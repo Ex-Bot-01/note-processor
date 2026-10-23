@@ -80,9 +80,12 @@ word invented about my own notes.
 
 - Corpus: ~1,500 existing `.md` notes (~18k chunks), growing one daily file per working day.
 - **Notes are mixed German and English**, so every embedding model and keyword heuristic has to be
-  multilingual. Vectors: 384-dim q8 ≈ 7 MB for ~18k chunks; brute-force cosine scan in RAM, this
-  is not a vector-search-infrastructure problem. Indexing budget: minutes of CPU for the whole
-  corpus, milliseconds-to-seconds for one file.
+  multilingual. Chosen model: `google/embeddinggemma-2` text tower (Apache-2.0), self-hosted —
+  downloaded once by `np models install`, no API at index time (§9). Vectors: 512-dim via MRL
+  truncation, q8 ≈ 19 MB for ~18k chunks; brute-force cosine scan in RAM, this is not a
+  vector-search-infrastructure problem. Throughput is the one real cost of that model and is
+  measured before we commit (§13 step 2).
+- Weights are never committed to the repo; `np models install` fetches and verifies sha256.
 - LLM: self-hosted OpenAI-compatible endpoint only (currently Qwen3-Next-class on my server).
   Model id, base URL and key are config; no vendor SDK in the tree. `embeddings.provider` may be
   pointed at that endpoint's `/v1/embeddings` instead of the local model — one config flag, and
@@ -226,16 +229,35 @@ note-processor/
   (typed, `approved` flag), `tags`, `clusters` (+ membership), `contradictions`, `summaries`
   (note_id, model, source_hash, text, gate_result, created_at). FTS5 over note **and** summary
   text for keyword search; vectors scanned brute-force in RAM.
-- **Embeddings**: local multilingual int8 model via `candle` — default `paraphrase-multilingual-
-  MiniLM-L12-v2` (384-d), alternative `multilingual-e5-small`, chosen by a benchmark on my own
-  notes (§14). Model downloaded once, pinned by sha256; recorded on every vector. Raw chunks are
-  embedded for citation-grade retrieval, the compressed summary is embedded as one extra vector
-  per node for clustering and nearest-neighbour work (shorter text, less noise). Optional
-  `embeddings.provider = "openai-compatible"` uses the endpoint instead — cheaper CPU, but then
-  note text crosses the network and indexing needs the server up; default stays local.
-  Keyword/tag derivation is statistical, never model-based: existing tags from frontmatter/`#tags`,
-  titles, link anchors, distinctiveness by vault-relative TF-IDF so keywords are what makes a
-  note different, not what makes it sound like a note.
+- **Embeddings — self-hosted `google/embeddinggemma-2`, text tower only.** Verified against the
+  hub: 740M params total but 270M in the text tower (`language_model.*`, 413 tensors), 768-d native
+  with Matryoshka truncation to 512/256/128 (we use **512**, re-normalised after slicing), mean
+  pooling over token embeddings then L2-normalise, 8K-token context, Apache-2.0.
+  - `np models install` downloads it once, slices out the `language_model.*` tensors plus tokenizer
+    into the data dir (~540 MB bf16; the vision/audio towers we do not use stay in the download
+    cache), pins sha256, and records model id + version on every vector.
+  - Runtime: candle (`candle-transformers` 0.11 ships `gemma4` text layers). Its `TextModel`
+    returns last-token logits for generation, so np-core carries a **text-only encoder wrapper** —
+    all positions out of the final norm, mean-pool with the attention mask, normalise, slice to 512.
+    The layer code is private in candle, so this wrapper is adapted from candle's Apache-2.0
+    `gemma4` module and lives in np-core with the licence noted.
+  - Fallbacks, in order, if that stalls: (a) GGUF Q8_0 (`ggml-org/embeddinggemma-2-GGUF`, 310 MB,
+    text-only) through llama.cpp bindings — costs a C++ build on Windows, so it is not the default;
+    (b) `paraphrase-multilingual-MiniLM-L12-v2` (118M, 384-d, ~7 MB total, runs on candle's
+    well-trodden Bert path) if the benchmark shows EmbeddingGemma is too slow on my CPU;
+    (c) `embeddings.provider = "openai-compatible"` for endpoint embeddings — cheapest CPU, but note
+    text crosses the network and indexing needs the server up. Every fallback is one config key and
+    a re-embed, never a code change.
+  - **Task prefixes are part of correctness**: the model is trained with instruction prefixes,
+    retrieval being asymmetric (query prefix on my questions, document prefix on stored chunks,
+    `none` when there is no title) and clustering/similarity symmetric (same prefix both sides).
+    Prefix text lives in config; queries and corpus must always share the same dimension.
+  - Raw chunks are embedded for citation-grade retrieval; each node also gets one vector from its
+    compressed summary, used for clustering and nearest-neighbour work (shorter text, less noise,
+    and far fewer tokens than embedding summaries alone would need).
+  - Keyword/tag derivation stays statistical, never model-based: existing tags from
+    frontmatter/`#tags`, titles, link anchors, distinctiveness by vault-relative TF-IDF so keywords
+    are what makes a note different, not what makes it sound like a note.
 - **API** (`127.0.0.1:8765`, token in config file, `Origin` checked): `GET /api/index`,
   `GET /api/notes/{id}`, `POST /api/notes/{id}/links` (approve placement), `GET|PUT /api/file`,
   `POST /api/daily/today`, `POST /api/search` (chat/RAG, streams), `GET /api/graph`,
@@ -281,13 +303,20 @@ Fixture vaults in `tests/fixtures/` (messy notes, appended text, ticks in prose 
 renames, deletes, CRLF files, unicode + umlaut names, a file >260-char path). Golden-file tests:
 `INDEX.md` render, item timeline resolution, tick-extraction-before-regeneration order. Property
 test: pipeline twice = byte-identical output. Cross-platform CI matrix (ubuntu-latest +
-windows-latest) running `cargo test` and `npm run build`. LLM behind a trait with a fake for
+windows-latest) running `cargo test` and `npm run build`, with embeddings behind a trait and a
+**deterministic stub embedder** in tests — CI never downloads 1.5 GB of weights or calls my LLM
+endpoint. Real-model quality and throughput are measured by an offline bench binary on my machine,
+not in CI. LLM behind a trait with a fake for
 tests; one opt-in integration test against the real endpoint, skipped by default.
 
 ## 13. Build order
 
 1. `np-core`: discover/hash/parse/registry + SQLite schema (fixtures, golden `INDEX.md`).
-2. Embeddings (multilingual, local) + clustering + review-queue suggestions with evidence.
+2. Embeddings: `np models install` + the text-only encoder wrapper + **a throughput and quality
+   benchmark on my own notes** (chunks/hour on this CPU, retrieval spot-checks in German and
+   English). Decision rule: keep EmbeddingGemma 2 if a full first pass fits in one evening,
+   otherwise fall back per §9 and record the choice. Then clustering + review-queue suggestions
+   with evidence.
 2b. Enrich queue: grounded compression into `processed/` with the gate and `## Dropped` list.
 3. Item timelines: markers, provenance, tick extraction, staleness.
 4. `npd`: API, WebSocket events, watcher integration, scheduler, autostart installer.
@@ -296,8 +325,8 @@ tests; one opt-in integration test against the real endpoint, skipped by default
 
 ## 14. Left to the builder (my call, listed so you can veto)
 
-- Exact embedding model after a benchmark on my own notes (mixed German/English); both candidates
-  local, int8, pinned by hash.
+- Which of the two multilingual models survives the benchmark in step 2; both are local, pinned by
+  hash, and switchable by config.
 - Default status-marker vocabulary in §8.7, stored as config so I can add my own wording later.
 - Catalog shard threshold (default 600 entries per file) and the continuation-line indent rule.
 - Compression target 35 % and how many gate retries (one).
@@ -312,7 +341,8 @@ tests; one opt-in integration test against the real endpoint, skipped by default
 1. **Compressed copy: yes**, into a separate `processed/` tree, strictly bounded to the messy
    original, which stays the ground truth (§8.7). The day file itself stays messy; I read the
    compressed twin, the TODO segment, or ask chat.
-2. **Language: mixed German/English** → multilingual embeddings, local by default (§9).
+2. **Language: mixed German/English** → self-hosted `google/embeddinggemma-2` text tower at 512-d
+   MRL, local by default; endpoint embeddings available as a config flag (§9).
    **Status: open is the default** — anything not marked finished or paused; a tick means done
    (§8.7).
 3. **No other editors.** note-processor is the only writer by design, so external-change handling
