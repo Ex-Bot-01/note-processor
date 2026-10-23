@@ -33,7 +33,7 @@ use thiserror::Error;
 use crate::catalog::{self, CatalogEntry};
 use crate::change::{classify, Change};
 use crate::config::{abs_path, Config, ConfigError, MarkerConfig, WorkspaceRegistry};
-use crate::db::{self, Db, DbError, LIVE_EDGE};
+use crate::db::{self, Db, DbError, LIVE_EDGE, PROSE_ORIGIN};
 use crate::hash::{sha256_bytes, sha256_file, Snapshot};
 use crate::items::{extract_items, ItemCandidate};
 use crate::links::{resolve, store_links, RawLink};
@@ -47,8 +47,6 @@ const ENCODING_UTF8: &str = "utf-8";
 /// `notes.encoding` for bytes UTF-8 cannot hold, decoded with replacements instead of failing the scan
 /// (Review Focus 1b).
 const ENCODING_LOSSY: &str = "lossy";
-/// `links.origin` for an edge the parser read out of a note, as opposed to one a person approved.
-const PROSE_ORIGIN: &str = "prose";
 /// `meta` key holding the index files this program has published, newline-separated. The previous list
 /// is what lets a rescan delete the shards it no longer produces.
 const INDEX_FILES_KEY: &str = "index_files";
@@ -814,8 +812,8 @@ fn note_tags(db: &Db) -> Result<HashMap<i64, Vec<String>>, DbError> {
 /// `dst_note_id` until its source is edited. [`crate::db::unresolved_targets`] answers the list this scan
 /// reports beside this number as [`ScanReport::unresolved_targets`], and both are read from one
 /// transaction — that query asks the same question with the same [`LIVE_EDGE`] predicate and the same
-/// `origin = 'prose'` filter — an approved edge is an input, and once M3 writes them the two figures
-/// must not diverge.
+/// [`PROSE_ORIGIN`] filter, neither spelling its own literal — an approved edge is an input, and once
+/// M3 writes them the two figures must not diverge.
 fn unresolved_links(db: &Db) -> Result<i64, DbError> {
     Ok(db.0.query_row(
         &format!(

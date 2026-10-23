@@ -215,6 +215,29 @@ fn json_output_matches_the_fixture_corpus() {
         report["unresolved_links"].as_u64().unwrap_or(0) > 0,
         "the corpus is written to leave ambiguous targets: {report}"
     );
+    // The names behind that count are part of the JSON contract too, not only of the printed summary:
+    // `Gamma` is the ambiguous basename the corpus exists to produce, and an attachment target must not
+    // appear. Pinned as a whole array, so renaming the field or changing its shape — a map, an object,
+    // a nested list — fails here rather than in a downstream reader.
+    let targets: Vec<&str> = report["unresolved_targets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`unresolved_targets` must serialise as an array: {report}"))
+        .iter()
+        .map(|target| {
+            target
+                .as_str()
+                .unwrap_or_else(|| panic!("every unresolved target is a name: {report}"))
+        })
+        .collect();
+    assert_eq!(
+        targets,
+        vec!["Gamma"],
+        "the JSON has to name the note behind the count: {report}"
+    );
+    assert!(
+        !targets.contains(&"scan.png"),
+        "an attachment is not a missing note: {report}"
+    );
     assert!(ws.index().is_file(), "`--json` still writes the catalog");
 }
 

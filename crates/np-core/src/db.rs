@@ -396,6 +396,13 @@ fn rebase_abs(abs: &str, from: &str, to: &str) -> Option<String> {
     None
 }
 
+/// `links.origin` for an edge the parser read out of a note, as opposed to one a person approved.
+/// Spelled once here because the count and the list beside it are two queries ([`unresolved_targets`]
+/// here, `crate::scan::unresolved_links` there) plus the writer and the deleter in [`crate::scan`], and
+/// an author-facing report that filtered one query by a literal `'prose'` and the other by a constant
+/// would drift the moment M3 introduces a second origin.
+pub(crate) const PROSE_ORIGIN: &str = "prose";
+
 /// A link edge whose destination is a live note, spelled once because four queries have to agree on
 /// it: the two counts `crate::scan::catalog_entries` renders, that module's `unresolved_links`, and
 /// [`unresolved_targets`] here. The notes→files join is the point — an edge into a stale note, or one
@@ -422,7 +429,7 @@ pub(crate) const LIVE_EDGE: &str =
 pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
     let mut statement = db.0.prepare(&format!(
         "SELECT DISTINCT target FROM links l
-          WHERE l.origin = 'prose' AND l.kind != 'attachment'
+          WHERE l.origin = '{PROSE_ORIGIN}' AND l.kind != 'attachment'
             AND NOT {LIVE_EDGE}
           ORDER BY target",
     ))?;

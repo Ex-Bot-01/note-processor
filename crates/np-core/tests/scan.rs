@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use np_core::catalog;
 use np_core::config::{CatalogConfig, Config};
 use np_core::db::{self, Db, NoteCounts};
 use np_core::hash::sha256_file;
@@ -684,6 +685,100 @@ fn a_directory_wearing_a_generated_name_survives_and_the_scan_succeeds() {
         report.skipped
     );
     assert!(ws.root.join("INDEX.md").is_file(), "the catalog is written");
+}
+
+#[test]
+fn a_superseded_shard_without_our_fingerprint_survives_and_is_reported_on_every_scan() {
+    // The fingerprint, not the name, is what grants deletion (see `np_published`). A shard from an earlier
+    // generation whose bytes were rewritten behind np's back — a CRLF checkout, an editor, a sync tool —
+    // no longer opens with `catalog::HEADER`, so it is a foreign file wearing one of our names: it stays
+    // on disk and reaches `skipped`.
+    //
+    // The scan runs **twice** after the rewrite. One green pass could be a one-shot artefact of the fresh
+    // `meta` list: a name reported once and unlinked by the next scan, or one kept only while the delete
+    // list still names it, is a leak either way. Stability across scans is the property that matters.
+    let ws = scratch(
+        &[
+            ("a.md", "one\n"),
+            ("b.md", "two\n"),
+            ("c.md", "three\n"),
+            ("d.md", "four\n"),
+        ],
+        2,
+    );
+    let first = scan(&ws.root, &ws.cfg).expect("scan that shards");
+    assert_eq!(first.index_files.len(), 3, "{:?}", first.index_files);
+
+    // One shard is rewritten with CRLF line endings — same information, no longer our bytes.
+    let foreign = ws.root.join(&first.index_files[1]);
+    let text = fs::read_to_string(&foreign).expect("test: read the superseded shard");
+    fs::write(&foreign, text.replace('\n', "\r\n")).expect("test: rewrite the shard as CRLF");
+    let foreign_bytes = fs::read(&foreign).expect("test: read back the rewritten shard");
+    assert!(
+        !foreign_bytes.starts_with(catalog::HEADER.as_bytes()),
+        "the rewrite must break the published-file fingerprint"
+    );
+    // The other shard still carries it, so the same pass has a legitimate deletion to make and the case
+    // cannot pass by deleting nothing at all.
+    let ours = &first.index_files[2];
+    assert!(fs::read(ws.root.join(ours))
+        .expect("test: read the intact shard")
+        .starts_with(catalog::HEADER.as_bytes()));
+
+    // Two notes fewer is one file again: both shards are superseded.
+    fs::remove_file(ws.root.join("c.md")).expect("test: shrink the corpus");
+    fs::remove_file(ws.root.join("d.md")).expect("test: shrink the corpus");
+
+    let name = foreign.file_name().unwrap().to_string_lossy().into_owned();
+
+    // The first pass after the rewrite: kept, and named.
+    let second = scan(&ws.root, &ws.cfg).expect("scan after the shrink");
+    assert!(
+        foreign.is_file(),
+        "a superseded shard np cannot prove it published is never unlinked"
+    );
+    assert_eq!(
+        fs::read(&foreign).expect("test: re-read the rewritten shard"),
+        foreign_bytes,
+        "the file survives byte for byte"
+    );
+    assert!(
+        !ws.root.join(ours).exists(),
+        "the shard that still carries the header is deleted as usual: {second:?}"
+    );
+    assert!(
+        second.skipped.iter().any(|skipped| skipped == &name),
+        "{name} has to be named in the report: {:?}",
+        second.skipped
+    );
+
+    // The pass that decides whether this is a rule or an artefact: `meta` now names only `INDEX.md`, so
+    // the surviving file can only be found by listing the root and reading it again.
+    let third = scan(&ws.root, &ws.cfg).expect("rescan with the foreign shard still in place");
+
+    assert!(
+        foreign.is_file(),
+        "a second scan must not delete what the first one promised to keep"
+    );
+    assert_eq!(
+        fs::read(&foreign).expect("test: re-read the shard after the rescan"),
+        foreign_bytes,
+        "and it survives byte for byte again"
+    );
+    assert!(
+        third.skipped.iter().any(|skipped| skipped == &name),
+        "{name} has to be reported on every scan: {:?}",
+        third.skipped
+    );
+    assert_eq!(
+        second.skipped, third.skipped,
+        "the same collision must be reported identically twice"
+    );
+    assert_eq!(third.index_files, vec!["INDEX.md".to_string()]);
+    assert!(
+        ws.root.join("INDEX.md").is_file(),
+        "and the catalog is still written around it"
+    );
 }
 
 #[test]
