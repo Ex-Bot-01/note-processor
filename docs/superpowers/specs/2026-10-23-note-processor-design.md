@@ -1,7 +1,7 @@
 # note-processor — design
 
 Date: 2026-10-23
-Status: draft for approval
+Status: for approval (review round answered)
 Repo: https://github.com/Ex-Bot-01/note-processor
 
 ## 1. Intent and the why
@@ -31,13 +31,20 @@ word invented about my own notes.
   processed and inserted into the existing graph; changed file → re-ingested and every entry
   that pointed at it updated; moved file → identity and history preserved; deleted file →
   entries marked stale, not destroyed.
-- `INDEX.md`: one line per note — title, path, size, tags, links, cluster, status summary —
-  alphabetized, machine-generated, safe to hand to an LLM for an overview.
+- `INDEX.md`: one entry per note — title, path, size, tags, related words, links, cluster, status
+  summary — alphabetized, machine-generated, safe to hand an LLM for an overview. One line by
+  default, wrapping to indented continuation lines when the related words need the room, and the
+  catalog shards into `INDEX-<range>.md` past a configurable size with `INDEX.md` as entry point
+  (§9). No importance filter: nothing is silently hidden from the overview.
+- A compressed, grounded copy of every note under `processed/` — the clean short version that
+  feeds its graph node, while the messy original stays the ground truth (§8.7).
 - Daily notes: opening a day creates `YYYY-MM-DD.md` if absent; a fenced TODO segment at the
   top is generated from the last *n* days (default 30); I write messy underneath; saving
   triggers processing of that file.
-- Item timelines: an item records first written, last touched, current state (open / done /
-  superseded) and `file:line` evidence for each transition. State changes only on text I wrote.
+- Item timelines: an item records first written, last touched, current state (**open** by default,
+  **done**, **paused**, or **superseded**) and `file:line` evidence for each transition. Open is
+  the absence of a marker: anything I have not marked finished or paused is still open. State
+  changes only on text I wrote (§8.7).
 - Review queue with evidence: probable-same-project clusters, orphans with nearest neighbours,
   near-duplicates. Approving writes a real `[[wikilink]]`; after that the result is
   deterministic.
@@ -53,8 +60,9 @@ word invented about my own notes.
   arbitrary edits, write-back into note bodies beyond the two cases in §7.
 - Voice memos / transcription. Ingest keeps a `SourceAdapter` trait seam so a future adapter can
   emit a `.md` file and join the normal pipeline.
-- Tidying prose by rewriting it (see §14 open question 1) — v1 lints structure, shows findings,
-  does not silently restructure my notes.
+- Restructuring the originals. The messy file is never reflowed, retitled or summarised in place;
+  compression happens only into a separate derived file under `processed/` (§8.7). A structural
+  lint (missing heading, orphan list item, broken link target) reports in the UI.
 - Multi-device sync, accounts, mobile, cloud storage of any kind.
 - A plugin runtime. Only the trait seams (`SourceAdapter`, cluster/scoring functions) exist.
 - Obsidian compatibility beyond plain `[[wikilink]]` and standard frontmatter being readable.
@@ -71,11 +79,14 @@ word invented about my own notes.
 ## 5. Constraints
 
 - Corpus: ~1,500 existing `.md` notes (~18k chunks), growing one daily file per working day.
-- Embeddings: 512-dim, q8 storage ≈ 19 MB; brute-force cosine scan in RAM is fine — this is not
-  a vector-search-infrastructure problem. Indexing budget: minutes of CPU for the whole corpus,
-  milliseconds-to-seconds for one file.
-- LLM: self-hosted OpenAI-compatible endpoint only (currently a Qwen3-Next-class model on my
-  server). Model id, base URL and key are config; no vendor SDK in the tree.
+- **Notes are mixed German and English**, so every embedding model and keyword heuristic has to be
+  multilingual. Vectors: 384-dim q8 ≈ 7 MB for ~18k chunks; brute-force cosine scan in RAM, this
+  is not a vector-search-infrastructure problem. Indexing budget: minutes of CPU for the whole
+  corpus, milliseconds-to-seconds for one file.
+- LLM: self-hosted OpenAI-compatible endpoint only (currently Qwen3-Next-class on my server).
+  Model id, base URL and key are config; no vendor SDK in the tree. `embeddings.provider` may be
+  pointed at that endpoint's `/v1/embeddings` instead of the local model — one config flag, and
+  the trade is spelled out in §9.
 - No LLM, no network in the indexing path. Catalog quality must not depend on the endpoint.
 - Single machine, single user, but the API is loopback HTTP so `curl` and tests work.
 - Linux **and** Windows: file watching, paths, line endings, autostart all differ (§11).
@@ -115,11 +126,12 @@ React + Vite + TypeScript (my call, best-supported markdown editor integration; 
 | Create daily file `YYYY-MM-DD.md` | workspace | only if absent; body empty apart from the TODO segment |
 | TODO segment between `<!-- np:todo:start -->` / `:end -->` markers | today's daily file | whole-region replace; nothing outside the markers is touched; ticks extracted before rewrite (§8.3) |
 | Approved `[[wikilink]]` | the note I approved it in | appended under a `## Related` heading (created if absent), never inside existing lines |
-| `INDEX.md` | workspace root | whole-file regenerate; excluded from tracking (§9) |
+| `INDEX.md` (+ `INDEX-<range>.md`) | workspace root | whole-file regenerate; excluded from tracking (§9) |
+| Compressed copy `<relpath>` | `processed/` in workspace | whole-file regenerate from the current source hash only; derived, never an input (§8.7) |
 
 Everything else derived — tags, keywords, clusters, entities, statuses, contradiction edges —
-lives in the database and appears in `INDEX.md`/the UI. Nothing is written into note bodies by an
-LLM. No file is rewritten as a side effect of indexing; line endings and encoding are preserved
+lives in the database and appears in `INDEX.md`/the UI. No LLM output ever lands inside a note
+body: model text goes only into new files under `processed/`. No file is rewritten as a side effect of indexing; line endings and encoding are preserved
 byte-for-byte outside the regions above.
 
 ## 8. Behaviour that was decided
@@ -170,6 +182,28 @@ TODO segment filled with unresolved items carried verbatim with their source lin
 empty block, never an apology paragraph, never a fabricated list. Chat says it cannot answer
 rather than answering from memory.
 
+### 8.7 Compressed node summaries — grounded, gated, reversible
+Every graph node carries a compressed version of its source note; the day file stays messy and
+its compressed twin is what I read or hand to an LLM. Rules:
+
+- **Bounded**: the summary may only restate what is in the source. It may reorder, merge duplicate
+  mentions, and tighten wording; it may not add a fact, name, number, date or conclusion.
+- **Nothing dropped silently**: every open/done/paused item and every `[[link]]`/tag/entity in the
+  source must appear in the summary (items keep their provenance `(file:Lnn)`), otherwise the
+  difference is listed under a `## Dropped` heading for me to see.
+- **Gate before it is stored**: a deterministic check rejects any summary containing a capitalised
+  entity, number or date absent from the source, and any item present in the source but neither
+  summarised nor listed as dropped. One retry with a stricter prompt; if it still fails, keep the
+  previous summary, mark the node `ungrounded` in the UI, and never overwrite good text with bad.
+- **Target**: ≤ 35 % of source tokens (configurable), items exempt from compression pressure.
+- The original is always the ground truth: the note card shows the compressed copy above the raw
+  text with a one-click *open original at this line* on every summarised section.
+
+**Status markers** (my default list, case-insensitive, extendable in config without a rebuild):
+done — `✅`, `- [x]`, "done", "finished", "erledigt", "fertig", "abgeschlossen"; paused —
+"paused", "pausiert", "on hold", "gestoppt", "verschoben", "vertagt"; open — everything else,
+including explicit `- [ ]`. A marker line attaches to the item it names (§8.4).
+
 ## 9. Architecture (my call unless noted)
 
 ```
@@ -183,16 +217,25 @@ note-processor/
 
 - **np-core**: no HTTP, no UI, no async task spawning. Everything testable with `cargo test` on
   fixture folders. Stages: discover → hash/dedupe → parse (frontmatter, headings, lists, links,
-  tags, items) → chunk (~350 tokens ±overlap) → embed → cluster → index/render.
+  tags, items) → chunk (~350 tokens ±overlap) → embed → cluster → index/render. A separate
+  **enrich** queue (LLM compression, §8.7) runs after the deterministic pass, resumable and
+  rate-limited: it can be down or offline and every deterministic surface stays complete.
 - **Storage**: SQLite (`rusqlite`) in the OS data dir, one DB per workspace. Tables: `files`
   (path, display path, hash, size, mtime, state), `notes`, `headings`, `chunks` (q8 vector blob),
   `items` (+`item_events` for first/touched/done/superseded with `file:line`), `links`
-  (typed, `approved` flag), `tags`, `clusters` (+ membership), `contradictions`. FTS5 over note
+  (typed, `approved` flag), `tags`, `clusters` (+ membership), `contradictions`, `summaries`
+  (note_id, model, source_hash, text, gate_result, created_at). FTS5 over note **and** summary
   text for keyword search; vectors scanned brute-force in RAM.
-- **Embeddings**: local int8 model via `candle` (candidate: `bge-small-en-v1.5` Matryoshka-truncated
-  to 512 dims; fallback `all-MiniLM-L6-v2`). Model downloaded once, pinned by sha256 in config.
-  Keyword/tag derivation is statistical, not model-based: existing tags from frontmatter/`#tags`,
-  titles, link anchors for distinctiveness (vault-relative TF-IDF), no LLM.
+- **Embeddings**: local multilingual int8 model via `candle` — default `paraphrase-multilingual-
+  MiniLM-L12-v2` (384-d), alternative `multilingual-e5-small`, chosen by a benchmark on my own
+  notes (§14). Model downloaded once, pinned by sha256; recorded on every vector. Raw chunks are
+  embedded for citation-grade retrieval, the compressed summary is embedded as one extra vector
+  per node for clustering and nearest-neighbour work (shorter text, less noise). Optional
+  `embeddings.provider = "openai-compatible"` uses the endpoint instead — cheaper CPU, but then
+  note text crosses the network and indexing needs the server up; default stays local.
+  Keyword/tag derivation is statistical, never model-based: existing tags from frontmatter/`#tags`,
+  titles, link anchors, distinctiveness by vault-relative TF-IDF so keywords are what makes a
+  note different, not what makes it sound like a note.
 - **API** (`127.0.0.1:8765`, token in config file, `Origin` checked): `GET /api/index`,
   `GET /api/notes/{id}`, `POST /api/notes/{id}/links` (approve placement), `GET|PUT /api/file`,
   `POST /api/daily/today`, `POST /api/search` (chat/RAG, streams), `GET /api/graph`,
@@ -218,7 +261,9 @@ or embedded. One active workspace at a time; recently used workspaces listed for
 each with its own DB. Day rollover uses local midnight. If a file changes on disk while open in
 the editor the app does **not** overwrite: it shows a conflict banner with *reload*, *keep mine
 (write anyway)* and *save as copy*. Model id + version recorded on every vector so a model change triggers
-a controlled re-embed rather than mixed-space comparisons.
+a controlled re-embed rather than mixed-space comparisons. A summary is regenerated only when its
+source hash changes, so `processed/` is stable across re-runs and an endpoint outage never blanks
+an existing compressed copy.
 
 ## 11. Cross-platform
 
@@ -242,7 +287,8 @@ tests; one opt-in integration test against the real endpoint, skipped by default
 ## 13. Build order
 
 1. `np-core`: discover/hash/parse/registry + SQLite schema (fixtures, golden `INDEX.md`).
-2. Embeddings + clustering + review-queue suggestions with evidence.
+2. Embeddings (multilingual, local) + clustering + review-queue suggestions with evidence.
+2b. Enrich queue: grounded compression into `processed/` with the gate and `## Dropped` list.
 3. Item timelines: markers, provenance, tick extraction, staleness.
 4. `npd`: API, WebSocket events, watcher integration, scheduler, autostart installer.
 5. UI: index → note card → review queue → editor + TODO segment → chat panel.
@@ -250,17 +296,26 @@ tests; one opt-in integration test against the real endpoint, skipped by default
 
 ## 14. Left to the builder (my call, listed so you can veto)
 
-- Exact embedding model after a benchmark on my own notes; both candidates are local and pinned.
+- Exact embedding model after a benchmark on my own notes (mixed German/English); both candidates
+  local, int8, pinned by hash.
+- Default status-marker vocabulary in §8.7, stored as config so I can add my own wording later.
+- Catalog shard threshold (default 600 entries per file) and the continuation-line indent rule.
+- Compression target 35 % and how many gate retries (one).
 - Chunk size/overlap, cluster method (agglomerative over cosine with a link/tag prior), and the
   similarity thresholds that put something in the review queue instead of asserting it.
 - "Stale since edit" definition: days since last edit with no state event, threshold configurable.
 - `INDEX.md` line format: `- [[Title]](path) · size · tags · →2 ←1 · cluster · status`.
 - DB schema details, error taxonomy, log rotation for `npd`, config file layout.
 
-## 15. Open — needs my answer
+## 15. Resolved in review
 
-1. Does the app ever write a **tidied copy** of a note, and where? (v1 as written: no.)
-2. Which markers count as open/done in what I actually type — and are the notes German, English
-   or mixed? (picks the embedding model)
-3. Do I also edit these files in another editor while the app is open?
-4. `INDEX.md`: one line for every note, or only "important" ones — and who decides important?
+1. **Compressed copy: yes**, into a separate `processed/` tree, strictly bounded to the messy
+   original, which stays the ground truth (§8.7). The day file itself stays messy; I read the
+   compressed twin, the TODO segment, or ask chat.
+2. **Language: mixed German/English** → multilingual embeddings, local by default (§9).
+   **Status: open is the default** — anything not marked finished or paused; a tick means done
+   (§8.7).
+3. **No other editors.** note-processor is the only writer by design, so external-change handling
+   stays a safety net (hash check + banner) rather than a core flow.
+4. **One entry per note, no filter** — wrapping and sharding handle size, related words go on the
+   entry (§2).
