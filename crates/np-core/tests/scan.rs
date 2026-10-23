@@ -166,6 +166,24 @@ fn generated(rel: &str) -> bool {
     name.starts_with("INDEX") && (name.ends_with(".md") || name.ends_with(".tmp"))
 }
 
+/// Every generated catalog file in the workspace root as name → bytes: the entry point and all its
+/// shards, i.e. exactly what a rescan has to reproduce byte-for-byte.
+fn generated_catalog(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for entry in fs::read_dir(root).expect("test: read workspace root") {
+        let entry = entry.expect("test: readdir entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !generated(&name) || name.ends_with(".tmp") {
+            continue;
+        }
+        out.insert(
+            name,
+            fs::read(entry.path()).expect("test: read generated file"),
+        );
+    }
+    out
+}
+
 /// One `COUNT(*)`-shaped number from the workspace database.
 fn scalar(open: &Db, sql: &str) -> i64 {
     open.0
@@ -562,7 +580,7 @@ fn reparse_replaces_prose_links() {
 fn unresolved_targets_are_listed_for_the_hint() {
     let ws = workspace();
 
-    scan(&ws.root, &ws.cfg).expect("scan");
+    let report = scan(&ws.root, &ws.cfg).expect("scan");
 
     let open = ws.db();
     let targets = db::unresolved_targets(&open).expect("test: unresolved targets");
@@ -586,6 +604,86 @@ fn unresolved_targets_are_listed_for_the_hint() {
         2,
         "both spelled links land on the file they name"
     );
+    // The report carries that list, because it is what the CLI prints beside the count: a summary
+    // whose number and list come from different queries would name targets its own count denies.
+    assert_eq!(
+        report.unresolved_targets, targets,
+        "the report has to carry the same list the query answers"
+    );
+    assert!(
+        (targets.len() as i64) <= report.unresolved_links,
+        "one target written in two notes counts twice and lists once: {report:?}"
+    );
+}
+
+#[test]
+fn a_foreign_note_wearing_a_generated_name_survives_and_is_reported() {
+    // The name rule and the delete rule are not the same rule. A workspace that already holds a
+    // hand-written root note called `INDEX-old.md` must keep it: the walk never indexes generated
+    // names, so deleting it here would destroy a file no scan ever wrote (spec §7).
+    let ws = scratch(
+        &[
+            ("a.md", "one\n"),
+            (
+                "INDEX-old.md",
+                "# Meine alten Notizen\n\nHand-written, and nobody else's to delete.\n",
+            ),
+        ],
+        600,
+    );
+    let before = fs::read(ws.root.join("INDEX-old.md")).expect("test: read the hand-written note");
+
+    let report =
+        scan(&ws.root, &ws.cfg).expect("a foreign INDEX-named note must not fail the scan");
+
+    assert!(
+        ws.root.join("INDEX-old.md").is_file(),
+        "a note this program never published is never deleted"
+    );
+    assert_eq!(
+        fs::read(ws.root.join("INDEX-old.md")).expect("test: re-read the hand-written note"),
+        before,
+        "the note survives byte for byte"
+    );
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|skipped| skipped == "INDEX-old.md"),
+        "the collision has to be reported instead of silently overwritten: {:?}",
+        report.skipped
+    );
+    assert_eq!(
+        report.notes, 1,
+        "and it stays out of the catalog: {report:?}"
+    );
+}
+
+#[test]
+fn a_directory_wearing_a_generated_name_survives_and_the_scan_succeeds() {
+    // A root directory named like a shard used to become a delete candidate: `fs::remove_file`
+    // answers `IsADirectory`, which is not `NotFound`, so every later scan of the workspace failed
+    // on it. np writes files and removes files; a directory wearing its name is left alone.
+    // Two short notes render one unsharded `INDEX.md`, so `INDEX-a-b.md` is a name this scan never
+    // publishes — the shape that used to be fatal on every later scan.
+    let ws = scratch(&[("a.md", "one\n"), ("b.md", "two\n")], 600);
+    fs::create_dir(ws.root.join("INDEX-a-b.md")).expect("test: plant a directory");
+
+    let report = scan(&ws.root, &ws.cfg).expect("a directory must not fail the scan");
+
+    assert!(
+        ws.root.join("INDEX-a-b.md").is_dir(),
+        "np never removes a directory"
+    );
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|skipped| skipped == "INDEX-a-b.md"),
+        "the name it could not delete has to be reported: {:?}",
+        report.skipped
+    );
+    assert!(ws.root.join("INDEX.md").is_file(), "the catalog is written");
 }
 
 #[test]
@@ -829,6 +927,20 @@ fn superseded_shards_are_deleted() {
         assert!(ws.root.join(name).is_file(), "{name} was rendered");
     }
     assert_eq!(index_files_meta(&ws.db()), first.index_files);
+
+    // Spec §12's byte-identical regeneration, for the sharded shape: a rescan under the same
+    // threshold rewrites every generated file to the same bytes and deletes nothing it just wrote.
+    // `second_scan_is_a_no_op` proves this only for an unsharded corpus, where one entry point
+    // cannot be superseded by anything.
+    let sharded = generated_catalog(&ws.root);
+    assert_eq!(sharded.len(), 3, "entry point plus two shards: {sharded:?}");
+    let again = scan(&ws.root, &ws.cfg).expect("rescan of a sharded catalog");
+    assert_eq!(again.index_files, first.index_files, "{again:?}");
+    assert_eq!(
+        generated_catalog(&ws.root),
+        sharded,
+        "a sharded catalog must be byte-identical across scans"
+    );
 
     // Two notes fewer is one file again, so both shards are superseded — obligation 7's delete half.
     fs::remove_file(ws.root.join("c.md")).expect("test: shrink the corpus");

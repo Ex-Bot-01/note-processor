@@ -187,6 +187,12 @@ fn scan_writes_the_catalog_and_reports_it() {
         text.contains("spell its path"),
         "unresolved links need the ambiguity hint:\n{text}"
     );
+    // ... and name them. `Gamma` is the ambiguous basename the corpus is written to produce, so a
+    // summary that prints only the count leaves the reader with nothing to fix.
+    assert!(
+        text.contains("  Gamma"),
+        "the unresolved targets have to be listed by name:\n{text}"
+    );
 }
 
 #[test]

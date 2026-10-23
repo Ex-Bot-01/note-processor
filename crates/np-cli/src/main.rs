@@ -76,6 +76,11 @@ fn print_summary(report: &ScanReport) {
         print!(" — a target matched more than one file or none; spell its path to place it, e.g. [[notes/a.md]]");
     }
     println!();
+    // The targets behind that count, spelled as their author wrote them. The scan reads both from one
+    // transaction, so this list can never answer a different question than the number above it.
+    for target in &report.unresolved_targets {
+        println!("  {target}");
+    }
     println!("skipped    {}", report.skipped.len());
     for path in &report.skipped {
         println!("  {path}");

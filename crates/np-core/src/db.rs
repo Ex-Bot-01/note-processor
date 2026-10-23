@@ -404,15 +404,16 @@ pub(crate) const LIVE_EDGE: &str =
     "EXISTS (SELECT 1 FROM notes dn JOIN files df ON df.rel = dn.rel \
                                  WHERE dn.id = l.dst_note_id AND df.state = 'ok')";
 
-/// The non-attachment link targets no live note answers: the "notes I could not place" list behind
-/// [`ScanReport::unresolved_links`](crate::ScanReport).
+/// The non-attachment link targets no live note answers: the "notes I could not place" list a scan
+/// carries as [`crate::ScanReport::unresolved_targets`] and prints beside its
+/// [`crate::ScanReport::unresolved_links`] count.
 ///
 /// `note_counts` counts every NULL destination, because at database level an attachment with no
 /// note row behind it is unresolved like a missing file; this is the author-facing question instead,
 /// so attachments are left out and only notes are asked about. Stale sources count too — their rows
 /// are history the report does not rewrite.
 ///
-/// The predicate is [`LIVE_EDGE`] rather than `dst_note_id IS NULL` on purpose: an edge whose stored
+/// The predicate is `LIVE_EDGE` rather than `dst_note_id IS NULL` on purpose: an edge whose stored
 /// destination went stale or was deleted counts in the report's number, so it has to be named here as
 /// well. A count and the list printed behind it that disagree would send the reader looking for a note
 /// the list cannot show.

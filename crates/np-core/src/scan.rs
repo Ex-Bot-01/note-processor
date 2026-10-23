@@ -16,12 +16,13 @@
 //! - **The catalog reads live rows only.** Entries and [`ScanReport::notes`] come from
 //!   `files.state = 'ok'`; [`crate::db::note_counts`] stays the unfiltered database truth, because a
 //!   stale note is hidden from the catalog, not forgotten (spec §2).
-//! - **`INDEX.md` and its shards are the only names this module creates or deletes** (spec §7), every
+//! - **`INDEX.md` and its shards are the only names this module creates, and it deletes only the ones
+//!   that open with its own generated header** (spec §7): a name alone never licenses a removal. Every
 //!   write goes through a temporary file plus `rename`, and no note body is ever opened for writing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -104,8 +105,10 @@ pub struct ScanReport {
     /// Paths the registry already had exactly as they are.
     pub unchanged: usize,
     /// Paths this scan could not index and left untouched: directories it could not read, files that
-    /// vanished or changed between walk and read, paths whose identity is already taken, and a catalog
-    /// temporary it could not remove (see [`clear_temp_corpses`]). Sorted, deduplicated, spelled as `rel`.
+    /// vanished or changed between walk and read, paths whose identity is already taken, a catalog
+    /// temporary it could not remove (see `clear_temp_corpses`), and a root entry wearing a generated
+    /// catalog name that this program did not publish — left on disk and named here instead of deleted.
+    /// Sorted, deduplicated, spelled as `rel`.
     pub skipped: Vec<String>,
     /// Live note rows — the same number of entries the catalog holds (spec §2).
     pub notes: i64,
@@ -113,6 +116,10 @@ pub struct ScanReport {
     /// count. [`crate::db::note_counts`]'s figure is the wider database question and does not match
     /// this one.
     pub unresolved_links: i64,
+    /// The targets behind [`Self::unresolved_links`], spelled as their author wrote them, sorted and
+    /// deduplicated — the list the CLI prints under that count ([`crate::db::unresolved_targets`] answers
+    /// both from one predicate, so the number and the names beside it cannot disagree).
+    pub unresolved_targets: Vec<String>,
     /// The catalog files written, `INDEX.md` first, then its shards.
     pub index_files: Vec<String>,
     /// Wall-clock milliseconds for the whole scan. Informational only — never in a generated file,
@@ -183,7 +190,10 @@ pub fn scan_with_inject(
     // comes after the stale-marking so nothing resolves onto a note that just left the live set.
     store_note_links(&db, &written.parsed)?;
     let entries = catalog_entries(&db)?;
+    // Count and list are read from the same open transaction as one another, which is what lets the CLI
+    // print the names directly under the number.
     let unresolved = unresolved_links(&db)?;
+    let targets = db::unresolved_targets(&db)?;
     let previous = index_list(&db)?;
     // Rendering is pure, so the set this scan is about to publish is known here — and `meta` records it
     // inside the transaction rather than after the writes. A list that *leads* reality costs little,
@@ -195,7 +205,9 @@ pub fn scan_with_inject(
     set_index_list(&db, &rendered)?;
     tx.commit().map_err(DbError::from)?;
 
-    write_index_files(&root, &rendered, &previous)?;
+    // A root entry that wears one of our names but is not ours stays on disk and reaches the report, so
+    // the user hears about the collision instead of losing the file.
+    skipped.extend(write_index_files(&root, &rendered, &previous)?);
     WorkspaceRegistry::open(&cfg.data_dir)?.record(&root, now)?;
 
     skipped.extend(written.skipped);
@@ -212,6 +224,7 @@ pub fn scan_with_inject(
         // report and the file it describes cannot drift apart.
         notes: entries.len() as i64,
         unresolved_links: unresolved,
+        unresolved_targets: targets,
         index_files: rendered.iter().map(|(name, _)| name.clone()).collect(),
         elapsed_ms: started.elapsed().as_millis(),
     })
@@ -798,8 +811,9 @@ fn note_tags(db: &Db) -> Result<HashMap<i64, Vec<String>>, DbError> {
 ///
 /// A destination that exists but is stale counts here, because it is a note nobody can reach: links are
 /// re-resolved only for notes this scan re-parsed, so an edge into a deleted note keeps its old
-/// `dst_note_id` until its source is edited. [`crate::db::unresolved_targets`], which backs the list
-/// printed behind this number, asks the same question with the same [`LIVE_EDGE`] predicate and the same
+/// `dst_note_id` until its source is edited. [`crate::db::unresolved_targets`] answers the list this scan
+/// reports beside this number as [`ScanReport::unresolved_targets`], and both are read from one
+/// transaction — that query asks the same question with the same [`LIVE_EDGE`] predicate and the same
 /// `origin = 'prose'` filter — an approved edge is an input, and once M3 writes them the two figures
 /// must not diverge.
 fn unresolved_links(db: &Db) -> Result<i64, DbError> {
@@ -863,11 +877,15 @@ fn set_index_list(db: &Db, rendered: &[(String, String)]) -> Result<(), DbError>
 /// The names removed in step 3 come from [`superseded_names`] — the directory and `meta` together — rather
 /// than from `meta` alone. A name already gone from disk is the state this call wanted, which is what
 /// makes [`set_index_list`] safe to commit ahead of these writes.
+///
+/// Returns the root entries that wear a generated name without carrying this program's fingerprint: they
+/// are left exactly as they are and reach [`ScanReport::skipped`], because spec §7 grants regeneration of
+/// what np published and not removal of whatever is named like it.
 fn write_index_files(
     root: &Path,
     rendered: &[(String, String)],
     previous: &[String],
-) -> Result<(), ScanError> {
+) -> Result<Vec<String>, ScanError> {
     // Collected before anything is written: the deletion set is what disk and `meta` hold minus this
     // scan's generation, so reading the root first cannot see a file this call is about to publish — and
     // a root that cannot be listed fails the scan before it has touched anything.
@@ -880,7 +898,7 @@ fn write_index_files(
         publish(root, name, contents)?;
     }
 
-    for name in superseded {
+    for name in superseded.delete {
         let path = root.join(&name);
         match fs::remove_file(&path) {
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
@@ -888,7 +906,7 @@ fn write_index_files(
             Ok(()) => {}
         }
     }
-    Ok(())
+    Ok(superseded.foreign)
 }
 
 /// The generated names this workspace holds that this scan does not publish: what `meta` lists and what
@@ -900,37 +918,103 @@ fn write_index_files(
 /// would ever delete it. The listing sees reality instead, and the union covers both directions — which
 /// is also what lets `meta` be committed ahead of the files.
 ///
-/// Both sources are filtered by [`walk::is_generated_index`], because a note body is never this
-/// function's to delete (spec §7). That filter is also what makes a root-level `INDEX-<a>-<b>.md` ours to
-/// remove whether or not `meta` ever named it: those names are this program's to write.
+/// Both sources are filtered by [`walk::is_generated_index`], which only decides what is *worth asking
+/// about*. What decides what is ours to remove is the file's own fingerprint: a candidate is deleted only
+/// when it is a regular file opening with exactly [`catalog::HEADER`] (see [`np_published`]). A name that
+/// merely looks generated belongs to somebody else — a hand-written `INDEX-old.md` in the root is never
+/// indexed, because [`walk`] excludes these names, so deleting it would destroy a note no scan ever wrote
+/// (spec §7). Such a candidate, and a directory wearing the name, are returned for the report instead:
+/// the user learns about the collision, and a `remove_file` that could only answer `IsADirectory` never
+/// breaks every later scan of the workspace.
+///
+/// A `meta` name no longer on disk appears in neither list. Its absence is already the state this call
+/// wanted — which is exactly how the delete loop in [`write_index_files`] reads an
+/// [`io::ErrorKind::NotFound`] — and naming it in the report would be a collision nobody can see.
 fn superseded_names(
     root: &Path,
     rendered: &[(String, String)],
     previous: &[String],
-) -> Result<Vec<String>, ScanError> {
-    let mut names: Vec<String> = previous
-        .iter()
-        .filter(|name| walk::is_generated_index(name))
-        .cloned()
-        .collect();
+) -> Result<Superseded, ScanError> {
     let entries = fs::read_dir(root).map_err(|source| ScanError::Io {
         path: root.to_path_buf(),
         source,
     })?;
+    // Every generated-looking name in the root, tagged with whether it is ours. The verdict is taken while
+    // the listing runs, because `entry.file_type` is the cheapest answer to "file or directory" and a
+    // second `stat` would race with whatever renamed the entry between the two calls.
+    let mut present: Vec<(String, bool)> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| ScanError::Io {
             path: root.to_path_buf(),
             source,
         })?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if walk::is_generated_index(&name) {
-            names.push(name);
+        if !walk::is_generated_index(&name) {
+            continue;
         }
+        // The file type is asked before the contents: a directory has no header to read, and letting
+        // `File::open` answer for it would pretend a directory could be this program's output.
+        let ours =
+            entry.file_type().is_ok_and(|kind| kind.is_file()) && np_published(&entry.path());
+        present.push((name, ours));
     }
+
+    // The union the crash window needs: what `meta` names and what the root holds. A name in either list
+    // is judged by what is actually on disk, never by which list produced it.
+    let mut names: Vec<String> = present.iter().map(|(name, _)| name.clone()).collect();
+    names.extend(
+        previous
+            .iter()
+            .filter(|name| walk::is_generated_index(name))
+            .cloned(),
+    );
     names.sort();
     names.dedup();
-    names.retain(|name| !rendered.iter().any(|(published, _)| published == name));
-    Ok(names)
+
+    let mut superseded = Superseded::default();
+    for name in names {
+        if rendered.iter().any(|(published, _)| published == &name) {
+            continue;
+        }
+        match present.iter().find(|(found, _)| *found == name) {
+            Some((_, true)) => superseded.delete.push(name),
+            // On disk, but not ours: a foreign note or a directory wearing one of our names.
+            Some((_, false)) => superseded.foreign.push(name),
+            // Named by `meta` and already gone — the state this call wanted, which is how the delete loop
+            // in [`write_index_files`] reads an [`io::ErrorKind::NotFound`]. Reporting it would name a
+            // collision that is nothing but a shard this program never got round to writing.
+            None => {}
+        }
+    }
+    Ok(superseded)
+}
+
+/// The generated names one scan found in its root that it does not publish, split by who owns them.
+#[derive(Default)]
+struct Superseded {
+    /// Files this program published in an earlier generation: safe to unlink.
+    delete: Vec<String>,
+    /// Entries wearing a generated name that this program did not publish: left on disk and reported.
+    foreign: Vec<String>,
+}
+
+/// Whether `path` opens with exactly the bytes [`catalog::render`] puts at the top of every file it
+/// publishes — two header lines, byte for byte. That is how a scan tells its own output from a note that
+/// happens to be called `INDEX-something.md`.
+///
+/// Only those bytes are read, so a candidate's size never decides what a scan costs, and every failure —
+/// unreadable, shorter than the header, an I/O error, a CRLF file somebody else rewrote — answers "not
+/// ours". The bias is deliberate: guessing wrong keeps a stale shard on disk rather than deleting a note.
+fn np_published(path: &Path) -> bool {
+    let mut source = match fs::File::open(path) {
+        Ok(source) => source,
+        Err(_) => return false,
+    };
+    let mut head = [0u8; catalog::HEADER.len()];
+    match source.read_exact(&mut head) {
+        Ok(()) => head[..] == *catalog::HEADER.as_bytes(),
+        Err(_) => false,
+    }
 }
 
 /// Move one rendered file into place through a temporary name, so a reader never sees it half-written
