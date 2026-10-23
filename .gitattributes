@@ -1,0 +1,7 @@
+# The repository is LF everywhere, including on Windows checkouts: the catalog goldens are
+# compared byte-for-byte, so a checkout-time CRLF translation would fail `catalog.rs`.
+* text=auto eol=lf
+
+# Byte-exact fixtures and goldens must reach the working tree exactly as committed.
+/tests/fixtures/** -text
+/tests/golden/** -text

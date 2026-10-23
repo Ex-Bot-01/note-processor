@@ -1,5 +1,6 @@
 //! Core of note-processor: workspace discovery, catalog rendering.
 
+pub mod catalog;
 pub mod change;
 pub mod config;
 pub mod db;
