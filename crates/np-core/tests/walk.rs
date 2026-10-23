@@ -25,7 +25,14 @@ fn tree(files: &[(&str, &str)]) -> TempDir {
 
 /// `walk` that must succeed, mapped to its `rel` list.
 fn rels(root: &Path) -> Vec<String> {
-    rels_from(&walk(root, &WalkOptions::default()).expect("walk must succeed"))
+    rels_from(&walk_files(root))
+}
+
+/// `walk` with default options that must succeed, returning the files it found.
+fn walk_files(root: &Path) -> Vec<DiscoveredFile> {
+    walk(root, &WalkOptions::default())
+        .expect("walk must succeed")
+        .files
 }
 
 fn rels_from(found: &[DiscoveredFile]) -> Vec<String> {
@@ -41,7 +48,7 @@ fn sorted_and_normalized() {
         ("top.md", "top"),
     ]);
 
-    let found = walk(tmp.path(), &WalkOptions::default()).expect("walk");
+    let found = walk_files(tmp.path());
     let keys: Vec<&str> = found.iter().map(|file| file.case_key.as_str()).collect();
     // `/` (0x2F) sorts before every letter, so `a/notes/…` precedes `alpha/…`.
     assert_eq!(
@@ -148,7 +155,7 @@ fn non_utf8_filename_recorded() {
     let path = tmp.path().join(&name);
     fs::write(&path, b"body").expect("test setup: write non-UTF-8 named file");
 
-    let found = walk(tmp.path(), &WalkOptions::default()).expect("a raw byte name is not an error");
+    let found = walk_files(tmp.path());
 
     assert_eq!(found.len(), 1, "expected one entry, got {found:?}");
     let file = &found[0];
@@ -213,7 +220,7 @@ fn non_markdown_files_are_tracked_too() {
         ("notes/UPPER.MD", "a note"),
     ]);
 
-    let found = walk(tmp.path(), &WalkOptions::default()).expect("walk");
+    let found = walk_files(tmp.path());
 
     assert_eq!(
         rels_from(&found),
@@ -232,22 +239,92 @@ fn non_markdown_files_are_tracked_too() {
 }
 
 #[test]
-fn an_unreadable_root_is_the_only_error() {
+fn a_root_that_cannot_be_read_is_an_error() {
     let tmp = TempDir::new().expect("test setup: tempdir");
 
     let err = walk(&tmp.path().join("nope"), &WalkOptions::default())
-        .expect_err("a root that cannot be read must fail");
+        .expect_err("a missing root must fail, not report an empty workspace");
     assert!(
         err.to_string().contains("nope"),
         "the error must name the root: {err}"
     );
 
-    // A root that is a file holds no notes, which is not an error.
+    // A file is not a readable directory either. An empty list here would read as
+    // "the workspace lost every note", which is exactly the mistake Task 10 must not
+    // make, so nothing about a bad root may come back as `Ok`.
     let file = tmp.path().join("note.md");
     fs::write(&file, "x").expect("test setup: write file");
-    assert!(walk(&file, &WalkOptions::default())
-        .expect("a file root is walkable")
-        .is_empty());
+    let err =
+        walk(&file, &WalkOptions::default()).expect_err("a root that is a file must fail too");
+    assert!(
+        err.to_string().contains("note.md"),
+        "the error must name the root: {err}"
+    );
+}
+
+/// A subdirectory nobody may read must be named, not quietly skipped: an absent
+/// subtree and an unreadable one look identical in `files` alone.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_is_reported_not_silently_missing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tree(&[
+        ("keep.md", "k"),
+        ("secret/a.md", "a"),
+        ("secret/deep/b.md", "b"),
+    ]);
+    let secret = tmp.path().join("secret");
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o0))
+        .expect("test setup: chmod 0 the subdirectory");
+    if fs::read_dir(&secret).is_ok() {
+        // Running as root (common in containers) reads a mode-0 directory anyway.
+        eprintln!("skipping: this machine can read a mode-0 directory");
+        restore_mode(&secret);
+        return;
+    }
+
+    let walked = walk(tmp.path(), &WalkOptions::default())
+        .expect("one unreadable directory must not fail the walk");
+    restore_mode(&secret);
+
+    assert_eq!(rels_from(&walked.files), ["keep.md"]);
+    assert_eq!(
+        walked.unreadable,
+        ["secret"],
+        "the unreadable directory is named by its rel-style path"
+    );
+}
+
+#[cfg(unix)]
+fn restore_mode(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
+        .expect("test teardown: make the directory removable again");
+}
+
+/// Sibling of `symlink_loop_does_not_hang`, which cannot see `follow_links`: walkdir's
+/// own same-file check drops a directory loop even when links are followed. A link to
+/// a *file* is the case that changes — following it would record the link as a second
+/// copy of its target, so it gets hashed twice and becomes a duplicate note.
+#[cfg(unix)]
+#[test]
+fn symlink_to_a_file_is_not_recorded() {
+    let tmp = tree(&[("target.md", "the real note")]);
+    std::os::unix::fs::symlink(tmp.path().join("target.md"), tmp.path().join("link.md"))
+        .expect("test setup: symlink to a file");
+
+    let found = walk_files(tmp.path());
+
+    assert_eq!(rels_from(&found), ["target.md"]);
+    for file in &found {
+        assert!(
+            !file.abs.is_symlink(),
+            "a tracked path must be a real file, not a link: {:?}",
+            file.abs
+        );
+    }
 }
 
 #[test]
@@ -256,12 +333,16 @@ fn extra_excludes_are_honoured_at_every_depth() {
         ("draft.md", "d"),
         ("keep.md", "k"),
         ("notes/draft.md", "nested d"),
+        ("notes/Draft.MD", "same name, other case"),
     ]);
 
+    // The configured spelling is upper case on purpose: both sides fold before they
+    // are compared, because Windows path comparison does (spec §11).
     let opts = WalkOptions {
-        extra_excludes: vec!["draft.md".to_string()],
+        extra_excludes: vec!["DRAFT.md".to_string()],
     };
-    let found = walk(tmp.path(), &opts).expect("walk");
+    let walked = walk(tmp.path(), &opts).expect("walk");
 
-    assert_eq!(rels_from(&found), ["keep.md"]);
+    assert_eq!(rels_from(&walked.files), ["keep.md"]);
+    assert!(walked.unreadable.is_empty(), "nothing was unreadable");
 }

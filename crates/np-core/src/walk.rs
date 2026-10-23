@@ -29,8 +29,10 @@ const MARKDOWN_SUFFIX: &str = ".md";
 /// What can fail while discovering a workspace.
 #[derive(Debug, Error)]
 pub enum WalkError {
-    /// The workspace root itself could not be read. Entry-level failures never
-    /// reach this type: they skip that entry and the walk continues.
+    /// The workspace root is missing, is not a directory, or may not be read.
+    /// Nothing below the root reaches this type: an unreadable directory is named in
+    /// [`Walked::unreadable`] and an unreadable entry is skipped, so the walk keeps
+    /// going wherever it can.
     #[error("cannot read workspace root {}: {source}", .root.display())]
     Root {
         /// The root that could not be read, as the caller spelled it.
@@ -65,50 +67,100 @@ pub struct DiscoveredFile {
 /// Knobs for [`walk`].
 #[derive(Debug, Clone, Default)]
 pub struct WalkOptions {
-    /// Extra names to leave out at every depth, matched exactly as the built-in
-    /// exclusions are.
+    /// Extra names to leave out at every depth. Matched case-insensitively, because
+    /// these come from user config and Windows path comparison folds case (spec §11);
+    /// the built-in exclusions stay exact-case, since this program writes those names.
     pub extra_excludes: Vec<String>,
 }
 
-/// Discover every tracked file under `root`, sorted by `case_key` then `rel`.
+/// What a walk found, and what it could not look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walked {
+    /// Every tracked file under the root, sorted by `case_key` then `rel` then `abs`.
+    pub files: Vec<DiscoveredFile>,
+    /// `/`-normalised paths, spelled like `rel`, of directories whose contents could
+    /// not be read (permission denied, or a directory that vanished mid-walk). Empty
+    /// in the common case. A caller must **not** treat files under one of these as
+    /// deleted: they are unknown, not absent, and reporting them as Removed would mark
+    /// live notes stale.
+    pub unreadable: Vec<String>,
+}
+
+/// Discover every tracked file under `root`, sorted by `case_key` then `rel` then
+/// `abs`.
 ///
 /// All regular files come back, markdown or not. Symlinks are neither followed nor
-/// recorded, so a link back to a parent directory cannot loop. `INDEX.md`,
-/// `INDEX-<range>.md`, `processed/`, dot-files and dot-directories stay out; the
-/// catalog names only at the root, which is where they are written (spec §7).
+/// recorded, so a link back to a parent directory cannot loop and a link to a file is
+/// never counted as a second copy of its target. `INDEX.md`, `INDEX-<range>.md`,
+/// `processed/`, dot-files and dot-directories stay out; the catalog names only at the
+/// root, which is where they are written (spec §7).
 ///
-/// Only a root that cannot be read is an error: an entry whose metadata vanishes
-/// mid-walk (deleted, permission revoked) is skipped so one bad file cannot lose the
-/// whole workspace. A root that is not a directory simply yields no files.
-pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Vec<DiscoveredFile>, WalkError> {
-    fs::metadata(root).map_err(|source| WalkError::Root {
+/// `root` must be a readable directory: missing, unreadable and non-directory roots
+/// all fail as [`WalkError::Root`], because returning an empty list for them would
+/// look exactly like an emptied workspace. Below the root nothing is silent: a
+/// directory that cannot be traversed is named in [`Walked::unreadable`] while the
+/// rest of the workspace is still discovered, and an individual entry whose metadata
+/// vanishes mid-walk (deleted, permission revoked) is skipped so one bad file cannot
+/// lose the walk.
+pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Walked, WalkError> {
+    // `read_dir`, not `metadata`: stat succeeds on a directory nobody may read, and an
+    // unreadable root must not be reported as an empty workspace.
+    fs::read_dir(root).map_err(|source| WalkError::Root {
         root: root.to_path_buf(),
         source,
     })?;
 
+    // Config-supplied names are compared folded; see `WalkOptions::extra_excludes`.
+    let extra_excludes: Vec<String> = opts
+        .extra_excludes
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect();
     let walker = WalkDir::new(root)
         .follow_links(false)
         // `contents_first(false)` is walkdir's spelling of "root first": a directory
         // is yielded before its contents. Named here so a default can never flip.
         .contents_first(false)
         .into_iter()
-        .filter_entry(|entry| !is_skipped(entry, &opts.extra_excludes));
+        .filter_entry(|entry| !is_skipped(entry, &extra_excludes));
 
-    let mut found: Vec<DiscoveredFile> = Vec::new();
-    for entry in walker {
-        // An unreadable directory or an entry that raced away reports itself as an
-        // error and is dropped here; the rest of the workspace is still discovered.
-        let Ok(entry) = entry else { continue };
+    let mut files: Vec<DiscoveredFile> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for item in walker {
+        let entry = match item {
+            Ok(entry) => entry,
+            // A directory that could not be opened reports an error carrying its own
+            // path; everything else (a single unreadable readdir entry) has no name to
+            // report and is skipped with the entry it belonged to.
+            Err(err) => {
+                if let Some(dir) = err.path() {
+                    unreadable.push(unreadable_rel(dir, root));
+                }
+                continue;
+            }
+        };
         if entry.depth() == 0 || !entry.file_type().is_file() {
             continue;
         }
         if let Some(file) = record(&entry, root) {
-            found.push(file);
+            files.push(file);
         }
     }
 
-    sort_found(&mut found);
-    Ok(found)
+    sort_found(&mut files);
+    unreadable.sort();
+    unreadable.dedup();
+    Ok(Walked { files, unreadable })
+}
+
+/// Relative spelling of a directory the walk could not read. The root itself has no
+/// relative path, and `"."` names it rather than dropping the failure.
+fn unreadable_rel(dir: &Path, root: &Path) -> String {
+    let (rel, _display) = normalize_rel(dir.strip_prefix(root).unwrap_or(dir));
+    if rel.is_empty() {
+        return ".".to_string();
+    }
+    rel
 }
 
 /// `rel` with `/` separators plus the original OS spelling for display:
@@ -154,17 +206,22 @@ pub fn long_prefix(p: &str, windows: bool) -> String {
 
 /// Whether `entry` — and everything below it when it is a directory — stays out of
 /// the walk. The root itself is never excluded: the user named it, however hidden its
-/// own directory name is.
+/// own directory name is. `extra_excludes` arrives already lowercased.
 fn is_skipped(entry: &DirEntry, extra_excludes: &[String]) -> bool {
     if entry.depth() == 0 {
         return false;
     }
     let name = entry.file_name().to_string_lossy();
-    is_excluded(&name)
-        || extra_excludes
-            .iter()
-            .any(|excluded| excluded.as_str() == &*name)
-        || (entry.depth() == 1 && is_generated_index(&name))
+    if is_excluded(&name) {
+        return true;
+    }
+    if !extra_excludes.is_empty() {
+        let folded = name.to_lowercase();
+        if extra_excludes.iter().any(|excluded| excluded == &folded) {
+            return true;
+        }
+    }
+    entry.depth() == 1 && is_generated_index(&name)
 }
 
 /// Names excluded at every depth: dot-files, dot-directories and `processed/`.
@@ -201,11 +258,17 @@ fn record(entry: &DirEntry, root: &Path) -> Option<DiscoveredFile> {
     })
 }
 
-/// Order with no platform dependence: `case_key` ascending, `rel` breaking ties so
-/// two names differing only in case (`a.md`, `A.md` on a case-sensitive filesystem)
-/// still have one fixed order.
+/// Order with no platform dependence and no ties: `case_key` ascending, then `rel`
+/// (two names differing only in case, `a.md` and `A.md`, share a key on a
+/// case-sensitive filesystem), then `abs` — the tie-break for two different raw names
+/// that decode lossily to the same `rel`.
 fn sort_found(found: &mut [DiscoveredFile]) {
-    found.sort_by(|a, b| a.case_key.cmp(&b.case_key).then_with(|| a.rel.cmp(&b.rel)));
+    found.sort_by(|a, b| {
+        a.case_key
+            .cmp(&b.case_key)
+            .then_with(|| a.rel.cmp(&b.rel))
+            .then_with(|| a.abs.cmp(&b.abs))
+    });
 }
 
 /// Modification time as whole seconds since the Unix epoch, `0` when unavailable.
@@ -261,7 +324,13 @@ mod tests {
 
     #[test]
     fn sort_orders_by_case_key_then_rel() {
-        let mut found = vec![file("Zeta/b.md"), file("A.md"), file("a.md")];
+        // Given in the reverse of the tie order, so a comparator that stops at
+        // `case_key` would leave `a.md` first and fail.
+        let mut found = vec![
+            file("Zeta/b.md", "Zeta/b.md"),
+            file("a.md", "a.md"),
+            file("A.md", "A.md"),
+        ];
 
         sort_found(&mut found);
 
@@ -271,12 +340,32 @@ mod tests {
         assert_eq!(rels, ["A.md", "a.md", "Zeta/b.md"]);
     }
 
+    #[test]
+    fn sort_is_total_when_lossy_names_collide() {
+        // Two different raw names can decode to the same `rel` (0xFF and a literal
+        // replacement character both spell `we\u{fffd}.md`), so `abs` decides.
+        let mut found = vec![
+            file("we\u{fffd}.md", "/ws/we\u{fffd}.md"),
+            file("we\u{fffd}.md", "/ws/wex.md"),
+        ];
+
+        sort_found(&mut found);
+
+        let abs: Vec<&str> = found
+            .iter()
+            .map(|found| found.abs.to_str().unwrap_or("?"))
+            .collect();
+        // Byte order on the raw OS path decides: `x` (0x78) precedes the replacement
+        // character's first UTF-8 byte (0xEF).
+        assert_eq!(abs, ["/ws/wex.md", "/ws/we\u{fffd}.md"]);
+    }
+
     /// A record carrying only what the ordering reads.
-    fn file(rel: &str) -> DiscoveredFile {
+    fn file(rel: &str, abs: &str) -> DiscoveredFile {
         DiscoveredFile {
             rel: rel.to_string(),
             case_key: rel.to_lowercase(),
-            abs: Path::new(rel).to_path_buf(),
+            abs: Path::new(abs).to_path_buf(),
             size: 0,
             mtime: 0,
             is_markdown: true,
