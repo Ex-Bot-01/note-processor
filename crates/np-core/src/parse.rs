@@ -7,16 +7,20 @@
 //! Two rules hold everything together:
 //!
 //! - **Lines are 1-based and end at `\n`**, with one trailing `\r` trimmed for content only
-//!   ([`lines`]). Nothing here rewrites the input, and an LF and a CRLF copy of the same note
+//!   (`lines`). Nothing here rewrites the input, and an LF and a CRLF copy of the same note
 //!   produce identical headings, tags and line numbers — later tasks print those numbers into
 //!   `INDEX.md`, so they may not depend on how the file happens to be stored.
 //! - **A fenced block is not prose.** A line starting with ``` toggles fence state (a closing
-//!   fence ends the region) and nothing inside counts as a heading, a tag or a word.
+//!   fence ends the region) and nothing inside counts as a heading, a tag, a word or a link.
+//!   `prose_lines` is that decision and the only place it is written: [`crate::links`] iterates the
+//!   same lines, so extraction can never see a link inside a region the outline ignored.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use regex::Regex;
+
+use crate::links::{extract_links, RawLink};
 
 /// Which source supplied a note's title, so the catalog can say where it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,6 +66,10 @@ pub struct NoteDoc {
     /// Whitespace-separated tokens of the body prose. Frontmatter is metadata and a fenced
     /// block is not prose, so neither counts — the same exclusion headings and tags get.
     pub words: usize,
+    /// Every link the note contains, in reading order, from [`crate::links::extract_links`] over
+    /// the same raw text. Unlike the three fields above it this includes the frontmatter block:
+    /// a wikilink written in `related:` is prose the author meant.
+    pub links: Vec<RawLink>,
 }
 
 /// Read one note's text.
@@ -83,18 +91,7 @@ pub fn parse_markdown(raw: &str, fallback_title: &str) -> NoteDoc {
 
     let mut headings: Vec<Heading> = Vec::new();
     let mut words = 0usize;
-    let mut fenced = false;
-    for (number, text) in lines(raw) {
-        if number < head.body_start {
-            continue;
-        }
-        if is_fence(text) {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            continue;
-        }
+    for (number, text) in prose_lines(raw, head.body_start) {
         if let Some(heading) = heading_at(text, number) {
             headings.push(heading);
         }
@@ -103,7 +100,7 @@ pub fn parse_markdown(raw: &str, fallback_title: &str) -> NoteDoc {
     }
 
     let (title, title_source) = pick_title(&head, &headings, fallback_title);
-    // The one `NoteDoc` literal: Task 7 adds its `links` field here and nowhere else.
+    // The one `NoteDoc` literal, so no field can be filled by one caller and missed by another.
     NoteDoc {
         title,
         title_source,
@@ -111,6 +108,7 @@ pub fn parse_markdown(raw: &str, fallback_title: &str) -> NoteDoc {
         headings,
         tags: tags.into_tags(),
         words,
+        links: extract_links(raw),
     }
 }
 
@@ -207,6 +205,30 @@ fn lines(raw: &str) -> impl Iterator<Item = (usize, &str)> {
     raw.split('\n')
         .enumerate()
         .map(|(index, text)| (index + 1, text.strip_suffix('\r').unwrap_or(text)))
+}
+
+/// The lines that are prose: numbered from 1, `lines`-trimmed, starting at `first`, with every
+/// fenced region **and both of its fence lines** left out.
+///
+/// This is the single place that decides what "inside a fenced block" means, shared with
+/// [`crate::links`] so that headings, tags, words and links all stop at the same fence. `first` is
+/// the first line eligible to be prose — [`parse_markdown`] passes the line after the frontmatter
+/// block, [`crate::links::extract_links`] passes 1 because a link in frontmatter is still a link.
+///
+/// The state machine reads nothing but the start of a line, so it costs one `starts_with` per line
+/// and never looks back.
+pub(crate) fn prose_lines(raw: &str, first: usize) -> impl Iterator<Item = (usize, &str)> {
+    let mut fenced = false;
+    lines(raw).filter_map(move |(number, text)| {
+        if number < first {
+            return None;
+        }
+        if is_fence(text) {
+            fenced = !fenced;
+            return None;
+        }
+        (!fenced).then_some((number, text))
+    })
 }
 
 /// A line that opens or closes a fenced code block.

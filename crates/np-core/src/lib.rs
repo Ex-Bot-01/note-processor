@@ -4,6 +4,7 @@ pub mod change;
 pub mod config;
 pub mod db;
 pub mod hash;
+pub mod links;
 pub mod parse;
 pub mod walk;
 
