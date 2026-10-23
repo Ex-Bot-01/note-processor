@@ -102,7 +102,7 @@ fn version_is_semver() {
   - `pub fn normalize_rel(os: &Path) -> (String, String)` → (`rel` with `/`, display original), plus `case_key = rel.to_lowercase()`
   - `pub fn to_open_path(abs: &Path) -> PathBuf` — on Windows prefixes `\\?\` when the path is ≥ 260 chars and not already prefixed; identity elsewhere (spec §11). Every later file open goes through it.
   - `pub struct WalkOptions { pub extra_excludes: Vec<String> }`
-  - `pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Vec<DiscoveredFile>>` — sorted by `case_key`, `follow_links(false)`
+  - `pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Walked>` where `pub struct Walked { pub files: Vec<DiscoveredFile>, pub unreadable: Vec<String> }` — `files` sorted by `case_key`, `follow_links(false)`; `unreadable` lists `/`-normalised paths of directories whose traversal failed, and callers must **not** classify files under them as `Removed`. *(Ruling applied while executing Task 1–3: the plan's original `Result<Vec<DiscoveredFile>>` could not distinguish an empty workspace from an unreadable one, and `WalkDir::root_first(true)` does not exist in walkdir 2.5 — `.contents_first(false)` is its default root-before-contents order.)*
 
 - [ ] **Step 1: Write failing tests** in `tests/walk.rs` (build trees with a `tree(&[("a/b.md", "…")])` helper into `tempfile::TempDir`):
   - `sorted_and_normalized` — nested dirs come back `case_key`-ascending, every `rel` uses `/`, no leading `./`.
