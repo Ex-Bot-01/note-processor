@@ -396,20 +396,35 @@ fn rebase_abs(abs: &str, from: &str, to: &str) -> Option<String> {
     None
 }
 
-/// The non-attachment link targets no note answers: the "notes I could not place" list behind
+/// A link edge whose destination is a live note, spelled once because four queries have to agree on
+/// it: the two counts `crate::scan::catalog_entries` renders, that module's `unresolved_links`, and
+/// [`unresolved_targets`] here. The notes→files join is the point — an edge into a stale note, or one
+/// left pointing at a row that was deleted, is not a healthy link.
+pub(crate) const LIVE_EDGE: &str =
+    "EXISTS (SELECT 1 FROM notes dn JOIN files df ON df.rel = dn.rel \
+                                 WHERE dn.id = l.dst_note_id AND df.state = 'ok')";
+
+/// The non-attachment link targets no live note answers: the "notes I could not place" list behind
 /// [`ScanReport::unresolved_links`](crate::ScanReport).
 ///
 /// `note_counts` counts every NULL destination, because at database level an attachment with no
 /// note row behind it is unresolved like a missing file; this is the author-facing question instead,
 /// so attachments are left out and only notes are asked about. Stale sources count too — their rows
-/// are history the report does not rewrite. Sorted and deduplicated: one name written in three
-/// notes is one thing to fix.
+/// are history the report does not rewrite.
+///
+/// The predicate is [`LIVE_EDGE`] rather than `dst_note_id IS NULL` on purpose: an edge whose stored
+/// destination went stale or was deleted counts in the report's number, so it has to be named here as
+/// well. A count and the list printed behind it that disagree would send the reader looking for a note
+/// the list cannot show.
+///
+/// Sorted and deduplicated: one name written in three notes is one thing to fix.
 pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
-    let mut statement = db.0.prepare(
-        "SELECT DISTINCT target FROM links
-          WHERE dst_note_id IS NULL AND origin = 'prose' AND kind != 'attachment'
+    let mut statement = db.0.prepare(&format!(
+        "SELECT DISTINCT target FROM links l
+          WHERE l.origin = 'prose' AND l.kind != 'attachment'
+            AND NOT {LIVE_EDGE}
           ORDER BY target",
-    )?;
+    ))?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut targets = Vec::new();
     for row in rows {

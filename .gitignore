@@ -3,5 +3,7 @@
 /.superpowers
 *.sqlite*
 # A hand-run `np scan tests/fixtures/corpus` must not leave a catalog behind: the CLI and scan tests copy
-# that corpus wholesale and assert its file count.
+# that corpus wholesale and assert its file count. The `.tmp` line covers the corpse of a rename killed
+# between writing the temporary and renaming it.
 tests/fixtures/corpus/INDEX*.md
+tests/fixtures/corpus/INDEX*.tmp

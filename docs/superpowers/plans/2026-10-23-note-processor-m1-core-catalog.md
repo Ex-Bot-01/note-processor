@@ -248,6 +248,7 @@ fn version_is_semver() {
   - `pub fn size_human(bytes: u64) -> String` — `9 B`, `1.4 KB`, `2.1 MB` (one decimal from 10 KB up)
   - `pub fn render(entries: &[CatalogEntry], cfg: &CatalogConfig) -> Vec<(String, String)>` → `(filename, contents)`, always including `INDEX.md` as the entry point; shards are `INDEX-<first>-<last>.md` by title's lowercase first letter
   - Entry line format (exact, spec §14): `- [[{title}]]({rel}) · {size_human} · {tags} · →{out} ←{inc}` with `· #tag` joined tags or `· —` when none; a wrapped entry continues on lines indented two spaces, breaking before the token that would exceed 100 columns
+  - `→{out}` / `←{inc}` mean "edges landing on a live note" (`files.state = 'ok'`), not stored rows: Task 10 counts them with the same predicate as the unresolved figure, so a broken edge is never advertised as intact
 - [ ] **Step 1: Write failing tests** in `tests/catalog.rs`:
   - `entry_format_exact` — one known note renders the documented line byte-for-byte.
   - `alphabetized_case_insensitive_with_tiebreak` — ordering by lowercased title, ties broken by `rel`; output is stable across input permutations (shuffle with a fixed seed).

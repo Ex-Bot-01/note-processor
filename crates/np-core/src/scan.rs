@@ -32,7 +32,7 @@ use thiserror::Error;
 use crate::catalog::{self, CatalogEntry};
 use crate::change::{classify, Change};
 use crate::config::{abs_path, Config, ConfigError, MarkerConfig, WorkspaceRegistry};
-use crate::db::{self, Db, DbError};
+use crate::db::{self, Db, DbError, LIVE_EDGE};
 use crate::hash::{sha256_bytes, sha256_file, Snapshot};
 use crate::items::{extract_items, ItemCandidate};
 use crate::links::{resolve, store_links, RawLink};
@@ -57,12 +57,6 @@ const INDEX_FILES_KEY: &str = "index_files";
 const CATALOG_ENTRY: &str = "INDEX.md";
 /// Suffix of the temporary file every catalog write goes through before its `rename`.
 const TEMP_SUFFIX: &str = ".tmp";
-/// A link edge whose destination is a live note, spelled once because three queries have to agree on it:
-/// the two rendered counts and [`unresolved_links`]. The notes→files join is the point — an edge into a
-/// stale note, or one left pointing at a row that was deleted, is not a healthy link (see
-/// [`catalog_entries`]).
-const LIVE_EDGE: &str = "EXISTS (SELECT 1 FROM notes dn JOIN files df ON df.rel = dn.rel \
-                                 WHERE dn.id = l.dst_note_id AND df.state = 'ok')";
 
 /// A note re-parsed by one scan: its path and the links its text holds, which is everything
 /// [`store_note_links`] needs once the whole corpus is up to date.
@@ -110,8 +104,8 @@ pub struct ScanReport {
     /// Paths the registry already had exactly as they are.
     pub unchanged: usize,
     /// Paths this scan could not index and left untouched: directories it could not read, files that
-    /// vanished or changed between walk and read, and paths whose identity is already taken. Sorted,
-    /// deduplicated, spelled as `rel`.
+    /// vanished or changed between walk and read, paths whose identity is already taken, and a catalog
+    /// temporary it could not remove (see [`clear_temp_corpses`]). Sorted, deduplicated, spelled as `rel`.
     pub skipped: Vec<String>,
     /// Live note rows — the same number of entries the catalog holds (spec §2).
     pub notes: i64,
@@ -162,15 +156,16 @@ pub fn scan_with_inject(
     // one folder is one workspace however it was typed (spec §11).
     let root = abs_path(root);
     // Before the walk, not on the way out: a corpse the walk lists is a file this scan would index as an
-    // attachment (see [`clear_temp_corpses`]).
-    clear_temp_corpses(&root)?;
+    // attachment (see [`clear_temp_corpses`]). One that will not be removed is reported and retried by
+    // the next scan; it does not end this one.
+    let mut skipped = clear_temp_corpses(&root)?;
     let walked = walk::walk(&root, &WalkOptions::default())?;
     after_walk(&root);
 
     // A directory that could not be entered holds files that are unknown rather than absent: their
     // known rows stay out of the comparison (see [`known_rows`]) and the directory itself is what the
     // report names.
-    let mut skipped = walked.unreadable.clone();
+    skipped.extend(walked.unreadable.iter().cloned());
     let found = read_found(&walked.files, &mut skipped);
     let snapshots: Vec<Snapshot> = found.iter().map(|found| found.snapshot.clone()).collect();
 
@@ -191,10 +186,11 @@ pub fn scan_with_inject(
     let unresolved = unresolved_links(&db)?;
     let previous = index_list(&db)?;
     // Rendering is pure, so the set this scan is about to publish is known here — and `meta` records it
-    // inside the transaction rather than after the writes. A list that leads reality is harmless,
+    // inside the transaction rather than after the writes. A list that *leads* reality costs little,
     // because [`write_index_files`] treats a name already gone from disk as the state it wanted; a list
-    // that *lags* reality is not, because the shard it fails to name survives as an orphan nothing will
-    // ever delete again.
+    // that *lags* it would be fatal, because a shard it fails to name would survive as an orphan nothing
+    // ever deletes again. It cannot lag: [`superseded_names`] reads the root directory alongside `meta`,
+    // so a kill between this commit and the writes below still leaves every stranded shard named.
     let rendered = catalog::render(&entries, &cfg.catalog);
     set_index_list(&db, &rendered)?;
     tx.commit().map_err(DbError::from)?;
@@ -731,9 +727,9 @@ fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
         live.push(row?);
     }
 
-    // Both counts ask for a live destination. An edge into a note that left the catalog is not an intact
-    // link to advertise, and counting it would let the same broken edge read as healthy or not depending
-    // on whether its source happened to be re-parsed.
+    // Both counts ask for a live destination: `→n` / `←n` mean "edges landing on a live note", so an
+    // edge into a note the catalog hides is not advertised as intact. The reader of such a count would
+    // follow it to a note that is not in the catalog at all.
     let out = link_counts(
         db,
         &format!(
@@ -802,8 +798,9 @@ fn note_tags(db: &Db) -> Result<HashMap<i64, Vec<String>>, DbError> {
 ///
 /// A destination that exists but is stale counts here, because it is a note nobody can reach: links are
 /// re-resolved only for notes this scan re-parsed, so an edge into a deleted note keeps its old
-/// `dst_note_id` until its source is edited. `origin = 'prose'` matches [`crate::db::unresolved_targets`],
-/// which backs the status list — an approved edge is an input, and once M3 writes them the two figures
+/// `dst_note_id` until its source is edited. [`crate::db::unresolved_targets`], which backs the list
+/// printed behind this number, asks the same question with the same [`LIVE_EDGE`] predicate and the same
+/// `origin = 'prose'` filter — an approved edge is an input, and once M3 writes them the two figures
 /// must not diverge.
 fn unresolved_links(db: &Db) -> Result<i64, DbError> {
     Ok(db.0.query_row(
@@ -863,14 +860,19 @@ fn set_index_list(db: &Db, rendered: &[(String, String)]) -> Result<(), DbError>
 ///    never written while superseded shards of another generation survived beside them.
 /// 3. Superseded names, only once the entry point that no longer mentions them is live.
 ///
-/// Names to remove are filtered by [`walk::is_generated_index`] rather than trusted from `meta`, because
-/// a note body is never this function's to delete (spec §7). A name already gone from disk is the state
-/// this call wanted, which is also what makes [`set_index_list`] safe to commit ahead of these writes.
+/// The names removed in step 3 come from [`superseded_names`] — the directory and `meta` together — rather
+/// than from `meta` alone. A name already gone from disk is the state this call wanted, which is what
+/// makes [`set_index_list`] safe to commit ahead of these writes.
 fn write_index_files(
     root: &Path,
     rendered: &[(String, String)],
     previous: &[String],
 ) -> Result<(), ScanError> {
+    // Collected before anything is written: the deletion set is what disk and `meta` hold minus this
+    // scan's generation, so reading the root first cannot see a file this call is about to publish — and
+    // a root that cannot be listed fails the scan before it has touched anything.
+    let superseded = superseded_names(root, rendered, previous)?;
+
     for (name, contents) in rendered.iter().filter(|(name, _)| name != CATALOG_ENTRY) {
         publish(root, name, contents)?;
     }
@@ -878,12 +880,8 @@ fn write_index_files(
         publish(root, name, contents)?;
     }
 
-    for name in previous {
-        let kept = rendered.iter().any(|(written, _)| written == name);
-        if kept || !walk::is_generated_index(name) {
-            continue;
-        }
-        let path = root.join(name);
+    for name in superseded {
+        let path = root.join(&name);
         match fs::remove_file(&path) {
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(ScanError::Io { path, source }),
@@ -891,6 +889,48 @@ fn write_index_files(
         }
     }
     Ok(())
+}
+
+/// The generated names this workspace holds that this scan does not publish: what `meta` lists and what
+/// is actually sitting in the root, unioned.
+///
+/// `meta` alone is not enough. It is committed inside the scan's transaction (see [`set_index_list`]), so
+/// a kill between that commit and the writes in [`write_index_files`] leaves it naming only the
+/// generation that was never published; a superseded shard still on disk appears in no list, and nothing
+/// would ever delete it. The listing sees reality instead, and the union covers both directions — which
+/// is also what lets `meta` be committed ahead of the files.
+///
+/// Both sources are filtered by [`walk::is_generated_index`], because a note body is never this
+/// function's to delete (spec §7). That filter is also what makes a root-level `INDEX-<a>-<b>.md` ours to
+/// remove whether or not `meta` ever named it: those names are this program's to write.
+fn superseded_names(
+    root: &Path,
+    rendered: &[(String, String)],
+    previous: &[String],
+) -> Result<Vec<String>, ScanError> {
+    let mut names: Vec<String> = previous
+        .iter()
+        .filter(|name| walk::is_generated_index(name))
+        .cloned()
+        .collect();
+    let entries = fs::read_dir(root).map_err(|source| ScanError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| ScanError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if walk::is_generated_index(&name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names.retain(|name| !rendered.iter().any(|(published, _)| published == name));
+    Ok(names)
 }
 
 /// Move one rendered file into place through a temporary name, so a reader never sees it half-written
@@ -916,18 +956,41 @@ fn publish(root: &Path, name: &str, contents: &str) -> Result<(), ScanError> {
 /// nothing would ever clean it up. That is why [`scan`] calls this before the walk rather than where the
 /// temporaries are made: cleaned up on the way out, the corpse would still be indexed once by its own
 /// scan. Removal stops at directories — something named `INDEX.md.tmp` that is one belongs to somebody
-/// else — but a failed removal of a real file is fatal, because the corpse left behind is the bug this
-/// function exists to fix.
-fn clear_temp_corpses(root: &Path) -> Result<(), ScanError> {
+/// else.
+///
+/// A corpse that will not go away (an immutable or locked file, a root this user may list but not write)
+/// comes back in the returned list and reaches [`ScanReport::skipped`] instead of failing the scan: one
+/// stuck temporary must not stop every later scan of a workspace whose notes read perfectly well. It is
+/// indexed once by the scan that could not remove it — cleanup runs before the walk, so the file is there
+/// when the walk looks — and the next scan tries again.
+///
+/// One limitation to know before someone widens this: cleanup is **root-only**, while
+/// [`walk::is_generated_index`] excludes generated names only at depth 1 — so a `notes/INDEX.md.tmp`
+/// would be indexed as an attachment forever. It is unreachable today because [`publish`] joins the root
+/// alone and no other code makes these names.
+fn clear_temp_corpses(root: &Path) -> Result<Vec<String>, ScanError> {
     let entries = fs::read_dir(root).map_err(|source| ScanError::Io {
         path: root.to_path_buf(),
         source,
     })?;
+    remove_corpses(entries, remove_file).map_err(|source| ScanError::Io {
+        path: root.to_path_buf(),
+        source,
+    })
+}
+
+/// The loop behind [`clear_temp_corpses`]: every generated-looking temporary in the listing, removed or
+/// reported. `remove` is [`remove_file`] in production and a failing stub in the test that pins the
+/// tolerance rule, because an undeletable regular file needs filesystem privileges this suite does not
+/// have. A failure to *list* stays an error — that is the workspace being unreadable, which no later scan
+/// can fix either.
+fn remove_corpses(
+    entries: fs::ReadDir,
+    remove: fn(&Path) -> io::Result<()>,
+) -> Result<Vec<String>, io::Error> {
+    let mut skipped = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| ScanError::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(stem) = name.strip_suffix(TEMP_SUFFIX) else {
             continue;
@@ -936,14 +999,20 @@ fn clear_temp_corpses(root: &Path) -> Result<(), ScanError> {
         if !walk::is_generated_index(stem) || is_dir {
             continue;
         }
-        let path = entry.path();
-        match fs::remove_file(&path) {
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(ScanError::Io { path, source }),
-            Ok(()) => {}
+        if let Err(source) = remove(&entry.path()) {
+            // Already gone is the state this call wanted; anything else is reported and retried.
+            if source.kind() != io::ErrorKind::NotFound {
+                skipped.push(name);
+            }
         }
     }
-    Ok(())
+    Ok(skipped)
+}
+
+/// [`fs::remove_file`] with its parameter fixed to `&Path`, so [`remove_corpses`] can accept it as a
+/// function pointer beside a stub that always fails.
+fn remove_file(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
 }
 
 /// Everything from line `first` on, which is where [`body_start`] says the body begins.
@@ -980,4 +1049,72 @@ fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remove_corpses, remove_file};
+    use std::fs;
+    use std::io::{self, ErrorKind};
+    use std::path::Path;
+
+    /// A root holding one `INDEX.md.tmp` corpse and one file that merely looks similar.
+    fn root_with(names: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().expect("test setup: tempdir");
+        for name in names {
+            fs::write(tmp.path().join(name), "stale\n").expect("test setup: plant a file");
+        }
+        tmp
+    }
+
+    #[test]
+    fn an_undeletable_corpse_is_reported_rather_than_fatal() {
+        let root = root_with(&["INDEX.md.tmp"]);
+        // The shape of an immutable or locked file: present, listed, and refusing to be unlinked.
+        let refused: fn(&Path) -> io::Result<()> = |_| Err(io::Error::other("refused"));
+
+        let skipped = remove_corpses(fs::read_dir(root.path()).expect("test: read root"), refused)
+            .expect("a stuck corpse must not fail the scan");
+
+        assert_eq!(
+            skipped,
+            vec!["INDEX.md.tmp".to_string()],
+            "it is named for the report and retried next scan"
+        );
+    }
+
+    #[test]
+    fn a_corpse_that_is_already_gone_is_the_state_wanted() {
+        let root = root_with(&["INDEX-1-2.md.tmp"]);
+        let vanished: fn(&Path) -> io::Result<()> = |_| Err(io::Error::from(ErrorKind::NotFound));
+
+        let skipped = remove_corpses(
+            fs::read_dir(root.path()).expect("test: read root"),
+            vanished,
+        )
+        .expect("a corpse that raced away is not a failure");
+
+        assert!(skipped.is_empty(), "gone means done: {skipped:?}");
+    }
+
+    #[test]
+    fn the_pass_touches_no_name_that_is_not_ours() {
+        let root = root_with(&["INDEX-1-2.md.tmp", "notes.md", "INDEX-old.md"]);
+
+        let skipped = remove_corpses(
+            fs::read_dir(root.path()).expect("test: read root"),
+            remove_file,
+        )
+        .expect("test: removal pass");
+
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(
+            !root.path().join("INDEX-1-2.md.tmp").exists(),
+            "ours to clean"
+        );
+        assert!(
+            root.path().join("notes.md").is_file() && root.path().join("INDEX-old.md").is_file(),
+            "a note is never this pass's to delete (spec §7)"
+        );
+    }
 }

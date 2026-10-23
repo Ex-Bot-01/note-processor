@@ -762,6 +762,52 @@ fn edge_into_a_deleted_note_reads_as_unresolved() {
         line.contains("→0"),
         "no intact link to a hidden note: {line}"
     );
+
+    // The list printed behind that count has to name it too: a number with no name beside it sends the
+    // reader looking for a note the status line cannot show (see `db::unresolved_targets`).
+    let targets = db::unresolved_targets(&ws.db()).expect("test: unresolved targets");
+    assert!(
+        targets.iter().any(|target| target == "b"),
+        "the stale destination must be nameable: {targets:?}"
+    );
+}
+
+#[test]
+fn a_shard_that_meta_lost_track_of_is_still_deleted() {
+    // The window between committing `meta` and writing the files: the list already names only the new
+    // generation while the superseded shards of the old one are still sitting on disk. Deleting from
+    // `meta` alone would leave them there forever, so deletion candidates come from the directory too.
+    let ws = scratch(
+        &[
+            ("a.md", "one\n"),
+            ("b.md", "two\n"),
+            ("c.md", "three\n"),
+            ("d.md", "four\n"),
+        ],
+        2,
+    );
+    let first = scan(&ws.root, &ws.cfg).expect("scan that shards");
+    assert_eq!(first.index_files.len(), 3, "{:?}", first.index_files);
+
+    fs::remove_file(ws.root.join("c.md")).expect("test: shrink the corpus");
+    fs::remove_file(ws.root.join("d.md")).expect("test: shrink the corpus");
+    ws.db()
+        .0
+        .execute(
+            "UPDATE meta SET value = 'INDEX.md' WHERE key = 'index_files'",
+            [],
+        )
+        .expect("test: rewind meta to a committed-but-unwritten generation");
+
+    let second = scan(&ws.root, &ws.cfg).expect("scan after the restart");
+    assert_eq!(second.index_files, vec!["INDEX.md".to_string()]);
+    for name in &first.index_files[1..] {
+        assert!(
+            !ws.root.join(name).exists(),
+            "shard {name} stranded by the kill must be gone"
+        );
+    }
+    assert_eq!(index_files_meta(&ws.db()), vec!["INDEX.md".to_string()]);
 }
 
 #[test]
@@ -854,6 +900,8 @@ fn temp_corpse_from_a_failed_rename_is_not_indexed() {
     let ws = workspace();
     // A rename killed halfway leaves its temporary name behind, and `walk::is_generated_index` does not
     // match `INDEX.md.tmp` — so without cleanup the next scan indexes its own corpse as an attachment.
+    // The case where the corpse cannot be removed at all is pinned in `src/scan.rs`'s own tests, since
+    // forcing it needs filesystem privileges a test does not have.
     fs::write(ws.root.join("INDEX.md.tmp"), "stale\n").expect("test: plant a corpse");
 
     let report = scan(&ws.root, &ws.cfg).expect("scan with a corpse in the way");
