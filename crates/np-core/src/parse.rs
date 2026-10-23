@@ -116,8 +116,9 @@ pub fn parse_markdown(raw: &str, fallback_title: &str) -> NoteDoc {
 
 /// The frontmatter block, if the file has one, and where its body begins.
 struct Frontmatter {
-    /// `title:` value with quotes stripped and whitespace trimmed. `None` when the key is
-    /// absent or its value is blank — a blank value must fall through to the next source.
+    /// `title:` value with quotes stripped and then trimmed, so it is never blank. `None` when
+    /// the key is absent or its value is empty — a blank value must fall through to the next
+    /// source, which is why [`pick_title`] needs no emptiness check on this branch.
     title: Option<String>,
     /// `tags:` values as written; [`parse_markdown`] lowercases and deduplicates them.
     tags: Vec<String>,
@@ -245,6 +246,8 @@ fn collect_tags(text: &str, tags: &mut TagList) {
             let anchor = text[..index].ends_with("](");
             let joined = prev.is_some_and(blocked_by);
             if !anchor && !joined {
+                // `#` is one byte, so `index + 1` is a char boundary even before a multi-byte
+                // character such as the `ä` of `#äner-tag`.
                 if let Some(tag) = tag_tail_pattern().find(&text[index + 1..]) {
                     tags.push(tag.as_str());
                 }
@@ -261,10 +264,12 @@ fn blocked_by(prev: char) -> bool {
     prev.is_alphanumeric() || prev == '_' || prev == '/'
 }
 
-/// A scalar frontmatter value: trimmed, one layer of matching quotes removed, and `None` when
-/// nothing usable is left.
+/// A frontmatter scalar: one layer of matching quotes removed, then trimmed on both ends, and
+/// `None` when nothing usable is left. Trimming happens **after** unquoting, so a quoted blank
+/// (`title: "   "`) falls through to the next title source instead of becoming a title of three
+/// spaces, and `title: "  Vendor  "` cannot put padded text into `INDEX.md`.
 fn scalar(value: &str) -> Option<String> {
-    let value = unquote(value.trim());
+    let value = unquote(value.trim()).trim();
     (!value.is_empty()).then(|| value.to_string())
 }
 
