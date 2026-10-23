@@ -262,6 +262,17 @@ pub(crate) fn is_heading_line(text: &str) -> bool {
     text.starts_with('#') && heading_pattern().is_match(text)
 }
 
+/// The first body line: 1 when the file has no recognised frontmatter block, otherwise the line
+/// after its closing `---`.
+///
+/// The same `body_start` [`read_frontmatter`] already computes for [`parse_markdown`], exposed so
+/// [`crate::items`] can keep metadata out of the item scan instead of re-implementing the block rule.
+/// [`crate::links::extract_links`] deliberately does not use it: a link written in `related:` is
+/// prose the author meant, while a status word written in frontmatter claims nothing about an item.
+pub(crate) fn body_start(raw: &str) -> usize {
+    read_frontmatter(raw).body_start
+}
+
 /// The `#tags` on this line, appended to `tags`.
 ///
 /// The plan's pattern is `(?<![\\w/])#([\\p{L}][\\p{L}\\p{N}_/-]{1,40})`. Rust's `regex` crate
@@ -291,6 +302,11 @@ fn collect_tags(text: &str, tags: &mut TagList) {
 /// Whether a character right before `#` means this is not a tag: a letter, digit or underscore
 /// continues a word (`x#nothere`), and `/` makes the `#` an anchor inside a path
 /// (`notes/a.md#section`, `tags/#vendor`).
+///
+/// The keyword-side counterpart [`crate::items::is_word_char`] looks almost the same and differs on
+/// `/` deliberately: here a slash has to block, because it makes the `#` part of a path anchor;
+/// there a slash sits between two markers (`status done/paused`) and must not block. The two stay
+/// separate on purpose.
 fn blocked_by(prev: char) -> bool {
     prev.is_alphanumeric() || prev == '_' || prev == '/'
 }

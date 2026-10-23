@@ -153,35 +153,58 @@ fn no_marker_means_no_item_row() {
 }
 
 /// Ignored and release-only: run it with `cargo test --release -- --ignored`, which is what Task
-/// 10's fixture pass and CI do. The bound is the plan's — a scan that stays linear-ish on one huge
-/// line, so the failure mode it catches is quadratic work per line, not a slow machine.
+/// 10's fixture pass and CI do.
+///
+/// The plan's original bound was `< 200 ms` for the 5 MB line. That is a wall-clock constant on an
+/// unmeasured machine: the same input measured ~1.09 s in a debug build, so keeping it would mean
+/// betting on an unmeasured >= 5.4x release speedup inside an ignored test, which is flaky-CI
+/// material. What the case is actually for is *scaling*: per-line work must stay linear in line
+/// length, so the 5 MB pass may cost at most 8x the 1 MB pass (5x the size plus room for timing
+/// noise), with a deliberately generous absolute ceiling of 1 s for the 5 MB pass. The failure mode
+/// this catches is quadratic work per line, not a slow machine.
 #[test]
 #[ignore = "huge single-line input; release-only (`cargo test --release -- --ignored`)"]
 fn empty_and_huge_input() {
     assert!(extract_items("", &MarkerConfig::default()).is_empty());
 
-    // One 5 MB line of ordinary prose with the marker at the far end: every configured marker has
+    // One huge line of ordinary prose with the marker at the far end: every configured marker has
     // to be ruled out at every character that could start one, and nothing short of a full pass
     // finds the hit. A newline-split input would hide this, because per-line work is what scales.
     let filler = "alpha beta gamma delta ";
-    let repeats = 5 * 1024 * 1024 / filler.len();
-    let big = format!("{}erledigt", filler.repeat(repeats));
+    let line_of = |repeats: usize| format!("{}erledigt", filler.repeat(repeats));
+    let small_line = line_of(5 * 1024 * 1024 / filler.len() / 5 + 1);
+    let big_line = line_of(5 * 1024 * 1024 / filler.len());
     assert!(
-        big.len() >= 5 * 1024 * 1024,
-        "fixture is {} bytes",
-        big.len()
+        small_line.len() >= 1024 * 1024,
+        "small fixture is {} bytes",
+        small_line.len()
+    );
+    assert!(
+        big_line.len() >= 5 * 1024 * 1024,
+        "big fixture is {} bytes",
+        big_line.len()
     );
 
     let started = Instant::now();
-    let items = extract_items(&big, &MarkerConfig::default());
-    let took = started.elapsed();
+    let small = extract_items(&small_line, &MarkerConfig::default());
+    let small_took = started.elapsed();
 
-    assert_eq!(items.len(), 1, "one line yields one candidate");
-    assert_eq!(items[0].state, ItemState::Done);
-    assert_eq!(items[0].marker, "erledigt");
+    let started = Instant::now();
+    let big = extract_items(&big_line, &MarkerConfig::default());
+    let big_took = started.elapsed();
+
+    for found in [&small, &big] {
+        assert_eq!(found.len(), 1, "one line yields one candidate");
+        assert_eq!(found[0].state, ItemState::Done);
+        assert_eq!(found[0].marker, "erledigt");
+    }
     assert!(
-        took < Duration::from_millis(200),
-        "a 5 MB single line took {took:?}; the scan must stay linear-ish"
+        big_took <= small_took * 8,
+        "5 MB took {big_took:?} against 1 MB {small_took:?}: the scan must stay linear in length"
+    );
+    assert!(
+        big_took < Duration::from_secs(1),
+        "a 5 MB single line took {big_took:?}; expected well under a second in release"
     );
 }
 
@@ -219,6 +242,9 @@ fn keyword_markers_match_on_word_boundaries() {
         [("the  status", 1, ItemState::Paused, "on hold")]
     );
     assert!(extract_items("the on holdup notice\n", &markers).is_empty());
+    // A phrase needs exactly one plain space: `on  hold` (two of them), a tab or an NBSP is not the
+    // configured marker, and the line yields no item rather than a near miss.
+    assert!(extract_items("the on  hold status\n", &markers).is_empty());
 }
 
 #[test]
@@ -322,6 +348,34 @@ fn text_keeps_the_line_and_loses_the_bullet_and_marker() {
             ("", 2, ItemState::Done, "[x]"),
         ]
     );
+    // A blockquote `>` is prose, not a bullet: it stays in the text, and so does the double space,
+    // because cutting the box out leaves its gap behind exactly like every other cut does.
+    assert_eq!(
+        found(&extract_items("> [ ] buy milk\n", &markers)),
+        [(">  buy milk", 1, ItemState::Open, "[ ]")]
+    );
+}
+
+#[test]
+fn frontmatter_lines_are_not_items() {
+    let markers = MarkerConfig::default();
+
+    // A recognised frontmatter block is metadata, and nothing inside it claims a status about an
+    // item: read as body text, `  - done` would be a bullet carrying the `done` keyword and
+    // `status: erledigt` a Done row whose text is `status:`. The scan starts at the parser's own
+    // body line (`crate::parse::body_start`), so exactly the one real item below survives.
+    let note = "---\ntitle: Vendor\ntags:\n  - done\nstatus: erledigt\n---\n- [ ] buy milk\n";
+    assert_eq!(
+        found(&extract_items(note, &markers)),
+        [("buy milk", 7, ItemState::Open, "[ ]")]
+    );
+
+    // Without a closing `---` there is no block at all, so the file stays body from line 1 and the
+    // item is found where it was written — the parser's rule reused, not a second one.
+    assert_eq!(
+        found(&extract_items("---\n- [ ] buy milk\n", &markers)),
+        [("buy milk", 2, ItemState::Open, "[ ]")]
+    );
 }
 
 #[test]
@@ -337,11 +391,18 @@ fn checkbox_lookalikes_are_not_checkboxes() {
         found(&extract_items("status [ ] pending\n", &markers)),
         [("status  pending", 1, ItemState::Open, "[ ]")]
     );
-    // The box followed straight by its text is still the box — CJK notes write `- [ ]買い出し`.
+    // The box followed straight by its text is still the box — CJK notes write `- [ ]買い物する`.
     assert_eq!(
         found(&extract_items("- [ ]買い物する\n", &markers)),
         [("買い物する", 1, ItemState::Open, "[ ]")]
     );
+    // GFM's other box spellings are not boxes here: `[ x]`, `[  ]` and `[-]` match no checkbox and
+    // no keyword, so those lines yield no row at all rather than a state nobody wrote.
+    assert!(extract_items(
+        "- [ x] buy milk\n- [  ] buy milk\n- [-] buy milk\n",
+        &markers
+    )
+    .is_empty());
 }
 
 #[test]

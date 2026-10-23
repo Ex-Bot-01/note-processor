@@ -9,18 +9,20 @@
 //! - **A marker is what makes a line an item.** Prose with no marker yields nothing, which is how
 //!   "open" stays the absence of a marker *on an item* (spec §8.7) instead of a row for every
 //!   sentence in the file. An explicit open claim is written, not inferred: `- [ ]`.
-//! - **Two kinds of line are never items.** A fenced region and both of its fence lines come out of
-//!   [`crate::parse::prose_lines`], the same iterator that decides headings, tags, words and links;
-//!   an ATX heading comes out via [`crate::parse::is_heading_line`], because a heading names a topic
-//!   rather than an item — `## Erledigt` is an outline entry and creates no candidate. Neither rule
-//!   is re-implemented here.
+//! - **Three kinds of line never reach the scan.** A fenced region and both of its fence lines come
+//!   out of [`crate::parse::prose_lines`], the same iterator that decides headings, tags, words and
+//!   links; an ATX heading comes out via [`crate::parse::is_heading_line`], because a heading names a
+//!   topic rather than an item — `## Erledigt` is an outline entry and creates no candidate; and a
+//!   recognised frontmatter block is skipped by starting the scan at [`crate::parse::body_start`],
+//!   because `tags:` with a `  - done` under it is metadata, not an item claiming to be done. None
+//!   of these rules is re-implemented here.
 //! - **One line yields at most one candidate.** The checkbox wins over the vocabulary, and among the
 //!   configured markers the earliest in config order wins — every done marker before every paused
 //!   one — wherever on the line each of them happens to sit. A line that both ticks a box and says
 //!   `done` follows the box.
 
 use crate::config::MarkerConfig;
-use crate::parse::{is_heading_line, prose_lines};
+use crate::parse::{body_start, is_heading_line, prose_lines};
 
 /// The checkbox spellings and what each claims. These are not read from [`MarkerConfig`]: `- [ ]`,
 /// the Open spelling, is in no marker list at all (spec §8.7 has open as everything else), and a box
@@ -82,10 +84,12 @@ pub struct ItemCandidate {
 /// and so does `- buy milk`, a bullet with neither a box nor a keyword. That is the spec's rule that
 /// **open is the absence of a marker on an item** (§8.7) rather than a property of prose.
 ///
-/// Two exclusions come from shared decisions, not from local rules: lines inside a ``` fenced region
-/// (including both fence lines) and ATX heading lines, `# …` through `###### …`. A heading with a
-/// marker word in it names a topic and yields no item; seven hashes is not a heading by the outline's
-/// own test, so it is prose like any other.
+/// Three exclusions come from shared decisions, not from local rules: lines inside a ``` fenced
+/// region (including both fence lines), ATX heading lines `# …` through `###### …`, and a recognised
+/// frontmatter block — the scan starts at [`crate::parse::body_start`], so `tags:` with a `  - done`
+/// under it yields no Done item and `status: erledigt` yields none whose text is `status:`. A
+/// heading with a marker word in it names a topic and yields no item; seven hashes is not a heading
+/// by the outline's own test, so it is prose like any other.
 ///
 /// Per line the order is the plan's: checkbox first, then the configured markers in config order —
 /// every entry of [`MarkerConfig::done`] before every entry of [`MarkerConfig::paused`] — and the
@@ -98,13 +102,14 @@ pub struct ItemCandidate {
 /// Cost: one pass over the lines and one pass over each line, with no pattern compiled per line and
 /// no per-line copy of the marker list — a character that cannot start any marker costs one table
 /// lookup ([`MarkerSet::starts_at`]), so the work stays linear in the input even for a 5 MB single
-/// line (see the `#[ignore]`d timing case in `tests/items.rs`). Like
-/// [`crate::links::extract_links`] this sees text and not a note: it starts at line 1, so a marker
-/// word written inside frontmatter counts as if it were body text.
+/// line (see the `#[ignore]`d timing case in `tests/items.rs`). Unlike
+/// [`crate::links::extract_links`], which deliberately reads from line 1 because a link written in
+/// frontmatter is still a link, this is a scan of the body only: a status word in metadata is about
+/// the note, not a claim one of its items makes.
 pub fn extract_items(raw: &str, markers: &MarkerConfig) -> Vec<ItemCandidate> {
     let set = MarkerSet::new(markers);
     let mut found = Vec::new();
-    for (number, line) in prose_lines(raw, 1) {
+    for (number, line) in prose_lines(raw, body_start(raw)) {
         if is_heading_line(line) {
             continue;
         }
@@ -160,6 +165,11 @@ fn strip_bullet(line: &str) -> &str {
 /// wikilink, neither of which claims anything about a status. A box directly followed by its text
 /// still counts: `- [ ]買い物する` is how a note that writes no spaces between CJK words spells a
 /// task, and rejecting it would silently lose the item.
+///
+/// The two spellings in [`CHECKBOXES`] are the only boxes this reads. GFM would also take `[ x]`,
+/// `[  ]` or `[-]` for a box, and none of them is one here: a line carrying only a malformed box
+/// matches no checkbox and no keyword either, so it yields no candidate rather than a state its
+/// author did not write.
 ///
 /// `[` is ASCII, so every offset here lands on a character boundary even inside multi-byte text, and
 /// the only case fold involved is the box's `x`.
@@ -220,7 +230,9 @@ struct Marker {
     state: ItemState,
     /// Whether the word-boundary rule applies. A keyword or phrase is built only from word
     /// characters and spaces (`done`, `on hold`, `erledigt`); anything else — `✅`, `- [x]` — is a
-    /// literal that matches verbatim wherever it appears.
+    /// literal that matches verbatim wherever it appears. A phrase matches on exactly the whitespace
+    /// it was written with, so `on hold` needs one plain space: `on  hold`, a tab or a non-breaking
+    /// space is not that marker and yields no item.
     wordish: bool,
 }
 
@@ -387,13 +399,22 @@ impl MarkerSet {
 /// What continues a word, and therefore blocks a keyword match: letters and digits in any script
 /// (`download`, `abandoned`, `fertigmaßig`) and the underscore that joins identifiers
 /// (`done_done`). `/` deliberately does not block, so `status done/paused` still reads.
+///
+/// The tag-side boundary test [`crate::parse::blocked_by`] differs on `/` for the opposite reason —
+/// there a slash marks an anchor inside a path (`notes/a.md#section`) and has to block. The two
+/// predicates are near-duplicates by coincidence, not copies to consolidate.
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
-/// Whether one character folds to an already-lowercase character. Both sides go through
-/// `to_lowercase` so a character that folds to more than one never compares equal to a single
-/// character of a marker.
+/// Whether one character folds to exactly this already-lowercase character.
+///
+/// `lower` is always a `to_lowercase` output — every [`Marker::folded`] entry and every
+/// [`MarkerSet`] group key is — and re-folding such a character yields just it, so the comparison
+/// reads against `lower` directly instead of folding the marker's own character again on every
+/// position of every line. Only the source character pays for an iterator, and one whose lowercase
+/// spelling is longer than a single character still never compares equal.
 fn folded_eq(ch: char, lower: char) -> bool {
-    ch.to_lowercase().eq(lower.to_lowercase())
+    let mut folding = ch.to_lowercase();
+    folding.next() == Some(lower) && folding.next().is_none()
 }
