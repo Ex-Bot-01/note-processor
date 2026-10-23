@@ -27,19 +27,28 @@ struct Workspace {
 }
 
 impl Workspace {
-    /// `np` pointed at this workspace with its data dir set to this tempdir.
+    /// `np` pointed at this workspace, with every directory it reads configuration from set to this
+    /// tempdir.
     ///
-    /// `XDG_DATA_HOME` (Windows: `%LOCALAPPDATA%`) is what [`np_core::config::default_data_dir`]
-    /// reads, and `XDG_CONFIG_HOME` points the config file lookup at the empty tempdir so a
-    /// developer's own `config.toml` cannot change what these assertions see.
+    /// Every directory the binary can read configuration from points into this tempdir, on every
+    /// platform: `XDG_DATA_HOME` and `%LOCALAPPDATA%` for the data dir, `XDG_CONFIG_HOME`, `HOME` and
+    /// `%APPDATA%` for the config file. Windows takes its config dir from `%APPDATA%` and ignores the XDG
+    /// variables entirely (see `np_core::config::config_file_path`), so without redirecting it a
+    /// developer's own `config.toml` would change what these assertions see.
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_np"));
         cmd.env("XDG_DATA_HOME", self.data_dir())
             .env("LOCALAPPDATA", self.data_dir())
             .env("HOME", self._tmp.path())
-            .env("XDG_CONFIG_HOME", self._tmp.path().join("config"));
+            .env("XDG_CONFIG_HOME", self.config_dir())
+            .env("APPDATA", self.config_dir());
         cmd.args(args).arg(&self.root);
         cmd
+    }
+
+    /// The empty directory standing in for the OS config dir.
+    fn config_dir(&self) -> PathBuf {
+        self._tmp.path().join("config")
     }
 
     fn data_dir(&self) -> PathBuf {
@@ -55,9 +64,32 @@ impl Workspace {
 fn workspace() -> Workspace {
     let tmp = TempDir::new().expect("test setup: tempdir");
     let root = tmp.path().join("ws");
-    copy_tree(&corpus(), &root);
+    let source = corpus();
+    assert_no_generated_catalog(&source);
+    copy_tree(&source, &root);
     fs::create_dir_all(tmp.path().join("config")).expect("test setup: config dir");
     Workspace { _tmp: tmp, root }
+}
+
+/// Fail loudly when the source corpus holds a generated catalog of its own.
+///
+/// [`copy_tree`] copies whatever the source directory holds, so an `INDEX.md` left behind by the brief's
+/// hand-verification run (`np scan tests/fixtures/corpus`) arrives in every copy and turns `added 17`
+/// into 18. `.gitignore` keeps such a file out of a commit; this keeps it out of a red herring.
+fn assert_no_generated_catalog(corpus: &Path) {
+    let leftovers: Vec<String> = fs::read_dir(corpus)
+        .expect("test setup: read source corpus")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.starts_with("INDEX") && (name.ends_with(".md") || name.ends_with(".tmp"))
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "`{}` holds generated catalog files: {leftovers:?}",
+        corpus.display()
+    );
 }
 
 /// The committed fixture corpus, next to the repository's `Cargo.toml`.
@@ -203,10 +235,13 @@ fn missing_data_dir_is_a_configuration_error_not_a_panic() {
     // No data dir from the environment and no config file to supply one: every path the program
     // would derive would land next to the current directory, so it must refuse instead.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_np"));
+    // Cleared rather than redirected: on Windows the data dir comes from `%LOCALAPPDATA%` and the config
+    // dir from `%APPDATA%`, so an unset XDG pair alone would still find a developer's real directories.
     cmd.env("XDG_DATA_HOME", "")
         .env("LOCALAPPDATA", "")
         .env("HOME", "")
         .env("XDG_CONFIG_HOME", "")
+        .env("APPDATA", "")
         .arg("scan")
         .arg(&ws.root);
 

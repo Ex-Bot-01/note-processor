@@ -2,3 +2,6 @@
 /ui/node_modules
 /.superpowers
 *.sqlite*
+# A hand-run `np scan tests/fixtures/corpus` must not leave a catalog behind: the CLI and scan tests copy
+# that corpus wholesale and assert its file count.
+tests/fixtures/corpus/INDEX*.md

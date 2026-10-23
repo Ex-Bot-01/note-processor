@@ -5,9 +5,10 @@
 //!
 //! - **One transaction for the database, files written after it commits.** The registry row, the note
 //!   row and everything derived from its text either all move to this scan's state or none of them do.
-//!   `INDEX.md` cannot join a SQLite transaction, so the catalog is rendered from the committed state
-//!   and then written; a scan that dies halfway leaves the previous catalog readable instead of
-//!   half-rewritten.
+//!   `INDEX.md` cannot join a SQLite transaction, so the catalog is rendered inside that transaction,
+//!   its name list is committed with it, and only then does the filesystem work start. A scan that dies
+//!   halfway leaves the previous catalog readable instead of half-rewritten, and never leaves a delete
+//!   list that lags the files on disk (see [`set_index_list`] and [`write_index_files`] for the order).
 //! - **Unknown is not absent.** A directory the walk could not enter, and a file that vanished or was
 //!   rewritten between the walk and the read, is named in [`ScanReport::skipped`] and keeps the row it
 //!   already has (Review Focus 5). Reporting either as `Removed` would stale live notes because of a
@@ -47,9 +48,21 @@ const ENCODING_UTF8: &str = "utf-8";
 const ENCODING_LOSSY: &str = "lossy";
 /// `links.origin` for an edge the parser read out of a note, as opposed to one a person approved.
 const PROSE_ORIGIN: &str = "prose";
-/// `meta` key holding the index files currently on disk, newline-separated. The previous list is what
-/// lets a rescan delete the shards it no longer produces.
+/// `meta` key holding the index files this program has published, newline-separated. The previous list
+/// is what lets a rescan delete the shards it no longer produces.
 const INDEX_FILES_KEY: &str = "index_files";
+/// The catalog's entry point, which [`catalog::render`] returns first and every reader opens. It is
+/// renamed **last** (see [`write_index_files`]): an entry point naming shards that were never written is
+/// a broken catalog, while one that is merely old is still a correct one.
+const CATALOG_ENTRY: &str = "INDEX.md";
+/// Suffix of the temporary file every catalog write goes through before its `rename`.
+const TEMP_SUFFIX: &str = ".tmp";
+/// A link edge whose destination is a live note, spelled once because three queries have to agree on it:
+/// the two rendered counts and [`unresolved_links`]. The notes→files join is the point — an edge into a
+/// stale note, or one left pointing at a row that was deleted, is not a healthy link (see
+/// [`catalog_entries`]).
+const LIVE_EDGE: &str = "EXISTS (SELECT 1 FROM notes dn JOIN files df ON df.rel = dn.rel \
+                                 WHERE dn.id = l.dst_note_id AND df.state = 'ok')";
 
 /// A note re-parsed by one scan: its path and the links its text holds, which is everything
 /// [`store_note_links`] needs once the whole corpus is up to date.
@@ -148,6 +161,9 @@ pub fn scan_with_inject(
     // One absolute spelling for the walk, the database key, the stored `abs` and the registry row, so
     // one folder is one workspace however it was typed (spec §11).
     let root = abs_path(root);
+    // Before the walk, not on the way out: a corpse the walk lists is a file this scan would index as an
+    // attachment (see [`clear_temp_corpses`]).
+    clear_temp_corpses(&root)?;
     let walked = walk::walk(&root, &WalkOptions::default())?;
     after_walk(&root);
 
@@ -174,12 +190,16 @@ pub fn scan_with_inject(
     let entries = catalog_entries(&db)?;
     let unresolved = unresolved_links(&db)?;
     let previous = index_list(&db)?;
+    // Rendering is pure, so the set this scan is about to publish is known here — and `meta` records it
+    // inside the transaction rather than after the writes. A list that leads reality is harmless,
+    // because [`write_index_files`] treats a name already gone from disk as the state it wanted; a list
+    // that *lags* reality is not, because the shard it fails to name survives as an orphan nothing will
+    // ever delete again.
+    let rendered = catalog::render(&entries, &cfg.catalog);
+    set_index_list(&db, &rendered)?;
     tx.commit().map_err(DbError::from)?;
 
-    let rendered = catalog::render(&entries, &cfg.catalog);
     write_index_files(&root, &rendered, &previous)?;
-    // Recorded only once the bytes are on disk: `meta` describes the catalog that exists.
-    set_index_list(&db, &rendered)?;
     WorkspaceRegistry::open(&cfg.data_dir)?.record(&root, now)?;
 
     skipped.extend(written.skipped);
@@ -477,8 +497,43 @@ fn index_file(
             store_note(db, rel, text, &doc, &items, readable.lossy)?;
             return Ok(Indexed::Done(Some((rel.to_string(), links))));
         }
+    } else {
+        // Nothing to parse, so this is an attachment. Any note row still sitting on this path is a
+        // leftover from the rename that made it one (see [`delete_note_row`]).
+        delete_note_row(db, rel)?;
     }
     Ok(Indexed::Done(None))
+}
+
+/// Delete the note row that a path this scan read as an attachment still carries.
+///
+/// A byte-identical rename that drops the extension (`note.md` → `note.txt`) is a `Moved`, and
+/// [`db::apply_move`] lets `notes.rel` cascade onto the new path — but an attachment is never parsed, so
+/// nothing overwrote that row. Left in place it renders as `- [[Title]](note.txt)` and is counted as a
+/// live note, against "tracked but never catalogued" (spec §10), so the row goes with what hangs off it.
+///
+/// Only this note's `origin = 'prose'` edges go too: an approved edge is an input and not derived output
+/// (spec §10). Edges pointing *in* lose their destination rather than being deleted, because they are
+/// another note's prose and stay countable as unresolved. Rewriting them is not optional bookkeeping:
+/// `dst_note_id` carries no foreign key and SQLite hands a deleted rowid to the next INSERT, so an edge
+/// left behind would eventually claim an unrelated note as its destination.
+fn delete_note_row(db: &Db, rel: &str) -> Result<(), DbError> {
+    let Some(id) = note_id(db, rel)? else {
+        return Ok(());
+    };
+    db.0.execute("DELETE FROM headings WHERE note_id = ?1", params![id])?;
+    db.0.execute("DELETE FROM tags WHERE note_id = ?1", params![id])?;
+    db.0.execute("DELETE FROM items WHERE note_id = ?1", params![id])?;
+    db.0.execute(
+        "DELETE FROM links WHERE src_note_id = ?1 AND origin = ?2",
+        params![id, PROSE_ORIGIN],
+    )?;
+    db.0.execute(
+        "UPDATE links SET dst_note_id = NULL WHERE dst_note_id = ?1",
+        params![id],
+    )?;
+    db.0.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+    Ok(())
 }
 
 /// Turn a constraint violation into "this path is skipped"; anything else stays an error.
@@ -676,14 +731,20 @@ fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
         live.push(row?);
     }
 
+    // Both counts ask for a live destination. An edge into a note that left the catalog is not an intact
+    // link to advertise, and counting it would let the same broken edge read as healthy or not depending
+    // on whether its source happened to be re-parsed.
     let out = link_counts(
         db,
-        "SELECT src_note_id, COUNT(*) FROM links GROUP BY src_note_id",
+        &format!(
+            "SELECT l.src_note_id, COUNT(*) FROM links l WHERE {LIVE_EDGE} GROUP BY l.src_note_id"
+        ),
     )?;
     let inc = link_counts(
         db,
-        "SELECT dst_note_id, COUNT(*) FROM links
-          WHERE dst_note_id IS NOT NULL GROUP BY dst_note_id",
+        &format!(
+            "SELECT l.dst_note_id, COUNT(*) FROM links l WHERE {LIVE_EDGE} GROUP BY l.dst_note_id"
+        ),
     )?;
     let tags = note_tags(db)?;
 
@@ -735,13 +796,23 @@ fn note_tags(db: &Db) -> Result<HashMap<i64, Vec<String>>, DbError> {
     Ok(tags)
 }
 
-/// Link rows with no note behind them, attachments excluded: the report's figure, and deliberately not
-/// [`crate::db::note_counts`]'s. An embed of an image legitimately stores `dst_note_id NULL`, and counting
-/// those would bury the "notes I could not place" signal (see [`crate::links::store_links`]).
+/// Link rows with no live note behind them, attachments excluded: the report's figure, and deliberately
+/// not [`crate::db::note_counts`]'s. An embed of an image legitimately stores `dst_note_id NULL`, and
+/// counting those would bury the "notes I could not place" signal (see [`crate::links::store_links`]).
+///
+/// A destination that exists but is stale counts here, because it is a note nobody can reach: links are
+/// re-resolved only for notes this scan re-parsed, so an edge into a deleted note keeps its old
+/// `dst_note_id` until its source is edited. `origin = 'prose'` matches [`crate::db::unresolved_targets`],
+/// which backs the status list — an approved edge is an input, and once M3 writes them the two figures
+/// must not diverge.
 fn unresolved_links(db: &Db) -> Result<i64, DbError> {
     Ok(db.0.query_row(
-        "SELECT COUNT(*) FROM links WHERE dst_note_id IS NULL AND kind != 'attachment'",
-        [],
+        &format!(
+            "SELECT COUNT(*) FROM links l
+              WHERE l.origin = ?1 AND l.kind != 'attachment'
+                AND NOT {LIVE_EDGE}"
+        ),
+        params![PROSE_ORIGIN],
         |row| row.get(0),
     )?)
 }
@@ -761,7 +832,12 @@ fn index_list(db: &Db) -> Result<Vec<String>, DbError> {
     }))
 }
 
-/// Record the index files now on disk, so a later scan knows which shards to delete.
+/// Record the index files this scan publishes, so a later scan knows which shards to delete.
+///
+/// Written inside the scan's transaction, before the files exist: `meta` describes the catalog this
+/// program is responsible for, and the next scan tolerates naming a file that never arrived
+/// ([`write_index_files`] ignores `NotFound`). Committing it afterwards cannot fail safely — a kill in
+/// that window leaves a shard on disk that no delete list mentions.
 fn set_index_list(db: &Db, rendered: &[(String, String)]) -> Result<(), DbError> {
     let value = rendered
         .iter()
@@ -778,27 +854,28 @@ fn set_index_list(db: &Db, rendered: &[(String, String)]) -> Result<(), DbError>
 
 /// Write the rendered catalog and delete the shards this scan no longer produces.
 ///
-/// Every file is written to a temporary name and moved into place with one `rename`, so a reader never
-/// sees a half-written catalog (spec §7's whole-file regenerate) and a crash leaves either the old catalog
-/// or the new one. Names that are no longer rendered are removed — but only names this program generates,
-/// checked against [`walk::is_generated_index`] rather than trusted from `meta`, because a note body is
-/// never this function's to delete (spec §7). A name already gone from disk is the state this call wanted.
+/// The order is the whole contract, because one set of files cannot be published atomically:
+///
+/// 1. Every shard, each written to a temporary name and moved in with one `rename`, so a reader never
+///    sees a half-written file (spec §7's whole-file regenerate).
+/// 2. `INDEX.md` last. Until it moves, the old catalog still names only files that exist; from then on
+///    the new one does too. Renaming it first is what let an entry point advertise shards that were
+///    never written while superseded shards of another generation survived beside them.
+/// 3. Superseded names, only once the entry point that no longer mentions them is live.
+///
+/// Names to remove are filtered by [`walk::is_generated_index`] rather than trusted from `meta`, because
+/// a note body is never this function's to delete (spec §7). A name already gone from disk is the state
+/// this call wanted, which is also what makes [`set_index_list`] safe to commit ahead of these writes.
 fn write_index_files(
     root: &Path,
     rendered: &[(String, String)],
     previous: &[String],
 ) -> Result<(), ScanError> {
-    for (name, contents) in rendered {
-        let temp = root.join(format!("{name}.tmp"));
-        let target = root.join(name);
-        fs::write(&temp, contents).map_err(|source| ScanError::Io {
-            path: temp.clone(),
-            source,
-        })?;
-        fs::rename(&temp, &target).map_err(|source| ScanError::Io {
-            path: target,
-            source,
-        })?;
+    for (name, contents) in rendered.iter().filter(|(name, _)| name != CATALOG_ENTRY) {
+        publish(root, name, contents)?;
+    }
+    for (name, contents) in rendered.iter().filter(|(name, _)| name == CATALOG_ENTRY) {
+        publish(root, name, contents)?;
     }
 
     for name in previous {
@@ -807,6 +884,59 @@ fn write_index_files(
             continue;
         }
         let path = root.join(name);
+        match fs::remove_file(&path) {
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(ScanError::Io { path, source }),
+            Ok(()) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Move one rendered file into place through a temporary name, so a reader never sees it half-written
+/// and a kill leaves either the old bytes or the new ones.
+fn publish(root: &Path, name: &str, contents: &str) -> Result<(), ScanError> {
+    let temp = root.join(format!("{name}{TEMP_SUFFIX}"));
+    let target = root.join(name);
+    fs::write(&temp, contents).map_err(|source| ScanError::Io {
+        path: temp.clone(),
+        source,
+    })?;
+    fs::rename(&temp, &target).map_err(|source| ScanError::Io {
+        path: target,
+        source,
+    })?;
+    Ok(())
+}
+
+/// Remove the `INDEX*.tmp` files a rename that died left behind.
+///
+/// A temporary name is not one [`walk::is_generated_index`] recognises, so an orphaned corpse left by a
+/// killed `rename` would be walked, hashed and catalogued-as-nothing as an ordinary attachment, and
+/// nothing would ever clean it up. That is why [`scan`] calls this before the walk rather than where the
+/// temporaries are made: cleaned up on the way out, the corpse would still be indexed once by its own
+/// scan. Removal stops at directories — something named `INDEX.md.tmp` that is one belongs to somebody
+/// else — but a failed removal of a real file is fatal, because the corpse left behind is the bug this
+/// function exists to fix.
+fn clear_temp_corpses(root: &Path) -> Result<(), ScanError> {
+    let entries = fs::read_dir(root).map_err(|source| ScanError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| ScanError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(TEMP_SUFFIX) else {
+            continue;
+        };
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !walk::is_generated_index(stem) || is_dir {
+            continue;
+        }
+        let path = entry.path();
         match fs::remove_file(&path) {
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(ScanError::Io { path, source }),

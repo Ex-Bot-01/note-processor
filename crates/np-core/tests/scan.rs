@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use np_core::config::Config;
+use np_core::config::{CatalogConfig, Config};
 use np_core::db::{self, Db, NoteCounts};
 use np_core::hash::sha256_file;
 use np_core::{scan, scan_with_inject};
@@ -53,9 +53,62 @@ fn corpus() -> PathBuf {
 fn workspace() -> Workspace {
     let tmp = TempDir::new().expect("test setup: tempdir");
     let root = tmp.path().join("ws");
-    copy_tree(&corpus(), &root);
+    let source = corpus();
+    assert_no_generated_catalog(&source);
+    copy_tree(&source, &root);
     let cfg = Config {
         data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+    Workspace {
+        _tmp: tmp,
+        root,
+        cfg,
+    }
+}
+
+/// Fail loudly when the source corpus holds a generated catalog of its own.
+///
+/// [`copy_tree`] copies whatever is in the source directory, so an `INDEX.md` left behind by
+/// `np scan tests/fixtures/corpus` arrives in every copy and silently adds one file and one note to
+/// counts these cases assert as constants. The ignore rule in `.gitignore` keeps it out of a commit;
+/// this keeps it out of a red herring.
+fn assert_no_generated_catalog(corpus: &Path) {
+    let leftovers: Vec<String> = fs::read_dir(corpus)
+        .expect("test setup: read source corpus")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.starts_with("INDEX") && (name.ends_with(".md") || name.ends_with(".tmp"))
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "`{}` holds generated catalog files: {leftovers:?}",
+        corpus.display()
+    );
+}
+
+/// A workspace holding exactly `files` (`rel` → contents), sharded at `per_file` entries.
+///
+/// For the cases the fixture corpus cannot express: a two-note graph whose target is deleted, and a
+/// corpus small enough that `max_entries_per_file` really splits it into shards.
+fn scratch(files: &[(&str, &str)], per_file: usize) -> Workspace {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: create scratch workspace");
+    for (rel, contents) in files {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap_or(root.as_path()))
+            .expect("test setup: create note directory");
+        fs::write(&path, contents).expect("test setup: write scratch note");
+    }
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        catalog: CatalogConfig {
+            max_entries_per_file: per_file,
+            ..CatalogConfig::default()
+        },
         ..Config::default()
     };
     Workspace {
@@ -148,6 +201,42 @@ fn entry_lines(text: &str) -> Vec<&str> {
     text.lines()
         .filter(|line| line.starts_with("- [["))
         .collect()
+}
+
+/// The rendered entry line for one `rel`, looked for in `INDEX.md` and every shard; `None` when the
+/// catalog holds no entry. Titles in the scratch cases are short, so an entry never wraps.
+fn entry_line(root: &Path, rel: &str) -> Option<String> {
+    let needle = format!("({rel})");
+    for entry in fs::read_dir(root)
+        .expect("test: read workspace root")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("INDEX") || !name.ends_with(".md") {
+            continue;
+        }
+        let text = fs::read_to_string(entry.path()).expect("test: read index file");
+        let found = text
+            .lines()
+            .find(|line| line.starts_with("- [[") && line.contains(&needle));
+        if let Some(line) = found {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
+/// The `meta('index_files')` list, one name per line, in the order the scan wrote it.
+fn index_files_meta(open: &Db) -> Vec<String> {
+    let value: String = open
+        .0
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'index_files'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("test: index_files row");
+    value.lines().map(str::to_string).collect()
 }
 
 /// Link rows written for one note, so a re-parse can be compared against its own history.
@@ -580,4 +669,209 @@ fn unreadable_directory_does_not_mark_its_files_stale() {
         Some("ok"),
         "a permission error must not stale a whole subtree"
     );
+}
+
+#[test]
+fn renamed_to_an_attachment_leaves_the_catalog() {
+    let ws = workspace();
+    let first = scan(&ws.root, &ws.cfg).expect("first scan");
+    assert_eq!(first.notes, CORPUS_NOTES);
+
+    // Give the note an edge to lose: an inbound link is what proves the leftover row is deleted rather
+    // than merely hidden.
+    let mut host = fs::read_to_string(ws.root.join("sprint-review.md")).expect("test: read note");
+    host.push_str("\nSiehe [[stray-idea]].\n");
+    fs::write(ws.root.join("sprint-review.md"), host).expect("test: write note");
+    scan(&ws.root, &ws.cfg).expect("scan after the edit");
+
+    // A byte-identical rename that drops the extension is a `Moved`, and `notes.rel` cascades onto the
+    // new path — where nothing parses it again. An attachment is tracked but never catalogued (§10).
+    fs::rename(
+        ws.root.join("stray-idea.md"),
+        ws.root.join("stray-idea.txt"),
+    )
+    .expect("test: rename a note to a .txt");
+    let report = scan(&ws.root, &ws.cfg).expect("scan after the rename");
+
+    assert_eq!(report.moved, 1, "{report:?}");
+    let open = ws.db();
+    assert_eq!(
+        state(&open, "stray-idea.txt").as_deref(),
+        Some("ok"),
+        "the renamed path stays tracked as a file"
+    );
+    assert_eq!(
+        scalar(
+            &open,
+            "SELECT COUNT(*) FROM notes WHERE rel = 'stray-idea.txt'"
+        ),
+        0,
+        "no note row may survive on an attachment path"
+    );
+    assert_eq!(report.notes, CORPUS_NOTES - 1, "{report:?}");
+    let text = index_text(&ws.root);
+    assert!(
+        !text.contains("stray-idea"),
+        "an attachment is not catalogued: {text}"
+    );
+    assert!(entry_line(&ws.root, "stray-idea.txt").is_none());
+    // The edge that pointed at the deleted note row reads as a note nobody could place instead of
+    // dangling at a rowid SQLite will hand to some later INSERT.
+    assert_eq!(
+        report.unresolved_links,
+        first.unresolved_links + 1,
+        "{report:?}"
+    );
+    assert_eq!(
+        scalar(
+            &open,
+            "SELECT COUNT(*) FROM links l
+               LEFT JOIN notes n ON n.id = l.dst_note_id
+              WHERE l.dst_note_id IS NOT NULL AND n.id IS NULL"
+        ),
+        0,
+        "no edge may point at a note id that no longer exists"
+    );
+}
+
+#[test]
+fn edge_into_a_deleted_note_reads_as_unresolved() {
+    // Two notes linked together, in a corpus small enough to read the entry line off the catalog.
+    let ws = scratch(
+        &[("a.md", "Siehe [[b]].\n"), ("b.md", "Zurück zu [[a]].\n")],
+        600,
+    );
+    let first = scan(&ws.root, &ws.cfg).expect("first scan");
+    assert_eq!(first.unresolved_links, 0, "{first:?}");
+    let before = entry_line(&ws.root, "a.md").expect("a.md is catalogued");
+    assert!(before.contains("→1"), "{before}");
+
+    // `a.md` is unchanged by the deletion, so it is never re-parsed and its edge keeps the old
+    // `dst_note_id`. The destination's file is what tells the truth now.
+    fs::remove_file(ws.root.join("b.md")).expect("test: delete the link target");
+    let report = scan(&ws.root, &ws.cfg).expect("scan after the deletion");
+
+    assert_eq!(report.removed, 1, "{report:?}");
+    assert_eq!(report.notes, 1, "{report:?}");
+    assert_eq!(
+        report.unresolved_links, 1,
+        "the surviving edge is unresolved: {report:?}"
+    );
+    let line = entry_line(&ws.root, "a.md").expect("a.md is still catalogued");
+    assert!(
+        line.contains("→0"),
+        "no intact link to a hidden note: {line}"
+    );
+}
+
+#[test]
+fn superseded_shards_are_deleted() {
+    let ws = scratch(
+        &[
+            ("a.md", "one\n"),
+            ("b.md", "two\n"),
+            ("c.md", "three\n"),
+            ("d.md", "four\n"),
+        ],
+        2,
+    );
+
+    let first = scan(&ws.root, &ws.cfg).expect("scan that shards");
+    assert_eq!(first.index_files.len(), 3, "{:?}", first.index_files);
+    assert_eq!(first.index_files[0], "INDEX.md");
+    for name in &first.index_files {
+        assert!(ws.root.join(name).is_file(), "{name} was rendered");
+    }
+    assert_eq!(index_files_meta(&ws.db()), first.index_files);
+
+    // Two notes fewer is one file again, so both shards are superseded — obligation 7's delete half.
+    fs::remove_file(ws.root.join("c.md")).expect("test: shrink the corpus");
+    fs::remove_file(ws.root.join("d.md")).expect("test: shrink the corpus");
+    let second = scan(&ws.root, &ws.cfg).expect("scan after the shrink");
+
+    assert_eq!(second.index_files, vec!["INDEX.md".to_string()]);
+    for name in &first.index_files[1..] {
+        assert!(
+            !ws.root.join(name).exists(),
+            "superseded shard {name} must be gone from disk"
+        );
+    }
+    assert_eq!(index_files_meta(&ws.db()), vec!["INDEX.md".to_string()]);
+    let text = index_text(&ws.root);
+    assert!(
+        !text.contains("INDEX-"),
+        "no link to a deleted shard: {text}"
+    );
+}
+
+#[test]
+fn entry_point_is_published_after_its_shards() {
+    let ws = scratch(
+        &[
+            ("a.md", "one\n"),
+            ("b.md", "two\n"),
+            ("c.md", "three\n"),
+            ("d.md", "four\n"),
+        ],
+        2,
+    );
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let published = fs::read(ws.root.join("INDEX.md")).expect("INDEX.md after the first scan");
+
+    // A new note opens a third bucket, and a directory sits in the way of that shard's `rename` — so the
+    // scan dies with shards written and its entry point still to come.
+    fs::write(ws.root.join("e.md"), "five\n").expect("test: add a note");
+    fs::create_dir(ws.root.join("INDEX-e-e.md")).expect("test: block the shard rename");
+
+    let failed = scan(&ws.root, &ws.cfg).expect_err("a blocked rename must fail the scan");
+    assert!(
+        failed.to_string().contains("INDEX-e-e.md"),
+        "the message has to name the file: {failed}"
+    );
+
+    // The old entry point still names only files that exist. Publishing it first is what left a reader
+    // with links to shards that were never written.
+    assert_eq!(
+        fs::read(ws.root.join("INDEX.md")).expect("INDEX.md after the failed scan"),
+        published,
+        "INDEX.md must not move until every shard exists"
+    );
+    // And `meta` already names the attempted set: it is committed with the scan's transaction, so a
+    // process killed here cannot leave a shard that no delete list mentions.
+    assert_eq!(
+        index_files_meta(&ws.db()),
+        vec![
+            "INDEX.md".to_string(),
+            "INDEX-a-b.md".to_string(),
+            "INDEX-c-d.md".to_string(),
+            "INDEX-e-e.md".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn temp_corpse_from_a_failed_rename_is_not_indexed() {
+    let ws = workspace();
+    // A rename killed halfway leaves its temporary name behind, and `walk::is_generated_index` does not
+    // match `INDEX.md.tmp` — so without cleanup the next scan indexes its own corpse as an attachment.
+    fs::write(ws.root.join("INDEX.md.tmp"), "stale\n").expect("test: plant a corpse");
+
+    let report = scan(&ws.root, &ws.cfg).expect("scan with a corpse in the way");
+
+    assert!(
+        !ws.root.join("INDEX.md.tmp").exists(),
+        "the corpse is unlinked"
+    );
+    let open = ws.db();
+    assert_eq!(
+        scalar(
+            &open,
+            "SELECT COUNT(*) FROM files WHERE rel = 'INDEX.md.tmp'"
+        ),
+        0,
+        "a corpse is never indexed"
+    );
+    assert_eq!(report.added as i64, CORPUS_FILES, "{report:?}");
+    // The cleanup runs before the writes rather than instead of them.
+    assert!(ws.root.join("INDEX.md").is_file());
 }
