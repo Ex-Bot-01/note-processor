@@ -253,6 +253,15 @@ fn heading_at(text: &str, number: usize) -> Option<Heading> {
     })
 }
 
+/// Whether this line is an ATX heading, by the same test [`heading_at`] applies.
+///
+/// The shared decision [`crate::items`] uses to keep headings out of the item list: a heading names
+/// a topic, so `## Erledigt` is an outline entry and not a done item. Checking for `#` first keeps
+/// prose lines out of the regex engine here too.
+pub(crate) fn is_heading_line(text: &str) -> bool {
+    text.starts_with('#') && heading_pattern().is_match(text)
+}
+
 /// The `#tags` on this line, appended to `tags`.
 ///
 /// The plan's pattern is `(?<![\\w/])#([\\p{L}][\\p{L}\\p{N}_/-]{1,40})`. Rust's `regex` crate
