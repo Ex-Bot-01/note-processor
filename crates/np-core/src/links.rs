@@ -66,8 +66,11 @@ pub struct RawLink {
     pub line: usize,
 }
 
-/// Every link a note's text contains, in reading order, several per line where the author wrote
-/// several.
+/// Every link a note's text contains: line by line, and within a line in the order the scan reaches
+/// them. That is reading order except at one place — a link nested inside another link's text
+/// (`[![badge](img/i.png)](https://x)`) is reported after the destination that surrounds it, because
+/// the outer link is only known to be a link once its `)` is read. Both rows carry the same line
+/// number and nothing downstream orders by anything finer than that.
 ///
 /// Two syntaxes are links: `[[target]]` with its embed form `![[target]]`, and
 /// `[text](destination)`. The kind follows the extension of the target and nothing else: an
@@ -101,17 +104,30 @@ pub fn extract_links(raw: &str) -> Vec<RawLink> {
     found
 }
 
-/// The links on one prose line, appended in the order they start.
+/// The links on one prose line, appended in the order the scan reaches them — see
+/// [`MarkdownLink::resume`] for the one case where that is not strictly left to right.
 ///
 /// Only ASCII bytes are ever tested or sliced at, so `cursor` is always on a character boundary
 /// even when the byte at it is the middle of a multi-byte character — that byte cannot be `[`, and
 /// the `starts_with` below is reached only for a real bracket.
+///
+/// Every per-line decision is taken once, before the loop, because this runs on every note and an
+/// unfenced paste of minified JSON or code is one long line of brackets: asking each `[` whether
+/// anything closes it would make the line quadratic. `]]`, `](` and `)` are each answered by one
+/// search over the line, and a wikilink search that comes up empty ends the search for the whole
+/// line — nothing further along can close either.
 fn scan_line(text: &str, number: usize, out: &mut Vec<RawLink>) {
     let bytes = text.as_bytes();
+    let mut wikilinks_left = text.contains("]]");
+    let markdown_links_left = if text.contains("](") && text.contains(')') {
+        closed_brackets(text)
+    } else {
+        HashMap::new()
+    };
     let mut cursor = 0usize;
     while cursor < bytes.len() {
         match bytes[cursor] {
-            b'[' if text[cursor..].starts_with("[[") => {
+            b'[' if wikilinks_left && text[cursor..].starts_with("[[") => {
                 // `![[target]]` arrives here as well, two characters later than the `!`: the kind
                 // comes from the extension, so the embed marker needs no case of its own.
                 let inner = cursor + 2;
@@ -120,25 +136,51 @@ fn scan_line(text: &str, number: usize, out: &mut Vec<RawLink>) {
                         push(out, wikilink(&text[inner..end]), number);
                         cursor = end + 2;
                     }
-                    // An unterminated `[[` is prose. Its second bracket may still open a markdown
-                    // link, so the scan steps one character instead of past it.
-                    None => cursor += 1,
+                    // Nothing closes a wikilink between here and the end of the line, so nothing
+                    // further along will either. The second bracket still gets its turn at the
+                    // markdown syntax on the next character.
+                    None => {
+                        wikilinks_left = false;
+                        cursor += 1;
+                    }
                 }
             }
             b'[' => {
-                match markdown_link(text, cursor) {
+                match markdown_link(text, cursor, &markdown_links_left) {
                     Some(link) => {
                         push(out, markdown_target(link.destination), number);
                         cursor = link.resume;
                     }
-                    // Unbalanced brackets, or no `(` after them: the inner ones get their own turn
-                    // on the next character.
+                    // No closing bracket, or no `(` after it: the brackets inside get their own
+                    // turn on the next character.
                     None => cursor += 1,
                 }
             }
             _ => cursor += 1,
         }
     }
+}
+
+/// Each `[` of a line and the `]` that closes it, decided for the whole line in one pass.
+///
+/// One pass is the point: looking for the close of each bracket separately rescans the tail of the
+/// line every time, which turns a line full of unbalanced brackets into quadratic work. A `[` with
+/// no entry here never closes, so it opens no link; a `]` with no opener before it is ignored.
+fn closed_brackets(text: &str) -> HashMap<usize, usize> {
+    let mut openers: Vec<usize> = Vec::new();
+    let mut closes: HashMap<usize, usize> = HashMap::new();
+    for (index, byte) in text.bytes().enumerate() {
+        match byte {
+            b'[' => openers.push(index),
+            b']' => {
+                if let Some(opener) = openers.pop() {
+                    closes.insert(opener, index);
+                }
+            }
+            _ => {}
+        }
+    }
+    closes
 }
 
 /// Adds what one link syntax yielded, if it yielded anything.
@@ -165,38 +207,25 @@ struct MarkdownLink<'a> {
     resume: usize,
 }
 
-/// The markdown link at `open`, which has to be a `[`.
-fn markdown_link(text: &str, open: usize) -> Option<MarkdownLink<'_>> {
-    let bytes = text.as_bytes();
-    // Bracket depth, so a nested pair (`[see [x]](a.md)`) does not end the link text early.
-    let mut depth = 1usize;
-    let mut inner: Option<usize> = None;
-    let mut index = open + 1;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'[' => {
-                depth += 1;
-                if inner.is_none() {
-                    inner = Some(index);
-                }
-            }
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    // `index` is the closing `]`, or the end of the line when the brackets never balanced. Either
-    // way, a link needs `(` right after it; `[a [b] c` and `[a] b.md` are prose.
-    if bytes.get(index) != Some(&b']') || bytes.get(index + 1) != Some(&b'(') {
+/// The markdown link at `open`, which has to be a `[` that [`closed_brackets`] matched.
+fn markdown_link<'a>(
+    text: &'a str,
+    open: usize,
+    closes: &HashMap<usize, usize>,
+) -> Option<MarkdownLink<'a>> {
+    // A nested pair (`[see [x]](a.md)`) ends the link text at the bracket that matches the opener,
+    // not at the first `]`.
+    let close = *closes.get(&open)?;
+    // A link needs `(` right after its own closing bracket; `[a [b] c` and `[a] b.md` are prose.
+    if text.as_bytes().get(close + 1) != Some(&b'(') {
         return None;
     }
-    let destination_start = index + 2;
+    let destination_start = close + 2;
     let end = find(text, ")", destination_start)?;
+    // Both offsets are ASCII brackets, so this slice is on character boundaries.
+    let inner = text[open + 1..close]
+        .find('[')
+        .map(|offset| open + 1 + offset);
     Some(MarkdownLink {
         destination: &text[destination_start..end],
         resume: inner.unwrap_or(end + 1),
@@ -225,7 +254,7 @@ fn wikilink(inner: &str) -> Option<(String, LinkKind)> {
 
 /// The target and kind of a markdown destination, or nothing when it names no file of the corpus.
 fn markdown_target(destination: &str) -> Option<(String, LinkKind)> {
-    let written = destination.trim();
+    let written = strip_title(destination.trim());
     // An empty destination, an in-page anchor and a protocol-relative URL are not workspace paths,
     // and neither is anything carrying a scheme.
     if written.is_empty()
@@ -261,6 +290,22 @@ fn markdown_target(destination: &str) -> Option<(String, LinkKind)> {
         LinkKind::Attachment
     };
     Some((path.to_string(), kind))
+}
+
+/// A markdown title attribute cut off the destination: `[t](notes/a.md "Release")` is a link to
+/// `notes/a.md` with a tooltip, and pandoc and GitHub write them constantly.
+///
+/// The title has to be quoted and separated from the path by whitespace, which is what keeps a path
+/// that merely contains a space — `[t](my photo.png)` — intact. A destination that opens with a
+/// quote but never separates one (`[t]("a b")`) is left alone; it names no file either way.
+fn strip_title(destination: &str) -> &str {
+    if !destination.ends_with('"') {
+        return destination;
+    }
+    match destination.rfind(" \"") {
+        Some(cut) => destination[..cut].trim_end(),
+        None => destination,
+    }
 }
 
 /// Whether a destination carries a scheme — `https:`, `mailto:`, and also a Windows drive letter,
@@ -330,8 +375,12 @@ pub struct ResolvedLink {
 ///    usually omits `.md` while an attachment target keeps it.
 ///
 /// More than one candidate at any step stays unresolved — two `a.md` files in different directories
-/// make the target `a` ambiguous, and so does a note `a.md` beside an image `a.png`. An unknown
-/// target is unresolved the same way, and an empty corpus resolves nothing without failing.
+/// make the target `a` ambiguous, and so does a note `a.md` beside an image `a.png`. Nothing prefers
+/// one kind over another: a wikilink may legitimately name an attachment, so preferring `.md` would
+/// break a real link rather than guess well. **The author's way out is to spell the path** —
+/// `[[notes/a.md]]` or `[text](notes/a.md)` is exact and wins over the ambiguity — which is what a
+/// later report should suggest next to an unresolved target. An unknown target is unresolved the same
+/// way, and an empty corpus resolves nothing without failing.
 pub fn resolve(
     corpus: &BTreeMap<String, String>,
     links: &[(String, Vec<RawLink>)],
@@ -393,6 +442,10 @@ fn basename_index(corpus: &BTreeMap<String, String>) -> HashMap<String, Vec<Stri
     index
 }
 
+/// The one statement [`store_links`] writes, named so it is prepared once per call.
+const INSERT_LINK: &str = "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
 /// Write the link rows Task 9 counts and Task 10 reports.
 ///
 /// `src_rel` and `dst_rel` become note ids through `notes.rel`, because a move rewrites a path and
@@ -420,6 +473,10 @@ fn basename_index(corpus: &BTreeMap<String, String>) -> HashMap<String, Vec<Stri
 /// `prose` or `approved`; anything else is refused by the CHECK constraint and returned as
 /// [`DbError::Sqlite`].
 pub fn store_links(db: &Db, links: &[ResolvedLink], origin: &str) -> Result<(), DbError> {
+    // `prepare_cached`, in this function and in [`note_id`], because a workspace scan writes on the
+    // order of 10^4 link rows: `Connection::execute` prepares its statement afresh every call, so
+    // using it here would mean 10^4 parses of one INSERT. The cache lives on the connection, so the
+    // statement is parsed once and reused by every later call as well.
     let mut ids: HashMap<&str, Option<i64>> = HashMap::new();
     for link in links {
         let Some(src) = note_id(db, &mut ids, &link.src_rel)? else {
@@ -429,19 +486,15 @@ pub fn store_links(db: &Db, links: &[ResolvedLink], origin: &str) -> Result<(), 
             Some(rel) => note_id(db, &mut ids, rel)?,
             None => None,
         };
-        db.0.execute(
-            "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                src,
-                dst,
-                link.kind.as_str(),
-                link.target,
-                // No note has a line number near `i64::MAX`, but a bare cast would wrap one.
-                i64::try_from(link.line).unwrap_or(i64::MAX),
-                origin
-            ],
-        )?;
+        db.0.prepare_cached(INSERT_LINK)?.execute(params![
+            src,
+            dst,
+            link.kind.as_str(),
+            link.target,
+            // No note has a line number near `i64::MAX`, but a bare cast would wrap one.
+            i64::try_from(link.line).unwrap_or(i64::MAX),
+            origin
+        ])?;
     }
     Ok(())
 }
@@ -457,7 +510,7 @@ fn note_id<'a>(
         return Ok(*id);
     }
     let mut statement =
-        db.0.prepare("SELECT id FROM notes WHERE rel = ?1 LIMIT 1")?;
+        db.0.prepare_cached("SELECT id FROM notes WHERE rel = ?1 LIMIT 1")?;
     let mut rows = statement.query(params![rel])?;
     let id = match rows.next()? {
         Some(row) => Some(row.get::<_, i64>(0)?),

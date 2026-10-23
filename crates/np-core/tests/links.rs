@@ -8,8 +8,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use np_core::db::{note_counts, upsert_file, Db};
+use np_core::db::{note_counts, upsert_file, Db, DbError};
 use np_core::hash::Snapshot;
 use np_core::links::{extract_links, resolve, store_links, LinkKind, RawLink, ResolvedLink};
 use np_core::parse::parse_markdown;
@@ -317,15 +318,19 @@ fn line_numbers_stable_across_endings() {
         ]
     );
 
-    // The same over the committed fixtures: `german-note.md` is stored with `\r\n`, and its one
-    // real link sits after a fenced block.
-    let german = fixture("german-note.md");
+    // The same over a committed fixture. Both spellings are rebuilt from the stored bytes instead
+    // of comparing the file against a normalisation of itself: on a checkout that stores LF, the
+    // file and `german.replace("\r\n", "\n")` are the same string and the assertion proves nothing.
+    let lf = fixture("german-note.md").replace("\r\n", "\n");
+    let dos = crlf(&lf);
+    assert!(dos.contains("\r\n"), "the CRLF twin has to exist");
     assert_eq!(
-        found(&extract_links(&german.replace("\r\n", "\n"))),
-        found(&extract_links(&german))
+        found(&extract_links(&dos)),
+        found(&extract_links(&lf)),
+        "the fixture reports the same lines in either spelling"
     );
     assert_eq!(
-        found(&extract_links(&german)),
+        found(&extract_links(&dos)),
         [("notizen/andere.md", LinkKind::Md, 13)],
         "the in-page anchor `[siehe](#anker)` on that line adds no row"
     );
@@ -397,6 +402,33 @@ fn markdown_destinations_are_normalised() {
             ("notes/z.md", LinkKind::Md, 1),
         ]
     );
+
+    // A title attribute is pandoc/GitHub/editor noise, not part of the path: `[x](a.md "Title")`
+    // is a link to `a.md`. Left attached, the file name ends in `"Title"`, so the extension test
+    // reads `md "Title"` — the note link gets filed as an attachment whose target nothing can
+    // place, and every such link inflates `unresolved_links`.
+    assert_eq!(
+        found(&extract_links(
+            "[x](notes/a.md \"Release\") ![alt](img/x.png \"The title\") [y](my photo.png)\n"
+        )),
+        [
+            ("notes/a.md", LinkKind::Md, 1),
+            ("img/x.png", LinkKind::Attachment, 1),
+            // A path that merely contains a space keeps it: the cut needs whitespace *and* a
+            // quote, which is what separates a title from a file name.
+            ("my photo.png", LinkKind::Attachment, 1),
+        ],
+        "a title must not change a link's kind or leave its target holding the tooltip"
+    );
+
+    // A fragment and a title on one destination, and a destination that is nothing but a quoted
+    // string — which names no file and stays skipped.
+    assert_eq!(
+        found(&extract_links(
+            "[x](notes/b.md#stelle \"Tipp\") [y](\"a b\")\n"
+        )),
+        [("notes/b.md", LinkKind::Md, 1)]
+    );
 }
 
 #[test]
@@ -426,6 +458,14 @@ fn brackets_that_are_not_links() {
     );
     assert_eq!(found(&extract_links("] x ] (y.md) and [[]]\n")), []);
 
+    // An unterminated `[[` steps one character, not two, so its own second bracket gets its turn
+    // at the markdown syntax — which is why the link after the junk below is still found.
+    assert_eq!(
+        found(&extract_links("]] then [[x](notes/a.md)\n")),
+        [("notes/a.md", LinkKind::Md, 1)],
+        "the failed wikilink must not skip the bracket that could open a markdown link"
+    );
+
     // A target is sliced by byte index, so multi-byte text next to the brackets — `\u{00e4}` is
     // the `ä` of `nächste.md` — is the case that would fail on a character boundary.
     assert_eq!(
@@ -433,19 +473,96 @@ fn brackets_that_are_not_links() {
         [("ä", LinkKind::Wiki, 1), ("nächste.md", LinkKind::Md, 1),]
     );
 
-    // Malformed bracket soup is not an error either; the scanner just walks past it.
+    // Malformed bracket soup is not an error either. Two shapes are pinned rather than merely
+    // exercised, so what the scanner decides about them cannot drift silently: `[[![](]` yields no
+    // row at all — the text between `[[` and the first `]]` is `![](`, which names no file — while
+    // `[[a]]]](` yields the one row that is genuinely there, a wikilink to `a`.
+    assert_eq!(found(&extract_links("[[![](]")), []);
+    assert_eq!(
+        found(&extract_links("[[a]]]](")),
+        [("a", LinkKind::Wiki, 1)],
+        "the trailing `]](` is junk; the wikilink before it is real"
+    );
+
+    // The rest only have to survive: no panic, however the brackets are stacked next to
+    // multi-byte text.
     for junk in [
         "[[[",
         "]]](",
         "[]](",
         "[[|]](((",
         "[\\",
-        "[[a]]]](",
-        "[[![](]",
         "\u{1f600}[[\u{e9}\u{1f600}]](",
     ] {
         let _ = extract_links(junk);
     }
+}
+
+/// The same shapes at the size of a real accident.
+///
+/// An unfenced paste of minified JSON or JS is one line holding tens of thousands of `[`, and
+/// `parse_markdown` now extracts links from every note, so a scanner that asks each `[` whether
+/// anything closes it spends the rest of the afternoon there. `scan_line` answers `]]` and the
+/// bracket pairs once per line instead, which is the property this measures.
+///
+/// Ignored and release-only, in the style of Task 8's huge-input test: run it with
+/// `cargo test --release -- --ignored`, which CI does from Task 10 on. The bound is deliberately
+/// generous — orders of magnitude above what the linear scan measures — so it fails on a quadratic
+/// shape rather than on a busy machine.
+#[test]
+#[ignore = "huge single-line input; release-only (`cargo test --release -- --ignored`)"]
+fn bracket_heavy_line_is_linear() {
+    // One line of a million openers with no `]]` anywhere: every `[` is a wikilink attempt nothing
+    // closes, followed by a markdown attempt whose brackets never pair either.
+    let unmatched = "[".repeat(1_000_000);
+    // A second line whose brackets *do* pair and which carries both `](` and `)`, so the markdown
+    // branch is reached on every opener and the one pairing pass does the whole job.
+    let paired = format!("{}(a)", "[x]".repeat(250_000));
+    let text = format!("{unmatched}\n{paired}\n");
+
+    let start = Instant::now();
+    let links = extract_links(&text);
+    let elapsed = start.elapsed();
+
+    assert!(links.is_empty(), "brackets alone are not links: {links:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "1.25M brackets over two lines took {elapsed:?}; the scan is quadratic in line length",
+    );
+}
+
+#[test]
+fn unknown_origin_is_refused() {
+    // `links.origin` has a CHECK domain, so a wrong spelling at the call site has to fail loudly
+    // rather than write rows nothing later recognises. Modelled on the CHECK probes of
+    // `tests/db.rs`: assert the constraint violation itself, then that nothing was written.
+    let db = Db::in_memory().expect("in-memory database");
+    add_note(&db, "index.md");
+    add_note(&db, "notes/a.md");
+    let links = [ResolvedLink {
+        src_rel: "index.md".to_string(),
+        target: "notes/a.md".to_string(),
+        kind: LinkKind::Md,
+        line: 1,
+        dst_rel: Some("notes/a.md".to_string()),
+    }];
+
+    let err = store_links(&db, &links, "notes")
+        .expect_err("an origin outside the CHECK domain has to be refused");
+    assert!(
+        matches!(
+            err,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(fault, _))
+                if fault.code == rusqlite::ErrorCode::ConstraintViolation
+        ),
+        "expected a CHECK violation on origin, got {err}"
+    );
+    assert!(rows(&db).is_empty(), "a refused link writes no row");
+
+    // The same list goes in under a spelling the schema knows, so the refusal above was about
+    // `origin` and not about the row.
+    store_links(&db, &links, "prose").expect("the same link under a known origin");
+    assert_eq!(rows(&db).len(), 1);
 }
 
 #[test]
