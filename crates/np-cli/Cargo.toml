@@ -10,3 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+np-core = { path = "../np-core" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
