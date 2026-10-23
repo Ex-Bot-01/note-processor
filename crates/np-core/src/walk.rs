@@ -233,7 +233,7 @@ fn is_excluded(name: &str) -> bool {
 /// derived output placed at the workspace root (spec §7), so a nested `INDEX-old.md`
 /// is an ordinary note and this exclusion applies only one level below the root.
 /// Matching is exact-case because these names are ours to write.
-fn is_generated_index(name: &str) -> bool {
+pub(crate) fn is_generated_index(name: &str) -> bool {
     match name.strip_suffix(MARKDOWN_SUFFIX) {
         Some(stem) => stem == INDEX_STEM || stem.starts_with(INDEX_SHARD_PREFIX),
         None => false,
@@ -272,7 +272,11 @@ fn sort_found(found: &mut [DiscoveredFile]) {
 }
 
 /// Modification time as whole seconds since the Unix epoch, `0` when unavailable.
-fn epoch_secs(meta: &fs::Metadata) -> i64 {
+///
+/// Shared with [`crate::scan`], which re-states a file before reading it: comparing that second
+/// against the walk's is what catches a file rewritten mid-scan, so both readings have to round
+/// time the same way.
+pub(crate) fn epoch_secs(meta: &fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|when| when.duration_since(SystemTime::UNIX_EPOCH).ok())

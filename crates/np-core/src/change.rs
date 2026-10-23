@@ -34,6 +34,12 @@ pub enum Change {
 /// `rel`, `false` (Windows) keys on `case_key` (spec §11). It is an argument rather than a
 /// `#[cfg]` so both rules are testable on one machine; the call site passes `!cfg!(windows)`.
 ///
+/// Input contract: each side holds **at most one snapshot per identity**, which is what
+/// [`Snapshot::new`] over one [`crate::walk::DiscoveredFile`] gives a caller — two snapshots of one
+/// path would be paired positionally and could report the pair as a move. Both lists come from the
+/// same walk, so `case_key` is every entry's own `rel` lowercased; a snapshot that breaks that rule
+/// matches files it is not.
+///
 /// The decisions, in order:
 ///
 /// - A snapshot with an empty `hash` is a read failure, not content. Found-side markers
@@ -41,6 +47,7 @@ pub enum Change {
 ///   — an unreadable file is unknown, not deleted. Known-side markers are dropped, so they
 ///   can neither produce a `Removed` nor lend their hash to a move; a readable file sitting
 ///   on such a path is therefore `Added`, which is what fills the empty row in.
+///
 /// - A matched pair whose `size` **and** `mtime` both equal `found`'s emits nothing without
 ///   consulting the hashes at all.
 /// - Otherwise the hashes decide: different hash at the same identity is `Modified`; equal
@@ -74,8 +81,14 @@ pub fn classify(
 
     let mut changes: Vec<(String, Change)> = Vec::new();
     // Hashes the workspace still holds at a path that did not go away. A move may never
-    // claim content that is still sitting where it was.
-    let mut present_hashes: HashSet<&str> = HashSet::new();
+    // claim content that is still sitting where it was — which includes both spellings of a
+    // matched pair (its old bytes and the new ones written to the same path) and the known hash
+    // behind a path that could only not be **read**, since unreadable content has not departed.
+    let mut present_hashes: HashSet<&str> = known
+        .iter()
+        .filter(|s| !s.hash.is_empty() && unreadable.contains(key_of(s, case_sensitive)))
+        .map(|s| s.hash.as_str())
+        .collect();
     let mut unmatched_known: Vec<&Snapshot> = Vec::new();
     let mut unmatched_found: Vec<&Snapshot> = Vec::new();
 
@@ -89,6 +102,7 @@ pub fn classify(
         // `rel` order, so the pairing does not depend on the caller's input order.
         for (before, after) in knowns.iter().zip(founds.iter()) {
             present_hashes.insert(before.hash.as_str());
+            present_hashes.insert(after.hash.as_str());
             if before.size == after.size && before.mtime == after.mtime {
                 continue;
             }

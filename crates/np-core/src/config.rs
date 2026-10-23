@@ -130,19 +130,29 @@ impl Config {
     /// that is present keeps every default its structs provide, so a partial file
     /// only changes the keys it spells out; unparsable content is
     /// [`ConfigError::Parse`]. Unknown keys are allowed.
+    /// A `data_dir` neither the file nor the environment supplied is a failure, not a default:
+    /// every path this program derives from it would go relative — a `workspaces/` directory next
+    /// to whatever directory the command happened to run in. The CLI reports it and exits 1.
     pub fn load(override_: Option<&Path>) -> Result<Config, ConfigError> {
-        match override_ {
-            Some(path) => read_config(path),
+        let mut cfg = match override_ {
+            Some(path) => read_config(path)?,
             None => match config_file_path() {
                 Some(path) => match read_config(&path) {
                     Err(ConfigError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
-                        Ok(Config::default())
+                        Config::default()
                     }
-                    other => other,
+                    other => other?,
                 },
-                None => Ok(Config::default()),
+                None => Config::default(),
             },
+        };
+        if cfg.data_dir.as_os_str().is_empty() {
+            // A config file that does not name a data dir means the OS one, which
+            // `Config::default()` already resolved; reaching here empty means the environment
+            // named nothing either.
+            cfg.data_dir = default_data_dir().ok_or(ConfigError::MissingField("data_dir"))?;
         }
+        Ok(cfg)
     }
 
     /// This workspace's database: `data_dir/workspaces/<sha256(abs)[0..16]>.sqlite`.
@@ -150,8 +160,14 @@ impl Config {
     /// The workspace need not exist: the absolute spelling of `workspace` (current
     /// directory prepended when relative, no symlink resolution) is hashed as
     /// given, so the same input always yields the same path.
+    ///
+    /// The digest covers the raw OS bytes rather than a decoded string, because lossy decoding maps
+    /// two different paths onto one text: a byte that is not valid UTF-8 and a literal replacement
+    /// character both decode to `U+FFFD`. Two workspaces sharing one database would mark each
+    /// other's notes stale on alternate scans. Windows has no byte-exact spelling of a path to reach
+    /// for, so it keeps the lossy one.
     pub fn workspace_db(&self, workspace: &Path) -> PathBuf {
-        let digest = Sha256::digest(abs_path(workspace).to_string_lossy().as_bytes());
+        let digest = Sha256::digest(path_bytes(&abs_path(workspace)));
         let name = hex_prefix(&digest[..DB_HASH_BYTES]);
         self.data_dir
             .join("workspaces")
@@ -179,7 +195,10 @@ fn read_config(path: &Path) -> Result<Config, ConfigError> {
 
 /// Absolute spelling of `path`: the current directory is prepended when it is
 /// relative, symlinks are not resolved.
-fn abs_path(path: &Path) -> PathBuf {
+///
+/// Shared with [`crate::scan`], which walks and writes through this same spelling so the workspace
+/// key in a database row and the name in the registry are the one absolute path.
+pub(crate) fn abs_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -187,6 +206,21 @@ fn abs_path(path: &Path) -> PathBuf {
         // directory leaves the spelling as given instead of failing.
         env::current_dir().unwrap_or_default().join(path)
     }
+}
+
+/// The bytes of a path as the OS holds them, which is what makes two paths that decode to the same
+/// lossy text hash apart.
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// The bytes of a path as the OS holds them. Windows paths are UTF-16 and reach this program as
+/// text, so its spelling stays lossy — see [`Config::workspace_db`].
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 /// Lowercase hex for the leading bytes of a digest.
@@ -232,14 +266,18 @@ fn config_dir() -> Option<PathBuf> {
 }
 
 /// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share` (Windows: `%LOCALAPPDATA%`).
+/// `None` when the environment names no data directory at all — what [`Config::load`] refuses
+/// rather than deriving paths relative to the current directory.
 #[cfg(windows)]
-fn default_data_dir() -> Option<PathBuf> {
+pub fn default_data_dir() -> Option<PathBuf> {
     dir_from(env_path("LOCALAPPDATA"), None, None)
 }
 
 /// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share` (Windows: `%LOCALAPPDATA%`).
+/// `None` when the environment names no data directory at all — what [`Config::load`] refuses
+/// rather than deriving paths relative to the current directory.
 #[cfg(not(windows))]
-fn default_data_dir() -> Option<PathBuf> {
+pub fn default_data_dir() -> Option<PathBuf> {
     dir_from(
         env_path("XDG_DATA_HOME"),
         env_path("HOME"),

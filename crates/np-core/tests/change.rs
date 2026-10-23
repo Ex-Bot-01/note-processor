@@ -322,3 +322,40 @@ fn one_entry_per_path_and_sorted_by_rel() {
         ]
     );
 }
+
+#[test]
+fn a_matched_pair_protects_its_new_hash_from_a_move_claim() {
+    // `a.md` was edited into content `g2`, and `c.md` is a copy of that same new content while
+    // `b.md` (also `g2`) disappears. Content `g2` is demonstrably still in the workspace, so
+    // `c.md` is a second file holding it — not `b.md` travelling, which would rewrite a live
+    // row's `rel` and give one note two paths to the same bytes.
+    let known = vec![snap("a.md", "g1", 10, 100), snap("b.md", "g2", 20, 200)];
+    let found = vec![snap("a.md", "g2", 30, 300), snap("c.md", "g2", 30, 300)];
+
+    assert_eq!(
+        classify(&known, &found, CASE_SENSITIVE),
+        vec![
+            ("a.md".to_string(), Change::Modified),
+            ("b.md".to_string(), Change::Removed),
+            ("c.md".to_string(), Change::Added),
+        ]
+    );
+}
+
+#[test]
+fn an_unreadable_path_protects_its_known_hash_from_a_move_claim() {
+    // `a.md` could not be read this time (empty hash marker), `b.md` is gone and `c.md` carries
+    // the hash all three used to share. `a.md`'s content is unknown, not absent, so nothing may
+    // claim to have moved from `b.md`: `c.md` is added and `b.md` stays out of the output as a
+    // move source.
+    let known = vec![snap("a.md", "dup", 10, 100), snap("b.md", "dup", 10, 100)];
+    let found = vec![snap("a.md", "", 0, 0), snap("c.md", "dup", 10, 300)];
+
+    assert_eq!(
+        classify(&known, &found, CASE_SENSITIVE),
+        vec![
+            ("b.md".to_string(), Change::Removed),
+            ("c.md".to_string(), Change::Added),
+        ]
+    );
+}

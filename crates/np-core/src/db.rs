@@ -378,18 +378,44 @@ fn count(conn: &Connection, sql: &str) -> Result<i64, DbError> {
 /// move of a file inside a directory — `C:\ws\notes\a.md` does not end with `notes/a.md` — and
 /// the replacement is re-spelled with whichever separator matched, so the new path stays native.
 ///
-/// The separator check is what stops `/ws/xa.md` from being read as ending in `a.md`.
+/// The separator check is what stops `/ws/xa.md` from being read as ending in `a.md`. The boundary
+/// itself may be spelled either way, because a root the user wrote with one separator keeps it
+/// where the first component was joined while deeper components carry the platform's own: a stored
+/// `C:/ws/notes\a.md` is the same file under `C:/ws/` as `C:\ws\notes\a.md`, and answering `BadAbs`
+/// for the mixed spelling would lose a nested rename's history.
 fn rebase_abs(abs: &str, from: &str, to: &str) -> Option<String> {
     for separator in ["/", "\\"] {
         let suffix = from.replace('/', separator);
         let Some(root) = abs.strip_suffix(suffix.as_str()) else {
             continue;
         };
-        if root.is_empty() || root.ends_with(separator) {
+        if root.is_empty() || root.ends_with(['/', '\\']) {
             return Some(format!("{root}{}", to.replace('/', separator)));
         }
     }
     None
+}
+
+/// The non-attachment link targets no note answers: the "notes I could not place" list behind
+/// [`ScanReport::unresolved_links`](crate::ScanReport).
+///
+/// `note_counts` counts every NULL destination, because at database level an attachment with no
+/// note row behind it is unresolved like a missing file; this is the author-facing question instead,
+/// so attachments are left out and only notes are asked about. Stale sources count too — their rows
+/// are history the report does not rewrite. Sorted and deduplicated: one name written in three
+/// notes is one thing to fix.
+pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
+    let mut statement = db.0.prepare(
+        "SELECT DISTINCT target FROM links
+          WHERE dst_note_id IS NULL AND origin = 'prose' AND kind != 'attachment'
+          ORDER BY target",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut targets = Vec::new();
+    for row in rows {
+        targets.push(row?);
+    }
+    Ok(targets)
 }
 
 #[cfg(test)]
@@ -424,6 +450,22 @@ mod tests {
         assert_eq!(
             rebase_abs("C:\\ws\\a.md", "a.md", "b.md"),
             Some("C:\\ws\\b.md".to_string())
+        );
+    }
+
+    #[test]
+    fn rebase_abs_accepts_either_separator_at_the_boundary() {
+        // A Windows root spelled `C:/ws/` keeps its slash where the first component is joined,
+        // while everything deeper arrives with backslashes, so the stored path mixes spellings.
+        // Refusing this would answer `BadAbs` to every nested rename under such a root.
+        assert_eq!(
+            rebase_abs("C:/ws/notes\\a.md", "notes/a.md", "notes/b.md"),
+            Some("C:/ws/notes\\b.md".to_string())
+        );
+        // The mirror case: a backslash root, slash-separated contents.
+        assert_eq!(
+            rebase_abs("C:\\ws/notes/a.md", "notes/a.md", "notes/sub/b.md"),
+            Some("C:\\ws/notes/sub/b.md".to_string())
         );
     }
 

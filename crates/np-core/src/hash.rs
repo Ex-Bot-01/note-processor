@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::walk;
+use crate::walk::{self, DiscoveredFile};
 
 /// Bytes read per iteration when hashing a file. Notes are small, but one pathological
 /// multi-megabyte file must not decide how much memory a scan needs.
@@ -37,6 +37,25 @@ pub struct Snapshot {
     pub size: u64,
     /// Modification time in whole seconds since the Unix epoch.
     pub mtime: i64,
+}
+
+impl Snapshot {
+    /// The snapshot of one discovered file with the given content digest.
+    ///
+    /// `rel` and `case_key` travel together from [`DiscoveredFile`] rather than being spelled out
+    /// at each call site, because [`crate::change::classify`] matches identity on one and reports
+    /// the other: a snapshot whose `case_key` is not its own `rel` lowercased would match files
+    /// that are not it. Pass an empty `hash` for a file whose contents could not be read — that
+    /// is the marker [`crate::change::classify`] reads as "unknown".
+    pub fn new(found: &DiscoveredFile, hash: String) -> Self {
+        Snapshot {
+            rel: found.rel.clone(),
+            case_key: found.case_key.clone(),
+            hash,
+            size: found.size,
+            mtime: found.mtime,
+        }
+    }
 }
 
 /// What can fail while hashing a file.

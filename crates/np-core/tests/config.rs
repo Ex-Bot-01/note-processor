@@ -285,3 +285,35 @@ fn registry_reopens_without_losing_rows() {
         .expect("test: read journal_mode");
     assert_eq!(mode.to_lowercase(), "wal");
 }
+
+/// A workspace path whose raw bytes are not valid UTF-8, so no `String` can hold it.
+#[cfg(unix)]
+fn non_utf8_workspace() -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    // `0xFF` is not a UTF-8 sequence: this is a real OS path whose lossy text carries `U+FFFD`.
+    PathBuf::from(OsStr::from_bytes(b"/ws/we\xffrd"))
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_db_separates_a_non_utf8_path_from_its_lossy_spelling() {
+    // Lossy decoding maps `0xFF` and a literal replacement character to the same text, so hashing
+    // the decoded string would hand two different workspaces one database — and each scan of one
+    // would mark the other's notes stale.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let cfg = config_with_data_dir(tmp.path());
+    let raw = non_utf8_workspace();
+    let lossy_twin = PathBuf::from("/ws/we\u{fffd}rd");
+
+    assert_eq!(
+        raw.as_os_str().to_string_lossy(),
+        lossy_twin.as_os_str().to_string_lossy(),
+        "test premise: the two paths decode to one text"
+    );
+    assert_ne!(
+        cfg.workspace_db(&raw),
+        cfg.workspace_db(&lossy_twin),
+        "the database key is the raw OS path, not its lossy text"
+    );
+}
