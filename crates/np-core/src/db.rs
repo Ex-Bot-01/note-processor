@@ -12,7 +12,8 @@
 //! [`rusqlite::Connection::unchecked_transaction`], which needs the public connection.
 
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 use thiserror::Error;
@@ -109,9 +110,18 @@ pub const MIGRATIONS: &[&str] = &[
 /// What can fail while opening or writing the workspace database.
 #[derive(Debug, Error)]
 pub enum DbError {
-    /// The database file or its directory could not be created.
-    #[error("db io: {0}")]
-    Io(#[from] std::io::Error),
+    /// The database's directory could not be created. Like [`crate::hash::HashError::Read`],
+    /// the message names the path it failed on: a report that cannot say which database broke
+    /// is no use to whoever has to fix it. A database file that opens but rejects a statement
+    /// arrives through [`DbError::Sqlite`] instead — SQLite's own text already quotes the file
+    /// name (`unable to open database file: <path>`), so nothing re-wraps it.
+    #[error("cannot create the database at {}: {source}", .path.display())]
+    Io {
+        /// The database path whose directory could not be made.
+        path: PathBuf,
+        /// Why it failed.
+        source: io::Error,
+    },
     /// SQLite rejected a statement. Constraint violations arrive unchanged, because Task 10
     /// reports the offending path under `skipped` and carries on with the next one.
     #[error("sqlite: {0}")]
@@ -160,7 +170,10 @@ impl Db {
             // `Path::parent` of a bare file name is the empty path, which is not a directory
             // to create.
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(|source| DbError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
             }
         }
         let conn = Connection::open(path)?;
@@ -260,8 +273,15 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
 /// derived from the note's content are keyed on `notes.id` and therefore not affected at all.
 /// `case_key` is lowercased here in Rust, the way [`crate::walk`] builds it — SQLite's
 /// `LOWER()` folds ASCII only and would give a renamed umlaut filename a case key no snapshot
-/// ever produces. `abs` is rebased by swapping the old `rel` suffix for the new one, so the
-/// workspace root keeps its exact spelling.
+/// ever produces. `abs` is rebased by swapping the old `rel` suffix for the new one under
+/// whichever separator spelling the stored path uses — `rel` is always `/`-separated while `abs`
+/// is native — so the workspace root keeps its exact spelling and a Windows move stays a Windows
+/// path.
+///
+/// The row also comes back to `state = 'ok'`: `classify` reports `Moved` only for a path that is
+/// there now, so a move is a sighting even when the file had been marked stale. It refreshes
+/// `last_seen` and `state` but not `size`, `mtime` or `hash` — a caller that learned fresh
+/// metadata with the move follows up with [`upsert_file`].
 ///
 /// A missing `from` is an error rather than a silent no-op: the caller got it from a row that
 /// was there a moment ago, and moving nothing would leave the scan reporting a move that did
@@ -287,7 +307,7 @@ pub fn apply_move(db: &Db, from: &str, to: &str, now: i64) -> Result<(), DbError
 
     db.0.execute(
         "UPDATE files
-            SET rel = ?2, case_key = ?3, abs = ?4, last_seen = ?5
+            SET rel = ?2, case_key = ?3, abs = ?4, last_seen = ?5, state = 'ok'
           WHERE rel = ?1",
         params![from, to, to.to_lowercase(), new_abs, now],
     )?;
@@ -352,16 +372,24 @@ fn count(conn: &Connection, sql: &str) -> Result<i64, DbError> {
 /// `abs` with its trailing `from` replaced by `to`, or `None` when `abs` does not end in
 /// `from` along a separator.
 ///
-/// The separator check is what stops `/ws/xa.md` from being read as ending in `a.md`. Both
-/// separators count because `rel` is always `/`-separated while `abs` uses the platform's own,
-/// and on Windows a path can carry either.
+/// The suffix is tried under both separator spellings, because the two paths are spelled
+/// differently by design: `rel` is always `/`-separated ([`crate::walk`] joins with `/`) while
+/// `abs` is the native path the walker was handed. Matching only `/` would fail every Windows
+/// move of a file inside a directory — `C:\ws\notes\a.md` does not end with `notes/a.md` — and
+/// the replacement is re-spelled with whichever separator matched, so the new path stays native.
+///
+/// The separator check is what stops `/ws/xa.md` from being read as ending in `a.md`.
 fn rebase_abs(abs: &str, from: &str, to: &str) -> Option<String> {
-    let root = abs.strip_suffix(from)?;
-    if root.is_empty() || root.ends_with('/') || root.ends_with('\\') {
-        Some(format!("{root}{to}"))
-    } else {
-        None
+    for separator in ["/", "\\"] {
+        let suffix = from.replace('/', separator);
+        let Some(root) = abs.strip_suffix(suffix.as_str()) else {
+            continue;
+        };
+        if root.is_empty() || root.ends_with(separator) {
+            return Some(format!("{root}{}", to.replace('/', separator)));
+        }
     }
+    None
 }
 
 #[cfg(test)]
@@ -385,6 +413,18 @@ mod tests {
             Some("C:\\ws\\sub\\b.md".to_string())
         );
         assert_eq!(rebase_abs("a.md", "a.md", "b.md"), Some("b.md".to_string()));
+        // The case that matters on Windows: `rel` is `/`-separated, `abs` is not, and the
+        // file sits inside a directory. Answering None here would lose the note's history.
+        assert_eq!(
+            rebase_abs("C:\\ws\\notes\\a.md", "notes/a.md", "notes/b.md"),
+            Some("C:\\ws\\notes\\b.md".to_string())
+        );
+        // A root-level file whose abs uses backslashes: the match happens on the second
+        // spelling, so the answer keeps the native separator.
+        assert_eq!(
+            rebase_abs("C:\\ws\\a.md", "a.md", "b.md"),
+            Some("C:\\ws\\b.md".to_string())
+        );
     }
 
     #[test]
@@ -393,5 +433,7 @@ mod tests {
         // abs from another workspace has nothing to swap.
         assert_eq!(rebase_abs("/ws/xa.md", "a.md", "b.md"), None);
         assert_eq!(rebase_abs("/elsewhere/a.md", "notes/a.md", "b.md"), None);
+        // The same trap in the Windows spelling.
+        assert_eq!(rebase_abs("C:\\ws\\xa.md", "a.md", "b.md"), None);
     }
 }

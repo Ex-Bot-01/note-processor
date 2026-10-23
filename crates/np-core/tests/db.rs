@@ -6,6 +6,7 @@
 //! and `items` are inserted here by hand: filling them in is Tasks 7-9's job, and this
 //! module must not grow an API just to make its own tests shorter.
 
+use std::fs;
 use std::path::Path;
 
 use np_core::db::{
@@ -84,7 +85,10 @@ fn migrations_are_idempotent() {
     // A nested path so the same call is also shown to create the directories it needs.
     let path = tmp.path().join("workspaces").join("ws.sqlite");
 
-    drop(Db::open(&path).expect("first open migrates"));
+    let first = Db::open(&path).expect("first open migrates");
+    upsert_file(&first, &snap("a.md", "h1"), Path::new("/ws/a.md"), 7)
+        .expect("test setup: one registry row");
+    drop(first);
     let db = Db::open(&path).expect("second open applies nothing new");
 
     // One row per migration after two opens: the version bookkeeping neither re-applies
@@ -103,8 +107,14 @@ fn migrations_are_idempotent() {
             .expect("schema_version values");
     assert_eq!(versions, (1..=MIGRATIONS.len() as i64).collect::<Vec<_>>());
 
-    // Migration 1 created its tables and the second open did not recreate or empty them.
-    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM files"), 0);
+    // Migration 1 created its tables and the second open neither recreated nor emptied them.
+    // Without the written row, a version-bookkeeping bug that dropped and rebuilt a table would
+    // look exactly as green as this test did before.
+    assert_eq!(
+        scalar::<String>(&db, "SELECT hash FROM files WHERE rel = 'a.md'"),
+        "h1",
+        "the row written before the reopen is still there"
+    );
     assert!(path.exists(), "the database file is where it was asked for");
 }
 
@@ -123,6 +133,26 @@ fn a_schema_newer_than_this_build_is_an_error() {
     assert!(
         err.to_string().contains("99"),
         "the error has to name the version it cannot handle: {err}"
+    );
+}
+
+#[test]
+fn an_unusable_database_path_names_itself() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    // A regular file where the database's parent directory should be: `create_dir_all` cannot
+    // work, and the failure is worthless to a report unless it says which path broke.
+    let blocker = tmp.path().join("blocker");
+    fs::write(&blocker, b"not a directory").expect("test setup: blocker file");
+    let path = blocker.join("ws.sqlite");
+
+    let err = Db::open(&path).expect_err("a file cannot hold a database directory");
+    assert!(
+        matches!(err, DbError::Io { .. }),
+        "expected the io variant, got {err}"
+    );
+    assert!(
+        err.to_string().contains(&path.display().to_string()),
+        "the error names the database path: {err}"
     );
 }
 
@@ -200,6 +230,12 @@ fn the_schema_is_what_the_plan_mandates() {
     );
     rejects(
         &db,
+        "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+         VALUES (1, NULL, 'md', 'x.md', 1, 'user')",
+        "links.origin",
+    );
+    rejects(
+        &db,
         "INSERT INTO items (note_id, text, line, state, marker)
          VALUES (1, 'task', 1, 'wip', NULL)",
         "items.state",
@@ -235,6 +271,17 @@ fn move_keeps_note_identity() {
     )
     .expect("test setup: heading row");
     let link_before = link_row(&db);
+
+    // An earlier scan reported this path gone. `classify` can only emit `Moved` for a path that
+    // is there now, so the move has to bring the row back into the live set.
+    mark_stale(&db, from).expect("mark the file stale first");
+    assert_eq!(
+        scalar::<String>(
+            &db,
+            &format!("SELECT state FROM files WHERE rel = '{from}'")
+        ),
+        "stale"
+    );
 
     apply_move(
         &db,
@@ -272,6 +319,11 @@ fn move_keeps_note_identity() {
 
     // The registry row itself moved, and its derived columns moved with it.
     assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM files"), 1);
+    assert_eq!(
+        scalar::<String>(&db, &format!("SELECT state FROM files WHERE rel = '{to}'")),
+        "ok",
+        "a moved file is present, so it stops being stale"
+    );
     assert_eq!(
         scalar::<String>(
             &db,
@@ -453,6 +505,12 @@ fn wal_and_foreign_keys_are_set_where_they_are_legal() {
         "wal",
         "a file database runs in WAL"
     );
+    // Caveat for whoever reads a green run as proof: the bundled SQLite is compiled with
+    // `-DSQLITE_DEFAULT_FOREIGN_KEYS=1` (libsqlite3-sys build.rs), so `foreign_keys` already
+    // reads 1 on a connection this program never configured — deleting the pragma line from
+    // `Db::open`/`Db::in_memory` would not fail a single test here. The pragma stays because a
+    // non-bundled SQLite defaults it to OFF, and then a move would quietly leave its notes on
+    // the old path.
     assert_eq!(
         scalar::<i64>(&db, "PRAGMA foreign_keys"),
         1,
@@ -473,7 +531,9 @@ fn a_note_row_has_to_name_a_known_file() {
     let db = Db::in_memory().expect("in-memory database");
 
     // `notes.rel REFERENCES files(rel)` is what makes an orphan note impossible; the same
-    // key is what `apply_move` cascades along.
+    // key is what `apply_move` cascades along. Like the `PRAGMA foreign_keys` readings in
+    // `wal_and_foreign_keys_are_set_where_they_are_legal`, this fires on the bundled build's
+    // default too, so it does not prove the pragma — only that the constraint is declared.
     let err = insert_note_err(&db, "never-seen.md");
     assert!(
         matches!(
