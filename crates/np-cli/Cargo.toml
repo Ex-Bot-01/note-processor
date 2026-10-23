@@ -1,0 +1,12 @@
+[package]
+name = "np-cli"
+version.workspace = true
+edition.workspace = true
+description = "note-processor command line interface"
+
+[[bin]]
+name = "np"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
