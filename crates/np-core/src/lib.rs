@@ -4,6 +4,7 @@ pub mod change;
 pub mod config;
 pub mod db;
 pub mod hash;
+pub mod parse;
 pub mod walk;
 
 /// Milestone version this crate implements, taken from the workspace version.
