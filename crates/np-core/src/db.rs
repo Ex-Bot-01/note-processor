@@ -625,9 +625,13 @@ fn first_violation(conn: &Connection) -> Result<Option<(String, i64, String)>, D
 /// path under `skipped` and keeps scanning.
 ///
 /// This and [`apply_move`] / [`mark_stale`] prepare through [`Connection::prepare_cached`], like the
-/// scan path already does: all three run once per file inside one scan's write loop, so an
-/// uncached [`Connection::execute`] would re-compile the same handful of statements thousands of
-/// times per run. Caching changes how a statement is obtained, not what it does: every error — the
+/// scan path already does, because each runs once per *path* inside a scan's write loop rather than
+/// once per run: this one for every file the walk found, [`apply_move`] for every moved path (a
+/// case-only rename included) and [`mark_stale`] for every removed one — so an uncached
+/// [`Connection::execute`] would re-compile these statements thousands of times over a large
+/// workspace. The saving is not three prepares per file: a warm pass over unchanged files calls only
+/// this function, since nothing moved and nothing went away, so exactly one prepare is saved per
+/// file. Caching changes how a statement is obtained, not what it does: every error — the
 /// identity collisions below included — reaches the caller exactly as it did before.
 pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), DbError> {
     db.0.prepare_cached(

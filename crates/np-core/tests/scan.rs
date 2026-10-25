@@ -1124,6 +1124,52 @@ fn renamed_to_an_attachment_leaves_the_catalog() {
 }
 
 #[test]
+fn a_byte_identical_rename_into_md_creates_the_missing_note_row() {
+    // The mirror of [`renamed_to_an_attachment_leaves_the_catalog`]: same bytes, extension gained.
+    // Classification reports a `Moved` and no content change, so only the missing-row half of the
+    // re-parse condition in `index_file` can index this note — the branch where `existing` is `None`
+    // while `rewritten` is false.
+    let ws = scratch(&[("idea.txt", "Gedanke ueber den Umbau\n")], 600);
+    let first = scan(&ws.root, &ws.cfg).expect("first scan");
+    assert_eq!(first.notes, 0, "an attachment is not a note: {first:?}");
+
+    fs::rename(ws.root.join("idea.txt"), ws.root.join("idea.md"))
+        .expect("test: rename the attachment to .md");
+    let report = scan(&ws.root, &ws.cfg).expect("scan after the rename");
+
+    // The hash is the identity and it did not change, so nothing was reported as content churn.
+    assert_eq!(report.moved, 1, "{report:?}");
+    assert_eq!(report.added, 0, "{report:?}");
+    assert_eq!(report.modified, 0, "{report:?}");
+
+    // `notes.rel` carries no UNIQUE constraint, so a caller-supplied id mis-passed as `None` would
+    // insert a second row rather than fail. Count the rows for the path; "at least one" would pass.
+    let open = ws.db();
+    assert_eq!(
+        scalar(&open, "SELECT COUNT(*) FROM notes WHERE rel = 'idea.md'"),
+        1,
+        "exactly one note row for the renamed path"
+    );
+    assert_eq!(report.notes, 1, "{report:?}");
+    assert!(
+        entry_line(&ws.root, "idea.md").is_some(),
+        "the rebuilt note is catalogued: {}",
+        index_text(&ws.root)
+    );
+
+    // A third scan has nothing left to do and must not add a row while doing it.
+    let again = scan(&ws.root, &ws.cfg).expect("scan after the rebuild");
+    assert_eq!(again.moved, 0, "{again:?}");
+    assert_eq!(again.added, 0, "{again:?}");
+    assert_eq!(again.notes, 1, "{again:?}");
+    assert_eq!(
+        scalar(&open, "SELECT COUNT(*) FROM notes WHERE rel = 'idea.md'"),
+        1,
+        "the no-op scan still found one row"
+    );
+}
+
+#[test]
 fn edge_into_a_deleted_note_reads_as_unresolved() {
     // Two notes linked together, in a corpus small enough to read the entry line off the catalog.
     let ws = scratch(

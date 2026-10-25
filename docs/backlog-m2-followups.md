@@ -133,6 +133,28 @@ split deliberately:
 
 If the delta is inside run-to-run noise, say so. A flat result is a usable answer; an unmeasured improvement claim is not.
 
+### Recorded results
+
+Both sets from `cargo test --release -p np-core --test perf -- --ignored --nocapture` on the same machine, three
+consecutive runs each, milliseconds per pass (cold = first pass over the corpus, warm = second pass over the identical
+files).
+
+| Build | Cold (ms) | Warm (ms) |
+| --- | --- | --- |
+| baseline `d2b55dc` — benchmark only, no F9/F10 | 395 / 410 / 401 | 57 / 58 / 58 |
+| after F9 + F10 at `14b2935` | 370 / 380 / 371 | 41 / 42 / 41 |
+
+What these numbers can and cannot carry:
+
+- Of the three statements F9 caches, only `upsert_file` ever runs against this corpus — nothing moves and nothing is
+  removed — so the two rows above cannot both be pure signal for the two changes. F10's saved lookup sits on the
+  re-parse path, which a cold pass reaches as `Added` (where the old code also did exactly one lookup) and a warm pass
+  never reaches at all; nothing here measures F10.
+- Therefore no percentage is recorded here, and **no figure from this table may be quoted as an improvement until an
+  A/B/A repeat** — baseline, change, baseline again, on this machine — confirms the gap survives a return to the first
+  commit. The run-to-run spread inside a single row (395 against 410) is visible in the same table as the gap between
+  rows, which is what that repeat is for.
+
 ## F15 — changing a parse rule never reaches notes that did not change
 
 - **Where:** `crates/np-core/src/scan.rs:499-501` — a note is re-parsed only when classification says

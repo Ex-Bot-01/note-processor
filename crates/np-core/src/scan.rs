@@ -607,11 +607,16 @@ fn folded_row(db: &Db, case_key: &str, rel: &str) -> Result<Option<String>, DbEr
 /// §10), so a rescan must never undo one.
 ///
 /// `existing` is the note row behind `rel` as [`index_file`] resolved it — `None` when there is none
-/// yet. The id is passed in rather than looked up here because the caller already had to ask the
-/// same question to decide whether a re-parse was needed, and a second lookup per note was F10.
-/// Nothing between that decision and this function can create the row: [`db::upsert_file`] writes
-/// `files` only, so no fresh read is required after it — and when `existing` is `None`, the `INSERT`
-/// below mints the id itself via `last_insert_rowid`, so none is needed after the write either.
+/// yet. The id is passed in rather than looked up here because [`index_file`] needs the same answer
+/// to decide whether to re-parse at all, and before F10 the duplicate existed on exactly one branch:
+/// its `rewritten || note_id(db, rel)?.is_none()` short-circuits on `Added | Modified`, so a changed
+/// note did its only lookup inside this function — only a row-less note, where `rewritten` is false
+/// and `is_none()` alone decides, was asked the question twice.
+///
+/// No fresh read is required between that lookup and here: [`db::upsert_file`] runs *before* it, not
+/// between, and writes `files` only, so nothing has touched `notes` in the meantime — and when
+/// `existing` is `None`, the `INSERT` below mints the id itself via `last_insert_rowid`, so none is
+/// needed after the write either.
 fn store_note(
     db: &Db,
     rel: &str,
