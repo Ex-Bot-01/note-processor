@@ -13,6 +13,10 @@
 //!   rewritten between the walk and the read, is named in [`ScanReport::skipped`] and keeps the row it
 //!   already has (Review Focus 5). Reporting either as `Removed` would stale live notes because of a
 //!   permission error or a race.
+//! - **Parse rules reach notes that did not change.** Byte comparison cannot see a rule change, so
+//!   `meta` records the parse rules version the rows were written with and a scan that finds a different
+//!   value re-parses every markdown note once (see [`PARSE_VERSION_KEY`]). Classification stays the
+//!   truth about the *files*: such a scan still reports its notes as unchanged.
 //! - **The catalog reads live rows only.** Entries and [`ScanReport::notes`] come from
 //!   `files.state = 'ok'`; [`crate::db::note_counts`] stays the unfiltered database truth, because a
 //!   stale note is hidden from the catalog, not forgotten (spec §2).
@@ -37,7 +41,7 @@ use crate::db::{self, Db, DbError, LIVE_EDGE, PROSE_ORIGIN};
 use crate::hash::{sha256_bytes, sha256_file, Snapshot};
 use crate::items::{extract_items, ItemCandidate};
 use crate::links::{resolve, store_links, RawLink};
-use crate::parse::{body_start, parse_markdown, NoteDoc};
+use crate::parse::{body_start, parse_markdown, NoteDoc, PARSE_VERSION};
 use crate::walk::{self, DiscoveredFile, WalkOptions};
 
 /// The UTF-8 byte order mark: dropped before decoding for parsing, kept in the bytes that are hashed.
@@ -50,6 +54,10 @@ const ENCODING_LOSSY: &str = "lossy";
 /// `meta` key holding the index files this program has published, newline-separated. The previous list
 /// is what lets a rescan delete the shards it no longer produces.
 const INDEX_FILES_KEY: &str = "index_files";
+/// `meta` key holding the value of [`crate::parse::PARSE_VERSION`] that this workspace's derived rows
+/// were written with. Absent means "written before this mechanism existed", which is not a version to
+/// compare against and therefore refreshes; see the comparison in `refresh_needed`.
+pub const PARSE_VERSION_KEY: &str = "parse_version";
 /// The catalog's entry point, which [`catalog::render`] returns first and every reader opens. It is
 /// renamed **last** (see [`write_index_files`]): an entry point naming shards that were never written is
 /// a broken catalog, while one that is merely old is still a correct one.
@@ -175,6 +183,12 @@ pub fn scan_with_inject(
     let snapshots: Vec<Snapshot> = found.iter().map(|found| found.snapshot.clone()).collect();
 
     let db = Db::open(&cfg.workspace_db(&root))?;
+    // Which rules wrote the rows on disk. Read before anything is written, so this one scan both does the
+    // re-parse and records what it re-parsed with: `classify` compares bytes and knows nothing about the
+    // rules that turn those bytes into headings, tags, items and links, so without this a note nobody has
+    // edited since an older build ran would keep its old derived rows forever (F15).
+    let stored = parse_version(&db)?;
+    let refresh = refresh_needed(stored);
     let now = now_secs();
     let changes = classify(
         &known_rows(&db, &walked.unreadable)?,
@@ -183,7 +197,15 @@ pub fn scan_with_inject(
     );
 
     let tx = db.0.unchecked_transaction().map_err(DbError::from)?;
-    let written = apply_changes(&db, &found, &changes, now, !cfg!(windows), &cfg.markers)?;
+    let written = apply_changes(
+        &db,
+        &found,
+        &changes,
+        refresh,
+        now,
+        !cfg!(windows),
+        &cfg.markers,
+    )?;
     // Resolution waits for that pass so a link can land on a file that only appeared in this scan, and
     // comes after the stale-marking so nothing resolves onto a note that just left the live set.
     store_note_links(&db, &written.parsed)?;
@@ -201,7 +223,17 @@ pub fn scan_with_inject(
     // so a kill between this commit and the writes below still leaves every stranded shard named.
     let rendered = catalog::render(&entries, &cfg.catalog);
     set_index_list(&db, &rendered)?;
+    if refresh {
+        // Recorded in the same transaction as the rows it describes: a scan that dies halfway has to
+        // refresh again rather than leave half the corpus labelled as current. An up-to-date database
+        // writes nothing here, so the steady-state scan pays one `SELECT` and no extra `INSERT`.
+        set_meta(&db, PARSE_VERSION_KEY, &PARSE_VERSION.to_string())?;
+    }
     tx.commit().map_err(DbError::from)?;
+    // After the commit, so nothing is announced about a scan that rolled itself back — the same rule
+    // [`crate::db::report_orphans`] follows. The report's own counts stay the classification truth; this
+    // is the only place a person learns that a scan with nothing to report did real work.
+    report_refresh(&mut io::stderr(), stored, written.refreshed);
 
     // A root entry that wears one of our names but is not ours stays on disk and reaches the report, so
     // the user hears about the collision instead of losing the file.
@@ -238,6 +270,10 @@ struct Written {
     unchanged: usize,
     /// Paths whose identity was already held by another row (see [`apply_changes`]).
     skipped: Vec<String>,
+    /// Notes this scan re-parsed **only** because the parse rules moved on — a file `classify` called
+    /// unchanged. Deliberately absent from [`ScanReport`], whose counts stay the classification truth and
+    /// whose JSON shape the CLI tests pin; [`report_refresh`] is where it becomes visible.
+    refreshed: usize,
     /// Every note re-parsed here, for [`store_note_links`].
     parsed: Vec<Parsed>,
 }
@@ -402,6 +438,7 @@ fn apply_changes(
     db: &Db,
     found: &[Found],
     changes: &[(String, Change)],
+    refresh: bool,
     now: i64,
     case_sensitive: bool,
     markers: &MarkerConfig,
@@ -421,10 +458,16 @@ fn apply_changes(
         }
         // `Removed` is keyed on a path that is not in `found`, so it cannot reach this lookup.
         let change = pending.get(rel).copied();
-        match index_file(db, readable, change, now, case_sensitive, markers)? {
+        match index_file(db, readable, change, refresh, now, case_sensitive, markers)? {
             Indexed::Taken => written.skipped.push(rel.to_string()),
             Indexed::Done(links) => {
                 if let Some(parsed) = links {
+                    // `Some` here means the text was re-parsed, and a note `classify` did not call
+                    // changed can only have been re-parsed because of `refresh`. An attachment yields
+                    // `None`, so it is never counted as refreshed.
+                    if refresh && matches!(change, None | Some(Change::Removed)) {
+                        written.refreshed += 1;
+                    }
                     written.parsed.push(parsed);
                 }
                 match change {
@@ -454,11 +497,13 @@ enum Indexed {
     Taken,
 }
 
-/// Bring one found file's row up to date and re-index its contents when they changed.
+/// Bring one found file's row up to date and re-index its contents when they changed, or when `refresh`
+/// says the rules that wrote its derived rows are no longer this build's.
 fn index_file(
     db: &Db,
     readable: &Found,
     change: Option<&Change>,
+    refresh: bool,
     now: i64,
     case_sensitive: bool,
     markers: &MarkerConfig,
@@ -496,7 +541,9 @@ fn index_file(
     // path. Missing rows are rebuilt whatever `classify` said: a file that changed extension into `.md`
     // while keeping its bytes is a `Moved`, and would otherwise stay unparsed forever.
     if let Some(text) = &readable.text {
-        let rewritten = matches!(change, Some(Change::Added | Change::Modified));
+        // `refresh` rewrites a note whose bytes did not change: the whole point of F15 is that its
+        // derived rows were written by rules this build no longer has.
+        let rewritten = refresh || matches!(change, Some(Change::Added | Change::Modified));
         // One id lookup per note, resolved here — after any move above has been applied, which is
         // what lets `notes.rel ON UPDATE CASCADE` have caught up with the path. The same answer
         // decides whether a note without a row is rebuilt (`is_none()` below) and whether
@@ -859,17 +906,34 @@ fn unresolved_links(db: &Db) -> Result<i64, DbError> {
 
 /// The index files this workspace holds from the last scan, from [`INDEX_FILES_KEY`].
 fn index_list(db: &Db) -> Result<Vec<String>, DbError> {
-    let stored: Option<String> =
-        db.0.query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            params![INDEX_FILES_KEY],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let stored = meta_value(db, INDEX_FILES_KEY)?;
     // One name per line, and no names at all when the value is an empty list rather than absent.
     Ok(stored.map_or_else(Vec::new, |value| {
         value.lines().map(str::to_string).collect()
     }))
+}
+
+/// One `meta` value as this program wrote it: `None` when the key was never written or holds NULL.
+fn meta_value(db: &Db, key: &str) -> Result<Option<String>, DbError> {
+    Ok(db
+        .0
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// The one `meta` upsert this module writes, shared by the published index-file list and the parse rules
+/// version, so neither invents its own conflict clause.
+fn set_meta(db: &Db, key: &str, value: &str) -> Result<(), DbError> {
+    db.0.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 /// Record the index files this scan publishes, so a later scan knows which shards to delete.
@@ -884,12 +948,50 @@ fn set_index_list(db: &Db, rendered: &[(String, String)]) -> Result<(), DbError>
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    db.0.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)
-         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        params![INDEX_FILES_KEY, value],
-    )?;
-    Ok(())
+    set_meta(db, INDEX_FILES_KEY, &value)
+}
+
+/// The parse rules version this workspace recorded under [`PARSE_VERSION_KEY`].
+///
+/// `None` covers "the key is absent" and "the value is not a number this build can read" — a NULL, a
+/// hand-edited file, a spelling from a future version. Both mean the same thing here: the stored rows
+/// carry no label this build can trust, so they are rewritten and the truth recorded.
+fn parse_version(db: &Db) -> Result<Option<u32>, DbError> {
+    Ok(meta_value(db, PARSE_VERSION_KEY)?.and_then(|value| value.trim().parse().ok()))
+}
+
+/// Whether this scan has to re-parse every markdown note it reads.
+///
+/// Equality with [`PARSE_VERSION`] and nothing else means up to date. A database holding a *higher* value
+/// is rewritten here too, and the recorded value moves back to what this build actually wrote: guessing
+/// that newer rows are still valid would leave data labelled with rules this binary does not have, and one
+/// full re-parse is cheap next to a catalog that quietly disagrees with the code that renders it.
+fn refresh_needed(stored: Option<u32>) -> bool {
+    stored != Some(PARSE_VERSION)
+}
+
+/// Say out loud that a scan re-parsed notes whose files did not change — unless there is nothing to say.
+///
+/// The report itself stays silent on purpose ([`ScanReport`] counts what classification decided, and its
+/// JSON shape is pinned by the CLI tests), so without this line a rule change would reach a workspace and
+/// rewrite every derived row in it while `np scan` printed `modified 0`. stderr only, for the same reason
+/// the orphan receipt is: `--json` must keep stdout parseable.
+///
+/// The sink is a parameter because stderr cannot be redirected in-process — the standard library offers no
+/// way to replace the global handle — so the tests in this module drive the formatting directly, exactly as
+/// [`crate::db`] does for its receipt. What they cannot pin is that the production call site names stderr.
+fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
+    // Zero means the refresh cost nothing extra: a first scan re-parses nothing it was not going to parse
+    // as added anyway. "Rules moved, nothing to do" is not news.
+    if notes == 0 {
+        return;
+    }
+    writeln!(
+        out,
+        "note-processor: re-parsed {notes} unchanged note(s) for parse rules v{PARSE_VERSION} (database held {})",
+        stored.map_or_else(|| "nothing".to_string(), |version| format!("v{version}")),
+    )
+    .expect("printing the re-parse receipt to stderr");
 }
 
 /// Write the rendered catalog and delete the shards this scan no longer produces.
@@ -1201,7 +1303,7 @@ fn now_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{np_published, remove_corpses, remove_file};
+    use super::{np_published, remove_corpses, remove_file, report_refresh, PARSE_VERSION};
     use crate::catalog::{HEADER, HEADER_CRLF};
     use std::fs;
     use std::io::{self, ErrorKind};
@@ -1262,6 +1364,37 @@ mod tests {
         assert!(
             !np_published(&root.path().join("absent.md")),
             "an unreadable candidate is not a deletion licence"
+        );
+    }
+
+    /// The refresh receipt: one line naming the count and both versions, silence when there is nothing to
+    /// report. Pinned through a sink because stderr cannot be redirected in-process.
+    #[test]
+    fn the_refresh_receipt_names_the_count_and_both_versions() {
+        let mut out = Vec::new();
+        report_refresh(&mut out, Some(3), 12);
+        assert_eq!(
+            String::from_utf8(out).expect("the receipt is utf-8"),
+            format!(
+                "note-processor: re-parsed 12 unchanged note(s) for parse rules v{PARSE_VERSION} \
+                 (database held v3)\n"
+            ),
+        );
+
+        // A database written before the mechanism existed says so instead of claiming a version zero.
+        let mut out = Vec::new();
+        report_refresh(&mut out, None, 1);
+        assert!(
+            String::from_utf8_lossy(&out).contains("database held nothing"),
+            "{out:?}"
+        );
+
+        // Every first scan of an empty-or-all-added workspace passes through here with nothing to say.
+        let mut out = Vec::new();
+        report_refresh(&mut out, None, 0);
+        assert!(
+            out.is_empty(),
+            "a refresh that re-parsed nothing is not news: {out:?}"
         );
     }
 

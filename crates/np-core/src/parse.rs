@@ -22,6 +22,25 @@ use regex::Regex;
 
 use crate::links::{extract_links, RawLink};
 
+/// The parse rules this build writes derived rows with.
+///
+/// Bump this by one whenever a change to [`parse_markdown`], [`crate::items::extract_items`] or
+/// [`crate::links::extract_links`] changes what a note's stored headings, tags, items, links, word count
+/// or title come out as. Nothing else can notice such a change: [`crate::change`] compares file bytes, so
+/// a note nobody has edited since the old rules ran looks finished forever, and its rows would keep the
+/// old spelling while `INDEX.md` kept rendering it — stable, so nothing looks broken, and wrong.
+///
+/// [`mod@crate::scan`] compares this value with the one stored in the workspace database's `meta` table at
+/// scan start. When they differ it re-parses every note once and records this value again, which is how a
+/// rule change reaches a database written by an older build. A SQL migration cannot do that job: entries
+/// of [`crate::db::MIGRATIONS`] change tables and never read a note.
+///
+/// Version 1 is the first versioned build, so the value it has to describe is *absence*: a database from
+/// before this constant recorded nothing at all, which is not a version and therefore refreshes on its
+/// first scan. That single refresh is what carries R3's frontmatter-recognition (F7) and tag-display
+/// (F8) changes into the files M1 already indexed.
+pub const PARSE_VERSION: u32 = 1;
+
 /// Which source supplied a note's title, so the catalog can say where it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TitleSource {

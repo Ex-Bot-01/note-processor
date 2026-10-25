@@ -14,6 +14,7 @@ use np_core::catalog;
 use np_core::config::{CatalogConfig, Config};
 use np_core::db::{self, Db, NoteCounts};
 use np_core::hash::sha256_file;
+use np_core::parse::PARSE_VERSION;
 use np_core::{scan, scan_with_inject};
 use tempfile::TempDir;
 
@@ -1371,4 +1372,420 @@ fn temp_corpse_from_a_failed_rename_is_not_indexed() {
     assert_eq!(report.added as i64, CORPUS_FILES, "{report:?}");
     // The cleanup runs before the writes rather than instead of them.
     assert!(ws.root.join("INDEX.md").is_file());
+}
+
+// ---------------------------------------------------------------------------------------------
+// F15 — a parse-rule change has to reach notes whose bytes did not change.
+//
+// `classify` compares hashes, so an unedited note looks finished forever and keeps the derived rows an
+// older build wrote. The mechanism under test is one number in `meta` (`PARSE_VERSION_KEY`) compared with
+// `np_core::parse::PARSE_VERSION` at scan start; a database whose stored value differs gets every note
+// re-parsed once. These cases hand-build such a database the way `tests/db.rs` builds its pre-migration
+// fixture — scan once for honest hashes, then rewrite the derived rows and the recorded version by hand,
+// leaving the files on disk untouched.
+// ---------------------------------------------------------------------------------------------
+
+/// Notes for the F15 cases: frontmatter tags, a body tag, an item, two links, and one note whose opening
+/// `---` region is prose — current rules (F7) keep the heading below it in the outline, while the pre-R3
+/// parser swallowed that whole section. Tracked files: three notes plus one attachment.
+const RULE_NOTES: [(&str, &str); 4] = [
+    (
+        "alpha.md",
+        "---\ntitle: Alpha\ntags: [Vendor]\n---\n\n## Setup\n\nKickoff notes #Alpha with [[beta]] \
+         and a task.\n\n- [ ] mail the vendor\n",
+    ),
+    (
+        "beta.md",
+        "# Beta Plan\n\nSecond note, linked from [[alpha]]. #Beta\n",
+    ),
+    (
+        "thematic-break.md",
+        "---\nOpening prose about the week.\n---\n\n# Real Heading\n\nMore prose under it #gamma\n",
+    ),
+    ("pic.png", "not really an image\n"),
+];
+
+/// The three notes of [`RULE_NOTES`], in `rel` order.
+const RULE_NOTE_RELS: [&str; 3] = ["alpha.md", "beta.md", "thematic-break.md"];
+
+/// `RULE_NOTES` indexed from scratch in its own workspace: what the current rules produce, and therefore
+/// what a refreshed database has to match row for row and byte for byte.
+fn reference_workspace() -> Workspace {
+    let ws = scratch(&RULE_NOTES, 50);
+    scan(&ws.root, &ws.cfg).expect("reference scan");
+    ws
+}
+
+/// Rewrite one note's derived rows the way an older build would have left them: no heading rows at all,
+/// one tag in a spelling these notes never contain, and a title taken from the file name. The bytes on
+/// disk are not touched — that is the situation F15 exists for.
+fn write_rows_like_an_older_build(open: &Db, rel: &str) {
+    open.0
+        .execute(
+            "DELETE FROM headings WHERE note_id = (SELECT id FROM notes WHERE rel = ?1)",
+            [rel],
+        )
+        .expect("test setup: drop the heading rows");
+    open.0
+        .execute(
+            "DELETE FROM tags WHERE note_id = (SELECT id FROM notes WHERE rel = ?1)",
+            [rel],
+        )
+        .expect("test setup: drop the tag rows");
+    open.0
+        .execute(
+            "INSERT INTO tags (note_id, tag) SELECT id, 'old-tag' FROM notes WHERE rel = ?1",
+            [rel],
+        )
+        .expect("test setup: plant the stale tag");
+    open.0
+        .execute(
+            "UPDATE notes SET title = 'Old Title', title_source = 'filename', word_count = 1
+              WHERE rel = ?1",
+            [rel],
+        )
+        .expect("test setup: stale title and word count");
+}
+
+/// The recorded parse rules version, as the database holds it now. `None` is a file that never recorded
+/// one — an M1 workspace, which is not a version to compare against.
+fn recorded_parse_version(open: &Db) -> Option<u32> {
+    open.0
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [np_core::scan::PARSE_VERSION_KEY],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Record `version` as the rules this database was parsed under, whether or not a scan wrote a value
+/// first — the fixture is hand-built, so it does not assume anything about what the previous scan stored.
+///
+/// From the scan's point of view writing a *lower* value is exactly what bumping the constant does: the
+/// comparison at scan start is between this number and the constant, and nothing else.
+fn record_parse_version(open: &Db, version: u32) {
+    open.0
+        .execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![np_core::scan::PARSE_VERSION_KEY, version.to_string()],
+        )
+        .expect("test setup: record the lagging version");
+    assert_eq!(
+        recorded_parse_version(open),
+        Some(version),
+        "test setup: the lag is in place"
+    );
+}
+
+/// Forget the recorded version entirely: the shape of a database written before this mechanism existed.
+fn forget_parse_version(open: &Db) {
+    open.0
+        .execute(
+            "DELETE FROM meta WHERE key = ?1",
+            [np_core::scan::PARSE_VERSION_KEY],
+        )
+        .expect("test setup: delete the recorded version");
+    assert_eq!(
+        recorded_parse_version(open),
+        None,
+        "test setup: no label at all"
+    );
+}
+
+/// One comparable dump of everything derived from note text: title and word count per note, then its
+/// headings, tags, items and resolved edges. Spelled through `rel` only, so two workspaces holding the
+/// same notes produce equal output regardless of their rowids or absolute paths.
+fn derived_rows(open: &Db) -> Vec<Vec<String>> {
+    vec![
+        texts(
+            open,
+            "SELECT rel || '|' || title || '|' || title_source || '|' || word_count
+               FROM notes ORDER BY rel",
+        ),
+        texts(
+            open,
+            "SELECT n.rel || '|' || h.level || '|' || h.text || '|' || h.line
+               FROM headings h JOIN notes n ON n.id = h.note_id ORDER BY 1",
+        ),
+        texts(
+            open,
+            "SELECT n.rel || '|' || t.tag FROM tags t JOIN notes n ON n.id = t.note_id
+              ORDER BY n.rel, t.rowid",
+        ),
+        texts(
+            open,
+            "SELECT n.rel || '|' || i.text || '|' || i.state || '|' || COALESCE(i.marker, '-')
+               FROM items i JOIN notes n ON n.id = i.note_id ORDER BY 1",
+        ),
+        texts(
+            open,
+            "SELECT src.rel || '|' || l.kind || '|' || l.target || '|' || COALESCE(dst.rel, '?')
+               FROM links l JOIN notes src ON src.id = l.src_note_id
+                    LEFT JOIN notes dst ON dst.id = l.dst_note_id ORDER BY 1",
+        ),
+    ]
+}
+
+/// The highest `rowid` of each derived table: which *physical* rows are stored, not what they say.
+///
+/// Re-parsing a note deletes its child rows and inserts new ones (see `store_note`), so these numbers move
+/// whenever a scan re-stores anything even when the replacement bytes are identical. That is the cheap seam
+/// by which a test outside the crate can tell "wrote the same rows again" apart from "wrote nothing".
+fn child_rowids(open: &Db) -> Vec<i64> {
+    ["headings", "tags", "items", "links"]
+        .iter()
+        .map(|table| {
+            scalar(
+                open,
+                &format!("SELECT COALESCE(MAX(rowid), 0) FROM {table}"),
+            )
+        })
+        .collect()
+}
+
+/// The tag rows of one note, in stored order.
+fn tags_of(open: &Db, rel: &str) -> Vec<String> {
+    texts(
+        open,
+        &format!(
+            "SELECT t.tag FROM tags t JOIN notes n ON n.id = t.note_id
+              WHERE n.rel = '{rel}' ORDER BY t.rowid"
+        ),
+    )
+}
+
+#[test]
+fn a_stale_parse_version_reparses_every_unchanged_note() {
+    let ws = scratch(&RULE_NOTES, 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let reference = reference_workspace();
+
+    // Hand-build the lagging database: an older build's rows, and a recorded version behind this one.
+    let open = ws.db();
+    for rel in RULE_NOTE_RELS {
+        write_rows_like_an_older_build(&open, rel);
+    }
+    record_parse_version(&open, PARSE_VERSION - 1);
+    drop(open);
+    assert_eq!(
+        scalar(&ws.db(), "SELECT COUNT(*) FROM headings"),
+        0,
+        "the planted rows must really be stale before the scan can repair them"
+    );
+    assert_eq!(tags_of(&ws.db(), "alpha.md"), vec!["old-tag".to_string()]);
+
+    let report = scan(&ws.root, &ws.cfg).expect("refresh scan");
+
+    // The report stays the classification truth (F15's decided semantics): no file changed, so nothing is
+    // modified and every tracked file still counts as unchanged. The refresh is not advertised here.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 0, 0),
+        "unchanged bytes are not a modification: {report:?}"
+    );
+    assert_eq!(
+        report.unchanged as i64,
+        RULE_NOTES.len() as i64,
+        "{report:?}"
+    );
+    assert!(report.skipped.is_empty(), "{report:?}");
+    assert_eq!(report.notes, RULE_NOTE_RELS.len() as i64);
+
+    let open = ws.db();
+    assert_eq!(
+        recorded_parse_version(&open),
+        Some(PARSE_VERSION),
+        "the refresh records the rules it wrote with, so it happens once"
+    );
+    assert_eq!(
+        derived_rows(&open),
+        derived_rows(&reference.db()),
+        "one scan with unchanged bytes must bring every derived row up to current rules"
+    );
+    drop(open);
+    assert_eq!(
+        generated_catalog(&ws.root),
+        generated_catalog(&reference.root),
+        "INDEX.md must show the titles and tags current rules produce"
+    );
+    // The specific consequence F15 was filed for: a heading an older parser hid inside a prose `---`
+    // region, now in the catalog — from bytes nobody edited.
+    assert!(
+        index_text(&ws.root).contains("[[Real Heading]](thematic-break.md)"),
+        "{}",
+        index_text(&ws.root)
+    );
+}
+
+#[test]
+fn a_database_that_never_recorded_a_parse_version_is_refreshed_too() {
+    let ws = scratch(&RULE_NOTES, 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let reference = reference_workspace();
+
+    // The real M1 upgrade: no `parse_version` row at all, which is not a version to compare against.
+    let open = ws.db();
+    for rel in RULE_NOTE_RELS {
+        write_rows_like_an_older_build(&open, rel);
+    }
+    forget_parse_version(&open);
+    assert_eq!(recorded_parse_version(&open), None, "test setup: no label");
+    drop(open);
+
+    let report = scan(&ws.root, &ws.cfg).expect("scan of an unlabelled database");
+
+    assert_eq!(report.modified, 0, "{report:?}");
+    assert_eq!(
+        report.unchanged as i64,
+        RULE_NOTES.len() as i64,
+        "{report:?}"
+    );
+    let open = ws.db();
+    assert_eq!(recorded_parse_version(&open), Some(PARSE_VERSION));
+    assert_eq!(derived_rows(&open), derived_rows(&reference.db()));
+}
+
+#[test]
+fn the_refresh_is_one_shot_and_the_next_scan_writes_no_bytes() {
+    let ws = scratch(&RULE_NOTES, 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let open = ws.db();
+    write_rows_like_an_older_build(&open, "alpha.md");
+    record_parse_version(&open, PARSE_VERSION - 1);
+    drop(open);
+
+    scan(&ws.root, &ws.cfg).expect("refresh scan");
+    // Precondition: the refresh did repair the planted rows, so what follows is not proving nothing.
+    assert_eq!(tags_of(&ws.db(), "alpha.md"), vec!["Vendor", "Alpha"]);
+
+    let catalog = generated_catalog(&ws.root);
+    let rows = derived_rows(&ws.db());
+    let rowids = child_rowids(&ws.db());
+
+    let again = scan(&ws.root, &ws.cfg).expect("scan after the refresh");
+
+    assert_eq!(
+        (again.added, again.modified, again.moved, again.removed),
+        (0, 0, 0, 0),
+        "{again:?}"
+    );
+    assert_eq!(again.unchanged as i64, RULE_NOTES.len() as i64, "{again:?}");
+    assert_eq!(
+        generated_catalog(&ws.root),
+        catalog,
+        "the refresh is one-shot: the catalog must be byte-identical after it"
+    );
+    let open = ws.db();
+    assert_eq!(
+        derived_rows(&open),
+        rows,
+        "no row may move on the quiet scan"
+    );
+    assert_eq!(
+        child_rowids(&open),
+        rowids,
+        "and no row may be deleted and rewritten either: a second refresh would re-store every note"
+    );
+    assert_eq!(recorded_parse_version(&open), Some(PARSE_VERSION));
+}
+
+#[test]
+fn a_second_rule_change_refreshes_once_and_the_scan_after_it_is_quiet() {
+    let ws = scratch(&RULE_NOTES, 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let open = ws.db();
+    write_rows_like_an_older_build(&open, "beta.md");
+    record_parse_version(&open, PARSE_VERSION - 1);
+    drop(open);
+    scan(&ws.root, &ws.cfg).expect("first refresh");
+
+    // A second rule change: the constant moves again, which the database sees as its recorded value
+    // falling behind, and the rows go stale in the same way they did the first time.
+    let open = ws.db();
+    write_rows_like_an_older_build(&open, "thematic-break.md");
+    record_parse_version(&open, PARSE_VERSION - 1);
+    drop(open);
+
+    let second = scan(&ws.root, &ws.cfg).expect("scan after the second bump");
+    assert_eq!(second.modified, 0, "{second:?}");
+    let reference = reference_workspace();
+    let open = ws.db();
+    assert_eq!(
+        derived_rows(&open),
+        derived_rows(&reference.db()),
+        "the second bump must refresh every note too, not only the one that went stale"
+    );
+    assert_eq!(recorded_parse_version(&open), Some(PARSE_VERSION));
+    let catalog = generated_catalog(&ws.root);
+    let rowids = child_rowids(&open);
+    drop(open);
+
+    let after = scan(&ws.root, &ws.cfg).expect("scan after the second refresh");
+    assert_eq!(
+        (after.added, after.modified, after.moved, after.removed),
+        (0, 0, 0, 0),
+        "{after:?}"
+    );
+    assert_eq!(generated_catalog(&ws.root), catalog, "again one-shot");
+    assert_eq!(
+        child_rowids(&ws.db()),
+        rowids,
+        "the second refresh must be one-shot too"
+    );
+}
+
+#[test]
+fn an_up_to_date_database_reparses_only_what_changed() {
+    let ws = scratch(&RULE_NOTES, 50);
+    let first = scan(&ws.root, &ws.cfg).expect("first scan");
+
+    // A fresh database records the current version, and forces nothing: every note was being parsed as
+    // `Added` anyway, so there is nothing for a refresh to add.
+    assert_eq!(first.added as i64, RULE_NOTES.len() as i64, "{first:?}");
+    assert_eq!(recorded_parse_version(&ws.db()), Some(PARSE_VERSION));
+
+    // The cheap seam for "parses only what changed": rows planted by hand on an up-to-date database must
+    // survive a warm scan. A refresh that reached every note would repair them, and there is no cheaper
+    // way to see the difference from outside the crate.
+    let open = ws.db();
+    write_rows_like_an_older_build(&open, "alpha.md");
+    drop(open);
+    assert_eq!(tags_of(&ws.db(), "alpha.md"), vec!["old-tag".to_string()]);
+
+    let warm = scan(&ws.root, &ws.cfg).expect("warm scan");
+    assert_eq!(
+        (warm.added, warm.modified, warm.moved, warm.removed),
+        (0, 0, 0, 0),
+        "{warm:?}"
+    );
+    assert_eq!(
+        tags_of(&ws.db(), "alpha.md"),
+        vec!["old-tag".to_string()],
+        "an up-to-date database must not be re-parsed: the planted rows have to survive"
+    );
+
+    // One edited note is still re-parsed on its own, and only it.
+    fs::write(
+        ws.root.join("beta.md"),
+        "# Beta Plan\n\nRewritten, linked from [[alpha]]. #Beta #Extra\n",
+    )
+    .expect("test: edit one note");
+    let edited = scan(&ws.root, &ws.cfg).expect("scan after the edit");
+
+    assert_eq!(edited.modified, 1, "{edited:?}");
+    assert_eq!(
+        edited.unchanged as i64,
+        RULE_NOTES.len() as i64 - 1,
+        "{edited:?}"
+    );
+    assert_eq!(tags_of(&ws.db(), "beta.md"), vec!["Beta", "Extra"]);
+    assert_eq!(
+        tags_of(&ws.db(), "alpha.md"),
+        vec!["old-tag".to_string()],
+        "the note nobody edited stays exactly as stale as it was"
+    );
 }
