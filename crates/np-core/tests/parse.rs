@@ -110,7 +110,9 @@ fn frontmatter_recognised_subset() {
     // Inline `tags: [a, b]`, quoted scalar title, unknown keys ignored without error.
     let note = parse_markdown(&fixture("frontmatter-note.md"), "fallback-name");
     assert!(note.frontmatter, "the file opens with an exact --- line");
-    assert_eq!(note.tags, ["vendor", "beta", "gamma"]);
+    // `Vendor` is shown as written — deduplication ignores case but does not rewrite the spelling,
+    // and the body's `#vendor` folds into this first-seen tag.
+    assert_eq!(note.tags, ["Vendor", "beta", "gamma"]);
     assert!(
         !note.tags.iter().any(|t| t == "vc"),
         "`aliases:` is not `tags:`, got {:?}",
@@ -121,7 +123,7 @@ fn frontmatter_recognised_subset() {
     let note = parse_markdown(&fixture("block-tags-note.md"), "fallback-name");
     assert!(note.frontmatter);
     assert_eq!(note.title, "Block Tags Note");
-    assert_eq!(note.tags, ["vendor", "alpha", "delta"]);
+    assert_eq!(note.tags, ["Vendor", "alpha", "delta"]);
 
     // A block list item needs a `-` marker plus whitespace: an indented continuation line or
     // a `--nope` line is neither a tag nor an error.
@@ -148,20 +150,135 @@ fn frontmatter_recognised_subset() {
         assert!(!note.frontmatter, "{opener:?} must not open frontmatter");
     }
 
-    // Inside the block nothing counts as body work: neither a heading nor a tag.
+    // Inside a *keyed* block nothing counts as body work: neither a heading nor a tag. The `title:`
+    // line is what makes this region metadata — without a key the same lines are prose, which is
+    // what [`leading_rule_is_content_not_frontmatter`] pins.
     let note = parse_markdown(
-        "---\n# not a heading\nsee #inside\n---\n# real\n",
+        "---\ntitle: Vendor\n# not a heading\nsee #inside\n---\n# real\n",
         "fallback-name",
     );
     assert!(note.frontmatter);
-    assert_eq!(outline(&note.headings), [(1, "real", 5)]);
+    assert_eq!(outline(&note.headings), [(1, "real", 6)]);
     assert_eq!(note.tags, Vec::<String>::new());
 
-    // An empty frontmatter block is still a block, and the body after it parses normally.
+    // An empty `---` / `---` block is still a block (F7 keeps M1's reading here: an empty region
+    // holds no content the body could gain), and the body after it parses normally.
     let note = parse_markdown("---\n---\n# Head #tagged\n", "fallback-name");
     assert!(note.frontmatter);
     assert_eq!(outline(&note.headings), [(1, "Head #tagged", 3)]);
     assert_eq!(note.tags, ["tagged"]);
+
+    // Blank lines only is the same reading as nothing at all.
+    let note = parse_markdown("---\n\n   \n---\n# Head\n", "fallback-name");
+    assert!(note.frontmatter);
+    assert_eq!(outline(&note.headings), [(1, "Head", 5)]);
+
+    // A region whose only key is a spelling this parser reads no value from is not metadata either:
+    // an indented key and a quoted key would be hidden from the body in exchange for parsing
+    // nothing (`read_frontmatter` strips values at column 0 and quotes from neither).
+    for block in ["  title: x", "\"title\": x"] {
+        let note = parse_markdown(&format!("---\n{block}\n---\n# real\n"), "fallback-name");
+        assert!(!note.frontmatter, "{block:?} is not a key that is read");
+        assert_eq!(outline(&note.headings), [(1, "real", 4)], "{block:?}");
+    }
+
+    // A comment line is markdown too — here it is an outline entry again rather than hidden text.
+    let note = parse_markdown("---\n# nur ein Kommentar\n---\n# real\n", "fallback-name");
+    assert!(!note.frontmatter);
+    assert_eq!(
+        outline(&note.headings),
+        [(1, "nur ein Kommentar", 2), (1, "real", 4)]
+    );
+
+    // A key the parser ignores still makes the region frontmatter: editors write `type:` or
+    // `created:` without `title:` or `tags:`, and that metadata must not become prose.
+    let note = parse_markdown("---\ntype: note\n---\n# real\n", "fallback-name");
+    assert!(note.frontmatter);
+    assert_eq!(note.title, "real");
+    assert_eq!(note.title_source, TitleSource::Heading);
+}
+
+#[test]
+fn leading_rule_is_content_not_frontmatter() {
+    // F7: a note that opens with a thematic break keeps its first section.
+    let lf = fixture("thematic-break-note.md").replace("\r\n", "\n");
+    let note = parse_markdown(&lf, "fallback-name");
+
+    assert!(
+        !note.frontmatter,
+        "a region with no `key:` line before the closing --- is not frontmatter"
+    );
+    // The lines under the opening rule are ordinary markdown: the heading is in the outline and it
+    // wins the title — exactly the section M1 dropped from the note.
+    assert_eq!(
+        outline(&note.headings),
+        [(2, "Erste Liste", 4), (1, "Zweite Sektion", 10)]
+    );
+    assert_eq!(note.title, "Erste Liste");
+    assert_eq!(note.title_source, TitleSource::Heading);
+    assert_eq!(note.tags, ["regel"]);
+
+    // Every line of the file is body, both `---` rules included, so nothing is missing from the
+    // word count either.
+    assert_eq!(note.words, lf.split_whitespace().count());
+    assert!(
+        note.words > 20,
+        "the fixture is too small to prove anything: {:?} words",
+        note.words
+    );
+}
+
+#[test]
+fn tag_dedup_folds_case_and_keeps_the_first_spelling() {
+    // F8: identity folds Unicode case, display keeps the spelling that was written first.
+    assert_eq!(
+        parse_markdown("ein #ÄNER-TAG und ein #äner-tag\n", "fb").tags,
+        ["ÄNER-TAG"]
+    );
+    // The other order yields the other spelling: what survives is the first one written, not a
+    // normalised form of it.
+    assert_eq!(
+        parse_markdown("ein #äner-tag und ein #ÄNER-TAG\n", "fb").tags,
+        ["äner-tag"]
+    );
+
+    // Frontmatter tags take part in the same rule, through the same list.
+    let note = parse_markdown("---\ntags: [ÄNER-TAG]\n---\nbody #äner-tag\n", "fb");
+    assert_eq!(note.tags, ["ÄNER-TAG"]);
+
+    // First-seen order is what the catalog renders (`crate::scan::note_tags` reads the rows back by
+    // rowid), so folding for identity must not reorder anything.
+    assert_eq!(
+        parse_markdown("#Zulu #alpha #ZULU #Beta\n", "fb").tags,
+        ["Zulu", "alpha", "Beta"]
+    );
+}
+
+#[test]
+fn tag_folding_is_the_lowercase_mapping_not_a_case_fold() {
+    // The folding is `str::to_lowercase` (see `case_key` in the crate), and these two traps are what
+    // that choice means. They are asserted so the next reader can tell whether changing it was
+    // deliberate.
+
+    // `ß`: the lowercase mapping leaves `ß` alone while `S` maps to `s`, so a `ß` tag and an `SS`
+    // tag stay **two** tags. A full case fold maps `ß` to `ss` and would merge them, rewriting every
+    // stored German tag; that expansion is only on the uppercase side (`ß` → `SS`), which this
+    // folding never takes. Only same-spelling duplicates deduplicate here.
+    assert_eq!(
+        parse_markdown("#straße #STRASSE #straße\n", "fb").tags,
+        ["straße", "STRASSE"]
+    );
+
+    // `İ` (U+0130) lowercases to `i` + U+0307 COMBINING DOT ABOVE, so two spellings of *it* fold
+    // together while neither folds into the plain `i` spelling.
+    assert_eq!(
+        parse_markdown("#İSTANBUL #İstanbul\n", "fb").tags,
+        ["İSTANBUL"]
+    );
+    assert_eq!(
+        parse_markdown("#İSTANBUL #istanbul\n", "fb").tags,
+        ["İSTANBUL", "istanbul"]
+    );
 }
 
 #[test]
@@ -198,14 +315,15 @@ fn headings_with_line_numbers() {
 
 #[test]
 fn tags_from_body_hash_syntax() {
-    // `#vendor #contract` in prose: lowercased, deduplicated, first-seen order kept. The
-    // anchor-only link `[see](#anchor)` is not a tag, nor is a path anchor or `x#nothere`.
+    // `#vendor #contract` in prose: deduplicated ignoring case, first-seen order kept, each shown
+    // as written. The anchor-only link `[see](#anchor)` is not a tag, nor is a path anchor or
+    // `x#nothere`.
     let note = parse_markdown(&fixture("release-note.md"), "fallback-name");
-    assert_eq!(note.tags, ["vendor", "contract", "beta-2"]);
+    assert_eq!(note.tags, ["Vendor", "contract", "Beta-2"]);
 
     // A heading line's own markers are not a tag; tags inside prose still count.
     let note = parse_markdown("# Title\nSee #Rust and #rust again.\n", "fallback-name");
-    assert_eq!(note.tags, ["rust"]);
+    assert_eq!(note.tags, ["Rust"]);
 
     // First-seen order survives deduplication.
     let note = parse_markdown("one #bb two #aa three #bb\n", "fallback-name");
@@ -250,6 +368,7 @@ fn crlf_matches_lf() {
         "block-tags-note.md",
         "prose-only.md",
         "german-note.md",
+        "thematic-break-note.md",
     ] {
         // Normalise whatever the checkout stored into the two canonical forms.
         let lf = fixture(name).replace("\r\n", "\n");
@@ -314,9 +433,10 @@ fn non_ascii_title_headings_and_tags() {
         [(1, "Händler Vertrag", 1), (2, "Einzelheiten", 6)],
         "the fenced `# fake Überschrift` yields no heading"
     );
-    // `#Vertrag` twice deduplicates after lowercasing, an umlaut directly after the `#` is a
-    // normal tag character, and neither `ü#nicht` nor a path anchor becomes a tag.
-    assert_eq!(note.tags, ["vertrag", "äner-tag"]);
+    // `#Vertrag` twice deduplicates across case and keeps the spelling it was first written with,
+    // an umlaut directly after the `#` is a normal tag character, and neither `ü#nicht` nor a path
+    // anchor becomes a tag.
+    assert_eq!(note.tags, ["Vertrag", "äner-tag"]);
 
     // The same note with CRLF everywhere parses to the identical document.
     assert_eq!(

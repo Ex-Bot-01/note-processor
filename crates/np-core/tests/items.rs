@@ -376,6 +376,20 @@ fn frontmatter_lines_are_not_items() {
         found(&extract_items("---\n- [ ] buy milk\n", &markers)),
         [("buy milk", 2, ItemState::Open, "[ ]")]
     );
+
+    // F7 in the item scan: a note that opens with a thematic break has no block either, because a
+    // region without a `key:` line is prose. Its item survives instead of being swallowed as
+    // metadata, on the line it was written.
+    assert_eq!(
+        found(&extract_items(
+            "---\nEin Gedanke.\n\n- [ ] Milch kaufen\n---\n\n- [ ] Brot holen\n",
+            &markers,
+        )),
+        [
+            ("Milch kaufen", 4, ItemState::Open, "[ ]"),
+            ("Brot holen", 7, ItemState::Open, "[ ]")
+        ]
+    );
 }
 
 #[test]
