@@ -333,7 +333,9 @@ tests; one opt-in integration test against the real endpoint, skipped by default
 - Chunk size/overlap, cluster method (agglomerative over cosine with a link/tag prior), and the
   similarity thresholds that put something in the review queue instead of asserting it.
 - "Stale since edit" definition: days since last edit with no state event, threshold configurable.
-- `INDEX.md` line format: `- [[Title]](path) · size · tags · →2 ←1 · cluster · status`.
+- `INDEX.md` line format: `- [[Title]](path) · size · tags · →2 ←1 · cluster · status`. `→n` and `←n`
+  count edges that land on a **live** note, not stored rows: an edge into a stale or deleted destination
+  is not advertised as intact and surfaces in the unresolved figure instead.
 - DB schema details, error taxonomy, log rotation for `npd`, config file layout.
 
 ## 15. Resolved in review

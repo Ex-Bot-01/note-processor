@@ -1,0 +1,9 @@
+---
+title: Meeting 2024-01-01
+tags: [meeting]
+---
+
+# Meeting 2024-01-01
+
+Anwesend: Ana, Bo, Cli.
+Thema: der Katalog und seine Shards (Kopie).
