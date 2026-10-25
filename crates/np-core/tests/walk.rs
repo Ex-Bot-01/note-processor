@@ -275,12 +275,21 @@ fn an_unreadable_directory_is_reported_not_silently_missing() {
         ("secret/deep/b.md", "b"),
     ]);
     let secret = tmp.path().join("secret");
+    // The mode the directory actually arrived with. `TempDir` creates it as `0o777 & !umask`, so a
+    // hardcoded 0o755 would *widen* permissions on a runner with a restrictive umask (0o077 gives
+    // 0o700); whatever was there is what the guard puts back.
+    let found_mode = fs::metadata(&secret)
+        .expect("test setup: read the directory mode")
+        .permissions()
+        .mode()
+        & 0o7777; // only the permission bits travel back; the file-type bits are not ours to set
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o0))
         .expect("test setup: chmod 0 the subdirectory");
     // Declared before any assertion so the mode goes back on every path out of this test,
     // panic included; `TempDir` cleanup cannot remove a tree holding a mode-0 directory.
     let _readable_again = ReadableAgain {
         dir: secret.clone(),
+        mode: found_mode,
     };
     if fs::read_dir(&secret).is_ok() {
         // Running as root (common in containers) reads a mode-0 directory anyway.
@@ -297,15 +306,45 @@ fn an_unreadable_directory_is_reported_not_silently_missing() {
         ["secret"],
         "the unreadable directory is named by its rel-style path"
     );
+
+    // Restoration asserted rather than assumed: dropping the guard here runs it early, and what comes
+    // back has to be the mode this machine made — `0o700` under a `0o077` umask, where restoring a fixed
+    // `0o755` would have handed group and other read+execute on a directory nobody asked for. The mode of
+    // a sibling made by the same umask is the premise, so a hardcoded value cannot pass this quietly.
+    drop(_readable_again);
+    let restored = fs::metadata(&secret)
+        .expect("test: re-read the directory mode")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        restored, found_mode,
+        "the guard restores the mode it captured"
+    );
+    let plain = tmp.path().join("plain");
+    fs::create_dir(&plain).expect("test setup: a directory made by this umask");
+    assert_eq!(
+        restored,
+        fs::metadata(&plain)
+            .expect("test: read the sibling mode")
+            .permissions()
+            .mode()
+            & 0o7777,
+        "and that mode is this machine's own, not an assumed one"
+    );
 }
 
-/// Restores `dir` to 0o755 when dropped.
+/// Restores `dir` to the mode it carried when the guard was created.
 ///
 /// A mode-0 directory makes `TempDir::drop` fail, and a leaked one stays unwritable on the
 /// machine forever, so the restoration may not depend on reaching the end of a test body.
+/// The mode travels in rather than being assumed: restoring a fixed 0o755 would grant read and
+/// execute to group and other on a runner whose umask made the directory narrower to begin with.
 #[cfg(unix)]
 struct ReadableAgain {
     dir: PathBuf,
+    /// The permission bits `fs::metadata` reported before the test chmod'd the directory.
+    mode: u32,
 }
 
 #[cfg(unix)]
@@ -315,7 +354,7 @@ impl Drop for ReadableAgain {
 
         // Best effort: `Drop` must not panic, and a failure here only repeats the leak the
         // guard exists to prevent.
-        let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(self.mode));
     }
 }
 

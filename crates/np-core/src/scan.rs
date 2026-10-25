@@ -996,23 +996,50 @@ struct Superseded {
     foreign: Vec<String>,
 }
 
-/// Whether `path` opens with exactly the bytes [`catalog::render`] puts at the top of every file it
-/// publishes — two header lines, byte for byte. That is how a scan tells its own output from a note that
-/// happens to be called `INDEX-something.md`.
+/// Whether `path` opens with the bytes [`catalog::render`] puts at the top of every file it publishes —
+/// two header lines, byte for byte, in either the LF or the CRLF spelling. That is how a scan tells its
+/// own output from a note that happens to be called `INDEX-something.md`.
 ///
 /// Only those bytes are read, so a candidate's size never decides what a scan costs, and every failure —
-/// unreadable, shorter than the header, an I/O error, a CRLF file somebody else rewrote — answers "not
-/// ours". The bias is deliberate: guessing wrong keeps a stale shard on disk rather than deleting a note.
+/// unreadable, shorter than the header, an I/O error — answers "not ours". The bias is deliberate:
+/// guessing wrong keeps a stale shard on disk rather than deleting a note.
+///
+/// CRLF is accepted because identity lives in the two header lines and nowhere else: a checkout, editor
+/// or sync tool that rewrote the line endings of a shard np published leaves the catalog intact, and
+/// refusing it would strand that shard in `skipped` forever. The same rule is why nothing after the
+/// header is examined — prose cannot change who wrote the file — and why the match stays line-exact: any
+/// other byte difference in those two lines, including a half-converted header, is not ours.
 fn np_published(path: &Path) -> bool {
     let mut source = match fs::File::open(path) {
         Ok(source) => source,
         Err(_) => return false,
     };
-    let mut head = [0u8; catalog::HEADER.len()];
-    match source.read_exact(&mut head) {
-        Ok(()) => head[..] == *catalog::HEADER.as_bytes(),
-        Err(_) => false,
+    // The longer of the two accepted spellings sets the window. A file that ends earlier simply yields
+    // fewer bytes, which is how a published shard whose header is its whole content still matches.
+    let mut head = [0u8; catalog::HEADER_CRLF.len()];
+    let read = match read_prefix(&mut source, &mut head) {
+        Ok(read) => read,
+        Err(_) => return false,
+    };
+    let head = &head[..read];
+    head.starts_with(catalog::HEADER.as_bytes())
+        || head.starts_with(catalog::HEADER_CRLF.as_bytes())
+}
+
+/// Fill `buf` from `source`, stopping at the end of the file. Returns how many bytes `buf` holds; an I/O
+/// error is reported so the caller can answer its own question with "not ours".
+fn read_prefix(source: &mut fs::File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut read = 0;
+    while read < buf.len() {
+        match source.read(&mut buf[read..]) {
+            // End of file: fewer bytes than asked for, which is an answer rather than a failure.
+            Ok(0) => break,
+            Ok(got) => read += got,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
     }
+    Ok(read)
 }
 
 /// Move one rendered file into place through a temporary name, so a reader never sees it half-written
@@ -1135,7 +1162,8 @@ fn now_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{remove_corpses, remove_file};
+    use super::{np_published, remove_corpses, remove_file};
+    use crate::catalog::{HEADER, HEADER_CRLF};
     use std::fs;
     use std::io::{self, ErrorKind};
     use std::path::Path;
@@ -1147,6 +1175,55 @@ mod tests {
             fs::write(tmp.path().join(name), "stale\n").expect("test setup: plant a file");
         }
         tmp
+    }
+
+    /// The deletion fingerprint accepts exactly two spellings of the header and nothing else.
+    #[test]
+    fn the_published_fingerprint_is_ours_in_either_line_ending_only() {
+        // Drift guard first: the accepted CRLF spelling is `HEADER` with Windows line endings and nothing
+        // more, so rewording the header cannot leave one spelling silently unrecognised.
+        assert_eq!(HEADER.replace('\n', "\r\n"), HEADER_CRLF);
+
+        let root = tempfile::TempDir::new().expect("test setup: tempdir");
+        let cases: [(&str, String, bool); 8] = [
+            ("lf.md", format!("{HEADER}one entry\n"), true),
+            // A published file with no entries is the header and nothing else.
+            ("lf-bare.md", HEADER.to_string(), true),
+            ("crlf.md", format!("{HEADER_CRLF}one entry\r\n"), true),
+            ("crlf-bare.md", HEADER_CRLF.to_string(), true),
+            // Neither accepted spelling, whatever a reader might guess from the bytes: a header
+            // converted on one line only, a header with other words in it, too little of a header to
+            // read, and an ordinary note.
+            (
+                "mixed.md",
+                "# INDEX\r\n_generated by note-processor; do not edit_\nbody\n".to_string(),
+                false,
+            ),
+            (
+                "reworded.md",
+                "# INDEX\r\n_generated by somebody else; do not edit_\r\nbody\r\n".to_string(),
+                false,
+            ),
+            ("short.md", "# IND".to_string(), false),
+            ("note.md", "# Meine Notizen\nbody\n".to_string(), false),
+        ];
+
+        for (name, body, ours) in &cases {
+            let path = root.path().join(name);
+            fs::write(&path, body).expect("test setup: write a candidate");
+            assert_eq!(
+                np_published(&path),
+                *ours,
+                "{name} opens {body:?}, which is {}ours",
+                if *ours { "" } else { "not " }
+            );
+        }
+
+        // A candidate that cannot be opened at all answers "not ours" rather than failing the scan.
+        assert!(
+            !np_published(&root.path().join("absent.md")),
+            "an unreadable candidate is not a deletion licence"
+        );
     }
 
     #[test]

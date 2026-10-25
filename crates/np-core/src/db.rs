@@ -20,6 +20,18 @@ use thiserror::Error;
 
 use crate::hash::Snapshot;
 
+/// How long a connection waits for another connection's write lock before reporting `SQLITE_BUSY`, in
+/// milliseconds. Set on every connection this crate opens — workspace database and registry alike.
+///
+/// WAL is chosen because two of them overlap (see [`Db::open`]), and WAL admits one writer at a time, so
+/// the second one needs an answer that is not `SQLITE_BUSY`. SQLite's own default is no wait at all;
+/// rusqlite raises that to 5000 ms for every connection it opens
+/// (`rusqlite-0.40.2/src/inner_connection.rs:118`), which would leave a command silently frozen for five
+/// seconds on a database somebody else is writing. Naming the value here keeps the wait this program's
+/// own, and short: long enough to cover an overlapping run's write phase, short enough that a genuinely
+/// stuck database reports within a few hundred milliseconds instead of hanging a command.
+pub(crate) const BUSY_TIMEOUT_MS: u32 = 250;
+
 /// The schema, oldest first. Each entry is applied once, inside its own transaction, and its
 /// 1-based position is recorded in `schema_version`. A database whose recorded version is
 /// ahead of this list is refused rather than trusted — a newer file read by an older binary
@@ -161,10 +173,13 @@ pub struct Db(pub Connection);
 impl Db {
     /// Open `path`, creating its directories and applying any pending migration.
     ///
-    /// Two pragmas are set before anything else: `journal_mode=WAL`, because a scan and an
-    /// `np` command can overlap, and `foreign_keys=ON`, because SQLite leaves constraints off
-    /// by default per connection — without it a move would leave its notes behind instead of
-    /// cascading, and orphan notes would be accepted.
+    /// Three pragmas are set before anything else, `busy_timeout` first so it also covers the
+    /// migrations that run below: `journal_mode=WAL`, because a scan and an `np` command can overlap,
+    /// `foreign_keys=ON`, because SQLite leaves constraints off by default per connection — without it a
+    /// move would leave its notes behind instead of cascading, and orphan notes would be accepted — and
+    /// `BUSY_TIMEOUT_MS` so the two of them that *do* overlap wait for each other instead of failing.
+    /// (A code span, not a link: the constant is `pub(crate)` and rustdoc warns when public docs link
+    /// to it.)
     pub fn open(path: &Path) -> Result<Db, DbError> {
         if let Some(parent) = path.parent() {
             // `Path::parent` of a bare file name is the empty path, which is not a directory
@@ -179,7 +194,11 @@ impl Db {
         let conn = Connection::open(path)?;
         // WAL is a file-database privilege: `:memory:` refuses it, so it is asked for here
         // and not in [`Db::in_memory`].
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(&format!(
+            "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};
+             PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;"
+        ))?;
         migrate(&conn)?;
         Ok(Db(conn))
     }
@@ -187,7 +206,11 @@ impl Db {
     /// An empty database in memory, migrated the same way a file one is. For tests.
     pub fn in_memory() -> Result<Db, DbError> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // The timeout is meaningless for a private `:memory:` database, which no second process can
+        // lock, and is set anyway so that "every connection sets it" stays true of this crate.
+        conn.execute_batch(&format!(
+            "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}; PRAGMA foreign_keys = ON;"
+        ))?;
         migrate(&conn)?;
         Ok(Db(conn))
     }
