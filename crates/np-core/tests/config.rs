@@ -239,16 +239,32 @@ fn registry_records_and_bumps_last_seen() {
         .record(Path::new("/a/notes"), 300)
         .expect("re-record /a/notes");
 
-    assert_eq!(
-        registry.recent().expect("recent"),
-        vec![("/a/notes".to_string(), 300), ("/b/more".to_string(), 200)]
+    let recent = registry.recent().expect("recent");
+
+    // A drive-less absolute path (`/a/notes`) is still absolute on Windows, where it resolves
+    // against the current drive — so the stored key is `D:/a/notes`-shaped there and `/a/notes`
+    // here. Compare by suffix; the ordering, count and timestamps stay exactly asserted.
+    assert_eq!(recent.len(), 2, "re-recording must not add a second row");
+    assert!(
+        recent[0].0.ends_with("a/notes"),
+        "most recently seen workspace first, got {:?}",
+        recent[0].0
     );
+    assert_eq!(recent[0].1, 300, "re-recording must bump last_seen");
+    assert!(
+        recent[1].0.ends_with("b/more"),
+        "older workspace second, got {:?}",
+        recent[1].0
+    );
+    assert_eq!(recent[1].1, 200);
 
     // `first_seen` belongs to the first sighting, not the latest one.
     let conn = Connection::open(tmp.path().join("workspaces.sqlite")).expect("test: open registry");
     let first_seen: i64 = conn
         .query_row(
-            "SELECT first_seen FROM workspaces WHERE workspace = '/a/notes'",
+            // Suffix match for the same reason as above: the stored key carries a drive letter
+            // on Windows.
+            "SELECT first_seen FROM workspaces WHERE workspace LIKE '%/a/notes'",
             [],
             |row| row.get(0),
         )
@@ -274,10 +290,18 @@ fn registry_reopens_without_losing_rows() {
     );
 
     let registry = WorkspaceRegistry::open(&data_dir).expect("reopening must not fail");
-    assert_eq!(
-        registry.recent().expect("recent"),
-        vec![("/a/notes".to_string(), 100)]
+    let recent = registry.recent().expect("recent");
+
+    // A drive-less absolute path (`/a/notes`) is still absolute on Windows, where it resolves
+    // against the current drive, so the persisted key is `D:/a/notes`-shaped there. Match by
+    // suffix rather than by the Unix spelling.
+    assert_eq!(recent.len(), 1, "the row must survive reopening");
+    assert!(
+        recent[0].0.ends_with("a/notes"),
+        "persisted workspace key, got {:?}",
+        recent[0].0
     );
+    assert_eq!(recent[0].1, 100);
 
     let conn = Connection::open(data_dir.join("workspaces.sqlite")).expect("test: open registry");
     let mode: String = conn
