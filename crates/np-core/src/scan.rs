@@ -497,11 +497,16 @@ fn index_file(
     // while keeping its bytes is a `Moved`, and would otherwise stay unparsed forever.
     if let Some(text) = &readable.text {
         let rewritten = matches!(change, Some(Change::Added | Change::Modified));
-        if rewritten || note_id(db, rel)?.is_none() {
+        // One id lookup per note, resolved here — after any move above has been applied, which is
+        // what lets `notes.rel ON UPDATE CASCADE` have caught up with the path. The same answer
+        // decides whether a note without a row is rebuilt (`is_none()` below) and whether
+        // [`store_note`] updates or inserts; looking it up again inside `store_note` was F10.
+        let existing = note_id(db, rel)?;
+        if rewritten || existing.is_none() {
             let doc = parse_markdown(text, file_stem(rel));
             let links = doc.links.clone();
             let items = extract_items(text, markers);
-            store_note(db, rel, text, &doc, &items, readable.lossy)?;
+            store_note(db, rel, existing, text, &doc, &items, readable.lossy)?;
             return Ok(Indexed::Done(Some((rel.to_string(), links))));
         }
     } else {
@@ -600,9 +605,17 @@ fn folded_row(db: &Db, case_key: &str, rel: &str) -> Result<Option<String>, DbEr
 /// that appended would duplicate every row on every rescan and break byte-identical regeneration. Only
 /// this note's `origin = 'prose'` links go; an approved edge is an input and not derived output (spec
 /// §10), so a rescan must never undo one.
+///
+/// `existing` is the note row behind `rel` as [`index_file`] resolved it — `None` when there is none
+/// yet. The id is passed in rather than looked up here because the caller already had to ask the
+/// same question to decide whether a re-parse was needed, and a second lookup per note was F10.
+/// Nothing between that decision and this function can create the row: [`db::upsert_file`] writes
+/// `files` only, so no fresh read is required after it — and when `existing` is `None`, the `INSERT`
+/// below mints the id itself via `last_insert_rowid`, so none is needed after the write either.
 fn store_note(
     db: &Db,
     rel: &str,
+    existing: Option<i64>,
     text: &str,
     doc: &NoteDoc,
     items: &[ItemCandidate],
@@ -615,7 +628,7 @@ fn store_note(
     let body = body_text(text, body_start(text));
     let words = i64::try_from(doc.words).unwrap_or(i64::MAX);
 
-    let id = match note_id(db, rel)? {
+    let id = match existing {
         Some(id) => {
             db.0.execute(
                 "UPDATE notes

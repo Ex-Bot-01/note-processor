@@ -411,19 +411,40 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         params![FK_ORPHANS_KEY, removed.value()],
     )?;
-    if removed.total() > 0 {
-        // Saying it out loud as well: reading the receipt back needs sqlite3, and a person who just
-        // watched an ordinary command delete rows deserves to be told they were deleted. The position
-        // is deliberate — after the violation check above, so nothing is announced about a migration
-        // that rolled itself back. All zeros stays silent: every pre-F5 workspace passes through here,
-        // and "found nothing" on an ordinary upgrade is not news.
-        eprintln!(
-            "note-processor: removed {} orphan row(s) while adding note foreign keys ({})",
-            removed.total(),
-            removed.value(),
-        );
-    }
+    // Saying it out loud as well: reading the receipt back needs sqlite3, and a person who just
+    // watched an ordinary command delete rows deserves to be told they were deleted.
+    report_orphans(&mut io::stderr(), &removed);
     Ok(())
+}
+
+/// Write the orphan receipt to `out` — [`std::io::stderr`] in production — unless there is nothing
+/// to say.
+///
+/// The sink is a parameter rather than a hard-wired `eprintln!` because stderr cannot be captured
+/// in-process here: the standard library offers no way to replace the global handle, and this runs
+/// inside [`Db::open`], before any test could redirect descriptor 2. Taking the sink lets the unit
+/// tests in this module pin both halves of the promise — one line naming the total and the stored
+/// counts for a real cleanup, silence for an all-zero one — so a regression in this visibility path
+/// fails a test instead of going unnoticed; what they cannot pin is that the production call site
+/// names stderr.
+///
+/// A failed write panics, which is what `eprintln!` did: losing the announcement to a closed
+/// terminal quietly is the silence this function exists to avoid.
+fn report_orphans(out: &mut dyn io::Write, removed: &OrphanCleanup) {
+    // The position at the call site is deliberate — after the violation check in
+    // [`add_note_foreign_keys`], so nothing is announced about a migration that rolled itself back.
+    // All zeros stays silent: every pre-F5 workspace passes through here, and "found nothing" on an
+    // ordinary upgrade is not news.
+    if removed.total() == 0 {
+        return;
+    }
+    writeln!(
+        out,
+        "note-processor: removed {} orphan row(s) while adding note foreign keys ({})",
+        removed.total(),
+        removed.value(),
+    )
+    .expect("printing the orphan receipt to stderr");
 }
 
 /// What [`add_note_foreign_keys`] had to remove, kept apart by shape because a person reading the
@@ -546,12 +567,14 @@ const CHILD_TABLES: &[ChildTable] = &[
 /// The copy is ordered by `rowid`, and that order is load-bearing rather than stylistic. No code
 /// addresses a child row *by* its rowid — rows are found through their note — but the rowids SQLite
 /// hands out on the way in decide what [`crate::scan::note_tags`] returns, because it reads tags
-/// `ORDER BY note_id, rowid` and [`crate::catalog`] renders them in that first-seen order. An unordered
-/// copy leaves the choice to the planner: today a table scan happens to answer in rowid order, but a
-/// plan that reads the covering `tags_tag` index — likelier once F9/F10 add indexes or an `ANALYZE`
-/// writes statistics — would reassign the rowids in tag order and the next scan would rewrite every
-/// tagged entry line of `INDEX.md` with no real change to report, which is the byte-stability
-/// [`crate::catalog`] promises at its top.
+/// `ORDER BY note_id, rowid` and [`crate::catalog`] renders them in that first-seen order. Without the
+/// sort the answer belongs to the planner: today a plain table scan happens to yield rowid order, but
+/// any future plan that reaches the rows another way would hand the rowids out in that other order —
+/// reading `tags_tag` and fetching each row behind it, say (that index carries `tag` and the rowid
+/// only, so it cannot answer `SELECT note_id, tag` by itself), or a plan some `ANALYZE`-written
+/// statistic prefers. The next scan would then rewrite every tagged entry line of `INDEX.md` with no
+/// real change to report, against the byte-stability [`crate::catalog`] promises at its top. The sort
+/// pins the outcome for determinism whatever a later planner decides; it is not a bet on today's plan.
 fn rebuild_with_keys(conn: &Connection, table: &ChildTable) -> Result<(), DbError> {
     let staged = format!("{}_new", table.name);
     conn.execute_batch(&format!(
@@ -600,8 +623,14 @@ fn first_violation(conn: &Connection) -> Result<Option<(String, i64, String)>, D
 /// A `case_key` collision — two paths differing only in case on a case-sensitive filesystem —
 /// surfaces as the constraint violation it is. Nothing picks a winner: Task 10 reports such a
 /// path under `skipped` and keeps scanning.
+///
+/// This and [`apply_move`] / [`mark_stale`] prepare through [`Connection::prepare_cached`], like the
+/// scan path already does: all three run once per file inside one scan's write loop, so an
+/// uncached [`Connection::execute`] would re-compile the same handful of statements thousands of
+/// times per run. Caching changes how a statement is obtained, not what it does: every error — the
+/// identity collisions below included — reaches the caller exactly as it did before.
 pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), DbError> {
-    db.0.execute(
+    db.0.prepare_cached(
         "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ok', ?7)
          ON CONFLICT (rel) DO UPDATE SET
@@ -612,19 +641,19 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
              mtime     = excluded.mtime,
              state     = 'ok',
              last_seen = excluded.last_seen",
-        params![
-            s.rel,
-            s.case_key,
-            // `abs` is stored as TEXT, so a path that is not valid UTF-8 arrives here lossy.
-            abs.to_string_lossy(),
-            s.hash,
-            // No filesystem sizes a file near `i64::MAX`, but the column is SQLite's INTEGER
-            // and a bare `as` cast would wrap such a size into a negative one.
-            i64::try_from(s.size).unwrap_or(i64::MAX),
-            s.mtime,
-            now
-        ],
-    )?;
+    )?
+    .execute(params![
+        s.rel,
+        s.case_key,
+        // `abs` is stored as TEXT, so a path that is not valid UTF-8 arrives here lossy.
+        abs.to_string_lossy(),
+        s.hash,
+        // No filesystem sizes a file near `i64::MAX`, but the column is SQLite's INTEGER
+        // and a bare `as` cast would wrap such a size into a negative one.
+        i64::try_from(s.size).unwrap_or(i64::MAX),
+        s.mtime,
+        now
+    ])?;
     Ok(())
 }
 
@@ -650,29 +679,29 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
 /// not happen. A `to` that some other row already holds fails on the primary key, like any
 /// other collision — two paths cannot be one note.
 pub fn apply_move(db: &Db, from: &str, to: &str, now: i64) -> Result<(), DbError> {
+    // The lookup keeps its own cached statement, and the `MissingRel` mapping below still reads the
+    // same `QueryReturnedNoRows` it always did — caching the prepare changes how the statement is
+    // made, not what a miss reports.
     let abs: String =
-        db.0.query_row(
-            "SELECT abs FROM files WHERE rel = ?1",
-            params![from],
-            |row| row.get(0),
-        )
-        .map_err(|err| match err {
-            rusqlite::Error::QueryReturnedNoRows => DbError::MissingRel {
-                rel: from.to_string(),
-            },
-            other => DbError::Sqlite(other),
-        })?;
+        db.0.prepare_cached("SELECT abs FROM files WHERE rel = ?1")?
+            .query_row(params![from], |row| row.get(0))
+            .map_err(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => DbError::MissingRel {
+                    rel: from.to_string(),
+                },
+                other => DbError::Sqlite(other),
+            })?;
     let new_abs = rebase_abs(&abs, from, to).ok_or_else(|| DbError::BadAbs {
         rel: from.to_string(),
         abs,
     })?;
 
-    db.0.execute(
+    db.0.prepare_cached(
         "UPDATE files
             SET rel = ?2, case_key = ?3, abs = ?4, last_seen = ?5, state = 'ok'
           WHERE rel = ?1",
-        params![from, to, to.to_lowercase(), new_abs, now],
-    )?;
+    )?
+    .execute(params![from, to, to.to_lowercase(), new_abs, now])?;
     Ok(())
 }
 
@@ -683,10 +712,8 @@ pub fn apply_move(db: &Db, from: &str, to: &str, now: i64) -> Result<(), DbError
 /// instead of forgetting it ever existed (spec §2). A path that is not in the registry changes
 /// nothing, which is correct — there is no row to mark.
 pub fn mark_stale(db: &Db, rel: &str) -> Result<(), DbError> {
-    db.0.execute(
-        "UPDATE files SET state = 'stale' WHERE rel = ?1",
-        params![rel],
-    )?;
+    db.0.prepare_cached("UPDATE files SET state = 'stale' WHERE rel = ?1")?
+        .execute(params![rel])?;
     Ok(())
 }
 
@@ -807,7 +834,7 @@ pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::rebase_abs;
+    use super::{rebase_abs, report_orphans, OrphanCleanup};
 
     #[test]
     fn rebase_abs_swaps_the_rel_suffix() {
@@ -854,6 +881,50 @@ mod tests {
             rebase_abs("C:\\ws/notes/a.md", "notes/a.md", "notes/sub/b.md"),
             Some("C:\\ws/notes/sub/b.md".to_string())
         );
+    }
+
+    #[test]
+    fn the_orphan_receipt_is_written_out_with_its_total_and_shapes() {
+        // The stderr visibility path, pinned through the sink `report_orphans` writes to: a person
+        // who watched an ordinary command delete rows has to be told. Capturing the real stderr
+        // in-process is not possible — no stable API replaces the global handle, and the migration
+        // runs inside `Db::open` before a test could redirect descriptor 2 — so the function takes
+        // its sink for exactly this test.
+        let mut out = Vec::new();
+        report_orphans(
+            &mut out,
+            &OrphanCleanup {
+                headings: 2,
+                tags: 1,
+                items: 0,
+                links_src: 3,
+                links_dst_null: 4,
+            },
+        );
+        assert_eq!(
+            String::from_utf8(out).expect("the receipt is text"),
+            "note-processor: removed 10 orphan row(s) while adding note foreign keys \
+             (headings=2,tags=1,items=0,links_src=3,links_dst_null=4)\n"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_with_nothing_removed_writes_no_receipt() {
+        // The other half of the promise: every pre-F5 workspace passes through the migration, and
+        // "found nothing" on an ordinary upgrade is not news. If this ever prints, every upgrade
+        // shouts and the receipt stops meaning anything.
+        let mut out = Vec::new();
+        report_orphans(
+            &mut out,
+            &OrphanCleanup {
+                headings: 0,
+                tags: 0,
+                items: 0,
+                links_src: 0,
+                links_dst_null: 0,
+            },
+        );
+        assert!(out.is_empty(), "all zeros has to stay silent");
     }
 
     #[test]

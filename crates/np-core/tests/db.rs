@@ -738,12 +738,15 @@ fn a_freshly_created_database_records_an_empty_orphan_receipt() {
 
 #[test]
 fn a_version_two_database_keeps_the_tag_rows_in_rowid_order() {
-    // `scan::note_tags` reads tags `ORDER BY note_id, rowid` and `catalog::entry_line` renders them in
-    // that first-seen order, so the rowids migration 3 hands back decide published bytes. A copy that
-    // left the order to the planner — a table scan answers in rowid order, a read of the covering
-    // `tags_tag` index does not — would rewrite every tagged entry line of `INDEX.md` on the first scan
-    // after the upgrade, with no real change behind it (see the byte-stability promise at
-    // `crate::catalog`'s top).
+    // What this test *pins* is migration 3's `ORDER BY rowid` copy (see `rebuild_with_keys` in
+    // `src/db.rs`), not a regression that could be happening today: while the copy is sorted, any
+    // plan — even one reading `tags_tag` and fetching behind it — must emit the rows in rowid order,
+    // so these assertions cannot fail on the current build. They exist for the future change that
+    // drops the sort and meets a planner that then answers in another order (a new index, statistics
+    // from `ANALYZE`); without them that would surface as every tagged entry line of `INDEX.md`
+    // rewriting itself on someone's first scan after an upgrade, with no real change behind it
+    // (see the byte-stability promise at `crate::catalog`'s top). The fixture is deliberately spelled
+    // out-of-order (`zeta`, `alpha`, `mid`) so the pinned order is distinguishable from a sorted one.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = tmp.path().join("ws.sqlite");
     seed_tag_disorder(&path);
