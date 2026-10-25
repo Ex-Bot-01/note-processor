@@ -8,10 +8,13 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+// The hold times and the writer/holder handoff live in `tests/common/mod.rs`, which `tests/config.rs`
+// uses for the registry as well, so a change to `BUSY_TIMEOUT_MS` moves both binaries together.
+mod common;
+
+use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::db::{
     apply_move, mark_stale, note_counts, upsert_file, Db, DbError, NoteCounts, MIGRATIONS,
 };
@@ -529,15 +532,6 @@ fn wal_and_foreign_keys_are_set_where_they_are_legal() {
     assert_eq!(scalar::<i64>(&db, "PRAGMA foreign_keys"), 1);
 }
 
-/// How long the first connection holds its write transaction while the second one waits, in
-/// milliseconds. Inside this crate's busy timeout (`BUSY_TIMEOUT_MS` is 250), so a write that waits has
-/// to win; short enough that a lock nobody releases fails the test rather than hanging it.
-const HOLD_MS: u64 = 40;
-/// A hold time past that timeout and still far below the 5000 ms rusqlite installs on every connection
-/// of its own (`rusqlite-0.40.2/src/inner_connection.rs:118`), which is what makes the third test below
-/// measure this crate's value instead of the driver's.
-const HOLD_PAST_TIMEOUT_MS: u64 = 700;
-
 /// A `files` row insert needing no child table — these cases measure locks, not the schema.
 fn insert_file(rel: &str) -> String {
     format!(
@@ -547,46 +541,36 @@ fn insert_file(rel: &str) -> String {
 }
 
 /// Run `sql` on `blocked` while `holder` still holds a write transaction, then commit the holder.
-/// Returns what the statement returned and how long it took.
 ///
 /// The waiting statement cannot run on this thread: only this thread can hand over the lock it is
-/// waiting for. The writer announces itself before it starts, so the commit lands while that statement
-/// is already inside SQLite's busy loop rather than after it gave up.
+/// waiting for, so the connection travels to the writer and its outcome comes back. See
+/// [`common::contended`] for why the two timings it reports are split.
 fn write_while_locked(
     holder: &Db,
     blocked: Db,
     sql: String,
     hold: Duration,
-) -> (rusqlite::Result<usize>, Duration) {
-    let (tx, rx) = mpsc::channel();
-    let writer = thread::spawn(move || {
-        tx.send(()).expect("test: the writer is about to block");
-        let started = Instant::now();
-        let written = blocked.0.execute(&sql, []);
-        (written, started.elapsed())
-    });
-
-    rx.recv().expect("test: the writer reached its statement");
-    thread::sleep(hold);
-    holder
-        .0
-        .execute("COMMIT", [])
-        .expect("test: release the write lock");
-    writer.join().expect("test: writer thread")
+) -> Contention<rusqlite::Result<usize>> {
+    contended(
+        hold,
+        move || blocked.0.execute(&sql, []),
+        || {
+            holder
+                .0
+                .execute("COMMIT", [])
+                .expect("test: release the write lock");
+        },
+    )
 }
 
 /// The setup both contention tests share: two open connections, then a write transaction on one of
 /// them. Opening both first means nothing below races on a schema write — only on the row.
 fn locked_pair(path: &Path) -> Db {
     let holder = Db::open(path).expect("open the first connection");
-    holder
-        .0
-        .execute("BEGIN IMMEDIATE", [])
-        .expect("test: take the write lock");
-    holder
-        .0
-        .execute(&insert_file("a.md"), [])
-        .expect("test: write inside the transaction");
+    hold_write_lock(
+        |sql| holder.0.execute(sql, []).map(|_| ()),
+        &insert_file("a.md"),
+    );
     holder
 }
 
@@ -600,17 +584,20 @@ fn a_second_writer_waits_for_the_held_transaction_instead_of_failing_busy() {
     let holder = locked_pair(&path);
     let blocked = Db::open(&path).expect("open a second connection while the file is unlocked");
 
-    let (written, waited) = write_while_locked(
+    let contention = write_while_locked(
         &holder,
         blocked,
         insert_file("b.md"),
         Duration::from_millis(HOLD_MS),
     );
 
-    written.expect("the second write has to wait for the lock, not fail with SQLITE_BUSY");
+    contention
+        .outcome
+        .expect("the second write has to wait for the lock, not fail with SQLITE_BUSY");
     assert!(
-        waited >= Duration::from_millis(HOLD_MS / 2),
-        "the statement returned after {waited:?}, so it never waited for the held lock"
+        contention.waited >= Duration::from_millis(HOLD_MS / 2),
+        "the statement returned after {:?}, so it never waited for the held lock",
+        contention.waited
     );
     assert_eq!(
         names(&holder, "SELECT rel FROM files ORDER BY rel"),
@@ -633,14 +620,16 @@ fn a_connection_with_no_busy_timeout_is_refused_the_same_write_at_once() {
         .execute_batch("PRAGMA busy_timeout = 0;")
         .expect("test: switch the timeout off");
 
-    let (written, waited) = write_while_locked(
+    let contention = write_while_locked(
         &holder,
         blocked,
         insert_file("b.md"),
         Duration::from_millis(HOLD_MS),
     );
 
-    let err = written.expect_err("with no timeout set, a locked write must be refused");
+    let err = contention
+        .outcome
+        .expect_err("with no timeout set, a locked write must be refused");
     assert!(
         matches!(
             &err,
@@ -649,9 +638,12 @@ fn a_connection_with_no_busy_timeout_is_refused_the_same_write_at_once() {
         ),
         "expected SQLITE_BUSY, got {err}"
     );
+    // `inside_call`, not `waited`: this is the one bound that asks how long SQLite itself hesitated,
+    // and `waited` deliberately includes the handoff to the holder plus its whole hold.
     assert!(
-        waited < Duration::from_millis(HOLD_MS),
-        "the refusal is immediate, not a wait: {waited:?}"
+        contention.inside_call < Duration::from_millis(HOLD_MS),
+        "the refusal is immediate, not a wait: {:?}",
+        contention.inside_call
     );
 }
 
@@ -659,23 +651,27 @@ fn a_connection_with_no_busy_timeout_is_refused_the_same_write_at_once() {
 fn the_busy_timeout_in_force_is_this_crates_and_not_the_drivers_default() {
     // "A write that waits and wins" alone would prove nothing about `BUSY_TIMEOUT_MS`: rusqlite calls
     // `sqlite3_busy_timeout(db, 5000)` on every connection it opens, so deleting the pragma would leave
-    // the patient test above green. Holding the lock past this crate's 250 ms and well inside those five
-    // seconds is what measures ours — the writer has to give up with `SQLITE_BUSY` while the holder still
-    // has the transaction, which a 5 s timeout would simply have waited out.
+    // the patient test above green. The hold sits between the two values — `HOLD_PAST_TIMEOUT_MS` is
+    // 3000 ms, past this crate's 1800 ms and well inside those five seconds — which keeps the case a
+    // discriminator rather than a tautology: our connection gives up with `SQLITE_BUSY` while the holder
+    // still has the transaction, and a connection left on the driver default would have waited it out
+    // and succeeded. Were the hold ever raised past 5000 ms, or our timeout lowered to where any hold
+    // refuses, this test would prove nothing and should be moved rather than loosened.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = tmp.path().join("ws.sqlite");
     let holder = locked_pair(&path);
     let blocked = Db::open(&path).expect("open a second connection while the file is unlocked");
 
-    let (written, waited) = write_while_locked(
+    let contention = write_while_locked(
         &holder,
         blocked,
         insert_file("b.md"),
         Duration::from_millis(HOLD_PAST_TIMEOUT_MS),
     );
 
-    let err =
-        written.expect_err("a lock held past the configured timeout has to be refused eventually");
+    let err = contention
+        .outcome
+        .expect_err("a lock held past the configured timeout has to be refused eventually");
     assert!(
         matches!(
             &err,
@@ -684,13 +680,17 @@ fn the_busy_timeout_in_force_is_this_crates_and_not_the_drivers_default() {
         ),
         "expected SQLITE_BUSY, got {err}"
     );
+    // Half our timeout below, the driver's default above: the refusal has to land near 1800 ms, which
+    // is neither "refused at once" (the control case) nor "waited out a 5 s timeout".
     assert!(
-        waited >= Duration::from_millis(100),
-        "the write gave up after {waited:?}, which is not the ~250 ms this crate asks for"
+        contention.inside_call >= Duration::from_millis(900),
+        "the write gave up after {:?}, which is not the ~1800 ms this crate asks for",
+        contention.inside_call
     );
     assert!(
-        waited < Duration::from_secs(1),
-        "the write waited {waited:?}, i.e. something nearer to rusqlite's own 5 s default than to ours"
+        contention.inside_call < Duration::from_millis(4500),
+        "the write waited {:?}, i.e. something nearer to rusqlite's own 5 s default than to ours",
+        contention.inside_call
     );
 }
 

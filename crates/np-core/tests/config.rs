@@ -11,11 +11,14 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+// The same harness `crates/np-core/tests/db.rs` uses against a workspace database; see that file's
+// header note on why the hold times and the handoff are shared.
+mod common;
+
+use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
     config_file_path, CatalogConfig, Config, ConfigError, MarkerConfig, WorkspaceRegistry,
 };
@@ -378,54 +381,57 @@ fn registry_records_and_bumps_last_seen() {
     assert_eq!(first_seen, 100);
 }
 
-/// How long the holding connection keeps its write transaction open, in milliseconds: inside this
-/// crate's busy timeout (`BUSY_TIMEOUT_MS` is 250), and short enough that a lock nobody releases fails
-/// the test rather than hanging it.
-const HOLD_MS: u64 = 40;
-/// A hold past that timeout and still far below the 5000 ms rusqlite sets on every connection of its own
-/// (`rusqlite-0.40.2/src/inner_connection.rs:118`), so a test using it measures this crate's value.
-const HOLD_PAST_TIMEOUT_MS: u64 = 700;
-
 /// Take the write lock on the registry file from a second handle — the other `np` run that WAL and the
 /// busy timeout exist for. It opens after the registry exists, so no schema write races with assertions.
 fn hold_registry_lock(data_dir: &Path) -> Connection {
     let holder = Connection::open(data_dir.join("workspaces.sqlite"))
         .expect("test: open the registry file again");
-    holder
-        .execute_batch(
-            "BEGIN IMMEDIATE;
-             INSERT INTO workspaces (workspace, first_seen, last_seen) VALUES ('/held/notes', 1, 1);",
-        )
-        .expect("test: take the write lock");
+    hold_write_lock(
+        |sql| holder.execute_batch(sql),
+        "INSERT INTO workspaces (workspace, first_seen, last_seen) VALUES ('/held/notes', 1, 1)",
+    );
     holder
 }
 
-/// Call `record` on `registry` while `holder` holds the lock, then commit the holder. Returns what the
-/// call returned and how long it took, with the registry handed back.
+/// The payload this binary needs back from the writer thread: the registry itself, because the
+/// assertions read its rows afterwards. `db.rs` returns a bare statement result, so only the shape of
+/// the outcome stays local; the handoff and the timings come from [`common::contended`].
+type Recorded = (Result<(), ConfigError>, WorkspaceRegistry);
+
+/// Call `record` on `registry` while `holder` holds the lock, then commit the holder.
 ///
 /// The waiting `record` cannot run on this thread — only this thread can release the lock it is blocked
-/// on — so the registry travels to the writer and back. The writer announces itself first, so the commit
-/// lands while that call is already inside SQLite's busy loop rather than after it gave up.
+/// on — so the registry travels to the writer and back inside [`Recorded`].
 fn record_while_locked(
     holder: Connection,
     registry: WorkspaceRegistry,
     hold: Duration,
-) -> (Result<(), ConfigError>, Duration, WorkspaceRegistry) {
-    let (tx, rx) = mpsc::channel();
-    let writer = thread::spawn(move || {
-        tx.send(()).expect("test: the writer is about to block");
-        let mut registry = registry;
-        let started = Instant::now();
-        let recorded = registry.record(Path::new("/waiting/notes"), 200);
-        (recorded, started.elapsed(), registry)
-    });
+) -> Contention<Recorded> {
+    contended(
+        hold,
+        move || {
+            let mut registry = registry;
+            let recorded = registry.record(Path::new("/waiting/notes"), 200);
+            (recorded, registry)
+        },
+        || {
+            holder
+                .execute_batch("COMMIT")
+                .expect("test: release the write lock");
+        },
+    )
+}
 
-    rx.recv().expect("test: the writer reached its statement");
-    thread::sleep(hold);
-    holder
-        .execute_batch("COMMIT")
-        .expect("test: release the write lock");
-    writer.join().expect("test: writer thread")
+/// The driver failure behind a [`ConfigError`], if there is one: the registry wraps SQLite errors in
+/// `io::Error::other` (see `From<rusqlite::Error> for ConfigError`), so a typed match has to unwrap
+/// that rather than compare the message text.
+fn sqlite_error(err: &ConfigError) -> Option<&rusqlite::Error> {
+    match err {
+        ConfigError::Io(io_err) => io_err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rusqlite::Error>()),
+        _ => None,
+    }
 }
 
 #[test]
@@ -438,12 +444,13 @@ fn a_registry_write_waits_for_another_connection_instead_of_failing_busy() {
     let registry = WorkspaceRegistry::open(tmp.path()).expect("registry should open");
     let holder = hold_registry_lock(tmp.path());
 
-    let (recorded, waited, registry) =
-        record_while_locked(holder, registry, Duration::from_millis(HOLD_MS));
+    let contention = record_while_locked(holder, registry, Duration::from_millis(HOLD_MS));
+    let (recorded, registry) = contention.outcome;
     recorded.expect("the registry write has to wait for the lock, not fail with SQLITE_BUSY");
     assert!(
-        waited >= Duration::from_millis(HOLD_MS / 2),
-        "record() returned after {waited:?}, so it never waited for the held lock"
+        contention.waited >= Duration::from_millis(HOLD_MS / 2),
+        "record() returned after {:?}, so it never waited for the held lock",
+        contention.waited
     );
 
     let recent = registry.recent().expect("recent");
@@ -458,34 +465,47 @@ fn a_registry_write_waits_for_another_connection_instead_of_failing_busy() {
 fn the_registry_busy_timeout_is_the_same_short_one() {
     // Why this case sits beside the one above: rusqlite installs its own 5000 ms timeout on every
     // connection it opens (`rusqlite-0.40.2/src/inner_connection.rs:118`), so patience alone would not
-    // notice the registry pragma going missing. Held past our 250 ms and well inside those five seconds,
-    // `record` has to come back refusing — which is what proves the value set in
-    // `WorkspaceRegistry::open` is the one in force. The workspace-database equivalent is
+    // notice the registry pragma going missing. The hold sits between the two values —
+    // `HOLD_PAST_TIMEOUT_MS` is 3000 ms, past our 1800 ms and well inside those five seconds — so the
+    // case stays a discriminator rather than a tautology: `record` has to come back refusing while the
+    // holder still has the transaction, which a driver-default connection would have waited out. That
+    // gap is also what proves the value set in `WorkspaceRegistry::open` is the one in force. The
+    // workspace-database equivalent is
     // `the_busy_timeout_in_force_is_this_crates_and_not_the_drivers_default` in
     // `crates/np-core/tests/db.rs`; both connections read the same constant.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let registry = WorkspaceRegistry::open(tmp.path()).expect("registry should open");
     let holder = hold_registry_lock(tmp.path());
 
-    let (recorded, waited, _registry) = record_while_locked(
+    let contention = record_while_locked(
         holder,
         registry,
         Duration::from_millis(HOLD_PAST_TIMEOUT_MS),
     );
 
+    let (recorded, _registry) = contention.outcome;
     let err =
         recorded.expect_err("a lock held past the configured timeout has to be refused eventually");
+    // The typed code, not the message: `database is locked` is driver wording and could change under
+    // us, and only the code says the refusal was "the lock is held" rather than some other failure.
     assert!(
-        err.to_string().contains("database is locked"),
-        "expected the busy refusal, got {err:?}"
+        matches!(
+            sqlite_error(&err),
+            Some(rusqlite::Error::SqliteFailure(fault, _))
+                if fault.code == rusqlite::ErrorCode::DatabaseBusy
+        ),
+        "expected SQLITE_BUSY, got {err:?}"
+    );
+    // Half our timeout below, the driver's default above: the give-up has to land near 1800 ms.
+    assert!(
+        contention.inside_call >= Duration::from_millis(900),
+        "record() gave up after {:?}, which is not the ~1800 ms this crate asks for",
+        contention.inside_call
     );
     assert!(
-        waited >= Duration::from_millis(100),
-        "record() gave up after {waited:?}, which is not the ~250 ms this crate asks for"
-    );
-    assert!(
-        waited < Duration::from_secs(1),
-        "record() waited {waited:?}, i.e. something nearer rusqlite's own 5 s default than our value"
+        contention.inside_call < Duration::from_millis(4500),
+        "record() waited {:?}, i.e. something nearer rusqlite's own 5 s default than our value",
+        contention.inside_call
     );
 }
 

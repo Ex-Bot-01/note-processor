@@ -69,6 +69,11 @@ Order of attack, round by round — each round is one task brief with its own re
   externally reformatted shard is reclaimed instead of orphaned. **Done when:** the existing leak-path test in
   `crates/np-core/tests/scan.rs:690-782` is updated to assert deletion, and a file with *different* prose but a CRLF
   header still survives.
+- **Accepted residual (R2a, not an oversight):** the two header lines are the whole identity signal, so a
+  hand-written file that carries them under a generated name **is** deliberately deleted — authorship of the body
+  is unknowable from disk, and rendering the corpus to compare bytes is the guess the fingerprint exists to avoid;
+  `a_hand_written_file_carrying_our_header_under_a_generated_name_is_deleted` in
+  `crates/np-core/tests/scan.rs` pins that behaviour.
 
 ## F7 — a leading horizontal rule reads as frontmatter
 

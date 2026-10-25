@@ -918,12 +918,20 @@ fn write_index_files(
 ///
 /// Both sources are filtered by [`walk::is_generated_index`], which only decides what is *worth asking
 /// about*. What decides what is ours to remove is the file's own fingerprint: a candidate is deleted only
-/// when it is a regular file opening with exactly [`catalog::HEADER`] (see [`np_published`]). A name that
-/// merely looks generated belongs to somebody else — a hand-written `INDEX-old.md` in the root is never
-/// indexed, because [`walk`] excludes these names, so deleting it would destroy a note no scan ever wrote
-/// (spec §7). Such a candidate, and a directory wearing the name, are returned for the report instead:
-/// the user learns about the collision, and a `remove_file` that could only answer `IsADirectory` never
-/// breaks every later scan of the workspace.
+/// when it is a regular file opening with [`catalog::HEADER`] byte for byte, in either its LF or its CRLF
+/// spelling (see [`np_published`]). A name that merely looks generated belongs to somebody else — a
+/// hand-written `INDEX-old.md` in the root is never indexed, because [`walk`] excludes these names, so
+/// deleting it would destroy a note no scan ever wrote (spec §7). Such a candidate, and a directory
+/// wearing the name, are returned for the report instead: the user learns about the collision, and a
+/// `remove_file` that could only answer `IsADirectory` never breaks every later scan of the workspace.
+///
+/// The fingerprint is read as the *whole* identity signal, and that has one accepted consequence: a file
+/// carrying those two header lines under a generated name **is** deleted even when this program never
+/// published it and a person wrote the prose. Authorship is not recoverable from anything else on disk —
+/// separating an edited shard from a hand-written note would mean rendering the corpus and comparing
+/// bytes, the guess the fingerprint exists to avoid — so the header decides, not who typed the body.
+/// `a_hand_written_file_carrying_our_header_under_a_generated_name_is_deleted` pins that as intended
+/// behaviour, and `docs/backlog-m2-followups.md` records it as an accepted residual.
 ///
 /// A `meta` name no longer on disk appears in neither list. Its absence is already the state this call
 /// wanted — which is exactly how the delete loop in [`write_index_files`] reads an

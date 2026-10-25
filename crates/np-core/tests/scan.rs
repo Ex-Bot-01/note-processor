@@ -661,6 +661,68 @@ fn a_foreign_note_wearing_a_generated_name_survives_and_is_reported() {
 }
 
 #[test]
+fn a_hand_written_file_carrying_our_header_under_a_generated_name_is_deleted() {
+    // Intended behaviour, pinned here so it cannot be "fixed" by accident: the two header lines are the
+    // *whole* identity signal, so a file that opens with them under a generated name is deleted even
+    // though np never published it and its prose was typed by hand. The header — not the authorship of
+    // the body — is what says "generated output, safe to regenerate", because nothing else on disk can
+    // tell that file from one np wrote: the alternative would be rendering the whole corpus and comparing
+    // bytes, which is the guess the fingerprint exists to avoid. The sibling case above shows the other
+    // half of the rule: without our header, the same name is untouchable.
+    let ws = scratch(
+        &[
+            ("a.md", "one\n"),
+            ("b.md", "two\n"),
+            (
+                "INDEX-a-b.md",
+                &format!("{}An entry nobody rendered.\n", catalog::HEADER),
+            ),
+        ],
+        600,
+    );
+    // Premise: the file is sitting there before any scan has run, opening with np's LF header verbatim.
+    let planted =
+        fs::read(ws.root.join("INDEX-a-b.md")).expect("test setup: read the planted file");
+    assert!(planted.starts_with(catalog::HEADER.as_bytes()));
+    // Two short notes render one unsharded `INDEX.md`, so this scan publishes no shard at all: the file
+    // above is not a generation it superseded, and it goes purely on what its own header claims.
+
+    let report =
+        scan(&ws.root, &ws.cfg).expect("a shard wearing our header must not fail the scan");
+
+    assert!(
+        !ws.root.join("INDEX-a-b.md").exists(),
+        "the header is the identity signal, so a file carrying it is np's to remove: {report:?}"
+    );
+    assert!(
+        !report
+            .skipped
+            .iter()
+            .any(|skipped| skipped == "INDEX-a-b.md"),
+        "a file np treated as its own is not a collision to report: {:?}",
+        report.skipped
+    );
+    assert_eq!(report.notes, 2, "neither note is touched: {report:?}");
+    assert_eq!(
+        report.index_files,
+        vec!["INDEX.md".to_string()],
+        "this scan published no shard, so the deletion cannot rest on a superseded list: {report:?}"
+    );
+
+    // And it stays gone: nothing about the deletion depends on a first-scan artefact.
+    let second = scan(&ws.root, &ws.cfg).expect("rescan after the reclaim");
+    assert!(!ws.root.join("INDEX-a-b.md").exists());
+    assert!(
+        !second
+            .skipped
+            .iter()
+            .any(|skipped| skipped == "INDEX-a-b.md"),
+        "{:?}",
+        second.skipped
+    );
+}
+
+#[test]
 fn a_directory_wearing_a_generated_name_survives_and_the_scan_succeeds() {
     // A root directory named like a shard used to become a delete candidate: `fs::remove_file`
     // answers `IsADirectory`, which is not `NotFound`, so every later scan of the workspace failed
@@ -931,16 +993,30 @@ fn unreadable_directory_does_not_mark_its_files_stale() {
     let ws = workspace();
     scan(&ws.root, &ws.cfg).expect("first scan");
     let locked = ws.root.join("deep");
+    // The mode the directory actually arrived with. `TempDir` creates it as `0o777 & !umask`, so putting
+    // back a hardcoded 0o755 would *widen* permissions on a runner with a restrictive umask (0o077 gives
+    // 0o700); whatever was there is what the guard restores. Same reasoning as the `walk.rs` equivalent.
+    let found_mode = fs::metadata(&locked)
+        .expect("test setup: read the directory mode")
+        .permissions()
+        .mode()
+        & 0o7777; // permission bits only; the file-type bits are not ours to set
     fs::set_permissions(&locked, Permissions::from_mode(0o000)).expect("test: chmod 000");
     // Restored on every path out of this block, so the tempdir can clean up after itself even if
     // an assertion below fails.
-    struct Restore(PathBuf);
+    struct Restore {
+        dir: PathBuf,
+        mode: u32,
+    }
     impl Drop for Restore {
         fn drop(&mut self) {
-            let _ = fs::set_permissions(&self.0, Permissions::from_mode(0o755));
+            let _ = fs::set_permissions(&self.dir, Permissions::from_mode(self.mode));
         }
     }
-    let _restore = Restore(locked.clone());
+    let _restore = Restore {
+        dir: locked.clone(),
+        mode: found_mode,
+    };
 
     let report = scan(&ws.root, &ws.cfg).expect("an unreadable directory must not fail the scan");
 
@@ -955,6 +1031,32 @@ fn unreadable_directory_does_not_mark_its_files_stale() {
         state(&ws.db(), "deep/nested/beta.md").as_deref(),
         Some("ok"),
         "a permission error must not stale a whole subtree"
+    );
+
+    // Restoration asserted rather than assumed, as in the `walk.rs` case: dropping the guard here runs it
+    // early, and what comes back has to be the mode this machine made — `0o700` under a `0o077` umask,
+    // where restoring a fixed `0o755` would have handed group and other read+execute on a directory
+    // nobody asked for. The sibling below is made by the same umask, so an assumed value cannot pass.
+    drop(_restore);
+    let restored = fs::metadata(&locked)
+        .expect("test: re-read the directory mode")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        restored, found_mode,
+        "the guard restores the mode it captured"
+    );
+    let plain = ws._tmp.path().join("plain-sibling");
+    fs::create_dir(&plain).expect("test setup: a directory made by this umask");
+    assert_eq!(
+        restored,
+        fs::metadata(&plain)
+            .expect("test: read the sibling mode")
+            .permissions()
+            .mode()
+            & 0o7777,
+        "and that mode is this machine's own, not an assumed one"
     );
 }
 

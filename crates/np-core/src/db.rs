@@ -26,11 +26,25 @@ use crate::hash::Snapshot;
 /// WAL is chosen because two of them overlap (see [`Db::open`]), and WAL admits one writer at a time, so
 /// the second one needs an answer that is not `SQLITE_BUSY`. SQLite's own default is no wait at all;
 /// rusqlite raises that to 5000 ms for every connection it opens
-/// (`rusqlite-0.40.2/src/inner_connection.rs:118`), which would leave a command silently frozen for five
-/// seconds on a database somebody else is writing. Naming the value here keeps the wait this program's
-/// own, and short: long enough to cover an overlapping run's write phase, short enough that a genuinely
-/// stuck database reports within a few hundred milliseconds instead of hanging a command.
-pub(crate) const BUSY_TIMEOUT_MS: u32 = 250;
+/// (`rusqlite-0.40.2/src/inner_connection.rs:118`). Naming the value here keeps the wait this program's
+/// own rather than the driver's.
+///
+/// What it has to cover is an overlapping scan's **whole write transaction**, not one statement: a scan
+/// opens a single transaction and runs `apply_changes`, `store_note_links`, the catalog reads,
+/// `catalog::render` and `set_index_list` inside it before committing (see `scan::scan`), so content
+/// hashing is the only substantial cost that sits outside. A second writer arriving as that phase starts
+/// has to outlast all of it: a value in the low hundreds of milliseconds gave up part-way through the
+/// overlap WAL exists to tolerate, which is a worse answer than waiting.
+///
+/// 1800 ms is a budget for that phase rather than a measurement of one. It is bounded by the two numbers
+/// around it: below rusqlite's 5000 ms, so a command waiting behind a genuinely wedged transaction still
+/// reports in about two seconds instead of five, and far above the single-statement contention an ordinary
+/// command meets. What it has *not* been checked against is a write phase over a corpus of several
+/// thousand notes — no fixture that size exists locally. The two contention tests
+/// (`crates/np-core/tests/db.rs`, `crates/np-core/tests/config.rs`) pin the value between those bounds;
+/// they do not prove it is enough at scale. If a scan's write phase ever runs past it, that scan reports
+/// `database is locked` under overlap and this constant is what moves.
+pub(crate) const BUSY_TIMEOUT_MS: u32 = 1800;
 
 /// The schema, oldest first. Each entry is applied once, inside its own transaction, and its
 /// 1-based position is recorded in `schema_version`. A database whose recorded version is
