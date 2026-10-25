@@ -16,7 +16,8 @@ mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::db::{
-    apply_move, mark_stale, note_counts, upsert_file, Db, DbError, NoteCounts, MIGRATIONS,
+    apply_move, mark_stale, note_counts, upsert_file, Db, DbError, NoteCounts, FK_ORPHANS_KEY,
+    MIGRATIONS,
 };
 use np_core::hash::Snapshot;
 use tempfile::TempDir;
@@ -458,9 +459,15 @@ CREATE TABLE meta (
 INSERT INTO schema_version (version) VALUES (1), (2);
 "#;
 
-/// Write a version-two database at `path` holding both kinds of row migration 3 has to tell apart:
-/// children of two real notes, and five leftovers from the manual-cleanup era whose `note_id` names a
+/// Write a version-two database at `path` holding the three kinds of row migration 3 has to tell
+/// apart: children of two live notes, the children of one note whose file was reported gone
+/// (`state = 'stale'`, spec §2), and five leftovers from the manual-cleanup era whose `note_id` names a
 /// note no scan ever wrote.
+///
+/// The stale note is not decoration. An orphan clean that asked `files` who is still live, rather than
+/// asking `notes` who ever existed, would treat it as one of the five and delete exactly the rows spec
+/// §2 exists to protect — while passing every test written against a fixture whose parents are all
+/// `'ok'`. [`a_stale_note_keeps_its_children_and_the_edge_that_points_at_it`] pins the difference.
 fn seed_version_two(path: &Path) {
     let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
     conn.execute_batch(VERSION_TWO)
@@ -468,16 +475,24 @@ fn seed_version_two(path: &Path) {
     conn.execute_batch(
         "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
             ('a.md', 'a.md', '/ws/a.md', 'ha', 1, 1, 'ok', 1),
-            ('b.md', 'b.md', '/ws/b.md', 'hb', 1, 1, 'ok', 1);
+            ('b.md', 'b.md', '/ws/b.md', 'hb', 1, 1, 'ok', 1),
+            ('c.md', 'c.md', '/ws/c.md', 'hc', 1, 1, 'stale', 1);
          INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
             (1, 'a.md', 'A', 'filename', 'utf-8', 3, 'a'),
-            (2, 'b.md', 'B', 'filename', 'utf-8', 3, 'b');
-         -- Legitimate rows: two notes' own children and one resolved edge between them.
-         INSERT INTO headings (note_id, level, text, line) VALUES (1, 1, 'A heading', 1);
-         INSERT INTO tags (note_id, tag) VALUES (1, 'keep'), (2, 'both');
-         INSERT INTO items (note_id, text, line, state, marker) VALUES (2, 'task', 2, 'open', '- [ ]');
+            (2, 'b.md', 'B', 'filename', 'utf-8', 3, 'b'),
+            (3, 'c.md', 'C', 'filename', 'utf-8', 3, 'c');
+         -- Legitimate rows: three notes' own children, and edges between them. Note 3 owns `c.md`,
+         -- whose file is gone; its rows are as much a note's as the other two.
+         INSERT INTO headings (note_id, level, text, line) VALUES
+            (1, 1, 'A heading', 1), (3, 1, 'C heading', 8);
+         INSERT INTO tags (note_id, tag) VALUES (1, 'keep'), (2, 'both'), (3, 'old');
+         INSERT INTO items (note_id, text, line, state, marker) VALUES
+            (2, 'task', 2, 'open', '- [ ]'), (3, 'old task', 8, 'done', '- [x]');
          INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
-            (1, 2, 'md', 'b.md', 3, 'prose');
+            (1, 2, 'md', 'b.md', 3, 'prose'),
+            -- Written while `c.md` was there. The stale note is this edge's destination rather than its
+            -- source, so no rule about deleting an owner would be the thing that repairs it.
+            (2, 3, 'wiki', 'C', 9, 'prose');
          -- Orphans: children of note 77, plus one edge whose destination is note 88. Neither id was
          -- ever a note row.
          INSERT INTO headings (note_id, level, text, line) VALUES (77, 2, 'Gone', 4);
@@ -490,9 +505,39 @@ fn seed_version_two(path: &Path) {
     .expect("test setup: seed the old rows");
 }
 
+/// Write a version-two database whose `tags` rows are written in an order the `tags_tag` index would
+/// not return them in, for [`a_version_two_database_keeps_the_tag_rows_in_rowid_order`]: rowid order is
+/// zeta, alpha, mid while reading the index hands back alpha, mid, zeta.
+fn seed_tag_disorder(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_TWO)
+        .expect("test setup: version-two schema");
+    conn.execute_batch(
+        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
+            ('a.md', 'a.md', '/ws/a.md', 'ha', 1, 1, 'ok', 1);
+         INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
+            (1, 'a.md', 'A', 'filename', 'utf-8', 3, 'a');
+         INSERT INTO tags (note_id, tag) VALUES (1, 'zeta'), (1, 'alpha'), (1, 'mid');",
+    )
+    .expect("test setup: seed the tag rows");
+}
+
 /// The `meta` value a correct upgrade of [`seed_version_two`] leaves behind: one labelled count for
-/// each orphan shape.
+/// each orphan shape, and no more — the stale note's children must not have raised any of them.
 const ONE_OF_EACH: &str = "headings=1,tags=1,items=1,links_src=1,links_dst_null=1";
+
+/// The `meta` value [`FK_ORPHANS_KEY`] documents for a file with nothing to clean, and for one created
+/// from scratch. Kept apart from a missing key, which means the file never upgraded.
+const NOTHING_REMOVED: &str = "headings=0,tags=0,items=0,links_src=0,links_dst_null=0";
+
+/// The orphan receipt as migration 3 wrote it, read back under the constant it writes under — so a
+/// renamed key fails these tests instead of reading `NULL` and comparing equal to nothing.
+fn receipt(db: &Db) -> String {
+    scalar::<String>(
+        db,
+        &format!("SELECT value FROM meta WHERE key = '{FK_ORPHANS_KEY}'"),
+    )
+}
 
 #[test]
 fn a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note() {
@@ -522,21 +567,21 @@ fn a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note() {
             &db,
             "SELECT note_id || ':' || text FROM headings ORDER BY line"
         ),
-        ["1:A heading"]
+        ["1:A heading", "3:C heading"]
     );
     assert_eq!(
         names(
             &db,
             "SELECT note_id || ':' || tag FROM tags ORDER BY note_id, tag"
         ),
-        ["1:keep", "2:both"]
+        ["1:keep", "2:both", "3:old"]
     );
     assert_eq!(
         names(
             &db,
             "SELECT note_id || ':' || text FROM items ORDER BY line"
         ),
-        ["2:task"]
+        ["2:task", "3:old task"]
     );
     // The edge into a note that never existed is NULLed rather than deleted: it is the source's prose,
     // and dropping it would quietly lower `unresolved_links`.
@@ -544,7 +589,8 @@ fn a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note() {
         edges(&db),
         [
             (1, Some(2), "b.md".to_string()),
-            (1, None, "AlsoGone".to_string())
+            (1, None, "AlsoGone".to_string()),
+            (2, Some(3), "C".to_string())
         ],
         "the resolved edge keeps its destination and the dangling one loses only that"
     );
@@ -562,7 +608,7 @@ fn a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note() {
 
     // And what was removed is written down where a human can read it back.
     assert_eq!(
-        scalar::<String>(&db, "SELECT value FROM meta WHERE key = 'fk_orphans'"),
+        receipt(&db),
         ONE_OF_EACH,
         "the cleanup reports what it deleted"
     );
@@ -577,8 +623,11 @@ fn a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note() {
 #[test]
 fn the_foreign_key_migration_does_not_run_a_second_time() {
     // Same bookkeeping `migrations_are_idempotent` pins for the SQL entries, for a migration that is
-    // code rather than a script: a second open must not rebuild the tables again (it would fail on
-    // the `headings_new` name) and must not rewrite the receipt.
+    // code rather than a script. A re-run cannot be caught by a leftover `headings_new` name: the
+    // rebuild renames the staged table back into place, so nothing of that name survives to collide
+    // with, and a second run would quietly rebuild all four tables again. What detects it is what a
+    // re-run leaves behind — an extra `schema_version` row, and a receipt recomputed over an
+    // already-clean file, which would read as zeros instead of the counts this upgrade earned.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = tmp.path().join("ws.sqlite");
     seed_version_two(&path);
@@ -606,12 +655,112 @@ fn the_foreign_key_migration_does_not_run_a_second_time() {
 
     // A re-run would find no orphans left to remove and rewrite the receipt to zeros; the counts are
     // the ones the upgrade earned.
+    assert_eq!(receipt(&db), ONE_OF_EACH);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM links"), 3);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM tags"), 3);
+}
+
+#[test]
+fn a_stale_note_keeps_its_children_and_the_edge_that_points_at_it() {
+    // Spec §2: a file that is gone is marked stale and nothing of its note is destroyed, so the note can
+    // come back later as the same note. Migration 3 has to read "orphan" as "no `notes` row answers
+    // this", not as "no live file answers this": switch the cleanup to filter on `files.state = 'ok'`
+    // and every assertion below fails, which is exactly the history the spec protects.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_two(&path);
+
+    let db = Db::open(&path).expect("the normal open migrates an old file");
+
+    // The fixture really is the case: a stale registry row, and a note that still answers to it.
     assert_eq!(
-        scalar::<String>(&db, "SELECT value FROM meta WHERE key = 'fk_orphans'"),
-        ONE_OF_EACH
+        scalar::<String>(&db, "SELECT state FROM files WHERE rel = 'c.md'"),
+        "stale",
+        "the file is the one a scan reported gone"
     );
-    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM links"), 2);
-    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM tags"), 2);
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes WHERE id = 3"),
+        1
+    );
+
+    // Its children survived the rebuild with their note still named.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || text FROM headings WHERE note_id = 3"
+        ),
+        ["3:C heading"]
+    );
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || tag FROM tags WHERE note_id = 3"
+        ),
+        ["3:old"]
+    );
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || text || ':' || state FROM items WHERE note_id = 3"
+        ),
+        ["3:old task:done"]
+    );
+    // And the edge written to it still points at it. `ON DELETE SET NULL` is for a target that stopped
+    // being a note, which a stale one has not.
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM links WHERE dst_note_id = 3"),
+        1,
+        "the inbound edge keeps its destination"
+    );
+
+    // Absent from the receipt, which is what the equality asserts: a cleanup that took the stale note
+    // for an orphan would report `headings=2,tags=2,items=2,…`, and one that deleted its inbound edge
+    // instead of leaving it alone would report `links_src=2` or `links_dst_null=2`.
+    assert_eq!(
+        receipt(&db),
+        ONE_OF_EACH,
+        "nothing belonging to the stale note was counted as removed"
+    );
+}
+
+#[test]
+fn a_freshly_created_database_records_an_empty_orphan_receipt() {
+    // [`FK_ORPHANS_KEY`] promises the receipt is written even when every count is zero, so that "looked
+    // and found none" reads differently from "this file never upgraded". A brand-new workspace is the
+    // smallest case of that promise, and the one every fresh database takes.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+
+    let db = Db::open(&path).expect("a new file migrates from scratch");
+
+    assert_eq!(receipt(&db), NOTHING_REMOVED);
+}
+
+#[test]
+fn a_version_two_database_keeps_the_tag_rows_in_rowid_order() {
+    // `scan::note_tags` reads tags `ORDER BY note_id, rowid` and `catalog::entry_line` renders them in
+    // that first-seen order, so the rowids migration 3 hands back decide published bytes. A copy that
+    // left the order to the planner — a table scan answers in rowid order, a read of the covering
+    // `tags_tag` index does not — would rewrite every tagged entry line of `INDEX.md` on the first scan
+    // after the upgrade, with no real change behind it (see the byte-stability promise at
+    // `crate::catalog`'s top).
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_tag_disorder(&path);
+
+    let db = Db::open(&path).expect("the normal open migrates an old file");
+
+    assert_eq!(
+        names(&db, "SELECT tag FROM tags ORDER BY rowid"),
+        ["zeta", "alpha", "mid"],
+        "the rebuilt table handed out its rowids in the order the rows were written"
+    );
+    // The exact read `note_tags` performs, so what is pinned is the catalog's order rather than a
+    // query's.
+    assert_eq!(
+        names(&db, "SELECT tag FROM tags ORDER BY note_id, rowid"),
+        ["zeta", "alpha", "mid"]
+    );
 }
 
 #[test]

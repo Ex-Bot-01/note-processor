@@ -411,6 +411,18 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         params![FK_ORPHANS_KEY, removed.value()],
     )?;
+    if removed.total() > 0 {
+        // Saying it out loud as well: reading the receipt back needs sqlite3, and a person who just
+        // watched an ordinary command delete rows deserves to be told they were deleted. The position
+        // is deliberate — after the violation check above, so nothing is announced about a migration
+        // that rolled itself back. All zeros stays silent: every pre-F5 workspace passes through here,
+        // and "found nothing" on an ordinary upgrade is not news.
+        eprintln!(
+            "note-processor: removed {} orphan row(s) while adding note foreign keys ({})",
+            removed.total(),
+            removed.value(),
+        );
+    }
     Ok(())
 }
 
@@ -427,6 +439,11 @@ struct OrphanCleanup {
 }
 
 impl OrphanCleanup {
+    /// Every row the cleanup changed, added up. What decides whether the receipt is worth printing.
+    fn total(&self) -> usize {
+        self.headings + self.tags + self.items + self.links_src + self.links_dst_null
+    }
+
     /// The stored spelling — the labels of [`FK_ORPHANS_KEY`], in the order the tables are rebuilt.
     fn value(&self) -> String {
         format!(
@@ -524,12 +541,22 @@ const CHILD_TABLES: &[ChildTable] = &[
 ///
 /// Runs inside the caller's transaction with enforcement off, so neither the `DROP` nor the `RENAME`
 /// can disturb another table's references, and a failure at any step leaves the original table where it
-/// was. Rowids are not carried over — no code addresses a child row by rowid, only by its note.
+/// was.
+///
+/// The copy is ordered by `rowid`, and that order is load-bearing rather than stylistic. No code
+/// addresses a child row *by* its rowid — rows are found through their note — but the rowids SQLite
+/// hands out on the way in decide what [`crate::scan::note_tags`] returns, because it reads tags
+/// `ORDER BY note_id, rowid` and [`crate::catalog`] renders them in that first-seen order. An unordered
+/// copy leaves the choice to the planner: today a table scan happens to answer in rowid order, but a
+/// plan that reads the covering `tags_tag` index — likelier once F9/F10 add indexes or an `ANALYZE`
+/// writes statistics — would reassign the rowids in tag order and the next scan would rewrite every
+/// tagged entry line of `INDEX.md` with no real change to report, which is the byte-stability
+/// [`crate::catalog`] promises at its top.
 fn rebuild_with_keys(conn: &Connection, table: &ChildTable) -> Result<(), DbError> {
     let staged = format!("{}_new", table.name);
     conn.execute_batch(&format!(
         "CREATE TABLE {staged} ({columns});
-         INSERT INTO {staged} ({copied}) SELECT {copied} FROM {name};
+         INSERT INTO {staged} ({copied}) SELECT {copied} FROM {name} ORDER BY rowid;
          DROP TABLE {name};
          ALTER TABLE {staged} RENAME TO {name};
          {indexes}",
