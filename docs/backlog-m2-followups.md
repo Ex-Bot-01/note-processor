@@ -13,7 +13,9 @@ Order of attack, round by round — each round is one task brief with its own re
 | R2a | F4, F6, F14 | small and independent: connection pragma, fingerprint tolerance, hermetic config tests |
 | R2b | F5 | the one schema migration, kept alone because it rebuilds tables |
 | R3 | F7, F8 | parsing semantics that change stored data, so they must land before M2 writes new rows |
-| R4 | F9, F10 | performance, invisible at 1.5k notes but wrong to carry into a watcher |
+| R3b | F15 | re-parse trigger: without it the shipped rules never reach existing databases |
+| R4a | benchmark only | lands first so F9/F10 can be measured honestly (see the measurement protocol below) |
+| R4b | F9, F10 | performance, invisible at 1.5k notes but wrong to carry into a watcher |
 | R5 | F11, F12, F13 | naming/rendering/identity cleanups that M2's `processed/` writer would otherwise copy |
 
 ---
@@ -118,6 +120,37 @@ Order of attack, round by round — each round is one task brief with its own re
 - **Fix:** measure with display width (East Asian wide, combining marks, emoji) while keeping the wrap point a pure
   function of bytes so byte-stability holds. **Done when:** a CJK-titled note renders within 100 *columns* and the
   golden files are regenerated deliberately in their own commit.
+
+## Measurement protocol for the performance items (F9, F10)
+
+A claim like "cached prepares speed up the write path" is worthless without a number taken the same way on both sides.
+The first R4 attempt tried to measure before implementing and ran out of time having written no code, so the work is
+split deliberately:
+
+1. add an `#[ignore]`d release benchmark over a synthetic corpus of at least 2,000 files, in its own commit with no
+   behaviour change, and record its numbers at that commit;
+2. implement F9/F10, run the same benchmark on the same machine, and report both numbers side by side.
+
+If the delta is inside run-to-run noise, say so. A flat result is a usable answer; an unmeasured improvement claim is not.
+
+## F15 — changing a parse rule never reaches notes that did not change
+
+- **Where:** `crates/np-core/src/scan.rs:499-501` — a note is re-parsed only when classification says
+  `Added | Modified`, or when its note row is missing.
+- **Found by:** the R3 review (`R3 REVIEW: pass`, P1) while landing F7 and F8.
+- **Consequence for a user who already ran M1:** headings, tags, `word_count` and the title keep their pre-R3 values
+  forever. `INDEX.md` goes on showing a section that is no longer hidden and a tag spelled the old way — stable, so
+  nothing looks broken — and then those lines change bytes when an unrelated edit touches the note. That is worse
+  than an obvious failure, because the catalog is supposed to be trustworthy.
+- **Fix:** store a `parse_version` constant in `meta`; at scan start compare it with the value this build writes.
+  When the stored value is behind, force the rewrite path for every markdown note in that one scan and record the new
+  version afterwards. A SQL migration cannot do this — migrations here are schema-only (`db.rs:53-56`) — and hashing
+  must still run over raw bytes so forcing a re-parse does not itself count as a modification.
+- **Done when:** a database written with `parse_version` behind (build it by hand, like the pre-migration fixture in
+  `tests/db.rs`) shows every note's derived rows refreshed by one scan with no content change, `INDEX.md` reflects
+  the current rules, and a second scan reports zero changes; plus a test that bumping the constant again re-triggers.
+- **Priority:** must land before the first M2 release. Every future parse-rule change depends on this mechanism, so it
+  is cheaper to build once now than to retrofit after clustering stores derived data too.
 
 ## F14 — two configuration tests depend on ambient `$HOME`
 
