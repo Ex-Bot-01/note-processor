@@ -277,16 +277,19 @@ fn an_unreadable_directory_is_reported_not_silently_missing() {
     let secret = tmp.path().join("secret");
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o0))
         .expect("test setup: chmod 0 the subdirectory");
+    // Declared before any assertion so the mode goes back on every path out of this test,
+    // panic included; `TempDir` cleanup cannot remove a tree holding a mode-0 directory.
+    let _readable_again = ReadableAgain {
+        dir: secret.clone(),
+    };
     if fs::read_dir(&secret).is_ok() {
         // Running as root (common in containers) reads a mode-0 directory anyway.
         eprintln!("skipping: this machine can read a mode-0 directory");
-        restore_mode(&secret);
         return;
     }
 
     let walked = walk(tmp.path(), &WalkOptions::default())
         .expect("one unreadable directory must not fail the walk");
-    restore_mode(&secret);
 
     assert_eq!(rels_from(&walked.files), ["keep.md"]);
     assert_eq!(
@@ -296,12 +299,24 @@ fn an_unreadable_directory_is_reported_not_silently_missing() {
     );
 }
 
+/// Restores `dir` to 0o755 when dropped.
+///
+/// A mode-0 directory makes `TempDir::drop` fail, and a leaked one stays unwritable on the
+/// machine forever, so the restoration may not depend on reaching the end of a test body.
 #[cfg(unix)]
-fn restore_mode(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
+struct ReadableAgain {
+    dir: PathBuf,
+}
 
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
-        .expect("test teardown: make the directory removable again");
+#[cfg(unix)]
+impl Drop for ReadableAgain {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Best effort: `Drop` must not panic, and a failure here only repeats the leak the
+        // guard exists to prevent.
+        let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o755));
+    }
 }
 
 /// Sibling of `symlink_loop_does_not_hang`, which cannot see `follow_links`: walkdir's

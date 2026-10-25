@@ -139,6 +139,7 @@ fn no_config_file_means_defaults() {
     // `load(None)` reads this machine's config path; only assert when nothing is
     // there, so the test never depends on (or touches) a real user config.
     let Some(path) = config_file_path() else {
+        eprintln!("skipping: this environment names no config directory");
         return;
     };
     if path.exists() {
@@ -155,6 +156,9 @@ fn no_config_file_means_defaults() {
 #[test]
 fn config_file_path_points_at_note_processor_config() {
     let Some(path) = config_file_path() else {
+        eprintln!(
+            "skipping: this environment names no config directory, so there is no path to check"
+        );
         return;
     };
     assert!(

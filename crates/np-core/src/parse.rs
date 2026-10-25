@@ -37,7 +37,7 @@ pub enum TitleSource {
 
 impl TitleSource {
     /// The `notes.title_source` spelling, so the word that reaches the database is written here and
-    /// not at each call site — [`crate::scan`] stores it for every note it indexes.
+    /// not at each call site — [`mod@crate::scan`] stores it for every note it indexes.
     pub fn as_str(self) -> &'static str {
         match self {
             TitleSource::Frontmatter => "frontmatter",

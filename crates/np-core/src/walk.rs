@@ -193,7 +193,7 @@ pub fn to_open_path(abs: &Path) -> PathBuf {
 }
 
 /// Testable core of [`to_open_path`]: `p` with the Windows extended-length prefix
-/// added when `windows` is set, `p` is [`LONG_PATH_CHARS`] characters or longer and
+/// added when `windows` is set, `p` is `LONG_PATH_CHARS` characters or longer and
 /// does not already carry the prefix. Deliberately not `#[cfg]`-gated so one machine
 /// tests both rules; it expects an absolute path, because a prefixed relative path
 /// is not valid on Windows.

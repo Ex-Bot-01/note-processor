@@ -10,10 +10,10 @@
 //!   "open" stays the absence of a marker *on an item* (spec §8.7) instead of a row for every
 //!   sentence in the file. An explicit open claim is written, not inferred: `- [ ]`.
 //! - **Three kinds of line never reach the scan.** A fenced region and both of its fence lines come
-//!   out of [`crate::parse::prose_lines`], the same iterator that decides headings, tags, words and
-//!   links; an ATX heading comes out via [`crate::parse::is_heading_line`], because a heading names a
+//!   out of `crate::parse::prose_lines`, the same iterator that decides headings, tags, words and
+//!   links; an ATX heading comes out via `crate::parse::is_heading_line`, because a heading names a
 //!   topic rather than an item — `## Erledigt` is an outline entry and creates no candidate; and a
-//!   recognised frontmatter block is skipped by starting the scan at [`crate::parse::body_start`],
+//!   recognised frontmatter block is skipped by starting the scan at `crate::parse::body_start`,
 //!   because `tags:` with a `  - done` under it is metadata, not an item claiming to be done. None
 //!   of these rules is re-implemented here.
 //! - **One line yields at most one candidate.** The checkbox wins over the vocabulary, and among the
@@ -86,7 +86,7 @@ pub struct ItemCandidate {
 ///
 /// Three exclusions come from shared decisions, not from local rules: lines inside a ``` fenced
 /// region (including both fence lines), ATX heading lines `# …` through `###### …`, and a recognised
-/// frontmatter block — the scan starts at [`crate::parse::body_start`], so `tags:` with a `  - done`
+/// frontmatter block — the scan starts at `crate::parse::body_start`, so `tags:` with a `  - done`
 /// under it yields no Done item and `status: erledigt` yields none whose text is `status:`. A
 /// heading with a marker word in it names a topic and yields no item; seven hashes is not a heading
 /// by the outline's own test, so it is prose like any other.
@@ -101,7 +101,7 @@ pub struct ItemCandidate {
 ///
 /// Cost: one pass over the lines and one pass over each line, with no pattern compiled per line and
 /// no per-line copy of the marker list — a character that cannot start any marker costs one table
-/// lookup ([`MarkerSet::starts_at`]), so the work stays linear in the input even for a 5 MB single
+/// lookup (`MarkerSet::starts_at`), so the work stays linear in the input even for a 5 MB single
 /// line (see the `#[ignore]`d timing case in `tests/items.rs`). Unlike
 /// [`crate::links::extract_links`], which deliberately reads from line 1 because a link written in
 /// frontmatter is still a link, this is a scan of the body only: a status word in metadata is about

@@ -8,7 +8,7 @@
 //!   `INDEX.md` cannot join a SQLite transaction, so the catalog is rendered inside that transaction,
 //!   its name list is committed with it, and only then does the filesystem work start. A scan that dies
 //!   halfway leaves the previous catalog readable instead of half-rewritten, and never leaves a delete
-//!   list that lags the files on disk (see [`set_index_list`] and [`write_index_files`] for the order).
+//!   list that lags the files on disk (see `set_index_list` and `write_index_files` for the order).
 //! - **Unknown is not absent.** A directory the walk could not enter, and a file that vanished or was
 //!   rewritten between the walk and the read, is named in [`ScanReport::skipped`] and keeps the row it
 //!   already has (Review Focus 5). Reporting either as `Removed` would stale live notes because of a
