@@ -10,7 +10,8 @@ Order of attack, round by round — each round is one task brief with its own re
 | Round | Items | Why this order |
 | --- | --- | --- |
 | R1 | F1, F2, F3 | test and doc hygiene; zero behavioural risk, unblocks honest `cargo doc` |
-| R2 | F4, F5, F6 | schema and durability: one migration, plus the delete rule made line-ending tolerant |
+| R2a | F4, F6, F14 | small and independent: connection pragma, fingerprint tolerance, hermetic config tests |
+| R2b | F5 | the one schema migration, kept alone because it rebuilds tables |
 | R3 | F7, F8 | parsing semantics that change stored data, so they must land before M2 writes new rows |
 | R4 | F9, F10 | performance, invisible at 1.5k notes but wrong to carry into a watcher |
 | R5 | F11, F12, F13 | naming/rendering/identity cleanups that M2's `processed/` writer would otherwise copy |
@@ -112,6 +113,18 @@ Order of attack, round by round — each round is one task brief with its own re
 - **Fix:** measure with display width (East Asian wide, combining marks, emoji) while keeping the wrap point a pure
   function of bytes so byte-stability holds. **Done when:** a CJK-titled note renders within 100 *columns* and the
   golden files are regenerated deliberately in their own commit.
+
+## F14 — two configuration tests depend on ambient `$HOME`
+
+- **Where:** `crates/np-core/tests/config.rs:89` and `:101`.
+- **Evidence (found while doing F2, reproduced on `780ccf0`):** with the environment stripped —
+  `env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config` — both fail with
+  `MissingField("data_dir")`, because `default_data_dir()` correctly returns `None` and the loader now refuses an
+  empty data dir (the behaviour M1 deliberately chose). The product is right; the tests are not hermetic, and a
+  machine without `$HOME` (or a stripped CI shell) turns a correct build red.
+- **Fix:** give both tests an explicit temporary `HOME` / `XDG_CONFIG_HOME` (the way the CLI integration tests
+  already isolate config) instead of inheriting the ambient environment. **Done when:**
+  `env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config` passes, and the normal run still passes.
 
 ## F13 — `rel` / `abs` stored as lossy strings
 
