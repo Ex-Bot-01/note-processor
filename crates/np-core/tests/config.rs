@@ -447,6 +447,11 @@ fn a_registry_write_waits_for_another_connection_instead_of_failing_busy() {
     let contention = record_while_locked(holder, registry, Duration::from_millis(HOLD_MS));
     let (recorded, registry) = contention.outcome;
     recorded.expect("the registry write has to wait for the lock, not fail with SQLITE_BUSY");
+    // A diagnostic, not a discriminator, for the same reason as the workspace-database case beside it in
+    // `tests/db.rs`: `common::contended` sleeps the whole `HOLD_MS` before releasing and `waited` starts
+    // before that sleep, so a write that got the lock back is over half the hold by construction. The
+    // registry's real discriminator is `the_registry_busy_timeout_is_the_same_short_one`; this figure is
+    // printed because one near zero would mean the harness stopped measuring.
     assert!(
         contention.waited >= Duration::from_millis(HOLD_MS / 2),
         "record() returned after {:?}, so it never waited for the held lock",

@@ -521,9 +521,20 @@ fn index_file(
 ///
 /// Only this note's `origin = 'prose'` edges go too: an approved edge is an input and not derived output
 /// (spec §10). Edges pointing *in* lose their destination rather than being deleted, because they are
-/// another note's prose and stay countable as unresolved. Rewriting them is not optional bookkeeping:
-/// `dst_note_id` carries no foreign key and SQLite hands a deleted rowid to the next INSERT, so an edge
-/// left behind would eventually claim an unrelated note as its destination.
+/// another note's prose and stay countable as unresolved.
+///
+/// Migration 3 gave every one of these five statements a twin in the schema — each child table cascades
+/// off `notes(id)`, and `links.dst_note_id` is `ON DELETE SET NULL`. The hand-written ones stay: they
+/// name in the code what is about to happen, and they hold whatever a connection's `foreign_keys` pragma
+/// happens to say. Two places the schema now reaches further are worth knowing from here:
+///
+/// - The cascade takes **every** outgoing edge, so an approved one leaves with its source note. A foreign
+///   key cannot be conditional, and an edge whose source row is gone has nothing to point at; M1 writes no
+///   approved edges (`store_links` is called with `prose` only), so today the two agree exactly. If a later
+///   milestone starts writing them, this is the decision to revisit.
+/// - An orphan can no longer survive this function at all. SQLite hands a deleted rowid to the next
+///   INSERT, so an inbound edge left pointing at a dead note would eventually claim an unrelated note as
+///   its destination — which is precisely what `dst_note_id`'s foreign key now rules out.
 fn delete_note_row(db: &Db, rel: &str) -> Result<(), DbError> {
     let Some(id) = note_id(db, rel)? else {
         return Ok(());
@@ -808,8 +819,10 @@ fn note_tags(db: &Db) -> Result<HashMap<i64, Vec<String>>, DbError> {
 /// counting those would bury the "notes I could not place" signal (see [`crate::links::store_links`]).
 ///
 /// A destination that exists but is stale counts here, because it is a note nobody can reach: links are
-/// re-resolved only for notes this scan re-parsed, so an edge into a deleted note keeps its old
-/// `dst_note_id` until its source is edited. [`crate::db::unresolved_targets`] answers the list this scan
+/// re-resolved only for notes this scan re-parsed, so an edge into a stale note keeps its old
+/// `dst_note_id` until its source is edited. An edge into a note row that was actually *deleted* arrives
+/// by the other door: migration 3's `ON DELETE SET NULL` empties it, and an empty destination counts here
+/// as well. [`crate::db::unresolved_targets`] answers the list this scan
 /// reports beside this number as [`ScanReport::unresolved_targets`], and both are read from one
 /// transaction — that query asks the same question with the same [`LIVE_EDGE`] predicate and the same
 /// [`PROSE_ORIGIN`] filter, neither spelling its own literal — an approved edge is an input, and once

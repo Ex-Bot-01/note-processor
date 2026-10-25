@@ -8,6 +8,10 @@
 //! stay put because they hang off `notes.id`, which never changes. That is how a rename
 //! keeps a note's links.
 //!
+//! That hanging-off is stated in the schema as well as in the code: migration 3 gave every child
+//! column a foreign key on `notes(id)`, so a row no note owns cannot be written at all. Each entry of
+//! [`MIGRATIONS`] says what a deleted note does to the rows around it.
+//!
 //! There is no transaction helper on purpose: Task 10 wraps a whole scan in one
 //! [`rusqlite::Connection::unchecked_transaction`], which needs the public connection.
 
@@ -51,14 +55,17 @@ pub(crate) const BUSY_TIMEOUT_MS: u32 = 1800;
 /// ahead of this list is refused rather than trusted — a newer file read by an older binary
 /// would otherwise be written to a schema this code does not know.
 ///
-/// Two entries rather than one, split along the line that matters (`files` + `notes` are the
+/// Three entries rather than one, split along the lines that matter (`files` + `notes` are the
 /// registry and the note's identity; everything after them is derived from a note's contents
-/// and can be rebuilt from the file), so the version bookkeeping has more than one row to
-/// prove itself with. Later milestones append an entry here; they do not edit one.
-pub const MIGRATIONS: &[&str] = &[
+/// and can be rebuilt from the file; the third adds the keys between those two groups), so the
+/// version bookkeeping has more than one row to prove itself with. Later milestones append an
+/// entry here; they do not edit one — migration 3 exists precisely because a database on disk has
+/// already applied the first two, and SQLite cannot add a constraint to a table that is there.
+pub const MIGRATIONS: &[Migration] = &[
     // The registry, and one note row per markdown file. `rel` is the identity a scan keys on
     // and `case_key` the one a case-insensitive filesystem keys on, so both are constrained.
-    r#"
+    Migration::Sql(
+        r#"
     CREATE TABLE files (
         rel       TEXT    PRIMARY KEY,
         case_key  TEXT    NOT NULL UNIQUE,
@@ -88,9 +95,12 @@ pub const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX notes_rel ON notes(rel);
     "#,
+    ),
     // Derived rows. Every one of them keys on `notes.id`, which is why a move never has to
-    // touch them and why identity survives a rename.
-    r#"
+    // touch them and why identity survives a rename — and why they are the tables migration 3 puts
+    // a foreign key on.
+    Migration::Sql(
+        r#"
     CREATE TABLE headings (
         note_id INTEGER NOT NULL,
         level   INTEGER NOT NULL,
@@ -131,7 +141,26 @@ pub const MIGRATIONS: &[&str] = &[
         value TEXT
     );
     "#,
+    ),
+    // The child tables' note keys become real foreign keys. Not a script: SQLite has no `ALTER TABLE
+    // ADD CONSTRAINT`, so each table is rebuilt, and the orphans an older build left behind have to be
+    // counted and reported on the way through.
+    Migration::Code(add_note_foreign_keys),
 ];
+
+/// One step of the schema, as one entry of [`MIGRATIONS`].
+#[derive(Clone, Copy)]
+pub enum Migration {
+    /// A SQL script, applied verbatim inside the step's own transaction.
+    Sql(&'static str),
+    /// A step that cannot be written as a script — a table rebuild, or a cleanup whose counts have to
+    /// be reported — run inside the same kind of transaction. Returning an error rolls the whole step
+    /// back and leaves the recorded version where it was.
+    ///
+    /// The connection is handed over with `foreign_keys` switched off, because a rebuild needs it that
+    /// way; every migration step runs under that switch and enforcement is back on afterwards.
+    Code(fn(&Connection) -> Result<(), DbError>),
+}
 
 /// What can fail while opening or writing the workspace database.
 #[derive(Debug, Error)]
@@ -152,6 +181,21 @@ pub enum DbError {
     /// reports the offending path under `skipped` and carries on with the next one.
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A migration's `PRAGMA foreign_key_check` reported rows, so the file holds child rows no parent
+    /// owns and its data cannot satisfy the constraints being added. The migration rolls back instead
+    /// of recording itself: carrying on to write into a database whose own keys are broken would hide
+    /// the damage rather than report it.
+    #[error("foreign key check found {count} row(s) outside their parent's key, first offender: table {table} rowid {rowid} references {parent}")]
+    ForeignKeys {
+        /// How many rows the check reported.
+        count: i64,
+        /// The first row it reported.
+        table: String,
+        /// Rowid of that row, so whoever has to repair the data can find it.
+        rowid: i64,
+        /// The parent table its key names.
+        parent: String,
+    },
     /// The file was written by a newer version of this program, so its schema is unknown.
     #[error("database schema version {found} is newer than this build knows ({known})")]
     TooNew {
@@ -247,15 +291,36 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
         });
     }
 
-    for (index, sql) in MIGRATIONS.iter().enumerate() {
+    // Foreign-key enforcement is switched off for the whole loop and back on after it, whatever the
+    // loop returns. A table rebuild cannot happen with it on — dropping a table fails while another one
+    // references it, and `ALTER TABLE ... RENAME` rewrites the references it finds — and the pragma has
+    // no effect inside a transaction (sqlite.org/lang_altertable.html, step 7 of the documented
+    // procedure), so it cannot move into the one migration that needs it. Both open paths ask for
+    // `foreign_keys = ON` before calling this, so restoring it keeps that promise to the caller even
+    // when a migration fails.
+    conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+    let applied = apply_migrations(conn, current);
+    let restored = conn.execute_batch("PRAGMA foreign_keys = ON");
+    applied?;
+    restored?;
+    Ok(())
+}
+
+/// Apply every migration above `from`, one transaction each.
+fn apply_migrations(conn: &Connection, from: i64) -> Result<(), DbError> {
+    for (index, migration) in MIGRATIONS.iter().enumerate() {
         let version = index as i64 + 1;
-        if version <= current {
+        if version <= from {
             continue;
         }
         // One entry per transaction: DDL is transactional in SQLite, so a migration that
-        // fails halfway leaves nothing behind and cannot be recorded as done.
+        // fails halfway leaves nothing behind and cannot be recorded as done. A code step gets the
+        // same transaction, which is what lets it check its own work before anything is committed.
         let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(sql)?;
+        match migration {
+            Migration::Sql(sql) => tx.execute_batch(sql)?,
+            Migration::Code(apply) => apply(&tx)?,
+        }
         tx.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             params![version],
@@ -263,6 +328,239 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
         tx.commit()?;
     }
     Ok(())
+}
+
+/// `meta` key recording what migration 3 removed to make its constraints possible.
+///
+/// `meta` is where this program already keeps the workspace bookkeeping a person may need in order to
+/// explain itself — [`mod@crate::scan`] records the published index files there — so the receipt needs no
+/// new channel: there is no logger to write to, and returning the counts from `Db::open` would mean
+/// plumbing a migration detail through every caller that opens a database. The value is one labelled
+/// count per shape, `headings=…,tags=…,items=…,links_src=…,links_dst_null=…`, written even when they
+/// are all zero: "looked and found none" is worth telling apart from "this file never upgraded".
+pub const FK_ORPHANS_KEY: &str = "fk_orphans";
+
+/// Migration 3 — every child table gains a real foreign key on its note.
+///
+/// `headings`, `tags`, `links` and `items` carried their note's id as a bare integer. The invariant
+/// "one note row per file, and its children belong to that note" was held by hand in
+/// `scan::delete_note_row`, and one forgotten delete there left an orphan child whose dead id SQLite
+/// hands to the next `INSERT` — a silent re-adoption. The shapes below follow what that code already
+/// does, statement for statement:
+///
+/// - `headings.note_id`, `tags.note_id`, `items.note_id` → `REFERENCES notes(id) ON DELETE CASCADE`:
+///   a heading with no note is nothing, and `delete_note_row` deletes them today.
+/// - `links.src_note_id` → the same. An edge from a note that is gone is not an edge.
+/// - `links.dst_note_id` → `ON DELETE SET NULL`, **not** CASCADE: dropping a target must not delete
+///   the *source's* row, which is another note's prose. Keeping it with a NULL destination is what
+///   `delete_note_row` does by hand and what keeps the edge inside `unresolved_links`.
+///
+/// The one place the schema is stricter than the hand-written cleanup is approved edges. That function
+/// drops only this note's `origin = 'prose'` rows and keeps an approved one (spec §10), but a foreign
+/// key cannot be conditional: either an approved edge goes with its source or the source row cannot be
+/// deleted at all. It goes. M1 writes no approved edges — nothing calls `store_links` with that origin
+/// outside tests — so nothing observable changes today, and `delete_note_row` says so where a reader
+/// of that code will look.
+///
+/// SQLite has no `ALTER TABLE ADD CONSTRAINT`, so each table is rebuilt the documented way
+/// (sqlite.org/lang_altertable.html): stage `<name>_new` with the constraints in its definition, copy
+/// the rows across, drop the old table, rename the staged one back, recreate its indexes. Enforcement
+/// is off for the duration — [`migrate`] switches it outside the transaction, the only place it has an
+/// effect — and `PRAGMA foreign_key_check` runs **inside** that transaction, so a report rolls the
+/// whole migration back instead of committing a file that cannot satisfy its own schema.
+///
+/// One consequence of running that check over the whole database: a file holding an orphan **note** — a
+/// `notes.rel` no `files` row answers, which migration 1's key already forbids — refuses to open at all.
+/// That row is not this step's to delete (its file may come back, which is what `state = 'stale'` exists
+/// for) and not its to invent a parent for, so refusing the upgrade is the only honest answer left.
+/// Nothing in M1 can produce one: a note row is written after its file is upserted, and `files` rows are
+/// never deleted.
+fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
+    // Orphans first: a database from the manual-cleanup era may hold children no note owns, and they
+    // would fail the check below. Nothing with a real note is touched.
+    let removed = OrphanCleanup {
+        headings: detach_orphans(conn, "headings", "note_id")?,
+        tags: detach_orphans(conn, "tags", "note_id")?,
+        items: detach_orphans(conn, "items", "note_id")?,
+        links_src: detach_orphans(conn, "links", "src_note_id")?,
+        links_dst_null: unlink_destinations(conn)?,
+    };
+
+    for table in CHILD_TABLES {
+        rebuild_with_keys(conn, table)?;
+    }
+
+    if let Some((table, rowid, parent)) = first_violation(conn)? {
+        // The counts were computed and the tables rebuilt in this transaction; returning here discards
+        // all of it, including the orphan removals, so the file is exactly as it was opened.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check()",
+            [],
+            |row| row.get(0),
+        )?;
+        return Err(DbError::ForeignKeys {
+            count,
+            table,
+            rowid,
+            parent,
+        });
+    }
+
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![FK_ORPHANS_KEY, removed.value()],
+    )?;
+    Ok(())
+}
+
+/// What [`add_note_foreign_keys`] had to remove, kept apart by shape because a person reading the
+/// receipt wants to know which table an older build was leaving rows in.
+struct OrphanCleanup {
+    headings: usize,
+    tags: usize,
+    items: usize,
+    /// Rows deleted: their source note no longer exists, so there is no sentence left to keep.
+    links_src: usize,
+    /// Rows NULLed rather than deleted: the edge stays, its destination goes.
+    links_dst_null: usize,
+}
+
+impl OrphanCleanup {
+    /// The stored spelling — the labels of [`FK_ORPHANS_KEY`], in the order the tables are rebuilt.
+    fn value(&self) -> String {
+        format!(
+            "headings={},tags={},items={},links_src={},links_dst_null={}",
+            self.headings, self.tags, self.items, self.links_src, self.links_dst_null
+        )
+    }
+}
+
+/// Delete the rows of `table` whose `column` names no note, returning how many went.
+///
+/// Both names come from the call sites in this module and never from a caller or a file, so writing the
+/// statement out with `format!` is safe. `NOT IN` is exact here because `notes.id` is an `INTEGER
+/// PRIMARY KEY` and can never be NULL; against a nullable column the same predicate would match nothing
+/// at all.
+fn detach_orphans(conn: &Connection, table: &str, column: &str) -> Result<usize, DbError> {
+    Ok(conn.execute(
+        &format!("DELETE FROM {table} WHERE {column} NOT IN (SELECT id FROM notes)"),
+        [],
+    )?)
+}
+
+/// NULL the destinations that name no note, returning how many changed.
+///
+/// Not a delete: an edge whose target disappeared is still a sentence somebody wrote, and
+/// [`note_counts`] counts a NULL destination as unresolved. Leaving them in place would fail the check
+/// at the end of [`add_note_foreign_keys`], which is why they are repaired rather than kept.
+fn unlink_destinations(conn: &Connection) -> Result<usize, DbError> {
+    Ok(conn.execute(
+        "UPDATE links SET dst_note_id = NULL
+          WHERE dst_note_id IS NOT NULL AND dst_note_id NOT IN (SELECT id FROM notes)",
+        [],
+    )?)
+}
+
+/// One child table that [`add_note_foreign_keys`] rebuilds.
+struct ChildTable {
+    /// Its name, which is also the name the staged `<name>_new` table is renamed back to.
+    name: &'static str,
+    /// Every column in declaration order — copied out of migration 2 verbatim, with the new
+    /// `REFERENCES` clause added to the one that names a note. Copying them instead of generating them
+    /// means a rebuild cannot quietly drop a type, a NOT NULL or one of the CHECKs.
+    columns: &'static str,
+    /// The same columns as a comma-separated list for the copy. Naming them rather than using
+    /// `SELECT *` means a column added to one side later cannot transpose values into the other.
+    copied: &'static str,
+    /// The table's `CREATE INDEX` statements, recreated after the rename because dropping a table
+    /// drops its indexes with it. Empty when the table has none.
+    indexes: &'static str,
+}
+
+const CHILD_TABLES: &[ChildTable] = &[
+    ChildTable {
+        name: "headings",
+        columns: "note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                  level INTEGER NOT NULL,
+                  text  TEXT NOT NULL,
+                  line  INTEGER NOT NULL",
+        copied: "note_id, level, text, line",
+        indexes: "",
+    },
+    ChildTable {
+        name: "tags",
+        columns: "note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                  tag TEXT NOT NULL",
+        copied: "note_id, tag",
+        indexes: "CREATE INDEX tags_tag ON tags(tag);",
+    },
+    ChildTable {
+        name: "links",
+        // Two keys, two actions: the source's edge is its own prose and dies with it, the destination
+        // is a reference to somebody else's note and merely becomes unresolved.
+        columns: "src_note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                  dst_note_id INTEGER REFERENCES notes(id) ON DELETE SET NULL,
+                  kind   TEXT NOT NULL CHECK (kind IN ('wiki','md','attachment')),
+                  target TEXT NOT NULL,
+                  line   INTEGER NOT NULL,
+                  origin TEXT NOT NULL CHECK (origin IN ('prose','approved'))",
+        copied: "src_note_id, dst_note_id, kind, target, line, origin",
+        indexes: "CREATE INDEX links_dst_note_id ON links(dst_note_id);",
+    },
+    ChildTable {
+        name: "items",
+        columns: "note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                  text  TEXT NOT NULL,
+                  line  INTEGER NOT NULL,
+                  state TEXT NOT NULL CHECK (state IN ('open','done','paused')),
+                  marker TEXT",
+        copied: "note_id, text, line, state, marker",
+        indexes: "",
+    },
+];
+
+/// Rebuild one child table so its own definition carries the constraints.
+///
+/// Runs inside the caller's transaction with enforcement off, so neither the `DROP` nor the `RENAME`
+/// can disturb another table's references, and a failure at any step leaves the original table where it
+/// was. Rowids are not carried over — no code addresses a child row by rowid, only by its note.
+fn rebuild_with_keys(conn: &Connection, table: &ChildTable) -> Result<(), DbError> {
+    let staged = format!("{}_new", table.name);
+    conn.execute_batch(&format!(
+        "CREATE TABLE {staged} ({columns});
+         INSERT INTO {staged} ({copied}) SELECT {copied} FROM {name};
+         DROP TABLE {name};
+         ALTER TABLE {staged} RENAME TO {name};
+         {indexes}",
+        columns = table.columns,
+        copied = table.copied,
+        name = table.name,
+        indexes = table.indexes,
+    ))?;
+    Ok(())
+}
+
+/// The first row `PRAGMA foreign_key_check` reports, if it reports any: its table, rowid and the
+/// parent its key names.
+///
+/// The check reads the constraints as declared and ignores the `foreign_keys` pragma, which is why it
+/// can run inside the rebuild's own transaction — [`crate::links`] and `scan::delete_note_row` both
+/// rely on enforcement being on for ordinary writes, but this is the one place that has to ask the
+/// question while the pragma is off.
+fn first_violation(conn: &Connection) -> Result<Option<(String, i64, String)>, DbError> {
+    let mut statement = conn.prepare("SELECT * FROM pragma_foreign_key_check()")?;
+    let mut rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
 }
 
 /// Record a file that is there now — or bring a known row back to `state = 'ok'`.
@@ -442,8 +740,10 @@ pub(crate) const PROSE_ORIGIN: &str = "prose";
 
 /// A link edge whose destination is a live note, spelled once because four queries have to agree on
 /// it: the two counts `crate::scan::catalog_entries` renders, that module's `unresolved_links`, and
-/// [`unresolved_targets`] here. The notes→files join is the point — an edge into a stale note, or one
-/// left pointing at a row that was deleted, is not a healthy link.
+/// [`unresolved_targets`] here. The notes→files join is the point: an edge into a stale note is not a
+/// healthy link. Migration 3 removed the other case this predicate used to catch — an edge pointing at a
+/// note row that had been deleted, now impossible because `dst_note_id` is a foreign key that NULLs
+/// itself — so the join stays for the stale case and the query is unchanged.
 pub(crate) const LIVE_EDGE: &str =
     "EXISTS (SELECT 1 FROM notes dn JOIN files df ON df.rel = dn.rel \
                                  WHERE dn.id = l.dst_note_id AND df.state = 'ok')";
@@ -458,9 +758,9 @@ pub(crate) const LIVE_EDGE: &str =
 /// are history the report does not rewrite.
 ///
 /// The predicate is `LIVE_EDGE` rather than `dst_note_id IS NULL` on purpose: an edge whose stored
-/// destination went stale or was deleted counts in the report's number, so it has to be named here as
-/// well. A count and the list printed behind it that disagree would send the reader looking for a note
-/// the list cannot show.
+/// destination went stale counts in the report's number without having a NULL in it, so it has to be
+/// named here as well. A count and the list printed behind it that disagree would send the reader
+/// looking for a note the list cannot show.
 ///
 /// Sorted and deduplicated: one name written in three notes is one thing to fix.
 pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {

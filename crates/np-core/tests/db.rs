@@ -1,5 +1,5 @@
-//! The workspace database: schema bookkeeping, moves that keep a note's identity, and
-//! deletions that only mark a row stale.
+//! The workspace database: schema bookkeeping, moves that keep a note's identity,
+//! deletions that only mark a row stale, and the foreign keys migration 3 added on top of both.
 //!
 //! Every assertion goes through SQL on the open connection, because what Task 10 relies on
 //! is the state of the rows, not the return value of a helper. Rows for `notes`, `links`
@@ -60,6 +60,10 @@ fn column_names(db: &Db, table: &str) -> Vec<String> {
 }
 
 /// A statement that has to be refused by a CHECK constraint.
+///
+/// The extended code is what is asserted, not just `ConstraintViolation`: a foreign key reports the
+/// same primary code, so matching only that would let an orphan row satisfy the test while proving
+/// nothing about the CHECK. Every caller therefore names a parent that exists.
 fn rejects(db: &Db, sql: &str, column: &str) {
     let err =
         db.0.execute(sql, [])
@@ -68,7 +72,7 @@ fn rejects(db: &Db, sql: &str, column: &str) {
         matches!(
             err,
             rusqlite::Error::SqliteFailure(fault, _)
-                if fault.code == rusqlite::ErrorCode::ConstraintViolation
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK
         ),
         "expected a CHECK violation on {column}, got {err}"
     );
@@ -220,6 +224,12 @@ fn the_schema_is_what_the_plan_mandates() {
         );
     }
 
+    // A note the child rows below can name. Migration 3 makes `note_id` a foreign key, so a made-up
+    // id would be refused as an orphan and never reach the CHECK this section is about.
+    upsert_file(&db, &snap("a.md", "h"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let note = insert_note(&db, "a.md", "A");
+
     // The CHECK constraints are what keep a later milestone from writing a state this
     // program would read as neither live nor stale.
     rejects(
@@ -230,21 +240,430 @@ fn the_schema_is_what_the_plan_mandates() {
     );
     rejects(
         &db,
-        "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
-         VALUES (1, NULL, 'html', 'x.md', 1, 'prose')",
+        &format!(
+            "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+             VALUES ({note}, NULL, 'html', 'x.md', 1, 'prose')"
+        ),
         "links.kind",
     );
     rejects(
         &db,
-        "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
-         VALUES (1, NULL, 'md', 'x.md', 1, 'user')",
+        &format!(
+            "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+             VALUES ({note}, NULL, 'md', 'x.md', 1, 'user')"
+        ),
         "links.origin",
     );
     rejects(
         &db,
-        "INSERT INTO items (note_id, text, line, state, marker)
-         VALUES (1, 'task', 1, 'wip', NULL)",
+        &format!(
+            "INSERT INTO items (note_id, text, line, state, marker)
+             VALUES ({note}, 'task', 1, 'wip', NULL)"
+        ),
         "items.state",
+    );
+}
+
+/// The `src_note_id`, `dst_note_id` and `target` of every link row, oldest line first.
+fn edges(db: &Db) -> Vec<(i64, Option<i64>, String)> {
+    db.0.prepare("SELECT src_note_id, dst_note_id, target FROM links ORDER BY line")
+        .expect("links are readable")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("link rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("link values")
+}
+
+/// Whether one statement is refused by a foreign key — the extended code again, so an orphan insert
+/// cannot be mistaken for the CHECK or UNIQUE violation that shares its primary code.
+fn refuses_orphan(db: &Db, sql: &str) {
+    let err =
+        db.0.execute(sql, [])
+            .expect_err("a row naming no note has to be refused");
+    assert!(
+        matches!(
+            &err,
+            rusqlite::Error::SqliteFailure(fault, _)
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+        ),
+        "expected a foreign-key violation from `{sql}`, got {err}"
+    );
+}
+
+#[test]
+fn a_child_row_that_names_no_note_is_refused() {
+    // The invariant "one note row per file, and its children belong to that note" used to be held by
+    // hand in `scan::delete_note_row`. One forgotten delete left a child whose dead `note_id` SQLite
+    // would hand to the next INSERT, silently re-adopting it; migration 3 says the invariant in the
+    // schema instead, so an orphan is refused where it is written.
+    let db = Db::in_memory().expect("in-memory database");
+    upsert_file(&db, &snap("a.md", "h1"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    // Each shape an orphan takes: the three cascade children, an edge whose source note is gone, and
+    // an edge whose destination was never a note. A NULL destination stays legal — that is the
+    // unresolved state `note_counts` counts — so only the made-up id is refused.
+    for sql in [
+        "INSERT INTO headings (note_id, level, text, line) VALUES (999, 2, 'H', 1)".to_string(),
+        "INSERT INTO tags (note_id, tag) VALUES (999, 'tag')".to_string(),
+        "INSERT INTO items (note_id, text, line, state, marker) VALUES (999, 'task', 1, 'open', NULL)"
+            .to_string(),
+        "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+         VALUES (999, NULL, 'wiki', 'Nobody', 1, 'prose')"
+            .to_string(),
+        format!(
+            "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+             VALUES ({a}, 999, 'wiki', 'Never', 2, 'prose')"
+        ),
+    ] {
+        refuses_orphan(&db, &sql);
+    }
+
+    // The same rows against the note that does exist still go in: what is refused is the missing
+    // parent, not the child table.
+    db.0.execute(
+        "INSERT INTO headings (note_id, level, text, line) VALUES (?1, 2, 'H', 1)",
+        rusqlite::params![a],
+    )
+    .expect("a heading of a real note");
+}
+
+#[test]
+fn deleting_a_note_row_cascades_to_its_children_and_nulls_inbound_edges() {
+    // `scan::delete_note_row` writes these five statements by hand. Here only the parent row goes
+    // away, which is what shows the schema now does the same thing on its own — and shows the one
+    // direction it must not take: an edge pointing *into* the deleted note survives with a NULL
+    // destination, because it is another note's prose and `unresolved_links` has to keep counting it.
+    let db = Db::in_memory().expect("in-memory database");
+    upsert_file(&db, &snap("a.md", "h1"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row a");
+    upsert_file(&db, &snap("b.md", "h2"), Path::new("/ws/b.md"), 1)
+        .expect("test setup: registry row b");
+    let a = insert_note(&db, "a.md", "A");
+    let b = insert_note(&db, "b.md", "B");
+
+    db.0.execute(
+        "INSERT INTO headings (note_id, level, text, line) VALUES (?1, 2, 'H', 1)",
+        rusqlite::params![a],
+    )
+    .expect("test setup: heading");
+    db.0.execute(
+        "INSERT INTO tags (note_id, tag) VALUES (?1, 'tag')",
+        rusqlite::params![a],
+    )
+    .expect("test setup: tag");
+    db.0.execute(
+        "INSERT INTO items (note_id, text, line, state, marker) VALUES (?1, 'task', 2, 'open', NULL)",
+        rusqlite::params![a],
+    )
+    .expect("test setup: item");
+    // An approved outgoing edge on purpose: a foreign key is not conditional, so `ON DELETE CASCADE`
+    // takes an approved edge with its source too. `delete_note_row` documents that consequence.
+    db.0.execute(
+        "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+         VALUES (?1, ?2, 'md', 'b.md', 3, 'approved')",
+        rusqlite::params![a, b],
+    )
+    .expect("test setup: approved outgoing edge");
+    db.0.execute(
+        "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+         VALUES (?1, ?2, 'wiki', 'A', 4, 'prose')",
+        rusqlite::params![b, a],
+    )
+    .expect("test setup: inbound edge");
+
+    db.0.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![a])
+        .expect("delete the note row itself");
+
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM headings"), 0);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM tags"), 0);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM items"), 0);
+    assert_eq!(
+        edges(&db),
+        [(b, None, "A".to_string())],
+        "the source's own edge cascades away; the inbound edge stays and loses only its destination"
+    );
+
+    // The NULLed edge is still unresolved rather than forgotten: this is the count a scan reports.
+    let counts = note_counts(&db).expect("counts");
+    assert_eq!((counts.links, counts.unresolved_links), (1, 1));
+}
+
+/// The schema as of version 2 — the first two `MIGRATIONS` entries copied out verbatim, and
+/// deliberately **not** read from them. This fixture is history: migration 3 has to upgrade the shape
+/// an M1 database holds on disk, so it must not move when the code under test does.
+const VERSION_TWO: &str = r#"
+CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+
+CREATE TABLE files (
+    rel       TEXT    PRIMARY KEY,
+    case_key  TEXT    NOT NULL UNIQUE,
+    abs       TEXT    NOT NULL,
+    hash      TEXT    NOT NULL,
+    size      INTEGER NOT NULL,
+    mtime     INTEGER NOT NULL,
+    state     TEXT    NOT NULL CHECK (state IN ('ok','stale')),
+    last_seen INTEGER NOT NULL
+);
+CREATE INDEX files_case_key ON files(case_key);
+
+CREATE TABLE notes (
+    id           INTEGER PRIMARY KEY,
+    rel          TEXT REFERENCES files(rel) ON UPDATE CASCADE,
+    title        TEXT,
+    title_source TEXT,
+    encoding     TEXT,
+    word_count   INTEGER,
+    body         TEXT
+);
+CREATE INDEX notes_rel ON notes(rel);
+
+CREATE TABLE headings (
+    note_id INTEGER NOT NULL,
+    level   INTEGER NOT NULL,
+    text    TEXT    NOT NULL,
+    line    INTEGER NOT NULL
+);
+
+CREATE TABLE tags (
+    note_id INTEGER NOT NULL,
+    tag     TEXT    NOT NULL
+);
+CREATE INDEX tags_tag ON tags(tag);
+
+CREATE TABLE links (
+    src_note_id INTEGER NOT NULL,
+    dst_note_id INTEGER,
+    kind        TEXT    NOT NULL CHECK (kind IN ('wiki','md','attachment')),
+    target      TEXT    NOT NULL,
+    line        INTEGER NOT NULL,
+    origin      TEXT    NOT NULL CHECK (origin IN ('prose','approved'))
+);
+CREATE INDEX links_dst_note_id ON links(dst_note_id);
+
+CREATE TABLE items (
+    note_id INTEGER NOT NULL,
+    text    TEXT    NOT NULL,
+    line    INTEGER NOT NULL,
+    state   TEXT    NOT NULL CHECK (state IN ('open','done','paused')),
+    marker  TEXT
+);
+
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+INSERT INTO schema_version (version) VALUES (1), (2);
+"#;
+
+/// Write a version-two database at `path` holding both kinds of row migration 3 has to tell apart:
+/// children of two real notes, and five leftovers from the manual-cleanup era whose `note_id` names a
+/// note no scan ever wrote.
+fn seed_version_two(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_TWO)
+        .expect("test setup: version-two schema");
+    conn.execute_batch(
+        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
+            ('a.md', 'a.md', '/ws/a.md', 'ha', 1, 1, 'ok', 1),
+            ('b.md', 'b.md', '/ws/b.md', 'hb', 1, 1, 'ok', 1);
+         INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
+            (1, 'a.md', 'A', 'filename', 'utf-8', 3, 'a'),
+            (2, 'b.md', 'B', 'filename', 'utf-8', 3, 'b');
+         -- Legitimate rows: two notes' own children and one resolved edge between them.
+         INSERT INTO headings (note_id, level, text, line) VALUES (1, 1, 'A heading', 1);
+         INSERT INTO tags (note_id, tag) VALUES (1, 'keep'), (2, 'both');
+         INSERT INTO items (note_id, text, line, state, marker) VALUES (2, 'task', 2, 'open', '- [ ]');
+         INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+            (1, 2, 'md', 'b.md', 3, 'prose');
+         -- Orphans: children of note 77, plus one edge whose destination is note 88. Neither id was
+         -- ever a note row.
+         INSERT INTO headings (note_id, level, text, line) VALUES (77, 2, 'Gone', 4);
+         INSERT INTO tags (note_id, tag) VALUES (77, 'gone');
+         INSERT INTO items (note_id, text, line, state, marker) VALUES (77, 'task', 5, 'open', NULL);
+         INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+            (77, NULL, 'wiki', 'Nobody', 6, 'prose'),
+            (1, 88, 'wiki', 'AlsoGone', 7, 'prose');",
+    )
+    .expect("test setup: seed the old rows");
+}
+
+/// The `meta` value a correct upgrade of [`seed_version_two`] leaves behind: one labelled count for
+/// each orphan shape.
+const ONE_OF_EACH: &str = "headings=1,tags=1,items=1,links_src=1,links_dst_null=1";
+
+#[test]
+fn a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note() {
+    // The upgrade path a real M1 workspace takes: an old file opened through the normal code path,
+    // which may legitimately hold children left behind before the constraints existed.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_two(&path);
+
+    let db = Db::open(&path).expect("the normal open migrates an old file");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+        MIGRATIONS.len() as i64,
+        "the foreign-key migration is the newest recorded step"
+    );
+    // Nothing violates a key once the orphans are gone — and had anything been left behind, the
+    // migration would have rolled itself back and this open would have failed.
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check()"),
+        0
+    );
+
+    // Every legitimate row is there, with its note still attached.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || text FROM headings ORDER BY line"
+        ),
+        ["1:A heading"]
+    );
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || tag FROM tags ORDER BY note_id, tag"
+        ),
+        ["1:keep", "2:both"]
+    );
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || text FROM items ORDER BY line"
+        ),
+        ["2:task"]
+    );
+    // The edge into a note that never existed is NULLed rather than deleted: it is the source's prose,
+    // and dropping it would quietly lower `unresolved_links`.
+    assert_eq!(
+        edges(&db),
+        [
+            (1, Some(2), "b.md".to_string()),
+            (1, None, "AlsoGone".to_string())
+        ],
+        "the resolved edge keeps its destination and the dangling one loses only that"
+    );
+
+    // The orphans are gone, not re-attached to something convenient.
+    for sql in [
+        "SELECT COUNT(*) FROM headings WHERE note_id = 77",
+        "SELECT COUNT(*) FROM tags WHERE note_id = 77",
+        "SELECT COUNT(*) FROM items WHERE note_id = 77",
+        "SELECT COUNT(*) FROM links WHERE src_note_id = 77",
+        "SELECT COUNT(*) FROM links WHERE dst_note_id = 88",
+    ] {
+        assert_eq!(scalar::<i64>(&db, sql), 0, "{sql}");
+    }
+
+    // And what was removed is written down where a human can read it back.
+    assert_eq!(
+        scalar::<String>(&db, "SELECT value FROM meta WHERE key = 'fk_orphans'"),
+        ONE_OF_EACH,
+        "the cleanup reports what it deleted"
+    );
+
+    // The constraint is live on the upgraded file, not merely declared.
+    refuses_orphan(
+        &db,
+        "INSERT INTO headings (note_id, level, text, line) VALUES (77, 2, 'Again', 9)",
+    );
+}
+
+#[test]
+fn the_foreign_key_migration_does_not_run_a_second_time() {
+    // Same bookkeeping `migrations_are_idempotent` pins for the SQL entries, for a migration that is
+    // code rather than a script: a second open must not rebuild the tables again (it would fail on
+    // the `headings_new` name) and must not rewrite the receipt.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_two(&path);
+    Db::open(&path)
+        .expect("first open upgrades")
+        .0
+        .close()
+        .expect("close");
+
+    let db = Db::open(&path).expect("second open applies nothing new");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM schema_version"),
+        MIGRATIONS.len() as i64,
+        "no migration is recorded twice"
+    );
+    let versions: Vec<i64> =
+        db.0.prepare("SELECT version FROM schema_version ORDER BY version")
+            .expect("schema_version is readable")
+            .query_map([], |row| row.get(0))
+            .expect("schema_version rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("schema_version values");
+    assert_eq!(versions, (1..=MIGRATIONS.len() as i64).collect::<Vec<_>>());
+
+    // A re-run would find no orphans left to remove and rewrite the receipt to zeros; the counts are
+    // the ones the upgrade earned.
+    assert_eq!(
+        scalar::<String>(&db, "SELECT value FROM meta WHERE key = 'fk_orphans'"),
+        ONE_OF_EACH
+    );
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM links"), 2);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM tags"), 2);
+}
+
+#[test]
+fn a_file_whose_data_cannot_satisfy_the_keys_refuses_to_upgrade() {
+    // The check at the end of migration 3 is not decoration for the keys it adds: it reads the whole
+    // database, so a row that broke migration 1's `notes.rel REFERENCES files(rel)` refuses the upgrade.
+    // Such a note may not be deleted here — its file can come back, which is what marking a row stale is
+    // for — and no parent may be invented for it, so the only honest answer is to say no.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_two(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("test setup: reopen the old file");
+        // Enforcement has to be switched off to plant this row at all: the bundled SQLite is built with
+        // `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so even a bare connection refuses it. That is the point of the
+        // case — only a file that arrived from outside this program can hold such a row.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("test setup: relax keys for the fixture");
+        conn.execute(
+            "INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body)
+             VALUES (77, 'never-was.md', 'Gone', 'filename', 'utf-8', 1, 'body')",
+            [],
+        )
+        .expect("test setup: a note row with no files row");
+    }
+
+    let err = Db::open(&path).expect_err("a row the keys refuse has to be reported");
+    assert!(
+        matches!(
+            &err,
+            DbError::ForeignKeys { count, table, parent, .. } if *count == 1 && table == "notes" && parent == "files"
+        ),
+        "expected the orphan note to be named, got {err}"
+    );
+
+    // And refusing means refusing: the version stays where it was and every row is as it was written,
+    // because the rebuild and the orphan removals happened inside the rolled-back transaction.
+    // Read through a plain connection rather than `Db::open`, which would refuse the file again.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        2,
+        "a migration that was refused records nothing"
+    );
+    assert_eq!(
+        one("SELECT COUNT(*) FROM notes WHERE id = 77"),
+        1,
+        "and it removed nothing either"
     );
 }
 
@@ -594,6 +1013,12 @@ fn a_second_writer_waits_for_the_held_transaction_instead_of_failing_busy() {
     contention
         .outcome
         .expect("the second write has to wait for the lock, not fail with SQLITE_BUSY");
+    // A diagnostic, not a discriminator: `contended` sleeps the whole `HOLD_MS` before handing the lock
+    // back and `waited` starts before that sleep (`common::contended`), so any write that got past the
+    // lock is over half the hold by construction. Nothing here goes red because `busy_timeout` went
+    // missing — that is what `a_connection_with_no_busy_timeout_is_refused_the_same_write_at_once` and
+    // the bounds in `the_busy_timeout_in_force_is_this_crates_and_not_the_drivers_default` are for. The
+    // figure stays printed because one near zero would mean the harness stopped measuring at all.
     assert!(
         contention.waited >= Duration::from_millis(HOLD_MS / 2),
         "the statement returned after {:?}, so it never waited for the held lock",
