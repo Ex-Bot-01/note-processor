@@ -72,8 +72,30 @@ const INDEX_FILES_KEY: &str = "index_files";
 /// were written with. Absent means "written before this mechanism existed", which is not a version to
 /// compare against and therefore refreshes; see the comparison in `refresh_needed`.
 pub const PARSE_VERSION_KEY: &str = "parse_version";
+/// `meta` key holding what the **last scan** of this workspace could not index, beside what its registry
+/// currently duplicates.
+///
+/// Beside [`crate::db::FK_ORPHANS_KEY`] and [`crate::db::PATHS_LOSSY_KEY`] for the same reason (F22 §1): a
+/// refusal is a fact with no afterlife otherwise — one line on stdout or stderr at the moment it happened,
+/// gone as soon as the terminal closes, while the note stays missing from the catalog until somebody
+/// renames the file. There is no logger to write to and the catalog's bytes may not move, so `meta` is where
+/// a person reading the workspace later has to be able to ask what was lost.
+///
+/// The value is `unreadable=N;unkeyable=N;duplicates=N;names=a,b`, written **even when every count is
+/// zero**: this record describes the *last scan* rather than the history of the file, so a fixed workspace
+/// has to overwrite an old complaint instead of leaving it standing there forever (F22 §2). `names` holds
+/// up to eight display spellings joined by `,` — see [`Unindexable::names`] for their order — and a path
+/// holding a comma reads as two entries, because this is a diagnosis for a human at an `sqlite3` prompt and
+/// not a format to parse. Nothing decides anything with it: no deletion rule reads this key (F22 §4.2).
+pub const UNINDEXABLE_KEY: &str = "unindexable";
 /// Suffix of the temporary file every catalog write goes through before its `rename`.
 const TEMP_SUFFIX: &str = ".tmp";
+/// How many display spellings one record names, most actionable first (see [`Unindexable::names`]).
+///
+/// Bounded because the value is written on **every** scan: a workspace with an unreadable subtree under a
+/// `chmod -R 000` would otherwise grow one `meta` row's text without limit, and a person reading it can act
+/// on eight paths no better than on eight hundred.
+const NAME_CAP: usize = 8;
 
 /// A note re-parsed by one scan: its path and the links its text holds, which is everything
 /// [`store_note_links`] needs once the whole corpus is up to date. The path travels in both spellings so the
@@ -174,9 +196,108 @@ pub struct ScanReport {
     /// reader cannot tell "nothing was removed" apart from "this build stopped reporting it", and every
     /// reader grows a missing-key branch to answer a question `null` already answered.
     pub upgrade_orphans: Option<String>,
+    /// What this scan could not index, and what the registry duplicates — counted by kind, which is the
+    /// diagnosis [`ScanReport::skipped`] cannot give because it merges every cause into one list of paths
+    /// (F22 §1). `None` when every count is zero, so a workspace that lost nothing keeps a clean report.
+    ///
+    /// **Null, not absent**, exactly like [`Self::upgrade_orphans`]: the JSON key is there on every scan
+    /// whatever the outcome, because a reader must be able to tell "nothing was lost" apart from "this build
+    /// stopped reporting it", and every reader would otherwise grow a missing-key branch to answer a question
+    /// `null` already answered.
+    ///
+    /// The durable copy is `meta`'s [`UNINDEXABLE_KEY`] value, written after this scan's commit and overwritten
+    /// by the next one. This field is not read back from it, and nothing that *decides* anything reads either:
+    /// unknown-is-not-absent stays settled by the walk's own lists (F22 §4.2), so a refused record write
+    /// degrades the diagnosis and never changes what is indexed.
+    pub unindexable: Option<Unindexable>,
     /// Wall-clock milliseconds for the whole scan. Informational only — never in a generated file,
     /// where it would make every regeneration differ (spec §10).
     pub elapsed_ms: u128,
+}
+
+/// What one scan could not index, and what its registry duplicates — F22's diagnosis, counted by kind.
+///
+/// This exists because [`ScanReport::skipped`] cannot carry it: one merged list names an unreadable
+/// directory and a name the byte spelling refuses identically, so even the live line cannot tell a
+/// permission problem from an unkeyable name (F22 §1). The list itself keeps its entries **verbatim** —
+/// causes arrive here, as separate counts, rather than by rewording strings a person's `grep` already
+/// depends on.
+///
+/// Its durable copy is the [`UNINDEXABLE_KEY`] value this scan writes after its commit; [`Self::value`] is
+/// that one spelling, so `meta`, `np scan`'s summary line and this struct's own fields describe one fact
+/// rather than three recomputations of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unindexable {
+    /// Directories whose contents this walk did not read: permission denied, or a directory that vanished
+    /// mid-walk. Somebody's `chmod`, not anybody's filename.
+    pub unreadable: usize,
+    /// Names the byte spelling cannot hold (F18) — the count [`Self::unreadable`] refuses to be confused
+    /// with, because this one is fixed by renaming a file. Windows-only in practice: `os_bytes` is exact on
+    /// Unix, so no scan run there ever raises this above zero (see [`crate::walk::Walked::unrepresentable`]).
+    pub unkeyable: usize,
+    /// Display paths holding more than one live (`state = 'ok'`) `files` row — F23's "this note appears
+    /// twice", counted and deliberately **not** explained. Why a path got two rows is F23's ambiguity, and a
+    /// count that named a cause would be re-deciding it here (F22 §4.5).
+    pub duplicates: usize,
+    /// Up to eight display spellings, most actionable first: [`Self::unkeyable`] paths, then
+    /// [`Self::unreadable`] ones, then duplicated paths — the entries a person can act on themselves
+    /// survive the cap before the ones somebody else's permissions control.
+    ///
+    /// Names are display text, so **a name here identifies no path**: two byte-distinct paths can share one
+    /// lossy spelling (F20 §1) and then two entries look alike, exactly as two `skipped` lines do. It says
+    /// where to look, not which twin.
+    pub names: Vec<String>,
+}
+
+impl Unindexable {
+    /// The stored spelling under [`UNINDEXABLE_KEY`] — the string `meta` holds and `np scan` prints beside
+    /// the label, so a person comparing the line they just read with the record a later run finds is
+    /// comparing one format. Public for the reason [`crate::db::orphan_total`] is public: the CLI renders
+    /// this record and must not invent a second spelling of it.
+    pub fn value(&self) -> String {
+        format!(
+            "unreadable={};unkeyable={};duplicates={};names={}",
+            self.unreadable,
+            self.unkeyable,
+            self.duplicates,
+            self.names.join(","),
+        )
+    }
+
+    /// Whether this scan lost nothing at all, which is the case [`ScanReport::unindexable`] reports as
+    /// `None` while `meta` still records it as zeros — "looked and found none" staying distinguishable from
+    /// "this workspace was never scanned by a build that looks" (F22 §2).
+    fn is_empty(&self) -> bool {
+        self.unreadable == 0 && self.unkeyable == 0 && self.duplicates == 0
+    }
+}
+
+/// The record one scan loses, from the two lists [`crate::walk`] reported and the registry's duplicated
+/// display paths.
+///
+/// Takes the pieces rather than the database or the walk because all three are already in hand once the
+/// write pass ends (F22 §3), and because a hand-built list is the only way to exercise the refusal arm on a
+/// platform that refuses no name — see `scan::tests` for the case that does.
+fn unindexable_record(
+    unreadable: &[UnknownPath],
+    unkeyable: &[UnknownPath],
+    duplicates: &[String],
+) -> Unindexable {
+    // Ordered by kind rather than merged, and capped in that order: a refused name is one a person can fix
+    // by renaming, which is worth more room than a directory their own `chmod` controls.
+    let names = unkeyable
+        .iter()
+        .map(|path| path.display.clone())
+        .chain(unreadable.iter().map(|path| path.display.clone()))
+        .chain(duplicates.iter().cloned())
+        .take(NAME_CAP)
+        .collect();
+    Unindexable {
+        unreadable: unreadable.len(),
+        unkeyable: unkeyable.len(),
+        duplicates: duplicates.len(),
+        names,
+    }
 }
 
 /// Index `root` into its workspace database and regenerate its catalog.
@@ -283,6 +404,9 @@ pub fn scan_with_inject(
     // so a kill between this commit and the writes below still leaves every stranded shard named.
     let rendered = catalog::render(&entries, &cfg.catalog);
     set_index_list(&db, &rendered)?;
+    // Read here, inside the transaction and after every write of this scan, so the duplicate count answers
+    // what this scan leaves behind rather than what it found (F23's duplicate is *created* by a write pass).
+    let duplicates = duplicated_rels(&db)?;
     if record_version {
         // Recorded in the same transaction as the rows it describes: a scan that dies halfway has to
         // refresh again rather than leave half the corpus labelled as current. An up-to-date database
@@ -299,6 +423,14 @@ pub fn scan_with_inject(
         // every scan in silence, which looks exactly like the version never being written by accident.
         report_refresh_gap(&mut io::stderr(), written.uncovered + hidden_by_unknown);
     }
+
+    // The durable record of what this scan could not index, written **after** the commit it describes — the
+    // position F21's receipt echo established, and for the same reason: a scan that rolled itself back has
+    // nothing to announce. Written on every scan, including one that lost nothing, because the record is
+    // current state and an old value left standing is a false accusation (F22 §2).
+    let losses = unindexable_record(&walked.unreadable, &walked.unrepresentable, &duplicates);
+    let record = losses.value();
+    record_unindexable(&db, &record);
 
     // A root entry that wears one of our names but is not ours stays on disk and reaches the report, so
     // the user hears about the collision instead of losing the file.
@@ -325,6 +457,9 @@ pub fn scan_with_inject(
         unresolved_targets: targets,
         index_files: rendered.iter().map(|(name, _)| name.clone()).collect(),
         upgrade_orphans,
+        // `None` when nothing was lost, so the common report stays clean while its JSON still carries the
+        // key as `null` — one shape for every scan, which is what [`ScanReport::upgrade_orphans`] argues.
+        unindexable: (!losses.is_empty()).then_some(losses),
         elapsed_ms: started.elapsed().as_millis(),
     })
 }
@@ -1334,6 +1469,39 @@ fn set_meta(db: &Db, key: &str, value: &str) -> Result<(), DbError> {
         params![key, value],
     )?;
     Ok(())
+}
+
+/// The display paths the registry holds **more than one live row** for: F23's "this note appears twice",
+/// counted and not explained (F22 §4.5).
+///
+/// Grouped by `rel` — the display text — because that is what two catalog entries are rendered from: two
+/// byte-distinct paths sharing one lossy spelling produce two alike-looking lines in `INDEX.md`, which is
+/// exactly the thing a person notices and cannot account for. `state = 'ok'` keeps this the live-catalog
+/// question; a note whose file went stale is not a note that appears twice. Sorted by the same text, so one
+/// workspace produces one record.
+///
+/// Collected in full before returning, like every other read here, so no statement is left mid-iteration
+/// across a write.
+fn duplicated_rels(db: &Db) -> Result<Vec<String>, DbError> {
+    let mut statement = db.0.prepare(
+        "SELECT rel FROM files WHERE state = 'ok' GROUP BY rel HAVING COUNT(*) > 1 ORDER BY rel",
+    )?;
+    let rels = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rels)
+}
+
+/// Record what this scan lost, **post-commit and best-effort** (F22 §3).
+///
+/// The result is dropped for the reason [`crate::db::report_orphans`] gives for its own writes: by the time
+/// this runs the scan's work is committed, so a `meta` write that refuses — a full disk, a lock another
+/// process holds past the timeout, a trigger — costs this workspace its record and nothing else. Returning
+/// `Err` would report a failed scan whose rows and catalog are already durable, and `.expect` would do worse
+/// (F21 §2: that panic is exactly what F21 removed). The loss still reaches this run's report field and its
+/// stdout line; only its afterlife is degraded.
+fn record_unindexable(db: &Db, value: &str) {
+    let _ = set_meta(db, UNINDEXABLE_KEY, value);
 }
 
 /// Record the index files this scan publishes, so a later scan knows which shards to delete.
