@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use np_core::walk::{long_prefix, to_open_path, walk, DiscoveredFile, WalkOptions};
+use np_core::walk::{long_prefix, to_open_path, walk, DiscoveredFile, UnknownPath, WalkOptions};
 use tempfile::TempDir;
 
 /// Build a workspace holding `files` as `(relative path, contents)` and return it.
@@ -37,6 +37,16 @@ fn walk_files(root: &Path) -> Vec<DiscoveredFile> {
 
 fn rels_from(found: &[DiscoveredFile]) -> Vec<String> {
     found.iter().map(|file| file.rel.clone()).collect()
+}
+
+/// Both spellings of the paths in one of `Walked`'s unknown lists, as `(display, bytes)`: the display half
+/// is what the report prints and the byte half is what a caller matches on, so an assertion written against this
+/// pins both at once (F20).
+fn named(paths: &[UnknownPath]) -> Vec<(&str, &[u8])> {
+    paths
+        .iter()
+        .map(|path| (path.display.as_str(), path.bytes.as_slice()))
+        .collect()
 }
 
 #[test]
@@ -302,9 +312,9 @@ fn an_unreadable_directory_is_reported_not_silently_missing() {
 
     assert_eq!(rels_from(&walked.files), ["keep.md"]);
     assert_eq!(
-        walked.unreadable,
-        ["secret"],
-        "the unreadable directory is named by its rel-style path"
+        named(&walked.unreadable),
+        [("secret", b"secret".as_slice())],
+        "the unreadable directory is named by its rel-style path, and by the same bytes as its identity"
     );
 
     // Restoration asserted rather than assumed: dropping the guard here runs it early, and what comes
@@ -499,7 +509,17 @@ fn an_unpaired_surrogate_name_is_refused() {
         "neither twin is indexed; the valid pair is"
     );
     // One line for two files: the report names display spellings, and both twins share this one.
-    assert_eq!(walked.unrepresentable, ["caf\u{fffd}.md"]);
+    //
+    // F20 moves the dedup key to bytes and that changes nothing here, which is worth stating rather than
+    // discovering on a Windows box: `path_keys::os_bytes` has no byte spelling for a UTF-16 name, so these two
+    // paths' *identity* bytes are the lossy text too and they still dedup to one entry. The F20 split — two
+    // entries, two report lines, spelled alike — is the Unix case, where the keys really do differ; on Unix no
+    // name is ever refused, so this list stays empty there.
+    assert_eq!(
+        named(&walked.unrepresentable),
+        [("caf\u{fffd}.md", "caf\u{fffd}.md".as_bytes())],
+        "one entry for two names whose bytes are as indistinguishable as their text"
+    );
 }
 
 /// The directory shape of the same refusal, which is the half that used to survive: a directory named with an
@@ -543,7 +563,11 @@ fn an_unpaired_surrogate_directory_is_never_entered() {
     );
     // Recorded once, as the directory's own display spelling, in the list the scan matches by **prefix** — so
     // every row below it stays unknown rather than becoming a `Removed` this scan cannot support.
-    assert_eq!(walked.unreadable, ["caf\u{fffd}".to_string()]);
+    assert_eq!(
+        named(&walked.unreadable),
+        [("caf\u{fffd}", "caf\u{fffd}".as_bytes())],
+        "the display spelling is what the report prints; on Windows the bytes are that same text"
+    );
     assert!(
         walked.unrepresentable.is_empty(),
         "a directory is a prefix, not one refused file: {:?}",
