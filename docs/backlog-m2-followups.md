@@ -243,11 +243,21 @@ What these numbers can and cannot carry:
   no constraint fires, nothing reaches `skipped`. Round 2 also moved that platform's identity fold from Unicode
   `case_key` to ASCII `case_bytes`, so a non-ASCII case rename is no longer followed either. A green
   `windows-latest` job proves none of this either way: nothing in that suite can build a colliding name.
-- **Fix:** an explicit decision, not a slow drift — either encode the wide units as WTF-8 so bytes exist to key
-  on (changing `path_bytes`, `normalize_rel` and `rebase_abs` in one step, never `rel_bytes` alone), or say so
-  in user-facing docs and make Windows refuse to *silently* overwrite: detect a display-text collision there and
-  report it as `skipped` the way Unix does for byte collisions. **Do when:** on Windows, two names that differ
-  only in unrepresentable units either key apart or are named in the report — never silently merged.
+- **Shipped (`01d35a2`, `docs/design-f18-windows-refusal.md`): the silent overwrite is gone.** A name whose OS form
+  cannot survive the byte spelling losslessly is no longer indexed at all: it is named in `skipped`, its existing row
+  keeps its note and children, and the walk treats it as *unknown rather than absent* (`Walked::unrepresentable`,
+  `scan::is_unknown_path`). The predicate is pure over `u16` so Linux CI can execute the surrogate rule; the Windows
+  arm itself is only type-checked (`cargo check --target x86_64-pc-windows-msvc`) and its integration test says in
+  writing that CI compiles it out. **What that mitigation does not do is give Windows identity** — it makes the
+  absence loud. Two such names are still one file to this program; now neither is indexed instead of one silently
+  rewriting the other.
+- **Still open:** (1) real byte identity on Windows, which means encoding the wide units as WTF-8 and changing
+  `path_bytes`, `normalize_rel`, `rebase_abs`, every stored key and a migration **in one step** — never `rel_bytes`
+  alone, or a path is written under one rule and read under another; (2) round 2's move from Unicode `case_key` to
+  ASCII `case_bytes` for the identity fold, which stopped non-ASCII case renames being followed on Windows at all
+  (§5 pins the regression; following it would need a Unicode-folded byte key, which is exactly what §3 refuses for
+  Unix). **Do when:** two Windows names differing only in unpaired surrogates key apart *and* are both indexed —
+  not merely reported — and a `Ämli.md` → `ämli.md` rename on Windows still carries the note.
 
 ## F19 — a legacy duplicate note pair re-parses the whole corpus forever
 
