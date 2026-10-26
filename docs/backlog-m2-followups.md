@@ -298,9 +298,11 @@ What these numbers can and cannot carry:
   spelling: (1) a real deletion inside the readable one is never reported `Removed`, and a rename there produces a
   **second live row instead of a move**, because the moved-away path stays unknown rather than becoming `Removed`;
   and (2) one note can be charged twice, in `written.uncovered` (`scan.rs:567`) *and* `hidden_by_unknown`
-  (`scan.rs:486`), so the refresh-gap line over-counts. Bounded, not permanent: it self-heals the moment the
-  refused or unreadable sibling is renamed away, and no phantom row survives that. This is the imprecision F18's own
-  doc points at but does not own — F18 widened who enters these lists, it did not create the matching.
+  (`scan.rs:486`), so the refresh-gap line over-counts. Bounded **for rows the walk keyed from real bytes**: for those
+  it self-heals the moment the refused or unreadable sibling is renamed away, and no phantom row survives. It does
+  **not** heal for a row whose stored key is display text — see F23, which is the same obstruction with no scan-driven
+  exit at all. This is the imprecision F18's own doc points at but does not own: F18 widened who enters these lists, it
+  did not create the matching.
 - **Fix:** carry `rel_bytes` alongside the display spelling in both places (the unreadable set is built by the
   walk, which already has bytes) and key the dedup on bytes while printing display text. Neither changes catalog
   output, so goldens stay put; a fixture with twin directory names should pin both halves.
@@ -366,6 +368,12 @@ What these numbers can and cannot carry:
   ask a day later, and `np status` has nothing to say — it cannot report that any path is unindexable. F18 §3.3
   allowed a sibling list carrying reasons; the implementation chose one list because the caller's duty is identical
   either way, which is true for *safety* and false for *diagnosis*.
+- **Also unreported, and this is the entry that should carry it:** F23's duplicate state — one physical file with two
+  live `files` rows, hence **two catalog entries** — has no signal at all. What a scan does print today is honest but
+  indirect: a `skipped` line naming the obstructed directory, and the refresh-gap warning on stderr every run because
+  `refresh_needed` never goes false; the at-risk population is already durable in `meta` under `PATHS_LOSSY_KEY`. None
+  of that says "this note appears twice". Fold it into the same bounded `meta` record rather than inventing a third
+  mechanism.
 - **Fix:** reuse what F21 built rather than inventing a second mechanism — a bounded record in `meta`, the value
   carried on the open handle, and an always-present `ScanReport` field surfaced by `np scan`. (`np status` does not
   exist; `np scan` is this program's only command, as F21 §3 records.) Keep the single list but word the entry with its
@@ -394,16 +402,35 @@ What these numbers can and cannot carry:
   M, which reports `removed: 1`, stales a live note, drops it from the catalog and records `PARSE_VERSION` over rows
   nobody re-parsed. That is why the fallback stays as wide as it is: **a lossy key carries no byte spelling, so nothing
   computable at `known_rows` distinguishes the two.** The naive fix was tried, probed against both cases, and rejected.
+- **Evidence for rejecting the narrow patch** (`skip the fallback when the found set carries that display text`), so
+  nobody re-derives it: disable `key_is_display_derived` and both fixtures move in opposite directions. The harm case
+  becomes a clean `Moved: 1` — one live row, which is exactly why the patch looks right — while the fence case becomes
+  **`added: 1, removed: 1`**: a live note reported gone as its look-alike is indexed. The fence's twin deliberately
+  carries a different body from the hidden note; with identical content `classify` pairs them by hash, reports
+  `Moved: 1`, and the fixture proves nothing (that mistake was made and caught by mutation during this round).
 - **Fix candidates, with their costs.** (i) Pair by content hash the way `apply_move` does — needs the blocked path to
-  become readable at least once, so it repairs rather than prevents. (ii) Found-side suppression: when a listed path's
-  display text matches a row hidden by the fallback, skip that path and name it in `skipped`, trading duplicate rows
-  for a readable file left unindexed while its twin is unreadable — this changes what a scan is allowed to omit, so it
-  needs its own spec rather than arriving inside a hardening round. (iii) A future schema step that refuses to carry
-  display-derived keys at all: re-key every row from OS bytes or mark the workspace as needing a full re-index.
-- **Do when:** both cases are pinned as fixtures — one naming the duplicate-row harm, one fencing M so that any fix
-  reporting `removed: 1` there fails loudly — and a workspace with `caf\xe9/` (blocked) beside `caf\xe8/` holding one
-  display-keyed row converges to exactly one live `files` row and one `notes` row while still recording the parse
-  version. Until then, do not describe the fallback's over-hiding as churn that heals: it does not.
+  become readable at least once, so it repairs rather than prevents, and cannot help a workspace whose twin stays
+  unreadable forever. (ii) Found-side suppression: when a listed path's display text matches a row hidden by the
+  fallback, skip that path and name it in `skipped`, trading duplicate rows for a readable file left unindexed while
+  its twin is unreadable — this changes what a scan is allowed to omit, so it needs its own spec rather than arriving
+  inside a hardening round, **and it legitimately rewrites the fence fixture's `(added, moved, removed) == (1, 0, 0)`
+  into `added: 0` plus a `skipped` name**: that edit is expected under (ii) and must be justified in the commit body,
+  not made silently. (iii) A future schema step that refuses display-derived keys — re-key every row from OS bytes or
+  flag the workspace for a full re-index — costs a migration plus one complete re-parse of every flagged workspace,
+  and must say what happens to rows F23 already duplicated (merge them onto one id, or refuse and ask).
+- **Runner caveat:** both fixtures early-return with `NOT COVERAGE` when the filesystem refuses latin-1 directory
+  names or `chmod 000` fails to deny access (a privileged runner), so a green CI run is not proof they executed.
+  Validate any F23 fix on a runner where `denied()` is true and say which one in the PR.
+- **Pinned by:** `crates/np-core/tests/scan.rs::known_defect_a_readable_display_keyed_path_duplicates_its_own_row`
+  (the harm: two live `files` rows, two `notes` rows, version withheld) and
+  `crates/np-core/tests/scan.rs::a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`
+  (the fence: any fix reporting `removed: 1` there destroyed a live note). The harm fixture is to be **deleted** in the
+  commit that fixes this entry.
+- **Do when:** a workspace with `caf\xe9/` blocked beside `caf\xe8/`, holding one display-keyed row, ends up with
+  exactly one live `files` row and one `notes` row for that path **once the obstruction is gone** — while the twin is
+  still blocked, some charge to `hidden_by_unknown` remains correct and `PARSE_VERSION` stays withheld, so do not write
+  a "Do when" that demands recording the version mid-obstruction: `refresh_covered` withholding it is the safety, not
+  the bug. Until then, do not describe the fallback's over-hiding as churn that heals: it does not.
 ---
 
 ## Explicitly not in this backlog
