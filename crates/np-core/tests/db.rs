@@ -997,6 +997,11 @@ fn seed_lossy_version_three(path: &Path) {
 /// would read as modified content. `mtime` stays an impossible `1` on purpose — the cheap trigger has to
 /// *fail*, so the silence this fixture buys comes from the content hash matching, not from a size-and-mtime
 /// shortcut.
+/// Unix-only for the same reason as its two callers: a name whose bytes are not valid UTF-8 is built
+/// with `OsStrExt::from_bytes`, so on Windows this fixture has no user — and an un-gated helper would be
+/// dead code there, which `-D warnings` refuses. That is how eight CI runs came to fail on a green Linux
+/// suite (F13 §5).
+#[cfg(unix)]
 fn seed_scanned_lossy_version_three(path: &Path, rel: &str, hash: &str, size: i64) {
     let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
     conn.execute_batch(VERSION_THREE)
