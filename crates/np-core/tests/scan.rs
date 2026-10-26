@@ -2799,3 +2799,250 @@ fn a_directory_twinning_our_published_shard_is_judged_by_its_own_bytes() {
     assert!(dir.is_dir(), "the directory outlives a second scan");
     assert_eq!(third.skipped, vec![display], "{third:?}");
 }
+
+// ---------------------------------------------------------------------------
+// F20: the report-side filters match on bytes, so an unreadable (or refused) directory cannot hide a twin it
+// never saw. `walk` builds both spellings of every unknown path; these are the cases where one of them used to
+// be thrown away — see `docs/design-f20-bytes-in-reports.md` §1 and §5.
+// ---------------------------------------------------------------------------
+
+/// Latin-1 `café`: a directory name no `String` can hold, decoding to `caf\u{FFFD}`.
+#[cfg(unix)]
+const TWIN_DIR_NINE: &[u8] = b"caf\xe9";
+/// Latin-1 `cafè`: the twin. A **different** directory, and before F20 one display spelling was enough for the
+/// unreadable one of this pair to hide the readable one from `known_rows`.
+#[cfg(unix)]
+const TWIN_DIR_EIGHT: &[u8] = b"caf\xe8";
+/// The display text both of them decode to, which is what the report prints and what a lossy comparison saw.
+#[cfg(unix)]
+const TWIN_DIR_DISPLAY: &str = "caf\u{fffd}";
+/// `rel_bytes` of `<twin>/note.md`, as hex for the queries below: `state`-by-`rel` cannot address one twin of a
+/// pair whose display text is one string, so every assertion here names rows by their stored key.
+#[cfg(unix)]
+const TWIN_EIGHT_KEY: &str = "636166E82F6E6F74652E6D64";
+#[cfg(unix)]
+const TWIN_NINE_KEY: &str = "636166E92F6E6F74652E6D64";
+
+/// The shared premise of both cases below, asserted rather than assumed: two byte-distinct directory names that
+/// decode to one display spelling. A filesystem that folds them into one name would make the fixtures prove
+/// nothing, so `plant_twin_dir` reports failure and the caller says `NOT COVERAGE`.
+#[cfg(unix)]
+fn assert_twin_dirs() {
+    assert_ne!(TWIN_DIR_NINE, TWIN_DIR_EIGHT);
+    assert_eq!(
+        String::from_utf8_lossy(TWIN_DIR_NINE).into_owned(),
+        String::from_utf8_lossy(TWIN_DIR_EIGHT).into_owned(),
+        "the fixture has to produce one display spelling for two directories"
+    );
+    assert_eq!(String::from_utf8_lossy(TWIN_DIR_NINE), TWIN_DIR_DISPLAY);
+}
+
+/// One directory under a byte-spelled name, holding `note.md`. [`scratch_bytes`] writes root-level **files** and
+/// cannot make a directory, so this composes the existing `byte_name` helper rather than replacing it. `false`
+/// means this filesystem declined the name — the caller prints `NOT COVERAGE` instead of passing quietly (F18's
+/// rule), because a fixture that never arrived proves nothing.
+#[cfg(unix)]
+fn plant_twin_dir(root: &Path, dir: &[u8]) -> bool {
+    let path = byte_name(root, dir);
+    fs::create_dir(&path).is_ok() && fs::write(path.join("note.md"), "# Twin Heading\n").is_ok()
+}
+
+/// Whether 0o000 really denied access to this directory. Checked directly rather than inferred from the scan's
+/// own report: a privileged runner (or any platform where the mode is advisory) has to hear `NOT COVERAGE`, and
+/// a report that lost a line must still be allowed to fail.
+#[cfg(unix)]
+fn denied(path: &Path) -> bool {
+    fs::read_dir(path).is_err()
+}
+
+/// F20 §5's fixture: two sibling directories whose names differ only in bytes UTF-8 cannot hold — latin-1
+/// `caf\xE9` beside latin-1 `caf\xE8`, one display spelling `caf\u{FFFD}` — each holding a note, the first made
+/// unreadable. Both report-side filters used to compare display text, so the unreadable twin declared the
+/// readable one unknown: its live row left `known`, a deletion inside it was never reported, and a rename there
+/// became a second live row instead of a move (F20 §1).
+///
+/// What this pins, in §1's order of harm: the readable twin's row stays in the comparison, so its deletion is
+/// still `Removed`; the note behind the unreadable twin keeps its live row (unknown is not absent) and is
+/// charged **once** — the charge count itself lives in
+/// `scan::tests::one_note_behind_an_unknown_path_is_charged_in_exactly_one_counter`, because `ScanReport`
+/// deliberately carries no gap count to assert against.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_does_not_hide_its_readable_twin() {
+    assert_twin_dirs();
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    for dir in [TWIN_DIR_NINE, TWIN_DIR_EIGHT] {
+        if !plant_twin_dir(&ws.root, dir) {
+            eprintln!(
+                "NOT COVERAGE: this filesystem refused to create a directory named {dir:?}; \
+                 the matcher units in `scan::tests` still cover the byte comparison"
+            );
+            return;
+        }
+    }
+
+    let first = scan(&ws.root, &ws.cfg).expect("a twin pair must not fail the scan");
+    assert!(first.skipped.is_empty(), "{first:?}");
+    assert_eq!((first.added, first.notes), (3, 3), "{first:?}");
+
+    // Premise: two live rows, one display text, distinguished only by their stored bytes.
+    let db = ws.db();
+    assert_eq!(
+        texts(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE rel = 'caf\u{fffd}/note.md' ORDER BY rel_bytes"
+        ),
+        [TWIN_EIGHT_KEY, TWIN_NINE_KEY],
+        "both twins are tracked under the same display spelling"
+    );
+    // Make the next scan a refresh with visible work to do: withholding the version is only evidence if the
+    // refresh really ran and really reached the note it could read.
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    let _restore = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    // The premise that decides whether this scan can say anything at all, checked off the disk and not off the
+    // report, so a lost report line fails below instead of being mistaken for a platform that cannot chmod.
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the unreadable twin on this runner \
+             (a privileged user?), so this scan hid nothing"
+        );
+        return;
+    }
+    fs::remove_file(byte_name(&ws.root, TWIN_DIR_EIGHT).join("note.md"))
+        .expect("test setup: delete the readable twin's note");
+
+    let second = scan(&ws.root, &ws.cfg).expect("an unreadable directory must not fail the scan");
+    assert_eq!(
+        second.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the unreadable directory is named, and nothing else is: {second:?}"
+    );
+
+    // F20's claim. The deleted note sits under the **readable** twin, so this scan saw its absence and has to
+    // report it; before the fix the unreadable twin's identical display spelling hid the row from `known_rows`
+    // and the deletion went unreported forever.
+    assert_eq!(
+        (second.added, second.modified, second.moved, second.removed),
+        (0, 0, 0, 1),
+        "a deletion inside the readable twin is a deletion: {second:?}"
+    );
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{TWIN_EIGHT_KEY}' \
+                      AND state = 'stale'"
+            )
+        ),
+        1,
+        "the readable twin's row is the one marked stale"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{TWIN_NINE_KEY}' \
+                      AND state = 'ok'"
+            )
+        ),
+        1,
+        "unknown is not absent: the note behind the unreadable twin keeps its live row"
+    );
+    assert_eq!(
+        heading_texts(&db, "top.md"),
+        vec!["Top Heading".to_string()],
+        "the refresh still did its work on the side this scan could read"
+    );
+    // The charge. Exactly one, which is §4.4's answer: `hidden_by_unknown` owns this note and `written.uncovered`
+    // cannot see it, because a walk that could not enter the directory never listed the file. Only their sum is
+    // observable from here — a nonzero sum is what withholds the version.
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(outdated_parse_version()),
+        "the note behind the unreadable twin is charged to this refresh"
+    );
+    drop(db);
+    assert_eq!(second.notes, 2, "{second:?}");
+
+    // Convergence: once the subtree is readable again the next scan sees nothing new to report — the deletion
+    // was told once, not on every later scan — and the refresh completes.
+    drop(_restore);
+    let third = scan(&ws.root, &ws.cfg).expect("scan after the directory opens again");
+    assert!(third.skipped.is_empty(), "{third:?}");
+    assert_eq!(
+        (third.added, third.modified, third.moved, third.removed),
+        (0, 0, 0, 0),
+        "the deletion was reported once: {third:?}"
+    );
+    assert_eq!(third.notes, 2, "{third:?}");
+    assert_eq!(
+        recorded_parse_version(&ws.db()),
+        Some(PARSE_VERSION),
+        "with the subtree visible again the refresh must complete"
+    );
+}
+
+/// The same pair with **both** directories unreadable, which is F20 §3's report claim on a real scan: two paths
+/// are two lines even when they print identically, because dedup keys on bytes. Display-text dedup — what this
+/// list did before — published one line for two refused or unreadable paths, so the reader could not tell that
+/// two subtrees went missing from the catalog. `scan::tests::skipped_lines_dedups_by_bytes_and_not_by_display`
+/// is the same rule over a hand-built refused pair, which no Unix walk can produce.
+#[cfg(unix)]
+#[test]
+fn two_unreadable_twins_publish_two_report_lines_that_look_alike() {
+    assert_twin_dirs();
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    for dir in [TWIN_DIR_NINE, TWIN_DIR_EIGHT] {
+        if !plant_twin_dir(&ws.root, dir) {
+            eprintln!(
+                "NOT COVERAGE: this filesystem refused to create a directory named {dir:?}; \
+                 `scan::tests::skipped_lines_dedups_by_bytes_and_not_by_display` covers the rule meanwhile"
+            );
+            return;
+        }
+    }
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    let nine = byte_name(&ws.root, TWIN_DIR_NINE);
+    let eight = byte_name(&ws.root, TWIN_DIR_EIGHT);
+    let _nine = deny_access(&nine);
+    let _eight = deny_access(&eight);
+    // Premise off the disk: both really were blocked. If this platform cannot deny access the case is not
+    // coverage and says so; if it can, one collapsed line below is a real failure.
+    for path in [&nine, &eight] {
+        if !denied(path) {
+            eprintln!(
+                "NOT COVERAGE: 0o000 did not deny access to {} on this runner \
+                 (a privileged user?), so nothing was reported twice",
+                path.display()
+            );
+            return;
+        }
+    }
+
+    let report =
+        scan(&ws.root, &ws.cfg).expect("two unreadable directories must not fail the scan");
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string(), TWIN_DIR_DISPLAY.to_string()],
+        "two byte-distinct paths, two lines — alike because display text cannot tell them apart: {:?}",
+        report.skipped
+    );
+    assert_eq!(report.removed, 0, "unknown is not absent: {report:?}");
+    assert_eq!(
+        report.notes, 3,
+        "both hidden notes stay live in the catalog: {report:?}"
+    );
+    let db = ws.db();
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        3,
+        "neither subtree was marked stale"
+    );
+}
