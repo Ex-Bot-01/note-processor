@@ -591,8 +591,13 @@ test compiles on Windows into a name that cannot be built, and passes by asserti
   are otherwise unfalsifiable, so both get a grep a person can run: (a)
   `grep -n "CAST(" crates/np-core/src/db.rs` matches only migration 4's own notes copy (`CAST(rel AS BLOB)`,
   §4) and nothing in the steady-state write path — `upsert_file`, `apply_move`, the moved note insert;
-  (b) `grep -rn "fn .*fold\|to_lowercase" crates/np-core/src/*.rs` names a fold only inside
-  `crates/np-core/src/path_keys.rs`, plus a row-level assertion that every stored row satisfies
+  (b) **no fold *definition* lives outside `path_keys`** — `grep -rn "fn .*fold" crates/np-core/src/*.rs` names
+  only `path_keys::case_fold` and `path_keys::display_fold`, and nothing writes a value into `rel_bytes` or
+  `case_bytes` that did not come from those two. Round 1 restated this check, because the spelling it shipped with
+  was unsatisfiable: `to_lowercase` legitimately appears wherever the **display** fold is computed
+  (`links.rs`, `catalog.rs`, `parse.rs`, `items.rs`, `walk.rs`), since §3 keeps that fold Unicode and in the readers
+  — banning the token would ban round 2's own code and contradict §3. The row-level assertion below is what actually
+  binds the two columns, so it is the check; the grep only guards against a second definition appearing.
   `case_bytes = path_keys::case_fold(rel_bytes)` and `case_key = rel.to_lowercase()`, which is what "the same two
   functions wrote both columns" means when it is tested.
 - **Resolution stays honest.** A note linking `[[caf.md]]` with both twins present yields one
@@ -791,6 +796,14 @@ fold stays only where authors look. Proves on its own: §6's twin items — two 
 entries, both files openable from what was stored, the second scan reporting zero changes, twins landing in
 `unresolved_targets` rather than resolving by accident, deterministic catalog order — and it owns §4.2's churn
 for every workspace that reaches it without an intervening scan.
+
+One hazard arrives with it, and round 2 must not discover it late: **`notes` can legitimately hold two rows for one
+path.** `notes.rel` was never `UNIQUE` at version 3, so a legacy database may carry duplicate note rows for the same
+file; migration 4 copies both onto the same `rel_bytes`, which has no `UNIQUE` there by design. Every identity lookup
+round 2 writes must therefore say what it does with more than one row — an explicit `LIMIT 1` with the tie-break
+named, or an aggregate — because a bare `query_row` on a two-row key is not a wrong answer but a scan error. §5 asks
+for the two properties that make the population visible (`GROUP BY rel_bytes HAVING COUNT(*) > 1`, and no
+`rel_bytes IS NULL` after a write pass) for exactly this reason.
 
 **Which one reverts alone.** Round 2. Dropping it leaves round 1's keys being written and read by nobody — inert,
 no data loss, goldens unmoved, exactly the state they were in the day round 1 shipped. Round 1 does not revert
