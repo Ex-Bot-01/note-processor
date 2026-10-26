@@ -1612,12 +1612,46 @@ fn a_stale_parse_version_reparses_every_unchanged_note() {
         generated_catalog(&reference.root),
         "INDEX.md must show the titles and tags current rules produce"
     );
-    // The specific consequence F15 was filed for: a heading an older parser hid inside a prose `---`
-    // region, now in the catalog — from bytes nobody edited.
+    // What this pins is *delivery*: current rules put this heading into INDEX.md from bytes nobody
+    // edited. That an older parser hid it inside the prose `---` region is why F15 was filed — a catalog
+    // rendered by this build cannot show the old hiding place, so that half is not proven here.
     assert!(
         index_text(&ws.root).contains("[[Real Heading]](thematic-break.md)"),
         "{}",
         index_text(&ws.root)
+    );
+}
+
+#[test]
+fn a_null_meta_value_is_read_as_no_label_rather_than_failing_the_scan() {
+    // Someone who pokes at the database by hand can leave `NULL` in `meta.value`. Both readers here
+    // document NULL as "no label this build can trust"; reading the column as a plain `String` used to
+    // raise InvalidColumnType and fail the entire scan instead.
+    let ws = scratch(
+        &[
+            ("thematic-break.md", "---\n# Real Heading\n---\n\nprose\n"),
+            ("plain.md", "two\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    ws.db()
+        .0
+        .execute("UPDATE meta SET value = NULL", [])
+        .expect("test: null both meta values");
+
+    let second = scan(&ws.root, &ws.cfg).expect("a NULL meta value must not fail the scan");
+    assert_eq!(second.added, 0, "{second:?}");
+    assert_eq!(second.unchanged, 2, "{second:?}");
+
+    // The recovery rewrote both keys, so the next scan is an ordinary no-op again.
+    let third = scan(&ws.root, &ws.cfg).expect("scan after recovering from the NULL");
+    assert_eq!(third.unchanged, 2, "{third:?}");
+    assert_eq!(
+        index_files_meta(&ws.db()),
+        vec!["INDEX.md".to_string()],
+        "the index list must be rewritten from a NULL"
     );
 }
 

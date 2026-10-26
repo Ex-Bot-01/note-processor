@@ -464,7 +464,10 @@ fn apply_changes(
                 if let Some(parsed) = links {
                     // `Some` here means the text was re-parsed, and a note `classify` did not call
                     // changed can only have been re-parsed because of `refresh`. An attachment yields
-                    // `None`, so it is never counted as refreshed.
+                    // `None`, so it is never counted. A path that had no note row before this scan does
+                    // count: the refresh is writing its derived rows for the first time, which is work
+                    // the receipt describes — hence "path(s)" in [`report_refresh`] rather than a
+                    // promise that every one of them was already a note.
                     if refresh && matches!(change, None | Some(Change::Removed)) {
                         written.refreshed += 1;
                     }
@@ -914,15 +917,21 @@ fn index_list(db: &Db) -> Result<Vec<String>, DbError> {
 }
 
 /// One `meta` value as this program wrote it: `None` when the key was never written or holds NULL.
+///
+/// The column is read as `Option<String>` deliberately. A row holding NULL is what anyone gets after
+/// poking at the database by hand, and reading it as a plain `String` turns that into
+/// `InvalidColumnType` — an error that fails the whole scan, contradicting what [`parse_version`]
+/// promises two lines below its own name.
 fn meta_value(db: &Db, key: &str) -> Result<Option<String>, DbError> {
     Ok(db
         .0
         .query_row(
             "SELECT value FROM meta WHERE key = ?1",
             params![key],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
-        .optional()?)
+        .optional()?
+        .flatten())
 }
 
 /// The one `meta` upsert this module writes, shared by the published index-file list and the parse rules
@@ -988,7 +997,7 @@ fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
     }
     writeln!(
         out,
-        "note-processor: re-parsed {notes} unchanged note(s) for parse rules v{PARSE_VERSION} (database held {})",
+        "note-processor: re-parsed {notes} unchanged path(s) for parse rules v{PARSE_VERSION} (database held {})",
         stored.map_or_else(|| "nothing".to_string(), |version| format!("v{version}")),
     )
     .expect("printing the re-parse receipt to stderr");
@@ -1376,7 +1385,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("the receipt is utf-8"),
             format!(
-                "note-processor: re-parsed 12 unchanged note(s) for parse rules v{PARSE_VERSION} \
+                "note-processor: re-parsed 12 unchanged path(s) for parse rules v{PARSE_VERSION} \
                  (database held v3)\n"
             ),
         );
