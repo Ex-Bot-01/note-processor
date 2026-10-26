@@ -1481,6 +1481,45 @@ fn record_parse_version(open: &Db, version: u32) {
     );
 }
 
+/// Restore a captured permission mode on drop, so a failing assertion cannot leave a tempdir unreadable
+/// for the cleaner.
+#[cfg(unix)]
+struct ModeGuard {
+    path: PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+    }
+}
+
+/// chmod 000 on `path`, handing back the guard that restores whatever mode it actually had — hardcoding
+/// 0o755 would *widen* permissions on a runner with a restrictive umask.
+#[cfg(unix)]
+fn deny_access(path: &Path) -> ModeGuard {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)
+        .expect("test setup: read the permission bits")
+        .permissions()
+        .mode()
+        & 0o7777; // permission bits only; the file-type bits are not ours to set
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).expect("test: chmod 000");
+    ModeGuard {
+        path: path.to_path_buf(),
+        mode,
+    }
+}
+
+/// A stored rules version this build must treat as out of date, without assuming [`PARSE_VERSION`] is
+/// nonzero — resetting that constant to 0 would underflow every fixture below into "up to date".
+fn outdated_parse_version() -> u32 {
+    PARSE_VERSION.checked_sub(1).unwrap_or(PARSE_VERSION + 1)
+}
+
 /// Forget the recorded version entirely: the shape of a database written before this mechanism existed.
 fn forget_parse_version(open: &Db) {
     open.0
@@ -1569,7 +1608,7 @@ fn a_stale_parse_version_reparses_every_unchanged_note() {
     for rel in RULE_NOTE_RELS {
         write_rows_like_an_older_build(&open, rel);
     }
-    record_parse_version(&open, PARSE_VERSION - 1);
+    record_parse_version(&open, outdated_parse_version());
     drop(open);
     assert_eq!(
         scalar(&ws.db(), "SELECT COUNT(*) FROM headings"),
@@ -1671,7 +1710,7 @@ fn a_refresh_that_missed_a_note_leaves_the_parse_version_unrecorded() {
 
     let db = ws.db();
     forget_headings(&db, "covered.md");
-    record_parse_version(&db, PARSE_VERSION - 1);
+    record_parse_version(&db, outdated_parse_version());
     drop(db);
 
     // `missed.md` disappears between the walk and the read: unknown, so this scan writes nothing for it.
@@ -1693,7 +1732,7 @@ fn a_refresh_that_missed_a_note_leaves_the_parse_version_unrecorded() {
     );
     assert_eq!(
         recorded_parse_version(&db),
-        Some(PARSE_VERSION - 1),
+        Some(outdated_parse_version()),
         "a refresh that did not cover the corpus must not label it current"
     );
     drop(db);
@@ -1715,9 +1754,6 @@ fn a_refresh_that_missed_a_note_leaves_the_parse_version_unrecorded() {
 #[cfg(unix)]
 #[test]
 fn a_refresh_blocked_by_an_unreadable_directory_leaves_the_version_unrecorded() {
-    use std::fs::Permissions;
-    use std::os::unix::fs::PermissionsExt;
-
     // The other way a note escapes a refresh without reaching `skipped` as a written path: its directory
     // cannot be entered, so its live row is dropped by `known_rows` and never appears in `found` at all.
     let ws = scratch(
@@ -1731,31 +1767,19 @@ fn a_refresh_blocked_by_an_unreadable_directory_leaves_the_version_unrecorded() 
 
     let db = ws.db();
     forget_headings(&db, "top.md");
-    record_parse_version(&db, PARSE_VERSION - 1);
+    record_parse_version(&db, outdated_parse_version());
     drop(db);
 
-    let locked = ws.root.join("deep");
-    let found_mode = fs::metadata(&locked)
-        .expect("test setup: read the directory mode")
-        .permissions()
-        .mode()
-        & 0o7777;
-    fs::set_permissions(&locked, Permissions::from_mode(0o000)).expect("test: chmod 000");
-    struct Restore {
-        dir: PathBuf,
-        mode: u32,
-    }
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let _ = fs::set_permissions(&self.dir, Permissions::from_mode(self.mode));
-        }
-    }
-    let _restore = Restore {
-        dir: locked.clone(),
-        mode: found_mode,
-    };
+    let _restore = deny_access(&ws.root.join("deep"));
 
-    scan(&ws.root, &ws.cfg).expect("an unreadable directory must not fail the scan");
+    let report = scan(&ws.root, &ws.cfg).expect("an unreadable directory must not fail the scan");
+    // Premise first: on a runner where 0o000 does not deny access (a privileged CI user, say) this fixture
+    // proves nothing, and that has to be said here rather than surfacing as a confusing red below.
+    assert!(
+        report.skipped.iter().any(|skipped| skipped == "deep"),
+        "the blocked directory must be named, or this test proves nothing: {:?}",
+        report.skipped
+    );
 
     let db = ws.db();
     assert_eq!(
@@ -1765,7 +1789,7 @@ fn a_refresh_blocked_by_an_unreadable_directory_leaves_the_version_unrecorded() 
     );
     assert_eq!(
         recorded_parse_version(&db),
-        Some(PARSE_VERSION - 1),
+        Some(outdated_parse_version()),
         "rows hidden behind an unreadable directory are not covered by this refresh"
     );
     drop(db);
@@ -1776,6 +1800,45 @@ fn a_refresh_blocked_by_an_unreadable_directory_leaves_the_version_unrecorded() 
         recorded_parse_version(&ws.db()),
         Some(PARSE_VERSION),
         "once the subtree is visible again the refresh must complete"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_attachment_does_not_hold_the_parse_version_back() {
+    // Coverage counts notes. No parse rule can stale an image's rows, so charging an unreadable attachment
+    // would re-parse the entire corpus on every scan forever — over a file no parser will ever open — and
+    // repair nothing.
+    // Both ways an attachment can be missed: unreadable as itself, and hidden inside a directory the walk
+    // cannot enter — which [`known_rows`] drops, so it never reaches `found` either.
+    let ws = scratch(
+        &[
+            ("note.md", "# Note\n"),
+            ("shot.png", "\u{89}PNG not really a png\n"),
+            ("deep/clip.png", "\u{89}PNG also not a png\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+    let db = ws.db();
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    let _shot = deny_access(&ws.root.join("shot.png"));
+    let _deep = deny_access(&ws.root.join("deep"));
+    let report = scan(&ws.root, &ws.cfg).expect("an unreadable attachment must not fail the scan");
+    for named in ["shot.png", "deep"] {
+        assert!(
+            report.skipped.iter().any(|skipped| skipped == named),
+            "premise: the scan has to have been blocked at {named}: {:?}",
+            report.skipped
+        );
+    }
+
+    assert_eq!(
+        recorded_parse_version(&ws.db()),
+        Some(PARSE_VERSION),
+        "a path that owes no parse must not pin the rules version"
     );
 }
 
@@ -1846,7 +1909,7 @@ fn the_refresh_is_one_shot_and_the_next_scan_writes_no_bytes() {
     scan(&ws.root, &ws.cfg).expect("first scan");
     let open = ws.db();
     write_rows_like_an_older_build(&open, "alpha.md");
-    record_parse_version(&open, PARSE_VERSION - 1);
+    record_parse_version(&open, outdated_parse_version());
     drop(open);
 
     scan(&ws.root, &ws.cfg).expect("refresh scan");
@@ -1890,7 +1953,7 @@ fn a_second_rule_change_refreshes_once_and_the_scan_after_it_is_quiet() {
     scan(&ws.root, &ws.cfg).expect("first scan");
     let open = ws.db();
     write_rows_like_an_older_build(&open, "beta.md");
-    record_parse_version(&open, PARSE_VERSION - 1);
+    record_parse_version(&open, outdated_parse_version());
     drop(open);
     scan(&ws.root, &ws.cfg).expect("first refresh");
 
@@ -1898,7 +1961,7 @@ fn a_second_rule_change_refreshes_once_and_the_scan_after_it_is_quiet() {
     // falling behind, and the rows go stale in the same way they did the first time.
     let open = ws.db();
     write_rows_like_an_older_build(&open, "thematic-break.md");
-    record_parse_version(&open, PARSE_VERSION - 1);
+    record_parse_version(&open, outdated_parse_version());
     drop(open);
 
     let second = scan(&ws.root, &ws.cfg).expect("scan after the second bump");

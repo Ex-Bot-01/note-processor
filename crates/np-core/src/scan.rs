@@ -298,6 +298,9 @@ struct Found {
     /// Decoded note text; `None` for a file that could not be read or is not markdown, since an
     /// attachment is hashed, tracked and linkable but never parsed (spec §10).
     text: Option<String>,
+    /// Whether the walk called this a note at all. [`apply_changes`] needs it to charge a missed path
+    /// only when a parse was actually owed — see [`refresh_covered`].
+    is_markdown: bool,
     /// Whether `text` arrived through lossy decoding.
     lossy: bool,
 }
@@ -341,6 +344,7 @@ fn read_one(file: &DiscoveredFile) -> Found {
         snapshot: Snapshot::new(file, String::new()),
         abs: file.abs.clone(),
         text: None,
+        is_markdown: file.is_markdown,
         lossy: false,
     };
     let open = walk::to_open_path(&file.abs);
@@ -370,6 +374,7 @@ fn read_one(file: &DiscoveredFile) -> Found {
         snapshot: Snapshot::new(file, hash),
         abs: file.abs.clone(),
         text,
+        is_markdown: file.is_markdown,
         lossy,
     }
 }
@@ -400,29 +405,37 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// so their rows must reach neither a `Removed` nor a move (Task 4 handoff), and leaving them in would
 /// stale a whole subtree over one transient permission error.
 ///
-/// The count alongside the rows is how many live rows that second filter dropped. Nothing else reports
-/// them — they appear nowhere in `found`, so no later pass sees them — and [`scan_with_inject`] needs
-/// them to know that a parse-rule refresh never reached part of the corpus.
+/// The count alongside the rows is how many live **note** rows that second filter dropped — nothing else
+/// reports them, since they appear nowhere in `found` — which is how [`scan_with_inject`] knows a
+/// parse-rule refresh never reached part of the corpus. Attachments are excluded by the `EXISTS`: no parse
+/// rule can stale their rows, so counting one would pin the version forever over work that is not owed.
 fn known_rows(db: &Db, unreadable: &[String]) -> Result<(Vec<Snapshot>, usize), DbError> {
     let mut statement = db.0.prepare(
-        "SELECT rel, case_key, hash, size, mtime FROM files WHERE state = 'ok' ORDER BY rel",
+        "SELECT f.rel, f.case_key, f.hash, f.size, f.mtime,
+                EXISTS (SELECT 1 FROM notes n WHERE n.rel = f.rel)
+         FROM files f WHERE f.state = 'ok' ORDER BY f.rel",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok(Snapshot {
-            rel: row.get(0)?,
-            case_key: row.get(1)?,
-            hash: row.get(2)?,
-            size: row.get::<_, i64>(3)?.max(0) as u64,
-            mtime: row.get(4)?,
-        })
+        Ok((
+            Snapshot {
+                rel: row.get(0)?,
+                case_key: row.get(1)?,
+                hash: row.get(2)?,
+                size: row.get::<_, i64>(3)?.max(0) as u64,
+                mtime: row.get(4)?,
+            },
+            row.get::<_, bool>(5)?,
+        ))
     })?;
     // Read out fully here, so the write pass never runs with a read open across it.
     let mut known = Vec::new();
     let mut hidden = 0_usize;
     for row in rows {
-        let snapshot = row?;
+        let (snapshot, is_note) = row?;
         if under_unreadable(&snapshot.rel, unreadable) {
-            hidden += 1;
+            if is_note {
+                hidden += 1;
+            }
         } else {
             known.push(snapshot);
         }
@@ -469,9 +482,13 @@ fn apply_changes(
         // An unknown path is already named in the report and contributed only its marker to
         // `classify`; there is nothing here to write, and counting it either way would be a guess.
         if is_unknown(readable) {
-            // Nothing to write, but a refresh has to remember that this one was missed: its derived rows
-            // still hold whatever an older build wrote for them.
-            written.uncovered += 1;
+            // Nothing to write, but a refresh has to remember a missed *note*: its derived rows still hold
+            // whatever an older build wrote. An attachment is charged never — parse rules cannot make its
+            // row stale, so one unreadable image would otherwise pin the version forever and re-parse the
+            // whole corpus on every scan for nothing.
+            if readable.is_markdown {
+                written.uncovered += 1;
+            }
             continue;
         }
         // `Removed` is keyed on a path that is not in `found`, so it cannot reach this lookup.
@@ -479,8 +496,11 @@ fn apply_changes(
         match index_file(db, readable, change, refresh, now, case_sensitive, markers)? {
             Indexed::Taken => {
                 written.skipped.push(rel.to_string());
-                // Same reason as the unknown path above: this note keeps the rows it already had.
-                written.uncovered += 1;
+                // A note that lost an identity conflict keeps the rows it already had, so the refresh is
+                // not finished. Attachments are not charged here either, for the same reason as above.
+                if readable.is_markdown {
+                    written.uncovered += 1;
+                }
             }
             Indexed::Done(links) => {
                 if let Some(parsed) = links {
@@ -1010,6 +1030,12 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// an older build wrote, permanently — the exact failure F15 exists to prevent, reintroduced by the fix.
 /// Retrying is the cheaper fault: one subtree stays stale until it becomes readable again, and the scan
 /// after that records the version once the corpus is covered.
+///
+/// Notes only, on both sides. An unreadable image or a mode-000 download folder cannot be made current by
+/// any parse rule, so charging it would re-parse the whole corpus on every scan forever and repair nothing
+/// — while a note that stays unreadable *is* worth that loop, because the day it opens again its rows are
+/// wrong until the next scan runs. A path caught in a case collision is charged as a note and can hold the
+/// version back until someone resolves it; the notice below names the count so this is never silent.
 fn refresh_covered(written: &Written, hidden_by_unreadable: usize) -> bool {
     written.uncovered == 0 && hidden_by_unreadable == 0
 }
@@ -1024,21 +1050,6 @@ fn refresh_covered(written: &Written, hidden_by_unreadable: usize) -> bool {
 /// The sink is a parameter because stderr cannot be redirected in-process — the standard library offers no
 /// way to replace the global handle — so the tests in this module drive the formatting directly, exactly as
 /// [`crate::db`] does for its receipt. What they cannot pin is that the production call site names stderr.
-/// Say out loud that a refresh could not label the corpus, so the next scan will try again.
-///
-/// stderr for the same reason as [`report_refresh`]: stdout stays machine-readable JSON. `missed` counts
-/// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory.
-fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
-    if missed == 0 {
-        return;
-    }
-    writeln!(
-        out,
-        "note-processor: parse rules v{PARSE_VERSION} not recorded — {missed} path(s) were not re-parsed this scan; the next scan will retry"
-    )
-    .expect("printing the incomplete-refresh notice to stderr");
-}
-
 fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
     // Zero means the refresh cost nothing extra: a first scan re-parses nothing it was not going to parse
     // as added anyway. "Rules moved, nothing to do" is not news.
@@ -1051,6 +1062,21 @@ fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
         stored.map_or_else(|| "nothing".to_string(), |version| format!("v{version}")),
     )
     .expect("printing the re-parse receipt to stderr");
+}
+
+/// Say out loud that a refresh could not label the corpus, so the next scan will try again.
+///
+/// stderr for the same reason as [`report_refresh`]: stdout stays machine-readable JSON. `missed` counts
+/// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory.
+fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
+    if missed == 0 {
+        return;
+    }
+    writeln!(
+        out,
+        "note-processor: parse rules v{PARSE_VERSION} not recorded — {missed} note(s) were not re-parsed this scan; the next scan will retry"
+    )
+    .expect("printing the incomplete-refresh notice to stderr");
 }
 
 /// Write the rendered catalog and delete the shards this scan no longer produces.
@@ -1468,7 +1494,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("the notice is utf-8"),
             format!(
-                "note-processor: parse rules v{PARSE_VERSION} not recorded — 3 path(s) were not re-parsed this scan; the next scan will retry\n"
+                "note-processor: parse rules v{PARSE_VERSION} not recorded — 3 note(s) were not re-parsed this scan; the next scan will retry\n"
             ),
         );
 
