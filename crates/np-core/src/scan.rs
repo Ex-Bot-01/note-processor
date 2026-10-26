@@ -56,7 +56,7 @@ use crate::items::{extract_items, ItemCandidate};
 use crate::links::{resolve, store_links, RawLink};
 use crate::parse::{body_start, parse_markdown, NoteDoc, PARSE_VERSION};
 use crate::path_keys::{os_bytes, RelPath};
-use crate::walk::{self, DiscoveredFile, WalkOptions};
+use crate::walk::{self, DiscoveredFile, UnknownPath, WalkOptions};
 
 /// The UTF-8 byte order mark: dropped before decoding for parsing, kept in the bytes that are hashed.
 const BOM: &[u8] = &[0xef, 0xbb, 0xbf];
@@ -128,10 +128,15 @@ pub struct ScanReport {
     pub unchanged: usize,
     /// Paths this scan could not index and left untouched: directories it could not read, files that
     /// vanished or changed between walk and read, paths whose identity is already taken, a name the byte
-    /// spelling cannot hold (F18 — one line per affected display spelling), a catalog
-    /// temporary it could not remove (see `clear_temp_corpses`), and a root entry wearing a generated
-    /// catalog name that this program did not publish — left on disk and named here instead of deleted.
-    /// Sorted, deduplicated, spelled as `rel`.
+    /// spelling cannot hold (F18), a catalog temporary it could not remove (see `clear_temp_corpses`), and a root
+    /// entry wearing a generated catalog name that this program did not publish — left on disk and named here
+    /// instead of deleted.
+    /// Sorted and deduplicated by the path's **bytes**, printed as display text (F20). Where the keys differ, two
+    /// paths print two lines that look alike, because the report can name them no differently — they are not a
+    /// duplicate to clean up later, and collapsing them would hide one lost path. Where the key is itself lossy —
+    /// a Windows refusal, whose identity bytes come from `to_string_lossy` — two names still share a single line,
+    /// which `crates/np-core/tests/walk.rs` pins. So this list is a floor on what the scan lost, never a count of
+    /// it.
     pub skipped: Vec<String>,
     /// Live note rows — the same number of entries the catalog holds (spec §2).
     pub notes: i64,
@@ -145,6 +150,30 @@ pub struct ScanReport {
     pub unresolved_targets: Vec<String>,
     /// The catalog files written, `INDEX.md` first, then its shards.
     pub index_files: Vec<String>,
+    /// What **this process's own** schema upgrade deleted, spelled exactly as the receipt it stored under
+    /// [`crate::db::FK_ORPHANS_KEY`] — and `None` for every other scan.
+    ///
+    /// Two conditions make it `Some`: this open ran the orphan cleanup ([`crate::db::Db::upgrade_orphans`],
+    /// not a later open of the same file), and that cleanup removed at least one row.
+    ///
+    /// **Once per process rather than on every scan.** The stored key is never cleared, so "the upgrade
+    /// removed N rows" stays true for the life of the file; echoing it from then on would be a permanent
+    /// one-line warning, and a permanent warning trains the reader to ignore it — which is how real
+    /// signals die. The scan that did the deleting is the one run that needs saying.
+    ///
+    /// **And the key is never cleared after the echo.** Clearing would make this line load-bearing: a run
+    /// whose stdout went to a closed pipe, or a `--json` nobody read, would take the fact with it. Left in
+    /// place, the echo stays a convenience and `meta` stays the record. That is also where the two part
+    /// ways by design: an all-zero receipt **is** still written, because it proves the check ran, while
+    /// this field reports a **loss** and has nothing to report at zero — so a fresh workspace's first scan
+    /// prints no line and its `--json` says `"upgrade_orphans": null`, even though its database now holds
+    /// `headings=0,tags=0,…`.
+    ///
+    /// **Null, not absent.** The key is there on every scan report whatever the outcome, because one JSON
+    /// shape is worth more to its one consumer than one fewer `null`: with the key suppressed at zero, a
+    /// reader cannot tell "nothing was removed" apart from "this build stopped reporting it", and every
+    /// reader grows a missing-key branch to answer a question `null` already answered.
+    pub upgrade_orphans: Option<String>,
     /// Wall-clock milliseconds for the whole scan. Informational only — never in a generated file,
     /// where it would make every regeneration differ (spec §10).
     pub elapsed_ms: u128,
@@ -188,7 +217,12 @@ pub fn scan_with_inject(
     // Before the walk, not on the way out: a corpse the walk lists is a file this scan would index as an
     // attachment (see [`clear_temp_corpses`]). One that will not be removed is reported and retried by
     // the next scan; it does not end this one.
-    let mut skipped = clear_temp_corpses(&root)?;
+    // Carried as [`UnknownPath`] pairs to the end of the scan, where they are deduped and ordered by bytes and
+    // only then printed: a name that came off the disk keeps its real bytes all the way to the report (F20).
+    let mut skipped: Vec<UnknownPath> = clear_temp_corpses(&root)?
+        .into_iter()
+        .map(UnknownPath::from_display)
+        .collect();
     let walked = walk::walk(&root, &WalkOptions::default())?;
     after_walk(&root);
 
@@ -203,6 +237,13 @@ pub fn scan_with_inject(
     let snapshots: Vec<Snapshot> = found.iter().map(|found| found.snapshot.clone()).collect();
 
     let db = Db::open(&cfg.workspace_db(&root))?;
+    // Decided at the open, before anything else can decide it: only the process that ran the cleanup can
+    // announce it, and a cleanup that removed nothing has no loss to announce — its receipt stays in
+    // `meta` as the record that the check ran (see [`ScanReport::upgrade_orphans`]).
+    let upgrade_orphans = db
+        .upgrade_orphans()
+        .filter(|receipt| db::orphan_total(receipt) > 0)
+        .map(str::to_owned);
     // Which rules wrote the rows on disk. Read before anything is written, so this one scan both does the
     // re-parse and records what it re-parsed with: `classify` compares bytes and knows nothing about the
     // rules that turn those bytes into headings, tags, items and links, so without this a note nobody has
@@ -261,12 +302,15 @@ pub fn scan_with_inject(
 
     // A root entry that wears one of our names but is not ours stays on disk and reaches the report, so
     // the user hears about the collision instead of losing the file.
-    skipped.extend(write_index_files(&root, &rendered, &previous)?);
+    skipped.extend(
+        write_index_files(&root, &rendered, &previous)?
+            .into_iter()
+            .map(UnknownPath::from_display),
+    );
     WorkspaceRegistry::open(&cfg.data_dir)?.record(&root, now)?;
 
-    skipped.extend(written.skipped);
-    skipped.sort();
-    skipped.dedup();
+    skipped.extend(written.skipped.into_iter().map(UnknownPath::from_display));
+    let skipped = skipped_lines(skipped);
     Ok(ScanReport {
         added: written.added,
         modified: written.modified,
@@ -280,6 +324,7 @@ pub fn scan_with_inject(
         unresolved_links: unresolved,
         unresolved_targets: targets,
         index_files: rendered.iter().map(|(name, _)| name.clone()).collect(),
+        upgrade_orphans,
         elapsed_ms: started.elapsed().as_millis(),
     })
 }
@@ -352,15 +397,35 @@ fn owes_a_reparse(db: &Db, path: &RelPath, is_markdown: bool) -> Result<bool, Db
 /// An unknown path still reaches [`crate::change::classify`] — as an empty-hash marker rather than not
 /// at all. That is how such a file is kept from being counted `Removed`, and how the content its row
 /// records is kept from being claimed as some other path's move (see [`crate::change`]).
-fn read_found(files: &[DiscoveredFile], skipped: &mut Vec<String>) -> Vec<Found> {
+fn read_found(files: &[DiscoveredFile], skipped: &mut Vec<UnknownPath>) -> Vec<Found> {
     let found: Vec<Found> = files.iter().map(read_one).collect();
     skipped.extend(
         found
             .iter()
             .filter(|found| is_unknown(found))
-            .map(|found| found.snapshot.rel.clone()),
+            // Both spellings of the path, from the walk's own component walk: this file was listed, so its
+            // bytes are as exact as a refused directory's, and deduping on them keeps two unreadable twins
+            // from publishing one line (F20 §1).
+            .map(|found| UnknownPath {
+                display: found.snapshot.rel.clone(),
+                bytes: found.snapshot.rel_bytes.clone(),
+            }),
     );
     found
+}
+
+/// [`ScanReport::skipped`] from everything this scan collected: deduplicated by **bytes**, ordered by bytes,
+/// then printed as display text.
+///
+/// Keying on bytes is what stops two refused (or unreadable, or unread-and-vanished) paths that share one lossy
+/// display spelling from collapsing into a single line — the scan saw two paths and has to say so twice, however
+/// alike the two lines look (F20 §1). Sorting by the same key makes the order total where display text ties.
+/// A name that only ever existed as text arrives through [`UnknownPath::from_display`], whose bytes *are* that
+/// text's UTF-8 bytes, so such entries dedup and order exactly as the strings used to.
+fn skipped_lines(mut paths: Vec<UnknownPath>) -> Vec<String> {
+    paths.sort_by(|a, b| a.bytes.cmp(&b.bytes));
+    paths.dedup_by(|a, b| a.bytes == b.bytes);
+    paths.into_iter().map(|path| path.display).collect()
 }
 
 /// One file's snapshot and note text, with an empty digest when it could not be read as the walk saw it.
@@ -427,7 +492,12 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 }
 
 /// The registry rows `classify` compares against: live rows, minus anything whose path this scan could not
-/// look at — a subtree under an unreadable directory, or one refused name (F18).
+/// look at — a subtree under an unreadable directory, or one refused name (F18). The filter is
+/// [`is_unknown_path`], and it judges a row by its `rel_bytes`: a row whose *display* text happens to match an
+/// unknown path while its bytes do not belongs to a subtree this scan did read, and hiding it is F20. The one
+/// exception is a row whose stored key was itself derived from display text ([`key_is_display_derived`]): such a
+/// row has no byte spelling left to be judged by, so it is compared text against text — over-hiding rather than
+/// falsely reporting a live note `Removed` (F20 §4.2, "unknown is not absent").
 ///
 /// Stale rows stay out because their absence was already reported; leaving them in would count one
 /// deleted file as `removed` on every later scan. Dropping them is also what lets such a file come back
@@ -453,8 +523,8 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// so counting one would pin the version forever over work that is not owed.
 fn known_rows(
     db: &Db,
-    unreadable: &[String],
-    unrepresentable: &[String],
+    unreadable: &[UnknownPath],
+    unrepresentable: &[UnknownPath],
 ) -> Result<(Vec<Snapshot>, usize), DbError> {
     // Both key columns come back, because this is the database side of a byte-keyed comparison: hand out
     // display text here and every non-UTF-8 row reads as removed-and-re-added on every scan forever, which is
@@ -478,12 +548,21 @@ fn known_rows(
             row.get::<_, bool>(7)?,
         ))
     })?;
+    // The fallback's other side, built once per scan rather than per row: the same unknown paths spelled as
+    // text, for the rows that have no other spelling to be read by. Empty in the common case, so a workspace with
+    // nothing hidden pays nothing. Only the **unreadable** list gets this: see [`key_is_display_derived`] for why
+    // the refused-name arm needs no text side.
+    let unreadable_display = display_spelled(unreadable);
     // Read out fully here, so the write pass never runs with a read open across it.
     let mut known = Vec::new();
     let mut hidden = 0_usize;
     for row in rows {
         let (snapshot, is_note) = row?;
-        if is_unknown_path(&snapshot.rel, unreadable, unrepresentable) {
+        // Bytes first: that is the identity, and for any row the walk keyed it this is the whole answer.
+        let unknown = is_unknown_path(&snapshot.rel_bytes, unreadable, unrepresentable)
+            || (key_is_display_derived(&snapshot.rel, &snapshot.rel_bytes)
+                && under_unreadable(snapshot.rel.as_bytes(), &unreadable_display));
+        if unknown {
             if is_note {
                 hidden += 1;
             }
@@ -494,17 +573,28 @@ fn known_rows(
     Ok((known, hidden))
 }
 
-/// Whether `rel` sits inside a directory whose contents this walk never saw, which makes its absence from the
-/// found list meaningless — either the walk could not enter it, or the directory's own name was refused below
-/// ([`crate::walk::Walked::unreadable`] carries both shapes, F18). `"."` is how [`crate::walk`] spells the
+/// Whether `rel_bytes` sits inside a directory whose contents this walk never saw, which makes its absence from
+/// the found list meaningless — either the walk could not enter it, or the directory's own name was refused
+/// below ([`crate::walk::Walked::unreadable`] carries both shapes, F18). `"."` is how [`crate::walk`] spells the
 /// workspace root itself, and that leaves nothing knowable at all.
-fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
-    unreadable
-        .iter()
-        .any(|dir| dir == "." || rel.starts_with(&format!("{dir}/")))
+///
+/// Both sides of the comparison are **bytes**, and an entry only matches at a `/` boundary: `caf\xE9` hides
+/// `caf\xE9/a.md` and nothing else — not its twin `caf\xE8/a.md`, whose display spelling is identical (F20 §1),
+/// and not `caf\xE9x/a.md`, which is a different subtree.
+///
+/// An entry holding **no** bytes matches nothing. The walk spells the root `"."` for exactly that reason (see
+/// [`crate::walk`]'s `unknown_path`), and it matters in both directions: an empty prefix would match every path
+/// in the workspace, which is the one way this filter could hide the whole corpus rather than one subtree.
+fn under_unreadable(rel_bytes: &[u8], unreadable: &[UnknownPath]) -> bool {
+    unreadable.iter().any(|dir| {
+        dir.bytes == b"."
+            || (rel_bytes.len() > dir.bytes.len()
+                && rel_bytes[..dir.bytes.len()] == dir.bytes[..]
+                && rel_bytes[dir.bytes.len()] == b'/')
+    })
 }
 
-/// Whether `rel` names a path this scan must not judge absent, from the two lists [`crate::walk`] reports.
+/// Whether `rel_bytes` names a path this scan must not judge absent, from the two lists [`crate::walk`] reports.
 ///
 /// They describe different shapes of "unknown" and so match differently: an unreadable **directory** hides a
 /// whole subtree, hence [`under_unreadable`]'s prefix rule, while a refused name
@@ -515,18 +605,78 @@ fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
 /// Every arm here suppresses `Removed` for the same reason — the scan did not see that path, which is not
 /// evidence it stopped existing.
 ///
-/// A refused name is compared as display text, and that costs nothing on the only platform that can produce
-/// one: Windows builds its key from `to_string_lossy`, so a refused path's `rel_bytes` *are* these bytes
-/// (F18). The consequence worth stating is the twin — a live row whose own spelling is the same lossy text
-/// is dropped from the comparison alongside the refused path, so such a scan counts that twin as `Added` and
-/// refreshes its own row instead of risking a `Removed` against a path this scan just refused. Churn, never an
-/// overwrite — but do not read that as Unix sitting outside this arm. **No *refused* name can reach either list
-/// there** (`path_keys::name_is_lossless` is `true` for every byte a Unix filename holds), yet the prefix rule still
-/// fires on any unreadable directory, and F20's twin-directory case — two directories whose names differ only in
-/// bytes that display as one `U+FFFD` — drops a live row through here on Linux today. F18 widened who lands in
-/// these lists; it did not create the matching imprecision, and F20 owns it.
-fn is_unknown_path(rel: &str, unreadable: &[String], unrepresentable: &[String]) -> bool {
-    unrepresentable.iter().any(|name| name == rel) || under_unreadable(rel, unreadable)
+/// Both arms compare **bytes** (F20), which is the whole point of [`UnknownPath`]. Matching display text instead
+/// let one unreadable or refused directory hide its readable twin: `caf\xE9/` and `caf\xE8/` spell one
+/// `caf\u{FFFD}/`, so rows belonging to a subtree this scan had read in full dropped out of `known` — a real
+/// deletion inside the readable twin went unreported, a rename there produced a second live row instead of a
+/// move, and one note could be charged in both `written.uncovered` and `hidden_by_unknown`.
+///
+/// Windows loses nothing by the switch and gains nothing from it: its key bytes *are* the lossy text (F18), so
+/// byte equality there decides exactly what text equality decided. On Unix no *refused* name can reach either
+/// list at all (`path_keys::name_is_lossless` is `true` for every byte a filename holds), while the prefix arm
+/// still fires on any genuinely unreadable directory — and that is where the twin case above is reachable today.
+fn is_unknown_path(
+    rel_bytes: &[u8],
+    unreadable: &[UnknownPath],
+    unrepresentable: &[UnknownPath],
+) -> bool {
+    unrepresentable.iter().any(|path| path.bytes == rel_bytes)
+        || under_unreadable(rel_bytes, unreadable)
+}
+
+/// Whether a row's stored key is the bytes of its own **display text** instead of the bytes of the path on
+/// disk — the shape [`crate::db::copy_files_rows`] leaves behind, since migration 4 keyed every row through
+/// [`crate::path_keys::rel_bytes_of_display`]. A note really named `caf\xE9/note.md` therefore sits under
+/// `63 61 66 EF BF BD 2F 6E 6F 74 65 2E 6D 64`: the `U+FFFD` spelling of a name whose bytes no `String` holds
+/// (`docs/design-f13-byte-paths.md` §4.2, and `crates/np-core/tests/db.rs` proves such rows ship).
+///
+/// Both halves of the test keep this to rows whose key **is** their own display text, which is what F20's byte
+/// matching cannot judge: a key differing from its row's display bytes came off the disk, and a `rel` with no
+/// `U+FFFD` in it has one spelling — either way [`is_unknown_path`] already decided the row exactly as it did
+/// before this fallback existed.
+///
+/// Do not read that as a class only old databases hold. A name that genuinely contains `U+FFFD` (the bytes
+/// `EF BF BD`, valid UTF-8, creatable on Linux today) satisfies both halves forever, because for it the key really
+/// is the OS bytes; and on Windows every lossily-named row qualifies, since [`crate::path_keys::os_bytes`] has no
+/// byte spelling for a UTF-16 name. In those cases the text arm is just the byte arm again — same bytes, same
+/// answer — which is why widening here costs nothing they were not already paying.
+///
+/// A migrated row leaves the class only when a scan sees its path **and** pairs it by hash, so
+/// [`crate::db::apply_move`] rewrites `rel_bytes` from the walk (F13 §4.2's one-time churn). Nothing else does:
+/// an unchanged row is refreshed in place and keeps the key it has, so this fallback is not transitional for the
+/// cases above — say "until someone renames it", not "until the next scan".
+///
+/// The refused-name arm gets no text side, deliberately: a refusal entry's own bytes are lossy wherever refusals
+/// happen (Windows keys them from `to_string_lossy`, so they already equal a qualifying row's key and the byte arm
+/// matches), and on Unix nothing is ever refused ([`crate::path_keys::name_is_lossless`] accepts every byte a Unix
+/// name holds). A fallback there would be an untestable branch, not a safety net.
+fn key_is_display_derived(rel: &str, rel_bytes: &[u8]) -> bool {
+    rel.contains('\u{FFFD}') && rel_bytes == crate::path_keys::rel_bytes_of_display(rel)
+}
+
+/// The two unknown lists re-spelled for [`key_is_display_derived`] rows: each entry keeps its
+/// [`UnknownPath::display`] and takes that text as its bytes, exactly as [`UnknownPath::from_display`] does for
+/// a path that only ever existed as text.
+///
+/// Matching these against such a row's `rel` is deliberately **wider** than the byte comparison, and only for
+/// those rows: one `caf\u{FFFD}` entry then hides it whichever twin its bytes came from. The asymmetry is the whole
+/// argument — a false `Removed` stales a live note, drops it from the catalog, under-charges the refresh gap so
+/// [`PARSE_VERSION_KEY`] is recorded over rows nobody re-parsed, and (F13 §4.2) brings the note back as a **second
+/// `notes.id`** when the directory opens again.
+///
+/// **Do not call that over-hiding harmless, and do not call it self-healing.** When the row's own path is readable
+/// while an unreadable twin shares its display spelling — which a lossy key cannot distinguish from the case this
+/// fallback exists for — hiding the row leaves the listed path with no row to pair with, so it indexes as a spurious
+/// `Added`: two live `files` and `notes` rows for one file, and `hidden_by_unknown` holds [`PARSE_VERSION_KEY`] back
+/// until somebody renames or removes the twin. **No scan clears that.** Backlog **F23** owns the ambiguity — no
+/// predicate computable here can separate the two cases, because a display spelling has many byte twins and a lossy
+/// key records none of them — and requires both configurations pinned as fixtures: one naming the duplicate-row harm,
+/// one fencing the safety that any future fix must not trade away.
+fn display_spelled(paths: &[UnknownPath]) -> Vec<UnknownPath> {
+    paths
+        .iter()
+        .map(|path| UnknownPath::from_display(path.display.clone()))
+        .collect()
 }
 
 /// Write this scan's changes: every readable file's registry row refreshed, contents re-indexed where
@@ -1374,8 +1524,10 @@ fn write_index_files(
 /// only for what is genuinely a display question — [`index_names::is_generated_index`] and the report line.
 ///
 /// Which leaves one asymmetry to know about: **verdicts are per entry, report lines are not.** `foreign`
-/// carries display text and [`ScanReport::skipped`] dedups it, so two byte-distinct foreign twins publish a
-/// single line. Read that count as "names needing attention", never as "files on disk".
+/// carries display text only — it was never a path the walk keyed — so the bytes [`ScanReport::skipped`] dedups
+/// by are that text's own UTF-8 bytes, and two byte-distinct foreign twins still publish a single line. Read
+/// that count as "names needing attention", never as "files on disk"; the paths the *walk* named do get one
+/// line each (F20).
 ///
 /// `meta` alone is not enough. It is committed inside the scan's transaction (see [`set_index_list`]), so
 /// a kill between that commit and the writes in [`write_index_files`] leaves it naming only the
@@ -1676,10 +1828,12 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        folded_row, is_unknown_path, known_rows, np_published, refresh_covered, remove_corpses,
-        remove_file, report_refresh, report_refresh_gap, Written, PARSE_VERSION,
+        apply_changes, folded_row, is_unknown_path, known_rows, np_published, refresh_covered,
+        remove_corpses, remove_file, report_refresh, report_refresh_gap, skipped_lines,
+        under_unreadable, Found, UnknownPath, Written, PARSE_VERSION,
     };
     use crate::catalog::{HEADER, HEADER_CRLF};
+    use crate::config::MarkerConfig;
     use crate::db::{self, upsert_file, Db};
     use crate::hash::Snapshot;
     use crate::path_keys::{self, RelPath};
@@ -1757,10 +1911,10 @@ mod tests {
     /// The exact arm: one refused file, and four neighbours that must keep being judged.
     #[test]
     fn a_refused_name_suppresses_only_its_own_rel() {
-        let refused = ["notes/caf\u{fffd}.md".to_string()];
+        let refused = [display_keyed_unknown("notes/caf\u{fffd}.md")];
 
         assert!(
-            is_unknown_path("notes/caf\u{fffd}.md", &[], &refused),
+            is_unknown_path(&key("notes/caf\u{fffd}.md"), &[], &refused),
             "the refused path itself is unknown to this scan"
         );
 
@@ -1774,7 +1928,7 @@ mod tests {
             "caf\u{fffd}.md",           // the same spelling at the root
         ] {
             assert!(
-                !is_unknown_path(rel, &[], &refused),
+                !is_unknown_path(&key(rel), &[], &refused),
                 "{rel} is another path"
             );
         }
@@ -1786,25 +1940,70 @@ mod tests {
     /// `Removed` by the next scan.
     #[test]
     fn a_refused_directory_suppresses_every_row_below_it() {
-        let dirs = ["notes/caf\u{fffd}".to_string()];
+        let dirs = [display_keyed_unknown("notes/caf\u{fffd}")];
 
         assert!(
-            is_unknown_path("notes/caf\u{fffd}/a.md", &dirs, &[]),
+            is_unknown_path(&key("notes/caf\u{fffd}/a.md"), &dirs, &[]),
             "a child of the refused directory"
         );
         assert!(
-            is_unknown_path("notes/caf\u{fffd}/deep/deeper/b.md", &dirs, &[]),
+            is_unknown_path(&key("notes/caf\u{fffd}/deep/deeper/b.md"), &dirs, &[]),
             "at any depth: the walk never entered at all"
         );
         // Only what is *below* it. A directory whose name merely starts with the same bytes is a different
         // subtree, and the refused spelling itself is not suppressed — no file row can be keyed by a
         // directory's path, so there is nothing here that needs suppressing.
         assert!(
-            !is_unknown_path("notes/caf\u{fffd}x/a.md", &dirs, &[]),
+            !is_unknown_path(&key("notes/caf\u{fffd}x/a.md"), &dirs, &[]),
             "a sibling that shares the prefix bytes"
         );
-        assert!(!is_unknown_path("notes/other/a.md", &dirs, &[]));
-        assert!(!is_unknown_path("notes/caf\u{fffd}", &dirs, &[]));
+        assert!(!is_unknown_path(&key("notes/other/a.md"), &dirs, &[]));
+        assert!(!is_unknown_path(&key("notes/caf\u{fffd}"), &dirs, &[]));
+    }
+
+    /// The byte identity [`crate::walk`] would record for a path spelled as text — the faithful-copy rule
+    /// ([`path_keys::rel_bytes_of_display`]), which is also exactly what a row written by migration 4 holds.
+    fn key(rel: &str) -> Vec<u8> {
+        path_keys::rel_bytes_of_display(rel)
+    }
+
+    /// An unknown path from its **raw identity bytes**, with the display text a lossy decode of those same
+    /// bytes produces. Unlike [`display_keyed_unknown`], whose bytes are derived from its text, this one can hold
+    /// bytes no `String` can — which is the whole subject of F20: `raw(b"caf\xE9")` and `raw(b"caf\xE8")` are two paths
+    /// whose `display` fields are one string.
+    fn raw(bytes: &[u8]) -> UnknownPath {
+        UnknownPath {
+            display: String::from_utf8_lossy(bytes).into_owned(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// The premise every F20 case below rests on, asserted instead of assumed: `left` and `right` are distinct
+    /// as identity and identical as display text. Put it in a helper because a fixture that quietly stopped
+    /// producing one shared spelling would keep passing while proving nothing.
+    fn assert_twin_bytes(left: &[u8], right: &[u8]) {
+        assert_ne!(left, right, "twins have to be different paths");
+        assert_eq!(
+            String::from_utf8_lossy(left).into_owned(),
+            String::from_utf8_lossy(right).into_owned(),
+            "twins have to share one display spelling"
+        );
+    }
+
+    /// An unknown path whose [`UnknownPath::bytes`] are the **stored key** a path gets when it only ever existed as
+    /// text — [`path_keys::rel_bytes_of_display`], the rule migration 4 keyed every copied row through. That is why
+    /// the [`key_is_display_derived`] fixtures build their entries this way: entry and row agree because both went
+    /// through the key rule, not because either holds OS bytes.
+    ///
+    /// Deliberately not named like `walk::tests::unknown_from_text_bytes`, which takes a path's `str::as_bytes`
+    /// with no key rule between. The two return the same bytes for every input today — `rel_bytes_of_display` *is*
+    /// `as_bytes` — and promise different things: this one tracks the stored-key rule, that one tracks the platform
+    /// whose refusal entries are already lossy text (F18). Two names keep that difference visible at the call site.
+    fn display_keyed_unknown(display: &str) -> UnknownPath {
+        UnknownPath {
+            display: display.to_string(),
+            bytes: key(display),
+        }
     }
 
     /// A registry row for `rel` with one note behind it: the shape [`known_rows`] counts as **hidden**, and
@@ -1845,7 +2044,7 @@ mod tests {
         plant_note(&db, "elsewhere/c.md");
 
         // A refused directory, recorded as [`crate::walk`] records it.
-        let dirs = ["notes/caf\u{fffd}".to_string()];
+        let dirs = [display_keyed_unknown("notes/caf\u{fffd}")];
         let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
 
         assert_eq!(
@@ -1859,8 +2058,8 @@ mod tests {
         );
 
         // The other arm, fed a refused *file*: exactly its own row disappears and is charged.
-        let (known, hidden) =
-            known_rows(&db, &[], &["notes/peer.md".to_string()]).expect("the rows read back again");
+        let (known, hidden) = known_rows(&db, &[], &[display_keyed_unknown("notes/peer.md")])
+            .expect("the rows read back again");
         assert_eq!(hidden, 1, "one refused note, one charge");
         assert!(
             !known.iter().any(|row| row.rel == "notes/peer.md"),
@@ -1895,6 +2094,359 @@ mod tests {
             !refresh_covered(&missed_write, 0),
             "the write-pass half still holds on its own"
         );
+    }
+
+    /// The one exception to byte matching, and its bound, in one comparison. A row whose key migration 4 derived
+    /// from display text ([`key_is_display_derived`]) has no byte spelling to be judged by, so an unreadable
+    /// directory whose bytes it cannot tell apart hides it — over-hidden, charged, reported nothing. The same
+    /// display spelling keyed from **real** bytes is a row the walk re-keyed, and stays in `known` on its bytes:
+    /// that is F20's twin fix surviving the fallback, asserted rather than promised.
+    #[test]
+    fn a_display_keyed_row_falls_back_to_text_and_a_byte_keyed_row_does_not() {
+        assert_twin_bytes(b"caf\xE9/note.md", b"caf\xE8/note.md");
+
+        let db = Db::in_memory().expect("in-memory database");
+        // The migrated row: a note really named `caf\xE9/note.md`, stored under the bytes of its lossy text.
+        plant_note(&db, "caf\u{fffd}/note.md");
+        // A row this build wrote: one display spelling, the walk's own bytes as its key.
+        let walked = Snapshot {
+            rel_bytes: b"caf\xE9/note.md".to_vec(),
+            case_bytes: path_keys::case_fold(b"caf\xE9/note.md"),
+            rel: "caf\u{fffd}/note.md".to_string(),
+            case_key: path_keys::display_fold("caf\u{fffd}/note.md"),
+            hash: "h".to_string(),
+            size: 4,
+            mtime: 10,
+        };
+        upsert_file(&db, &walked, Path::new("/ws/caf\u{fffd}/note.md"), 1)
+            .expect("test setup: byte-keyed registry row");
+        db::insert_note(
+            &db,
+            &RelPath::new(
+                b"caf\xE9/note.md".to_vec(),
+                "caf\u{fffd}/note.md".to_string(),
+            ),
+            "t",
+            "filename",
+            "utf-8",
+            3,
+            "body",
+        )
+        .expect("test setup: note behind the byte-keyed row");
+        // A plain name, to show the fallback reaches no further than a lossy key can.
+        plant_note(&db, "top.md");
+
+        // The blocked directory is the **twin** (`caf\xE8`); `caf\xE9` was read in full by this walk.
+        let dirs = [raw(b"caf\xE8")];
+        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
+
+        assert_eq!(
+            known
+                .iter()
+                .map(|row| row.rel_bytes.as_slice())
+                .collect::<Vec<_>>(),
+            [b"caf\xE9/note.md".as_slice(), b"top.md".as_slice()],
+            "the byte-keyed row and the plain row stay in the comparison; only the text-keyed row drops out"
+        );
+        assert_eq!(
+            hidden, 1,
+            "the legacy note is charged to a refresh that could not reach it, and no other note is"
+        );
+    }
+
+    // F20 §5: the two matchers over hand-built `UnknownPath`s whose **bytes** differ while their display text
+    // does not. A Linux filesystem refuses no name, so the refused arm is hand-built here exactly as F18's tests
+    // above build it — and the unreadable arm is hand-built for a reason F18 did not need: on Unix the twin pair
+    // `caf\xE9` / `caf\xE8` is reachable today, and only raw bytes can spell it.
+
+    /// Byte near-twins are different paths. Neither matcher may let `caf\xE9` cover `caf\xE8`, whose display
+    /// spelling is identical — that single collapse is F20 §1: a readable subtree dropped out of `known`, so a
+    /// deletion in it went unreported and a rename there produced a second live row instead of a move.
+    #[test]
+    fn a_byte_near_twin_is_not_the_unknown_path() {
+        assert_twin_bytes(b"caf\xE9", b"caf\xE8");
+
+        // The prefix arm: an unreadable directory covers its own subtree and nothing else.
+        let dirs = [raw(b"caf\xE9")];
+        assert!(under_unreadable(b"caf\xE9/low.md", &dirs), "its own child");
+        assert!(
+            !under_unreadable(b"caf\xE8/low.md", &dirs),
+            "the twin's child shares the display spelling and stays a path this scan read"
+        );
+        assert!(
+            !is_unknown_path(b"caf\xE8/low.md", &dirs, &[]),
+            "`known_rows` asks [`is_unknown_path`], so the twin's row is not hidden from the comparison"
+        );
+
+        // The exact arm: one refused file, its byte-twin, and three neighbours that share something with it.
+        // Exact equality is what keeps all four of these visible (F18), and bytes are what makes the first of
+        // them the *right* one to suppress when two refused names spell alike.
+        let files = [raw(b"caf\xE9.md")];
+        assert!(
+            is_unknown_path(b"caf\xE9.md", &[], &files),
+            "the refused path itself is unknown to this scan"
+        );
+        for other in [
+            b"caf\xE8.md".as_slice(),     // the twin: one display spelling, another path
+            b"caf\xE9.md.bak".as_slice(), // the refused bytes as a prefix of a longer name
+            b"other/caf\xE9.md".as_slice(), // the same name in another directory
+            b"caf\xE9/x.md".as_slice(),   // below the twin spelling of its own directory
+        ] {
+            assert!(
+                !is_unknown_path(other, &[], &files),
+                "{} is another path",
+                String::from_utf8_lossy(other)
+            );
+        }
+    }
+
+    /// The prefix rule ends at a `/` byte: `foo` names a **directory**, so it covers everything below it and
+    /// nothing that merely starts with the same bytes. Drop the boundary check and one unreadable directory
+    /// hides every path sharing its first letters — `foobar/x.md` among them, which this scan did read.
+    #[test]
+    fn an_unreadable_prefix_matches_only_at_a_slash_boundary() {
+        let dirs = [raw(b"foo")];
+        assert!(under_unreadable(b"foo/x.md", &dirs), "its own child");
+        assert!(
+            under_unreadable(b"foo/deep/deeper/x.md", &dirs),
+            "at any depth: the walk never entered at all"
+        );
+        assert!(
+            !under_unreadable(b"foobar/x.md", &dirs),
+            "a sibling whose name merely starts with the same bytes"
+        );
+        assert!(
+            !under_unreadable(b"foo", &dirs),
+            "a directory is not below itself"
+        );
+        assert!(
+            !is_unknown_path(b"foobar/x.md", &dirs, &[]),
+            "and the boundary holds through the arm `known_rows` uses"
+        );
+
+        // A multi-component entry behaves the same way: the boundary is checked against its **last** byte.
+        let dirs = [raw(b"notes/caf\xE9")];
+        assert!(under_unreadable(b"notes/caf\xE9/deep/x.md", &dirs));
+        assert!(!under_unreadable(b"notes/caf\xE8/x.md", &dirs));
+        assert!(!under_unreadable(b"notes/caf\xE9x/x.md", &dirs));
+    }
+
+    /// `"."` is how [`crate::walk`] spells the workspace root, and it means **everything below**: a scan that
+    /// could not read the root at all knows nothing about any path, so none may be judged absent. Both fields
+    /// carry `"."` for that reason — see [`crate::walk`]'s `unknown_path`.
+    #[test]
+    fn the_root_entry_makes_every_path_below_it_unknown() {
+        let dirs = [UnknownPath {
+            display: ".".to_string(),
+            bytes: b".".to_vec(),
+        }];
+        for rel in [
+            b"a.md".as_slice(),
+            b"deep/b.md".as_slice(),
+            // A non-UTF-8 path too: `"."` is not a byte prefix of this one, and does not need to be.
+            b"caf\xE9/deep/c.md".as_slice(),
+        ] {
+            assert!(
+                under_unreadable(rel, &dirs),
+                "{}: the root was unreadable, so nothing below it is knowable",
+                String::from_utf8_lossy(rel)
+            );
+            assert!(
+                is_unknown_path(rel, &dirs, &[]),
+                "{} reaches the same answer through `known_rows`' arm",
+                String::from_utf8_lossy(rel)
+            );
+        }
+    }
+
+    /// An entry holding **no** bytes matches nothing rather than everything. The walk never builds one — it
+    /// spells the root `"."` (see [`crate::walk`]) — and an empty prefix is the single way this filter could
+    /// hide a whole corpus instead of one subtree, so the degenerate case is pinned rather than trusted.
+    #[test]
+    fn an_entry_with_no_bytes_matches_nothing() {
+        let dirs = [UnknownPath {
+            display: String::new(),
+            bytes: Vec::new(),
+        }];
+        for rel in [b"a.md".as_slice(), b"deep/b.md".as_slice()] {
+            assert!(
+                !under_unreadable(rel, &dirs),
+                "an empty entry must not swallow {}",
+                String::from_utf8_lossy(rel)
+            );
+            assert!(
+                !is_unknown_path(rel, &dirs, &[]),
+                "nor reach the comparison through the prefix arm"
+            );
+        }
+        // The exact arm degenerates the same way: no row is keyed by an empty path, so nothing is suppressed.
+        let files = [UnknownPath {
+            display: String::new(),
+            bytes: Vec::new(),
+        }];
+        assert!(!is_unknown_path(b"a.md", &[], &files));
+    }
+
+    /// [`ScanReport::skipped`] is sorted and deduplicated by **bytes**: two refused (or unreadable, or
+    /// unread-and-vanished) paths sharing one lossy spelling publish two lines that look alike, because the
+    /// scan saw two paths and can only name them alike (F20 §1, §3). One path reaching the report twice is
+    /// still one line — the dedup survives the key change, it just stops being able to merge two paths.
+    #[test]
+    fn skipped_lines_dedups_by_bytes_and_not_by_display() {
+        assert_twin_bytes(b"caf\xE8/note.md", b"caf\xE9/note.md");
+        let shared = "caf\u{fffd}/note.md";
+
+        assert_eq!(
+            skipped_lines(vec![
+                raw(b"caf\xE9/note.md"),
+                raw(b"caf\xE8/note.md"),
+                raw(b"caf\xE8/note.md"),
+            ]),
+            [shared, shared],
+            "two paths, two lines, ordered by the byte key rather than by arrival"
+        );
+
+        assert_eq!(
+            skipped_lines(vec![raw(b"caf\xE8/note.md"), raw(b"caf\xE8/note.md")]),
+            [shared],
+            "one path named twice is one line"
+        );
+    }
+
+    /// §4.4's answer, **counted** rather than assumed: one note behind one unknown path is charged in exactly
+    /// one of the two counters the gap line adds together.
+    ///
+    /// They are disjoint for the rows both sides judge **by bytes**, which is what this test builds.
+    /// `hidden_by_unknown` charges a live row this scan never looked at — a note under an unreadable directory,
+    /// which the walk could not even list, so it never reaches `found` and cannot be charged twice.
+    /// `written.uncovered` charges a path the walk *did* list whose contents this scan could not read. One row
+    /// cannot be both: [`under_unreadable`]'s byte prefix only ever names a directory that was never entered, and
+    /// [`is_unknown_path`]'s refused arm only ever names a name the walk would not key — neither is a listed path.
+    ///
+    /// The [`key_is_display_derived`] fallback sits outside that construction: it hides a row on **display** text,
+    /// so a row it drops may be one whose own path was listed and could not be read, which is
+    /// `written.uncovered`'s shape as well. Nothing below proves those two charges cannot meet — F23 in
+    /// `docs/backlog-m2-followups.md` owns what that fallback costs.
+    ///
+    /// Before F20 the two sets overlapped for byte-keyed rows too: a note in the readable twin was hidden by its
+    /// unreadable twin's display spelling **and** charged as an unread write, so one note cost two charges and the
+    /// refresh-gap line over-counted (F20 §1). `ScanReport` carries no gap count, which is why this arithmetic lives
+    /// here rather than in `tests/scan.rs`.
+    #[test]
+    fn one_note_behind_an_unknown_path_is_charged_in_exactly_one_counter() {
+        assert_twin_bytes(b"caf\xE9", b"caf\xE8");
+        let db = Db::in_memory().expect("in-memory database");
+        // The twin pair, stored the way the write pass stores a walk's finding: distinct identity bytes, one
+        // display spelling `caf\u{FFFD}/low.md`.
+        plant_twin_note(&db, b"caf\xE9", "low.md");
+        plant_twin_note(&db, b"caf\xE8", "low.md");
+        // The unreadable twin, spelled with the bytes the walk really saw.
+        let dirs = [raw(b"caf\xE9")];
+
+        // Case 1 — the fixture in `tests/scan.rs`: one directory the walk could not enter, its note behind it.
+        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
+        assert_eq!(hidden, 1, "one note behind the unreadable twin: one charge");
+        assert_eq!(
+            known.iter().map(|row| row.rel.as_str()).collect::<Vec<_>>(),
+            ["caf\u{fffd}/low.md"],
+            "and the only row left in the comparison is the **readable** twin's"
+        );
+        let written = apply_changes(
+            &db,
+            &[twin_found(b"caf\xE8", "low.md", true)],
+            &[],
+            true,
+            1,
+            true,
+            &MarkerConfig::default(),
+        )
+        .expect("the write pass runs over the twin this scan read");
+        assert_eq!(
+            written.uncovered, 0,
+            "a note this scan read is not charged as an uncovered write"
+        );
+        assert_eq!(
+            hidden + written.uncovered,
+            1,
+            "one note the refresh missed, one charge on the gap line"
+        );
+
+        // Case 2 — the overlap F20 closed. The readable twin's note cannot be read this scan either (gone, or
+        // changed, between walk and read), so it reaches `found` as an unknown marker while its unreadable twin
+        // sits in the list. Matched on display text it would be charged **twice**: hidden by a refusal this
+        // scan never made, and missed by the write pass.
+        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back again");
+        assert_eq!(
+            hidden, 1,
+            "only the genuinely hidden note is charged: the readable twin's row is still in `known`"
+        );
+        assert!(
+            known
+                .iter()
+                .any(|row| row.rel_bytes == b"caf\xE8/low.md".to_vec()),
+            "the readable twin survives the comparison on bytes"
+        );
+        let written = apply_changes(
+            &db,
+            &[twin_found(b"caf\xE8", "low.md", false)],
+            &[],
+            true,
+            1,
+            true,
+            &MarkerConfig::default(),
+        )
+        .expect("the write pass runs over an unreadable twin");
+        assert_eq!(
+            written.uncovered, 1,
+            "the note this scan could not read is charged once"
+        );
+        assert_eq!(
+            hidden + written.uncovered,
+            2,
+            "two notes the refresh missed, two charges — display-text matching made this three (F20 §1)"
+        );
+    }
+
+    /// One twin's path pair: identity bytes that UTF-8 cannot hold (`caf\xE9/low.md`) plus the single display
+    /// spelling both twins decode to.
+    fn twin_row(dir: &[u8], name: &str) -> (RelPath, Snapshot) {
+        let whole = [dir, b"/", name.as_bytes()].concat();
+        let path = RelPath::new(whole.clone(), String::from_utf8_lossy(&whole).into_owned());
+        let snapshot = Snapshot {
+            case_bytes: path_keys::case_fold(&whole),
+            case_key: path_keys::display_fold(&path.rel),
+            hash: "h".to_string(),
+            mtime: 10,
+            rel: path.rel.clone(),
+            rel_bytes: whole,
+            size: 4,
+        };
+        (path, snapshot)
+    }
+
+    /// A live row for one twin's note — file plus the note hanging off it, which is what makes it chargeable.
+    fn plant_twin_note(db: &Db, dir: &[u8], name: &str) {
+        let (path, snapshot) = twin_row(dir, name);
+        upsert_file(db, &snapshot, &Path::new("/ws").join(&path.rel), 1)
+            .expect("test setup: registry row for a twin");
+        db::insert_note(db, &path, "t", "filename", "utf-8", 3, "body")
+            .expect("test setup: note row for a twin");
+    }
+
+    /// The same twin as [`apply_changes`] sees it: text in hand when this scan read it, or the empty-digest
+    /// marker a failed read leaves behind (see [`super::read_one`]).
+    fn twin_found(dir: &[u8], name: &str, read: bool) -> Found {
+        let (_, mut snapshot) = twin_row(dir, name);
+        if !read {
+            snapshot.hash.clear();
+        }
+        Found {
+            abs: Path::new("/ws").join(&snapshot.rel),
+            is_markdown: true,
+            lossy: true,
+            text: read.then(|| "# Twin\n".to_string()),
+            snapshot,
+        }
     }
 
     /// A root holding one `INDEX.md.tmp` corpse and one file that merely looks similar.

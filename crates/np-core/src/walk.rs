@@ -81,25 +81,65 @@ pub struct WalkOptions {
     pub extra_excludes: Vec<String>,
 }
 
+/// A path this scan cannot judge absent, spelled twice: [`display`](Self::display) is what the report prints,
+/// [`bytes`](Self::bytes) is what a caller matches on.
+///
+/// The entries [`crate::walk`] builds take both spellings from **one** component walk
+/// ([`crate::path_keys::rel_bytes` through [`normalize_rel`]), so a path cannot be matched by one spelling and
+/// named by another (F13 §4.1). Keeping them apart is what F20 is about: two directories whose names differ only
+/// in bytes UTF-8 cannot hold — `caf\xE9/` beside `caf\xE8/` — share one display spelling, so a filter that
+/// matched on `display` would let the unreadable twin hide the readable one. `UnknownPath::from_display` is the
+/// one constructor with no component walk to borrow, and it says what its fields hold instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownPath {
+    /// The spelling the report prints: [`Self::bytes`] decoded with replacements for what UTF-8 cannot hold.
+    /// Never used to decide which path a row is.
+    pub display: String,
+    /// The identity a matcher compares on, and every matcher reads this field and nothing else — but the
+    /// stronger claim holds only for what [`crate::walk`] builds: there these are the `/`-joined OS bytes of a
+    /// path on disk, spelled exactly as [`crate::path_keys`] keys a `files` row. An entry from
+    /// `UnknownPath::from_display` names no path on disk, so its `bytes` are only the UTF-8 bytes of its own
+    /// display text (`U+FFFD` included) and can say nothing about which twin a row is.
+    ///
+    /// That asymmetry is why the report's merged [`crate::ScanReport::skipped`] list must never be handed to a
+    /// matcher: it mixes both kinds, and matching a text-only entry against a byte-keyed row is F20 §1 all over
+    /// again — one `U+FFFD` spelling hiding the path whose bytes differ. Only [`Walked::unreadable`] and
+    /// [`Walked::unrepresentable`] are spellings of paths this walk saw.
+    pub bytes: Vec<u8>,
+}
+
+impl UnknownPath {
+    /// Both spellings of a report line that only ever existed as text — a temporary corpse, a foreign catalog
+    /// entry, an identity clash among paths this scan **did** read. Its `bytes` are the bytes of that spelling
+    /// ([`path_keys::rel_bytes_of_display`]), so keying them behaves as keying the text did; a path that came
+    /// off the disk is spelled by `unknown_path` below, which takes the bytes from the same component walk
+    /// [`normalize_rel`] uses for a tracked file.
+    pub(crate) fn from_display(display: String) -> Self {
+        let bytes = path_keys::rel_bytes_of_display(&display);
+        Self { display, bytes }
+    }
+}
+
 /// What a walk found, and what it could not look at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walked {
     /// Every tracked file under the root, sorted by `case_key` then the byte identity `rel_bytes`.
     pub files: Vec<DiscoveredFile>,
-    /// `/`-normalised paths, spelled like `rel`, of directories whose contents this walk **did not read**:
-    /// either it could not enter them (permission denied, or a directory that vanished mid-walk) or the
-    /// directory's own name was refused below. Empty in the common case. A caller must **not** treat files
-    /// under one of these as deleted: they are unknown, not absent, and reporting them as Removed would mark
-    /// live notes stale.
+    /// Paths of directories whose contents this walk **did not read**: either it could not enter them
+    /// (permission denied, or a directory that vanished mid-walk) or the directory's own name was refused
+    /// below. Empty in the common case. A caller must **not** treat files under one of these as deleted: they
+    /// are unknown, not absent, and reporting them as Removed would mark live notes stale.
     ///
     /// Both shapes belong here because both hide a whole subtree, so both need the same answer — the scan
     /// matches this list by prefix ([`mod@crate::scan`] keeps the rows of every path below an entry) rather
     /// than naming each file inside it. A reason is deliberately not part of this type: the report names the
-    /// path either way, and what a caller must do is identical.
-    pub unreadable: Vec<String>,
-    /// `/`-normalised paths, spelled like `rel`, of **files whose own name** the byte key cannot hold —
-    /// on Windows, a name carrying an unpaired surrogate, which `path_keys::name_is_lossless` refuses (F18).
-    /// They are left out of [`Walked::files`] rather than indexed under a key two different names may share.
+    /// path either way, and what a caller must do is identical. Matching is by [`UnknownPath::bytes`] and
+    /// printing by [`UnknownPath::display`], because two byte-distinct directories can share one display
+    /// spelling (F20).
+    pub unreadable: Vec<UnknownPath>,
+    /// Paths of **files whose own name** the byte key cannot hold — on Windows, a name carrying an unpaired
+    /// surrogate, which `path_keys::name_is_lossless` refuses (F18). They are left out of [`Walked::files`]
+    /// rather than indexed under a key two different names may share.
     ///
     /// The two lists answer the same question and differ only in what they name and how wide a hole they cut:
     /// [`Self::unreadable`] holds **directories whose contents were not read** — unreadable, or refused by
@@ -107,8 +147,10 @@ pub struct Walked {
     /// file** whose contents were never in doubt, only its identity is unspellable, and nothing beside it is
     /// in the dark. Both mean "unknown is not absent", and a caller must suppress `Removed` for both:
     /// [`mod@crate::scan`] names every entry in [`crate::ScanReport::skipped`] and keeps the row each path
-    /// already has. Empty on Unix, where `os_bytes` is exact and no name can fail the test.
-    pub unrepresentable: Vec<String>,
+    /// already has. Empty on Unix, where `os_bytes` is exact and no name can fail the test. Matched by
+    /// [`UnknownPath::bytes`], printed by [`UnknownPath::display`] — which is why two refused twins publish
+    /// two report lines rather than one (F20).
+    pub unrepresentable: Vec<UnknownPath>,
 }
 
 /// Discover every tracked file under `root`, sorted by `case_key` then the byte
@@ -167,8 +209,8 @@ fn walk_with_predicate(
     // a refused file names itself exactly, while a refused directory stands for everything below it and so
     // joins [`Walked::unreadable`], where the scan already matches by prefix. There is no third channel
     // because nothing would do with it that `unreadable` does not already do.
-    let mut refused_dirs: Vec<String> = Vec::new();
-    let mut refused_files: Vec<String> = Vec::new();
+    let mut refused_dirs: Vec<UnknownPath> = Vec::new();
+    let mut refused_files: Vec<UnknownPath> = Vec::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
         // `contents_first(false)` is walkdir's spelling of "root first": a directory
@@ -186,18 +228,18 @@ fn walk_with_predicate(
             match refusal(entry, lossless) {
                 None => true,
                 Some(Refusal::File) => {
-                    refused_files.push(entry_rel(entry, root));
+                    refused_files.push(entry_path(entry, root));
                     false
                 }
                 Some(Refusal::Subtree) => {
-                    refused_dirs.push(entry_rel(entry, root));
+                    refused_dirs.push(entry_path(entry, root));
                     false
                 }
             }
         });
 
     let mut files: Vec<DiscoveredFile> = Vec::new();
-    let mut unreadable: Vec<String> = Vec::new();
+    let mut unreadable: Vec<UnknownPath> = Vec::new();
     for item in walker {
         let entry = match item {
             Ok(entry) => entry,
@@ -206,7 +248,7 @@ fn walk_with_predicate(
             // report and is skipped with the entry it belonged to.
             Err(err) => {
                 if let Some(dir) = err.path() {
-                    unreadable.push(unreadable_rel(dir, root));
+                    unreadable.push(unreadable_path(dir, root));
                 }
                 continue;
             }
@@ -224,12 +266,16 @@ fn walk_with_predicate(
     sort_found(&mut files);
     // Refused directories and unreadable ones are the same claim about the same shape, so they are sorted and
     // deduped as one list; a directory cannot be both (a refused one was never opened).
+    //
+    // Both rules read [`UnknownPath::bytes`], never `display`: byte order is the deterministic one, and two
+    // byte-distinct paths that share a display spelling are **two** entries — deduping them by text would put
+    // the report back in the position of naming one path where the disk holds two (F20 §1).
     unreadable.extend(refused_dirs);
     let mut unrepresentable = refused_files;
-    unreadable.sort();
-    unreadable.dedup();
-    unrepresentable.sort();
-    unrepresentable.dedup();
+    for list in [&mut unreadable, &mut unrepresentable] {
+        list.sort_by(|a, b| a.bytes.cmp(&b.bytes));
+        list.dedup_by(|a, b| a.bytes == b.bytes);
+    }
     Ok(Walked {
         files,
         unreadable,
@@ -273,21 +319,34 @@ fn refusal(entry: &DirEntry, lossless: fn(&OsStr) -> bool) -> Option<Refusal> {
     }
 }
 
-/// The `rel` spelling of one entry, which is how both report lists name a path.
-fn entry_rel(entry: &DirEntry, root: &Path) -> String {
+/// The two spellings of one entry's relative path, which is how both report lists name a path.
+fn entry_path(entry: &DirEntry, root: &Path) -> UnknownPath {
     let abs = entry.path();
-    let (_rel_bytes, rel, _display) = normalize_rel(abs.strip_prefix(root).unwrap_or(abs));
-    rel
+    unknown_path(abs.strip_prefix(root).unwrap_or(abs))
 }
 
-/// Relative spelling of a directory the walk could not read. The root itself has no
-/// relative path, and `"."` names it rather than dropping the failure.
-fn unreadable_rel(dir: &Path, root: &Path) -> String {
-    let (_rel_bytes, rel, _display) = normalize_rel(dir.strip_prefix(root).unwrap_or(dir));
-    if rel.is_empty() {
-        return ".".to_string();
+/// Both spellings of a directory the walk could not read. The root itself has no relative path, and `"."` names
+/// it rather than dropping the failure.
+fn unreadable_path(dir: &Path, root: &Path) -> UnknownPath {
+    unknown_path(dir.strip_prefix(root).unwrap_or(dir))
+}
+
+/// [`UnknownPath`] for one path relative to the workspace root, both spellings from a single [`normalize_rel`]
+/// call (F13 §4.1).
+///
+/// A path that normalises to empty — the root itself, or anything whose components are all `CurDir` — spells
+/// `"."` in **both** fields rather than empty ones. That is a constraint, not a cosmetic choice: both report-side
+/// matchers read `"."` as "everything below the root", while an empty prefix would match every path in the
+/// workspace *and* leave the report unable to say which path failed.
+fn unknown_path(os: &Path) -> UnknownPath {
+    let (bytes, display, _abs_display) = normalize_rel(os);
+    if bytes.is_empty() {
+        return UnknownPath {
+            display: ".".to_string(),
+            bytes: b".".to_vec(),
+        };
     }
-    rel
+    UnknownPath { display, bytes }
 }
 
 /// The spellings of one path relative to the workspace root:
@@ -422,7 +481,7 @@ pub(crate) fn epoch_secs(meta: &fs::Metadata) -> i64 {
 mod tests {
     use super::{
         is_excluded, normalize_rel, refusal, sort_found, walk_with_predicate, DiscoveredFile,
-        Refusal, WalkOptions,
+        Refusal, UnknownPath, WalkOptions,
     };
     use crate::path_keys;
     use std::ffi::OsStr;
@@ -452,6 +511,22 @@ mod tests {
     /// `&str` here can hold.
     fn refuse_that_name(name: &OsStr) -> bool {
         !name.to_string_lossy().starts_with(REFUSED)
+    }
+
+    /// The pair ([`UnknownPath::display`], [`UnknownPath::bytes`]) that a name made of ordinary ASCII produces
+    /// — one spelling, so writing it once writes both fields. Every refused name in this module's fixtures is
+    /// ASCII, which is what lets an expectation be spelled as text while the assertion still pins the bytes.
+    ///
+    /// The bytes here are the text's own `str::as_bytes`, with no key rule between — deliberately not named like
+    /// `scan::tests::display_keyed_unknown`, which routes the same text through
+    /// [`crate::path_keys::rel_bytes_of_display`] to stand for a **stored row key**. Equal results, different
+    /// provenance: this is what [`crate::walk`] records on the platform that refuses names (F18), where an entry's
+    /// bytes already are its lossy text.
+    fn unknown_from_text_bytes(display: &str) -> UnknownPath {
+        UnknownPath {
+            display: display.to_string(),
+            bytes: display.as_bytes().to_vec(),
+        }
     }
 
     /// A workspace root holding `names` (`/`-separated, parents created as needed).
@@ -497,7 +572,7 @@ mod tests {
         // would name three paths here.
         assert_eq!(
             walked.unreadable,
-            ["refused-dir".to_string()],
+            [unknown_from_text_bytes("refused-dir")],
             "one prefix entry, not one per unreadable child"
         );
         // And recorded in the list the scan matches by **prefix**: a refused directory hides a subtree, which
@@ -523,10 +598,10 @@ mod tests {
 
         assert_eq!(
             walked.unreadable,
-            ["deep/refused-dir", "refused-dir"]
-                .iter()
-                .map(|name| name.to_string())
-                .collect::<Vec<_>>(),
+            [
+                unknown_from_text_bytes("deep/refused-dir"),
+                unknown_from_text_bytes("refused-dir")
+            ],
             "the nested refusal must carry its parent, or the prefix rule hides nothing: {:?}",
             walked.unreadable
         );
@@ -549,8 +624,8 @@ mod tests {
         assert_eq!(
             walked.unrepresentable,
             [
-                "refused-file.md".to_string(),
-                "sibling/refused-nested.md".to_string()
+                unknown_from_text_bytes("refused-file.md"),
+                unknown_from_text_bytes("sibling/refused-nested.md")
             ],
             "each refused file names itself, relative to the root"
         );

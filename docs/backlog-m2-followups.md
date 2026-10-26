@@ -298,48 +298,139 @@ What these numbers can and cannot carry:
   spelling: (1) a real deletion inside the readable one is never reported `Removed`, and a rename there produces a
   **second live row instead of a move**, because the moved-away path stays unknown rather than becoming `Removed`;
   and (2) one note can be charged twice, in `written.uncovered` (`scan.rs:567`) *and* `hidden_by_unknown`
-  (`scan.rs:486`), so the refresh-gap line over-counts. Bounded, not permanent: it self-heals the moment the
-  refused or unreadable sibling is renamed away, and no phantom row survives that. This is the imprecision F18's own
-  doc points at but does not own — F18 widened who enters these lists, it did not create the matching.
+  (`scan.rs:486`), so the refresh-gap line over-counts. Bounded **for rows the walk keyed from real bytes**: for those
+  it self-heals the moment the refused or unreadable sibling is renamed away, and no phantom row survives. It does
+  **not** heal for a row whose stored key is display text — see F23, which is the same obstruction with no scan-driven
+  exit at all. This is the imprecision F18's own doc points at but does not own: F18 widened who enters these lists, it
+  did not create the matching.
 - **Fix:** carry `rel_bytes` alongside the display spelling in both places (the unreadable set is built by the
   walk, which already has bytes) and key the dedup on bytes while printing display text. Neither changes catalog
   output, so goldens stay put; a fixture with twin directory names should pin both halves.
   **Do when:** a workspace with `caf\xe9/` and `caf\xe8/`, one unreadable, reports exactly the rows it should,
   names both refused paths on separate lines, and counts the note behind them once — not in both
   `written.uncovered` and `hidden_by_unknown`.
+- **Shipped (`bc8f05c`, `aa74a04`, `7acd75f`, `86ee207`, `docs/design-f20-bytes-in-reports.md`).** An unknown path now
+  travels as `walk::UnknownPath { display, bytes }` from the walk that has the OS bytes to the filter that needs
+  them: `under_unreadable` matches a byte prefix plus a real `/`, `is_unknown_path`'s refused arm compares exact
+  bytes, and `skipped` sorts and dedups by bytes while printing display text — so two byte-distinct paths publish two
+  look-alike lines. The fixture exists and runs here (`caf\xe9/` blocked beside readable `caf\xe8/`, real `chmod
+  000`, no skip taken): the readable twin's deletion is reported, a rename there is one `Moved` with no `Added` twin,
+  and the hidden note is charged exactly once — the double charge F20 feared turns out not to survive byte matching,
+  and the arithmetic that used to sum three now sums two.
+- **One exception this round had to add, and it is not legacy-only.** Migration 4 keyed every row through
+  `rel_bytes_of_display`, so a migrated row's stored key *is* its lossy text: byte-only matching hid nothing from it
+  and reported a live note `removed: 1` while its directory was unreadable (review `d2cbf5de`). Such rows are now
+  also compared text-against-text, which hides the row instead of falsely deleting it. A name genuinely holding
+  `U+FFFD`, and every lossy Windows name, qualify permanently; a migrated row leaves the class only when a scan pairs
+  it by hash so `apply_move` rewrites `rel_bytes`, never merely because a scan ran. The refused-name side of that
+  fallback was deleted as unable to ever fire (Windows refusal entries are already lossy-keyed; Unix refuses nothing),
+  with the mutation confirming the guarantee never lived there.
+- **Over-hiding is NOT always harmless churn, and this entry said it was.** When a display-keyed row's own path is
+  readable while an unreadable twin shares its display spelling, hiding the row leaves the listed path with nothing to
+  pair against: it indexes as a spurious `Added`, so **one file gets two live `files` rows and two `notes` rows**, and
+  `hidden_by_unknown` holds `PARSE_VERSION` back until someone renames or removes the twin — no scan clears it. The
+  alternative is worse (a false `Removed` stales a live note and later returns it as a second id), so the wider
+  matching stays; **F23** owns the ambiguity, which no predicate at `known_rows` can resolve.
+- **What this does not claim:** on Windows, where identity bytes come from `to_string_lossy`, two refused names still
+  share one `skipped` line — so that list is a floor on what a scan lost, never a count. That is stated by a
+  `#[cfg(windows)]` test in `tests/walk.rs` which **no CI run can execute**: it prints `NOT COVERAGE` and returns,
+  because no filesystem there will hold an unpaired surrogate either.
 
-## F21 — a refusing stderr can block the first upgrade of an orphan-holding workspace
+## F21 — a refusing stderr could block the first upgrade of an orphan-holding workspace
 
-- **Where:** `crates/np-core/src/db.rs`'s `report_orphans`, which unwraps when its write fails, and the
-  migration step that calls it inside the transaction.
-- **Risk:** a pre-F5 workspace holding orphan notes, opened with descriptor 2 refusing writes (`|& head`, a
-  detached service, `/dev/full`), panics mid-migration — so the upgrade never completes. The keep-the-panic
-  reasoning on record is "never delete rows unannounced", which is defensible; but its stated reason ("losing
-  the announcement silently is the silence this function exists to avoid") is weaker than the code makes it,
-  because the same receipt is written durably into `meta` two lines before the print. So the panic protects a
-  signal that is already stored, at the cost of refusing the upgrade entirely.
-- **Fix:** keep "never delete unannounced", but make the announcement not depend on a stream: verify the
-  `meta` receipt was written (it is, in the same transaction) and treat a failed stderr write as degraded
-  rather than fatal — or defer the print until after commit and let the next scan retry it, which is what F13
-  round 7 did for the refresh receipts. **Do when:** an orphan-holding version-2 workspace upgrades with
-  descriptor 2 closed, and `np scan` afterwards still surfaces the orphan count.
+- **Was:** `db.rs`'s `report_orphans` did `.expect` on its write to descriptor 2, from inside migration 3's
+  transaction. A pre-F5 workspace holding orphans and opened with stderr refusing writes (`|& head`, a detached
+  service, `/dev/full`) panicked mid-migration and never upgraded — the panic guarding a duplicate of the receipt
+  written two statements earlier, in the same transaction.
+- **Shipped (`0b6a071`, `a775b90`, `docs/design-f21-durable-upgrade-announcement.md`): durable first, echoed second.**
+  The `meta` receipt is the announcement of record and the deletion cannot commit without it — pinned by forcing that
+  write to fail (`a_receipt_that_cannot_be_written_rolls_the_cleanup_back`), not by trusting statement order. The
+  stderr echo dropped its `expect` and moved **after `tx.commit()`**, so a failed COMMIT can no longer announce rows
+  that then rolled back; `Db::open` carries the stored string to `ScanReport::upgrade_orphans`, and stdout, `--json`
+  and the echo all render that one value. The field is `Some` only when the cleanup removed more than zero rows, so a
+  fresh workspace announces nothing while the all-zero receipt still lands in `meta` as proof the check ran.
+- **What it does not claim.** No test pins the post-commit position of the echo: a second connection's write lock, a
+  read-only file, a `RAISE(ABORT)` trigger and a page limit each refuse an *earlier* statement rather than the commit,
+  so no portable COMMIT failure exists to build one on — that guarantee is call-site position plus the durable
+  receipt. And the announcement is once-per-process by design: if stdout refused too, the fact survives only in
+  `meta`, which is what "no stream is load-bearing" means here. **Do when:** a person can learn what an old upgrade
+  deleted without opening `sqlite3` — that is F22's durable-announcement mechanism applied to receipts, not a new
+  echo.
 
 ## F22 — a refusal exists only as one report line, with no reason attached
 
 - **Where:** `scan.rs` puts refused names in `report.skipped` and nowhere durable — the `meta` receipt carries the
-  parse version and orphan counts, not refusals — while `walk.rs:97-99` records no cause, so a directory that was
-  **refused** and a directory nobody may enter print identically.
+  parse version and orphan counts, not refusals — while `walk::UnknownPath`'s field docs record no cause (the text
+  that used to sit at `walk.rs:97-99` moved there in F20), so a directory that was **refused** and a directory nobody
+  may enter print identically.
 - **Risk:** on Windows a refusal means a note is missing from the catalog, permanently, until someone renames the
   file. The only evidence is one line on stdout or stderr at the moment it happened: redirect the summary away, or
   ask a day later, and `np status` has nothing to say — it cannot report that any path is unindexable. F18 §3.3
   allowed a sibling list carrying reasons; the implementation chose one list because the caller's duty is identical
   either way, which is true for *safety* and false for *diagnosis*.
-- **Fix:** persist a bounded record in `meta` (a count plus display spellings) and surface it from `np status`, so a
-  refusal outlives its own line; keep the single list but word the entry with its cause where the walk knows it
-  (`skipped: unreadable directory` against `skipped: name this build cannot key`). Report text only, so catalog
-  goldens stay put. **Do when:** a workspace scanned with descriptor 2 closed still lets `np status` name the refused
-  path on the next run, and the two causes are distinguishable in the output.
+- **Also unreported, and this is the entry that should carry it:** F23's duplicate state — one physical file with two
+  live `files` rows, hence **two catalog entries** — has no signal at all. What a scan does print today is honest but
+  indirect: a `skipped` line naming the obstructed directory, and the refresh-gap warning on stderr every run because
+  `refresh_needed` never goes false; the at-risk population is already durable in `meta` under `PATHS_LOSSY_KEY`. None
+  of that says "this note appears twice". Fold it into the same bounded `meta` record rather than inventing a third
+  mechanism.
+- **Fix:** reuse what F21 built rather than inventing a second mechanism — a bounded record in `meta`, the value
+  carried on the open handle, and an always-present `ScanReport` field surfaced by `np scan`. (`np status` does not
+  exist; `np scan` is this program's only command, as F21 §3 records.) Keep the single list but word the entry with its
+  cause where the walk knows it — `skipped: unreadable directory` against `skipped: name this build cannot key`.
+  Report text plus a `meta` key only, so catalog goldens stay put. **Do when:** a workspace scanned with stderr
+  refusing writes still lets a later `np scan` name the refused path, and the two causes are distinguishable in the
+  output.
 
+## F23 — a display-text key cannot say which byte twin its row is for
+
+- **Where:** `crates/np-core/src/scan.rs`'s `key_is_display_derived` fallback in `known_rows`, and the rows migration
+  4 keyed through `path_keys::rel_bytes_of_display` (`db.rs`). A name genuinely holding `U+FFFD`, and every lossy
+  Windows name, are in this class permanently; only a hash-paired `Moved` (so `apply_move` rewrites `rel_bytes`) lets
+  a migrated row out.
+- **Risk — two configurations, identical inputs to `known_rows`, opposite right answers.** Both start from one stored
+  row keyed `63 61 66 EF BF BD 2F …` with display `caf\u{FFFD}/note.md`, and an unreadable directory whose display
+  spelling is the same:
+  - **N′ — the row's own file IS the readable path.** The fallback hides the row, so nothing pairs with the listed
+    file: it indexes as `Added` and the workspace ends with **two live `files` rows and two `notes` rows for one
+    physical file**, two catalog entries, and links/headings able to diverge between the ids.
+    `hidden_by_unknown` also holds `PARSE_VERSION` back, so every scan re-parses the corpus — F15's class — until
+    someone renames or removes the twin. **No scan clears either half.**
+  - **M — the row's own file is inside the blocked directory** and the readable path is its unindexed twin. Here
+    hiding the row is *correct*: the scan reports `added: 1`, the note survives, and the version stays withheld.
+  Any predicate that stops hiding N′ (for instance "the walk listed a path with this display text") also stops hiding
+  M, which reports `removed: 1`, stales a live note, drops it from the catalog and records `PARSE_VERSION` over rows
+  nobody re-parsed. That is why the fallback stays as wide as it is: **a lossy key carries no byte spelling, so nothing
+  computable at `known_rows` distinguishes the two.** The naive fix was tried, probed against both cases, and rejected.
+- **Evidence for rejecting the narrow patch** (`skip the fallback when the found set carries that display text`), so
+  nobody re-derives it: disable `key_is_display_derived` and both fixtures move in opposite directions. The harm case
+  becomes a clean `Moved: 1` — one live row, which is exactly why the patch looks right — while the fence case becomes
+  **`added: 1, removed: 1`**: a live note reported gone as its look-alike is indexed. The fence's twin deliberately
+  carries a different body from the hidden note; with identical content `classify` pairs them by hash, reports
+  `Moved: 1`, and the fixture proves nothing (that mistake was made and caught by mutation during this round).
+- **Fix candidates, with their costs.** (i) Pair by content hash the way `apply_move` does — needs the blocked path to
+  become readable at least once, so it repairs rather than prevents, and cannot help a workspace whose twin stays
+  unreadable forever. (ii) Found-side suppression: when a listed path's display text matches a row hidden by the
+  fallback, skip that path and name it in `skipped`, trading duplicate rows for a readable file left unindexed while
+  its twin is unreadable — this changes what a scan is allowed to omit, so it needs its own spec rather than arriving
+  inside a hardening round, **and it legitimately rewrites the fence fixture's `(added, moved, removed) == (1, 0, 0)`
+  into `added: 0` plus a `skipped` name**: that edit is expected under (ii) and must be justified in the commit body,
+  not made silently. (iii) A future schema step that refuses display-derived keys — re-key every row from OS bytes or
+  flag the workspace for a full re-index — costs a migration plus one complete re-parse of every flagged workspace,
+  and must say what happens to rows F23 already duplicated (merge them onto one id, or refuse and ask).
+- **Runner caveat:** both fixtures early-return with `NOT COVERAGE` when the filesystem refuses latin-1 directory
+  names or `chmod 000` fails to deny access (a privileged runner), so a green CI run is not proof they executed.
+  Validate any F23 fix on a runner where `denied()` is true and say which one in the PR.
+- **Pinned by:** `crates/np-core/tests/scan.rs::known_defect_a_readable_display_keyed_path_duplicates_its_own_row`
+  (the harm: two live `files` rows, two `notes` rows, version withheld) and
+  `crates/np-core/tests/scan.rs::a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`
+  (the fence: any fix reporting `removed: 1` there destroyed a live note). The harm fixture is to be **deleted** in the
+  commit that fixes this entry.
+- **Do when:** a workspace with `caf\xe9/` blocked beside `caf\xe8/`, holding one display-keyed row, ends up with
+  exactly one live `files` row and one `notes` row for that path **once the obstruction is gone** — while the twin is
+  still blocked, some charge to `hidden_by_unknown` remains correct and `PARSE_VERSION` stays withheld, so do not write
+  a "Do when" that demands recording the version mid-obstruction: `refresh_covered` withholding it is the safety, not
+  the bug. Until then, do not describe the fallback's over-hiding as churn that heals: it does not.
 ---
 
 ## Explicitly not in this backlog

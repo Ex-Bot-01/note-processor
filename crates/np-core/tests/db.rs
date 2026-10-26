@@ -415,72 +415,15 @@ fn deleting_a_note_row_cascades_to_its_children_and_nulls_inbound_edges() {
 }
 
 /// The schema as of version 2 — the first two `MIGRATIONS` entries copied out verbatim, and
-/// deliberately **not** read from them. This fixture is history: migration 3 has to upgrade the shape
-/// an M1 database holds on disk, so it must not move when the code under test does.
-const VERSION_TWO: &str = r#"
-CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
-
-CREATE TABLE files (
-    rel       TEXT    PRIMARY KEY,
-    case_key  TEXT    NOT NULL UNIQUE,
-    abs       TEXT    NOT NULL,
-    hash      TEXT    NOT NULL,
-    size      INTEGER NOT NULL,
-    mtime     INTEGER NOT NULL,
-    state     TEXT    NOT NULL CHECK (state IN ('ok','stale')),
-    last_seen INTEGER NOT NULL
-);
-CREATE INDEX files_case_key ON files(case_key);
-
-CREATE TABLE notes (
-    id           INTEGER PRIMARY KEY,
-    rel          TEXT REFERENCES files(rel) ON UPDATE CASCADE,
-    title        TEXT,
-    title_source TEXT,
-    encoding     TEXT,
-    word_count   INTEGER,
-    body         TEXT
-);
-CREATE INDEX notes_rel ON notes(rel);
-
-CREATE TABLE headings (
-    note_id INTEGER NOT NULL,
-    level   INTEGER NOT NULL,
-    text    TEXT    NOT NULL,
-    line    INTEGER NOT NULL
-);
-
-CREATE TABLE tags (
-    note_id INTEGER NOT NULL,
-    tag     TEXT    NOT NULL
-);
-CREATE INDEX tags_tag ON tags(tag);
-
-CREATE TABLE links (
-    src_note_id INTEGER NOT NULL,
-    dst_note_id INTEGER,
-    kind        TEXT    NOT NULL CHECK (kind IN ('wiki','md','attachment')),
-    target      TEXT    NOT NULL,
-    line        INTEGER NOT NULL,
-    origin      TEXT    NOT NULL CHECK (origin IN ('prose','approved'))
-);
-CREATE INDEX links_dst_note_id ON links(dst_note_id);
-
-CREATE TABLE items (
-    note_id INTEGER NOT NULL,
-    text    TEXT    NOT NULL,
-    line    INTEGER NOT NULL,
-    state   TEXT    NOT NULL CHECK (state IN ('open','done','paused')),
-    marker  TEXT
-);
-
-CREATE TABLE meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-
-INSERT INTO schema_version (version) VALUES (1), (2);
-"#;
+/// deliberately **not** read from them. This fixture is history: migration 3 has to upgrade the shape an
+/// M1 database holds on disk, so it must not move when the code under test does.
+///
+/// One file rather than one copy per test binary, because `crates/np-cli/tests/cli.rs` seeds the same
+/// version-two file to drive the real binary: two verbatim copies of "version 2" are one silent edit away
+/// from two different schemas, and a migration test upgrading a shape nobody shipped would still be
+/// green. It is a *test* fixture — reading it into the library instead would put a downgrade path in
+/// production code to serve a test.
+const VERSION_TWO: &str = include_str!("fixtures/schema-v2.sql");
 
 /// Write a version-two database at `path` holding the three kinds of row migration 3 has to tell
 /// apart: children of two live notes, the children of one note whose file was reported gone
@@ -636,6 +579,17 @@ fn a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note() {
         "the cleanup reports what it deleted"
     );
 
+    // The same value reaches the process that did the deleting through the handle, not a second read of
+    // `meta` — and it has to survive **every** later step: migration 4 runs after this one, and a loop that
+    // overwrote the receipt with the later step's nothing would leave the upgrading scan silent while
+    // `meta` still held the record (`only_the_scan_that_removed_the_orphans_announces_them` in
+    // `crates/np-cli/tests/cli.rs` covers the printed half of the same fact).
+    assert_eq!(
+        db.upgrade_orphans(),
+        Some(ONE_OF_EACH),
+        "the open that ran the cleanup still carries its receipt after the steps that followed"
+    );
+
     // The constraint is live on the upgraded file, not merely declared.
     refuses_orphan(
         &db,
@@ -757,6 +711,80 @@ fn a_freshly_created_database_records_an_empty_orphan_receipt() {
     let db = Db::open(&path).expect("a new file migrates from scratch");
 
     assert_eq!(receipt(&db), NOTHING_REMOVED);
+}
+
+#[test]
+fn a_receipt_that_cannot_be_written_rolls_the_cleanup_back() {
+    // F21 §4.2: "never delete unannounced" is enforced by the transaction, not by the order the statements
+    // happen to be written in — so this case refuses the `meta` write and then asks whether any row went.
+    // Reading the code would let a refactor move the receipt past the commit, or soften its failure into a
+    // warning, and keep every other test green; this assertion does not.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_two(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("test setup: reopen the fixture");
+        // A `RAISE(ABORT)` trigger is the smallest way to fail **one** statement: migration 3's deletes, its
+        // four table rebuilds and its `PRAGMA foreign_key_check` all still run, so a passing assertion below
+        // cannot be the accident of some earlier refusal. A trigger rather than a read-only file because
+        // `Db::open` opens its own connection, which no test gets to configure.
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_receipts BEFORE INSERT ON meta
+             BEGIN SELECT RAISE(ABORT, 'no receipts here'); END;",
+        )
+        .expect("test setup: refuse writes to `meta`");
+    }
+
+    let err =
+        Db::open(&path).expect_err("a cleanup that cannot record its receipt must not commit");
+    // Reaching the next line is the proof that this left as an error rather than a panic — which is what it
+    // was before F21, where the only failing statement in this path was the stderr write's `.expect`.
+    assert!(
+        matches!(
+            &err,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(fault, _))
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        ),
+        "expected the receipt write itself to be refused, got {err}"
+    );
+    assert!(
+        err.to_string().contains("no receipts here"),
+        "the error has to name the refusal whoever would have to undo: {err}"
+    );
+
+    // Nothing was deleted. Read through a plain connection, because `Db::open` still refuses this file.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    for sql in [
+        "SELECT COUNT(*) FROM headings WHERE note_id = 77",
+        "SELECT COUNT(*) FROM tags WHERE note_id = 77",
+        "SELECT COUNT(*) FROM items WHERE note_id = 77",
+        "SELECT COUNT(*) FROM links WHERE src_note_id = 77",
+        "SELECT COUNT(*) FROM links WHERE dst_note_id = 88",
+    ] {
+        assert_eq!(
+            one(sql),
+            1,
+            "{sql}: the cleanup rolled back with its receipt"
+        );
+    }
+    // And it rolled back completely: no receipt row, and a file still at version two — so the next run of a
+    // real binary retries the upgrade rather than trusting a half-done one.
+    assert_eq!(
+        one(&format!(
+            "SELECT COUNT(*) FROM meta WHERE key = '{FK_ORPHANS_KEY}'"
+        )),
+        0,
+        "a refused receipt wrote nothing"
+    );
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        2,
+        "the step recorded nothing, so the cleanup can be retried"
+    );
 }
 
 #[test]

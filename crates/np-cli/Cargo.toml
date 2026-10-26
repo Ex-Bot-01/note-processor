@@ -14,4 +14,7 @@ np-core = { path = "../np-core" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# Only for `tests/cli.rs`, which has to seed a version-two workspace database by hand: no production API
+# writes an old schema, and the version-2 fixture is what makes F21's upgrade path reachable at all.
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
