@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::process::{Command, Output};
 
 use np_core::config::Config;
-use np_core::db::Db;
+use np_core::db::{Db, FK_ORPHANS_KEY};
 use np_core::parse::PARSE_VERSION;
 use tempfile::TempDir;
 
@@ -68,6 +68,16 @@ impl Workspace {
 
     fn index(&self) -> PathBuf {
         self.root.join("INDEX.md")
+    }
+
+    /// This workspace's database, derived the way the binary derives it from the same absolute root
+    /// [`Workspace::command`] passes — the same route [`record_parse_version`] takes.
+    fn db_path(&self) -> PathBuf {
+        Config {
+            data_dir: self.data_dir(),
+            ..Config::default()
+        }
+        .workspace_db(&self.root)
     }
 }
 
@@ -614,4 +624,322 @@ fn an_error_is_reported_rather_than_panicked_when_stderr_refuses_it() {
         refused.stdout(),
         refused.stderr()
     );
+}
+
+// ---------------------------------------------------------------------------
+// F21: an upgrade's deletions are announced from the durable receipt, not from a stream.
+//
+// Migration 3 wrote its orphan counts into `meta` and then called `report_orphans`, which `.expect`ed its
+// way onto stderr — inside the migration's own transaction. A workspace holding orphans and opened with
+// descriptor 2 refusing writes therefore had its whole upgrade rolled back, forever: exit 101, no rows
+// removed, file still at version two. The receipt is what F21 makes the signal; these cases pin that it
+// (a) survives a closed stderr, (b) reaches the scan that wrote it once and only once, and (c) says
+// nothing when there was nothing to say.
+//
+// They need the real binary for (a) — `Db::open` runs before any in-process test could replace descriptor
+// 2 — and a genuine version-two file for all three, because a freshly created database has no orphans to
+// announce. So the fixture below is seeded by hand.
+// ---------------------------------------------------------------------------
+
+/// The schema as of version 2 — the first two `MIGRATIONS` entries, copied out verbatim.
+///
+/// Duplicated from `VERSION_TWO` in `crates/np-core/tests/db.rs`: integration-test fixtures are private
+/// to their own test binary, and the alternative — a library function that writes old schemas — would put
+/// a downgrade path in production code to serve a test. Keep the two copies in step if either changes.
+const VERSION_TWO: &str = r#"
+CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+
+CREATE TABLE files (
+    rel       TEXT    PRIMARY KEY,
+    case_key  TEXT    NOT NULL UNIQUE,
+    abs       TEXT    NOT NULL,
+    hash      TEXT    NOT NULL,
+    size      INTEGER NOT NULL,
+    mtime     INTEGER NOT NULL,
+    state     TEXT    NOT NULL CHECK (state IN ('ok','stale')),
+    last_seen INTEGER NOT NULL
+);
+CREATE INDEX files_case_key ON files(case_key);
+
+CREATE TABLE notes (
+    id           INTEGER PRIMARY KEY,
+    rel          TEXT REFERENCES files(rel) ON UPDATE CASCADE,
+    title        TEXT,
+    title_source TEXT,
+    encoding     TEXT,
+    word_count   INTEGER,
+    body         TEXT
+);
+CREATE INDEX notes_rel ON notes(rel);
+
+CREATE TABLE headings (
+    note_id INTEGER NOT NULL,
+    level   INTEGER NOT NULL,
+    text    TEXT    NOT NULL,
+    line    INTEGER NOT NULL
+);
+
+CREATE TABLE tags (
+    note_id INTEGER NOT NULL,
+    tag     TEXT    NOT NULL
+);
+CREATE INDEX tags_tag ON tags(tag);
+
+CREATE TABLE links (
+    src_note_id INTEGER NOT NULL,
+    dst_note_id INTEGER,
+    kind        TEXT    NOT NULL CHECK (kind IN ('wiki','md','attachment')),
+    target      TEXT    NOT NULL,
+    line        INTEGER NOT NULL,
+    origin      TEXT    NOT NULL CHECK (origin IN ('prose','approved'))
+);
+CREATE INDEX links_dst_note_id ON links(dst_note_id);
+
+CREATE TABLE items (
+    note_id INTEGER NOT NULL,
+    text    TEXT    NOT NULL,
+    line    INTEGER NOT NULL,
+    state   TEXT    NOT NULL CHECK (state IN ('open','done','paused')),
+    marker  TEXT
+);
+
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+INSERT INTO schema_version (version) VALUES (1), (2);
+"#;
+
+/// The receipt [`seed_version_two`] earns: exactly one row of each shape removed, and one destination
+/// NULLed. Five rows changed, which is the total the summary line names.
+const ORPHAN_RECEIPT: &str = "headings=1,tags=1,items=1,links_src=1,links_dst_null=1";
+
+/// The receipt a cleanup that found nothing still writes — the record that the check ran, which is why it
+/// is kept even when the scan report has nothing to announce.
+const NOTHING_REMOVED: &str = "headings=0,tags=0,items=0,links_src=0,links_dst_null=0";
+
+/// Write a version-two workspace database at `path` holding the five rows migration 3 repairs — a heading,
+/// a tag, an item and an edge owned by note 77, plus one edge whose destination is note 88; neither id was
+/// ever a note row.
+///
+/// Beside them sit the children of two live notes and of one note whose file went stale, so a cleanup that
+/// deleted more than it should show up as a bigger receipt rather than passing unnoticed.
+fn seed_version_two(path: &Path) {
+    fs::create_dir_all(
+        path.parent()
+            .expect("test setup: the database has a parent"),
+    )
+    .expect("test setup: create the workspaces directory");
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_TWO)
+        .expect("test setup: version-two schema");
+    conn.execute_batch(
+        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
+            ('a.md', 'a.md', '/ws/a.md', 'ha', 1, 1, 'ok', 1),
+            ('b.md', 'b.md', '/ws/b.md', 'hb', 1, 1, 'ok', 1),
+            ('c.md', 'c.md', '/ws/c.md', 'hc', 1, 1, 'stale', 1);
+         INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
+            (1, 'a.md', 'A', 'filename', 'utf-8', 3, 'a'),
+            (2, 'b.md', 'B', 'filename', 'utf-8', 3, 'b'),
+            (3, 'c.md', 'C', 'filename', 'utf-8', 3, 'c');
+         INSERT INTO headings (note_id, level, text, line) VALUES
+            (1, 1, 'A heading', 1), (77, 2, 'Gone', 4);
+         INSERT INTO tags (note_id, tag) VALUES (1, 'keep'), (77, 'gone');
+         INSERT INTO items (note_id, text, line, state, marker) VALUES
+            (2, 'task', 2, 'open', '- [ ]'), (77, 'task', 5, 'open', NULL);
+         INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+            (1, 2, 'md', 'b.md', 3, 'prose'),
+            (77, NULL, 'wiki', 'Nobody', 6, 'prose'),
+            (1, 88, 'wiki', 'AlsoGone', 7, 'prose');",
+    )
+    .expect("test setup: seed the old rows");
+}
+
+/// The single value a probe query returns, with the query in the failure message.
+fn scalar<T: rusqlite::types::FromSql>(db: &Db, sql: &str) -> T {
+    db.0.query_row(sql, [], |row| row.get::<_, T>(0))
+        .unwrap_or_else(|err| panic!("query failed: {sql}\n{err}"))
+}
+
+/// The orphan receipt as migration 3 stored it, read back under the constant it writes under — so a
+/// renamed key fails these tests instead of reading `NULL` and comparing equal to nothing.
+fn receipt(db: &Db) -> String {
+    scalar(
+        db,
+        &format!("SELECT value FROM meta WHERE key = '{FK_ORPHANS_KEY}'"),
+    )
+}
+
+/// Every orphan [`seed_version_two`] planted, gone — and the legitimate rows beside it, kept. Asserted
+/// after an upgrade whichever channel announced it.
+fn assert_only_the_orphans_went(db: &Db) {
+    for sql in [
+        "SELECT COUNT(*) FROM headings WHERE note_id = 77",
+        "SELECT COUNT(*) FROM tags WHERE note_id = 77",
+        "SELECT COUNT(*) FROM items WHERE note_id = 77",
+        "SELECT COUNT(*) FROM links WHERE src_note_id = 77",
+        "SELECT COUNT(*) FROM links WHERE dst_note_id = 88",
+    ] {
+        assert_eq!(scalar::<i64>(db, sql), 0, "{sql}");
+    }
+    // A cleanup that deleted everything would satisfy the loop above; these are the rows the receipt says it
+    // never touched — a live note's own tag, its resolved edge with its destination still attached, and the
+    // dangling edge NULLed rather than dropped (migration 3's `ON DELETE SET NULL` shape).
+    assert_eq!(
+        scalar::<i64>(db, "SELECT COUNT(*) FROM tags WHERE note_id = 1"),
+        1,
+        "a live note's tag survived"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            db,
+            "SELECT COUNT(*) FROM links WHERE src_note_id = 1 AND target = 'b.md'
+                AND dst_note_id IS NOT NULL"
+        ),
+        1,
+        "the edge between two real notes kept its destination"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            db,
+            "SELECT COUNT(*) FROM links WHERE target = 'AlsoGone' AND dst_note_id IS NULL"
+        ),
+        1,
+        "the dangling edge lost only its destination: it is somebody's prose"
+    );
+}
+
+/// The all-zero case, which is every fresh workspace: migration 3 runs, removes nothing, and the scan says
+/// nothing about it — while `meta` still records that the check happened.
+///
+/// Two workspaces because the field only exists on the process that did the migrating, and the two channels
+/// are read differently: one run prints its summary, the other prints `--json`.
+#[test]
+fn an_upgrade_that_removed_nothing_is_announced_nowhere() {
+    let json_ws = workspace();
+    let report: serde_json::Value =
+        serde_json::from_str(&run(&mut json_ws.command(&["scan", "--json"])).stdout())
+            .expect("`--json` must print one JSON object");
+    assert!(
+        report["upgrade_orphans"].is_null(),
+        "a cleanup that removed no rows has no loss to report: {report}"
+    );
+
+    let plain = workspace();
+    let first = run(&mut plain.command(&["scan"]));
+    first.assert_success();
+    assert!(
+        !first.stdout().contains("orphan row(s)"),
+        "`removed 0 orphan row(s)` would state a deletion that did not happen:\n{}",
+        first.stdout()
+    );
+
+    // The durable half is untouched by all of this: the receipt is written even at zero, because "looked
+    // and found none" has to read differently from "this file never upgraded".
+    let db = Db::open(&json_ws.db_path()).expect("test setup: open the upgraded database");
+    assert_eq!(receipt(&db), NOTHING_REMOVED);
+}
+
+/// F21 §4.1, against the descriptor that produced the defect: stderr refuses every write while migration 3
+/// is running, and the upgrade still completes.
+///
+/// Before the fix this run exited 101 — `report_orphans` panicked inside the migration's transaction, which
+/// rolled the deletes and the receipt back together, so the file stayed at version two and every later run
+/// failed the same way. Exit 0 plus a removed-orphans line on stdout is the whole promise; the panic's own
+/// message could not be printed either, so nothing else about the run was readable.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scan_upgrades_with_descriptor_two_closed() {
+    let ws = workspace();
+    seed_version_two(&ws.db_path());
+
+    // Premise first, as `a_scan_survives_a_stderr_that_refuses_every_write` learned: `/dev/null` accepts
+    // every write and so does a descriptor opened read-only, so only `/dev/full` actually refuses one.
+    if fs::write("/dev/full", "receipt").is_ok() {
+        panic!("test premise: /dev/full accepted a write, so this case would prove nothing");
+    }
+
+    // Not through [`run`]: that helper captures stderr, and this test's subject is descriptor 2.
+    let mut cmd = ws.command(&["scan"]);
+    let argv = format!("{cmd:?}");
+    let output = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .expect("test setup: open /dev/full for writing"),
+        ))
+        .spawn()
+        .unwrap_or_else(|err| panic!("cannot start `{argv}`: {err}"))
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("cannot wait for `{argv}`: {err}"));
+    let survived = Run { argv, output };
+
+    assert_eq!(
+        survived.code(),
+        0,
+        "an upgrade must not be refused because stderr would not take its receipt: stdout `{}`, stderr `{}`",
+        survived.stdout(),
+        survived.stderr()
+    );
+    // The line still goes to stdout — a stream that is open here — naming the total beside the counts.
+    assert!(
+        survived.stdout().contains("removed 5 orphan row(s)"),
+        "the run that deleted five rows has to say so:\n{}",
+        survived.stdout()
+    );
+
+    // And the deletions are real, not a rolled-back attempt: reopened through the normal path — which now
+    // finds nothing to migrate — the orphans are gone and their receipt is in `meta`.
+    let db = Db::open(&ws.db_path()).expect("the upgraded file opens normally afterwards");
+    assert_only_the_orphans_went(&db);
+    assert_eq!(receipt(&db), ORPHAN_RECEIPT);
+}
+
+/// The echo is once per process, not a fixture on every report: the run whose own open removed the rows
+/// carries the receipt on both channels, and no later run of the same workspace mentions it again — while
+/// `meta` keeps it forever.
+#[test]
+fn only_the_scan_that_removed_the_orphans_announces_them() {
+    let ws = workspace();
+    seed_version_two(&ws.db_path());
+
+    let upgrading = run(&mut ws.command(&["scan", "--json"]));
+    upgrading.assert_success();
+    // The same string `meta` holds, not a re-spelling of it: stdout and `--json` read one field, so they
+    // cannot disagree about a fact F21 refuses to put on a stream alone.
+    let report: serde_json::Value =
+        serde_json::from_str(&upgrading.stdout()).expect("`--json` must print one JSON object");
+    assert_eq!(
+        report["upgrade_orphans"].as_str(),
+        Some(ORPHAN_RECEIPT),
+        "the upgrading scan carries the receipt it wrote: {}",
+        upgrading.stdout()
+    );
+
+    let later = run(&mut ws.command(&["scan", "--json"]));
+    later.assert_success();
+    let again: serde_json::Value =
+        serde_json::from_str(&later.stdout()).expect("`--json` must print one JSON object");
+    assert!(
+        again["upgrade_orphans"].is_null(),
+        "a scan that migrated nothing has nothing to announce: {again}"
+    );
+
+    let printed = run(&mut ws.command(&["scan"]));
+    printed.assert_success();
+    assert!(
+        !printed.stdout().contains("orphan row(s)"),
+        "the receipt is history, not a queue; a line on every scan trains the reader to ignore it:\n{}",
+        printed.stdout()
+    );
+
+    // Never cleared: the echo stays a copy of a record that outlives it. Read through the normal path,
+    // which proves a later open neither rewrites nor repeats it.
+    let db = Db::open(&ws.db_path()).expect("test setup: open the upgraded database");
+    assert_only_the_orphans_went(&db);
+    assert_eq!(receipt(&db), ORPHAN_RECEIPT);
 }

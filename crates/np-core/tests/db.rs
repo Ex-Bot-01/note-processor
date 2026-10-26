@@ -760,6 +760,80 @@ fn a_freshly_created_database_records_an_empty_orphan_receipt() {
 }
 
 #[test]
+fn a_receipt_that_cannot_be_written_rolls_the_cleanup_back() {
+    // F21 §4.2: "never delete unannounced" is enforced by the transaction, not by the order the statements
+    // happen to be written in — so this case refuses the `meta` write and then asks whether any row went.
+    // Reading the code would let a refactor move the receipt past the commit, or soften its failure into a
+    // warning, and keep every other test green; this assertion does not.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_two(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("test setup: reopen the fixture");
+        // A `RAISE(ABORT)` trigger is the smallest way to fail **one** statement: migration 3's deletes, its
+        // four table rebuilds and its `PRAGMA foreign_key_check` all still run, so a passing assertion below
+        // cannot be the accident of some earlier refusal. A trigger rather than a read-only file because
+        // `Db::open` opens its own connection, which no test gets to configure.
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_receipts BEFORE INSERT ON meta
+             BEGIN SELECT RAISE(ABORT, 'no receipts here'); END;",
+        )
+        .expect("test setup: refuse writes to `meta`");
+    }
+
+    let err =
+        Db::open(&path).expect_err("a cleanup that cannot record its receipt must not commit");
+    // Reaching the next line is the proof that this left as an error rather than a panic — which is what it
+    // was before F21, where the only failing statement in this path was the stderr write's `.expect`.
+    assert!(
+        matches!(
+            &err,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(fault, _))
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        ),
+        "expected the receipt write itself to be refused, got {err}"
+    );
+    assert!(
+        err.to_string().contains("no receipts here"),
+        "the error has to name the refusal whoever would have to undo: {err}"
+    );
+
+    // Nothing was deleted. Read through a plain connection, because `Db::open` still refuses this file.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    for sql in [
+        "SELECT COUNT(*) FROM headings WHERE note_id = 77",
+        "SELECT COUNT(*) FROM tags WHERE note_id = 77",
+        "SELECT COUNT(*) FROM items WHERE note_id = 77",
+        "SELECT COUNT(*) FROM links WHERE src_note_id = 77",
+        "SELECT COUNT(*) FROM links WHERE dst_note_id = 88",
+    ] {
+        assert_eq!(
+            one(sql),
+            1,
+            "{sql}: the cleanup rolled back with its receipt"
+        );
+    }
+    // And it rolled back completely: no receipt row, and a file still at version two — so the next run of a
+    // real binary retries the upgrade rather than trusting a half-done one.
+    assert_eq!(
+        one(&format!(
+            "SELECT COUNT(*) FROM meta WHERE key = '{FK_ORPHANS_KEY}'"
+        )),
+        0,
+        "a refused receipt wrote nothing"
+    );
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        2,
+        "the step recorded nothing, so the cleanup can be retried"
+    );
+}
+
+#[test]
 fn a_version_two_database_keeps_the_tag_rows_in_rowid_order() {
     // What this test *pins* is migration 3's `ORDER BY rowid` copy (see `rebuild_with_keys` in
     // `src/db.rs`), not a regression that could be happening today: while the copy is sorted, any

@@ -39,12 +39,31 @@ scan report. Rule: **a scan echoes the receipt only when its own process perform
 - `Db::open` remembers, for the lifetime of the handle, whether *this* open ran the orphan cleanup, and keeps the
   value it wrote.
 - `ScanReport` gains one additive field — `pub upgrade_orphans: Option<String>` — holding that stored value when this
-  process did the cleanup, `None` otherwise. The stdout summary prints one line naming the total and the counts;
-  `--json` carries the same string. Nothing is repeated on later scans, because by then the user has been told once
-  and the record is still in `meta` for whoever asks with `sqlite3`.
+  process did the cleanup **and the cleanup removed at least one row**, `None` otherwise. The stdout summary prints one
+  line naming the total and the counts; `--json` carries the same string, read from the same field, so the two channels
+  cannot disagree. Nothing is repeated on later scans, because by then the user has been told once and the record is
+  still in `meta` for whoever asks with `sqlite3`.
 - Why "this process" rather than "whenever the key is non-zero": a permanent one-line warning on every scan would
   train the user to ignore it, which is how real signals die. And why not clear the key after echoing: clearing makes
   the echo load-bearing again — if both streams fail once, the fact is gone.
+
+### 3.1 The all-zero case, settled in the round
+
+A brand-new workspace runs migration 3 too, and its receipt is `headings=0,tags=0,…`. Three readings were available
+for what the field should then hold:
+
+- **(a) print whenever the cleanup ran.** Rejected: the first scan of every fresh workspace would print
+  `removed 0 orphan row(s)`, which states a deletion that did not happen — the same noise the pinned all-zero silence
+  in `report_orphans` exists to prevent.
+- **(b) keep the field as stored, suppress only the stdout line at zero.** Rejected: stdout and `--json` would then
+  disagree about one fact, and channel disagreement is what F21 and F22 are about. It should not arrive as a side
+  effect of tidiness.
+- **(c) gate the field itself on total > 0** — chosen. `upgrade_orphans` means "this upgrade deleted rows; here is the
+  receipt", not "migration 3 ran", and both channels follow from that one value by construction.
+
+The durable record is unchanged by this: the all-zero receipt **is** still written to `meta`, because its job is to
+prove the check ran ("looked and found none" against "this file never upgraded"). So the receipt and the echoed field
+differ at zero deliberately — the receipt records that the look happened, the echo reports a loss.
 
 ## 4. Invariants
 
@@ -66,6 +85,12 @@ scan report. Rule: **a scan echoes the receipt only when its own process perform
   panic.
 - The existing `report_orphans` unit tests keep their assertions — they pin wording and the all-zero silence, none of
   which changes; only the failure mode does.
+- The all-zero case §3.1 settles: a fresh workspace's first scan has `upgrade_orphans == null`, prints no line, and its
+  `meta` still holds the all-zero receipt. (`crates/np-cli/tests/cli.rs`,
+  `an_upgrade_that_removed_nothing_is_announced_nowhere`.)
+- And the unit-level half of §4.1: a sink that returns `ENOSPC` for every write does not abort the migration
+  (`crates/np-core/src/db.rs`, `a_sink_that_refuses_writes_does_not_abort_the_upgrade`). It cannot replace the
+  closed-descriptor case above, because only a real descriptor 2 pins the production call site.
 
 ## 6. Gates
 
