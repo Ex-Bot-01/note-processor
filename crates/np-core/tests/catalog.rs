@@ -16,6 +16,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use unicode_width::UnicodeWidthStr;
+
 use np_core::catalog::{render, size_human, CatalogEntry};
 use np_core::config::CatalogConfig;
 
@@ -157,9 +159,12 @@ fn titles_in(contents: &str) -> Vec<String> {
         .collect()
 }
 
-/// Display columns of a rendered line: characters, so an umlaut counts once.
+/// Display columns of a rendered line, measured the way `catalog::wrap` measures them: an ideograph
+/// or emoji occupies two columns and a combining mark none, so a CJK title is wider than its
+/// character count. Asserting in the same unit the rule budgets is what makes a column assertion
+/// mean "fits on the line" rather than "has this many characters".
 fn columns(line: &str) -> usize {
-    line.chars().count()
+    line.width()
 }
 
 /// The unwrapped rendering of one entry, recovered by undoing the wrap of a default-indent render.
@@ -171,20 +176,28 @@ fn logical_line(entry: &CatalogEntry) -> String {
         .to_string()
 }
 
-/// An entry whose unwrapped rendering is exactly `wanted` columns wide: the tag is padded to
-/// whatever length closes the gap, so a boundary test states a column budget instead of a
-/// hand-counted string.
+/// An entry whose unwrapped rendering is exactly `wanted` columns wide on the ASCII baseline
+/// `Pad` / `pad.md`: see [`padded_like`] for the arithmetic.
+fn padded_entry(wanted: usize) -> CatalogEntry {
+    padded_like(&entry("Pad", "pad.md", "1 B", &[""], 0, 0), wanted)
+}
+
+/// An entry whose unwrapped rendering is exactly `wanted` **display columns** wide, shaped like
+/// `baseline`: the tag is padded to whatever length closes the gap, so a boundary test states a
+/// column budget instead of a hand-counted string.
 ///
 /// The baseline renders its single empty tag as `#`, and the padded entry renders `#` plus the
-/// padding, so the line grows by exactly `tag.len()` — `wanted - overhead`, with nothing added for
-/// the prefix. (Spec §14 puts `{tags}` between the size and the counts, which is what decides this
-/// arithmetic.)
-fn padded_entry(wanted: usize) -> CatalogEntry {
-    let overhead = logical_line(&entry("Pad", "pad.md", "1 B", &[""], 0, 0))
-        .chars()
-        .count();
-    let tag = "t".repeat(wanted - overhead);
-    entry("Pad", "pad.md", "1 B", &[&tag], 0, 0)
+/// padding, so the line grows by exactly `pad.len()` columns — `wanted - overhead`, with nothing
+/// added for the prefix — because the padding is ASCII. That is what lets a baseline of any width
+/// (an ideograph title, an emoji one) reach an exact column count. (Spec §14 puts `{tags}` between
+/// the size and the counts, which is what decides this arithmetic.)
+fn padded_like(baseline: &CatalogEntry, wanted: usize) -> CatalogEntry {
+    let overhead = columns(&logical_line(baseline));
+    let pad = "t".repeat(wanted - overhead);
+    CatalogEntry {
+        tags: vec![pad],
+        ..baseline.clone()
+    }
 }
 
 /// The shard bucket `render` files a title under: its first character lowercased when that is
@@ -363,6 +376,186 @@ fn one_column_over_breaks_before_the_token() {
             .replace("\n  ", " "),
         logical_line(&edge)
     );
+}
+
+/// A CJK title reaches the limit on columns long before it reaches it on characters: six
+/// ideographs are 6 characters but 12 columns, so measuring characters read this entry 6 columns
+/// short and let a 101-column line through unwrapped (F12).
+#[test]
+fn cjk_title_wraps_on_display_columns() {
+    let ideographs = entry("進捗レポート", "notes/cjk.md", "1 B", &[""], 0, 0);
+
+    let edge = padded_like(&ideographs, 101);
+    let logical = logical_line(&edge);
+    assert_eq!(columns(&logical), 101);
+    assert_eq!(
+        logical.chars().count(),
+        95,
+        "the wide title must be narrower in characters than in columns"
+    );
+
+    let rendered = render(std::slice::from_ref(&edge), &config(600));
+    let lines: Vec<&str> = body(contents(&rendered, "INDEX.md")).lines().collect();
+
+    assert_eq!(lines.len(), 2, "101 columns must wrap: {lines:?}");
+    for line in &lines {
+        assert!(columns(line) <= 100, "{} columns: {line:?}", columns(line));
+    }
+    // Wrapping still only inserts a newline and the indent.
+    assert_eq!(
+        body(contents(&rendered, "INDEX.md"))
+            .trim_end()
+            .replace("\n  ", " "),
+        logical
+    );
+}
+
+/// The overflow a character count actually produced: wide tokens scattered through a long entry
+/// add up, so every packed line sat inside 100 characters while occupying far more than 100
+/// columns.
+#[test]
+fn crowded_wide_tokens_stay_inside_the_column_budget() {
+    let tags: Vec<String> = [
+        "進捗",
+        "報告",
+        "alpha",
+        "bravo",
+        "カイゼン",
+        "delta",
+        "echo",
+        "レビュー",
+        "foxtrot",
+        "golf",
+        "hotel",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let crowded = CatalogEntry {
+        tags,
+        ..entry("進捗レポート", "notes/cjk-status.md", "1.4 KB", &[], 4, 2)
+    };
+
+    let rendered = render(std::slice::from_ref(&crowded), &config(600));
+    let lines: Vec<&str> = body(contents(&rendered, "INDEX.md")).lines().collect();
+
+    assert!(lines.len() > 1, "a wide crowded entry must wrap: {lines:?}");
+    for line in &lines {
+        assert!(columns(line) <= 100, "{} columns: {line:?}", columns(line));
+        assert!(
+            line.chars().count() < columns(line),
+            "a wrapped line should carry wide characters, whose columns a character count misses: \
+             {line:?}"
+        );
+    }
+    assert_eq!(
+        body(contents(&rendered, "INDEX.md"))
+            .trim_end()
+            .replace("\n  ", " "),
+        logical_line(&crowded)
+    );
+}
+
+/// One emoji is one character and two columns, so a line of exactly 100 characters can already be
+/// 101 columns wide — the same off-by-the-emoji that the CJK case shows by a larger margin.
+#[test]
+fn an_emoji_counts_two_columns_when_wrapping() {
+    let party = entry("🎉 Party", "notes/party.md", "1 B", &[""], 0, 0);
+
+    let edge = padded_like(&party, 101);
+    let logical = logical_line(&edge);
+    assert_eq!(columns(&logical), 101);
+    assert_eq!(
+        logical.chars().count(),
+        100,
+        "one emoji: exactly the old character limit, one column over"
+    );
+
+    let rendered = render(std::slice::from_ref(&edge), &config(600));
+    let lines: Vec<&str> = body(contents(&rendered, "INDEX.md")).lines().collect();
+
+    assert_eq!(lines.len(), 2, "101 columns must wrap: {lines:?}");
+    for line in &lines {
+        assert!(columns(line) <= 100, "{} columns: {line:?}", columns(line));
+    }
+}
+
+/// Combining marks occupy no column of their own, so they must not push an entry over the limit in
+/// the other direction either: `Ü`, `ï`, `é`, `ë` spelled as base + combining mark are 16
+/// characters and 12 columns, and a character count read that as 4 columns too many.
+#[test]
+fn combining_marks_add_no_columns_when_wrapping() {
+    // "Ünïcodé tëst", decomposed: every accent is its own `\u{308}` / `\u{301}` scalar.
+    let accented = entry(
+        "U\u{308}ni\u{308}code\u{301} te\u{308}st",
+        "notes/accented.md",
+        "1 B",
+        &[""],
+        0,
+        0,
+    );
+
+    let edge = padded_like(&accented, 100);
+    let logical = logical_line(&edge);
+    assert_eq!(columns(&logical), 100);
+    assert_eq!(
+        logical.chars().count(),
+        104,
+        "four combining marks: over the character limit, inside the column budget"
+    );
+
+    let rendered = render(std::slice::from_ref(&edge), &config(600));
+    let lines: Vec<&str> = body(contents(&rendered, "INDEX.md")).lines().collect();
+
+    assert_eq!(
+        lines.len(),
+        1,
+        "a 100-column entry must not wrap: {lines:?}"
+    );
+}
+
+/// The ASCII wrap point did not move: the twelve-tag entry still breaks between `#tag8` and
+/// `#tag9`, at exactly 98 columns. Pinned as a literal because every fixture here is ASCII or
+/// single-width, which is why the committed goldens kept their bytes when the measurement changed.
+#[test]
+fn ascii_wrap_point_did_not_move() {
+    let tags: Vec<String> = (1..=12).map(|index| format!("tag{index}")).collect();
+    let crowded = CatalogEntry {
+        tags,
+        ..entry("Twelve Tags", "inbox/twelve-tags.md", "1.4 KB", &[], 4, 2)
+    };
+
+    let rendered = render(&[crowded], &config(600));
+    let lines: Vec<&str> = body(contents(&rendered, "INDEX.md")).lines().collect();
+
+    assert_eq!(
+        lines[0],
+        "- [[Twelve Tags]](inbox/twelve-tags.md) · 1.4 KB · #tag1 #tag2 #tag3 #tag4 #tag5 #tag6 \
+         #tag7 #tag8"
+    );
+    assert_eq!(columns(lines[0]), 98);
+    assert_eq!(
+        lines[0].chars().count(),
+        columns(lines[0]),
+        "ASCII is one character per column, so both measures agree here"
+    );
+    assert!(lines[1].starts_with("  #tag9"), "{lines:?}");
+}
+
+/// The `unicode-width` behaviour `catalog::wrap` depends on. The dependency is pinned exactly in
+/// the workspace manifest; this is its behavioural half: an upgrade that reclassifies one of these
+/// characters fails here instead of moving a wrap point and changing published bytes silently.
+#[test]
+fn pinned_display_widths_of_the_rendered_shapes() {
+    assert_eq!("進".width(), 2, "a CJK ideograph occupies two columns");
+    assert_eq!("🎉".width(), 2, "an emoji occupies two columns");
+    assert_eq!("a".width(), 1, "ASCII is one column");
+    assert_eq!("e\u{301}".width(), 1, "a combining mark adds no column");
+    assert_eq!("é".width(), 1, "the same vowel precomposed is one column");
+    // Ambiguous-width characters measured the non-CJK way, at one column each: `wrap` must keep
+    // calling `UnicodeWidthStr::width` rather than `width_cjk`, because two columns here would
+    // rewrite every committed golden.
+    assert_eq!("·—→←".width(), 4, "the line format's own separators");
 }
 
 #[test]
