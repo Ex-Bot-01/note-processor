@@ -1213,34 +1213,53 @@ fn refresh_covered(written: &Written, hidden_by_unreadable: usize) -> bool {
 ///
 /// The sink is a parameter because stderr cannot be redirected in-process — the standard library offers no
 /// way to replace the global handle — so the tests in this module drive the formatting directly, exactly as
-/// [`crate::db`] does for its receipt. What they cannot pin is that the production call site names stderr.
+/// [`crate::db`] does for its receipt. What they cannot pin is that the production call site names stderr,
+/// nor what a scan does when that descriptor will not accept the line: both are pinned by
+/// `a_parse_rule_change_reports_the_re_parse_on_stderr` and
+/// `a_scan_survives_a_stderr_that_refuses_every_write` in `crates/np-cli/tests/cli.rs`, which run the real
+/// binary.
+///
+/// **A write that fails is dropped, here and in [`report_refresh_gap`], and that is deliberate.** Both are
+/// called after `tx.commit()`: the rows, the note, the published index list and — when the corpus was fully
+/// covered — the recorded rules version are already durable. Failing a scan because a line could not be
+/// printed would turn work that succeeded into exit 101 or a `ScanError` over a courtesy notice, which is what
+/// an unusable descriptor 2 means in practice: a detached terminal, a service running with stderr nowhere,
+/// a device refusing writes. The cost of dropping it is one lost announcement about work already done, and the
+/// next scan prints it again while the version still lags.
+///
+/// [`crate::db::report_orphans`] still unwraps on a refused write. It is left alone on purpose: its line is
+/// printed inside the migration transaction, so nothing has been committed when it runs and a process that
+/// dies there leaves the file as it was — a different decision from the one above, and not this change's to
+/// revisit.
 fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
     // Zero means the refresh cost nothing extra: a first scan re-parses nothing it was not going to parse
     // as added anyway. "Rules moved, nothing to do" is not news.
     if notes == 0 {
         return;
     }
-    writeln!(
+    // Dropped, not unwrapped: see the note above on why a stderr that will not take this line is not a scan
+    // failure.
+    let _ = writeln!(
         out,
         "note-processor: re-parsed {notes} unchanged path(s) for parse rules v{PARSE_VERSION} (database held {})",
         stored.map_or_else(|| "nothing".to_string(), |version| format!("v{version}")),
-    )
-    .expect("printing the re-parse receipt to stderr");
+    );
 }
 
 /// Say out loud that a refresh could not label the corpus, so the next scan will try again.
 ///
 /// stderr for the same reason as [`report_refresh`]: stdout stays machine-readable JSON. `missed` counts
-/// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory.
+/// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory — and
+/// the write result is dropped for the reason spelled out on [`report_refresh`].
 fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
     if missed == 0 {
         return;
     }
-    writeln!(
+    // Dropped for the same reason as [`report_refresh`]'s write.
+    let _ = writeln!(
         out,
         "note-processor: parse rules v{PARSE_VERSION} not recorded — {missed} note(s) were not re-parsed this scan; the next scan will retry"
-    )
-    .expect("printing the incomplete-refresh notice to stderr");
+    );
 }
 
 /// Write the rendered catalog and delete the shards this scan no longer produces.
