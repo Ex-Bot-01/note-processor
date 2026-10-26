@@ -3455,3 +3455,366 @@ fn known_defect_a_readable_display_keyed_path_duplicates_its_own_row() {
         "the hidden row also holds the parse version back, every scan, until the twin is renamed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F22 — a scan's losses get a durable record, not just a line.
+//
+// The record is `meta`'s [`np_core::scan::UNINDEXABLE_KEY`] value, and the three cases below are its three
+// promises: it **names** what was lost and by which kind, it **stops** naming it once nothing is lost, and it
+// is written **best-effort** so a refused write costs the record and not the scan. Its counts come from
+// [`np_core::scan`]'s own hands; `crates/np-cli/tests/cli.rs` pins the stdout line and the JSON key, which no
+// in-process test can reach.
+// ---------------------------------------------------------------------------
+
+/// The record as this scan wrote it, read back under the constant it writes under — so a renamed key fails
+/// here rather than reading `NULL` and comparing equal to nothing.
+///
+/// Gated with its callers: every case that reads the record needs a byte-spelled path or a denied directory,
+/// both of which are `cfg(unix)` fixtures, and an ungated helper would be dead code on Windows.
+#[cfg(unix)]
+fn recorded_losses(open: &Db) -> String {
+    open.0
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [np_core::scan::UNINDEXABLE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("test: every scan writes the record, even at zero")
+}
+
+/// A report's loss record as one comparable tuple, so a failure names all four parts instead of one.
+/// Gated with the `cfg(unix)` cases that read it.
+#[cfg(unix)]
+fn losses(
+    field: &Option<np_core::scan::Unindexable>,
+) -> Option<(usize, usize, usize, Vec<String>)> {
+    field.as_ref().map(|record| {
+        (
+            record.unreadable,
+            record.unkeyable,
+            record.duplicates,
+            record.names.clone(),
+        )
+    })
+}
+
+/// The scratch workspace F22's first two cases need: one readable note and one directory holding another.
+///
+/// A **directory** rather than a bare note because `unreadable` counts subtrees the walk did not enter
+/// ([`np_core::walk::Walked::unreadable`]), which is also the shape whose report line cannot say whether it
+/// was a permission problem or a refused name — the ambiguity F22 exists to remove.
+#[cfg(unix)]
+fn f22_workspace() -> Workspace {
+    scratch(
+        &[
+            ("top.md", "# Top Heading\n"),
+            ("blocked/note.md", "# Blocked Heading\n"),
+        ],
+        600,
+    )
+}
+
+/// F22 §5's first case: an unreadable directory reaches the record **by kind**, and the report field agrees
+/// with it.
+///
+/// Before F22 the durable half did not exist and the live half said only `skipped 1` — indistinguishable from
+/// a name this build refuses to key. Both counts are asserted apart (`unreadable=1;unkeyable=0`) because that
+/// separation *is* the fix, and `skipped` is asserted unchanged beside it: the list keeps its entries verbatim
+/// (F22 §4.1), so a cause here does not arrive by rewording a string somebody's `grep` depends on.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_is_recorded_as_a_loss_of_that_exact_kind() {
+    let ws = f22_workspace();
+    let blocked = ws.root.join("blocked");
+    // Both notes indexed first, so the loss below is a note that **has** a row rather than one that never
+    // arrived — which is the case whose report line has to be told apart from a refused name.
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    // Premise, checked off the disk and not off the report (F23's lesson: a green run is not proof a fixture
+    // ran). On a privileged runner 0o000 denies nothing, so this scan would hide nothing and every assertion
+    // below would be about a workspace that lost nothing at all.
+    let _restore = deny_access(&blocked);
+    if !denied(&blocked) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to {} on this runner (a privileged user?), so this \
+             scan lost nothing and the record it wrote would prove nothing",
+            blocked.display()
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("an unreadable directory must not fail the scan");
+
+    // The durable half: one labelled count per kind, and the path named.
+    let db = ws.db();
+    assert_eq!(
+        recorded_losses(&db),
+        "unreadable=1;unkeyable=0;duplicates=0;names=blocked",
+        "the record has to say which kind of loss this was: {:?}",
+        report.skipped
+    );
+    // The live half, with the same counts — one fact, two channels, no recomputation.
+    assert_eq!(
+        losses(&report.unindexable),
+        Some((1, 0, 0, vec!["blocked".to_string()])),
+        "the report field carries the record it just wrote: {report:?}"
+    );
+    // `skipped` still holds the path and nothing else, worded exactly as it was before F22 (F22 §4.1).
+    assert_eq!(report.skipped, vec!["blocked".to_string()], "{report:?}");
+    // And unknown is still not absent: the note behind the blocked directory keeps its live row.
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        2,
+        "the record diagnoses the loss; it decides nothing about the rows (F22 §4.2)"
+    );
+}
+
+/// F22 §5's second case: the record is **current state**, so a fixed workspace stops reporting the old
+/// problem — and a scan that loses nothing still writes it, all zeros, with its report field `None`.
+///
+/// The overwrite is the whole point of this one. A record written only when something is lost would leave
+/// `unreadable=1;names=blocked` standing in `meta` forever after the `chmod` was undone, accusing a workspace
+/// that is fine — and "no record at all" would read exactly like "this workspace was never scanned by a build
+/// that looks". Hence zeros rather than a deleted row.
+#[cfg(unix)]
+#[test]
+fn a_scan_that_loses_nothing_overwrites_the_record_an_earlier_scan_left() {
+    let ws = f22_workspace();
+    let blocked = ws.root.join("blocked");
+
+    // A fresh workspace already writes the all-zero spelling: `None` in the report, zeros in the record.
+    let first = scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+    assert_eq!(
+        recorded_losses(&ws.db()),
+        "unreadable=0;unkeyable=0;duplicates=0;names=",
+        "an empty record is written, not skipped"
+    );
+    assert_eq!(losses(&first.unindexable), None, "{first:?}");
+
+    // Lose something, so there is an old record to overwrite. Premise off the disk, as above.
+    {
+        let _restore = deny_access(&blocked);
+        if !denied(&blocked) {
+            eprintln!(
+                "NOT COVERAGE: 0o000 did not deny access to {} on this runner (a privileged user?), so \
+                 there would be no old record to overwrite",
+                blocked.display()
+            );
+            return;
+        }
+        let lost = scan(&ws.root, &ws.cfg).expect("test setup: a losing scan");
+        assert_eq!(
+            recorded_losses(&ws.db()),
+            "unreadable=1;unkeyable=0;duplicates=0;names=blocked",
+            "test setup: the record has to be worth overwriting: {lost:?}"
+        );
+    }
+    // The guard put the mode back, checked rather than trusted: without this the scan below would be a
+    // second losing scan and its zeros would mean nothing.
+    assert!(
+        fs::read_dir(&blocked).is_ok(),
+        "test setup: the mode guard did not restore access to {}",
+        blocked.display()
+    );
+
+    let fixed = scan(&ws.root, &ws.cfg).expect("a readable workspace must not fail the scan");
+    let db = ws.db();
+    assert_eq!(
+        recorded_losses(&db),
+        "unreadable=0;unkeyable=0;duplicates=0;names=",
+        "the fixed workspace stops reporting a loss it no longer has"
+    );
+    assert_eq!(
+        losses(&fixed.unindexable),
+        None,
+        "and its report says nothing: {fixed:?}"
+    );
+    assert!(fixed.skipped.is_empty(), "{fixed:?}");
+    // The row was never marked stale by the scan that could not read it, so nothing is re-added either.
+    assert_eq!(
+        (fixed.added, fixed.removed),
+        (0, 0),
+        "the record changed; the registry did not"
+    );
+}
+
+/// A second byte-twin pair — `old\xE9` beside `old\xE8`, one display spelling `old\u{FFFD}/note.md` — for the
+/// half of the duplicate count that must **not** fire: two rows whose display text is one string and only one
+/// of them live.
+#[cfg(unix)]
+const STALE_TWIN_NINE: &[u8] = b"old\xe9";
+#[cfg(unix)]
+const STALE_TWIN_EIGHT: &[u8] = b"old\xe8";
+/// The display spelling both stale-pair twins decode to.
+#[cfg(unix)]
+const STALE_TWIN_DISPLAY: &str = "old\u{fffd}";
+
+/// One [`plant_twin_dir`] directory holding a note with `body` as its own content, so no two paths in a
+/// fixture share a hash and [`crate::change`] can pair them into a `Moved`.
+///
+/// `false` means this filesystem refused the name, which makes the caller's case not coverage — the same rule
+/// [`plant_twin_dir`] states rather than hides.
+#[cfg(unix)]
+fn plant_note_dir(root: &Path, dir: &[u8], body: &str) -> bool {
+    plant_twin_dir(root, dir) && fs::write(byte_name(root, dir).join("note.md"), body).is_ok()
+}
+
+/// F22 §5's third case: `duplicates` counts **live registry rows per display path**, and nothing else.
+///
+/// Two twins of `caf\xE9` / `caf\xE8` give one display path with two live rows — the state
+/// [`known_defect_a_readable_display_keyed_path_duplicates_its_own_row`] ends in, reached here through the
+/// same [`plant_twin_dir`] helper rather than a third way to make two live rows, so the two cases cannot
+/// drift. Beside them sits a second pair whose rows are one live and **one stale**: that path appears once in
+/// the catalog, so it is not a duplicate, and it is the assertion that pins `state = 'ok'`. Drop the filter
+/// and this case reports two duplicates and names `old\u{FFFD}/note.md`, which is a note nobody has twice.
+#[cfg(unix)]
+#[test]
+fn the_duplicate_count_names_a_display_path_with_two_live_rows_and_not_one_with_a_stale_row() {
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    for (dir, body) in [
+        (TWIN_DIR_NINE, "# One Heading\n"),
+        (TWIN_DIR_EIGHT, "# Quite Another Heading\n"),
+        (STALE_TWIN_NINE, "# Kept Heading\n"),
+        (STALE_TWIN_EIGHT, "# Doomed Heading\n"),
+    ] {
+        if !plant_note_dir(&ws.root, dir, body) {
+            eprintln!(
+                "NOT COVERAGE: this filesystem refused to create a directory named {dir:?}, so no display \
+                 path here holds two live rows and the duplicate count would have nothing to count"
+            );
+            return;
+        }
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    // One of the second pair's files goes, so its row turns stale while the display text stays on disk.
+    fs::remove_file(byte_name(&ws.root, STALE_TWIN_EIGHT).join("note.md"))
+        .expect("test setup: remove one twin's note");
+    let report = scan(&ws.root, &ws.cfg).expect("a stale row must not fail the scan");
+
+    // Premises on the rows themselves, so a count of `1` below means "one duplicated display path" and not
+    // "the fixture never produced its twins".
+    let db = ws.db();
+    let live = |rel: &str| {
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE rel = '{rel}' AND state = 'ok'"),
+        )
+    };
+    assert_eq!(
+        live("caf\u{fffd}/note.md"),
+        2,
+        "test setup: one display path, two live rows — the shape F23's harm fixture leaves behind"
+    );
+    assert_eq!(
+        live(&format!("{STALE_TWIN_DISPLAY}/note.md")),
+        1,
+        "test setup: the other path has exactly one live row"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel = '{STALE_TWIN_DISPLAY}/note.md' \
+                 AND state = 'stale'"
+            )
+        ),
+        1,
+        "and one stale row beside it: counted by a filter-less query, and wrongly"
+    );
+
+    let duplicate = format!("{TWIN_DIR_DISPLAY}/note.md");
+    assert_eq!(
+        recorded_losses(&db),
+        format!("unreadable=0;unkeyable=0;duplicates=1;names={duplicate}"),
+        "the duplicated path is named and the stale one is not"
+    );
+    assert_eq!(
+        losses(&report.unindexable),
+        Some((0, 0, 1, vec![duplicate.clone()])),
+        "{report:?}"
+    );
+    // The two channels are one string, not two spellings of the same numbers.
+    assert_eq!(
+        report.unindexable.as_ref().expect("some").value(),
+        recorded_losses(&db),
+        "the field and `meta` hold one value"
+    );
+}
+
+/// F22 §5's last case: a `meta` write that refuses leaves the scan **successful**.
+///
+/// The refusal is a `RAISE(ABORT)` trigger on the one key this record uses, so every other `meta` write of
+/// the scan — the published index-file list, the parse rules version — still runs and the transaction still
+/// commits. That is F21 §2's rule moved to the new mechanism: before it, the only failing statement in that
+/// path was a `.expect`, and one line nobody could read rolled a whole upgrade back. Here the equivalent
+/// mistake would report a failed scan whose rows and catalog are already durable.
+///
+/// The loss this run diagnoses is a duplicate rather than an unreadable directory, so the case needs no
+/// `chmod` premise and runs whatever the runner's privileges — but it does need two live rows for one display
+/// path, which is byte-spelled work, hence `cfg(unix)`.
+#[cfg(unix)]
+#[test]
+fn a_refused_record_write_leaves_the_scan_successful() {
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    for (dir, body) in [
+        (TWIN_DIR_NINE, "# One Heading\n"),
+        (TWIN_DIR_EIGHT, "# Quite Another Heading\n"),
+    ] {
+        if !plant_note_dir(&ws.root, dir, body) {
+            eprintln!(
+                "NOT COVERAGE: this filesystem refused to create a directory named {dir:?}, so this scan \
+                 had no loss to record and its refusal would have proved nothing"
+            );
+            return;
+        }
+    }
+    let first = scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+    assert!(
+        first.unindexable.is_some(),
+        "test setup: the scan has to be carrying a record: {first:?}"
+    );
+
+    // Replace the stored value with a marker **before** refusing anything, so "the write was refused" is
+    // observable below rather than merely consistent with a scan that rewrote the same text again.
+    let db = ws.db();
+    db.0.execute(
+        "UPDATE meta SET value = ?1 WHERE key = ?2",
+        rusqlite::params!["SENTINEL", np_core::scan::UNINDEXABLE_KEY],
+    )
+    .expect("test setup: seed the marker directly");
+    // Then refuse the one key, on both branches of the upsert, and leave every other `meta` write alone.
+    db.0.execute_batch(&format!(
+        "CREATE TRIGGER refuse_record BEFORE INSERT ON meta
+             WHEN new.key = '{key}'
+             BEGIN SELECT RAISE(ABORT, 'no record here'); END;
+         CREATE TRIGGER refuse_record_update BEFORE UPDATE ON meta
+             WHEN old.key = '{key}' AND new.key = '{key}'
+             BEGIN SELECT RAISE(ABORT, 'no record here'); END;",
+        key = np_core::scan::UNINDEXABLE_KEY
+    ))
+    .expect("test setup: refuse writes to this one `meta` key");
+    drop(db);
+
+    let second = scan(&ws.root, &ws.cfg).expect("a refused `meta` write must not fail the scan");
+
+    // Reaching this line is the proof it stayed a result rather than becoming a panic.
+    assert!(
+        second.unindexable.is_some(),
+        "the diagnosis still reaches the run that lost the path: {second:?}"
+    );
+    let db = ws.db();
+    assert_eq!(
+        recorded_losses(&db),
+        "SENTINEL",
+        "the refused write wrote nothing, which is what makes the premise real"
+    );
+    // And the rest of the scan landed: the transaction committed its index list and the catalog is on disk.
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM meta WHERE key = 'index_files'"),
+        1,
+        "the writes that were not refused still ran"
+    );
+    assert!(ws.root.join("INDEX.md").is_file(), "{second:?}");
+    assert_eq!(second.notes, 3, "{second:?}");
+}

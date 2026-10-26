@@ -1998,7 +1998,7 @@ mod tests {
     use super::{
         apply_changes, folded_row, is_unknown_path, known_rows, np_published, refresh_covered,
         remove_corpses, remove_file, report_refresh, report_refresh_gap, skipped_lines,
-        under_unreadable, Found, UnknownPath, Written, PARSE_VERSION,
+        under_unreadable, unindexable_record, Found, UnknownPath, Written, NAME_CAP, PARSE_VERSION,
     };
     use crate::catalog::{HEADER, HEADER_CRLF};
     use crate::config::MarkerConfig;
@@ -2479,6 +2479,104 @@ mod tests {
             [shared],
             "one path named twice is one line"
         );
+    }
+
+    /// F22 §3's arithmetic, over **hand-built** walk lists.
+    ///
+    /// A Linux filesystem refuses no name — `os_bytes` is exact — so the refusal arm has no end-to-end
+    /// fixture and is counted here instead, exactly as the matcher cases above and in `walk::tests` build
+    /// their refused entries. What this does **not** claim is that any real scan produces a non-zero
+    /// `unkeyable`: only Windows refuses a name, and that arm stays unexecuted (F18's honest terms). The last
+    /// block pins the consequence for every run on this platform: `unkeyable` is zero, always.
+    #[test]
+    fn the_record_counts_each_loss_by_kind_and_caps_its_names() {
+        // Two refused names and one unreadable directory, all with distinct display text. The counts have to
+        // stay apart, because "3 paths skipped" — the sentence `skipped` prints — is precisely what F22
+        // exists to replace with a diagnosis.
+        let refused = [
+            display_keyed_unknown("caf\u{fffd}.md"),
+            display_keyed_unknown("zebra.md"),
+        ];
+        let blocked = [raw(b"caf\xE9")];
+        let duplicates = ["dup/a.md".to_string(), "dup/b.md".to_string()];
+        let record = unindexable_record(&blocked, &refused, &duplicates);
+
+        assert_eq!(
+            (record.unreadable, record.unkeyable, record.duplicates),
+            (1, 2, 2),
+            "three kinds of loss, three counts — merged they would say only \"5\""
+        );
+        assert_eq!(
+            record.names,
+            [
+                "caf\u{fffd}.md",
+                "zebra.md",
+                "caf\u{fffd}",
+                "dup/a.md",
+                "dup/b.md",
+            ],
+            "unkeyable first, then unreadable, then duplicated: the order the cap cuts in"
+        );
+        // The stored spelling, pinned whole — `meta`, `np scan`'s line and this struct read one format, so a
+        // person comparing yesterday's terminal against today's record is comparing one string.
+        assert_eq!(
+            record.value(),
+            "unreadable=1;unkeyable=2;duplicates=2;names=caf\u{fffd}.md,zebra.md,caf\u{fffd},dup/a.md,dup/b.md",
+        );
+
+        // The cap: five refused, four unreadable, three duplicated is twelve losses and eight names. The
+        // entries that fall off are the duplicates — a note appearing twice is less urgent than a name this
+        // build can never key (F22 §3).
+        let spelled = |prefix: &str, count: usize| -> Vec<UnknownPath> {
+            (0..count)
+                .map(|index| display_keyed_unknown(&format!("{prefix}{index}.md")))
+                .collect()
+        };
+        let many_duplicates: Vec<String> = (0..3).map(|index| format!("dup{index}.md")).collect();
+        let capped = unindexable_record(&spelled("dir", 4), &spelled("no", 5), &many_duplicates);
+        assert_eq!(
+            (capped.unreadable, capped.unkeyable, capped.duplicates),
+            (4, 5, 3),
+            "the counts still say twelve while the names say eight"
+        );
+        assert_eq!(
+            capped.names.len(),
+            NAME_CAP,
+            "the value is bounded: it is rewritten on every scan, so an unbounded list would grow one \
+             `meta` row without limit"
+        );
+        assert_eq!(
+            &capped.names[..5],
+            ["no0.md", "no1.md", "no2.md", "no3.md", "no4.md"],
+            "every refused name survives before any directory's"
+        );
+        assert_eq!(
+            &capped.names[5..],
+            ["dir0.md", "dir1.md", "dir2.md"],
+            "and the three duplicates are what the cap cost"
+        );
+
+        // Nothing lost: `is_empty` is what makes the report field `None`, while the value is still the full
+        // all-zero spelling — a fixed workspace has to overwrite an older complaint rather than leave it
+        // standing there accusing somebody (F22 §2).
+        let clean = unindexable_record(&[], &[], &[]);
+        assert!(clean.is_empty(), "nothing lost is nothing reported");
+        assert_eq!(
+            clean.value(),
+            "unreadable=0;unkeyable=0;duplicates=0;names="
+        );
+        assert!(clean.names.is_empty());
+
+        // And the shape every scan on this platform can actually reach: an unreadable directory, no refusal
+        // of any kind. `walk::Walked::unrepresentable` is empty on Unix by construction, so a real run's
+        // record reads `unkeyable=0` here for the same reason — the non-zero arm above is Windows-only and
+        // unexecuted.
+        let unix = unindexable_record(&blocked, &[], &[]);
+        assert_eq!(
+            unix.unkeyable, 0,
+            "Unix refuses no name, so no scan run here can raise this count"
+        );
+        assert!(!unix.is_empty(), "one unreadable directory is still a loss");
     }
 
     /// §4.4's answer, **counted** rather than assumed: one note behind one unknown path is charged in exactly
