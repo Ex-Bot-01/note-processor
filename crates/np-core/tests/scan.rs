@@ -1834,6 +1834,76 @@ fn an_unreadable_attachment_does_not_hold_the_parse_version_back() {
 
 #[cfg(unix)]
 #[test]
+fn a_refused_move_does_not_label_the_note_it_left_behind_current() {
+    // The one charge site that reads the wrong path if you are not careful. `old.md`'s bytes turn up at
+    // `a.md`, which loses the case-insensitive identity race to `A.md`, so the move is refused — and
+    // `classify` has already suppressed `old.md`'s `Removed` because a move is never also a deletion.
+    // Its row stays live holding pre-refresh data with nothing at the destination to charge: exactly the
+    // stale-labelled-current outcome F15 exists to prevent.
+    let ws = scratch(
+        &[
+            ("old.md", "# Old Heading\n"),
+            ("A.md", "# Upper A\n"),
+            ("other.md", "# Other\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    fs::rename(ws.root.join("old.md"), ws.root.join("a.md"))
+        .expect("test: move the bytes onto a colliding name");
+    let db = ws.db();
+    forget_headings(&db, "old.md");
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    let report = scan(&ws.root, &ws.cfg).expect("a refused move must not fail the scan");
+    assert!(
+        report.skipped.iter().any(|skipped| skipped == "a.md"),
+        "premise: the destination has to be refused: {:?}",
+        report.skipped
+    );
+
+    let db = ws.db();
+    assert!(
+        heading_texts(&db, "old.md").is_empty(),
+        "premise: the note left behind is still stale"
+    );
+    assert_eq!(
+        state(&db, "old.md").as_deref(),
+        Some("ok"),
+        "a refused move must not stale the path it came from"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(outdated_parse_version()),
+        "the note this scan left behind is stale, so the rules version must not be recorded"
+    );
+    drop(db);
+
+    // It heals once the rival *moves* rather than disappears. Deleting `A.md` would not free the identity:
+    // a removed path goes `stale` and keeps its `case_key`, which is unique over every row, so the only way
+    // the destination opens up is a scan that rewrites the rival's own row — and freeing it takes a second
+    // scan, because that rewrite happens when the rival's own path is processed while the move wanting the
+    // identity can already have been refused in the same pass.
+    fs::rename(ws.root.join("A.md"), ws.root.join("B.md"))
+        .expect("test: move the rival out of the way");
+    scan(&ws.root, &ws.cfg).expect("scan that moves the rival out of the way");
+    scan(&ws.root, &ws.cfg).expect("scan that lands the freed move");
+    assert_eq!(
+        heading_texts(&ws.db(), "a.md"),
+        vec!["Old Heading".to_string()],
+        "the move must land and its rows be rewritten"
+    );
+    assert_eq!(
+        recorded_parse_version(&ws.db()),
+        Some(PARSE_VERSION),
+        "a covering refresh after the collision clears must record"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_case_collision_with_no_row_behind_it_does_not_hold_the_version_back() {
     // The last way to pin the rules version forever: `a.md` and `A.md` share one `case_key`, so one of them
     // is refused at insert on every scan. It never has a row, so there is nothing stale to repair — and
@@ -1851,12 +1921,32 @@ fn a_case_collision_with_no_row_behind_it_does_not_hold_the_version_back() {
     // Which of the two the scanner refuses is an internal detail, so read it back from the registry rather
     // than guess: exactly one of them has no row. On a case-insensitive checkout the pair folded into one
     // file at setup time and neither is refused — that runner says so out loud instead of passing vacuously.
+    // Gate on the filesystem rather than the registry. On a checkout that folds case the setup made one
+    // file out of the pair, and the registry would then show exactly one of the two missing — which reads
+    // as a collision this scan refused, not as a fixture that never existed.
+    let folded = fs::read_dir(&ws.root)
+        .expect("test setup: read the workspace")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("a.md")
+        })
+        .count();
+    if folded < 2 {
+        eprintln!("skip: this filesystem folds a.md and A.md into one file, so nothing collides");
+        return;
+    }
+
     let db = ws.db();
     let refused = ["a.md", "A.md"]
         .into_iter()
         .find(|rel| state(&db, rel).is_none());
     let Some(refused) = refused else {
-        eprintln!("skip: this filesystem folds a.md and A.md together, so nothing collides");
+        eprintln!(
+            "skip: both spellings hold rows, so this build's identity rule does not fold them"
+        );
         return;
     };
     record_parse_version(&db, outdated_parse_version());

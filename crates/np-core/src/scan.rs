@@ -314,7 +314,9 @@ fn is_unknown(found: &Found) -> bool {
 ///
 /// A markdown path with no `notes` row has nothing to re-label. An unreadable new file is indexed as
 /// `Added` on whichever scan can next read it, whatever the recorded version says, and the loser of a case
-/// collision (`a.md` against `A.md`, one `case_key`) never gets a row at all. Charging either would hold
+/// collision (`a.md` against `A.md`, one `case_key`) is refused at insert and holds no row of its own in the
+/// normal case — a database written before tags were folded by Unicode case can hold a row the new key
+/// refuses, and that one *is* charged, which is the safe direction. Charging either would hold
 /// the rules version back forever over rows that do not exist, re-parsing the whole corpus on every scan
 /// to repair nothing — the same mistake the attachment filter above already avoids, one level deeper.
 fn owes_a_reparse(db: &Db, rel: &str, is_markdown: bool) -> Result<bool, DbError> {
@@ -509,9 +511,18 @@ fn apply_changes(
             Indexed::Taken => {
                 written.skipped.push(rel.to_string());
                 // A note that lost an identity conflict keeps the rows it already had, so the refresh is
-                // not finished — but only the *winner* of a collision has rows. The loser has none, and
-                // charging it would hold the version back over nothing to repair.
-                if owes_a_reparse(db, rel, readable.is_markdown)? {
+                // not finished — but only the *winner* of a collision has rows, and charging the loser
+                // would hold the version back over nothing to repair.
+                //
+                // A refused **move** is judged by the path it came from, not the one it wanted. `classify`
+                // suppresses the source's `Removed` because a move is never also a deletion, so that row
+                // stays live with its pre-refresh data while the destination holds nothing at all: reading
+                // `rel` here would report full coverage over a note left behind stale.
+                let owed = match change {
+                    Some(Change::Moved { from }) => owes_a_reparse(db, from, true)?,
+                    _ => owes_a_reparse(db, rel, readable.is_markdown)?,
+                };
+                if owed {
                     written.uncovered += 1;
                 }
             }
@@ -1050,10 +1061,12 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// the loser of a case collision, which never gets a row at all. Charging any of them would re-parse the
 /// whole corpus on every scan forever and repair nothing.
 ///
-/// What *can* still hold the version back indefinitely is a note whose rows exist and cannot be read — a
-/// mode-000 `.md` file, or one inside a directory nobody can enter. That loop is worth paying for: those
-/// rows are wrong the moment the file opens again, and the notice below names the count so this is never
-/// silent.
+/// What *can* still hold the version back is stale data that exists and cannot be rewritten: a note whose
+/// rows are there but unreadable (a mode-000 `.md`, or one inside a directory nobody can enter), a live row
+/// hidden behind such a directory, and a move refused by an identity conflict — judged by the path it came
+/// from, since `classify` suppressed that path's `Removed` and its rows are still in the catalog. That loop
+/// is worth paying for: those rows stay wrong until the obstruction clears, and the notice below names the
+/// count so this is never silent.
 fn refresh_covered(written: &Written, hidden_by_unreadable: usize) -> bool {
     written.uncovered == 0 && hidden_by_unreadable == 0
 }
