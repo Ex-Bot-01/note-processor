@@ -988,36 +988,15 @@ fn umlaut_and_nested_names_are_resolvable() {
 #[cfg(unix)]
 #[test]
 fn unreadable_directory_does_not_mark_its_files_stale() {
-    use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
     let ws = workspace();
     scan(&ws.root, &ws.cfg).expect("first scan");
+    // `deny_access` captures the mode the directory actually arrived with and restores it on every path out
+    // of this block — a hardcoded 0o755 would *widen* permissions under a restrictive umask.
     let locked = ws.root.join("deep");
-    // The mode the directory actually arrived with. `TempDir` creates it as `0o777 & !umask`, so putting
-    // back a hardcoded 0o755 would *widen* permissions on a runner with a restrictive umask (0o077 gives
-    // 0o700); whatever was there is what the guard restores. Same reasoning as the `walk.rs` equivalent.
-    let found_mode = fs::metadata(&locked)
-        .expect("test setup: read the directory mode")
-        .permissions()
-        .mode()
-        & 0o7777; // permission bits only; the file-type bits are not ours to set
-    fs::set_permissions(&locked, Permissions::from_mode(0o000)).expect("test: chmod 000");
-    // Restored on every path out of this block, so the tempdir can clean up after itself even if
-    // an assertion below fails.
-    struct Restore {
-        dir: PathBuf,
-        mode: u32,
-    }
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let _ = fs::set_permissions(&self.dir, Permissions::from_mode(self.mode));
-        }
-    }
-    let _restore = Restore {
-        dir: locked.clone(),
-        mode: found_mode,
-    };
+    let _restore = deny_access(&locked);
+    let found_mode = _restore.mode;
 
     let report = scan(&ws.root, &ws.cfg).expect("an unreadable directory must not fail the scan");
 
@@ -1486,6 +1465,7 @@ fn record_parse_version(open: &Db, version: u32) {
 #[cfg(unix)]
 struct ModeGuard {
     path: PathBuf,
+    /// The mode captured before the chmod, so a test can assert the restoration instead of assuming it.
     mode: u32,
 }
 
@@ -1824,6 +1804,16 @@ fn an_unreadable_attachment_does_not_hold_the_parse_version_back() {
     record_parse_version(&db, outdated_parse_version());
     drop(db);
 
+    // Premise for the hidden branch: without a live row behind `deep/clip.png` there is nothing for the
+    // `EXISTS` filter to exclude, and the assertion below would prove nothing.
+    let db = ws.db();
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        3,
+        "all three paths must be tracked before either is blocked"
+    );
+    drop(db);
+
     let _shot = deny_access(&ws.root.join("shot.png"));
     let _deep = deny_access(&ws.root.join("deep"));
     let report = scan(&ws.root, &ws.cfg).expect("an unreadable attachment must not fail the scan");
@@ -1839,6 +1829,49 @@ fn an_unreadable_attachment_does_not_hold_the_parse_version_back() {
         recorded_parse_version(&ws.db()),
         Some(PARSE_VERSION),
         "a path that owes no parse must not pin the rules version"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_case_collision_with_no_row_behind_it_does_not_hold_the_version_back() {
+    // The last way to pin the rules version forever: `a.md` and `A.md` share one `case_key`, so one of them
+    // is refused at insert on every scan. It never has a row, so there is nothing stale to repair — and
+    // charging it would re-parse the corpus indefinitely to fix a file the scanner will never index.
+    let ws = scratch(
+        &[
+            ("a.md", "# Lower A\n"),
+            ("A.md", "# Upper A\n"),
+            ("other.md", "# Other\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    // Which of the two the scanner refuses is an internal detail, so read it back from the registry rather
+    // than guess: exactly one of them has no row. On a case-insensitive checkout the pair folded into one
+    // file at setup time and neither is refused — that runner says so out loud instead of passing vacuously.
+    let db = ws.db();
+    let refused = ["a.md", "A.md"]
+        .into_iter()
+        .find(|rel| state(&db, rel).is_none());
+    let Some(refused) = refused else {
+        eprintln!("skip: this filesystem folds a.md and A.md together, so nothing collides");
+        return;
+    };
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    let report = scan(&ws.root, &ws.cfg).expect("a colliding path must not fail the scan");
+    assert!(
+        report.skipped.iter().any(|skipped| skipped == refused),
+        "premise: {refused} has no row and must be named as skipped: {:?}",
+        report.skipped
+    );
+    assert_eq!(
+        recorded_parse_version(&ws.db()),
+        Some(PARSE_VERSION),
+        "a refused path with no rows behind it must not pin the rules version"
     );
 }
 

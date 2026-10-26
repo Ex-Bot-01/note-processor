@@ -310,6 +310,17 @@ fn is_unknown(found: &Found) -> bool {
     found.snapshot.hash.is_empty()
 }
 
+/// Whether skipping `rel` leaves **stale** derived rows behind — the only thing a refresh can repair.
+///
+/// A markdown path with no `notes` row has nothing to re-label. An unreadable new file is indexed as
+/// `Added` on whichever scan can next read it, whatever the recorded version says, and the loser of a case
+/// collision (`a.md` against `A.md`, one `case_key`) never gets a row at all. Charging either would hold
+/// the rules version back forever over rows that do not exist, re-parsing the whole corpus on every scan
+/// to repair nothing — the same mistake the attachment filter above already avoids, one level deeper.
+fn owes_a_reparse(db: &Db, rel: &str, is_markdown: bool) -> Result<bool, DbError> {
+    Ok(is_markdown && note_id(db, rel)?.is_some())
+}
+
 /// Read every discovered file, re-stating each one first, and name the unreadable ones in `skipped`.
 ///
 /// The restatement is what closes the walk-to-read window (Review Focus 5): a file that has gone, or
@@ -407,8 +418,9 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 ///
 /// The count alongside the rows is how many live **note** rows that second filter dropped — nothing else
 /// reports them, since they appear nowhere in `found` — which is how [`scan_with_inject`] knows a
-/// parse-rule refresh never reached part of the corpus. Attachments are excluded by the `EXISTS`: no parse
-/// rule can stale their rows, so counting one would pin the version forever over work that is not owed.
+/// parse-rule refresh never reached part of the corpus. Any row with no note behind it is excluded by the
+/// `EXISTS` — attachments and never-yet-parsed paths alike: no parse rule can stale rows that do not exist,
+/// so counting one would pin the version forever over work that is not owed.
 fn known_rows(db: &Db, unreadable: &[String]) -> Result<(Vec<Snapshot>, usize), DbError> {
     let mut statement = db.0.prepare(
         "SELECT f.rel, f.case_key, f.hash, f.size, f.mtime,
@@ -482,11 +494,11 @@ fn apply_changes(
         // An unknown path is already named in the report and contributed only its marker to
         // `classify`; there is nothing here to write, and counting it either way would be a guess.
         if is_unknown(readable) {
-            // Nothing to write, but a refresh has to remember a missed *note*: its derived rows still hold
-            // whatever an older build wrote. An attachment is charged never — parse rules cannot make its
-            // row stale, so one unreadable image would otherwise pin the version forever and re-parse the
-            // whole corpus on every scan for nothing.
-            if readable.is_markdown {
+            // Nothing to write, but a refresh has to remember a missed note *whose rows already exist*:
+            // those still hold whatever an older build wrote. An attachment, or a note that never got a
+            // row, is charged never — there is nothing stale to repair, so charging it would pin the
+            // version forever and re-parse the whole corpus on every scan for nothing.
+            if owes_a_reparse(db, rel, readable.is_markdown)? {
                 written.uncovered += 1;
             }
             continue;
@@ -497,8 +509,9 @@ fn apply_changes(
             Indexed::Taken => {
                 written.skipped.push(rel.to_string());
                 // A note that lost an identity conflict keeps the rows it already had, so the refresh is
-                // not finished. Attachments are not charged here either, for the same reason as above.
-                if readable.is_markdown {
+                // not finished — but only the *winner* of a collision has rows. The loser has none, and
+                // charging it would hold the version back over nothing to repair.
+                if owes_a_reparse(db, rel, readable.is_markdown)? {
                     written.uncovered += 1;
                 }
             }
@@ -1031,11 +1044,16 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// Retrying is the cheaper fault: one subtree stays stale until it becomes readable again, and the scan
 /// after that records the version once the corpus is covered.
 ///
-/// Notes only, on both sides. An unreadable image or a mode-000 download folder cannot be made current by
-/// any parse rule, so charging it would re-parse the whole corpus on every scan forever and repair nothing
-/// — while a note that stays unreadable *is* worth that loop, because the day it opens again its rows are
-/// wrong until the next scan runs. A path caught in a case collision is charged as a note and can hold the
-/// version back until someone resolves it; the notice below names the count so this is never silent.
+/// Notes with existing rows only, on both sides. Three things are deliberately not charged, because no
+/// parse rule can stale what does not exist: an unreadable image or mode-000 download folder, a markdown
+/// path that has never had a `notes` row (it is indexed as `Added` whenever it next becomes readable), and
+/// the loser of a case collision, which never gets a row at all. Charging any of them would re-parse the
+/// whole corpus on every scan forever and repair nothing.
+///
+/// What *can* still hold the version back indefinitely is a note whose rows exist and cannot be read — a
+/// mode-000 `.md` file, or one inside a directory nobody can enter. That loop is worth paying for: those
+/// rows are wrong the moment the file opens again, and the notice below names the count so this is never
+/// silent.
 fn refresh_covered(written: &Written, hidden_by_unreadable: usize) -> bool {
     written.uncovered == 0 && hidden_by_unreadable == 0
 }
