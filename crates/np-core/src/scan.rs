@@ -494,9 +494,10 @@ fn known_rows(
     Ok((known, hidden))
 }
 
-/// Whether `rel` sits inside a directory the walk could not read, which makes its absence from the found
-/// list meaningless. `"."` is how [`crate::walk`] spells the workspace root itself, and that leaves
-/// nothing knowable at all.
+/// Whether `rel` sits inside a directory whose contents this walk never saw, which makes its absence from the
+/// found list meaningless — either the walk could not enter it, or the directory's own name was refused below
+/// ([`crate::walk::Walked::unreadable`] carries both shapes, F18). `"."` is how [`crate::walk`] spells the
+/// workspace root itself, and that leaves nothing knowable at all.
 fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
     unreadable
         .iter()
@@ -518,8 +519,12 @@ fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
 /// one: Windows builds its key from `to_string_lossy`, so a refused path's `rel_bytes` *are* these bytes
 /// (F18). The consequence worth stating is the twin — a live row whose own spelling is the same lossy text
 /// is dropped from the comparison alongside the refused path, so such a scan counts that twin as `Added` and
-/// refreshes its own row instead of risking a `Removed` against a path this scan just refused. Churn on one
-/// platform, never an overwrite; on Unix both lists are empty and nothing here fires.
+/// refreshes its own row instead of risking a `Removed` against a path this scan just refused. Churn, never an
+/// overwrite — but do not read that as Unix sitting outside this arm. **No *refused* name can reach either list
+/// there** (`path_keys::name_is_lossless` is `true` for every byte a Unix filename holds), yet the prefix rule still
+/// fires on any unreadable directory, and F20's twin-directory case — two directories whose names differ only in
+/// bytes that display as one `U+FFFD` — drops a live row through here on Linux today. F18 widened who lands in
+/// these lists; it did not create the matching imprecision, and F20 owns it.
 fn is_unknown_path(rel: &str, unreadable: &[String], unrepresentable: &[String]) -> bool {
     unrepresentable.iter().any(|name| name == rel) || under_unreadable(rel, unreadable)
 }

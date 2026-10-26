@@ -292,11 +292,21 @@ What these numbers can and cannot carry:
   `hidden_by_unreadable` inflates enough to hold back the parse version. Separately, `skipped.sort();
   skipped.dedup()` publishes one line for two byte-distinct refused files that share a display spelling — a
   reduced form of §1's "the report cannot name the file it lost".
+- **Wider since F18, and worse in two specific ways** (whole-branch pass `f7639d0c`). A refused directory is pushed
+  into the same `unreadable` list (`walk.rs:227`), so anything that lands in it — refused or genuinely unreadable —
+  now hides a subtree from `known`. While such a sibling sits beside a **readable** directory of the same lossy
+  spelling: (1) a real deletion inside the readable one is never reported `Removed`, and a rename there produces a
+  **second live row instead of a move**, because the moved-away path stays unknown rather than becoming `Removed`;
+  and (2) one note can be charged twice, in `written.uncovered` (`scan.rs:567`) *and* `hidden_by_unknown`
+  (`scan.rs:486`), so the refresh-gap line over-counts. Bounded, not permanent: it self-heals the moment the
+  refused or unreadable sibling is renamed away, and no phantom row survives that. This is the imprecision F18's own
+  doc points at but does not own — F18 widened who enters these lists, it did not create the matching.
 - **Fix:** carry `rel_bytes` alongside the display spelling in both places (the unreadable set is built by the
   walk, which already has bytes) and key the dedup on bytes while printing display text. Neither changes catalog
   output, so goldens stay put; a fixture with twin directory names should pin both halves.
-  **Do when:** a workspace with `caf\xe9/` and `caf\xe8/`, one unreadable, reports exactly the rows it should
-  and names both refused paths on separate lines.
+  **Do when:** a workspace with `caf\xe9/` and `caf\xe8/`, one unreadable, reports exactly the rows it should,
+  names both refused paths on separate lines, and counts the note behind them once — not in both
+  `written.uncovered` and `hidden_by_unknown`.
 
 ## F21 — a refusing stderr can block the first upgrade of an orphan-holding workspace
 
@@ -313,6 +323,22 @@ What these numbers can and cannot carry:
   rather than fatal — or defer the print until after commit and let the next scan retry it, which is what F13
   round 7 did for the refresh receipts. **Do when:** an orphan-holding version-2 workspace upgrades with
   descriptor 2 closed, and `np scan` afterwards still surfaces the orphan count.
+
+## F22 — a refusal exists only as one report line, with no reason attached
+
+- **Where:** `scan.rs` puts refused names in `report.skipped` and nowhere durable — the `meta` receipt carries the
+  parse version and orphan counts, not refusals — while `walk.rs:97-99` records no cause, so a directory that was
+  **refused** and a directory nobody may enter print identically.
+- **Risk:** on Windows a refusal means a note is missing from the catalog, permanently, until someone renames the
+  file. The only evidence is one line on stdout or stderr at the moment it happened: redirect the summary away, or
+  ask a day later, and `np status` has nothing to say — it cannot report that any path is unindexable. F18 §3.3
+  allowed a sibling list carrying reasons; the implementation chose one list because the caller's duty is identical
+  either way, which is true for *safety* and false for *diagnosis*.
+- **Fix:** persist a bounded record in `meta` (a count plus display spellings) and surface it from `np status`, so a
+  refusal outlives its own line; keep the single list but word the entry with its cause where the walk knows it
+  (`skipped: unreadable directory` against `skipped: name this build cannot key`). Report text only, so catalog
+  goldens stay put. **Do when:** a workspace scanned with descriptor 2 closed still lets `np status` name the refused
+  path on the next run, and the two causes are distinguishable in the output.
 
 ---
 
