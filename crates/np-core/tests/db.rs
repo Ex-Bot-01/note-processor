@@ -909,9 +909,10 @@ CREATE TABLE meta (
 INSERT INTO schema_version (version) VALUES (1), (2), (3);
 "#;
 
-/// Write a version-three database for [`a_version_three_database_upgrades_without_moving_anything`] and
-/// [`the_byte_key_migration_refuses_to_run_while_enforcement_is_on`], holding every shape migration 4 has
-/// to carry across without moving a byte:
+/// Write a version-three database for [`a_version_three_database_upgrades_without_moving_anything`],
+/// [`the_byte_key_migration_refuses_to_run_while_enforcement_is_on`] and
+/// [`the_byte_key_gate_refuses_a_note_whose_file_row_is_gone`] (which adds its own orphan note row),
+/// holding every shape migration 4 has to carry across without moving a byte:
 ///
 /// - six `files` rows with different names — plain ASCII, a name that is valid UTF-8 but not ASCII, and a
 ///   name whose display fold needs Unicode (`ẞ`) — so one `case_bytes` value bound for the whole copy,
@@ -1288,6 +1289,79 @@ fn the_byte_key_migration_refuses_to_run_while_enforcement_is_on() {
         file_table_counts(&path),
         counts_before,
         "and cascaded nothing away either"
+    );
+}
+
+#[test]
+fn the_byte_key_gate_refuses_a_note_whose_file_row_is_gone() {
+    // A gate is only a defence if something can be turned away by it (F13 §5), and every fixture that has
+    // ever reached migration 4's `PRAGMA foreign_key_check` gave its notes parents — so the suite had never
+    // seen it fire. An orphan note row is the case the step cannot repair: it may not delete the note (its
+    // file may come back, which is what `state = 'stale'` is for) and may not invent a parent for it, so
+    // refusing the upgrade is the only honest answer left.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_three(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("test setup: reopen the old file");
+        // Enforcement has to be off to plant this at all — the bundled SQLite is built with
+        // `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so even a bare connection refuses it. That is the point of the
+        // case: only a file that arrived from outside this program can hold such a row, which is how
+        // migration 3 came to be counting orphans under [`FK_ORPHANS_KEY`] in the first place.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("test setup: relax keys for the fixture");
+        conn.execute(
+            "INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body)
+             VALUES (77, 'never-was.md', 'Gone', 'filename', 'utf-8', 1, 'body')",
+            [],
+        )
+        .expect("test setup: a note row whose `rel` names no files row");
+    }
+
+    // The fixture is what this test claims to have written: six files, five notes — the fifth answered by
+    // nothing — beside the child rows `seed_version_three` wrote. A file sitting at version 3 means only
+    // migration 4 can run, so the error below cannot belong to an earlier step.
+    let counts = file_table_counts(&path);
+    assert_eq!(
+        counts,
+        vec![6, 5, 3, 4, 2, 4],
+        "files, notes, headings, tags, items, links: the orphan is the fifth note"
+    );
+
+    let err =
+        Db::open(&path).expect_err("a key the rebuilt table cannot resolve has to be refused");
+    assert!(
+        matches!(
+            &err,
+            DbError::ForeignKeys { count, table, parent, .. }
+                if *count == 1 && table == "notes" && parent == "files"
+        ),
+        "expected the gate to name the orphan note and the parent it misses, got {err}"
+    );
+
+    // And refusing means refusing: the version stays at 3, `files` keeps its version-3 shape rather than
+    // half a rebuild, and every table holds exactly what the fixture wrote. Read through a plain connection,
+    // because `Db::open` refuses this file again.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        3,
+        "a migration the gate refuses records nothing"
+    );
+    assert_eq!(
+        one("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'rel_bytes'"),
+        0,
+        "and it leaves no half-applied rebuild behind"
+    );
+    drop(conn);
+    assert_eq!(
+        file_table_counts(&path),
+        counts,
+        "no row was deleted, moved or duplicated by the step that failed"
     );
 }
 
