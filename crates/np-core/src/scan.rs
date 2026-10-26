@@ -150,6 +150,24 @@ pub struct ScanReport {
     pub unresolved_targets: Vec<String>,
     /// The catalog files written, `INDEX.md` first, then its shards.
     pub index_files: Vec<String>,
+    /// What **this process's own** schema upgrade deleted, spelled exactly as the receipt it stored under
+    /// [`crate::db::FK_ORPHANS_KEY`] — and `None` for every other scan.
+    ///
+    /// Two conditions make it `Some`: this open ran the orphan cleanup ([`crate::db::Db::upgrade_orphans`],
+    /// not a later open of the same file), and that cleanup removed at least one row.
+    ///
+    /// **Once per process rather than on every scan.** The stored key is never cleared, so "the upgrade
+    /// removed N rows" stays true for the life of the file; echoing it from then on would be a permanent
+    /// one-line warning, and a permanent warning trains the reader to ignore it — which is how real
+    /// signals die. The scan that did the deleting is the one run that needs saying.
+    ///
+    /// **And the key is never cleared after the echo.** Clearing would make this line load-bearing: a run
+    /// whose stdout went to a closed pipe, or a `--json` nobody read, would take the fact with it. Left in
+    /// place, the echo stays a convenience and `meta` stays the record. That is also where the two part
+    /// ways by design: an all-zero receipt **is** still written, because it proves the check ran, while
+    /// this field reports a **loss** and has nothing to report at zero — so a fresh workspace's first scan
+    /// prints no line and carries no field, even though its database now holds `headings=0,tags=0,…`.
+    pub upgrade_orphans: Option<String>,
     /// Wall-clock milliseconds for the whole scan. Informational only — never in a generated file,
     /// where it would make every regeneration differ (spec §10).
     pub elapsed_ms: u128,
@@ -213,6 +231,13 @@ pub fn scan_with_inject(
     let snapshots: Vec<Snapshot> = found.iter().map(|found| found.snapshot.clone()).collect();
 
     let db = Db::open(&cfg.workspace_db(&root))?;
+    // Decided at the open, before anything else can decide it: only the process that ran the cleanup can
+    // announce it, and a cleanup that removed nothing has no loss to announce — its receipt stays in
+    // `meta` as the record that the check ran (see [`ScanReport::upgrade_orphans`]).
+    let upgrade_orphans = db
+        .upgrade_orphans()
+        .filter(|receipt| db::orphan_total(receipt) > 0)
+        .map(str::to_owned);
     // Which rules wrote the rows on disk. Read before anything is written, so this one scan both does the
     // re-parse and records what it re-parsed with: `classify` compares bytes and knows nothing about the
     // rules that turn those bytes into headings, tags, items and links, so without this a note nobody has
@@ -293,6 +318,7 @@ pub fn scan_with_inject(
         unresolved_links: unresolved,
         unresolved_targets: targets,
         index_files: rendered.iter().map(|(name, _)| name.clone()).collect(),
+        upgrade_orphans,
         elapsed_ms: started.elapsed().as_millis(),
     })
 }

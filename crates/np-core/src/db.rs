@@ -259,8 +259,18 @@ pub enum DbError {
 ///
 /// The connection is public because Task 10 runs a whole scan inside one transaction, which
 /// needs the [`Connection`] itself rather than a helper this module would have to grow.
+///
+/// The second field is what an upgrade tells *its own process* about itself ([`Db::upgrade_orphans`]).
+/// It is not part of the file and it is not read back out of the file on demand: it is this open's
+/// memory, so a second `Db::open` of the same database starts with nothing to announce.
 #[derive(Debug)]
-pub struct Db(pub Connection);
+pub struct Db(
+    /// The live connection, public for Task 10's whole-scan transaction.
+    pub Connection,
+    /// The orphan receipt this open wrote, when — and only when — it ran that cleanup itself.
+    /// Read through [`Db::upgrade_orphans`].
+    Option<String>,
+);
 
 impl Db {
     /// Open `path`, creating its directories and applying any pending migration.
@@ -291,8 +301,8 @@ impl Db {
              PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;"
         ))?;
-        migrate(&conn)?;
-        Ok(Db(conn))
+        let upgrade_orphans = migrate(&conn)?;
+        Ok(Db(conn, upgrade_orphans))
     }
 
     /// An empty database in memory, migrated the same way a file one is. For tests.
@@ -303,13 +313,28 @@ impl Db {
         conn.execute_batch(&format!(
             "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}; PRAGMA foreign_keys = ON;"
         ))?;
-        migrate(&conn)?;
-        Ok(Db(conn))
+        let upgrade_orphans = migrate(&conn)?;
+        Ok(Db(conn, upgrade_orphans))
     }
 }
 
-/// Apply every migration whose version is above what the file recorded.
-fn migrate(conn: &Connection) -> Result<(), DbError> {
+impl Db {
+    /// The receipt this open wrote under [`FK_ORPHANS_KEY`], when — and only when — **this** open ran
+    /// the orphan cleanup; `None` for every open that found the schema already migrated.
+    ///
+    /// Carried on the handle rather than read from `meta` by whoever feels like saying it: the stored
+    /// receipt is never cleared, so "the upgrade removed N rows" stays true for the life of the file, and
+    /// a scan that echoed it from then on would be a permanent one-line warning (F21 §3). Whether the
+    /// value is worth printing is the reader's question — [`crate::ScanReport::upgrade_orphans`] answers
+    /// it, and drops the all-zero case that proves only that the check ran.
+    pub fn upgrade_orphans(&self) -> Option<&str> {
+        self.1.as_deref()
+    }
+}
+
+/// Apply every migration whose version is above what the file recorded, returning the orphan receipt
+/// when one of *these* steps wrote one (see [`ORPHAN_CLEANUP_VERSION`] and [`Db::upgrade_orphans`]).
+fn migrate(conn: &Connection) -> Result<Option<String>, DbError> {
     // The bookkeeping table is not itself a migration entry: it has to exist before the first
     // entry can be recorded in it.
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")?;
@@ -335,13 +360,29 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
     conn.execute_batch("PRAGMA foreign_keys = OFF")?;
     let applied = apply_migrations(conn, current);
     let restored = conn.execute_batch("PRAGMA foreign_keys = ON");
-    applied?;
+    // The receipt travels out through `applied`, but the `?` stays where it is: enforcement has to go
+    // back on before any migration error leaves this function, and a failed open keeps no handle that
+    // could read the value anyway.
+    let orphans = applied?;
     restored?;
-    Ok(())
+    Ok(orphans)
 }
 
-/// Apply every migration above `from`, one transaction each.
-fn apply_migrations(conn: &Connection, from: i64) -> Result<(), DbError> {
+/// The 1-based [`MIGRATIONS`] entry that removes orphan rows and writes their receipt — entry 3,
+/// [`add_note_foreign_keys`].
+///
+/// Named because [`apply_migrations`] has to know which step's commit it reads a receipt back from.
+/// Comparing the step *functions* would be the cleverer spelling and is not a dependable one (function
+/// pointer comparison is environment-unpredictable), so the position is stated instead — and drift is
+/// not silent: reading the key back answers `QueryReturnedNoRows` if the step that writes
+/// [`FK_ORPHANS_KEY`] ever moves off this version, which every migration test in
+/// `crates/np-core/tests/db.rs` would then trip over.
+const ORPHAN_CLEANUP_VERSION: i64 = 3;
+
+/// Apply every migration above `from`, one transaction each, remembering the orphan receipt if one of
+/// those steps wrote it.
+fn apply_migrations(conn: &Connection, from: i64) -> Result<Option<String>, DbError> {
+    let mut orphans = None;
     for (index, migration) in MIGRATIONS.iter().enumerate() {
         let version = index as i64 + 1;
         if version <= from {
@@ -355,13 +396,24 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<(), DbError> {
             Migration::Sql(sql) => tx.execute_batch(sql)?,
             Migration::Code(apply) => apply(&tx)?,
         }
+        if version == ORPHAN_CLEANUP_VERSION {
+            // Read back **inside** the step's own transaction, so this is exactly the value that step
+            // wrote rather than a later reader's guess at it — and `query_row` has no answer for a
+            // missing row, so a step reordered off [`ORPHAN_CLEANUP_VERSION`], or one stopped from
+            // recording its cleanup, fails the open loudly instead of quietly losing the announcement.
+            orphans = Some(tx.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![FK_ORPHANS_KEY],
+                |row| row.get::<_, String>(0),
+            )?);
+        }
         tx.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             params![version],
         )?;
         tx.commit()?;
     }
-    Ok(())
+    Ok(orphans)
 }
 
 /// `meta` key recording what migration 3 removed to make its constraints possible.
@@ -440,13 +492,21 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
         });
     }
 
+    // This `?` is the invariant rather than error handling for its own sake (F21 §2): the write shares
+    // the transaction with the deletes above, so a receipt that cannot be written rolls the cleanup back
+    // and **nothing is ever deleted unannounced**. `a_receipt_that_cannot_be_written_rolls_the_cleanup_back`
+    // in `crates/np-core/tests/db.rs` refuses this one statement with a trigger and asserts the orphan rows
+    // survived — reading statement order would let the next refactor move this line or soften its failure
+    // and keep every other test green. It stays *before* the echo below for the same reason: durable first,
+    // stream second.
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         params![FK_ORPHANS_KEY, removed.value()],
     )?;
     // Saying it out loud as well: reading the receipt back needs sqlite3, and a person who just
-    // watched an ordinary command delete rows deserves to be told they were deleted.
+    // watched an ordinary command delete rows deserves to be told they were deleted. Best effort — see
+    // [`report_orphans`], and F21 §2 for why a refusing descriptor 2 may not undo the work above.
     report_orphans(&mut io::stderr(), &removed);
     Ok(())
 }
@@ -462,8 +522,14 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
 /// fails a test instead of going unnoticed; what they cannot pin is that the production call site
 /// names stderr.
 ///
-/// A failed write panics, which is what `eprintln!` did: losing the announcement to a closed
-/// terminal quietly is the silence this function exists to avoid.
+/// A failed write is dropped rather than raised (F21 §2). It used to `.expect`, from inside the
+/// migration's own transaction, so a workspace opened with descriptor 2 refusing writes had its whole
+/// upgrade rolled back — every time, forever, over one line nobody could read. That panic never
+/// protected the signal: the same counts are written into `meta` under [`FK_ORPHANS_KEY`] by the
+/// statement immediately above it, in that same transaction, and the scan whose own open did the
+/// deleting echoes them ([`crate::ScanReport::upgrade_orphans`]). An unprinted line is a lost courtesy;
+/// a refused upgrade is the worse silence, because it hides the deletions *and* leaves the file
+/// unupgraded.
 fn report_orphans(out: &mut dyn io::Write, removed: &OrphanCleanup) {
     // The position at the call site is deliberate — after the violation check in
     // [`add_note_foreign_keys`], so nothing is announced about a migration that rolled itself back.
@@ -472,13 +538,32 @@ fn report_orphans(out: &mut dyn io::Write, removed: &OrphanCleanup) {
     if removed.total() == 0 {
         return;
     }
-    writeln!(
+    // The result is dropped on purpose, for the reason above and in [`report_orphans`]'s doc — this is
+    // the echo, and the durable copy was written by the caller's previous statement.
+    let _ = writeln!(
         out,
         "note-processor: removed {} orphan row(s) while adding note foreign keys ({})",
         removed.total(),
         removed.value(),
-    )
-    .expect("printing the orphan receipt to stderr");
+    );
+}
+
+/// How many rows a stored [`FK_ORPHANS_KEY`] receipt announces: the sum of its labelled counts.
+///
+/// The reader that pairs with `OrphanCleanup::value` (a code span, not a link: that type is private and
+/// rustdoc warns when public docs link to it), for the callers left holding only the stored
+/// string — the scan report, and `np scan`'s summary line, which names the total beside the counts
+/// (F21 §3). Every number in the value is summed whatever its label: the spelling is this module's own
+/// and its labels are pinned by the tests around [`FK_ORPHANS_KEY`], so there is nothing here to
+/// validate — a fragment that will not parse as a count adds nothing rather than failing a report.
+pub fn orphan_total(value: &str) -> usize {
+    value
+        .split(',')
+        .filter_map(|part| match part.split_once('=') {
+            Some((_, count)) => count.parse::<usize>().ok(),
+            None => None,
+        })
+        .sum()
 }
 
 /// What [`add_note_foreign_keys`] had to remove, kept apart by shape because a person reading the
@@ -1278,7 +1363,7 @@ pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rebase_abs, report_orphans, OrphanCleanup};
+    use super::{orphan_total, rebase_abs, report_orphans, OrphanCleanup};
 
     #[test]
     fn rebase_abs_swaps_the_rel_suffix() {
@@ -1350,6 +1435,64 @@ mod tests {
             "note-processor: removed 10 orphan row(s) while adding note foreign keys \
              (headings=2,tags=1,items=0,links_src=3,links_dst_null=4)\n"
         );
+    }
+
+    /// A writer that refuses every write the way `/dev/full` does — `ENOSPC`, not “closed”, which Rust's
+    /// handle reports as success (see the premise in `crates/np-cli/tests/cli.rs`).
+    struct Refusing;
+
+    impl std::io::Write for Refusing {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(28))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_sink_that_refuses_writes_does_not_abort_the_upgrade() {
+        // F21 §1, at the unit level: this call sits inside the migration's transaction, so a panic here
+        // rolled the whole upgrade back — the file refused to open, every time, forever. The write is
+        // best effort because its signal has a durable home (`FK_ORPHANS_KEY`, written by the statement
+        // before this one). The production half of the promise — that the call site names stderr and
+        // survives a real descriptor 2 — is `a_scan_upgrades_with_descriptor_two_closed` in
+        // `crates/np-cli/tests/cli.rs`; no in-process test can reach descriptor 2.
+        report_orphans(
+            &mut Refusing,
+            &OrphanCleanup {
+                headings: 1,
+                tags: 0,
+                items: 0,
+                links_src: 0,
+                links_dst_null: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn the_stored_receipt_adds_up_to_the_total_the_announcement_names() {
+        // The stored spelling is the one thing a later reader holds (`Db::upgrade_orphans`, then the scan
+        // report), so the total printed beside it has to come from the same numbers the writer wrote.
+        let removed = OrphanCleanup {
+            headings: 2,
+            tags: 1,
+            items: 0,
+            links_src: 3,
+            links_dst_null: 4,
+        };
+        assert_eq!(orphan_total(&removed.value()), removed.total());
+        // And an all-zero receipt is zero, which is what keeps the scan report's field `None` for a
+        // cleanup that removed nothing (see `crate::ScanReport::upgrade_orphans`).
+        let untouched = OrphanCleanup {
+            headings: 0,
+            tags: 0,
+            items: 0,
+            links_src: 0,
+            links_dst_null: 0,
+        };
+        assert_eq!(orphan_total(&untouched.value()), 0);
     }
 
     #[test]

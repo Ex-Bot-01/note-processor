@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use np_core::config::Config;
+use np_core::db::orphan_total;
 use np_core::scan::{scan, ScanReport};
 
 #[derive(Parser)]
@@ -79,6 +80,19 @@ fn print_summary(report: &ScanReport) {
     let _ = writeln!(out, "moved      {}", report.moved);
     let _ = writeln!(out, "removed    {}", report.removed);
     let _ = writeln!(out, "unchanged  {}", report.unchanged);
+    // The upgrade's orphan receipt, echoed once by the run whose own `Db::open` did the deleting
+    // (`ScanReport::upgrade_orphans` says why it is once and not always). Dropped on a refusing
+    // descriptor 2 like every other line here — with deliberate reason this time: the deletions are
+    // already recorded in `meta` under `np_core::db::FK_ORPHANS_KEY`, so this line is the copy a person
+    // gets to read, not the only place the fact lives.
+    if let Some(receipt) = &report.upgrade_orphans {
+        let _ = writeln!(
+            out,
+            "upgrade    removed {} orphan row(s) while adding note foreign keys ({})",
+            orphan_total(receipt),
+            receipt
+        );
+    }
     let _ = writeln!(out, "notes      {}", report.notes);
     let _ = write!(out, "unresolved {}", report.unresolved_links);
     if report.unresolved_links > 0 {
