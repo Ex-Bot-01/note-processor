@@ -84,17 +84,27 @@ pub struct WalkOptions {
 /// A path this scan cannot judge absent, spelled twice: [`display`](Self::display) is what the report prints,
 /// [`bytes`](Self::bytes) is what a caller matches on.
 ///
-/// Both come out of **one** component walk ([`crate::path_keys::rel_bytes` through [`normalize_rel`]), so a path
-/// cannot be matched by one spelling and named by another (F13 §4.1). Keeping them apart is what F20 is about:
-/// two directories whose names differ only in bytes UTF-8 cannot hold — `caf\xE9/` beside `caf\xE8/` — share one
-/// display spelling, so a filter that matched on `display` would let the unreadable twin hide the readable one.
+/// The entries [`crate::walk`] builds take both spellings from **one** component walk
+/// ([`crate::path_keys::rel_bytes` through [`normalize_rel`]), so a path cannot be matched by one spelling and
+/// named by another (F13 §4.1). Keeping them apart is what F20 is about: two directories whose names differ only
+/// in bytes UTF-8 cannot hold — `caf\xE9/` beside `caf\xE8/` — share one display spelling, so a filter that
+/// matched on `display` would let the unreadable twin hide the readable one. `UnknownPath::from_display` is the
+/// one constructor with no component walk to borrow, and it says what its fields hold instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownPath {
     /// The spelling the report prints: [`Self::bytes`] decoded with replacements for what UTF-8 cannot hold.
     /// Never used to decide which path a row is.
     pub display: String,
-    /// The identity: the `/`-joined OS bytes, spelled exactly as [`crate::path_keys`] keys a `files` row.
-    /// Every matcher reads this field and nothing else.
+    /// The identity a matcher compares on, and every matcher reads this field and nothing else — but the
+    /// stronger claim holds only for what [`crate::walk`] builds: there these are the `/`-joined OS bytes of a
+    /// path on disk, spelled exactly as [`crate::path_keys`] keys a `files` row. An entry from
+    /// `UnknownPath::from_display` names no path on disk, so its `bytes` are only the UTF-8 bytes of its own
+    /// display text (`U+FFFD` included) and can say nothing about which twin a row is.
+    ///
+    /// That asymmetry is why the report's merged [`crate::ScanReport::skipped`] list must never be handed to a
+    /// matcher: it mixes both kinds, and matching a text-only entry against a byte-keyed row is F20 §1 all over
+    /// again — one `U+FFFD` spelling hiding the path whose bytes differ. Only [`Walked::unreadable`] and
+    /// [`Walked::unrepresentable`] are spellings of paths this walk saw.
     pub bytes: Vec<u8>,
 }
 

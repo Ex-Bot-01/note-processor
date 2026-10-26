@@ -133,7 +133,8 @@ pub struct ScanReport {
     /// catalog name that this program did not publish — left on disk and named here instead of deleted.
     /// Sorted and deduplicated by the path's **bytes**, printed as display text (F20): two byte-distinct paths
     /// sharing one lossy spelling print two lines, which look alike because the report can only name them
-    /// alike.
+    /// alike. Two identical-looking lines are therefore not a duplicate to clean up later — they are two paths
+    /// this scan lost, and collapsing them would hide one.
     pub skipped: Vec<String>,
     /// Live note rows — the same number of entries the catalog holds (spec §2).
     pub notes: i64,
@@ -458,8 +459,11 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 
 /// The registry rows `classify` compares against: live rows, minus anything whose path this scan could not
 /// look at — a subtree under an unreadable directory, or one refused name (F18). The filter is
-/// [`is_unknown_path`], and it judges every row by its `rel_bytes`: a row whose *display* text happens to match
-/// an unknown path while its bytes do not belongs to a subtree this scan did read, and hiding it is F20.
+/// [`is_unknown_path`], and it judges a row by its `rel_bytes`: a row whose *display* text happens to match an
+/// unknown path while its bytes do not belongs to a subtree this scan did read, and hiding it is F20. The one
+/// exception is a row whose stored key was itself derived from display text ([`key_is_display_derived`]): such a
+/// row has no byte spelling left to be judged by, so it is compared text against text — over-hiding rather than
+/// falsely reporting a live note `Removed` (F20 §4.2, "unknown is not absent").
 ///
 /// Stale rows stay out because their absence was already reported; leaving them in would count one
 /// deleted file as `removed` on every later scan. Dropping them is also what lets such a file come back
@@ -510,12 +514,25 @@ fn known_rows(
             row.get::<_, bool>(7)?,
         ))
     })?;
+    // The fallback's other side, built once per scan rather than per row: the same unknown paths spelled as
+    // text, for the rows that have no other spelling to be read by. Both lists are empty in the common case, so
+    // a workspace with nothing hidden pays nothing.
+    let unreadable_display = display_spelled(unreadable);
+    let unrepresentable_display = display_spelled(unrepresentable);
     // Read out fully here, so the write pass never runs with a read open across it.
     let mut known = Vec::new();
     let mut hidden = 0_usize;
     for row in rows {
         let (snapshot, is_note) = row?;
-        if is_unknown_path(&snapshot.rel_bytes, unreadable, unrepresentable) {
+        // Bytes first: that is the identity, and for any row the walk keyed it this is the whole answer.
+        let unknown = is_unknown_path(&snapshot.rel_bytes, unreadable, unrepresentable)
+            || (key_is_display_derived(&snapshot.rel, &snapshot.rel_bytes)
+                && is_unknown_path(
+                    snapshot.rel.as_bytes(),
+                    &unreadable_display,
+                    &unrepresentable_display,
+                ));
+        if unknown {
             if is_note {
                 hidden += 1;
             }
@@ -575,6 +592,44 @@ fn is_unknown_path(
 ) -> bool {
     unrepresentable.iter().any(|path| path.bytes == rel_bytes)
         || under_unreadable(rel_bytes, unreadable)
+}
+
+/// Whether a row's stored key is the bytes of its own **display text** instead of the bytes of the path on
+/// disk — the shape [`crate::db::copy_files_rows`] leaves behind, since migration 4 keyed every row through
+/// [`crate::path_keys::rel_bytes_of_display`]. A note really named `caf\xE9/note.md` therefore sits under
+/// `63 61 66 EF BF BD 2F 6E 6F 74 65 2E 6D 64`: the `U+FFFD` spelling of a name whose bytes no `String` holds
+/// (`docs/design-f13-byte-paths.md` §4.2, and `crates/np-core/tests/db.rs` proves such rows ship).
+///
+/// Both halves of the test are what keep this legacy rather than general, so that F20's byte matching stays
+/// the rule for every row written from now on: a key that differs from its row's display bytes came off the
+/// disk, and a `rel` with no `U+FFFD` in it has one spelling — either way [`is_unknown_path`] already decided
+/// the row exactly as it did before this fallback existed. Only a row failing both halves is text-keyed, and
+/// text is all such a row ever held.
+///
+/// A row stops needing the fallback the first time a scan can **see** its path: the walk lists the real bytes,
+/// [`crate::change`] pairs them with this row by hash, and [`crate::db::apply_move`] rewrites `rel_bytes` from
+/// the walk (F13 §4.2's one-time churn). The display text stays lossy after that, but the key no longer equals
+/// it, so only the byte arm can match the row again.
+fn key_is_display_derived(rel: &str, rel_bytes: &[u8]) -> bool {
+    rel.contains('\u{FFFD}') && rel_bytes == crate::path_keys::rel_bytes_of_display(rel)
+}
+
+/// The two unknown lists re-spelled for [`key_is_display_derived`] rows: each entry keeps its
+/// [`UnknownPath::display`] and takes that text as its bytes, exactly as [`UnknownPath::from_display`] does for
+/// a path that only ever existed as text.
+///
+/// Matching these against a legacy row's `rel` is deliberately **wider** than the byte comparison, and only for
+/// such rows: one `caf\u{FFFD}` entry then hides a legacy row whichever twin its bytes came from, so a migrated
+/// note can be over-hidden — left out of `known`, out of one refresh, reported nothing — where strict byte
+/// matching would have called it `Removed`. That asymmetry is the whole argument: over-hiding is churn that
+/// heals on the next scan that can read the directory, while a false `Removed` stales a live note, drops it from
+/// the catalog, under-charges the refresh gap so [`PARSE_VERSION_KEY`] is recorded over rows nobody re-parsed,
+/// and — per F13 §4.2 — brings the note back as a **second `notes.id`** when the directory opens again.
+fn display_spelled(paths: &[UnknownPath]) -> Vec<UnknownPath> {
+    paths
+        .iter()
+        .map(|path| UnknownPath::from_display(path.display.clone()))
+        .collect()
 }
 
 /// Write this scan's changes: every readable file's registry row refreshed, contents re-indexed where
@@ -1984,6 +2039,64 @@ mod tests {
         assert!(
             !refresh_covered(&missed_write, 0),
             "the write-pass half still holds on its own"
+        );
+    }
+
+    /// The one exception to byte matching, and its bound, in one comparison. A row whose key migration 4 derived
+    /// from display text ([`key_is_display_derived`]) has no byte spelling to be judged by, so an unreadable
+    /// directory whose bytes it cannot tell apart hides it — over-hidden, charged, reported nothing. The same
+    /// display spelling keyed from **real** bytes is a row the walk re-keyed, and stays in `known` on its bytes:
+    /// that is F20's twin fix surviving the fallback, asserted rather than promised.
+    #[test]
+    fn a_display_keyed_row_falls_back_to_text_and_a_byte_keyed_row_does_not() {
+        assert_twin_bytes(b"caf\xE9/note.md", b"caf\xE8/note.md");
+
+        let db = Db::in_memory().expect("in-memory database");
+        // The migrated row: a note really named `caf\xE9/note.md`, stored under the bytes of its lossy text.
+        plant_note(&db, "caf\u{fffd}/note.md");
+        // A row this build wrote: one display spelling, the walk's own bytes as its key.
+        let walked = Snapshot {
+            rel_bytes: b"caf\xE9/note.md".to_vec(),
+            case_bytes: path_keys::case_fold(b"caf\xE9/note.md"),
+            rel: "caf\u{fffd}/note.md".to_string(),
+            case_key: path_keys::display_fold("caf\u{fffd}/note.md"),
+            hash: "h".to_string(),
+            size: 4,
+            mtime: 10,
+        };
+        upsert_file(&db, &walked, Path::new("/ws/caf\u{fffd}/note.md"), 1)
+            .expect("test setup: byte-keyed registry row");
+        db::insert_note(
+            &db,
+            &RelPath::new(
+                b"caf\xE9/note.md".to_vec(),
+                "caf\u{fffd}/note.md".to_string(),
+            ),
+            "t",
+            "filename",
+            "utf-8",
+            3,
+            "body",
+        )
+        .expect("test setup: note behind the byte-keyed row");
+        // A plain name, to show the fallback reaches no further than a lossy key can.
+        plant_note(&db, "top.md");
+
+        // The blocked directory is the **twin** (`caf\xE8`); `caf\xE9` was read in full by this walk.
+        let dirs = [raw(b"caf\xE8")];
+        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
+
+        assert_eq!(
+            known
+                .iter()
+                .map(|row| row.rel_bytes.as_slice())
+                .collect::<Vec<_>>(),
+            [b"caf\xE9/note.md".as_slice(), b"top.md".as_slice()],
+            "the byte-keyed row and the plain row stay in the comparison; only the text-keyed row drops out"
+        );
+        assert_eq!(
+            hidden, 1,
+            "the legacy note is charged to a refresh that could not reach it, and no other note is"
         );
     }
 

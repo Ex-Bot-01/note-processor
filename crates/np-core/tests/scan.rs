@@ -2822,6 +2822,9 @@ const TWIN_DIR_DISPLAY: &str = "caf\u{fffd}";
 const TWIN_EIGHT_KEY: &str = "636166E82F6E6F74652E6D64";
 #[cfg(unix)]
 const TWIN_NINE_KEY: &str = "636166E92F6E6F74652E6D64";
+/// `rel_bytes` of `<readable twin>/renamed.md`: the row the rename step at the end of the fixture has to land on.
+#[cfg(unix)]
+const TWIN_EIGHT_RENAMED_KEY: &str = "636166E82F72656E616D65642E6D64";
 
 /// The shared premise of both cases below, asserted rather than assumed: two byte-distinct directory names that
 /// decode to one display spelling. A filesystem that folds them into one name would make the fixtures prove
@@ -2985,6 +2988,67 @@ fn an_unreadable_directory_does_not_hide_its_readable_twin() {
         Some(PARSE_VERSION),
         "with the subtree visible again the refresh must complete"
     );
+
+    // F20 §1's second consequence, as its own step so nothing above it is re-read: a **rename** inside the
+    // readable twin. The deleted note first returns onto the row it never lost, then the unreadable twin is
+    // blocked again and the note is renamed where it stands. Byte matching keeps the readable twin's row in
+    // `known`, so the new path pairs with its own old row and travels with its `notes.id`; matching display text
+    // — what this did before F20 — hid that row from the comparison, so the rename paired with nothing and came
+    // back as `Added` beside a still-live old row: one note, two identities, no move reported.
+    fs::write(
+        byte_name(&ws.root, TWIN_DIR_EIGHT).join("note.md"),
+        "# Twin Heading\n",
+    )
+    .expect("test setup: put the readable twin's note back");
+    let fourth = scan(&ws.root, &ws.cfg).expect("scan after the note returns");
+    assert_eq!(
+        (fourth.added, fourth.moved, fourth.removed),
+        (1, 0, 0),
+        "a returning file is `Added` onto the row it still has: {fourth:?}"
+    );
+    let eight_note = scalar(
+        &ws.db(),
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{TWIN_EIGHT_KEY}'"),
+    );
+
+    let eight = byte_name(&ws.root, TWIN_DIR_EIGHT);
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    fs::rename(eight.join("note.md"), eight.join("renamed.md"))
+        .expect("test setup: rename the readable twin's note");
+
+    let fifth =
+        scan(&ws.root, &ws.cfg).expect("a rename beside an unreadable twin must not fail the scan");
+    assert_eq!(
+        fifth.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "{fifth:?}"
+    );
+    assert_eq!(
+        (fifth.added, fifth.moved, fifth.removed),
+        (0, 1, 0),
+        "the rename is a move and not a second live row beside the old one: {fifth:?}"
+    );
+    assert_eq!(fifth.notes, 3, "`top.md` plus one note per twin: {fifth:?}");
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{TWIN_EIGHT_RENAMED_KEY}' \
+                      AND state = 'ok'"
+            )
+        ),
+        1,
+        "the move landed on the readable twin's own row"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{TWIN_EIGHT_RENAMED_KEY}'")
+        ),
+        eight_note,
+        "and the note travelled with the id it already had"
+    );
 }
 
 /// The same pair with **both** directories unreadable, which is F20 §3's report claim on a real scan: two paths
@@ -3044,5 +3108,180 @@ fn two_unreadable_twins_publish_two_report_lines_that_look_alike() {
         scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
         3,
         "neither subtree was marked stale"
+    );
+}
+
+/// Rewrite one row's two byte keys into the bytes of its own display text — precisely what migration 4 leaves
+/// behind for a name whose OS bytes were never held: `db::copy_files_rows` binds
+/// `path_keys::rel_bytes_of_display(rel)` for `rel_bytes` and folds those same bytes into `case_bytes`. The note
+/// follows onto the new key with its id, since `notes.rel_bytes` cascades off `files` and `apply_move` rewrites
+/// `notes.rel` by hand for a path that changes spelling.
+///
+/// This is the shape `crates/np-core/tests/db.rs::a_migrated_lossy_key_is_rewritten_by_the_first_byte_keyed_scan`
+/// reaches by migrating a real version-three database; writing the two UPDATEs here keeps the v3 schema in the
+/// binary that tests migrations rather than carrying it into the scan suite.
+#[cfg(unix)]
+fn rekey_row_like_migration_four(db: &Db, from_key: &[u8], rel: &str) {
+    // The parent first: `foreign_keys` is ON for every opened `Db`, so a child moved to the new key before its
+    // parent holds it would be refused, while the cascade does the move for free. With enforcement off the
+    // second statement is what carries the note, and it needs no parent at all — same result either way.
+    db.0.execute(
+        "UPDATE files SET rel = ?1, rel_bytes = ?2, case_bytes = ?3 WHERE rel_bytes = ?4",
+        rusqlite::params![
+            rel,
+            rel.as_bytes(),
+            np_core::path_keys::case_fold(rel.as_bytes()),
+            from_key
+        ],
+    )
+    .expect("test setup: rekey the row like migration 4");
+    db.0.execute(
+        "UPDATE notes SET rel = ?1, rel_bytes = ?2 WHERE rel_bytes = ?3",
+        rusqlite::params![rel, rel.as_bytes(), from_key],
+    )
+    .expect("test setup: rekey the note like migration 4");
+}
+
+/// F20 §4.2's residual end to end. A row whose stored key is **display text** — migration 4's shape for a path
+/// whose OS bytes were never held — cannot be byte-matched against an unreadable directory, because the bytes it
+/// holds are the `U+FFFD` spelling of a name whose real bytes are `63 61 66 E9 …`. Matching only bytes called
+/// such a row absent: one live note reported `removed: 1`, was marked stale and left the catalog while
+/// `hidden_by_unknown` under-charged, so `PARSE_VERSION` was recorded over rows nobody re-parsed — and when the
+/// directory became readable again the note came back as a **second `notes.id`**.
+///
+/// Pinned in that order: the note is not reported removed, keeps its live row under the key it holds, keeps its
+/// `notes.id`, and **is** charged — the version stays withheld while the reachable note is still refreshed. Then
+/// the recovery, which is what bounds the fallback to legacy rows: the next scan that can see the path re-keys it
+/// from the walk's bytes (F13 §4.2's one-time `Moved`, id intact), the refresh completes, and only byte matching
+/// can hide this row again.
+#[cfg(unix)]
+#[test]
+fn a_migrated_text_keyed_row_behind_an_unreadable_directory_is_not_reported_removed() {
+    const REAL_KEY: &str = "636166E92F6E6F74652E6D64";
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_NINE:?}; \
+             `scan::tests::a_display_keyed_row_falls_back_to_text_and_a_byte_keyed_row_does_not` covers the \
+             matcher meanwhile"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    // The premise, checked on the row rather than assumed: a lossy display spelling over real byte-named bytes,
+    // keyed the way a version-three database was copied.
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    assert_eq!(
+        key_hex(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE rel = 'caf\u{fffd}/note.md' ORDER BY rel_bytes"
+        ),
+        LOSSY_KEY,
+        "test setup: the row now holds the bytes of its own display text"
+    );
+    let note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    // Give the refresh visible work on the one note this scan will be able to reach, so a withheld version
+    // below means "the hidden note was charged" and not "no refresh ran".
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    let blocked = byte_name(&ws.root, TWIN_DIR_NINE);
+    let _restore = deny_access(&blocked);
+    if !denied(&blocked) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to {} on this runner (a privileged user?), so this \
+             scan hid nothing",
+            blocked.display()
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("an unreadable directory must not fail the scan");
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the blocked directory is named, and nothing else is: {report:?}"
+    );
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 0, 0),
+        "unknown is not absent: the live note behind it is not `Removed`: {report:?}"
+    );
+    assert_eq!(
+        report.notes, 2,
+        "the hidden note stays in the catalog: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "its row is not marked stale"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        note_id,
+        "and it is still the same note, not a fresh row behind a new id"
+    );
+    assert_eq!(
+        heading_texts(&db, "top.md"),
+        vec!["Top Heading".to_string()],
+        "the note this scan could read is refreshed all the same"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(outdated_parse_version()),
+        "the hidden note is charged in `hidden_by_unknown`: a refresh that missed it may not call the corpus current"
+    );
+    drop(db);
+
+    // The bound on the fallback, measured rather than asserted in prose: once the directory can be read, this
+    // row is keyed from real bytes and text matching has nothing left to say about it.
+    drop(_restore);
+    let healed = scan(&ws.root, &ws.cfg).expect("scan after the directory opens again");
+    assert!(healed.skipped.is_empty(), "{healed:?}");
+    assert_eq!(
+        (healed.added, healed.moved, healed.removed),
+        (0, 1, 0),
+        "the one-time re-key F13 §4.2 predicts, carried rather than removed-and-re-added: {healed:?}"
+    );
+    let db = ws.db();
+    assert_eq!(
+        texts(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE hex(rel_bytes) LIKE '636166%' AND state = 'ok' \
+             ORDER BY rel_bytes"
+        ),
+        [REAL_KEY],
+        "the row is keyed from the walk's bytes now, with no stale twin left behind"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{REAL_KEY}'")
+        ),
+        note_id,
+        "with the same `notes.id` it has always had"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION),
+        "the refresh that finally covered the corpus is allowed to record"
     );
 }
