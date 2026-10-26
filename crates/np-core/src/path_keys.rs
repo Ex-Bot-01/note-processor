@@ -120,8 +120,12 @@ pub fn display_fold(rel: &str) -> String {
 }
 
 /// The bytes of one name or path as the OS holds them.
+///
+/// Shared with [`crate::scan`], which keys the root entries it may delete by these bytes so two entries
+/// that share a lossy spelling stay two entries — the same reason identity lives in [`rel_bytes`] rather
+/// than in `display`.
 #[cfg(unix)]
-fn os_bytes(name: &OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     name.as_bytes().to_vec()
 }
@@ -129,7 +133,7 @@ fn os_bytes(name: &OsStr) -> Vec<u8> {
 /// The bytes of one name or path. Windows paths are UTF-16 code units and reach this program as text, so its
 /// spelling stays lossy — the same stance [`crate::config`] takes for the workspace key (F13 §5).
 #[cfg(not(unix))]
-fn os_bytes(name: &OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
     name.to_string_lossy().into_owned().into_bytes()
 }
 

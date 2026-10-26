@@ -2347,8 +2347,8 @@ fn an_up_to_date_database_reparses_only_what_changed() {
 // ---------------------------------------------------------------------------
 // F13 round 2: identity keyed on the OS bytes, end to end.
 //
-// Both cases build their file names with `OsStringExt::from_vec`, so both are `#[cfg(unix)]` — on Windows
-// the same name cannot be built at all and the test would pass by asserting nothing (F13 §5).
+// Every case here builds its file names with `OsStringExt::from_vec`, so every one is `#[cfg(unix)]` — on
+// Windows the same name cannot be built at all and the test would pass by asserting nothing (F13 §5).
 // ---------------------------------------------------------------------------
 
 /// A workspace holding exactly `files` (raw OS bytes of the name → contents). The `&str`-named [`scratch`]
@@ -2576,8 +2576,103 @@ fn placed_edges(db: &Db) -> Vec<String> {
 /// Delete a file whose name UTF-8 cannot hold.
 #[cfg(unix)]
 fn remove_twin(root: &Path, name: &[u8]) {
+    fs::remove_file(byte_name(root, name)).expect("test setup: remove one twin");
+}
+
+/// The path one byte-spelled root name really names — the spelling `OsStr::from_bytes` builds and the
+/// filesystem holds, which is what a lossy `String` cannot express.
+#[cfg(unix)]
+fn byte_name(root: &Path, name: &[u8]) -> PathBuf {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
-    fs::remove_file(root.join(OsString::from_vec(name.to_vec())))
-        .expect("test setup: remove one twin");
+    root.join(OsString::from_vec(name.to_vec()))
+}
+
+/// A generated shard name holding one raw byte UTF-8 cannot represent.
+#[cfg(unix)]
+const TWIN_RAW: &[u8] = b"INDEX-\xff.md";
+/// The same display spelling built the other way: the encoded replacement character itself. Both are names
+/// `np_core::index_names::is_generated_index` recognises, and both decode to `INDEX-\u{fffd}.md`.
+#[cfg(unix)]
+const TWIN_ENCODED: &[u8] = b"INDEX-\xef\xbf\xbd.md";
+
+/// F13 §1 replayed on the one code path in a scan that deletes files. Two root entries whose names differ
+/// only in bytes UTF-8 cannot hold share **one** display spelling, so a verdict taken on that text is a
+/// verdict about whichever entry `readdir` happened to reach first — and the deletion then joins that text
+/// back onto the root, which is a third file nobody judged.
+///
+/// Here our own published shard sits under the raw-byte spelling and a header-less foreign file sits under
+/// the encoded one. Neither outcome the collapse produces is acceptable: the foreign note must not be
+/// unlinked at its twin's bytes because the twin carried our header, and our shard must not survive in
+/// silence because the twin decided the verdict. So each entry is judged by its own name bytes.
+#[cfg(unix)]
+#[test]
+fn a_superseded_shard_and_its_foreign_twin_are_judged_by_their_own_bytes() {
+    // Premise first: two byte-distinct names, one display spelling, both of them ours to ask about.
+    let raw_display = String::from_utf8_lossy(TWIN_RAW).into_owned();
+    let encoded_display = String::from_utf8_lossy(TWIN_ENCODED).into_owned();
+    assert_eq!(
+        raw_display, encoded_display,
+        "the fixture has to produce one display spelling for two names"
+    );
+    for name in [TWIN_RAW, TWIN_ENCODED] {
+        assert!(
+            np_core::index_names::is_generated_index(&String::from_utf8_lossy(name)),
+            "{name:?} has to read as a generated name"
+        );
+    }
+
+    let ws = scratch(&[("a.md", "one\n"), ("b.md", "two\n")], 1);
+    let first = scan(&ws.root, &ws.cfg).expect("scan that shards");
+    assert_eq!(first.index_files.len(), 3, "{first:?}");
+
+    // One published shard moves out from under its own name: the same bytes, a spelling this scan will not
+    // produce. Renaming rather than copying keeps the header — the fingerprint that makes it ours.
+    let published = first.index_files[1].clone();
+    let ours = byte_name(&ws.root, TWIN_RAW);
+    fs::rename(ws.root.join(&published), &ours)
+        .expect("test: rename a published shard to its twin spelling");
+    // The foreign twin: same display text, no header, and nothing this program ever wrote.
+    let foreign = byte_name(&ws.root, TWIN_ENCODED);
+    fs::write(&foreign, "somebody else's prose\n").expect("test: write the foreign twin");
+
+    let second = scan(&ws.root, &ws.cfg).expect("a twin pair must not fail the scan");
+
+    // The foreign file is untouched — judged by its own bytes, which carry no header.
+    assert!(
+        foreign.is_file(),
+        "a header-less twin is not ours to delete: {:?}",
+        second.skipped
+    );
+    assert_eq!(
+        fs::read(&foreign).expect("test: re-read the foreign twin"),
+        b"somebody else's prose\n",
+        "and its bytes are exactly what they were"
+    );
+
+    // Our shard is gone, unlinked at the path the listing actually produced.
+    assert!(
+        !ours.exists(),
+        "a superseded shard np can prove it published is unlinked at its own path: {:?}",
+        second.skipped
+    );
+
+    // The collision is reported once, in display text — all a report line can hold.
+    assert!(
+        second
+            .skipped
+            .iter()
+            .any(|skipped| skipped == &encoded_display),
+        "the foreign twin has to be named: {:?}",
+        second.skipped
+    );
+
+    // The fixture added no notes and the deletion touched nothing else: both twins are excluded from the
+    // corpus by their generated name, and the shard this scan publishes is written again.
+    assert_eq!(second.notes, 2, "{second:?}");
+    assert_eq!(second.index_files, first.index_files, "{second:?}");
+    assert!(
+        ws.root.join(&published).is_file(),
+        "{published} is republished"
+    );
 }

@@ -27,6 +27,7 @@
 //!   plus `rename`, and no note body is ever opened for writing.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -45,7 +46,7 @@ use crate::index_names;
 use crate::items::{extract_items, ItemCandidate};
 use crate::links::{resolve, store_links, RawLink};
 use crate::parse::{body_start, parse_markdown, NoteDoc, PARSE_VERSION};
-use crate::path_keys::RelPath;
+use crate::path_keys::{os_bytes, RelPath};
 use crate::walk::{self, DiscoveredFile, WalkOptions};
 
 /// The UTF-8 byte order mark: dropped before decoding for parsing, kept in the bytes that are hashed.
@@ -1253,7 +1254,7 @@ fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
 ///    never written while superseded shards of another generation survived beside them.
 /// 3. Superseded names, only once the entry point that no longer mentions them is live.
 ///
-/// The names removed in step 3 come from [`superseded_names`] — the directory and `meta` together — rather
+/// The paths removed in step 3 come from [`superseded_names`] — the directory and `meta` together — rather
 /// than from `meta` alone. A name already gone from disk is the state this call wanted, which is what
 /// makes [`set_index_list`] safe to commit ahead of these writes.
 ///
@@ -1278,8 +1279,9 @@ fn write_index_files(
         publish(root, name, contents)?;
     }
 
-    for name in superseded.delete {
-        let path = root.join(&name);
+    // Every path here is the one the listing produced, never `root.join` of a display spelling: two root
+    // entries can share one lossy spelling and only one of them is the file the verdict was about.
+    for path in superseded.delete {
         match fs::remove_file(&path) {
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(ScanError::Io { path, source }),
@@ -1290,7 +1292,15 @@ fn write_index_files(
 }
 
 /// The generated names this workspace holds that this scan does not publish: what `meta` lists and what
-/// is actually sitting in the root, unioned.
+/// is actually sitting in the root, unioned and judged **one directory entry at a time**.
+///
+/// Each entry is keyed by its file-name bytes ([`os_bytes`]), not by its display text. Two byte-distinct
+/// entries whose names UTF-8 cannot hold — `INDEX-\xff.md` beside `INDEX-\xef\xbf\xbd.md` — lose to the same
+/// `U+FFFD` spelling, and a verdict taken on that spelling answers for whichever one readdir happened to
+/// reach first: it can unlink a header-less foreign file at its twin's bytes, or leave our own shard alive
+/// in silence. That is F13 §1 on the one code path here that deletes files (see
+/// `docs/design-f13-byte-paths.md`), so identity is compared as bytes end to end and the lossy text is kept
+/// only for what is genuinely a display question — [`index_names::is_generated_index`] and the report line.
 ///
 /// `meta` alone is not enough. It is committed inside the scan's transaction (see [`set_index_list`]), so
 /// a kill between that commit and the writes in [`write_index_files`] leaves it naming only the
@@ -1327,47 +1337,68 @@ fn superseded_names(
         path: root.to_path_buf(),
         source,
     })?;
-    // Every generated-looking name in the root, tagged with whether it is ours. The verdict is taken while
+    // Every generated-looking entry in the root, tagged with whether it is ours. The verdict is taken while
     // the listing runs, because `entry.file_type` is the cheapest answer to "file or directory" and a
     // second `stat` would race with whatever renamed the entry between the two calls.
-    let mut present: Vec<(String, bool)> = Vec::new();
+    let mut present: Vec<Listed> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| ScanError::Io {
             path: root.to_path_buf(),
             source,
         })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !index_names::is_generated_index(&name) {
+        let name = entry.file_name();
+        let display = name.to_string_lossy().into_owned();
+        if !index_names::is_generated_index(&display) {
             continue;
         }
         // The file type is asked before the contents: a directory has no header to read, and letting
         // `File::open` answer for it would pretend a directory could be this program's output.
-        let ours =
-            entry.file_type().is_ok_and(|kind| kind.is_file()) && np_published(&entry.path());
-        present.push((name, ours));
+        let path = entry.path();
+        let ours = entry.file_type().is_ok_and(|kind| kind.is_file()) && np_published(&path);
+        present.push(Listed {
+            name_bytes: os_bytes(&name),
+            path,
+            display,
+            ours,
+        });
     }
 
-    // The union the crash window needs: what `meta` names and what the root holds. A name in either list
-    // is judged by what is actually on disk, never by which list produced it.
-    let mut names: Vec<String> = present.iter().map(|(name, _)| name.clone()).collect();
-    names.extend(
+    // The union the crash window needs: what `meta` names and what the root holds. A key in either list
+    // is judged by what is actually on disk, never by which list produced it. One sort and dedup on the
+    // byte keys is also what keeps the deletion set free of duplicates: every entry below is one `root.join`
+    // away from its name, so distinct name bytes mean distinct paths.
+    let mut keys: Vec<Vec<u8>> = present
+        .iter()
+        .map(|listed| listed.name_bytes.clone())
+        .collect();
+    keys.extend(
         previous
             .iter()
             .filter(|name| index_names::is_generated_index(name))
-            .cloned(),
+            .map(|name| os_bytes(OsStr::new(name))),
     );
-    names.sort();
-    names.dedup();
+    keys.sort();
+    keys.dedup();
+
+    // What this scan publishes, spelled the same way. `publish` writes a name's bytes as the file name, so
+    // a key equal to one of these *is* the file just written; an entry that merely displays like a published
+    // name is a different file and stays a candidate under its own fingerprint.
+    let published: Vec<Vec<u8>> = rendered
+        .iter()
+        .map(|(name, _)| os_bytes(OsStr::new(name)))
+        .collect();
 
     let mut superseded = Superseded::default();
-    for name in names {
-        if rendered.iter().any(|(published, _)| published == &name) {
+    for key in keys {
+        if published.contains(&key) {
             continue;
         }
-        match present.iter().find(|(found, _)| *found == name) {
-            Some((_, true)) => superseded.delete.push(name),
-            // On disk, but not ours: a foreign note or a directory wearing one of our names.
-            Some((_, false)) => superseded.foreign.push(name),
+        match present.iter().find(|listed| listed.name_bytes == key) {
+            // Ours, unlinked at the path this entry actually has.
+            Some(listed) if listed.ours => superseded.delete.push(listed.path.clone()),
+            // On disk, but not ours: a foreign note or a directory wearing one of our names. Reported as
+            // display text because a report line is a display question (F13 §3).
+            Some(listed) => superseded.foreign.push(listed.display.clone()),
             // Named by `meta` and already gone — the state this call wanted, which is how the delete loop
             // in [`write_index_files`] reads an [`io::ErrorKind::NotFound`]. Reporting it would name a
             // collision that is nothing but a shard this program never got round to writing.
@@ -1377,12 +1408,28 @@ fn superseded_names(
     Ok(superseded)
 }
 
+/// One generated-looking root entry as the listing saw it: enough to judge it, enough to act on it.
+struct Listed {
+    /// Identity: the file name's OS bytes, which keep two entries sharing a lossy spelling apart. Windows
+    /// has no byte spelling, so its key is the lossy text and twins stay collapsed there — F13 §5's
+    /// residual, not a new one.
+    name_bytes: Vec<u8>,
+    /// What gets unlinked, straight from `entry.path()` — the bytes this entry really has on disk.
+    path: PathBuf,
+    /// The lossy display spelling: what [`index_names::is_generated_index`] reads and what the report names.
+    display: String,
+    /// Whether it is a regular file opening with [`catalog::HEADER`]: ours to remove.
+    ours: bool,
+}
+
 /// The generated names one scan found in its root that it does not publish, split by who owns them.
 #[derive(Default)]
 struct Superseded {
-    /// Files this program published in an earlier generation: safe to unlink.
-    delete: Vec<String>,
-    /// Entries wearing a generated name that this program did not publish: left on disk and reported.
+    /// Files this program published in an earlier generation: safe to unlink. Real paths from the listing,
+    /// because a display spelling can name a different entry than the one the verdict judged.
+    delete: Vec<PathBuf>,
+    /// Entries wearing a generated name that this program did not publish: left on disk and reported, in
+    /// the display text a report line is written in.
     foreign: Vec<String>,
 }
 
