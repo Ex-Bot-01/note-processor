@@ -354,18 +354,27 @@ mod tests {
 
     #[test]
     fn sort_is_total_when_lossy_names_collide() {
-        // Two different raw names decode to one `rel` (0xFF and a literal replacement character both
-        // spell `we\u{fffd}.md`) — F13 §1's collision. Their byte keys differ, so the order is fixed by
-        // identity alone: `x` (0x78) precedes 0xFF and no `abs` tie-break is consulted.
+        // F13 §1's collision, built so the collision is *inside* the fixture: 0xFF and the UTF-8 encoding
+        // of a literal replacement character both spell `we\u{fffd}.md`, so their display `rel` and their
+        // `case_key` are the same string and `case_key` cannot decide this order. Every other field is
+        // deliberately identical too — same `abs`, same size, same mtime — which leaves `rel_bytes` as the
+        // only thing in a `DiscoveredFile` that can separate them.
         let mut found = vec![
             file_bytes(b"we\xff.md", "we\u{fffd}.md"),
-            file_bytes(b"wex.md", "wex.md"),
+            file_bytes("we\u{fffd}.md".as_bytes(), "we\u{fffd}.md"),
         ];
 
         sort_found(&mut found);
 
         let keys: Vec<Vec<u8>> = found.iter().map(|found| found.rel_bytes.clone()).collect();
-        assert_eq!(keys, [b"wex.md".to_vec(), b"we\xff.md".to_vec()]);
+        // Byte order, not display order: 0xEF (the first byte of U+FFFD) precedes 0xFF at index 2. The
+        // input order is the reverse of this on purpose — `sort_by` is stable, so a comparator that stops
+        // at `case_key`, or compares display `rel`, leaves the pair as it was handed over and fails here.
+        assert_eq!(
+            keys,
+            ["we\u{fffd}.md".as_bytes().to_vec(), b"we\xff.md".to_vec()],
+            "one display spelling, two byte identities: the order comes from the key"
+        );
     }
 
     /// A record carrying only what the ordering reads, keyed by its display spelling.
