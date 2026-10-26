@@ -1709,6 +1709,185 @@ fn a_migrated_row_over_two_twins_reports_one_move_and_brings_the_lost_note_back(
     );
 }
 
+/// Extra rows for [`changed_content_under_a_migrated_lossy_key_mints_a_fresh_note_id`]: every child shape that
+/// can hang off the lossy note (the helper's heading, plus a tag and an item here), and one edge pointing
+/// **into** it.
+///
+/// The edge's source is a note whose `files` row is already `stale`, and that is the whole trick: a live source
+/// would be re-parsed by this very scan — a version-3 database holds no parse-rules label, so F15 refreshes the
+/// whole corpus — and its prose edges would be deleted and re-derived from its text, which is a different
+/// mechanism than the one under test. A stale source is never re-parsed, so its row survives with
+/// `dst_note_id` still set: exactly the shape `db::LIVE_EDGE` exists for, an edge that reports unresolved
+/// **without** holding a NULL.
+#[cfg(unix)]
+fn seed_children_and_an_inbound_edge(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the seeded file");
+    conn.execute_batch(
+        "-- Note 4 is the lossy note `seed_scanned_lossy_version_three` wrote.
+         INSERT INTO tags (note_id, tag) VALUES (4, 'carried');
+         INSERT INTO items (note_id, text, line, state, marker)
+              VALUES (4, 'a carried item', 2, 'open', '- [ ]');
+         -- A path the row knows about that no longer exists: stale already, so this scan neither re-parses
+         -- it nor rewrites its prose edges, and `known_rows` leaves it out of the comparison entirely.
+         INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen)
+              VALUES ('gone.md', 'gone.md', '/ws/gone.md', 'hg', 7, 1, 'stale', 80);
+         INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body)
+              VALUES (6, 'gone.md', 'Gone', 'filename', 'utf-8', 1, 'body');
+         INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+              VALUES (6, 4, 'wiki', 'Cafe', 3, 'prose');",
+    )
+    .expect("test setup: seed the note's children and its inbound edge");
+}
+
+/// §4.2's churn shape that re-mints a note id — the one place in round 2 where churn can silently orphan
+/// derived rows.
+///
+/// Same fixture as [`a_migrated_lossy_key_is_rewritten_by_the_first_byte_keyed_scan`] (a version-3 row displayed
+/// as `caf\u{fffd}.md` over a real file named `caf\xe9.md`, driven straight into this build), with one addition:
+/// the file's **content** is rewritten before the scan. Now the two byte keys hold two different hashes, so no
+/// move claim exists and the shape is `Removed` + `Added` rather than `Moved`. That difference is what §4.2 names
+/// as costly: the re-added note is a **fresh `notes.id`**, so edges into the old row now name a stale file and
+/// land in `unresolved_links`, while the stale row itself keeps every derived row and simply leaves the catalog.
+#[cfg(unix)]
+#[test]
+fn changed_content_under_a_migrated_lossy_key_mints_a_fresh_note_id() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace directory");
+    let on_disk = root.join(OsString::from_vec(b"caf\xe9.md".to_vec()));
+    fs::write(&on_disk, "# Cafe\n").expect("test setup: write the non-UTF-8 named note");
+
+    let display = "caf\u{fffd}.md";
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+    let db_path = cfg.workspace_db(&root);
+    fs::create_dir_all(
+        db_path
+            .parent()
+            .expect("test setup: the workspace database sits in a directory"),
+    )
+    .expect("test setup: database directory");
+    // The row holds the digest of the content as it was *before* the edit, which is what makes this the loud
+    // shape: `classify` pairs unmatched snapshots by hash and has nothing to pair here.
+    let hash = sha256_file(&on_disk).expect("test setup: hash the note as the migration left it");
+    let size = fs::metadata(&on_disk)
+        .expect("test setup: read the note's size")
+        .len() as i64;
+    seed_scanned_lossy_version_three(&db_path, display, &hash, size);
+    seed_children_and_an_inbound_edge(&db_path);
+
+    fs::write(&on_disk, "the same note, rewritten after the migration\n")
+        .expect("test setup: change the note's content");
+
+    let report = scan(&root, &cfg).expect("the first byte-keyed scan of edited, migrated content");
+    assert!(report.skipped.is_empty(), "{report:?}");
+    assert_eq!(
+        (
+            report.added,
+            report.modified,
+            report.moved,
+            report.removed,
+            report.unchanged
+        ),
+        (1, 0, 0, 1, 0),
+        "two hashes under two keys is one `Removed` and one `Added`, never a move: {report:?}"
+    );
+    // One live note row — the fresh one. The stale row and the already-stale source of the inbound edge are
+    // both out of the catalog, which counts exactly what this number counts.
+    assert_eq!(report.notes, 1, "{report:?}");
+    // §4.2's cost, stated as a number and a name: the edge into the old note is unresolved again.
+    assert_eq!(report.unresolved_links, 1, "{report:?}");
+    assert_eq!(report.unresolved_targets, vec!["Cafe".to_string()]);
+
+    let db = Db::open(&db_path).expect("test: reopen the migrated database");
+    // Which row is which: the migrated key survives as the stale one, still holding the bytes of the display
+    // spelling; the walk's real bytes are the live row.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT hex(rel_bytes) || '=' || state FROM files ORDER BY rel_bytes"
+        ),
+        [
+            // 63 61 66 E9 2E 6D 64 — the real name, live from this scan on.
+            "636166E92E6D64=ok".to_string(),
+            "636166EFBFBD2E6D64=stale".to_string(),
+            "676F6E652E6D64=stale".to_string(),
+        ],
+        "one file, two keys: the old one marked stale rather than deleted"
+    );
+
+    // Nothing detached when the row went stale: `mark_stale` writes `state` and no child row is touched.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT 'headings=' || (SELECT COUNT(*) FROM headings WHERE note_id = 4)
+                     || ' tags=' || (SELECT COUNT(*) FROM tags WHERE note_id = 4)
+                     || ' items=' || (SELECT COUNT(*) FROM items WHERE note_id = 4)
+                     || ' links=' || (SELECT COUNT(*) FROM links WHERE dst_note_id = 4)"
+        ),
+        ["headings=1 tags=1 items=1 links=1".to_string()],
+        "the stale row keeps its children — they are history, not garbage"
+    );
+    // And the unresolved edge is unresolved because of `LIVE_EDGE`, not because anything NULLed it out: the
+    // destination is still note 4, which is now behind a stale file.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT src_note_id || '->' || COALESCE(CAST(dst_note_id AS TEXT), 'NULL')
+                     || '/' || target FROM links"
+        ),
+        ["6->4/Cafe".to_string()],
+        "the edge stands with its destination attached"
+    );
+
+    // The id is what changed. Read structurally rather than as a literal, because the number is SQLite's to hand
+    // out; what matters is that it is not 4, and that this note's derived rows came from re-parsing the new
+    // content (no heading in it) instead of riding over from the old row.
+    let fresh_id = scalar::<i64>(
+        &db,
+        "SELECT n.id FROM notes n JOIN files f ON f.rel_bytes = n.rel_bytes WHERE f.state = 'ok'",
+    );
+    assert_ne!(
+        fresh_id, 4,
+        "the re-added note is a new row: §4.2's id re-mint"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"),
+        3,
+        "old note, fresh note, and the stale source of the edge"
+    );
+    assert_eq!(
+        names(
+            &db,
+            "SELECT n.title || '/' || n.title_source || '/h' || \
+                    (SELECT COUNT(*) FROM headings h WHERE h.note_id = n.id) \
+             FROM notes n JOIN files f ON f.rel_bytes = n.rel_bytes \
+             WHERE f.state = 'ok'"
+        ),
+        // The stem is the whole display name minus the extension, replacement character included — the
+        // display spelling of a name SQLite has no honest bytes for.
+        ["caf\u{fffd}/filename/h0".to_string()],
+        "re-derived, not carried: title from the file name, no heading rows"
+    );
+
+    // The catalog is what a person reads, so the detachment has to show there as well: the fresh note is
+    // published under its re-derived title and the stale row's old title is gone from the page.
+    let index = fs::read_to_string(root.join("INDEX.md")).expect("the scan publishes INDEX.md");
+    assert!(
+        index.contains("[[caf\u{fffd}]]"),
+        "the re-added note: {index}"
+    );
+    assert!(
+        !index.contains("[[Cafe]]"),
+        "the stale row left the catalog: {index}"
+    );
+}
+
 #[test]
 fn upsert_file_keys_come_from_rel_and_never_from_abs() {
     // The key travels on the snapshot; the byte-exact `abs` this writer is still handed is display material
