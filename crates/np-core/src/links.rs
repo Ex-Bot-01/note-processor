@@ -17,8 +17,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::params;
 
-use crate::db::{Db, DbError};
+use crate::db::{self, Db, DbError};
 use crate::parse::prose_lines;
+use crate::path_keys::RelPath;
 
 /// The only extension that names a note in M1. `.markdown` deliberately is not one: the walker,
 /// the parser and this module recognise one spelling, so a second would silently split every
@@ -349,24 +350,31 @@ fn is_attachment(extension: &str) -> bool {
 }
 
 /// One link with its target placed in the corpus — the row [`store_links`] writes.
+///
+/// Source and destination are [`RelPath`]s, not display strings. Placement still works on text (see
+/// [`resolve`]'s order), but the answer has to name **which row** it landed on: two live rows can spell one
+/// display path identically, and a link written against that text would otherwise be stored against whichever
+/// note the id lookup happened to reach (F13 §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLink {
-    /// The note the link was written in, `/`-separated as the registry spells it.
-    pub src_rel: String,
+    /// The note the link was written in.
+    pub src: RelPath,
     /// The target exactly as [`RawLink`] normalised it. Kept even when nothing matched: a later
     /// milestone suggests where to create the missing note, and can only do that from the text.
     pub target: String,
     pub kind: LinkKind,
     pub line: usize,
     /// The file the target names, or `None` when the corpus has no single answer for it.
-    pub dst_rel: Option<String>,
+    pub dst: Option<RelPath>,
 }
 
 /// Place every target in the corpus, never guessing.
 ///
 /// `corpus` is the map a scan builds — `case_key` → every live path carrying that fold — and `links`
-/// one `(src_rel, links)` entry per note, so a resolved list needs no second pass to know who wrote
-/// each link. Each target is placed in exactly this order:
+/// one `(src, links)` entry per note, so a resolved list needs no second pass to know who wrote
+/// each link. **The matching stays display text end to end** (F13 §4.1: an author names a title, not a byte
+/// sequence); what the byte key in each [`RelPath`] decides is only which row a placed target writes.
+/// Each target is placed in exactly this order:
 ///
 /// 1. **exact `rel`**, the spelling the registry uses;
 /// 2. **case-insensitively** by `case_key`, which is what a case-insensitive filesystem types — and,
@@ -386,19 +394,19 @@ pub struct ResolvedLink {
 /// either, and those targets stay unresolved by design (§3 accepts this rather than picking). An unknown target is unresolved the same
 /// way, and an empty corpus resolves nothing without failing.
 pub fn resolve(
-    corpus: &BTreeMap<String, Vec<String>>,
-    links: &[(String, Vec<RawLink>)],
+    corpus: &BTreeMap<String, Vec<RelPath>>,
+    links: &[(RelPath, Vec<RawLink>)],
 ) -> Vec<ResolvedLink> {
     let basenames = basename_index(corpus);
     let mut resolved: Vec<ResolvedLink> = Vec::new();
-    for (src_rel, raw_links) in links {
+    for (src, raw_links) in links {
         for link in raw_links {
             resolved.push(ResolvedLink {
-                src_rel: src_rel.clone(),
+                src: src.clone(),
                 target: link.target.clone(),
                 kind: link.kind,
                 line: link.line,
-                dst_rel: resolve_target(corpus, &basenames, &link.target),
+                dst: resolve_target(corpus, &basenames, &link.target),
             });
         }
     }
@@ -407,51 +415,53 @@ pub fn resolve(
 
 /// The corpus path one target names, in the order [`resolve`] documents.
 fn resolve_target(
-    corpus: &BTreeMap<String, Vec<String>>,
-    basenames: &HashMap<String, Vec<String>>,
+    corpus: &BTreeMap<String, Vec<RelPath>>,
+    basenames: &HashMap<String, Vec<RelPath>>,
     target: &str,
-) -> Option<String> {
+) -> Option<RelPath> {
     // One `case_key` lookup answers both of the first two steps: what is found here is either spelled
     // exactly as the target (step 1) or its only case variant (step 2) — but only when one path owns
     // that fold. `files.case_key UNIQUE` is gone (F13 §3), so `Ämli.md` and `ämli.md` can both be live
     // rows under the same fold, and then the fold names no file: falling through to step 3 hands the
     // pair to its "held by several paths" decline instead of resolving onto whichever row the corpus
     // map happened to keep.
-    if let Some(rel) = corpus
+    if let Some(found) = corpus
         .get(&target.to_lowercase())
         .filter(|candidates| candidates.len() == 1)
         .map(|candidates| candidates[0].clone())
     {
-        return Some(rel);
+        return Some(found);
     }
-    // Step 3. A file name held by several paths is not resolvable by anybody's rule.
+    // Step 3. A file name held by several paths is not resolvable by anybody's rule — and two byte-distinct
+    // twins carry the *same* display name, so they are two entries here even though a reader cannot tell them
+    // apart (F13 §3: that is why the corpus lists rows rather than deduplicating on text).
     basenames
         .get(&file_name(target).to_lowercase())
         .filter(|candidates| candidates.len() == 1)
         .map(|candidates| candidates[0].clone())
 }
 
-/// Corpus file names to the rels that carry them, lowercased: `deep/nested/Beta.md` is findable as
+/// Corpus file names to the rows that carry them, lowercased: `deep/nested/Beta.md` is findable as
 /// both `beta.md` and `beta`. A `Vec` longer than one entry is what makes a target ambiguous, and
 /// a file whose name has no extension contributes one key rather than two — inserting the same
 /// path twice under one key would make it ambiguous against itself. **Do not "fix" that with a dedup on
-/// display text.** Today every `rel` in this map is distinct, so comparing values is equivalent to comparing
-/// rows; once round 2 keys identity on bytes, two live rows can carry byte-identical display text, and a dedup
-/// there would collapse them into one candidate — silently reopening the guess this function exists to refuse.
-fn basename_index(corpus: &BTreeMap<String, Vec<String>>) -> HashMap<String, Vec<String>> {
-    let mut index: HashMap<String, Vec<String>> = HashMap::new();
-    for rels in corpus.values() {
-        for rel in rels {
-            let name = file_name(rel);
+/// display text.** Two live rows can carry byte-identical display text (F13 §1's twins), so a dedup there
+/// would collapse them into one candidate and silently reopen the guess this function exists to refuse;
+/// each row is pushed as its own entry whatever its spelling.
+fn basename_index(corpus: &BTreeMap<String, Vec<RelPath>>) -> HashMap<String, Vec<RelPath>> {
+    let mut index: HashMap<String, Vec<RelPath>> = HashMap::new();
+    for paths in corpus.values() {
+        for path in paths {
+            let name = file_name(&path.rel);
             let name_key = name.to_lowercase();
-            index.entry(name_key.clone()).or_default().push(rel.clone());
+            index.entry(name_key.clone()).or_default().push(path.clone());
             let stem = match extension(name) {
                 Some(extension) => &name[..name.len() - extension.len() - 1],
                 None => name,
             };
             let stem_key = stem.to_lowercase();
             if stem_key != name_key {
-                index.entry(stem_key).or_default().push(rel.clone());
+                index.entry(stem_key).or_default().push(path.clone());
             }
         }
     }
@@ -464,8 +474,9 @@ const INSERT_LINK: &str = "INSERT INTO links (src_note_id, dst_note_id, kind, ta
 
 /// Write the link rows Task 9 counts and Task 10 reports.
 ///
-/// `src_rel` and `dst_rel` become note ids through `notes.rel`, because a move rewrites a path and
-/// not a note — the id is what keeps a link attached across a rename ([`crate::db`]). Two kinds of
+/// Source and destination become note ids through `notes.rel_bytes`, because a move rewrites a path and
+/// not a note — the id is what keeps a link attached across a rename ([`crate::db`]) — and because display
+/// text is no longer a spelling that names one row (F13 §3). Two kinds of
 /// destination cannot be written as an id:
 ///
 /// - a target the corpus could not place keeps `dst_note_id NULL` plus the raw [`ResolvedLink::target`],
@@ -493,13 +504,13 @@ pub fn store_links(db: &Db, links: &[ResolvedLink], origin: &str) -> Result<(), 
     // order of 10^4 link rows: `Connection::execute` prepares its statement afresh every call, so
     // using it here would mean 10^4 parses of one INSERT. The cache lives on the connection, so the
     // statement is parsed once and reused by every later call as well.
-    let mut ids: HashMap<&str, Option<i64>> = HashMap::new();
+    let mut ids: HashMap<&[u8], Option<i64>> = HashMap::new();
     for link in links {
-        let Some(src) = note_id(db, &mut ids, &link.src_rel)? else {
+        let Some(src) = note_id(db, &mut ids, &link.src)? else {
             continue;
         };
-        let dst = match &link.dst_rel {
-            Some(rel) => note_id(db, &mut ids, rel)?,
+        let dst = match &link.dst {
+            Some(path) => note_id(db, &mut ids, path)?,
             None => None,
         };
         db.0.prepare_cached(INSERT_LINK)?.execute(params![
@@ -515,23 +526,28 @@ pub fn store_links(db: &Db, links: &[ResolvedLink], origin: &str) -> Result<(), 
     Ok(())
 }
 
-/// The note id for one `rel`, memoised per [`store_links`] call: a note's own path repeats on every
+/// The note id for one path's byte key, memoised per [`store_links`] call: a note's own path repeats on every
 /// one of its links, and a popular target repeats across notes.
+///
+/// Keyed on bytes, and read through [`db::note_ids`], which returns **every** row behind the key. Two rows on
+/// one key answer `None` here rather than a pick: this function has no report to name a duplicate in, and the
+/// write pass that owns the file has already put it in `skipped` (F13 §7). Storing an edge onto whichever row
+/// a query reached first is the silent guess the same rule refuses in [`crate::scan`].
 fn note_id<'a>(
     db: &Db,
-    ids: &mut HashMap<&'a str, Option<i64>>,
-    rel: &'a str,
+    ids: &mut HashMap<&'a [u8], Option<i64>>,
+    path: &'a RelPath,
 ) -> Result<Option<i64>, DbError> {
-    if let Some(id) = ids.get(rel) {
+    if let Some(id) = ids.get(path.rel_bytes.as_slice()) {
         return Ok(*id);
     }
-    let mut statement =
-        db.0.prepare_cached("SELECT id FROM notes WHERE rel = ?1 LIMIT 1")?;
-    let mut rows = statement.query(params![rel])?;
-    let id = match rows.next()? {
-        Some(row) => Some(row.get::<_, i64>(0)?),
-        None => None,
+    let behind_key = db::note_ids(db, &path.rel_bytes)?;
+    let id = match behind_key.as_slice() {
+        [only] => Some(*only),
+        // No row (an attachment, or a note this scan refused) or a legacy duplicate: either way there is no
+        // honest id to write.
+        _ => None,
     };
-    ids.insert(rel, id);
+    ids.insert(path.rel_bytes.as_slice(), id);
     Ok(id)
 }

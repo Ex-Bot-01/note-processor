@@ -4,6 +4,7 @@
 //! reproducible across runs and platforms and no tracked file may be dropped by an
 //! odd name.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -45,11 +46,18 @@ pub enum WalkError {
 /// One file found in the workspace, before its contents have been read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredFile {
-    /// Path relative to the workspace root, `/`-separated, no leading `./`. Lossily
-    /// decoded, so a non-UTF-8 name is readable but not necessarily reproducible.
+    /// The identity of this path: the OS bytes of the `/`-separated relative path, no leading
+    /// `./`. Every later stage keys on these bytes (F13 §4.1), so a name holding a byte UTF-8 cannot
+    /// represent stays two distinct files instead of collapsing into one lossy string.
+    pub rel_bytes: Vec<u8>,
+    /// [`path_keys::case_fold`] of `rel_bytes`: the ASCII-case identity guard that still reports
+    /// `a.md` beside `A.md` as one file on a case-sensitive filesystem.
+    pub case_bytes: Vec<u8>,
+    /// Display spelling of the relative path: `rel_bytes` decoded with replacements. Reports and the
+    /// catalog render this; nothing uses it to decide which file a row is (F13 §3).
     pub rel: String,
-    /// `rel` lowercased: the comparison key for links, and the case-insensitive
-    /// identity Windows needs (spec §11).
+    /// `rel` lowercased — the Unicode display fold link resolution matches an author's target against
+    /// (spec §11). Not an identity: two live rows may share it.
     pub case_key: String,
     /// The real OS path, byte-exact even when `rel` had to be decoded lossily.
     /// This is what [`to_open_path`] turns into an argument for `open()`.
@@ -76,7 +84,7 @@ pub struct WalkOptions {
 /// What a walk found, and what it could not look at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walked {
-    /// Every tracked file under the root, sorted by `case_key` then `rel` then `abs`.
+    /// Every tracked file under the root, sorted by `case_key` then the byte identity `rel_bytes`.
     pub files: Vec<DiscoveredFile>,
     /// `/`-normalised paths, spelled like `rel`, of directories whose contents could
     /// not be read (permission denied, or a directory that vanished mid-walk). Empty
@@ -86,8 +94,8 @@ pub struct Walked {
     pub unreadable: Vec<String>,
 }
 
-/// Discover every tracked file under `root`, sorted by `case_key` then `rel` then
-/// `abs`.
+/// Discover every tracked file under `root`, sorted by `case_key` then the byte
+/// identity `rel_bytes` (see [`sort_found`] for why the byte key needs no further tie-break).
 ///
 /// All regular files come back, markdown or not. Symlinks are neither followed nor
 /// recorded, so a link back to a parent directory cannot loop and a link to a file is
@@ -156,24 +164,34 @@ pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Walked, WalkError> {
 /// Relative spelling of a directory the walk could not read. The root itself has no
 /// relative path, and `"."` names it rather than dropping the failure.
 fn unreadable_rel(dir: &Path, root: &Path) -> String {
-    let (rel, _display) = normalize_rel(dir.strip_prefix(root).unwrap_or(dir));
+    let (_rel_bytes, rel, _display) = normalize_rel(dir.strip_prefix(root).unwrap_or(dir));
     if rel.is_empty() {
         return ".".to_string();
     }
     rel
 }
 
-/// `rel` with `/` separators plus the original OS spelling for display:
-/// `(rel, display)`. `CurDir` components are dropped, so the workspace root itself
-/// normalises to the empty string; input is expected to be relative to that root.
-pub fn normalize_rel(os: &Path) -> (String, String) {
-    let mut parts: Vec<String> = Vec::new();
+/// The spellings of one path relative to the workspace root:
+/// `(rel_bytes, rel_display, display)`.
+///
+/// `CurDir` components are dropped, so the workspace root itself normalises to empty in every column;
+/// input is expected to be relative to that root. The byte key and the display text come out of **one**
+/// component walk (F13 §4.1 takes `to_string_lossy` out of the middle of it rather than adding a second
+/// pass), so a path cannot be keyed by one spelling and reported by another.
+pub fn normalize_rel(os: &Path) -> (Vec<u8>, String, String) {
+    let mut names: Vec<&OsStr> = Vec::new();
     for component in os.components() {
         if let Component::Normal(name) = component {
-            parts.push(name.to_string_lossy().into_owned());
+            names.push(name);
         }
     }
-    (parts.join("/"), os.to_string_lossy().into_owned())
+    let rel_bytes = path_keys::rel_bytes(names.iter().copied());
+    let rel = names
+        .iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    (rel_bytes, rel, os.to_string_lossy().into_owned())
 }
 
 /// Path spelling to hand to `open()` and friends. Identity everywhere except
@@ -236,12 +254,16 @@ fn is_excluded(name: &str) -> bool {
 fn record(entry: &DirEntry, root: &Path) -> Option<DiscoveredFile> {
     let meta = entry.metadata().ok()?;
     let abs = entry.path().to_path_buf();
-    let (rel, _display) = normalize_rel(abs.strip_prefix(root).unwrap_or(&abs));
-    // Through `path_keys` rather than a local `to_lowercase`: this is the display fold that `files.case_key`
-    // stores and link resolution reads, so it has one owner for the whole crate (F13 §4).
+    let (rel_bytes, rel, _display) = normalize_rel(abs.strip_prefix(root).unwrap_or(&abs));
+    // Both folds through `path_keys` rather than locally (F13 §4): `case_bytes` is the ASCII byte fold
+    // that guards identity and `case_key` the Unicode display fold link resolution reads, and this walk
+    // is the one place either is derived — neither is ever written without the other.
+    let case_bytes = path_keys::case_fold(&rel_bytes);
     let case_key = path_keys::display_fold(&rel);
     let is_markdown = case_key.ends_with(MARKDOWN_SUFFIX);
     Some(DiscoveredFile {
+        rel_bytes,
+        case_bytes,
         rel,
         case_key,
         abs,
@@ -251,16 +273,17 @@ fn record(entry: &DirEntry, root: &Path) -> Option<DiscoveredFile> {
     })
 }
 
-/// Order with no platform dependence and no ties: `case_key` ascending, then `rel`
-/// (two names differing only in case, `a.md` and `A.md`, share a key on a
-/// case-sensitive filesystem), then `abs` — the tie-break for two different raw names
-/// that decode lossily to the same `rel`.
+/// Order with no platform dependence and no ties: `case_key` ascending, then the byte identity
+/// `rel_bytes`.
+///
+/// The byte key is what makes this total on its own. Comparing display `rel` needed an `abs` tie-break,
+/// because two different raw names decode to one lossy `rel` and their order then fell to whichever path
+/// was read last (F13 §1). Byte keys cannot tie, so the absolute path is no longer part of the answer.
 fn sort_found(found: &mut [DiscoveredFile]) {
     found.sort_by(|a, b| {
         a.case_key
             .cmp(&b.case_key)
-            .then_with(|| a.rel.cmp(&b.rel))
-            .then_with(|| a.abs.cmp(&b.abs))
+            .then_with(|| a.rel_bytes.cmp(&b.rel_bytes))
     });
 }
 
@@ -286,16 +309,17 @@ mod tests {
     fn normalize_rel_spells_components_with_slash_and_keeps_the_original() {
         let os = Path::new("notes").join("sub").join("a.md");
 
-        let (rel, display) = normalize_rel(&os);
+        let (rel_bytes, rel, display) = normalize_rel(&os);
 
+        assert_eq!(rel_bytes, b"notes/sub/a.md".to_vec());
         assert_eq!(rel, "notes/sub/a.md");
         assert_eq!(display, os.to_string_lossy());
     }
 
     #[test]
     fn normalize_rel_of_the_root_is_empty() {
-        assert_eq!(normalize_rel(Path::new("")).0, "");
-        assert_eq!(normalize_rel(Path::new(".")).0, "");
+        assert_eq!(normalize_rel(Path::new("")).0, Vec::<u8>::new());
+        assert_eq!(normalize_rel(Path::new(".")).0, Vec::<u8>::new());
     }
 
     #[test]
@@ -330,27 +354,25 @@ mod tests {
 
     #[test]
     fn sort_is_total_when_lossy_names_collide() {
-        // Two different raw names can decode to the same `rel` (0xFF and a literal
-        // replacement character both spell `we\u{fffd}.md`), so `abs` decides.
+        // Two different raw names decode to one `rel` (0xFF and a literal replacement character both
+        // spell `we\u{fffd}.md`) — F13 §1's collision. Their byte keys differ, so the order is fixed by
+        // identity alone: `x` (0x78) precedes 0xFF and no `abs` tie-break is consulted.
         let mut found = vec![
-            file("we\u{fffd}.md", "/ws/we\u{fffd}.md"),
-            file("we\u{fffd}.md", "/ws/wex.md"),
+            file_bytes(b"we\xff.md", "we\u{fffd}.md"),
+            file_bytes(b"wex.md", "wex.md"),
         ];
 
         sort_found(&mut found);
 
-        let abs: Vec<&str> = found
-            .iter()
-            .map(|found| found.abs.to_str().unwrap_or("?"))
-            .collect();
-        // Byte order on the raw OS path decides: `x` (0x78) precedes the replacement
-        // character's first UTF-8 byte (0xEF).
-        assert_eq!(abs, ["/ws/wex.md", "/ws/we\u{fffd}.md"]);
+        let keys: Vec<Vec<u8>> = found.iter().map(|found| found.rel_bytes.clone()).collect();
+        assert_eq!(keys, [b"wex.md".to_vec(), b"we\xff.md".to_vec()]);
     }
 
-    /// A record carrying only what the ordering reads.
+    /// A record carrying only what the ordering reads, keyed by its display spelling.
     fn file(rel: &str, abs: &str) -> DiscoveredFile {
         DiscoveredFile {
+            rel_bytes: path_keys::rel_bytes_of_display(rel),
+            case_bytes: path_keys::case_fold(rel.as_bytes()),
             rel: rel.to_string(),
             case_key: path_keys::display_fold(rel),
             abs: Path::new(abs).to_path_buf(),
@@ -358,5 +380,13 @@ mod tests {
             mtime: 0,
             is_markdown: true,
         }
+    }
+
+    /// The same record from the raw bytes a Unix walk would have recorded.
+    fn file_bytes(rel_bytes: &[u8], rel: &str) -> DiscoveredFile {
+        let mut found = file(rel, "/ws");
+        found.rel_bytes = rel_bytes.to_vec();
+        found.case_bytes = path_keys::case_fold(rel_bytes);
+        found
     }
 }

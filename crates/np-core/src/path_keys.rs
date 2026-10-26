@@ -13,26 +13,78 @@
 //!   not move with the byte key, or `[[ÄMLI]]` stops finding `Ämli.md`.
 //!
 //! No other module may write either column without calling through here (F13 §4: "one owner for the folds").
-//! The three writers of the key columns — [`crate::db::upsert_file`], [`crate::db::apply_move`] and
-//! [`crate::db::insert_note`] — plus migration 4's copy loop all derive both keys from these functions, so a
-//! key is never derived twice under two rules. `crate::walk` builds `case_key` through [`display_fold`] for
-//! the same reason: SQLite's `LOWER()` folds ASCII only, so a fold computed in SQL would be a second,
-//! different rule.
+//! [`crate::walk`] builds a row's whole key set — [`rel_bytes`], [`case_fold`] and [`display_fold`] together,
+//! so neither is ever written without the others — and migration 4's copy loop calls the same functions on the
+//! one population it can only copy faithfully ([`rel_bytes_of_display`]). The statements that *carry* a key
+//! ([`crate::db::upsert_file`], [`crate::db::apply_move`], [`crate::db::insert_note`]) take it as bytes from
+//! their caller rather than deriving it, which is why they bind what the walk computed instead of inventing
+//! their own rule.
 //!
-//! **Round 1 keys are a faithful copy, not OS fidelity.** Every caller here hands over *display* text —
-//! [`crate::hash::Snapshot`] holds strings and the statements take `&str` — so [`rel_bytes`] stores the bytes
-//! of that spelling, U+FFFD included. Deriving the key from the byte-exact path instead, while `note_id`, the
-//! catalog join and `known_rows` still match display text, is the half-moved state F13 §7 refuses; the
-//! byte-exact input arrives with the round that moves those readers.
+//! Both spellings of a path travel together, so they are one type: [`RelPath`]. A change list, a link corpus
+//! or a write call that named only one of them would either lose the identity (text alone, which is F13) or
+//! lose the line the report renders (bytes alone, which nobody can read).
 
-/// The identity key of one path: its bytes, unchanged.
+use std::ffi::OsStr;
+
+/// One path in both spellings this program keeps: [`rel_bytes`] for identity, `rel` for display.
 ///
-/// Round 1's argument is display text (see the module note), so a name whose raw bytes were not valid UTF-8
-/// arrives already carrying U+FFFD and is stored that way — `caf\u{FFFD}.md` yields
-/// `63 61 66 EF BF BD 2E 6D 64`, not the file's real `63 61 66 E9 2E 6D 64`. That is deliberate and asserted
-/// in F13 §5; the byte-exact form (`OsStrExt::as_bytes`) replaces this function's input in the round that
-/// keys identity on bytes, for every writer at once.
-pub fn rel_bytes(display: &str) -> Vec<u8> {
+/// The pair exists so that no call site has to choose. Identity decisions — change classification, row
+/// resolution, ordering, the note key — read [`RelPath::rel_bytes`]; reports and the rendered catalog read
+/// [`RelPath::rel`], which stays the honest lossy spelling (F13 §3: display sites keep reading text *because*
+/// they were always display-only). Two live rows may carry byte-identical `rel` values, so nothing that has
+/// to tell rows apart may compare or store that field alone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RelPath {
+    /// The identity: OS bytes of the `/`-joined path (F13 §4.1).
+    pub rel_bytes: Vec<u8>,
+    /// The display spelling: `rel_bytes` decoded with replacements for anything UTF-8 cannot hold.
+    pub rel: String,
+}
+
+impl RelPath {
+    /// The pair from a caller that already holds both spellings — which is every caller that reached the disk.
+    pub fn new(rel_bytes: Vec<u8>, rel: String) -> Self {
+        Self { rel_bytes, rel }
+    }
+
+    /// The pair for a path spelled as text, so its key is the bytes of that spelling.
+    ///
+    /// This is the faithful-copy route, not OS fidelity: it exists for values that only ever existed as text
+    /// (a rename target typed by hand in a test, a row written before byte keys). A path that came off the
+    /// disk goes through [`crate::walk`], which has the real bytes.
+    pub fn from_display(rel: &str) -> Self {
+        Self {
+            rel_bytes: rel_bytes_of_display(rel),
+            rel: rel.to_string(),
+        }
+    }
+}
+
+/// The identity key of a workspace-relative path, from its OS components: their bytes joined with `/`.
+///
+/// `Normal` components only — the spelling [`crate::walk`] records — and the join is ASCII `/` on every
+/// platform, because `rel` is this program's own relative spelling rather than the OS's absolute one. On Unix
+/// the bytes are the raw ones, which is the whole point: `caf\xe9.md` and `caf\xe8.md` key apart while both
+/// decode to `caf\u{FFFD}.md`. Windows has no byte spelling (its paths are UTF-16 and unpaired surrogates are
+/// the lossy case), so it falls back to the lossy text and stays F13's documented residual (F13 §5).
+pub fn rel_bytes<'a>(components: impl IntoIterator<Item = &'a OsStr>) -> Vec<u8> {
+    let mut joined: Vec<u8> = Vec::new();
+    for component in components {
+        if !joined.is_empty() {
+            joined.push(b'/');
+        }
+        joined.extend(os_bytes(component));
+    }
+    joined
+}
+
+/// The identity key of a row written before byte keys existed: the UTF-8 bytes of its stored display text.
+///
+/// Migration cannot invent bytes it never held (F13 §2), so migration 4's copy uses this rule and every
+/// affected path is counted into [`crate::db::PATHS_LOSSY_KEY`] for a person to read against the churn the
+/// first byte-keyed scan reports (F13 §4.2). For an ASCII or valid-UTF-8 name these *are* the OS bytes and
+/// nothing moves; for a lossy one the key is repaired by that first scan, not here.
+pub fn rel_bytes_of_display(display: &str) -> Vec<u8> {
     display.as_bytes().to_vec()
 }
 
@@ -67,19 +119,60 @@ pub fn display_fold(rel: &str) -> String {
     rel.to_lowercase()
 }
 
+/// The bytes of one name or path as the OS holds them.
+#[cfg(unix)]
+fn os_bytes(name: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().to_vec()
+}
+
+/// The bytes of one name or path. Windows paths are UTF-16 code units and reach this program as text, so its
+/// spelling stays lossy — the same stance [`crate::config`] takes for the workspace key (F13 §5).
+#[cfg(not(unix))]
+fn os_bytes(name: &OsStr) -> Vec<u8> {
+    name.to_string_lossy().into_owned().into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{case_fold, display_fold, rel_bytes};
+    use super::{case_fold, display_fold, rel_bytes, rel_bytes_of_display, RelPath};
+    use std::ffi::OsStr;
 
     #[test]
-    fn rel_bytes_keeps_the_spelling_it_was_given() {
-        // Round 1's keys are a copy: the U+FFFD a lossy read produced stays in the key, and an ASCII name is
-        // its own bytes. The byte-exact form is round 2's assertion (F13 §5).
+    fn rel_bytes_joins_the_component_bytes_with_slash() {
+        let components = [OsStr::new("notes"), OsStr::new("a.md")];
+        assert_eq!(rel_bytes(components), b"notes/a.md".to_vec());
+        // No components at all is the workspace root, which has no relative path (F13 §4.1).
+        assert_eq!(rel_bytes([]), Vec::<u8>::new());
+
+        // The one case F13 is about, as far as this module can show it on a platform that will not let a
+        // `&str` hold the byte: a raw byte survives the key while the display text cannot. The end-to-end
+        // form — a name built with `OsStrExt::from_bytes`, read off the disk, stored and reopened — is
+        // `crates/np-core/tests/walk.rs` and `crates/np-core/tests/scan.rs`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let latin1 = OsStr::from_bytes(b"caf\xe9.md");
+            let key = rel_bytes([latin1]);
+            assert_eq!(key, b"caf\xe9.md".to_vec());
+            assert_ne!(
+                String::from_utf8_lossy(&key).as_ref(),
+                "caf\u{e9}.md",
+                "the display spelling is where the byte stops being itself"
+            );
+        }
+    }
+
+    #[test]
+    fn rel_bytes_of_display_is_the_faithful_copy() {
+        // A migrated row can only be keyed by what it holds: the U+FFFD a lossy read produced stays in the
+        // key, and an ASCII name is its own bytes.
         assert_eq!(
-            rel_bytes("caf\u{fffd}.md"),
+            rel_bytes_of_display("caf\u{fffd}.md"),
             vec![0x63, 0x61, 0x66, 0xEF, 0xBF, 0xBD, 0x2E, 0x6D, 0x64]
         );
-        assert_eq!(rel_bytes("café.md"), "café.md".as_bytes().to_vec());
+        assert_eq!(rel_bytes_of_display("café.md"), "café.md".as_bytes().to_vec());
+        assert_eq!(RelPath::from_display("a.md").rel_bytes, b"a.md".to_vec());
     }
 
     #[test]
@@ -104,6 +197,6 @@ mod tests {
         );
         assert_eq!(display_fold("ÄMLI.md"), display_fold("ämli.md"));
         // A key and its fold are comparable byte strings, which is what the CHECK on both columns asks for.
-        assert_eq!(case_fold(&rel_bytes("A.md")), b"a.md".to_vec());
+        assert_eq!(case_fold(&rel_bytes_of_display("A.md")), b"a.md".to_vec());
     }
 }

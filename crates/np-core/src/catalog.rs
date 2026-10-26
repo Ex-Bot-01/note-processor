@@ -39,8 +39,13 @@ const OTHER_BUCKET: char = '#';
 pub struct CatalogEntry {
     /// Link text: the note's title, or its file name when it has no title.
     pub title: String,
-    /// Workspace-relative path, already in the `/`-separated spelling used inside markdown.
+    /// Workspace-relative path, already in the `/`-separated spelling used inside markdown. This is what
+    /// the entry renders.
     pub rel: String,
+    /// The same path as bytes — read by [`sort_key`] as the last tie-break and rendered by nothing (F13 §3).
+    /// Two live twins spell `rel` identically, so a display tie-break orders nothing and the rendered bytes
+    /// would fall to whichever row SQLite happened to read.
+    pub rel_bytes: Vec<u8>,
     /// Human size, e.g. `9 B` or `1.4 KB`; see [`size_human`].
     pub size_human: String,
     /// Tags in display order; rendered as `#tag` tokens, or `—` when the list is empty.
@@ -72,7 +77,7 @@ pub fn size_human(bytes: u64) -> String {
 /// Render the catalog: `INDEX.md` first, then its shards when the entry count passes
 /// `cfg.max_entries_per_file`.
 ///
-/// The order is total and input-order independent — lowercased title, then `rel` — so a shuffled
+/// The order is total and input-order independent — lowercased title, then the byte key — so a shuffled
 /// corpus renders byte-identically. Once sharded, `INDEX.md` holds only shard links and every
 /// entry lands in exactly one shard; file names are made unique by a positional suffix, because a
 /// bucket larger than the threshold would otherwise produce several `INDEX-m-m.md` files and
@@ -130,12 +135,17 @@ pub fn render(entries: &[CatalogEntry], cfg: &CatalogConfig) -> Vec<(String, Str
     rendered
 }
 
-/// Sort position of an entry: bucket, then lowercased title, then `rel`.
-fn sort_key(entry: &CatalogEntry) -> (u8, String, &str) {
+/// Sort position of an entry: bucket, then lowercased title, then the byte key.
+///
+/// The last component is bytes rather than `rel` (F13 §3) because for two twins the first two components and
+/// the rendered target are all identical — only the byte key separates them, which is what makes a
+/// regeneration byte-stable instead of dependent on rowid order. For an ASCII or valid-UTF-8 corpus this is
+/// the same comparison `rel` gave, since UTF-8 byte order is code-point order.
+fn sort_key(entry: &CatalogEntry) -> (u8, String, &[u8]) {
     (
         bucket_rank(bucket_key(&entry.title)),
         entry.title.to_lowercase(),
-        &entry.rel,
+        &entry.rel_bytes,
     )
 }
 

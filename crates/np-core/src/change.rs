@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::hash::Snapshot;
+use crate::path_keys::RelPath;
 
 /// What one path needs done to it, as reported by [`classify`].
 #[derive(Debug, PartialEq)]
@@ -18,17 +19,20 @@ pub enum Change {
     Added,
     /// The same identity at the same path with different contents.
     Modified,
-    /// Contents we already had, under a new path. `from` is the old `rel`.
-    Moved { from: String },
+    /// Contents we already had, under a new path. `from` is the old path, in both spellings:
+    /// [`db::apply_move`](crate::db::apply_move) finds the row by its bytes and rewrites the display
+    /// pair beside them, so a move named by text alone could not be carried out.
+    Moved { from: RelPath },
     /// A known path that is gone.
     Removed,
 }
 
 /// Compare what was known against what is there now and say what changed.
 ///
-/// Output is one entry per path, sorted by `rel` ascending, where the key is the path as
-/// it reads **now** — so a move is reported once, on its new path, and never also as a
-/// `Removed`.
+/// Output is one entry per path, sorted by byte key ascending, where the key is the path as it reads
+/// **now** — so a move is reported once, on its new path, and never also as a `Removed`. Each entry
+/// names its path as a [`RelPath`], because this list carries an identity decision into the write pass:
+/// text alongside for the report, bytes for everything that has to find the row (F13 §4.1).
 ///
 /// Matching uses `case_sensitive` to pick the identity: `true` (Linux, macOS) keys on
 /// `rel`, `false` (Windows) keys on `case_key` (spec §11). It is an argument rather than a
@@ -36,9 +40,9 @@ pub enum Change {
 ///
 /// Input contract: each side holds **at most one snapshot per identity**, which is what
 /// [`Snapshot::new`] over one [`crate::walk::DiscoveredFile`] gives a caller — two snapshots of one
-/// path would be paired positionally and could report the pair as a move. Both lists come from the
-/// same walk, so `case_key` is every entry's own `rel` lowercased; a snapshot that breaks that rule
-/// matches files it is not.
+/// path would be paired positionally and could report the pair as a move. Both lists come from the same
+/// walk, so `case_bytes` is every entry's own `rel_bytes` ASCII-folded and `case_key` its own `rel`
+/// lowercased; a snapshot that breaks either rule matches files it is not.
 ///
 /// The decisions, in order:
 ///
@@ -58,15 +62,15 @@ pub enum Change {
 ///   path carries it. Same content at two paths is two files, not a move of each other, and
 ///   a moved file whose contents also changed has two different hashes, so it stays
 ///   `Added` + `Removed` — the hash is the identity. When several removed paths could claim
-///   one added path, the one sharing the most leading directories wins, tie-broken by `rel`
+///   one added path, the one sharing the most leading directories wins, tie-broken by byte key
 ///   ascending; the rest stay `Removed`.
 pub fn classify(
     known: &[Snapshot],
     found: &[Snapshot],
     case_sensitive: bool,
-) -> Vec<(String, Change)> {
+) -> Vec<(RelPath, Change)> {
     // Read failures first: their paths must not appear in the output in any direction.
-    let unreadable: HashSet<&str> = found
+    let unreadable: HashSet<&[u8]> = found
         .iter()
         .filter(|s| s.hash.is_empty())
         .map(|s| key_of(s, case_sensitive))
@@ -79,7 +83,7 @@ pub fn classify(
     );
     let found_index = index_by_key(found.iter().filter(|s| !s.hash.is_empty()), case_sensitive);
 
-    let mut changes: Vec<(String, Change)> = Vec::new();
+    let mut changes: Vec<(RelPath, Change)> = Vec::new();
     // Hashes the workspace still holds at a path that did not go away. A move may never
     // claim content that is still sitting where it was — which includes both spellings of a
     // matched pair (its old bytes and the new ones written to the same path) and the known hash
@@ -107,7 +111,7 @@ pub fn classify(
                 continue;
             }
             if before.hash != after.hash {
-                changes.push((after.rel.clone(), Change::Modified));
+                changes.push((path_of(after), Change::Modified));
             }
         }
         unmatched_known.extend(knowns.iter().skip(founds.len()).copied());
@@ -122,9 +126,10 @@ pub fn classify(
     let claimants = group_by_hash(&unmatched_known);
     let added_count = count_by_hash(&unmatched_found);
 
-    // Move claims are resolved in `rel` order so the outcome never follows hash order.
-    unmatched_found.sort_by_key(|s| s.rel.as_str());
-    let mut moved_from: HashSet<&str> = HashSet::new();
+    // Move claims are resolved in byte-key order so the outcome never follows hash order, and never
+    // follows the display spelling two twins happen to share.
+    unmatched_found.sort_by_key(|s| s.rel_bytes.as_slice());
+    let mut moved_from: HashSet<&[u8]> = HashSet::new();
     for added in &unmatched_found {
         let hash = added.hash.as_str();
         let claim = match claimants.get(hash) {
@@ -137,44 +142,48 @@ pub fn classify(
         };
         match claim {
             Some(before) => {
-                moved_from.insert(before.rel.as_str());
-                changes.push((
-                    added.rel.clone(),
-                    Change::Moved {
-                        from: before.rel.clone(),
-                    },
-                ));
+                moved_from.insert(before.rel_bytes.as_slice());
+                changes.push((path_of(added), Change::Moved { from: path_of(before) }));
             }
-            None => changes.push((added.rel.clone(), Change::Added)),
+            None => changes.push((path_of(added), Change::Added)),
         }
     }
 
     for before in &unmatched_known {
-        if !moved_from.contains(before.rel.as_str()) {
-            changes.push((before.rel.clone(), Change::Removed));
+        if !moved_from.contains(before.rel_bytes.as_slice()) {
+            changes.push((path_of(before), Change::Removed));
         }
     }
 
-    changes.sort_by(|a, b| a.0.cmp(&b.0));
+    changes.sort_by(|a, b| a.0.rel_bytes.cmp(&b.0.rel_bytes));
     changes
 }
 
-/// The identity a path is matched on: its exact spelling where the filesystem keeps two
-/// names that differ only in case, its folded spelling where it keeps one file.
-fn key_of(snapshot: &Snapshot, case_sensitive: bool) -> &str {
+/// The identity a path is matched on: its exact bytes where the filesystem keeps two names that differ
+/// only in ASCII case, the ASCII fold of those bytes where it keeps one file.
+///
+/// Bytes, not display text (F13 §4.1): `caf\xe9.md` and `caf\xe8.md` spell themselves identically once
+/// decoded, so a `&str` key here is where a twin pair used to die — one bucket, one positional pair,
+/// one file dropped.
+fn key_of(snapshot: &Snapshot, case_sensitive: bool) -> &[u8] {
     if case_sensitive {
-        &snapshot.rel
+        &snapshot.rel_bytes
     } else {
-        &snapshot.case_key
+        &snapshot.case_bytes
     }
 }
 
-/// Snapshots grouped by identity, each group in `rel` ascending order.
+/// The two spellings of one snapshot, as the write pass needs them.
+fn path_of(snapshot: &Snapshot) -> RelPath {
+    RelPath::new(snapshot.rel_bytes.clone(), snapshot.rel.clone())
+}
+
+/// Snapshots grouped by identity, each group in byte-key ascending order.
 fn index_by_key<'a>(
     snapshots: impl Iterator<Item = &'a Snapshot>,
     case_sensitive: bool,
-) -> HashMap<&'a str, Vec<&'a Snapshot>> {
-    let mut index: HashMap<&str, Vec<&Snapshot>> = HashMap::new();
+) -> HashMap<&'a [u8], Vec<&'a Snapshot>> {
+    let mut index: HashMap<&[u8], Vec<&Snapshot>> = HashMap::new();
     for snapshot in snapshots {
         index
             .entry(key_of(snapshot, case_sensitive))
@@ -182,7 +191,7 @@ fn index_by_key<'a>(
             .push(snapshot);
     }
     for group in index.values_mut() {
-        group.sort_by_key(|s| s.rel.as_str());
+        group.sort_by_key(|s| s.rel_bytes.as_slice());
     }
     index
 }
@@ -209,16 +218,18 @@ fn count_by_hash<'a>(snapshots: &[&'a Snapshot]) -> HashMap<&'a str, usize> {
 }
 
 /// The candidate most plausibly the same file as `added`: the one sharing the most leading
-/// directories with it, tie-broken by `rel` ascending so the pick is not hash order.
+/// directories with it, tie-broken by byte key ascending so the pick is not hash order and not whichever
+/// spelling sorts first once two rows read alike.
 fn closest_to<'a>(candidates: &[&'a Snapshot], added: &Snapshot) -> Option<&'a Snapshot> {
     let mut best: Option<&'a Snapshot> = None;
     for candidate in candidates {
         let better = match best {
             None => true,
             Some(held) => {
-                let mine = shared_dirs(&candidate.rel, &added.rel);
-                let theirs = shared_dirs(&held.rel, &added.rel);
-                mine > theirs || (mine == theirs && candidate.rel < held.rel)
+                let mine = shared_dirs(&candidate.rel_bytes, &added.rel_bytes);
+                let theirs = shared_dirs(&held.rel_bytes, &added.rel_bytes);
+                mine > theirs
+                    || (mine == theirs && candidate.rel_bytes < held.rel_bytes)
             }
         };
         if better {
@@ -228,21 +239,28 @@ fn closest_to<'a>(candidates: &[&'a Snapshot], added: &Snapshot) -> Option<&'a S
     best
 }
 
-/// How many leading directories two `/`-separated paths share. The file name never counts,
+/// How many leading directories two `/`-separated byte paths share. The file name never counts,
 /// and a path at the workspace root shares none with anybody.
-fn shared_dirs(a: &str, b: &str) -> usize {
-    let Some((a_dir, _)) = a.rsplit_once('/') else {
-        return 0;
-    };
-    let Some((b_dir, _)) = b.rsplit_once('/') else {
+fn shared_dirs(a: &[u8], b: &[u8]) -> usize {
+    let (Some(a_dir), Some(b_dir)) = (dirs_of(a), dirs_of(b)) else {
         return 0;
     };
     let mut shared = 0;
-    for (x, y) in a_dir.split('/').zip(b_dir.split('/')) {
+    for (x, y) in a_dir
+        .split(|byte| *byte == b'/')
+        .zip(b_dir.split(|byte| *byte == b'/'))
+    {
         if x != y {
             break;
         }
         shared += 1;
     }
     shared
+}
+
+/// The directory part of a byte path — everything before its last `/`, or `None` when the name sits at
+/// the workspace root and therefore shares no directory with anybody.
+fn dirs_of(path: &[u8]) -> Option<&[u8]> {
+    let last = path.iter().rposition(|byte| *byte == b'/')?;
+    Some(&path[..last])
 }

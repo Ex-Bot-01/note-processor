@@ -25,7 +25,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
 use crate::hash::Snapshot;
-use crate::path_keys;
+use crate::path_keys::{self, RelPath};
 
 /// How long a connection waits for another connection's write lock before reporting `SQLITE_BUSY`, in
 /// milliseconds. Set on every connection this crate opens — workspace database and registry alike.
@@ -846,7 +846,7 @@ fn copy_files_rows(conn: &Connection) -> Result<(), DbError> {
         // Both keys come from this row's own `rel`, through the one module that owns them (F13 §4: no
         // statement derives a key by hand). Round 1's keys are the bytes of the stored display spelling,
         // U+FFFD included — see [`crate::path_keys`].
-        let rel_bytes = path_keys::rel_bytes(&row.rel);
+        let rel_bytes = path_keys::rel_bytes_of_display(&row.rel);
         let case_bytes = path_keys::case_fold(&rel_bytes);
         insert.execute(params![
             row.rowid,
@@ -911,19 +911,21 @@ fn lossy_rows(conn: &Connection, table: &str) -> Result<i64, DbError> {
 /// changes — which is what keeps the note's derived rows attached to it. `hash`, `size`, `mtime`, `abs` and
 /// `last_seen` are refreshed from the snapshot every time, because a scan that saw a file is a sighting of it.
 ///
-/// **Both byte keys are written here, and both come from `s.rel`, never from `abs`.** Migration 4 made
-/// `rel_bytes` / `case_bytes` `NOT NULL UNIQUE` and dropped `case_key UNIQUE`, so a write that supplied no key
-/// would fail with `SQLITE_CONSTRAINT_NOTNULL` on the first file of every scan, and the constraint that used
-/// to report P3's case pair would be gone. Deriving them from `abs` instead is not an improvement yet: the
-/// identity *readers* still match on is display text, so byte-exact keys written now would put new rows under
-/// one rule and every read under another (F13 §7). One module owns both derivations — [`crate::path_keys`].
+/// **Both byte keys are written here, and both travel on the snapshot.** [`crate::path_keys`] derived them
+/// from the walk's OS bytes and this statement binds what it is handed rather than inventing a rule of its
+/// own. Migration 4 made `rel_bytes` / `case_bytes` `NOT NULL UNIQUE` and dropped `case_key UNIQUE`, so a write
+/// that supplied no key would fail with `SQLITE_CONSTRAINT_NOTNULL` on the first file of every scan, and the
+/// constraint that used to report P3's case pair would be gone. Deriving them from the *display* text instead
+/// is the bug F13 exists to end: twins spell themselves identically, so the second one would resolve onto its
+/// twin's row and overwrite it with no constraint firing at all.
 ///
 /// The row is resolved by `id`, in two statements, where this function used to carry one
 /// `ON CONFLICT (rel) DO UPDATE` arm. That arm cannot survive the migration: `rel TEXT PRIMARY KEY` was the
 /// only reason `ON CONFLICT (rel)` matched anything, migration 4 gives `rel` no unique constraint at all, and
 /// SQLite answers a non-matching conflict target at *prepare* time — so an arm kept out of habit does not fail
-/// on a lossy name, it fails on the first ordinary ASCII file and takes every scan down with it. Resolution
-/// stays display-keyed on purpose: "which row spells this path" is the same question the readers still ask.
+/// on a lossy name, it fails on the first ordinary ASCII file and takes every scan down with it. The lookup
+/// that replaced it asks about `rel_bytes`, which is F13 §3's "the conflict target moves to `rel_bytes`" in
+/// the shape this function can prepare: two twins now resolve to two different rows.
 ///
 /// A `case_bytes` collision — two paths differing only in ASCII case on a case-sensitive filesystem —
 /// surfaces as the constraint violation it is, exactly as `case_key UNIQUE` used to. Nothing picks a winner:
@@ -940,11 +942,9 @@ fn lossy_rows(conn: &Connection, table: &str) -> Result<i64, DbError> {
 /// file. Caching changes how a statement is obtained, not what it does: every error — the
 /// identity collisions below included — reaches the caller exactly as it did before.
 pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), DbError> {
-    let rel_bytes = path_keys::rel_bytes(&s.rel);
-    let case_bytes = path_keys::case_fold(&rel_bytes);
     let existing: Option<i64> =
-        db.0.prepare_cached("SELECT id FROM files WHERE rel = ?1")?
-            .query_row(params![s.rel], |row| row.get(0))
+        db.0.prepare_cached("SELECT id FROM files WHERE rel_bytes = ?1")?
+            .query_row(params![&s.rel_bytes], |row| row.get(0))
             .optional()?;
 
     // `abs` is stored as TEXT, so a path that is not valid UTF-8 arrives here lossy.
@@ -962,7 +962,15 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
                   WHERE id = ?1",
             )?
             .execute(params![
-                id, rel_bytes, case_bytes, s.case_key, abs_text, s.hash, size, s.mtime, now
+                id,
+                &s.rel_bytes,
+                &s.case_bytes,
+                s.case_key,
+                abs_text,
+                s.hash,
+                size,
+                s.mtime,
+                now
             ])?;
         }
         None => {
@@ -972,7 +980,15 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ok', ?9)",
             )?
             .execute(params![
-                rel_bytes, case_bytes, s.rel, s.case_key, abs_text, s.hash, size, s.mtime, now
+                &s.rel_bytes,
+                &s.case_bytes,
+                s.rel,
+                s.case_key,
+                abs_text,
+                s.hash,
+                size,
+                s.mtime,
+                now
             ])?;
         }
     }
@@ -992,21 +1008,20 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
 /// stays in `scan.rs` because it writes no key at all.
 pub fn insert_note(
     db: &Db,
-    rel: &str,
+    path: &RelPath,
     title: &str,
     title_source: &str,
     encoding: &str,
     word_count: i64,
     body: &str,
 ) -> Result<i64, DbError> {
-    let rel_bytes = path_keys::rel_bytes(rel);
     db.0.prepare_cached(
         "INSERT INTO notes (rel_bytes, rel, title, title_source, encoding, word_count, body)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?
     .execute(params![
-        rel_bytes,
-        rel,
+        &path.rel_bytes,
+        path.rel,
         title,
         title_source,
         encoding,
@@ -1016,13 +1031,40 @@ pub fn insert_note(
     Ok(db.0.last_insert_rowid())
 }
 
+/// Every `notes.id` stored under one byte key, ascending by id.
+///
+/// **This reads every row on purpose; there is no `LIMIT 1`.** `notes.rel_bytes` carries no `UNIQUE`: a
+/// version-3 database could hold two note rows for one path (`notes.rel` was never unique) and migration 4
+/// copies both onto one key (F13 §7). Handing back one answer from that population is either a silent pick,
+/// which rewrites a note's whole derived set with another note's, or an `ExecuteMultipleValues` error, which
+/// makes a legacy workspace impossible to scan forever. Both are refused by returning the count for the caller
+/// to act on: one id is the normal path, none means "no row yet", and more than one is an identity conflict
+/// the scan reports and leaves alone.
+///
+/// The key arrives as bytes because that is the only spelling with one answer per file; matching on display
+/// text would let a twin's note answer for it (F13 §3).
+pub fn note_ids(db: &Db, rel_bytes: &[u8]) -> Result<Vec<i64>, DbError> {
+    let mut statement =
+        db.0.prepare_cached("SELECT id FROM notes WHERE rel_bytes = ?1 ORDER BY id")?;
+    let rows = statement.query_map(params![rel_bytes], |row| row.get::<_, i64>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
 /// Move a file's registry row from `from` to `to`, keeping everything that makes its note the
 /// same note.
 ///
-/// The row is found by `id`, like [`upsert_file`]'s resolution: `rel` stopped being unique in migration 4, so
-/// matching the update on it would rename every row sharing one display spelling — and before the migration
-/// there was no `id` to match on. Both byte keys are written in the same statement as the display pair, so the
-/// four columns cannot diverge.
+/// Both paths arrive as a [`RelPath`], because one statement has to write both spellings: the byte key is what
+/// the row is matched and stored on, and the display pair is what the catalog renders. Neither may be derived
+/// from the other here — a renamed lossy name does not round-trip through text.
+///
+/// The row is found by `id`, like [`upsert_file`]'s resolution, which was reached through the **byte** key:
+/// `rel` stopped being unique in migration 4, so matching the lookup on it would rename every row sharing one
+/// display spelling. Both byte keys are written in the same statement as the display pair, so the four columns
+/// cannot diverge.
 ///
 /// Three things follow the path. `notes.rel_bytes` rides `files`' own update through its
 /// `ON UPDATE CASCADE`, which is what lets the second statement below match on the **new** bytes; `notes.rel`
@@ -1048,26 +1090,28 @@ pub fn insert_note(
 /// was there a moment ago, and moving nothing would leave the scan reporting a move that did
 /// not happen. A `to` whose bytes some other row already holds fails on `rel_bytes UNIQUE` / its implicit
 /// primary key, like any other collision — two paths cannot be one note.
-pub fn apply_move(db: &Db, from: &str, to: &str, now: i64) -> Result<(), DbError> {
+pub fn apply_move(db: &Db, from: &RelPath, to: &RelPath, now: i64) -> Result<(), DbError> {
     // The lookup keeps its own cached statement, and the `MissingRel` mapping below still reads the
     // same `QueryReturnedNoRows` it always did — caching the prepare changes how the statement is
-    // made, not what a miss reports.
+    // made, not what a miss reports. It matches on bytes: two rows can spell one display `rel`, and a
+    // rename keyed on that text would drag both notes through this statement.
     let (id, abs): (i64, String) =
-        db.0.prepare_cached("SELECT id, abs FROM files WHERE rel = ?1")?
-            .query_row(params![from], |row| Ok((row.get(0)?, row.get(1)?)))
+        db.0.prepare_cached("SELECT id, abs FROM files WHERE rel_bytes = ?1")?
+            .query_row(params![&from.rel_bytes], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(|err| match err {
                 rusqlite::Error::QueryReturnedNoRows => DbError::MissingRel {
-                    rel: from.to_string(),
+                    rel: from.rel.clone(),
                 },
                 other => DbError::Sqlite(other),
             })?;
-    let new_abs = rebase_abs(&abs, from, to).ok_or_else(|| DbError::BadAbs {
-        rel: from.to_string(),
+    // `rebase_abs` is display work — its output is the display `abs` column (F13 §3) — so it reads the two
+    // display spellings, not the bytes.
+    let new_abs = rebase_abs(&abs, &from.rel, &to.rel).ok_or_else(|| DbError::BadAbs {
+        rel: from.rel.clone(),
         abs,
     })?;
 
-    let to_bytes = path_keys::rel_bytes(to);
-    let to_case = path_keys::case_fold(&to_bytes);
+    let to_case = path_keys::case_fold(&to.rel_bytes);
     db.0.prepare_cached(
         "UPDATE files
             SET rel_bytes = ?2, case_bytes = ?3, rel = ?4, case_key = ?5, abs = ?6, last_seen = ?7,
@@ -1076,10 +1120,10 @@ pub fn apply_move(db: &Db, from: &str, to: &str, now: i64) -> Result<(), DbError
     )?
     .execute(params![
         id,
-        to_bytes,
+        &to.rel_bytes,
         to_case,
-        to,
-        path_keys::display_fold(to),
+        to.rel,
+        path_keys::display_fold(&to.rel),
         new_abs,
         now
     ])?;
@@ -1088,7 +1132,7 @@ pub fn apply_move(db: &Db, from: &str, to: &str, now: i64) -> Result<(), DbError
     // spelling no longer names this note. Display text is what is written, because `notes.rel` is a display
     // column and the catalog renders it verbatim.
     db.0.prepare_cached("UPDATE notes SET rel = ?2 WHERE rel_bytes = ?1")?
-        .execute(params![to_bytes, to])?;
+        .execute(params![&to.rel_bytes, to.rel])?;
     Ok(())
 }
 
@@ -1098,9 +1142,13 @@ pub fn apply_move(db: &Db, from: &str, to: &str, now: i64) -> Result<(), DbError
 /// it can rejoin with its identity if the file comes back, and so the catalog can say "stale"
 /// instead of forgetting it ever existed (spec §2). A path that is not in the registry changes
 /// nothing, which is correct — there is no row to mark.
-pub fn mark_stale(db: &Db, rel: &str) -> Result<(), DbError> {
-    db.0.prepare_cached("UPDATE files SET state = 'stale' WHERE rel = ?1")?
-        .execute(params![rel])?;
+///
+/// Matched on `rel_bytes`, and taking bytes from the caller is what makes that possible (F13 §3): keyed on
+/// display text, deleting one twin marked **both** stale, so the catalog lost a note that was sitting there
+/// readable and nothing reported it.
+pub fn mark_stale(db: &Db, rel_bytes: &[u8]) -> Result<(), DbError> {
+    db.0.prepare_cached("UPDATE files SET state = 'stale' WHERE rel_bytes = ?1")?
+        .execute(params![rel_bytes])?;
     Ok(())
 }
 
@@ -1185,8 +1233,11 @@ pub(crate) const PROSE_ORIGIN: &str = "prose";
 /// healthy link. Migration 3 removed the other case this predicate used to catch — an edge pointing at a
 /// note row that had been deleted, now impossible because `dst_note_id` is a foreign key that NULLs
 /// itself — so the join stays for the stale case and the query is unchanged.
+/// The join is on `rel_bytes`, not the display `rel` (F13 §3): once two live rows may spell themselves
+/// identically, joining on that text is a cross product — one edge counted twice, and a stale twin able to
+/// answer for a live one, so the count and the list printed under it could disagree.
 pub(crate) const LIVE_EDGE: &str =
-    "EXISTS (SELECT 1 FROM notes dn JOIN files df ON df.rel = dn.rel \
+    "EXISTS (SELECT 1 FROM notes dn JOIN files df ON df.rel_bytes = dn.rel_bytes \
                                  WHERE dn.id = l.dst_note_id AND df.state = 'ok')";
 
 /// The non-attachment link targets no live note answers: the "notes I could not place" list a scan

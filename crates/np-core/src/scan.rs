@@ -45,6 +45,7 @@ use crate::index_names;
 use crate::items::{extract_items, ItemCandidate};
 use crate::links::{resolve, store_links, RawLink};
 use crate::parse::{body_start, parse_markdown, NoteDoc, PARSE_VERSION};
+use crate::path_keys::RelPath;
 use crate::walk::{self, DiscoveredFile, WalkOptions};
 
 /// The UTF-8 byte order mark: dropped before decoding for parsing, kept in the bytes that are hashed.
@@ -65,8 +66,14 @@ pub const PARSE_VERSION_KEY: &str = "parse_version";
 const TEMP_SUFFIX: &str = ".tmp";
 
 /// A note re-parsed by one scan: its path and the links its text holds, which is everything
-/// [`store_note_links`] needs once the whole corpus is up to date.
-type Parsed = (String, Vec<RawLink>);
+/// [`store_note_links`] needs once the whole corpus is up to date. The path travels in both spellings so the
+/// id lookup that follows can go by bytes (F13 §4.1).
+type Parsed = (RelPath, Vec<RawLink>);
+
+/// The two spellings of one found file, as the write pass and the link pass both need them.
+fn path_of(snapshot: &Snapshot) -> RelPath {
+    RelPath::new(snapshot.rel_bytes.clone(), snapshot.rel.clone())
+}
 
 /// What can fail while scanning a workspace.
 #[derive(Debug, Error)]
@@ -318,8 +325,8 @@ fn is_unknown(found: &Found) -> bool {
 /// exists, and that one *is* charged, which is the safe direction. Charging either would hold
 /// the rules version back forever over rows that do not exist, re-parsing the whole corpus on every scan
 /// to repair nothing — the same mistake the attachment filter above already avoids, one level deeper.
-fn owes_a_reparse(db: &Db, rel: &str, is_markdown: bool) -> Result<bool, DbError> {
-    Ok(is_markdown && note_id(db, rel)?.is_some())
+fn owes_a_reparse(db: &Db, path: &RelPath, is_markdown: bool) -> Result<bool, DbError> {
+    Ok(is_markdown && !matches!(note_row(db, path)?, NoteRow::Missing))
 }
 
 /// Read every discovered file, re-stating each one first, and name the unreadable ones in `skipped`.
@@ -417,27 +424,36 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// so their rows must reach neither a `Removed` nor a move (Task 4 handoff), and leaving them in would
 /// stale a whole subtree over one transient permission error.
 ///
+/// The note test correlates on `rel_bytes`: with twins a note belonging to either file would otherwise
+/// answer for both, and that boolean feeds the refresh-coverage decision, which decides whether
+/// [`PARSE_VERSION_KEY`] gets recorded (F13 §3).
+///
 /// The count alongside the rows is how many live **note** rows that second filter dropped — nothing else
 /// reports them, since they appear nowhere in `found` — which is how [`scan_with_inject`] knows a
 /// parse-rule refresh never reached part of the corpus. Any row with no note behind it is excluded by the
 /// `EXISTS` — attachments and never-yet-parsed paths alike: no parse rule can stale rows that do not exist,
 /// so counting one would pin the version forever over work that is not owed.
 fn known_rows(db: &Db, unreadable: &[String]) -> Result<(Vec<Snapshot>, usize), DbError> {
+    // Both key columns come back, because this is the database side of a byte-keyed comparison: hand out
+    // display text here and every non-UTF-8 row reads as removed-and-re-added on every scan forever, which is
+    // §1's never-converges symptom manufactured by the fix (F13 §4.1).
     let mut statement = db.0.prepare(
-        "SELECT f.rel, f.case_key, f.hash, f.size, f.mtime,
-                EXISTS (SELECT 1 FROM notes n WHERE n.rel = f.rel)
-         FROM files f WHERE f.state = 'ok' ORDER BY f.rel",
+        "SELECT f.rel_bytes, f.case_bytes, f.rel, f.case_key, f.hash, f.size, f.mtime,
+                EXISTS (SELECT 1 FROM notes n WHERE n.rel_bytes = f.rel_bytes)
+         FROM files f WHERE f.state = 'ok' ORDER BY f.rel_bytes",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
             Snapshot {
-                rel: row.get(0)?,
-                case_key: row.get(1)?,
-                hash: row.get(2)?,
-                size: row.get::<_, i64>(3)?.max(0) as u64,
-                mtime: row.get(4)?,
+                rel_bytes: row.get(0)?,
+                case_bytes: row.get(1)?,
+                rel: row.get(2)?,
+                case_key: row.get(3)?,
+                hash: row.get(4)?,
+                size: row.get::<_, i64>(5)?.max(0) as u64,
+                mtime: row.get(6)?,
             },
-            row.get::<_, bool>(5)?,
+            row.get::<_, bool>(7)?,
         ))
     })?;
     // Read out fully here, so the write pass never runs with a read open across it.
@@ -474,24 +490,29 @@ fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
 ///
 /// A path whose identity is already held by another row — two files named `a.md` and `A.md` on a
 /// case-sensitive filesystem, where `files.case_bytes` stays unique and nothing picks a winner — is
-/// reported under `skipped` and left out of the counts instead of aborting the scan (ruling P3).
+/// reported under `skipped` and left out of the counts instead of aborting the scan (ruling P3). So is a path
+/// holding more than one note row ([`NoteRow::Duplicate`]), which no constraint can see.
+///
+/// The pending map is keyed on bytes, like every other identity in the pass (F13 §4.1): keyed on display
+/// `rel`, two twins read back **the same change** from one slot whatever the columns are called.
 fn apply_changes(
     db: &Db,
     found: &[Found],
-    changes: &[(String, Change)],
+    changes: &[(RelPath, Change)],
     refresh: bool,
     now: i64,
     case_sensitive: bool,
     markers: &MarkerConfig,
 ) -> Result<Written, ScanError> {
     let mut written = Written::default();
-    let pending: HashMap<&str, &Change> = changes
+    let pending: HashMap<&[u8], &Change> = changes
         .iter()
-        .map(|(rel, change)| (rel.as_str(), change))
+        .map(|(path, change)| (path.rel_bytes.as_slice(), change))
         .collect();
 
     for readable in found {
         let rel = readable.snapshot.rel.as_str();
+        let path = path_of(&readable.snapshot);
         // An unknown path is already named in the report and contributed only its marker to
         // `classify`; there is nothing here to write, and counting it either way would be a guess.
         if is_unknown(readable) {
@@ -499,13 +520,13 @@ fn apply_changes(
             // those still hold whatever an older build wrote. An attachment, or a note that never got a
             // row, is charged never — there is nothing stale to repair, so charging it would pin the
             // version forever and re-parse the whole corpus on every scan for nothing.
-            if owes_a_reparse(db, rel, readable.is_markdown)? {
+            if owes_a_reparse(db, &path, readable.is_markdown)? {
                 written.uncovered += 1;
             }
             continue;
         }
         // `Removed` is keyed on a path that is not in `found`, so it cannot reach this lookup.
-        let change = pending.get(rel).copied();
+        let change = pending.get(readable.snapshot.rel_bytes.as_slice()).copied();
         match index_file(db, readable, change, refresh, now, case_sensitive, markers)? {
             Indexed::Taken => {
                 written.skipped.push(rel.to_string());
@@ -519,9 +540,17 @@ fn apply_changes(
                 // `rel` here would report full coverage over a note left behind stale.
                 let owed = match change {
                     Some(Change::Moved { from }) => owes_a_reparse(db, from, true)?,
-                    _ => owes_a_reparse(db, rel, readable.is_markdown)?,
+                    _ => owes_a_reparse(db, &path, readable.is_markdown)?,
                 };
                 if owed {
+                    written.uncovered += 1;
+                }
+            }
+            // The path holds more than one note row, so nothing about it was rewritten (F13 §7). Its rows
+            // exist and stay whatever rules wrote them, which is exactly what a refresh has to remember.
+            Indexed::Duplicate => {
+                written.skipped.push(rel.to_string());
+                if owes_a_reparse(db, &path, readable.is_markdown)? {
                     written.uncovered += 1;
                 }
             }
@@ -548,9 +577,9 @@ fn apply_changes(
         }
     }
 
-    for (rel, change) in changes {
+    for (path, change) in changes {
         if matches!(change, Change::Removed) {
-            db::mark_stale(db, rel)?;
+            db::mark_stale(db, &path.rel_bytes)?;
             written.removed += 1;
         }
     }
@@ -563,6 +592,10 @@ enum Indexed {
     Done(Option<Parsed>),
     /// Another path holds this identity, so nothing about this row was touched.
     Taken,
+    /// More than one note row sits on this path's key — a legacy duplicate `notes.rel` never forbade
+    /// (F13 §7). Picking one would rewrite that note's title, tags, items and links with the other's
+    /// contents, so nothing is written and the file is named in `skipped` instead.
+    Duplicate,
 }
 
 /// Bring one found file's row up to date and re-index its contents when they changed, or when `refresh`
@@ -577,14 +610,14 @@ fn index_file(
     markers: &MarkerConfig,
 ) -> Result<Indexed, ScanError> {
     let snapshot = &readable.snapshot;
-    let rel = snapshot.rel.as_str();
+    let path = path_of(snapshot);
     match change {
         Some(Change::Moved { from }) => {
             // One row of `files` moves, and [`db::apply_move`] rewrites that note's own `rel` for it:
             // migration 4 removed `notes.rel`'s foreign key, so the display column has no cascade left to
             // ride. Identity is what survives a rename either way — `notes.rel_bytes` follows its parent —
             // which is what keeps a renamed note the same note with its links attached (see [`crate::db`]).
-            if let Err(err) = db::apply_move(db, from, rel, now) {
+            if let Err(err) = db::apply_move(db, from, &path, now) {
                 return conflict_or_err(err, Indexed::Taken);
             }
         }
@@ -594,8 +627,8 @@ fn index_file(
                 // spelling of the same name — a case-only rename emits no change at all — and upserting
                 // over it would trip `files.case_bytes UNIQUE` instead of renaming the note that is still
                 // the same note (Task 4 handoff).
-                if let Some(old) = folded_row(db, &snapshot.case_key, rel)? {
-                    if let Err(err) = db::apply_move(db, &old, rel, now) {
+                if let Some(old) = folded_row(db, &snapshot.case_bytes, &snapshot.rel_bytes)? {
+                    if let Err(err) = db::apply_move(db, &old, &path, now) {
                         return conflict_or_err(err, Indexed::Taken);
                     }
                 }
@@ -619,18 +652,24 @@ fn index_file(
         // foreign key that used to do it). The same answer
         // decides whether a note without a row is rebuilt (`is_none()` below) and whether
         // [`store_note`] updates or inserts; looking it up again inside `store_note` was F10.
-        let existing = note_id(db, rel)?;
+        let existing = match note_row(db, &path)? {
+            NoteRow::Missing => None,
+            NoteRow::One(id) => Some(id),
+            NoteRow::Duplicate => return Ok(Indexed::Duplicate),
+        };
         if rewritten || existing.is_none() {
-            let doc = parse_markdown(text, file_stem(rel));
+            let doc = parse_markdown(text, file_stem(&path.rel));
             let links = doc.links.clone();
             let items = extract_items(text, markers);
-            store_note(db, rel, existing, text, &doc, &items, readable.lossy)?;
-            return Ok(Indexed::Done(Some((rel.to_string(), links))));
+            store_note(db, &path, existing, text, &doc, &items, readable.lossy)?;
+            return Ok(Indexed::Done(Some((path, links))));
         }
     } else {
         // Nothing to parse, so this is an attachment. Any note row still sitting on this path is a
         // leftover from the rename that made it one (see [`delete_note_row`]).
-        delete_note_row(db, rel)?;
+        if !delete_note_row(db, &path)? {
+            return Ok(Indexed::Duplicate);
+        }
     }
     Ok(Indexed::Done(None))
 }
@@ -658,9 +697,21 @@ fn index_file(
 /// - An orphan can no longer survive this function at all. SQLite hands a deleted rowid to the next
 ///   INSERT, so an inbound edge left pointing at a dead note would eventually claim an unrelated note as
 ///   its destination — which is precisely what `dst_note_id`'s foreign key now rules out.
-fn delete_note_row(db: &Db, rel: &str) -> Result<(), DbError> {
-    let Some(id) = note_id(db, rel)? else {
-        return Ok(());
+/// Returns `false` when the path carries **more than one** note row and nothing was deleted: choosing which
+/// of two notes to destroy is the same guess F13 §7 refuses, so the caller reports the file instead.
+/// `true` means the path is now free of note rows, whether or not one was there.
+fn delete_note_row(db: &Db, path: &RelPath) -> Result<bool, DbError> {
+    let note = note_row(db, path)?;
+    // Two rows on one key: there is no honest choice about which to destroy.
+    if matches!(note, NoteRow::Duplicate) {
+        return Ok(false);
+    }
+    let Some(id) = (match note {
+        NoteRow::One(id) => Some(id),
+        _ => None,
+    }) else {
+        // No note row behind an attachment path, which is already the state wanted.
+        return Ok(true);
     };
     db.0.execute("DELETE FROM headings WHERE note_id = ?1", params![id])?;
     db.0.execute("DELETE FROM tags WHERE note_id = ?1", params![id])?;
@@ -674,7 +725,7 @@ fn delete_note_row(db: &Db, rel: &str) -> Result<(), DbError> {
         params![id],
     )?;
     db.0.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
-    Ok(())
+    Ok(true)
 }
 
 /// Turn a constraint violation into "this path is skipped"; anything else stays an error.
@@ -705,13 +756,23 @@ fn is_identity_conflict(err: &DbError) -> bool {
 }
 
 /// The `rel` of a live row holding `case_key` under a different spelling of the same path.
-fn folded_row(db: &Db, case_key: &str, rel: &str) -> Result<Option<String>, DbError> {
+/// The row holding `case_bytes` under a different byte key — the one a rename has to follow. Matched on the
+/// ASCII byte fold and returning both spellings of the row it finds (F13 §3): once this matched the Unicode
+/// display fold it handed back a *twin* as "another spelling of the same name", and [`index_file`] then moved
+/// a row between two files that both exist. The accepted price is in [`crate::path_keys::case_fold`]'s doc:
+/// a rename that changes only a non-ASCII letter's case stops being followed here.
+fn folded_row(db: &Db, case_bytes: &[u8], rel_bytes: &[u8]) -> Result<Option<RelPath>, DbError> {
     Ok(db
         .0
         .query_row(
-            "SELECT rel FROM files WHERE case_key = ?1 AND rel != ?2",
-            params![case_key, rel],
-            |row| row.get(0),
+            "SELECT rel_bytes, rel FROM files WHERE case_bytes = ?1 AND rel_bytes != ?2",
+            params![case_bytes, rel_bytes],
+            |row| {
+                Ok(RelPath::new(
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            },
         )
         .optional()?)
 }
@@ -739,7 +800,7 @@ fn folded_row(db: &Db, case_key: &str, rel: &str) -> Result<Option<String>, DbEr
 /// `db`).
 fn store_note(
     db: &Db,
-    rel: &str,
+    path: &RelPath,
     existing: Option<i64>,
     text: &str,
     doc: &NoteDoc,
@@ -772,7 +833,7 @@ fn store_note(
         }
         None => db::insert_note(
             db,
-            rel,
+            path,
             &doc.title,
             doc.title_source.as_str(),
             encoding,
@@ -819,13 +880,32 @@ fn store_note(
     Ok(())
 }
 
-/// The note row behind one `rel`, if it has one. Its id is what every derived row hangs off.
-fn note_id(db: &Db, rel: &str) -> Result<Option<i64>, DbError> {
-    Ok(db
-        .0
-        .prepare_cached("SELECT id FROM notes WHERE rel = ?1 LIMIT 1")?
-        .query_row(params![rel], |row| row.get(0))
-        .optional()?)
+/// The note row one path owns, read by byte key.
+#[derive(Debug)]
+enum NoteRow {
+    /// No note behind the path yet — an attachment, or a note this scan has not written.
+    Missing,
+    /// The normal case: exactly one row, whose id every derived row hangs off.
+    One(i64),
+    /// More than one row on the key. Legal at version 3 (`notes.rel` was never `UNIQUE`) and copied onto one
+    /// `rel_bytes` by migration 4, so this is a population the reader has to name rather than pretend not to
+    /// have (F13 §7).
+    Duplicate,
+}
+
+/// How many note rows sit behind one path's byte key, and which one if there is a single answer.
+///
+/// **No `LIMIT 1`** (F13 §3): the old single-row read is what made a legacy duplicate silently *wrong* rather
+/// than loud — it handed one file's title, tags, items and links to the other file's note. Refusing with an
+/// error was the other wrong answer: it would make a workspace holding one old duplicate impossible to scan
+/// ever again. So the count travels back to the caller, which reports the file under `skipped`, rewrites no
+/// note, and carries on.
+fn note_row(db: &Db, path: &RelPath) -> Result<NoteRow, DbError> {
+    Ok(match db::note_ids(db, &path.rel_bytes)?.as_slice() {
+        [] => NoteRow::Missing,
+        [only] => NoteRow::One(*only),
+        _ => NoteRow::Duplicate,
+    })
 }
 
 /// Place and store the links of every note this scan re-parsed.
@@ -840,23 +920,31 @@ fn store_note_links(db: &Db, parsed: &[Parsed]) -> Result<(), DbError> {
     store_links(db, &resolved, PROSE_ORIGIN)
 }
 
-/// `case_key` → every live path carrying that fold: the corpus [`crate::links::resolve`] places targets in.
+/// `case_key` → every live row carrying that fold: the corpus [`crate::links::resolve`] places targets in.
+///
+/// Each entry is a [`RelPath`], so a placed target names the row it landed on rather than a spelling two
+/// rows may share; matching still happens entirely on display text, which is the author's question (F13 §4.1).
 ///
 /// A `Vec` rather than the one `rel` an earlier build kept, because `files.case_key` stopped being unique
 /// with migration 4 (F13 §3): `Ämli.md` beside `ämli.md` is two files whose display fold is one string, so
 /// `insert` would have handed the fold to whichever row was read last and a link naming that fold would land
 /// on it by iteration order. Listing both is what lets resolution see the ambiguity and decline, exactly as
 /// [`crate::links`] already models an ambiguous basename. A fold with one owner still resolves.
-fn live_corpus(db: &Db) -> Result<BTreeMap<String, Vec<String>>, DbError> {
-    let mut statement =
-        db.0.prepare("SELECT case_key, rel FROM files WHERE state = 'ok' ORDER BY case_key, rel")?;
+fn live_corpus(db: &Db) -> Result<BTreeMap<String, Vec<RelPath>>, DbError> {
+    let mut statement = db.0.prepare(
+        "SELECT case_key, rel_bytes, rel FROM files WHERE state = 'ok'
+         ORDER BY case_key, rel_bytes",
+    )?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            RelPath::new(row.get::<_, Vec<u8>>(1)?, row.get::<_, String>(2)?),
+        ))
     })?;
-    let mut corpus: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut corpus: BTreeMap<String, Vec<RelPath>> = BTreeMap::new();
     for row in rows {
-        let (case_key, rel) = row?;
-        corpus.entry(case_key).or_default().push(rel);
+        let (case_key, path) = row?;
+        corpus.entry(case_key).or_default().push(path);
     }
     Ok(corpus)
 }
@@ -866,23 +954,28 @@ fn live_corpus(db: &Db) -> Result<BTreeMap<String, Vec<String>>, DbError> {
 /// Live rows only, joined through `files`, so a stale note leaves the catalog while its rows stay in the
 /// database (spec §2). Tags come back in insertion order, which is the note's own order, because the
 /// renderer prints them as written.
+/// The join and the order are both on `rel_bytes` (F13 §3). On display `rel` two rows on each side of one
+/// spelling is a cross product, so the catalog gained duplicate entries carrying wrong link counts; and for
+/// twins that spelling is *identical*, so a display `ORDER BY` orders nothing and the rendered bytes fell to
+/// whichever row SQLite happened to read.
 fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
     let mut statement = db.0.prepare(
-        "SELECT n.id, n.rel, n.title, f.size
-           FROM notes n JOIN files f ON f.rel = n.rel
+        "SELECT n.id, n.rel_bytes, n.rel, n.title, f.size
+           FROM notes n JOIN files f ON f.rel_bytes = n.rel_bytes
           WHERE f.state = 'ok'
-          ORDER BY n.rel",
+          ORDER BY n.rel_bytes",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, i64>(3)?.max(0) as u64,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, i64>(4)?.max(0) as u64,
         ))
     })?;
     // Read out fully before the counts run, so no read is open across another statement.
-    let mut live: Vec<(i64, String, Option<String>, u64)> = Vec::new();
+    let mut live: Vec<(i64, Vec<u8>, String, Option<String>, u64)> = Vec::new();
     for row in rows {
         live.push(row?);
     }
@@ -906,7 +999,7 @@ fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
 
     Ok(live
         .into_iter()
-        .map(|(id, rel, title, size)| CatalogEntry {
+        .map(|(id, rel_bytes, rel, title, size)| CatalogEntry {
             title: title
                 .filter(|title| !title.is_empty())
                 .unwrap_or_else(|| file_name(&rel).to_string()),
@@ -914,6 +1007,7 @@ fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
             tags: tags.get(&id).cloned().unwrap_or_default(),
             out: count_of(&out, id),
             inc: count_of(&inc, id),
+            rel_bytes,
             rel,
         })
         .collect())

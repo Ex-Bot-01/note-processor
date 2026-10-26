@@ -19,15 +19,22 @@ use crate::walk::{self, DiscoveredFile};
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// What is known about one file at one moment: enough to classify what happened to it,
-/// and enough to store in the registry row. `rel`, `case_key`, `size` and `mtime` come
-/// from [`crate::walk::DiscoveredFile`]; `hash` comes from [`sha256_file`] over its
+/// and enough to store in the registry row. `rel_bytes`, `case_bytes`, `rel`, `case_key`, `size` and
+/// `mtime` come from [`crate::walk::DiscoveredFile`]; `hash` comes from [`sha256_file`] over its
 /// contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// Path relative to the workspace root, `/`-separated, in the spelling the
-    /// filesystem gave.
+    /// The identity: OS bytes of the `/`-separated path. Both sides of every comparison key on this and
+    /// on [`Snapshot::case_bytes`] — matching two snapshots by display `rel` is what merged `caf\xe9.md`
+    /// with `caf\xe8.md` before F13 §4.1.
+    pub rel_bytes: Vec<u8>,
+    /// [`crate::path_keys::case_fold`] of [`Snapshot::rel_bytes`]: the identity on a case-insensitive
+    /// filesystem.
+    pub case_bytes: Vec<u8>,
+    /// Display spelling of the path, `/`-separated — reports and registry rows only.
     pub rel: String,
-    /// `rel` lowercased — the identity a case-insensitive filesystem works with.
+    /// `rel` lowercased — the Unicode display fold link resolution reads. Not an identity: two live
+    /// rows share it whenever their names differ only in a non-ASCII letter.
     pub case_key: String,
     /// Lowercase-hex sha256 of the contents. **An empty string is a marker, not a
     /// digest**: it means the file could not be read, and [`crate::change::classify`]
@@ -42,13 +49,16 @@ pub struct Snapshot {
 impl Snapshot {
     /// The snapshot of one discovered file with the given content digest.
     ///
-    /// `rel` and `case_key` travel together from [`DiscoveredFile`] rather than being spelled out
-    /// at each call site, because [`crate::change::classify`] matches identity on one and reports
-    /// the other: a snapshot whose `case_key` is not its own `rel` lowercased would match files
-    /// that are not it. Pass an empty `hash` for a file whose contents could not be read — that
-    /// is the marker [`crate::change::classify`] reads as "unknown".
+    /// All four spellings travel together from [`DiscoveredFile`] rather than being spelled out at each
+    /// call site, because [`crate::change::classify`] matches identity on the byte keys and reports the
+    /// display text: a snapshot whose `case_bytes` is not the fold of its own `rel_bytes`, or whose
+    /// `case_key` is not its own `rel` lowercased, would match files that are not it. Pass an empty
+    /// `hash` for a file whose contents could not be read — that is the marker
+    /// [`crate::change::classify`] reads as "unknown".
     pub fn new(found: &DiscoveredFile, hash: String) -> Self {
         Snapshot {
+            rel_bytes: found.rel_bytes.clone(),
+            case_bytes: found.case_bytes.clone(),
             rel: found.rel.clone(),
             case_key: found.case_key.clone(),
             hash,
