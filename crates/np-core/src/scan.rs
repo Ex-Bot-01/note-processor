@@ -128,13 +128,15 @@ pub struct ScanReport {
     pub unchanged: usize,
     /// Paths this scan could not index and left untouched: directories it could not read, files that
     /// vanished or changed between walk and read, paths whose identity is already taken, a name the byte
-    /// spelling cannot hold (F18 — one line per path refused, which is not one line per display spelling), a
-    /// catalog temporary it could not remove (see `clear_temp_corpses`), and a root entry wearing a generated
-    /// catalog name that this program did not publish — left on disk and named here instead of deleted.
-    /// Sorted and deduplicated by the path's **bytes**, printed as display text (F20): two byte-distinct paths
-    /// sharing one lossy spelling print two lines, which look alike because the report can only name them
-    /// alike. Two identical-looking lines are therefore not a duplicate to clean up later — they are two paths
-    /// this scan lost, and collapsing them would hide one.
+    /// spelling cannot hold (F18), a catalog temporary it could not remove (see `clear_temp_corpses`), and a root
+    /// entry wearing a generated catalog name that this program did not publish — left on disk and named here
+    /// instead of deleted.
+    /// Sorted and deduplicated by the path's **bytes**, printed as display text (F20). Where the keys differ, two
+    /// paths print two lines that look alike, because the report can name them no differently — they are not a
+    /// duplicate to clean up later, and collapsing them would hide one lost path. Where the key is itself lossy —
+    /// a Windows refusal, whose identity bytes come from `to_string_lossy` — two names still share a single line,
+    /// which `crates/np-core/tests/walk.rs` pins. So this list is a floor on what the scan lost, never a count of
+    /// it.
     pub skipped: Vec<String>,
     /// Live note rows — the same number of entries the catalog holds (spec §2).
     pub notes: i64,
@@ -515,10 +517,10 @@ fn known_rows(
         ))
     })?;
     // The fallback's other side, built once per scan rather than per row: the same unknown paths spelled as
-    // text, for the rows that have no other spelling to be read by. Both lists are empty in the common case, so
-    // a workspace with nothing hidden pays nothing.
+    // text, for the rows that have no other spelling to be read by. Empty in the common case, so a workspace with
+    // nothing hidden pays nothing. Only the **unreadable** list gets this: see [`key_is_display_derived`] for why
+    // the refused-name arm needs no text side.
     let unreadable_display = display_spelled(unreadable);
-    let unrepresentable_display = display_spelled(unrepresentable);
     // Read out fully here, so the write pass never runs with a read open across it.
     let mut known = Vec::new();
     let mut hidden = 0_usize;
@@ -527,11 +529,7 @@ fn known_rows(
         // Bytes first: that is the identity, and for any row the walk keyed it this is the whole answer.
         let unknown = is_unknown_path(&snapshot.rel_bytes, unreadable, unrepresentable)
             || (key_is_display_derived(&snapshot.rel, &snapshot.rel_bytes)
-                && is_unknown_path(
-                    snapshot.rel.as_bytes(),
-                    &unreadable_display,
-                    &unrepresentable_display,
-                ));
+                && under_unreadable(snapshot.rel.as_bytes(), &unreadable_display));
         if unknown {
             if is_note {
                 hidden += 1;
@@ -600,16 +598,26 @@ fn is_unknown_path(
 /// `63 61 66 EF BF BD 2F 6E 6F 74 65 2E 6D 64`: the `U+FFFD` spelling of a name whose bytes no `String` holds
 /// (`docs/design-f13-byte-paths.md` §4.2, and `crates/np-core/tests/db.rs` proves such rows ship).
 ///
-/// Both halves of the test are what keep this legacy rather than general, so that F20's byte matching stays
-/// the rule for every row written from now on: a key that differs from its row's display bytes came off the
-/// disk, and a `rel` with no `U+FFFD` in it has one spelling — either way [`is_unknown_path`] already decided
-/// the row exactly as it did before this fallback existed. Only a row failing both halves is text-keyed, and
-/// text is all such a row ever held.
+/// Both halves of the test keep this to rows whose key **is** their own display text, which is what F20's byte
+/// matching cannot judge: a key differing from its row's display bytes came off the disk, and a `rel` with no
+/// `U+FFFD` in it has one spelling — either way [`is_unknown_path`] already decided the row exactly as it did
+/// before this fallback existed.
 ///
-/// A row stops needing the fallback the first time a scan can **see** its path: the walk lists the real bytes,
-/// [`crate::change`] pairs them with this row by hash, and [`crate::db::apply_move`] rewrites `rel_bytes` from
-/// the walk (F13 §4.2's one-time churn). The display text stays lossy after that, but the key no longer equals
-/// it, so only the byte arm can match the row again.
+/// Do not read that as a class only old databases hold. A name that genuinely contains `U+FFFD` (the bytes
+/// `EF BF BD`, valid UTF-8, creatable on Linux today) satisfies both halves forever, because for it the key really
+/// is the OS bytes; and on Windows every lossily-named row qualifies, since [`crate::path_keys::os_bytes`] has no
+/// byte spelling for a UTF-16 name. In those cases the text arm is just the byte arm again — same bytes, same
+/// answer — which is why widening here costs nothing they were not already paying.
+///
+/// A migrated row leaves the class only when a scan sees its path **and** pairs it by hash, so
+/// [`crate::db::apply_move`] rewrites `rel_bytes` from the walk (F13 §4.2's one-time churn). Nothing else does:
+/// an unchanged row is refreshed in place and keeps the key it has, so this fallback is not transitional for the
+/// cases above — say "until someone renames it", not "until the next scan".
+///
+/// The refused-name arm gets no text side, deliberately: a refusal entry's own bytes are lossy wherever refusals
+/// happen (Windows keys them from `to_string_lossy`, so they already equal a qualifying row's key and the byte arm
+/// matches), and on Unix nothing is ever refused ([`crate::path_keys::name_is_lossless`] accepts every byte a Unix
+/// name holds). A fallback there would be an untestable branch, not a safety net.
 fn key_is_display_derived(rel: &str, rel_bytes: &[u8]) -> bool {
     rel.contains('\u{FFFD}') && rel_bytes == crate::path_keys::rel_bytes_of_display(rel)
 }
@@ -618,9 +626,9 @@ fn key_is_display_derived(rel: &str, rel_bytes: &[u8]) -> bool {
 /// [`UnknownPath::display`] and takes that text as its bytes, exactly as [`UnknownPath::from_display`] does for
 /// a path that only ever existed as text.
 ///
-/// Matching these against a legacy row's `rel` is deliberately **wider** than the byte comparison, and only for
-/// such rows: one `caf\u{FFFD}` entry then hides a legacy row whichever twin its bytes came from, so a migrated
-/// note can be over-hidden — left out of `known`, out of one refresh, reported nothing — where strict byte
+/// Matching these against such a row's `rel` is deliberately **wider** than the byte comparison, and only for
+/// those rows: one `caf\u{FFFD}` entry then hides it whichever twin its bytes came from, so the note can be
+/// over-hidden — left out of `known`, out of one refresh, reported nothing — where strict byte
 /// matching would have called it `Removed`. That asymmetry is the whole argument: over-hiding is churn that
 /// heals on the next scan that can read the directory, while a false `Removed` stales a live note, drops it from
 /// the catalog, under-charges the refresh gap so [`PARSE_VERSION_KEY`] is recorded over rows nobody re-parsed,

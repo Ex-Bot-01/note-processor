@@ -69,6 +69,13 @@ pub struct UnknownPath {
 2. **Unknown is not absent.** No path may become `Removed` because its directory was unreadable or refused — that is
    the invariant F13 §1 and F18 built, and byte matching narrows who is unknown, so the risk is *over*-reporting
    deletions. The existing mode-000-directory and vanished-directory tests must pass unchanged in their assertions.
+   **The exception round 1 had to add** (review `d2cbf5de`): a row whose stored key *is* its display text has no byte
+   spelling left to match, so it is compared text against text — migration 4 keyed every row through
+   `rel_bytes_of_display`, and without the fallback a live note behind an unreadable directory went back to being
+   reported `Removed`. Over-hiding such a row is churn; under-hiding it is data loss. The class is **not** only
+   migrated rows: a name genuinely holding `U+FFFD`, and every Windows lossy name, qualify permanently — there the
+   text arm and the byte arm agree anyway. A migrated row leaves the class when a scan pairs its path by hash so
+   `apply_move` rewrites `rel_bytes`; an unchanged row keeps its key forever, so no doc may call this transitional.
 3. **No new fold or key definition outside `path_keys`.** This round consumes `rel_bytes`; it defines no spelling of
    its own. If a builder needs bytes it calls `normalize_rel`, never `to_string_lossy().into_bytes()`.
 4. **Charge once.** After the fix, one note behind one unknown path is charged in exactly one of
