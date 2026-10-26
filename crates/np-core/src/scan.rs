@@ -21,8 +21,10 @@
 //!   `files.state = 'ok'`; [`crate::db::note_counts`] stays the unfiltered database truth, because a
 //!   stale note is hidden from the catalog, not forgotten (spec §2).
 //! - **`INDEX.md` and its shards are the only names this module creates, and it deletes only the ones
-//!   that open with its own generated header** (spec §7): a name alone never licenses a removal. Every
-//!   write goes through a temporary file plus `rename`, and no note body is ever opened for writing.
+//!   that open with its own generated header** (spec §7): a name alone never licenses a removal. The
+//!   names themselves come from [`index_names`], which owns their spelling; what this module owns is the
+//!   fingerprint deciding which of them are ours to replace. Every write goes through a temporary file
+//!   plus `rename`, and no note body is ever opened for writing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -39,6 +41,7 @@ use crate::change::{classify, Change};
 use crate::config::{abs_path, Config, ConfigError, MarkerConfig, WorkspaceRegistry};
 use crate::db::{self, Db, DbError, LIVE_EDGE, PROSE_ORIGIN};
 use crate::hash::{sha256_bytes, sha256_file, Snapshot};
+use crate::index_names;
 use crate::items::{extract_items, ItemCandidate};
 use crate::links::{resolve, store_links, RawLink};
 use crate::parse::{body_start, parse_markdown, NoteDoc, PARSE_VERSION};
@@ -58,10 +61,6 @@ const INDEX_FILES_KEY: &str = "index_files";
 /// were written with. Absent means "written before this mechanism existed", which is not a version to
 /// compare against and therefore refreshes; see the comparison in `refresh_needed`.
 pub const PARSE_VERSION_KEY: &str = "parse_version";
-/// The catalog's entry point, which [`catalog::render`] returns first and every reader opens. It is
-/// renamed **last** (see [`write_index_files`]): an entry point naming shards that were never written is
-/// a broken catalog, while one that is merely old is still a correct one.
-const CATALOG_ENTRY: &str = "INDEX.md";
 /// Suffix of the temporary file every catalog write goes through before its `rename`.
 const TEMP_SUFFIX: &str = ".tmp";
 
@@ -1139,10 +1138,11 @@ fn write_index_files(
     // a root that cannot be listed fails the scan before it has touched anything.
     let superseded = superseded_names(root, rendered, previous)?;
 
-    for (name, contents) in rendered.iter().filter(|(name, _)| name != CATALOG_ENTRY) {
+    let entry_point = index_names::ENTRY;
+    for (name, contents) in rendered.iter().filter(|(name, _)| *name != entry_point) {
         publish(root, name, contents)?;
     }
-    for (name, contents) in rendered.iter().filter(|(name, _)| name == CATALOG_ENTRY) {
+    for (name, contents) in rendered.iter().filter(|(name, _)| *name == entry_point) {
         publish(root, name, contents)?;
     }
 
@@ -1166,8 +1166,8 @@ fn write_index_files(
 /// would ever delete it. The listing sees reality instead, and the union covers both directions — which
 /// is also what lets `meta` be committed ahead of the files.
 ///
-/// Both sources are filtered by [`walk::is_generated_index`], which only decides what is *worth asking
-/// about*. What decides what is ours to remove is the file's own fingerprint: a candidate is deleted only
+/// Both sources are filtered by [`index_names::is_generated_index`], which only decides what is *worth
+/// asking about*. What decides what is ours to remove is the file's own fingerprint: a candidate is deleted only
 /// when it is a regular file opening with [`catalog::HEADER`] byte for byte, in either its LF or its CRLF
 /// spelling (see [`np_published`]). A name that merely looks generated belongs to somebody else — a
 /// hand-written `INDEX-old.md` in the root is never indexed, because [`walk`] excludes these names, so
@@ -1205,7 +1205,7 @@ fn superseded_names(
             source,
         })?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !walk::is_generated_index(&name) {
+        if !index_names::is_generated_index(&name) {
             continue;
         }
         // The file type is asked before the contents: a directory has no header to read, and letting
@@ -1221,7 +1221,7 @@ fn superseded_names(
     names.extend(
         previous
             .iter()
-            .filter(|name| walk::is_generated_index(name))
+            .filter(|name| index_names::is_generated_index(name))
             .cloned(),
     );
     names.sort();
@@ -1318,7 +1318,7 @@ fn publish(root: &Path, name: &str, contents: &str) -> Result<(), ScanError> {
 
 /// Remove the `INDEX*.tmp` files a rename that died left behind.
 ///
-/// A temporary name is not one [`walk::is_generated_index`] recognises, so an orphaned corpse left by a
+/// A temporary name is not one [`index_names::is_generated_index`] recognises, so an orphaned corpse left by a
 /// killed `rename` would be walked, hashed and catalogued-as-nothing as an ordinary attachment, and
 /// nothing would ever clean it up. That is why [`scan`] calls this before the walk rather than where the
 /// temporaries are made: cleaned up on the way out, the corpse would still be indexed once by its own
@@ -1332,7 +1332,8 @@ fn publish(root: &Path, name: &str, contents: &str) -> Result<(), ScanError> {
 /// when the walk looks — and the next scan tries again.
 ///
 /// One limitation to know before someone widens this: cleanup is **root-only**, while
-/// [`walk::is_generated_index`] excludes generated names only at depth 1 — so a `notes/INDEX.md.tmp`
+/// [`index_names::is_generated_index`] is applied by [`crate::walk`] to root-level names only (depth 1) —
+/// so a `notes/INDEX.md.tmp`
 /// would be indexed as an attachment forever. It is unreachable today because [`publish`] joins the root
 /// alone and no other code makes these names.
 fn clear_temp_corpses(root: &Path) -> Result<Vec<String>, ScanError> {
@@ -1363,7 +1364,7 @@ fn remove_corpses(
             continue;
         };
         let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        if !walk::is_generated_index(stem) || is_dir {
+        if !index_names::is_generated_index(stem) || is_dir {
             continue;
         }
         if let Err(source) = remove(&entry.path()) {

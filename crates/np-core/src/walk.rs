@@ -12,6 +12,8 @@ use std::time::SystemTime;
 use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::index_names;
+
 /// Paths of this many characters or more need the Windows extended-length prefix
 /// (spec §11: `\\?\` above 260 chars).
 const LONG_PATH_CHARS: usize = 260;
@@ -19,11 +21,8 @@ const LONG_PATH_CHARS: usize = 260;
 const WINDOWS_PREFIX: &str = r"\\?\";
 /// Regenerated compressed copies live here; derived output, never an input (spec §7).
 const PROCESSED_DIR: &str = "processed";
-/// Stem of the catalog file this program writes at the workspace root (spec §7).
-const INDEX_STEM: &str = "INDEX";
-/// Shards of a catalog too big for one file: `INDEX-<range>.md`.
-const INDEX_SHARD_PREFIX: &str = "INDEX-";
-/// Markdown extension, matched against the already-lowercased `rel`.
+/// Markdown extension, matched against the already-lowercased `rel`. Whether a name is one of the catalog
+/// files this program writes is a different question, and [`crate::index_names`] answers it.
 const MARKDOWN_SUFFIX: &str = ".md";
 
 /// What can fail while discovering a workspace.
@@ -221,23 +220,14 @@ fn is_skipped(entry: &DirEntry, extra_excludes: &[String]) -> bool {
             return true;
         }
     }
-    entry.depth() == 1 && is_generated_index(&name)
+    // Generated catalog names are written at the root alone, so this exclusion applies only one level
+    // below it; a nested `INDEX-old.md` is an ordinary note.
+    entry.depth() == 1 && index_names::is_generated_index(&name)
 }
 
 /// Names excluded at every depth: dot-files, dot-directories and `processed/`.
 fn is_excluded(name: &str) -> bool {
     name.starts_with('.') || name == PROCESSED_DIR
-}
-
-/// The catalog files this program writes itself — `INDEX.md` and its shards. They are
-/// derived output placed at the workspace root (spec §7), so a nested `INDEX-old.md`
-/// is an ordinary note and this exclusion applies only one level below the root.
-/// Matching is exact-case because these names are ours to write.
-pub(crate) fn is_generated_index(name: &str) -> bool {
-    match name.strip_suffix(MARKDOWN_SUFFIX) {
-        Some(stem) => stem == INDEX_STEM || stem.starts_with(INDEX_SHARD_PREFIX),
-        None => false,
-    }
 }
 
 /// The record for one regular file, or `None` when its metadata cannot be read — a
@@ -285,7 +275,7 @@ pub(crate) fn epoch_secs(meta: &fs::Metadata) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_excluded, is_generated_index, normalize_rel, sort_found, DiscoveredFile};
+    use super::{is_excluded, normalize_rel, sort_found, DiscoveredFile};
     use std::path::Path;
 
     #[test]
@@ -302,16 +292,6 @@ mod tests {
     fn normalize_rel_of_the_root_is_empty() {
         assert_eq!(normalize_rel(Path::new("")).0, "");
         assert_eq!(normalize_rel(Path::new(".")).0, "");
-    }
-
-    #[test]
-    fn generated_index_names_are_recognised_at_exact_case() {
-        for name in ["INDEX.md", "INDEX-a-m.md", "INDEX-1-600.md"] {
-            assert!(is_generated_index(name), "{name} is generated");
-        }
-        for name in ["INDEX-old.txt", "index.md", "My-INDEX.md", "notes.md"] {
-            assert!(!is_generated_index(name), "{name} is not generated");
-        }
     }
 
     #[test]

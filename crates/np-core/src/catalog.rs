@@ -7,6 +7,7 @@
 //! changes only (spec §10, line format §14).
 
 use crate::config::CatalogConfig;
+use crate::index_names;
 
 /// Fixed prologue of every generated file, so a shard opened on its own still says what it is.
 ///
@@ -72,7 +73,7 @@ pub fn size_human(bytes: u64) -> String {
 /// corpus renders byte-identically. Once sharded, `INDEX.md` holds only shard links and every
 /// entry lands in exactly one shard; file names are made unique by a positional suffix, because a
 /// bucket larger than the threshold would otherwise produce several `INDEX-m-m.md` files and
-/// silently overwrite all but one.
+/// silently overwrite all but one. Every name comes from [`crate::index_names`], which owns the spelling.
 pub fn render(entries: &[CatalogEntry], cfg: &CatalogConfig) -> Vec<(String, String)> {
     let mut ordered: Vec<&CatalogEntry> = entries.iter().collect();
     ordered.sort_by(|left, right| sort_key(left).cmp(&sort_key(right)));
@@ -84,35 +85,32 @@ pub fn render(entries: &[CatalogEntry], cfg: &CatalogConfig) -> Vec<(String, Str
 
     let per_file = cfg.max_entries_per_file.max(1);
     if lines.len() <= per_file {
-        return vec![("INDEX.md".to_string(), file(&lines))];
+        return vec![(index_names::ENTRY.to_string(), file(&lines))];
     }
 
-    // `seen` counts how often a `<first>-<last>` range already occurred; a repeat gets the
-    // occurrence number appended so no shard is written over an earlier one. A vector rather than
-    // a map keeps the render path free of iteration order that could leak into the bytes.
-    let mut seen: Vec<(String, usize)> = Vec::new();
+    // `seen` counts how often one bucket range already occurred; a repeat gets the occurrence number
+    // appended to its shard name so no shard is written over an earlier one. The key is the pair of bucket
+    // characters, not a spelled-out range: the name itself is built by [`crate::index_names`], which owns
+    // that spelling. A vector rather than a map keeps the render path free of iteration order that could
+    // leak into the bytes.
+    let mut seen: Vec<((char, char), usize)> = Vec::new();
     let mut links: Vec<String> = Vec::new();
     let mut shards: Vec<(String, String)> = Vec::new();
 
     for (entry_chunk, line_chunk) in ordered.chunks(per_file).zip(lines.chunks(per_file)) {
         let first = bucket_key(&entry_chunk[0].title);
         let last = bucket_key(&entry_chunk[entry_chunk.len() - 1].title);
-        let range = format!("{first}-{last}");
-        let occurrence = match seen.iter_mut().find(|(seen, _)| *seen == range) {
+        let occurrence = match seen.iter_mut().find(|(range, _)| *range == (first, last)) {
             Some(entry) => {
                 entry.1 += 1;
                 entry.1
             }
             None => {
-                seen.push((range.clone(), 1));
+                seen.push(((first, last), 1));
                 1
             }
         };
-        let name = if occurrence == 1 {
-            format!("INDEX-{range}.md")
-        } else {
-            format!("INDEX-{range}-{occurrence}.md")
-        };
+        let name = index_names::shard_name(first, last, occurrence);
         let label = if occurrence == 1 {
             format!("[{first}\u{2013}{last}]")
         } else {
@@ -124,7 +122,7 @@ pub fn render(entries: &[CatalogEntry], cfg: &CatalogConfig) -> Vec<(String, Str
     }
 
     let mut rendered = Vec::with_capacity(shards.len() + 1);
-    rendered.push(("INDEX.md".to_string(), file(&links)));
+    rendered.push((index_names::ENTRY.to_string(), file(&links)));
     rendered.extend(shards);
     rendered
 }
