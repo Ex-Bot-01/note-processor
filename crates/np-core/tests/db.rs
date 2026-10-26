@@ -16,8 +16,8 @@ mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::db::{
-    apply_move, mark_stale, note_counts, upsert_file, Db, DbError, NoteCounts, FK_ORPHANS_KEY,
-    MIGRATIONS,
+    apply_move, mark_stale, note_counts, upsert_file, Db, DbError, Migration, NoteCounts,
+    FK_ORPHANS_KEY, MIGRATIONS, PATHS_LOSSY_KEY,
 };
 use np_core::hash::Snapshot;
 use tempfile::TempDir;
@@ -829,6 +829,524 @@ fn a_file_whose_data_cannot_satisfy_the_keys_refuses_to_upgrade() {
         one("SELECT COUNT(*) FROM notes WHERE id = 77"),
         1,
         "and it removed nothing either"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Migration 4 — the byte keys (F13 round 1). The fixture below is the shape a database holds *before*
+// that step runs, so it is written out here rather than produced by the code under test.
+// ---------------------------------------------------------------------------------------------
+
+/// The schema as of version 3: migration 1's two registry tables exactly as they still stand at that
+/// version, plus the four child tables in the shape migration 3 rebuilds them into (its own `DROP` and
+/// `RENAME` leave nothing behind to read, so the rebuilt definitions are copied here). Copied verbatim and
+/// deliberately **not** read from [`MIGRATIONS`] — like [`VERSION_TWO`] this fixture is history, and
+/// migration 4 has to upgrade the shape a database on disk already holds.
+const VERSION_THREE: &str = r#"
+CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+
+CREATE TABLE files (
+    rel       TEXT    PRIMARY KEY,
+    case_key  TEXT    NOT NULL UNIQUE,
+    abs       TEXT    NOT NULL,
+    hash      TEXT    NOT NULL,
+    size      INTEGER NOT NULL,
+    mtime     INTEGER NOT NULL,
+    state     TEXT    NOT NULL CHECK (state IN ('ok','stale')),
+    last_seen INTEGER NOT NULL
+);
+CREATE INDEX files_case_key ON files(case_key);
+
+CREATE TABLE notes (
+    id           INTEGER PRIMARY KEY,
+    rel          TEXT REFERENCES files(rel) ON UPDATE CASCADE,
+    title        TEXT,
+    title_source TEXT,
+    encoding     TEXT,
+    word_count   INTEGER,
+    body         TEXT
+);
+CREATE INDEX notes_rel ON notes(rel);
+
+CREATE TABLE headings (
+    note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    level   INTEGER NOT NULL,
+    text    TEXT    NOT NULL,
+    line    INTEGER NOT NULL
+);
+
+CREATE TABLE tags (
+    note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    tag     TEXT NOT NULL
+);
+CREATE INDEX tags_tag ON tags(tag);
+
+CREATE TABLE links (
+    src_note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    dst_note_id INTEGER REFERENCES notes(id) ON DELETE SET NULL,
+    kind        TEXT    NOT NULL CHECK (kind IN ('wiki','md','attachment')),
+    target      TEXT    NOT NULL,
+    line        INTEGER NOT NULL,
+    origin      TEXT    NOT NULL CHECK (origin IN ('prose','approved'))
+);
+CREATE INDEX links_dst_note_id ON links(dst_note_id);
+
+CREATE TABLE items (
+    note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    text    TEXT NOT NULL,
+    line    INTEGER NOT NULL,
+    state   TEXT NOT NULL CHECK (state IN ('open','done','paused')),
+    marker  TEXT
+);
+
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+INSERT INTO schema_version (version) VALUES (1), (2), (3);
+"#;
+
+/// Write a version-three database for [`a_version_three_database_upgrades_without_moving_anything`] and
+/// [`the_byte_key_migration_refuses_to_run_while_enforcement_is_on`], holding every shape migration 4 has
+/// to carry across without moving a byte:
+///
+/// - six `files` rows with different names — plain ASCII, a name that is valid UTF-8 but not ASCII, and a
+///   name whose display fold needs Unicode (`ẞ`) — so one `case_bytes` value bound for the whole copy,
+///   which passes a one-row fixture, cannot pass this one;
+/// - an **attachment** row (`img/logo.png`) with no note at all. It has no child, so nothing cascades if
+///   the copy loses it and `PRAGMA foreign_key_check` stays clean while the `DROP` destroys it: only the
+///   old-versus-new `COUNT(*)` of `files` can see that row (F13 §4);
+/// - one `state = 'stale'` row and a note whose children survive anyway, with **gaps in the note ids**
+///   (`1, 2, 5, 7`) so a re-mint hands out `1, 2, 3, 4` and fails;
+/// - note 1 and the stale note 5 each have child rows in all four derived tables, which are the four
+///   cascades `DROP TABLE notes` would ride with enforcement on.
+fn seed_version_three(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_THREE)
+        .expect("test setup: version-three schema");
+    conn.execute_batch(
+        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
+            ('a.md', 'a.md', '/ws/a.md', 'ha', 11, 101, 'ok', 901),
+            ('b.md', 'b.md', '/ws/b.md', 'hb', 12, 102, 'ok', 902),
+            ('c.md', 'c.md', '/ws/c.md', 'hc', 13, 103, 'stale', 903),
+            ('img/logo.png', 'img/logo.png', '/ws/img/logo.png', 'hp', 14, 104, 'ok', 904),
+            ('Straße/Ärger.md', 'straße/ärger.md', '/ws/Straße/Ärger.md', 'hs', 15, 105, 'ok', 905),
+            ('STRASSE-ẞ.md', 'strasse-ß.md', '/ws/STRASSE-ẞ.md', 'ht', 16, 106, 'ok', 906);
+         INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
+            (1, 'a.md', 'A', 'filename', 'utf-8', 3, 'a'),
+            (2, 'b.md', 'B', 'filename', 'utf-8', 3, 'b'),
+            -- Note 5 belongs to the stale file and note 7 to the non-ASCII name. The ids are not
+            -- consecutive on purpose: copying `id` rather than re-minting it is what keeps every derived
+            -- row attached (F13 §4), and a fresh 1..=4 would otherwise look identical.
+            (5, 'c.md', 'C', 'filename', 'utf-8', 3, 'c'),
+            (7, 'Straße/Ärger.md', 'Ärger', 'filename', 'utf-8', 3, 's');
+         -- Child rows: notes 1 and 5 each own a row in all four tables, note 7 has a heading, a tag and an
+         -- inbound edge, and one edge is unresolved so a NULL destination crosses the migration too.
+         INSERT INTO headings (note_id, level, text, line) VALUES
+            (1, 2, 'A heading', 1), (7, 1, 'Überschrift', 3), (5, 2, 'C heading', 8);
+         INSERT INTO tags (note_id, tag) VALUES (1, 'keep'), (2, 'both'), (5, 'old'), (7, 'straße');
+         INSERT INTO items (note_id, text, line, state, marker) VALUES
+            (1, 'task', 2, 'open', '- [ ]'), (5, 'old task', 8, 'done', '- [x]');
+         INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+            (1, 2, 'md', 'b.md', 3, 'prose'),
+            (1, NULL, 'wiki', 'Missing', 4, 'prose'),
+            (2, 7, 'wiki', 'Ärger', 9, 'prose'),
+            (5, 1, 'wiki', 'A', 10, 'prose');",
+    )
+    .expect("test setup: seed the old rows");
+}
+
+/// Write a version-three database holding one path whose display text carries U+FFFD — what a lossy read
+/// leaves behind (F13 §1) — beside an ordinary one, with the lossy file's note row present. The pair for
+/// [`the_lossy_receipt_counts_files_and_notes_in_both_shapes`]: this is the shape the receipt exists to name.
+fn seed_lossy_version_three(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_THREE)
+        .expect("test setup: version-three schema");
+    conn.execute_batch(
+        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
+            ('caf\u{FFFD}.md', 'caf\u{FFFD}.md', '/ws/caf\u{FFFD}.md', 'hl', 9, 90, 'ok', 909),
+            ('plain.md', 'plain.md', '/ws/plain.md', 'hq', 8, 80, 'ok', 908);
+         INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
+            (4, 'caf\u{FFFD}.md', 'Cafe', 'filename', 'utf-8', 1, 'body');",
+    )
+    .expect("test setup: seed the lossy row");
+}
+
+/// The tables whose rows migration 4 must neither lose nor duplicate — the two it rebuilds and the four
+/// whose cascades [`np_core::db::MIGRATIONS`]' fourth step could otherwise ride.
+const COUNTED_TABLES: &[&str] = &["files", "notes", "headings", "tags", "items", "links"];
+
+/// `COUNT(*)` of each [`COUNTED_TABLES`] table, read from a bare connection so the number is what the
+/// fixture wrote rather than something this program recomputed on the way in.
+fn file_table_counts(path: &Path) -> Vec<i64> {
+    let conn = rusqlite::Connection::open(path).expect("read the fixture's row counts");
+    COUNTED_TABLES
+        .iter()
+        .map(|table| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or_else(|err| panic!("{table} count: {err}"))
+        })
+        .collect()
+}
+
+/// What each fixture row of `files` has to hold after the upgrade: its display fold and its byte key.
+///
+/// Both are spelled out instead of computed, because they *are* the assertion. `case_bytes` is the
+/// ASCII-only fold of that row's own `rel` bytes (F13 §3): `Ä` keeps its capital, and `ẞ` keeps its own
+/// bytes even though the copied `case_key` beside it folds onto `ß` — the two facts of §3 in one row, and
+/// the row that fails a fold which reached for `str::to_lowercase`. Repeating them per row is what catches
+/// one `case_bytes` bind shared by the whole copy: every name here differs from every other under the
+/// ASCII fold, so a stamped-identical key collides or reads wrong.
+const MIGRATED_KEYS: &[(&str, &str, &[u8])] = &[
+    ("a.md", "a.md", b"a.md"),
+    ("b.md", "b.md", b"b.md"),
+    ("c.md", "c.md", b"c.md"),
+    ("img/logo.png", "img/logo.png", b"img/logo.png"),
+    // The ASCII `S` folds while the non-ASCII `Ä` does not, which is what `case_key` beside it — where
+    // both folded — shows is a different fact.
+    (
+        "Straße/Ärger.md",
+        "straße/ärger.md",
+        "straße/Ärger.md".as_bytes(),
+    ),
+    // And here the ASCII letters folded while `ẞ` did not — even though `case_key` shows the Unicode fold
+    // of the very same name.
+    ("STRASSE-ẞ.md", "strasse-ß.md", b"strasse-\xe1\xba\x9e.md"),
+];
+
+/// What each fixture row of `files` has to still hold, column by column: `rel, state, hash, size, mtime,
+/// last_seen, abs`. Migration 4 copies these verbatim (F13 §4's "carry `hash`, `size`, `mtime`, `state`
+/// verbatim"), and any value that moves here is a value the next scan reads as a change.
+const MIGRATED_COLUMNS: &[(&str, &str, &str, i64, i64, i64, &str)] = &[
+    ("a.md", "ok", "ha", 11, 101, 901, "/ws/a.md"),
+    ("b.md", "ok", "hb", 12, 102, 902, "/ws/b.md"),
+    ("c.md", "stale", "hc", 13, 103, 903, "/ws/c.md"),
+    ("img/logo.png", "ok", "hp", 14, 104, 904, "/ws/img/logo.png"),
+    (
+        "Straße/Ärger.md",
+        "ok",
+        "hs",
+        15,
+        105,
+        905,
+        "/ws/Straße/Ärger.md",
+    ),
+    ("STRASSE-ẞ.md", "ok", "ht", 16, 106, 906, "/ws/STRASSE-ẞ.md"),
+];
+
+/// The `paths_lossy` receipt migration 4 wrote, read back under the constant it writes under — a renamed
+/// key fails here rather than reading `NULL` and comparing equal to nothing.
+fn lossy_receipt(db: &Db) -> String {
+    scalar::<String>(
+        db,
+        &format!("SELECT value FROM meta WHERE key = '{PATHS_LOSSY_KEY}'"),
+    )
+}
+
+#[test]
+fn a_version_three_database_upgrades_without_moving_anything() {
+    // Migration 4's promise is that it changes the *shape* and nothing else (F13 §4): every key comes from
+    // its own row, no id is re-minted, no derived row cascades away, and no column value moves — because
+    // `classify` still compares display text, so a value rewritten here would be a scan that reports files
+    // it never saw change.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_three(&path);
+
+    let before = file_table_counts(&path);
+    assert_eq!(
+        before,
+        vec![6, 4, 3, 4, 2, 4],
+        "files, notes, headings, tags, items, links: the fixture is what this test claims to have written"
+    );
+
+    let db = Db::open(&path).expect("the normal open runs migration 4");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+        MIGRATIONS.len() as i64,
+        "the byte-key migration is the newest recorded step"
+    );
+    // The gate at the end of the step passed on a file that really did have rows in every table — and had
+    // it not, this open would have failed rather than returned.
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check()"),
+        0
+    );
+
+    // Every key was derived from its own row. `rel_bytes` is the UTF-8 bytes of *that* row's display text
+    // (round 1 writes a faithful copy, not the OS bytes — F13 §7), `case_bytes` that row's ASCII-only fold,
+    // and `case_key` the value the fixture wrote rather than one recomputed by SQL's ASCII `LOWER()`.
+    for (rel, case_key, case_bytes) in MIGRATED_KEYS {
+        let (rel_bytes, stored_case_key, stored_case_bytes): (Vec<u8>, String, Vec<u8>) =
+            db.0.query_row(
+                "SELECT rel_bytes, case_key, case_bytes FROM files WHERE rel = ?1",
+                rusqlite::params![*rel],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap_or_else(|err| panic!("{rel} has no byte key after the upgrade: {err}"));
+        assert_eq!(
+            rel_bytes,
+            rel.as_bytes(),
+            "{rel}: rel_bytes has to be the bytes of that row's own rel"
+        );
+        assert_eq!(
+            stored_case_bytes, *case_bytes,
+            "{rel}: case_bytes has to be the ASCII-only fold of those bytes"
+        );
+        assert_eq!(
+            stored_case_key, *case_key,
+            "{rel}: case_key is copied, not re-derived by an ASCII-only fold"
+        );
+    }
+
+    // The ids the fixture wrote, each still naming its own path. `1, 2, 5, 7` rather than `1, 2, 3, 4`
+    // because every derived row hangs off `notes.id`, and a re-mint silently re-parents them.
+    assert_eq!(
+        names(&db, "SELECT id || ':' || rel FROM notes ORDER BY id"),
+        ["1:a.md", "2:b.md", "5:c.md", "7:Straße/Ärger.md",],
+        "no note was re-minted and none changed its display path"
+    );
+
+    // The four cascading children, still attached to the same notes. Counts alone would pass a migration
+    // that lost one row and duplicated another.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || text FROM headings ORDER BY line"
+        ),
+        ["1:A heading", "7:Überschrift", "5:C heading"]
+    );
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || tag FROM tags ORDER BY note_id, rowid"
+        ),
+        ["1:keep", "2:both", "5:old", "7:straße"],
+        "`tags` is not rebuilt, so its rowids — and the catalog's tag order — cannot move"
+    );
+    assert_eq!(
+        names(
+            &db,
+            "SELECT note_id || ':' || text || ':' || state FROM items ORDER BY line"
+        ),
+        ["1:task:open", "5:old task:done"]
+    );
+    assert_eq!(
+        edges(&db),
+        [
+            (1, Some(2), "b.md".to_string()),
+            (1, None, "Missing".to_string()),
+            (2, Some(7), "Ärger".to_string()),
+            (5, Some(1), "A".to_string()),
+        ],
+        "no edge cascaded away and the unresolved one kept its NULL destination"
+    );
+
+    // The columns a scan compares, verbatim — including the stale row's `state`, which is what keeps that
+    // note in the database at all.
+    for (rel, state, hash, size, mtime, last_seen, abs) in MIGRATED_COLUMNS {
+        let row: (String, String, i64, i64, i64, String) =
+            db.0.query_row(
+                "SELECT state, hash, size, mtime, last_seen, abs FROM files WHERE rel = ?1",
+                rusqlite::params![*rel],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap_or_else(|err| panic!("{rel} is gone after the upgrade: {err}"));
+        assert_eq!(
+            row,
+            (
+                state.to_string(),
+                hash.to_string(),
+                *size,
+                *mtime,
+                *last_seen,
+                abs.to_string()
+            ),
+            "{rel}: nothing in this row may move"
+        );
+    }
+
+    // Nothing was lost or duplicated anywhere — the count that can see the attachment go, which no foreign
+    // key can report because it has no children.
+    let after: Vec<i64> = COUNTED_TABLES
+        .iter()
+        .map(|table| scalar::<i64>(&db, &format!("SELECT COUNT(*) FROM {table}")))
+        .collect();
+    assert_eq!(after, before, "every table holds what it held before");
+
+    // And the receipt is there afterwards (its two shapes are [`the_lossy_receipt_counts_files_and_notes_in_both_shapes`]).
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM meta WHERE key = '{PATHS_LOSSY_KEY}'")
+        ),
+        1,
+        "an upgraded file always carries its lossy-path receipt"
+    );
+}
+
+#[test]
+fn the_byte_key_migration_refuses_to_run_while_enforcement_is_on() {
+    // `DROP TABLE notes` under enforcement performs an implicit `DELETE FROM`, and four child tables are
+    // `ON DELETE CASCADE` — the whole workspace's headings, tags, items and prose edges would go with it
+    // and nothing downstream would report a thing (F13 §4). The step cannot switch enforcement off for
+    // itself, because the pragma has no effect inside a transaction, so it reads the pragma and refuses.
+    //
+    // `MIGRATIONS` is public and its `Code` variant carries the step function, which is the named seam §5
+    // asks for: nothing reachable through `Db::open` can observe this guard, since `migrate` forces the
+    // pragma off before the loop.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_three(&path);
+    let bytes_before = fs::read(&path).expect("test setup: read the fixture");
+    let counts_before = file_table_counts(&path);
+
+    let Migration::Code(step) = MIGRATIONS[3] else {
+        panic!("migration 4 is a code step, like migration 3");
+    };
+    let conn = rusqlite::Connection::open(&path).expect("reopen the version-three file");
+    // Outside any transaction, which is the only place the pragma means anything — and therefore the
+    // state a refactor of `migrate`, or another caller, could hand the step.
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .expect("test setup: switch enforcement on");
+    assert_eq!(
+        conn.query_row::<i64, _, _>("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("read the pragma back"),
+        1,
+        "the fixture really is the case this guard refuses"
+    );
+
+    let err = step(&conn).expect_err("a step that can drop a workspace has to refuse enforcement");
+    assert!(
+        matches!(&err, DbError::EnforcementOn { value } if *value == 1),
+        "expected the step's own error naming the pragma, got {err}"
+    );
+    assert!(
+        err.to_string().contains("foreign_keys"),
+        "the message has to say what was wrong: {err}"
+    );
+
+    // Refusing means refusing: not one byte of the file changed, so the version stayed at 3 and every row
+    // is where the fixture left it.
+    drop(conn);
+    assert_eq!(
+        fs::read(&path).expect("re-read the refused file"),
+        bytes_before,
+        "a refused migration writes nothing at all"
+    );
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT MAX(version) FROM schema_version", [], |row| row
+            .get(0))
+            .expect("schema_version is readable"),
+        3,
+        "the refused step recorded nothing"
+    );
+    drop(conn);
+    assert_eq!(
+        file_table_counts(&path),
+        counts_before,
+        "and cascaded nothing away either"
+    );
+}
+
+/// A single `?1` bind of `'a.md'` — a Rust `&str`, which rusqlite hands to SQLite as TEXT — into one key
+/// column, and the CHECK that has to refuse it.
+///
+/// This is the exact accident F13 cannot survive: BLOB is an affinity rather than a constraint, a TEXT key
+/// conflicts with nothing and violates nothing beside its own `typeof` check, and two rows holding one
+/// identity in two types that never compare equal is the original bug with better furniture (F13 §4).
+fn refuses_string_bind(db: &Db, sql: &str, column: &str) {
+    let err =
+        db.0.execute(sql, rusqlite::params!["a.md"])
+            .expect_err("a string bind into a byte key has to be refused at the write");
+    assert!(
+        matches!(
+            &err,
+            rusqlite::Error::SqliteFailure(fault, _)
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK
+        ),
+        "expected the `typeof(…) = 'blob'` CHECK on {column}, got {err}"
+    );
+}
+
+#[test]
+fn a_string_bind_is_refused_from_every_key_column() {
+    // One case per key column. `insert_note` and `upsert_file` bind bytes, so nothing else in the suite
+    // would notice a CHECK quietly dropped from one of these three declarations — and the API shape is the
+    // design's first defence, which makes this the backstop that has to be tested directly.
+    let db = Db::in_memory().expect("in-memory database");
+    upsert_file(&db, &snap("a.md", "h1"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: a registry row for the note's key to name");
+
+    // `files.rel_bytes`: the TEXT `'a.md'` beside it is a *different* row's display text, and SQLite stores
+    // no conflict — which is precisely how a string key would hide.
+    refuses_string_bind(
+        &db,
+        "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES (?1, x'622e6d64', 'b.md', 'b.md', '/ws/b.md', 'h2', 1, 1, 'ok', 1)",
+        "files.rel_bytes",
+    );
+    // `files.case_bytes`, with a perfectly good BLOB in its sibling column.
+    refuses_string_bind(
+        &db,
+        "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES (x'622e6d64', ?1, 'b.md', 'b.md', '/ws/b.md', 'h2', 1, 1, 'ok', 1)",
+        "files.case_bytes",
+    );
+    // `notes.rel_bytes`, naming the file row above so what refuses it is the CHECK and not the key.
+    refuses_string_bind(
+        &db,
+        "INSERT INTO notes (rel_bytes, rel, title, title_source, encoding, word_count, body)
+         VALUES (?1, 'a.md', 'A', 'filename', 'utf-8', 1, 'body')",
+        "notes.rel_bytes",
+    );
+
+    // Refused means not written: neither a key nor a row was left half-typed.
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM files"), 1);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"), 0);
+}
+
+#[test]
+fn the_lossy_receipt_counts_files_and_notes_in_both_shapes() {
+    // `paths_lossy` is the only way a person can tell the first byte-keyed scan's expected churn from a
+    // regression (F13 §4.2), so both shapes have to be readable apart: a workspace with nothing flagged,
+    // and one whose display text carries U+FFFD. The format is `files=<n>,notes=<n>`, the same shape as
+    // migration 3's receipt — labels, in a fixed order, comma-separated.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+
+    let clean = tmp.path().join("clean.sqlite");
+    seed_version_three(&clean);
+    let db = Db::open(&clean).expect("upgrade a workspace with nothing lossy");
+    assert_eq!(
+        lossy_receipt(&db),
+        "files=0,notes=0",
+        "zero is written down; its absence would mean the file never upgraded"
+    );
+
+    let lossy = tmp.path().join("lossy.sqlite");
+    seed_lossy_version_three(&lossy);
+    let db = Db::open(&lossy).expect("upgrade a workspace holding one lossy path");
+    // One `files` row and its own note row, both displayed as `caf\u{FFFD}.md`; the plain file beside them
+    // is not counted.
+    assert_eq!(
+        lossy_receipt(&db),
+        "files=1,notes=1",
+        "the count names both tables, so a flagged path is never read as an unflagged one"
     );
 }
 
