@@ -307,6 +307,24 @@ What these numbers can and cannot carry:
   **Do when:** a workspace with `caf\xe9/` and `caf\xe8/`, one unreadable, reports exactly the rows it should,
   names both refused paths on separate lines, and counts the note behind them once — not in both
   `written.uncovered` and `hidden_by_unknown`.
+- **Shipped (`bc8f05c`, `aa74a04`, `7acd75f`, `86ee207`, `docs/design-f20-bytes-in-reports.md`).** An unknown path now
+  travels as `walk::UnknownPath { display, bytes }` from the walk that has the OS bytes to the filter that needs
+  them: `under_unreadable` matches a byte prefix plus a real `/`, `is_unknown_path`'s refused arm compares exact
+  bytes, and `skipped` sorts and dedups by bytes while printing display text — so two byte-distinct paths publish two
+  look-alike lines. The fixture exists and runs here (`caf\xe9/` blocked beside readable `caf\xe8/`, real `chmod
+  000`, no skip taken): the readable twin's deletion is reported, a rename there is one `Moved` with no `Added` twin,
+  and the hidden note is charged exactly once — the double charge F20 feared turns out not to survive byte matching,
+  and the arithmetic that used to sum three now sums two.
+- **One exception this round had to add, and it is not legacy-only.** Migration 4 keyed every row through
+  `rel_bytes_of_display`, so a migrated row's stored key *is* its lossy text: byte-only matching hid nothing from it
+  and reported a live note `removed: 1` while its directory was unreadable (review `d2cbf5de`). Such rows are now
+  also compared text-against-text, which is over-hiding — churn — instead of a false deletion. A name genuinely
+  holding `U+FFFD`, and every lossy Windows name, qualify permanently; a migrated row leaves the class only when a
+  scan pairs it by hash so `apply_move` rewrites `rel_bytes`, never merely because a scan ran. The refused-name side
+  of that fallback was deleted as unable to ever fire (Windows refusal entries are already lossy-keyed; Unix refuses
+  nothing), with the mutation confirming the guarantee never lived there.
+- **What this does not claim:** on Windows, where identity bytes come from `to_string_lossy`, two refused names still
+  share one `skipped` line — `tests/walk.rs` pins it — so that list is a floor on what a scan lost, never a count.
 
 ## F21 — a refusing stderr can block the first upgrade of an orphan-holding workspace
 
