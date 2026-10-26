@@ -1554,13 +1554,73 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        np_published, remove_corpses, remove_file, report_refresh, report_refresh_gap,
+        folded_row, np_published, remove_corpses, remove_file, report_refresh, report_refresh_gap,
         PARSE_VERSION,
     };
     use crate::catalog::{HEADER, HEADER_CRLF};
+    use crate::db::{upsert_file, Db};
+    use crate::hash::Snapshot;
+    use crate::path_keys::{self, RelPath};
     use std::fs;
     use std::io::{self, ErrorKind};
     use std::path::Path;
+
+    /// A snapshot as [`crate::walk`] + `sha256_file` would produce it for a name that is valid UTF-8: both
+    /// byte keys derived from the spelling's own bytes.
+    fn snap(rel: &str) -> Snapshot {
+        Snapshot {
+            rel_bytes: path_keys::rel_bytes_of_display(rel),
+            case_bytes: path_keys::case_fold(rel.as_bytes()),
+            rel: rel.to_string(),
+            case_key: path_keys::display_fold(rel),
+            hash: "h".to_string(),
+            size: 4,
+            mtime: 10,
+        }
+    }
+
+    /// §3's accepted regression, as evidence rather than a paragraph: the ASCII byte fold cannot bridge a
+    /// Unicode-only case pair, so [`folded_row`] misses a rename that changes only a non-ASCII letter's case.
+    ///
+    /// Before round 2 this lookup ran on the Unicode display `case_key`, where `Ämli.md` and `ämli.md` are one
+    /// fold and the rename was followed onto the existing row. Matched on `case_bytes` it finds nothing, so the
+    /// caller upserts a second row — and [`crate::change::key_of`] is `case_bytes` under `case_sensitive =
+    /// false`, which means **on Windows this pair is the entire rename-following story**, not one corner of it
+    /// (`docs/backlog-m2-followups.md` F18). Two seams keep this out of the integration tests: `folded_row` is
+    /// private, and `scan::run` hardcodes case sensitivity as `!cfg!(windows)`; the classify half of the same
+    /// pair — the note detaching into `Added` + `Removed` — is pinned in `crates/np-core/tests/change.rs`.
+    #[test]
+    fn the_ascii_fold_cannot_follow_a_unicode_only_case_rename() {
+        let db = Db::in_memory().expect("in-memory database");
+        upsert_file(&db, &snap("Ämli.md"), Path::new("/ws/Ämli.md"), 1)
+            .expect("test setup: store the row under its capital-Ä spelling");
+
+        let renamed = snap("ämli.md");
+        // The premises, spelled out: one Unicode fold, two ASCII folds. It is the first of these that used to
+        // decide this lookup, and the second that decides it now.
+        assert_eq!(renamed.case_key, path_keys::display_fold("Ämli.md"));
+        assert_ne!(
+            renamed.case_bytes,
+            path_keys::case_fold("Ämli.md".as_bytes())
+        );
+
+        assert_eq!(
+            folded_row(&db, &renamed.case_bytes, &renamed.rel_bytes).expect("the lookup runs"),
+            None,
+            "`Ämli.md` → `ämli.md` is a rename this lookup no longer follows"
+        );
+
+        // Control, so the answer above is about the pair rather than about the fixture: an ASCII-only rename
+        // shares one `case_bytes` and is still followed onto the row it came from.
+        upsert_file(&db, &snap("Aemli.md"), Path::new("/ws/Aemli.md"), 1)
+            .expect("test setup: store the ASCII twin pair's row");
+        let ascii = snap("aemli.md");
+        assert_eq!(
+            folded_row(&db, &ascii.case_bytes, &ascii.rel_bytes).expect("the lookup runs"),
+            Some(RelPath::new(b"Aemli.md".to_vec(), "Aemli.md".to_string())),
+            "an ASCII case rename is still followed"
+        );
+    }
 
     /// A root holding one `INDEX.md.tmp` corpse and one file that merely looks similar.
     fn root_with(names: &[&str]) -> tempfile::TempDir {

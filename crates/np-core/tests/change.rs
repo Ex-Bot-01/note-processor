@@ -106,6 +106,41 @@ fn case_only_rename_on_a_case_sensitive_fs_is_a_move() {
     );
 }
 
+/// §3's accepted regression, made evidence: on a case-insensitive filesystem a rename that changes only a
+/// non-ASCII letter's case is no longer followed, and the note detaches.
+///
+/// `key_of` takes `case_bytes` — the ASCII byte fold — when `case_sensitive` is false, and that fold leaves `Ä`
+/// and `ä` exactly as they are: two identities where a person renamed one file. The content changed too, so the
+/// hash rule cannot pair them either and what comes back is `Added` + `Removed` — §4.2's detaching shape, with
+/// a fresh `notes.id` and the old row marked stale in the same pass. Unchanged content would still have
+/// travelled, because unmatched snapshots pair by hash; that is why this fixture edits.
+///
+/// On Windows `key_of` *is* `case_bytes`, so for that platform this pair is not one corner of rename following,
+/// it is the whole story (`docs/backlog-m2-followups.md` F18). The other half of the same pair — `folded_row`
+/// no longer finding the row — lives in `scan.rs`'s `#[cfg(test)]` module, which is the only place that can
+/// reach a private function; `scan::run` cannot be driven this way at all, because it hardcodes case
+/// sensitivity as `!cfg!(windows)`.
+#[test]
+fn a_unicode_only_case_rename_on_windows_detaches_the_note() {
+    let known = vec![snap("Ämli.md", "h1", 5, 10)];
+    let found = vec![snap("ämli.md", "h2", 9, 20)];
+
+    // The premises, spelled out: one Unicode display fold, two ASCII byte folds. Before F13 both lookups read
+    // the first line and this rename was followed.
+    assert_eq!(known[0].case_key, found[0].case_key);
+    assert_ne!(known[0].case_bytes, found[0].case_bytes);
+
+    assert_eq!(
+        classify(&known, &found, CASE_INSENSITIVE),
+        vec![
+            // Byte order decides the output order: `Ä` (C3 84) before `ä` (C3 A4).
+            (id("Ämli.md"), Change::Removed),
+            (id("ämli.md"), Change::Added),
+        ],
+        "one renamed file, two identities and no move claim: the note detaches"
+    );
+}
+
 #[test]
 fn content_change_is_modified() {
     let known = vec![snap("a.md", "h1", 5, 100)];
