@@ -215,8 +215,133 @@ pub(crate) fn name_is_lossless(name: &OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{case_fold, display_fold, rel_bytes, rel_bytes_of_display, RelPath};
+    // `name_is_lossless` is imported inside the one test that can call it (`#[cfg(unix)]`) rather than here:
+    // an import used only by a gated test is an unused-import warning on the other platform, and CI builds
+    // both with `-D warnings`.
+    use super::{
+        case_fold, display_fold, has_unpaired_surrogate, rel_bytes, rel_bytes_of_display, RelPath,
+    };
     use std::ffi::OsStr;
+
+    /// A high surrogate, and the low unit that completes it — spelled as numbers because no `char` can hold
+    /// either one alone. That inability is F18: a name holding one has no text spelling, so Windows' lossy
+    /// byte key replaces it with U+FFFD and two different names collide.
+    const HIGH: u16 = 0xD800;
+    const LOW: u16 = 0xDC00;
+
+    #[test]
+    fn a_high_surrogate_with_no_low_behind_it_is_unrepresentable() {
+        // `caf\u{e9}` followed by a lone high — the name F18 refuses.
+        let units: Vec<u16> = "caf\u{e9}".encode_utf16().chain([HIGH]).collect();
+        assert!(
+            has_unpaired_surrogate(&units),
+            "a trailing high surrogate spells no character"
+        );
+        // The same unit in the middle of a name is just as unpaired.
+        let middle: Vec<u16> = "caf"
+            .encode_utf16()
+            .chain([HIGH])
+            .chain("\u{e9}.md".encode_utf16())
+            .collect();
+        assert!(has_unpaired_surrogate(&middle), "position changes nothing");
+    }
+
+    #[test]
+    fn a_complete_surrogate_pair_is_representable() {
+        // `a`, then U+10000 as the pair HIGH+LOW, then `b`: four units for three characters, and every one
+        // of them reaches a `char`. Refusing this name would drop a real CJK or emoji name.
+        let units: Vec<u16> = "a"
+            .encode_utf16()
+            .chain([HIGH, LOW])
+            .chain("b".encode_utf16())
+            .collect();
+        assert!(
+            !has_unpaired_surrogate(&units),
+            "a high immediately followed by a low is one character, not two orphans"
+        );
+        // Two pairs back to back: the second high must not be blamed for the first pair.
+        assert!(!has_unpaired_surrogate(&[HIGH, LOW, HIGH, LOW]));
+    }
+
+    #[test]
+    fn a_lone_low_surrogate_is_unrepresentable() {
+        assert!(
+            has_unpaired_surrogate(&[LOW]),
+            "a low with nothing in front of it spells no character"
+        );
+        // A low trailing a *complete* pair is still alone: the pair consumed its high, so this one has no
+        // partner left. This is the case a scanner that only looked backwards would miss.
+        let units: Vec<u16> = "a".encode_utf16().chain([HIGH, LOW]).chain([LOW]).collect();
+        assert!(has_unpaired_surrogate(&units), "the third unit is unpaired");
+    }
+
+    #[test]
+    fn two_highs_in_a_row_leave_the_first_unpaired() {
+        // The second high could pair with the low behind it, so a rule that paired greedily from the back
+        // would call this name fine. It is not: the first high has no low *immediately* after it.
+        assert!(has_unpaired_surrogate(&[HIGH, HIGH, LOW]));
+        assert!(has_unpaired_surrogate(&[HIGH, HIGH]));
+    }
+
+    #[test]
+    fn an_empty_or_pure_bmp_name_is_representable() {
+        assert!(!has_unpaired_surrogate(&[]), "no units, no orphan");
+        for name in ["README.md", "caf\u{e9}.md", "\u{7b2c}\u{4e00}.md", "a/b"] {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            assert!(!has_unpaired_surrogate(&units), "{name} is pure BMP");
+        }
+        // The units just outside the surrogate range are ordinary characters.
+        assert!(!has_unpaired_surrogate(&[0xD7FF, 0xE000]));
+    }
+
+    /// Every name Unix can hand the walk is lossless, because `os_bytes` takes its bytes from the `OsStr`
+    /// itself — there is nothing for the surrogate rule to catch.
+    ///
+    /// This is the guard F18 asks for by name: a mitigation that silently skipped a real Unix file would cost
+    /// more than the Windows overwrite it prevents, so the no-op is pinned rather than assumed. It covers the
+    /// byte-named case F13 indexes (latin-1, an invalid UTF-8 sequence, a raw 0xFF) and the bytes that *are*
+    /// a surrogate's UTF-8 encoding — three ordinary bytes to Unix, which keys them exactly.
+    #[cfg(unix)]
+    #[test]
+    fn every_name_unix_can_produce_is_lossless() {
+        use super::name_is_lossless;
+        use std::os::unix::ffi::OsStrExt;
+
+        // The F13 names, straight from the disk-facing tests.
+        for name in [
+            b"caf\xe9.md".as_slice(),
+            b"we\xff.md".as_slice(),
+            b"caf\xe8.md".as_slice(),
+            b"\xc3\xa4ngstr\xf6m.md".as_slice(),
+            b"note.md.tmp".as_slice(),
+        ] {
+            assert!(
+                name_is_lossless(OsStr::from_bytes(name)),
+                "a raw byte is a fact about a Unix name, not a reason to skip it: {name:?}"
+            );
+        }
+
+        // U+D800 encoded as (invalid-in-strict-UTF-8) CESU bytes: `ED A0 80`. Windows would see one
+        // unpaired surrogate there; Unix sees three bytes and keys all three.
+        let cesu: &[u8] = &[b'c', b'a', b'f', 0xED, 0xA0, 0x80, b'.', b'm', b'd'];
+        assert!(
+            name_is_lossless(OsStr::from_bytes(cesu)),
+            "a surrogate's UTF-8 encoding is just bytes to `os_bytes`"
+        );
+
+        // Every byte value a component may hold. 0x00 is excluded because it terminates a path argument —
+        // no filesystem call can return a name containing it — and `/` for the same reason: a name
+        // component never holds a separator.
+        for byte in 0x01u8..=0xFF {
+            if byte == b'/' {
+                continue;
+            }
+            assert!(
+                name_is_lossless(OsStr::from_bytes(&[byte])),
+                "the single byte {byte:#04x} cannot be refused on Unix"
+            );
+        }
+    }
 
     #[test]
     fn rel_bytes_joins_the_component_bytes_with_slash() {

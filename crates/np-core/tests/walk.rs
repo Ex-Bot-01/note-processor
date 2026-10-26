@@ -400,3 +400,104 @@ fn extra_excludes_are_honoured_at_every_depth() {
     assert_eq!(rels_from(&walked.files), ["keep.md"]);
     assert!(walked.unreadable.is_empty(), "nothing was unreadable");
 }
+
+/// Nothing a normal tree can name is refused: [`Walked::unrepresentable`] stays empty, and every file on
+/// disk reaches [`Walked::files`].
+///
+/// The F18 refusal has to be inert for names the platform spells exactly, so this runs on both platforms CI
+/// builds — and on Unix it includes the raw-byte population F13 exists for (`caf\xe9.md`), because a
+/// mitigation that silently skipped a real Unix note would cost more than the Windows overwrite it prevents.
+/// The other direction — a name that *is* refused — needs a lone surrogate, which only Windows can put in a
+/// file name; that is [`an_unpaired_surrogate_name_is_refused`], and its absence from this machine's run is
+/// exactly why `path_keys::has_unpaired_surrogate`'s units are the coverage of the rule.
+#[test]
+fn nothing_a_normal_tree_can_name_is_refused() {
+    let tmp = tree(&[
+        ("notes/a.md", "a"),
+        ("caf\u{e9}.md", "cafe, spelled in UTF-8"),
+        ("UPPER.MD", "u"),
+    ]);
+    // The same name as raw bytes rather than as text: on Unix that is a *second*, distinct file, and the
+    // walk must key it exactly like every other one.
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(b"caf\xe9.md".to_vec());
+        fs::write(tmp.path().join(&raw), b"latin-1").expect("test setup: write raw-byte name");
+    }
+
+    let walked = walk(tmp.path(), &WalkOptions::default()).expect("walk must succeed");
+
+    assert!(
+        walked.unrepresentable.is_empty(),
+        "no ordinary name may be refused: {:?}",
+        walked.unrepresentable
+    );
+    // Three names from the tree, plus the raw-byte one only Unix can build.
+    let expected = if cfg!(unix) { 4 } else { 3 };
+    assert_eq!(
+        walked.files.len(),
+        expected,
+        "every file on disk is indexed: {:?}",
+        rels_from(&walked.files)
+    );
+}
+
+/// F18's refusal at the level of a real file — **written for a Windows machine to run, not for Linux CI.**
+///
+/// This cannot execute here: the module is compiled out on Linux, and no Linux syscall can hand `create()` an
+/// unpaired surrogate. So do not count this test as coverage of the rule — `path_keys`' predicate units are
+/// what CI runs and what F18's design doc names as the part that carries the weight. On a Windows box
+/// (`cargo test --test walk`) it is the end-to-end check: two live names differing only in an unpaired
+/// surrogate, which `to_string_lossy` spells identically, must both stay out of the catalog rather than one
+/// overwriting the other's row.
+///
+/// If even Windows refuses to *create* such a name, the test says so on stderr and returns without asserting:
+/// a silent pass here would be indistinguishable from the coverage this test cannot provide on Linux.
+#[cfg(windows)]
+#[test]
+fn an_unpaired_surrogate_name_is_refused() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    // The overwrite pair: `caf<U+D800>.md` and `caf<U+D801>.md` are two names, one lossy spelling.
+    let twin = |surrogate: u16| -> OsString {
+        OsString::from_wide(
+            &"caf"
+                .encode_utf16()
+                .chain([surrogate])
+                .chain(".md".encode_utf16())
+                .collect::<Vec<u16>>(),
+        )
+    };
+    let twins = [twin(0xD800), twin(0xD801)];
+    for (index, name) in twins.iter().enumerate() {
+        if let Err(err) = fs::write(tmp.path().join(name), format!("note {index}")) {
+            eprintln!(
+                "NOT COVERAGE: this Windows refused to create a name holding an unpaired surrogate \
+                 ({err}); run this test by hand and rely on the path_keys units meanwhile"
+            );
+            return;
+        }
+    }
+    // A *complete* pair is U+10000 — one ordinary character, and an ordinary name.
+    fs::write(tmp.path().join("\u{10000}.md"), "kept").expect("test setup: write valid-pair name");
+
+    let walked = walk(tmp.path(), &WalkOptions::default()).expect("walk must succeed");
+
+    for name in &twins {
+        assert!(
+            fs::metadata(tmp.path().join(name)).is_ok(),
+            "the refused file is on disk, so this is a refusal and not a missing entry"
+        );
+    }
+    assert_eq!(
+        rels_from(&walked.files),
+        ["\u{10000}.md"],
+        "neither twin is indexed; the valid pair is"
+    );
+    // One line for two files: the report names display spellings, and both twins share this one.
+    assert_eq!(walked.unrepresentable, ["caf\u{fffd}.md"]);
+}
