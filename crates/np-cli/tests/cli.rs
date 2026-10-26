@@ -777,6 +777,13 @@ fn an_upgrade_that_removed_nothing_is_announced_nowhere() {
         "`removed 0 orphan row(s)` would state a deletion that did not happen:\n{}",
         first.stdout()
     );
+    // The other channel, because the durable receipt's echo goes to stderr (`db::report_orphans`) and "nowhere"
+    // has to mean both streams this process writes to — stdout alone only rules out the summary line.
+    assert!(
+        !first.stderr().contains("orphan row(s)"),
+        "a receipt echo at zero would state a deletion that did not happen:\n{}",
+        first.stderr()
+    );
 
     // The durable half is untouched by all of this: the receipt is written even at zero, because "looked
     // and found none" has to read differently from "this file never upgraded".

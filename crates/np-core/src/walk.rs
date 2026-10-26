@@ -516,7 +516,13 @@ mod tests {
     /// The pair ([`UnknownPath::display`], [`UnknownPath::bytes`]) that a name made of ordinary ASCII produces
     /// — one spelling, so writing it once writes both fields. Every refused name in this module's fixtures is
     /// ASCII, which is what lets an expectation be spelled as text while the assertion still pins the bytes.
-    fn unknown(display: &str) -> UnknownPath {
+    ///
+    /// The bytes here are the text's own `str::as_bytes`, with no key rule between — deliberately not named like
+    /// `scan::tests::display_keyed_unknown`, which routes the same text through
+    /// [`crate::path_keys::rel_bytes_of_display`] to stand for a **stored row key**. Equal results, different
+    /// provenance: this is what [`crate::walk`] records on the platform that refuses names (F18), where an entry's
+    /// bytes already are its lossy text.
+    fn unknown_from_text_bytes(display: &str) -> UnknownPath {
         UnknownPath {
             display: display.to_string(),
             bytes: display.as_bytes().to_vec(),
@@ -566,7 +572,7 @@ mod tests {
         // would name three paths here.
         assert_eq!(
             walked.unreadable,
-            [unknown("refused-dir")],
+            [unknown_from_text_bytes("refused-dir")],
             "one prefix entry, not one per unreadable child"
         );
         // And recorded in the list the scan matches by **prefix**: a refused directory hides a subtree, which
@@ -592,7 +598,10 @@ mod tests {
 
         assert_eq!(
             walked.unreadable,
-            [unknown("deep/refused-dir"), unknown("refused-dir")],
+            [
+                unknown_from_text_bytes("deep/refused-dir"),
+                unknown_from_text_bytes("refused-dir")
+            ],
             "the nested refusal must carry its parent, or the prefix rule hides nothing: {:?}",
             walked.unreadable
         );
@@ -615,8 +624,8 @@ mod tests {
         assert_eq!(
             walked.unrepresentable,
             [
-                unknown("refused-file.md"),
-                unknown("sibling/refused-nested.md")
+                unknown_from_text_bytes("refused-file.md"),
+                unknown_from_text_bytes("sibling/refused-nested.md")
             ],
             "each refused file names itself, relative to the root"
         );

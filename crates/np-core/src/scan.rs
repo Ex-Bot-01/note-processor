@@ -1904,7 +1904,7 @@ mod tests {
     /// The exact arm: one refused file, and four neighbours that must keep being judged.
     #[test]
     fn a_refused_name_suppresses_only_its_own_rel() {
-        let refused = [unknown("notes/caf\u{fffd}.md")];
+        let refused = [display_keyed_unknown("notes/caf\u{fffd}.md")];
 
         assert!(
             is_unknown_path(&key("notes/caf\u{fffd}.md"), &[], &refused),
@@ -1933,7 +1933,7 @@ mod tests {
     /// `Removed` by the next scan.
     #[test]
     fn a_refused_directory_suppresses_every_row_below_it() {
-        let dirs = [unknown("notes/caf\u{fffd}")];
+        let dirs = [display_keyed_unknown("notes/caf\u{fffd}")];
 
         assert!(
             is_unknown_path(&key("notes/caf\u{fffd}/a.md"), &dirs, &[]),
@@ -1961,8 +1961,8 @@ mod tests {
     }
 
     /// An unknown path from its **raw identity bytes**, with the display text a lossy decode of those same
-    /// bytes produces. Unlike [`unknown`], whose bytes are derived from its text, this one can hold bytes no
-    /// `String` can — which is the whole subject of F20: `raw(b"caf\xE9")` and `raw(b"caf\xE8")` are two paths
+    /// bytes produces. Unlike [`display_keyed_unknown`], whose bytes are derived from its text, this one can hold
+    /// bytes no `String` can — which is the whole subject of F20: `raw(b"caf\xE9")` and `raw(b"caf\xE8")` are two paths
     /// whose `display` fields are one string.
     fn raw(bytes: &[u8]) -> UnknownPath {
         UnknownPath {
@@ -1983,9 +1983,16 @@ mod tests {
         );
     }
 
-    /// An unknown path as [`crate::walk`] spells one on the platform whose key bytes **are** its lossy display
-    /// text (Windows, F18): display and identity are the same bytes here, so writing one writes both fields.
-    fn unknown(display: &str) -> UnknownPath {
+    /// An unknown path whose [`UnknownPath::bytes`] are the **stored key** a path gets when it only ever existed as
+    /// text — [`path_keys::rel_bytes_of_display`], the rule migration 4 keyed every copied row through. That is why
+    /// the [`key_is_display_derived`] fixtures build their entries this way: entry and row agree because both went
+    /// through the key rule, not because either holds OS bytes.
+    ///
+    /// Deliberately not named like `walk::tests::unknown_from_text_bytes`, which takes a path's `str::as_bytes`
+    /// with no key rule between. The two return the same bytes for every input today — `rel_bytes_of_display` *is*
+    /// `as_bytes` — and promise different things: this one tracks the stored-key rule, that one tracks the platform
+    /// whose refusal entries are already lossy text (F18). Two names keep that difference visible at the call site.
+    fn display_keyed_unknown(display: &str) -> UnknownPath {
         UnknownPath {
             display: display.to_string(),
             bytes: key(display),
@@ -2030,7 +2037,7 @@ mod tests {
         plant_note(&db, "elsewhere/c.md");
 
         // A refused directory, recorded as [`crate::walk`] records it.
-        let dirs = [unknown("notes/caf\u{fffd}")];
+        let dirs = [display_keyed_unknown("notes/caf\u{fffd}")];
         let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
 
         assert_eq!(
@@ -2044,8 +2051,8 @@ mod tests {
         );
 
         // The other arm, fed a refused *file*: exactly its own row disappears and is charged.
-        let (known, hidden) =
-            known_rows(&db, &[], &[unknown("notes/peer.md")]).expect("the rows read back again");
+        let (known, hidden) = known_rows(&db, &[], &[display_keyed_unknown("notes/peer.md")])
+            .expect("the rows read back again");
         assert_eq!(hidden, 1, "one refused note, one charge");
         assert!(
             !known.iter().any(|row| row.rel == "notes/peer.md"),
@@ -2302,13 +2309,22 @@ mod tests {
     /// §4.4's answer, **counted** rather than assumed: one note behind one unknown path is charged in exactly
     /// one of the two counters the gap line adds together.
     ///
-    /// They are disjoint by construction now that both sides compare bytes. `hidden_by_unknown` charges a live
-    /// row this scan never looked at — a note under an unreadable directory, which the walk could not even list,
-    /// so it never reaches `found` and cannot be charged twice. `written.uncovered` charges a path the walk
-    /// *did* list whose contents this scan could not read. Before F20 those two sets overlapped: a note in the
-    /// readable twin was hidden by its unreadable twin's display spelling **and** charged as an unread write,
-    /// so one note cost two charges and the refresh-gap line over-counted (F20 §1). `ScanReport` carries no gap
-    /// count, which is why this arithmetic lives here rather than in `tests/scan.rs`.
+    /// They are disjoint for the rows both sides judge **by bytes**, which is what this test builds.
+    /// `hidden_by_unknown` charges a live row this scan never looked at — a note under an unreadable directory,
+    /// which the walk could not even list, so it never reaches `found` and cannot be charged twice.
+    /// `written.uncovered` charges a path the walk *did* list whose contents this scan could not read. One row
+    /// cannot be both: [`under_unreadable`]'s byte prefix only ever names a directory that was never entered, and
+    /// [`is_unknown_path`]'s refused arm only ever names a name the walk would not key — neither is a listed path.
+    ///
+    /// The [`key_is_display_derived`] fallback sits outside that construction: it hides a row on **display** text,
+    /// so a row it drops may be one whose own path was listed and could not be read, which is
+    /// `written.uncovered`'s shape as well. Nothing below proves those two charges cannot meet — F23 in
+    /// `docs/backlog-m2-followups.md` owns what that fallback costs.
+    ///
+    /// Before F20 the two sets overlapped for byte-keyed rows too: a note in the readable twin was hidden by its
+    /// unreadable twin's display spelling **and** charged as an unread write, so one note cost two charges and the
+    /// refresh-gap line over-counted (F20 §1). `ScanReport` carries no gap count, which is why this arithmetic lives
+    /// here rather than in `tests/scan.rs`.
     #[test]
     fn one_note_behind_an_unknown_path_is_charged_in_exactly_one_counter() {
         assert_twin_bytes(b"caf\xE9", b"caf\xE8");
