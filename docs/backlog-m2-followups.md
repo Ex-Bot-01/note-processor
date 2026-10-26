@@ -243,21 +243,31 @@ What these numbers can and cannot carry:
   no constraint fires, nothing reaches `skipped`. Round 2 also moved that platform's identity fold from Unicode
   `case_key` to ASCII `case_bytes`, so a non-ASCII case rename is no longer followed either. A green
   `windows-latest` job proves none of this either way: nothing in that suite can build a colliding name.
-- **Shipped (`01d35a2`, `docs/design-f18-windows-refusal.md`): the silent overwrite is gone.** A name whose OS form
-  cannot survive the byte spelling losslessly is no longer indexed at all: it is named in `skipped`, its existing row
-  keeps its note and children, and the walk treats it as *unknown rather than absent* (`Walked::unrepresentable`,
-  `scan::is_unknown_path`). The predicate is pure over `u16` so Linux CI can execute the surrogate rule; the Windows
-  arm itself is only type-checked (`cargo check --target x86_64-pc-windows-msvc`) and its integration test says in
-  writing that CI compiles it out. **What that mitigation does not do is give Windows identity** — it makes the
-  absence loud. Two such names are still one file to this program; now neither is indexed instead of one silently
-  rewriting the other.
+- **Shipped (`01d35a2`, `c3303ec`, `docs/design-f18-windows-refusal.md`): within one workspace, the silent overwrite
+  is closed on Windows.** Every component of an indexed path must survive the byte spelling, so a refused **file**
+  names itself in `skipped` and keeps its row (`Walked::unrepresentable`, matched by exact path) while a refused
+  **directory** is never entered and makes its whole subtree unknown by prefix (`Walked::unreadable`, F20's prefix
+  rule). Nothing at any relative depth is indexed under a lossy key, so no lookup can resolve one note onto
+  another's row. The predicate is pure over `u16`, so Linux CI executes the surrogate rule and both arms' behaviour
+  through an injected-predicate seam; the Windows arm itself is only type-checked (`cargo check --target
+  x86_64-pc-windows-msvc`) and its integration tests say in writing that CI compiles them out.
+- **What that claim does *not* cover.** No byte identity: two such names are still one file to this program, now
+  with neither indexed instead of one silently rewriting the other. The **workspace root's own name** is never
+  refused — it is relative to nothing — so two roots differing only in unpaired surrogates still hash to one
+  database (`config::path_bytes`' non-Unix arm, noted there). And a refused path holds `PARSE_VERSION` back for as
+  long as it stays unrepresentable, which on such a workspace means permanently: every scan re-parses and prints
+  the refresh-gap line rather than labelling rows current that this build did not write.
 - **Still open:** (1) real byte identity on Windows, which means encoding the wide units as WTF-8 and changing
   `path_bytes`, `normalize_rel`, `rebase_abs`, every stored key and a migration **in one step** — never `rel_bytes`
   alone, or a path is written under one rule and read under another; (2) round 2's move from Unicode `case_key` to
   ASCII `case_bytes` for the identity fold, which stopped non-ASCII case renames being followed on Windows at all
   (§5 pins the regression; following it would need a Unicode-folded byte key, which is exactly what §3 refuses for
-  Unix). **Do when:** two Windows names differing only in unpaired surrogates key apart *and* are both indexed —
-  not merely reported — and a `Ämli.md` → `ämli.md` rename on Windows still carries the note.
+  Unix); (3) **nothing here has been executed on the platform it is about** — `tests/walk.rs`'s two
+  `#[cfg(windows)]` tests (the file twin and the never-entered directory) run in CI's `windows-latest` job, but no
+  CI filesystem can create such a name, so each prints `NOT COVERAGE` and returns unless a human runs
+  `cargo test -p np-core --test walk -- --nocapture` on a Windows box. **Do when:** two Windows names differing
+  only in unpaired surrogates key apart *and* are both indexed — not merely reported — and a `Ämli.md` → `ämli.md`
+  rename on Windows still carries the note.
 
 ## F19 — a legacy duplicate note pair re-parses the whole corpus forever
 

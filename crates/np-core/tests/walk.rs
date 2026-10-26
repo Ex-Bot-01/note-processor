@@ -501,3 +501,52 @@ fn an_unpaired_surrogate_name_is_refused() {
     // One line for two files: the report names display spellings, and both twins share this one.
     assert_eq!(walked.unrepresentable, ["caf\u{fffd}.md"]);
 }
+
+/// The directory shape of the same refusal, which is the half that used to survive: a directory named with an
+/// unpaired surrogate was **descended**, so its children keyed as `dir\u{fffd}/n.md` and two such directories —
+/// or one beside a directory literally named U+FFFD — shared `rel_bytes`, and the row lookup overwrote one note
+/// with the other. Manual-run rules as above: no CI can create the name, so this is the shape to run by hand on
+/// a Windows machine, and it says `NOT COVERAGE` rather than passing quietly if the OS declines to make one.
+#[cfg(windows)]
+#[test]
+fn an_unpaired_surrogate_directory_is_never_entered() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let dir_name = OsString::from_wide(
+        &"caf"
+            .encode_utf16()
+            .chain([0xD800u16])
+            .collect::<Vec<u16>>(),
+    );
+    let inside = tmp.path().join(&dir_name).join("n.md");
+    if fs::create_dir(tmp.path().join(&dir_name)).is_err() || fs::write(&inside, "note").is_err() {
+        eprintln!(
+            "NOT COVERAGE: this Windows refused to create a directory holding an unpaired surrogate; \
+             run this test by hand and rely on the `walk` unit seam meanwhile"
+        );
+        return;
+    }
+
+    let walked =
+        walk(tmp.path(), &WalkOptions::default()).expect("a refusal is not a walk failure");
+
+    assert!(
+        inside.is_file(),
+        "the file still exists below the refused directory: this is a refusal, not an absent tree"
+    );
+    assert!(
+        rels_from(&walked.files).is_empty(),
+        "nothing below a refused directory may be indexed: {:?}",
+        rels_from(&walked.files)
+    );
+    // Recorded once, as the directory's own display spelling, in the list the scan matches by **prefix** — so
+    // every row below it stays unknown rather than becoming a `Removed` this scan cannot support.
+    assert_eq!(walked.unreadable, ["caf\u{fffd}".to_string()]);
+    assert!(
+        walked.unrepresentable.is_empty(),
+        "a directory is a prefix, not one refused file: {:?}",
+        walked.unrepresentable
+    );
+}

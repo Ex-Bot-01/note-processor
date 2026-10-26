@@ -1234,9 +1234,10 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 ///
 /// What *can* still hold the version back indefinitely is stale data that exists and cannot be rewritten: a
 /// note whose rows are there but unreadable (a mode-000 `.md`, or one inside a directory nobody can enter), a
-/// live row hidden behind such a directory, **a name this build refuses for good** (F18: while the file keeps
-/// that spelling no scan can index it, so its rows keep whatever an older build wrote and only renaming the
-/// file clears the debt), a move refused by an identity conflict — judged by the path it came from, since
+/// live row hidden behind such a directory, **a name this build refuses for good** (F18: while that spelling
+/// stays unrepresentable no scan can index it — a refused *file* leaves its own rows owing, a refused
+/// *directory* leaves everything below it owing — so they keep whatever an older build wrote and only renaming
+/// the path clears the debt), a move refused by an identity conflict — judged by the path it came from, since
 /// `classify` suppressed that path's `Removed` and its rows are still in the catalog — and **a legacy
 /// duplicate note pair** (`Indexed::Duplicate`). The unreadable ones clear when the obstruction does.
 /// A refused name and a duplicate never do on their own: no code renames a file and no code merges two note

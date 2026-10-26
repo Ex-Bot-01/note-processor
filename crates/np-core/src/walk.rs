@@ -510,6 +510,28 @@ mod tests {
         );
     }
 
+    /// A refusal is recorded by **path**, not by file name. Every other refusal fixture puts the refused
+    /// directory at depth 1, where the two spellings coincide — so a `rel` built from `file_name()` instead of
+    /// `strip_prefix(root)` would pass them all and then hide the wrong subtree the moment a real workspace
+    /// nested one (F18 review).
+    #[test]
+    fn a_refused_directory_is_recorded_by_its_path_not_its_file_name() {
+        let tmp = tree(&["deep/refused-dir/x.md", "refused-dir/y.md", "kept.md"]);
+
+        let walked = walk_with_predicate(tmp.path(), &WalkOptions::default(), refuse_that_name)
+            .expect("a refusal is not a walk failure");
+
+        assert_eq!(
+            walked.unreadable,
+            ["deep/refused-dir", "refused-dir"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>(),
+            "the nested refusal must carry its parent, or the prefix rule hides nothing: {:?}",
+            walked.unreadable
+        );
+    }
+
     /// The refused-file half, kept exact on purpose: a refused file says nothing about the paths beside it.
     #[test]
     fn a_refused_file_is_recorded_as_its_own_path_alone() {

@@ -219,7 +219,10 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 }
 
 /// The bytes of a path as the OS holds them. Windows paths are UTF-16 and reach this program as
-/// text, so its spelling stays lossy — see [`Config::workspace_db`].
+/// text, so its spelling stays lossy — see [`Config::workspace_db`]. This arm covers *any* non-Unix target, not
+/// Windows alone: wherever it applies, two paths differing only in units Rust cannot represent share one
+/// database. F18 §3 refuses such a name *inside* a workspace and never the root's own name, which is relative to
+/// nothing, so that collision is the one level the refusal does not reach.
 #[cfg(not(unix))]
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
