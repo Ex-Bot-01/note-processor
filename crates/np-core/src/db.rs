@@ -380,7 +380,7 @@ fn migrate(conn: &Connection) -> Result<Option<String>, DbError> {
 const ORPHAN_CLEANUP_VERSION: i64 = 3;
 
 /// Apply every migration above `from`, one transaction each, remembering the orphan receipt if one of
-/// those steps wrote it.
+/// those steps wrote it — and echoing that receipt **after** the step commits, never from inside it.
 fn apply_migrations(conn: &Connection, from: i64) -> Result<Option<String>, DbError> {
     let mut orphans = None;
     for (index, migration) in MIGRATIONS.iter().enumerate() {
@@ -396,22 +396,37 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<Option<String>, DbEr
             Migration::Sql(sql) => tx.execute_batch(sql)?,
             Migration::Code(apply) => apply(&tx)?,
         }
-        if version == ORPHAN_CLEANUP_VERSION {
-            // Read back **inside** the step's own transaction, so this is exactly the value that step
-            // wrote rather than a later reader's guess at it — and `query_row` has no answer for a
-            // missing row, so a step reordered off [`ORPHAN_CLEANUP_VERSION`], or one stopped from
-            // recording its cleanup, fails the open loudly instead of quietly losing the announcement.
-            orphans = Some(tx.query_row(
+        // Read back **inside** the step's own transaction, so this is exactly the value that step
+        // wrote rather than a later reader's guess at it — and `query_row` has no answer for a
+        // missing row, so a step reordered off [`ORPHAN_CLEANUP_VERSION`], or one stopped from
+        // recording its cleanup, fails the open loudly instead of quietly losing the announcement.
+        let receipt = if version == ORPHAN_CLEANUP_VERSION {
+            Some(tx.query_row(
                 "SELECT value FROM meta WHERE key = ?1",
                 params![FK_ORPHANS_KEY],
                 |row| row.get::<_, String>(0),
-            )?);
-        }
+            )?)
+        } else {
+            None
+        };
         tx.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             params![version],
         )?;
         tx.commit()?;
+        // The echo waits for the commit. A COMMIT can fail by itself — `SQLITE_FULL`, a WAL that
+        // cannot be resumed — and take the deletes with it, so announcing from
+        // [`add_note_foreign_keys`] used to say "removed N orphan row(s)" about rows that were still
+        // there, and say it again on every retry: the false announcement F21 §3.1 refuses. Nothing is
+        // printed anywhere before this line, so a step that rolled itself back — at any statement,
+        // including this commit — is silent. That silence rests on call-site position rather than on
+        // a test: no portable way to fail a COMMIT here is known (F21 §2 says so plainly), and the
+        // durable receipt in `meta` is what the promise actually rests on. `receipt` is scoped to one
+        // iteration, so no later step can re-echo an earlier one.
+        if let Some(value) = &receipt {
+            report_orphans(&mut io::stderr(), value);
+        }
+        orphans = receipt;
     }
     Ok(orphans)
 }
@@ -497,22 +512,23 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
     // and **nothing is ever deleted unannounced**. `a_receipt_that_cannot_be_written_rolls_the_cleanup_back`
     // in `crates/np-core/tests/db.rs` refuses this one statement with a trigger and asserts the orphan rows
     // survived — reading statement order would let the next refactor move this line or soften its failure
-    // and keep every other test green. It stays *before* the echo below for the same reason: durable first,
-    // stream second.
+    // and keep every other test green. Durable first, stream second: this step says nothing out loud
+    // at all, because the write *is* the announcement's record. [`apply_migrations`] echoes it once
+    // the commit has answered.
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         params![FK_ORPHANS_KEY, removed.value()],
     )?;
-    // Saying it out loud as well: reading the receipt back needs sqlite3, and a person who just
-    // watched an ordinary command delete rows deserves to be told they were deleted. Best effort — see
-    // [`report_orphans`], and F21 §2 for why a refusing descriptor 2 may not undo the work above.
-    report_orphans(&mut io::stderr(), &removed);
     Ok(())
 }
 
-/// Write the orphan receipt to `out` — [`std::io::stderr`] in production — unless there is nothing
-/// to say.
+/// Echo the stored orphan receipt to `out` — [`std::io::stderr`] in production — unless there is
+/// nothing to say.
+///
+/// `receipt` is the [`FK_ORPHANS_KEY`] value exactly as the migration wrote it, so this line, the scan
+/// report's field and `np scan`'s summary line render **one** string rather than recomputing the news
+/// three ways; the total beside it comes from [`orphan_total`], the same reader the summary uses.
 ///
 /// The sink is a parameter rather than a hard-wired `eprintln!` because stderr cannot be captured
 /// in-process here: the standard library offers no way to replace the global handle, and this runs
@@ -520,40 +536,44 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
 /// tests in this module pin both halves of the promise — one line naming the total and the stored
 /// counts for a real cleanup, silence for an all-zero one — so a regression in this visibility path
 /// fails a test instead of going unnoticed; what they cannot pin is that the production call site
-/// names stderr.
+/// names stderr, nor that it runs after the commit (see [`apply_migrations`]).
 ///
 /// A failed write is dropped rather than raised (F21 §2). It used to `.expect`, from inside the
 /// migration's own transaction, so a workspace opened with descriptor 2 refusing writes had its whole
 /// upgrade rolled back — every time, forever, over one line nobody could read. That panic never
-/// protected the signal: the same counts are written into `meta` under [`FK_ORPHANS_KEY`] by the
-/// statement immediately above it, in that same transaction, and the scan whose own open did the
-/// deleting echoes them ([`crate::ScanReport::upgrade_orphans`]). An unprinted line is a lost courtesy;
-/// a refused upgrade is the worse silence, because it hides the deletions *and* leaves the file
-/// unupgraded.
-fn report_orphans(out: &mut dyn io::Write, removed: &OrphanCleanup) {
-    // The position at the call site is deliberate — after the violation check in
-    // [`add_note_foreign_keys`], so nothing is announced about a migration that rolled itself back.
-    // All zeros stays silent: every pre-F5 workspace passes through here, and "found nothing" on an
-    // ordinary upgrade is not news.
-    if removed.total() == 0 {
+/// protected the signal: the same counts are written into `meta` under [`FK_ORPHANS_KEY`] in that same
+/// transaction, and the scan whose own open did the deleting echoes them
+/// ([`crate::ScanReport::upgrade_orphans`]). An unprinted line is a lost courtesy; a refused upgrade is
+/// the worse silence, because it hides the deletions *and* leaves the file unupgraded.
+///
+/// **One `np scan` run prints this sentence twice**, once here on stderr and again as the `upgrade`
+/// line of its stdout summary (`crates/np-cli/src/main.rs`). That is deliberate, not a double-report
+/// bug: this copy belongs to the run that did the deleting and appears even for a command that prints
+/// no report, while the summary line belongs to the report a person is reading — and neither has to
+/// arrive, because `meta` holds the fact either way.
+fn report_orphans(out: &mut dyn io::Write, receipt: &str) {
+    // The total is read out of the stored receipt rather than carried alongside it, so the stderr copy
+    // cannot disagree with the two stdout renderings of the same value. All zeros stays silent: every
+    // pre-F5 workspace passes through here, and "found nothing" on an ordinary upgrade is not news.
+    let total = orphan_total(receipt);
+    if total == 0 {
         return;
     }
-    // The result is dropped on purpose, for the reason above and in [`report_orphans`]'s doc — this is
-    // the echo, and the durable copy was written by the caller's previous statement.
+    // The result is dropped on purpose, for the reason in this function's doc — this is the echo, and
+    // the durable copy is committed in `meta` before this call is reached.
     let _ = writeln!(
         out,
         "note-processor: removed {} orphan row(s) while adding note foreign keys ({})",
-        removed.total(),
-        removed.value(),
+        total, receipt,
     );
 }
 
 /// How many rows a stored [`FK_ORPHANS_KEY`] receipt announces: the sum of its labelled counts.
 ///
 /// The reader that pairs with `OrphanCleanup::value` (a code span, not a link: that type is private and
-/// rustdoc warns when public docs link to it), for the callers left holding only the stored
-/// string — the scan report, and `np scan`'s summary line, which names the total beside the counts
-/// (F21 §3). Every number in the value is summed whatever its label: the spelling is this module's own
+/// rustdoc warns when public docs link to it), for every caller left holding only the stored
+/// string — the scan report, `np scan`'s summary line, and the stderr echo in [`report_orphans`], each
+/// of which names the total beside the counts (F21 §3). Every number in the value is summed whatever its label: the spelling is this module's own
 /// and its labels are pinned by the tests around [`FK_ORPHANS_KEY`], so there is nothing here to
 /// validate — a fragment that will not parse as a count adds nothing rather than failing a report.
 pub fn orphan_total(value: &str) -> usize {
@@ -579,11 +599,6 @@ struct OrphanCleanup {
 }
 
 impl OrphanCleanup {
-    /// Every row the cleanup changed, added up. What decides whether the receipt is worth printing.
-    fn total(&self) -> usize {
-        self.headings + self.tags + self.items + self.links_src + self.links_dst_null
-    }
-
     /// The stored spelling — the labels of [`FK_ORPHANS_KEY`], in the order the tables are rebuilt.
     fn value(&self) -> String {
         format!(
@@ -1418,17 +1433,12 @@ mod tests {
         // who watched an ordinary command delete rows has to be told. Capturing the real stderr
         // in-process is not possible — no stable API replaces the global handle, and the migration
         // runs inside `Db::open` before a test could redirect descriptor 2 — so the function takes
-        // its sink for exactly this test.
+        // its sink for exactly this test. The input is the stored spelling, because that string is
+        // what the caller has after the commit, and the total printed beside it is read back out of it.
         let mut out = Vec::new();
         report_orphans(
             &mut out,
-            &OrphanCleanup {
-                headings: 2,
-                tags: 1,
-                items: 0,
-                links_src: 3,
-                links_dst_null: 4,
-            },
+            "headings=2,tags=1,items=0,links_src=3,links_dst_null=4",
         );
         assert_eq!(
             String::from_utf8(out).expect("the receipt is text"),
@@ -1453,28 +1463,23 @@ mod tests {
 
     #[test]
     fn a_sink_that_refuses_writes_does_not_abort_the_upgrade() {
-        // F21 §1, at the unit level: this call sits inside the migration's transaction, so a panic here
-        // rolled the whole upgrade back — the file refused to open, every time, forever. The write is
-        // best effort because its signal has a durable home (`FK_ORPHANS_KEY`, written by the statement
-        // before this one). The production half of the promise — that the call site names stderr and
-        // survives a real descriptor 2 — is `a_scan_upgrades_with_descriptor_two_closed` in
-        // `crates/np-cli/tests/cli.rs`; no in-process test can reach descriptor 2.
-        report_orphans(
-            &mut Refusing,
-            &OrphanCleanup {
-                headings: 1,
-                tags: 0,
-                items: 0,
-                links_src: 0,
-                links_dst_null: 0,
-            },
-        );
+        // F21 §1, at the unit level. This echo used to sit inside the migration's transaction, so a
+        // panic here rolled the whole upgrade back — the file refused to open, every time, forever.
+        // It now runs after the commit (see `apply_migrations`), where a panic would still abort a run
+        // whose deletions are already durable. Either way the write is best effort, because its signal
+        // has a durable home: `FK_ORPHANS_KEY` in `meta`. The production half of the promise — that the
+        // call site names stderr and survives a descriptor 2 that refuses writes — is
+        // `a_scan_upgrades_when_stderr_refuses_writes` in `crates/np-cli/tests/cli.rs`; no in-process
+        // test can reach descriptor 2.
+        report_orphans(&mut Refusing, "headings=1,tags=0,items=0,links_src=0,links_dst_null=0");
     }
 
     #[test]
     fn the_stored_receipt_adds_up_to_the_total_the_announcement_names() {
-        // The stored spelling is the one thing a later reader holds (`Db::upgrade_orphans`, then the scan
-        // report), so the total printed beside it has to come from the same numbers the writer wrote.
+        // The stored spelling is the one thing every reader holds — `Db::upgrade_orphans`, the scan
+        // report, `np scan`'s summary line and the stderr echo all take the total from this function —
+        // so it is pinned against a literal total rather than against a second sum over the same
+        // struct: two functions reading one struct could agree while both miscounted the receipt.
         let removed = OrphanCleanup {
             headings: 2,
             tags: 1,
@@ -1482,9 +1487,10 @@ mod tests {
             links_src: 3,
             links_dst_null: 4,
         };
-        assert_eq!(orphan_total(&removed.value()), removed.total());
-        // And an all-zero receipt is zero, which is what keeps the scan report's field `None` for a
-        // cleanup that removed nothing (see `crate::ScanReport::upgrade_orphans`).
+        assert_eq!(orphan_total(&removed.value()), 10);
+        // And an all-zero receipt is zero, which is what keeps the scan report's field `None`, and the
+        // echo silent, for a cleanup that removed nothing (see
+        // `crate::ScanReport::upgrade_orphans`).
         let untouched = OrphanCleanup {
             headings: 0,
             tags: 0,
@@ -1503,13 +1509,7 @@ mod tests {
         let mut out = Vec::new();
         report_orphans(
             &mut out,
-            &OrphanCleanup {
-                headings: 0,
-                tags: 0,
-                items: 0,
-                links_src: 0,
-                links_dst_null: 0,
-            },
+            "headings=0,tags=0,items=0,links_src=0,links_dst_null=0",
         );
         assert!(out.is_empty(), "all zeros has to stay silent");
     }
