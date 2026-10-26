@@ -112,6 +112,10 @@ Order of attack, round by round — each round is one task brief with its own re
 - **Fix:** one `pub mod index_names` (or equivalent) owning the entry-point name, the shard pattern, the header and
   the predicate; everyone else calls it. M2's `processed/` writer must not have to copy this rule.
   **Done when:** `rg '"INDEX' crates/` finds the literal only in that module and in tests.
+- **Resolved in `84e3cf8`, with one deliberate deviation.** The entry-point name, shard pattern and predicate moved;
+  `HEADER` stayed in `catalog.rs`, because it is rendered output rather than a name and its CRLF variant is decided by
+  the renderer. The `Done when` check holds — no `"INDEX…"` literal survives outside `index_names.rs` and tests. M2's
+  `processed/` writer takes the names from `index_names` and needs no header rule at all.
 
 ## F12 — wrapping counts characters, not display width
 

@@ -31,6 +31,12 @@ const MARKDOWN_SUFFIX: &str = ".md";
 /// occurrence on the number joins the name (`INDEX-m-m-2.md`), because two chunks of the same threshold
 /// can cover one range and a repeated name would silently overwrite the earlier shard.
 pub fn shard_name(first: char, last: char, occurrence: usize) -> String {
+    // Zero is not "the first one": it would render the same name as occurrence 1 and let a second chunk
+    // overwrite the first shard silently. The renderer counts from 1; anything else is a caller bug.
+    debug_assert!(
+        occurrence >= 1,
+        "shard occurrences count from 1, got {occurrence}"
+    );
     let repeat = if occurrence > 1 {
         format!("{SEPARATOR}{occurrence}")
     } else {
@@ -87,7 +93,18 @@ mod tests {
         for name in [ENTRY, "INDEX-a-m.md", "INDEX-1-600.md"] {
             assert!(is_generated_index(name), "{name} is generated");
         }
-        for name in ["INDEX-old.txt", "index.md", "My-INDEX.md", "notes.md"] {
+        // Near misses, each a real file that must survive: a temp corpse (cleaned up by its own rule, never
+        // by this one), a backup of a shard, the same name in another case, and things that merely resemble
+        // our names.
+        for name in [
+            "INDEX-old.txt",
+            "index.md",
+            "My-INDEX.md",
+            "notes.md",
+            "INDEX.md.tmp",
+            "INDEX-1-2.md.bak",
+            "INDEX.MD",
+        ] {
             assert!(!is_generated_index(name), "{name} is not generated");
         }
     }

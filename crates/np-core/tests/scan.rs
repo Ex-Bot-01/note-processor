@@ -1327,7 +1327,7 @@ fn entry_point_is_published_after_its_shards() {
 #[test]
 fn temp_corpse_from_a_failed_rename_is_not_indexed() {
     let ws = workspace();
-    // A rename killed halfway leaves its temporary name behind, and `walk::is_generated_index` does not
+    // A rename killed halfway leaves its temporary name behind, and `index_names::is_generated_index` does not
     // match `INDEX.md.tmp` — so without cleanup the next scan indexes its own corpse as an attachment.
     // The case where the corpse cannot be removed at all is pinned in `src/scan.rs`'s own tests, since
     // forcing it needs filesystem privileges a test does not have.
