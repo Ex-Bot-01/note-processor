@@ -591,13 +591,16 @@ test compiles on Windows into a name that cannot be built, and passes by asserti
   are otherwise unfalsifiable, so both get a grep a person can run: (a)
   `grep -n "CAST(" crates/np-core/src/db.rs` matches only migration 4's own notes copy (`CAST(rel AS BLOB)`,
   §4) and nothing in the steady-state write path — `upsert_file`, `apply_move`, the moved note insert;
-  (b) **no fold *definition* lives outside `path_keys`** — `grep -rn "fn .*fold" crates/np-core/src/*.rs` names
-  only `path_keys::case_fold` and `path_keys::display_fold`, and nothing writes a value into `rel_bytes` or
-  `case_bytes` that did not come from those two. Round 1 restated this check, because the spelling it shipped with
-  was unsatisfiable: `to_lowercase` legitimately appears wherever the **display** fold is computed
-  (`links.rs`, `catalog.rs`, `parse.rs`, `items.rs`, `walk.rs`), since §3 keeps that fold Unicode and in the readers
-  — banning the token would ban round 2's own code and contradict §3. The row-level assertion below is what actually
-  binds the two columns, so it is the check; the grep only guards against a second definition appearing.
+  (b) **no fold *definition over paths* lives outside `path_keys`**, which the grep answers with a named list
+  rather than an empty set: `grep -rn "fn .*fold" crates/np-core/src/*.rs` returns `path_keys::case_fold` and
+  `path_keys::display_fold` — the two definitions — plus exactly two known non-definitions, `items::folded_eq`
+  (character equality while matching item text, nothing to do with paths) and `scan::folded_row` (a **reader** that
+  looks a row up by `case_key`, which round 2 re-keys). Anything else in that output is a second definition and has
+  to be folded into `path_keys`. Round 1 restated this check twice: the shipped spelling banned `to_lowercase`
+  outside `path_keys`, which is unsatisfiable, because the display fold is legitimately computed in `links.rs`,
+  `catalog.rs`, `parse.rs`, `items.rs` and `walk.rs` — §3 keeps that fold Unicode and inside the readers, so banning
+  the token would have banned round 2's own code and contradicted §3 two pages up. The row-level assertion below is
+  what actually binds the two columns; the grep only guards against a second definition appearing.
   `case_bytes = path_keys::case_fold(rel_bytes)` and `case_key = rel.to_lowercase()`, which is what "the same two
   functions wrote both columns" means when it is tested.
 - **Resolution stays honest.** A note linking `[[caf.md]]` with both twins present yields one
