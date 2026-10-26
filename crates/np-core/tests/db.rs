@@ -1378,10 +1378,13 @@ fn the_byte_key_gate_refuses_a_note_whose_file_row_is_gone() {
     assert!(
         matches!(
             &err,
-            DbError::ForeignKeys { count, table, parent, .. }
-                if *count == 1 && table == "notes" && parent == "files"
+            DbError::ForeignKeys { count, table, parent, rowid }
+                if *count == 1
+                    && table == "notes"
+                    && parent == "files"
+                    && *rowid == 77
         ),
-        "expected the gate to name the orphan note and the parent it misses, got {err}"
+        "expected the gate to name the planted orphan (note id 77) and the parent it misses, got {err}"
     );
 
     // And refusing means refusing: the version stays at 3, `files` keeps its version-3 shape rather than

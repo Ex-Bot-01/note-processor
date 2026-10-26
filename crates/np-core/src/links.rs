@@ -379,9 +379,11 @@ pub struct ResolvedLink {
 /// make the target `a` ambiguous, and so does a note `a.md` beside an image `a.png`, or two paths that
 /// differ only in case (`Ämli.md` beside `ämli.md`) and therefore share one `case_key`. Nothing prefers
 /// one kind over another: a wikilink may legitimately name an attachment, so preferring `.md` would
-/// break a real link rather than guess well. **The author's way out is to spell the path** —
+/// break a real link rather than guess well. **The author's way out is usually to spell the path** —
 /// `[[notes/a.md]]` or `[text](notes/a.md)` is exact and wins over the ambiguity — which is what a
-/// later report should suggest next to an unresolved target. An unknown target is unresolved the same
+/// later report should suggest next to an unresolved target. The exception is a pair differing only in case:
+/// every spelling of `Ämli.md` folds the same as every spelling of `ämli.md`, so no amount of qualifying places
+/// either, and those targets stay unresolved by design (§3 accepts this rather than picking). An unknown target is unresolved the same
 /// way, and an empty corpus resolves nothing without failing.
 pub fn resolve(
     corpus: &BTreeMap<String, Vec<String>>,
@@ -432,7 +434,10 @@ fn resolve_target(
 /// Corpus file names to the rels that carry them, lowercased: `deep/nested/Beta.md` is findable as
 /// both `beta.md` and `beta`. A `Vec` longer than one entry is what makes a target ambiguous, and
 /// a file whose name has no extension contributes one key rather than two — inserting the same
-/// path twice under one key would make it ambiguous against itself.
+/// path twice under one key would make it ambiguous against itself. **Do not "fix" that with a dedup on
+/// display text.** Today every `rel` in this map is distinct, so comparing values is equivalent to comparing
+/// rows; once round 2 keys identity on bytes, two live rows can carry byte-identical display text, and a dedup
+/// there would collapse them into one candidate — silently reopening the guess this function exists to refuse.
 fn basename_index(corpus: &BTreeMap<String, Vec<String>>) -> HashMap<String, Vec<String>> {
     let mut index: HashMap<String, Vec<String>> = HashMap::new();
     for rels in corpus.values() {

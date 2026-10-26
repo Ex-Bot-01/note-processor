@@ -580,8 +580,10 @@ fn index_file(
     let rel = snapshot.rel.as_str();
     match change {
         Some(Change::Moved { from }) => {
-            // One row moves and `notes.rel` follows by cascade, which is what keeps a renamed note the
-            // same note with its links attached (see [`crate::db`]).
+            // One row of `files` moves, and [`db::apply_move`] rewrites that note's own `rel` for it:
+            // migration 4 removed `notes.rel`'s foreign key, so the display column has no cascade left to
+            // ride. Identity is what survives a rename either way — `notes.rel_bytes` follows its parent —
+            // which is what keeps a renamed note the same note with its links attached (see [`crate::db`]).
             if let Err(err) = db::apply_move(db, from, rel, now) {
                 return conflict_or_err(err, Indexed::Taken);
             }
@@ -635,7 +637,7 @@ fn index_file(
 /// Delete the note row that a path this scan read as an attachment still carries.
 ///
 /// A byte-identical rename that drops the extension (`note.md` → `note.txt`) is a `Moved`, and
-/// [`db::apply_move`] lets `notes.rel` cascade onto the new path — but an attachment is never parsed, so
+/// [`db::apply_move`] rewrites `notes.rel` onto the new path — but an attachment is never parsed, so
 /// nothing overwrote that row. Left in place it renders as `- [[Title]](note.txt)` and is counted as a
 /// live note, against "tracked but never catalogued" (spec §10), so the row goes with what hangs off it.
 ///
@@ -685,8 +687,9 @@ fn conflict_or_err<T>(err: DbError, taken: T) -> Result<T, ScanError> {
 /// Whether a failed write means another row already holds this path's identity — the one failure that is
 /// a fact about the workspace rather than a broken scan.
 ///
-/// `files.rel` and `files.case_key` are both unique, so two paths can claim one note and no rule here may
-/// pick a winner; SQLite reports that as a constraint violation on either statement.
+/// `files.rel_bytes` and `files.case_bytes` are both unique — since migration 4 they, not the display
+/// columns, carry identity — so two paths can claim one note and no rule here may pick a winner; SQLite
+/// reports that as a constraint violation on either statement.
 fn is_identity_conflict(err: &DbError) -> bool {
     matches!(
         err,

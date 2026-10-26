@@ -3,8 +3,10 @@
 //! Two rules decide the shape of everything here. A file that is gone is **marked stale and
 //! never destroyed** (spec §2): its row keeps `state = 'stale'` with every child row intact,
 //! so the note can come back later and rejoin the live set as the same note. And a move
-//! changes a path, not a note — [`apply_move`] writes one row of `files` and lets
-//! `notes.rel ON UPDATE CASCADE` follow it, while `headings`, `tags`, `links` and `items`
+//! changes a path, not a note — [`apply_move`] writes one row of `files`, rewrites that note's display
+//! `rel` beside it, and lets `notes.rel_bytes` ride its own cascade (migration 4 removed `notes.rel`'s foreign
+//! key, so the display column is maintained here rather than by SQLite), while `headings`, `tags`, `links`
+//! and `items`
 //! stay put because they hang off `notes.id`, which never changes. That is how a rename
 //! keeps a note's links.
 //!
@@ -201,11 +203,12 @@ pub enum DbError {
         /// The parent table its key names.
         parent: String,
     },
-    /// [`byte_path_keys`] was reached with foreign-key enforcement switched on. This is not about the data —
+    /// `byte_path_keys` (this module's migration-4 step) was reached with foreign-key enforcement switched on.
+    /// This is not about the data —
     /// it is the step refusing to run at all, because `DROP TABLE notes` under enforcement performs an
     /// implicit `DELETE FROM` that obeys every child constraint, and four of those children are
     /// `ON DELETE CASCADE`: the workspace's headings, tags, items and prose edges would go with the row and
-    /// nothing downstream would report it. [`migrate`] switches enforcement off outside the transaction for
+    /// nothing downstream would report it. `migrate` switches enforcement off outside the transaction for
     /// exactly this reason; the guard is there so a later refactor cannot quietly hand the step a connection
     /// where that promise no longer holds.
     #[error("PRAGMA foreign_keys reads {value}; rebuilding `files` and `notes` needs it off, so nothing was written")]
@@ -979,7 +982,7 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
 /// Insert the note row for a file that has none yet, returning its freshly minted id.
 ///
 /// This is the program's **only writer of `notes.rel_bytes`**, and it lives here rather than beside the rest
-/// of [`crate::scan::store_note`] so that "bind this note key as TEXT" is not a call any scan-side site can
+/// of `scan::store_note` so that "bind this note key as TEXT" is not a call any scan-side site can
 /// write (F13 §4). That matters more here than anywhere else in the schema: `notes.rel` is plain TEXT and stays
 /// nullable, so an insert that named only the display column would succeed — leaving a note whose byte key is
 /// NULL, which matches nothing the re-keyed join, cascade and lookup compare on bytes. A note row silently

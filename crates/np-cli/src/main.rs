@@ -72,7 +72,8 @@ fn print_summary(report: &ScanReport) {
     print!("unresolved {}", report.unresolved_links);
     if report.unresolved_links > 0 {
         // An ambiguous target is left unresolved instead of guessed, so the number alone is not
-        // actionable. Spelling the path is (`np_core::links::resolve` matches an exact rel first).
+        // actionable. Spelling the path usually is (`np_core::links::resolve` matches an exact rel first) —
+        // except for a pair differing only in case, whose spellings fold identically and so place neither.
         print!(" — a target matched more than one file or none; spell its path to place it, e.g. [[notes/a.md]]");
     }
     println!();

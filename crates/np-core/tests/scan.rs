@@ -1994,7 +1994,7 @@ fn a_refused_move_does_not_label_the_note_it_left_behind_current() {
     drop(db);
 
     // It heals once the rival *moves* rather than disappears. Deleting `A.md` would not free the identity:
-    // a removed path goes `stale` and keeps its `case_key`, which is unique over every row, so the only way
+    // a removed path goes `stale` and keeps its `case_bytes`, which is unique over every row, so the only way
     // the destination opens up is a scan that rewrites the rival's own row — and freeing it takes a second
     // scan, because that rewrite happens when the rival's own path is processed while the move wanting the
     // identity can already have been refused in the same pass.
