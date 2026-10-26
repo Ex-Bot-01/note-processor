@@ -235,13 +235,19 @@ pub struct Unindexable {
     /// with, because this one is fixed by renaming a file. Windows-only in practice: `os_bytes` is exact on
     /// Unix, so no scan run there ever raises this above zero (see [`crate::walk::Walked::unrepresentable`]).
     pub unkeyable: usize,
-    /// Display paths holding more than one live (`state = 'ok'`) `files` row — F23's "this note appears
-    /// twice", counted and deliberately **not** explained. Why a path got two rows is F23's ambiguity, and a
-    /// count that named a cause would be re-deciding it here (F22 §4.5).
+    /// Display paths the registry holds **more than one live (`state = 'ok'`) row** for.
+    ///
+    /// **This is a question, not an accusation.** Two genuinely different files can share a display spelling —
+    /// latin-1 `caf\xE9/note.md` beside `caf\xE8/note.md`, both readable, both correctly indexed — and they land
+    /// here exactly as F23's one-file-two-rows does. It also counts attachments, which have no catalog entry at
+    /// all. So read it as "look at these paths" and confirm with `sqlite3` before deleting anything: the count is
+    /// deliberately **unexplained**, because why a path holds two rows is F23's ambiguity and a count naming a
+    /// cause would be re-deciding it here (F22 §4.5).
     pub duplicates: usize,
     /// Up to eight display spellings, most actionable first: [`Self::unkeyable`] paths, then
-    /// [`Self::unreadable`] ones, then duplicated paths — the entries a person can act on themselves
-    /// survive the cap before the ones somebody else's permissions control.
+    /// [`Self::duplicates`] ones, then [`Self::unreadable`] directories. A refused name and a duplicated path have
+    /// no other channel — the duplicate count is the *only* place F23's "this note appears twice" surfaces — while
+    /// an unreadable directory is also named in [`ScanReport::skipped`], so it can afford to lose cap room.
     ///
     /// Names are display text, so **a name here identifies no path**: two byte-distinct paths can share one
     /// lossy spelling (F20 §1) and then two entries look alike, exactly as two `skipped` lines do. It says
@@ -283,13 +289,14 @@ fn unindexable_record(
     unkeyable: &[UnknownPath],
     duplicates: &[String],
 ) -> Unindexable {
-    // Ordered by kind rather than merged, and capped in that order: a refused name is one a person can fix
-    // by renaming, which is worth more room than a directory their own `chmod` controls.
+    // Ordered by kind rather than merged, and capped in that order: refused names and duplicated paths have no
+    // other channel at all, while an unreadable directory is also named in `ScanReport::skipped`, so it gives up
+    // cap room first.
     let names = unkeyable
         .iter()
         .map(|path| path.display.clone())
-        .chain(unreadable.iter().map(|path| path.display.clone()))
         .chain(duplicates.iter().cloned())
+        .chain(unreadable.iter().map(|path| path.display.clone()))
         .take(NAME_CAP)
         .collect();
     Unindexable {
@@ -1471,14 +1478,18 @@ fn set_meta(db: &Db, key: &str, value: &str) -> Result<(), DbError> {
     Ok(())
 }
 
-/// The display paths the registry holds **more than one live row** for: F23's "this note appears twice",
-/// counted and not explained (F22 §4.5).
+/// The display paths the registry holds **more than one live row** for — counted, never explained (F22 §4.5).
 ///
-/// Grouped by `rel` — the display text — because that is what two catalog entries are rendered from: two
-/// byte-distinct paths sharing one lossy spelling produce two alike-looking lines in `INDEX.md`, which is
-/// exactly the thing a person notices and cannot account for. `state = 'ok'` keeps this the live-catalog
-/// question; a note whose file went stale is not a note that appears twice. Sorted by the same text, so one
-/// workspace produces one record.
+/// Grouped by `rel`, the display text, because that is what a person notices: two byte-distinct paths sharing one
+/// lossy spelling produce two alike-looking lines in `INDEX.md`. **That is also why the count cannot name a cause.**
+/// Two different files whose names collide under lossy decoding are legitimate, correctly indexed, and
+/// indistinguishable here from F23's duplicated note — and an attachment sharing a display spelling with a note
+/// counts too, though it has no catalog entry at all. Narrowing this with `key_is_display_derived` would not help:
+/// it flags both of F23's configurations identically (nothing separates them) while staying silent on Windows,
+/// where every lossy key qualifies.
+///
+/// `state = 'ok'` keeps stale rows out; a note whose file went away is not a path that appears twice. Sorted by the
+/// same text, so one workspace produces one record.
 ///
 /// Collected in full before returning, like every other read here, so no statement is left mid-iteration
 /// across a write.
@@ -1492,10 +1503,15 @@ fn duplicated_rels(db: &Db) -> Result<Vec<String>, DbError> {
     Ok(rels)
 }
 
-/// Record what this scan lost, **post-commit and best-effort** (F22 §3).
+/// Record what this scan lost, **after the transaction commit and best-effort** (F22 §3).
+///
+/// "After the commit" is not "after the scan finished": publishing the index files and recording the workspace
+/// row come later and can still fail the run. The record is therefore accurate about the *committed rows* it
+/// describes, and a scan that dies after this point leaves a record of work that really did land — which is the
+/// lesser error, since the alternative is describing nothing at all.
 ///
 /// The result is dropped for the reason [`crate::db::report_orphans`] gives for its own writes: by the time
-/// this runs the scan's work is committed, so a `meta` write that refuses — a full disk, a lock another
+/// this runs the scan's rows and catalog are committed, so a `meta` write that refuses — a full disk, a lock another
 /// process holds past the timeout, a trigger — costs this workspace its record and nothing else. Returning
 /// `Err` would report a failed scan whose rows and catalog are already durable, and `.expect` would do worse
 /// (F21 §2: that panic is exactly what F21 removed). The loss still reaches this run's report field and its
@@ -2511,22 +2527,24 @@ mod tests {
             [
                 "caf\u{fffd}.md",
                 "zebra.md",
-                "caf\u{fffd}",
                 "dup/a.md",
                 "dup/b.md",
+                "caf\u{fffd}",
             ],
-            "unkeyable first, then unreadable, then duplicated: the order the cap cuts in"
+            // A refused name and a duplicated path have no other channel; an unreadable directory is also
+            // named in `ScanReport::skipped`, so it gives up the last cap slot.
+            "unkeyable first, then duplicated paths, then unreadable directories"
         );
         // The stored spelling, pinned whole — `meta`, `np scan`'s line and this struct read one format, so a
         // person comparing yesterday's terminal against today's record is comparing one string.
         assert_eq!(
             record.value(),
-            "unreadable=1;unkeyable=2;duplicates=2;names=caf\u{fffd}.md,zebra.md,caf\u{fffd},dup/a.md,dup/b.md",
+            "unreadable=1;unkeyable=2;duplicates=2;names=caf\u{fffd}.md,zebra.md,dup/a.md,dup/b.md,caf\u{fffd}",
         );
 
-        // The cap: five refused, four unreadable, three duplicated is twelve losses and eight names. The
-        // entries that fall off are the duplicates — a note appearing twice is less urgent than a name this
-        // build can never key (F22 §3).
+        // The cap: five refused, four unreadable, three duplicated is twelve losses and eight names. What falls
+        // off is the directories: a refused name and a duplicated path reach the person only through this list,
+        // while an unreadable directory is named in `ScanReport::skipped` as well (F22 §3).
         let spelled = |prefix: &str, count: usize| -> Vec<UnknownPath> {
             (0..count)
                 .map(|index| display_keyed_unknown(&format!("{prefix}{index}.md")))
@@ -2552,8 +2570,8 @@ mod tests {
         );
         assert_eq!(
             &capped.names[5..],
-            ["dir0.md", "dir1.md", "dir2.md"],
-            "and the three duplicates are what the cap cost"
+            ["dup0.md", "dup1.md", "dup2.md"],
+            "then every duplicated path, and the four directories are what the cap cost — they are in              `skipped` too"
         );
 
         // Nothing lost: `is_empty` is what makes the report field `None`, while the value is still the full

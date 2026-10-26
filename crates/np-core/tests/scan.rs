@@ -3661,10 +3661,12 @@ fn plant_note_dir(root: &Path, dir: &[u8], body: &str) -> bool {
 
 /// F22 §5's third case: `duplicates` counts **live registry rows per display path**, and nothing else.
 ///
-/// Two twins of `caf\xE9` / `caf\xE8` give one display path with two live rows — the state
-/// [`known_defect_a_readable_display_keyed_path_duplicates_its_own_row`] ends in, reached here through the
-/// same [`plant_twin_dir`] helper rather than a third way to make two live rows, so the two cases cannot
-/// drift. Beside them sits a second pair whose rows are one live and **one stale**: that path appears once in
+/// Two twins of `caf\xE9` / `caf\xE8` give one display path with two live rows — and note what that is **not**:
+/// these are two different files with two different bodies, correctly indexed, which is the innocent shape a
+/// duplicate count cannot distinguish from F23's harm. [`known_defect_a_readable_display_keyed_path_duplicates_its_own_row`]
+/// ends in one physical file holding two rows; [`a_duplicated_note_from_f23_reaches_the_record`] builds that shape
+/// instead, through `rekey_row_like_migration_four`, so both the innocent and the harmful case are pinned. Beside
+/// them sits a second pair whose rows are one live and **one stale**: that path appears once in
 /// the catalog, so it is not a duplicate, and it is the assertion that pins `state = 'ok'`. Drop the filter
 /// and this case reports two duplicates and names `old\u{FFFD}/note.md`, which is a note nobody has twice.
 #[cfg(unix)]
@@ -3704,7 +3706,7 @@ fn the_duplicate_count_names_a_display_path_with_two_live_rows_and_not_one_with_
     assert_eq!(
         live("caf\u{fffd}/note.md"),
         2,
-        "test setup: one display path, two live rows — the shape F23's harm fixture leaves behind"
+        "test setup: one display path, two live rows (two different files here — see the case below for F23's)"
     );
     assert_eq!(
         live(&format!("{STALE_TWIN_DISPLAY}/note.md")),
@@ -3744,9 +3746,11 @@ fn the_duplicate_count_names_a_display_path_with_two_live_rows_and_not_one_with_
 
 /// F22 §5's last case: a `meta` write that refuses leaves the scan **successful**.
 ///
-/// The refusal is a `RAISE(ABORT)` trigger on the one key this record uses, so every other `meta` write of
-/// the scan — the published index-file list, the parse rules version — still runs and the transaction still
-/// commits. That is F21 §2's rule moved to the new mechanism: before it, the only failing statement in that
+/// The refusal is a pair of `RAISE(ABORT)` triggers on the one key this record uses, so every other `meta` write
+/// of the scan — the published index-file list, the parse rules version — still runs and the transaction still
+/// commits. Both upsert arms are installed for completeness, but only the UPDATE arm fires in practice: by the
+/// time a scan records losses the key already exists from its own first open, so the INSERT branch is coverage by
+/// trigger rather than by run. That is F21 §2's rule moved to the new mechanism: before it, the only failing statement in that
 /// path was a `.expect`, and one line nobody could read rolled a whole upgrade back. Here the equivalent
 /// mistake would report a failed scan whose rows and catalog are already durable.
 ///
@@ -3817,4 +3821,111 @@ fn a_refused_record_write_leaves_the_scan_successful() {
     );
     assert!(ws.root.join("INDEX.md").is_file(), "{second:?}");
     assert_eq!(second.notes, 3, "{second:?}");
+}
+
+/// F22's cap order has to keep the entries with **no other channel**: a duplicated path appears nowhere else in
+/// the report, while an unreadable directory is also named in `skipped`. With eight slots and both kinds present,
+/// the duplicate comes first.
+#[cfg(unix)]
+#[test]
+fn names_order_a_duplicated_path_before_an_unreadable_directory() {
+    let ws = scratch(
+        &[(
+            "top.md",
+            "# Top Heading
+",
+        )],
+        600,
+    );
+    for (dir, body) in [
+        (TWIN_DIR_NINE, "# One Heading\n"),
+        (TWIN_DIR_EIGHT, "# Quite Another Heading\n"),
+    ] {
+        if !plant_note_dir(&ws.root, dir, body) {
+            eprintln!("NOT COVERAGE: this filesystem refused to create {dir:?}, so nothing duplicates here");
+            return;
+        }
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let blocked = byte_name(&ws.root, b"blocked");
+    fs::create_dir_all(blocked.join("inner")).expect("test setup: create the blocked directory");
+    fs::write(blocked.join("inner/note.md"), "# Hidden Heading\n")
+        .expect("test setup: write the note behind the blocked directory");
+    let _restore = deny_access(&blocked);
+    if !denied(&blocked) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the blocked directory on this runner, so there is no \
+             unreadable entry to order against the duplicate"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("a blocked directory must not fail the scan");
+    let duplicate = format!("{TWIN_DIR_DISPLAY}/note.md");
+    let db = ws.db();
+    assert_eq!(
+        recorded_losses(&db),
+        format!("unreadable=1;unkeyable=0;duplicates=1;names={duplicate},blocked"),
+        "the duplicated path is named first: it has no other channel, `blocked` is in `skipped` too"
+    );
+    assert_eq!(
+        losses(&report.unindexable),
+        Some((1, 0, 1, vec![duplicate, "blocked".to_string()])),
+        "{report:?}"
+    );
+}
+
+/// The **harmful** duplicate, not the innocent one: F23's one physical file holding two live rows, built the way
+/// F23 builds it — a row re-keyed to its own lossy display text, then re-indexed from real bytes while a twin
+/// directory is blocked. The record has to see this shape too, or `duplicates` would count only the innocent case
+/// and the defect would stay invisible behind a look-alike count.
+#[cfg(unix)]
+#[test]
+fn a_duplicated_note_from_f23_reaches_the_record() {
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!("NOT COVERAGE: this filesystem refused to create {TWIN_DIR_NINE:?}, so F23 cannot be built");
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    drop(db);
+
+    assert!(
+        plant_twin_dir(&ws.root, TWIN_DIR_EIGHT),
+        "test setup: plant the twin that will be blocked"
+    );
+    let _restore = deny_access(&byte_name(&ws.root, TWIN_DIR_EIGHT));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_EIGHT)) {
+        eprintln!("NOT COVERAGE: 0o000 did not deny access to the twin, so no row is hidden and none duplicates");
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("F23's shape must not fail the scan");
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM files WHERE rel = 'caf\u{fffd}/note.md' AND state = 'ok'"
+        ),
+        2,
+        "one physical file, two live rows — the state F23 leaves behind"
+    );
+    let losses = recorded_losses(&db);
+    assert!(
+        losses.starts_with("unreadable=1;unkeyable=0;duplicates=1;"),
+        "the duplicate reaches the record: {losses}"
+    );
+    assert!(
+        losses.contains("caf\u{fffd}/note.md"),
+        "and names the path it happened to: {losses}"
+    );
+    assert_eq!(
+        report.unindexable.as_ref().expect("some").duplicates,
+        1,
+        "the same count on both channels: {report:?}"
+    );
 }
