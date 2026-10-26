@@ -633,8 +633,8 @@ fn an_error_is_reported_rather_than_panicked_when_stderr_refuses_it() {
 // way onto stderr — inside the migration's own transaction. A workspace holding orphans and opened with
 // descriptor 2 refusing writes therefore had its whole upgrade rolled back, forever: exit 101, no rows
 // removed, file still at version two. The receipt is what F21 makes the signal; these cases pin that it
-// (a) survives a closed stderr, (b) reaches the scan that wrote it once and only once, and (c) says
-// nothing when there was nothing to say.
+// (a) survives a stderr that refuses every write, (b) reaches the scan that wrote it once and only once,
+// on both channels and on every platform, and (c) says nothing when there was nothing to say.
 //
 // They need the real binary for (a) — `Db::open` runs before any in-process test could replace descriptor
 // 2 — and a genuine version-two file for all three, because a freshly created database has no orphans to
@@ -643,73 +643,12 @@ fn an_error_is_reported_rather_than_panicked_when_stderr_refuses_it() {
 
 /// The schema as of version 2 — the first two `MIGRATIONS` entries, copied out verbatim.
 ///
-/// Duplicated from `VERSION_TWO` in `crates/np-core/tests/db.rs`: integration-test fixtures are private
-/// to their own test binary, and the alternative — a library function that writes old schemas — would put
-/// a downgrade path in production code to serve a test. Keep the two copies in step if either changes.
-const VERSION_TWO: &str = r#"
-CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
-
-CREATE TABLE files (
-    rel       TEXT    PRIMARY KEY,
-    case_key  TEXT    NOT NULL UNIQUE,
-    abs       TEXT    NOT NULL,
-    hash      TEXT    NOT NULL,
-    size      INTEGER NOT NULL,
-    mtime     INTEGER NOT NULL,
-    state     TEXT    NOT NULL CHECK (state IN ('ok','stale')),
-    last_seen INTEGER NOT NULL
-);
-CREATE INDEX files_case_key ON files(case_key);
-
-CREATE TABLE notes (
-    id           INTEGER PRIMARY KEY,
-    rel          TEXT REFERENCES files(rel) ON UPDATE CASCADE,
-    title        TEXT,
-    title_source TEXT,
-    encoding     TEXT,
-    word_count   INTEGER,
-    body         TEXT
-);
-CREATE INDEX notes_rel ON notes(rel);
-
-CREATE TABLE headings (
-    note_id INTEGER NOT NULL,
-    level   INTEGER NOT NULL,
-    text    TEXT    NOT NULL,
-    line    INTEGER NOT NULL
-);
-
-CREATE TABLE tags (
-    note_id INTEGER NOT NULL,
-    tag     TEXT    NOT NULL
-);
-CREATE INDEX tags_tag ON tags(tag);
-
-CREATE TABLE links (
-    src_note_id INTEGER NOT NULL,
-    dst_note_id INTEGER,
-    kind        TEXT    NOT NULL CHECK (kind IN ('wiki','md','attachment')),
-    target      TEXT    NOT NULL,
-    line        INTEGER NOT NULL,
-    origin      TEXT    NOT NULL CHECK (origin IN ('prose','approved'))
-);
-CREATE INDEX links_dst_note_id ON links(dst_note_id);
-
-CREATE TABLE items (
-    note_id INTEGER NOT NULL,
-    text    TEXT    NOT NULL,
-    line    INTEGER NOT NULL,
-    state   TEXT    NOT NULL CHECK (state IN ('open','done','paused')),
-    marker  TEXT
-);
-
-CREATE TABLE meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-
-INSERT INTO schema_version (version) VALUES (1), (2);
-"#;
+/// The same file `crates/np-core/tests/db.rs` seeds its migration cases from: this binary drives the real
+/// `np`, that one drives `Db::open`, and if the two spellings of "version 2" ever drift apart each suite
+/// is upgrading a different database while both stay green. Shared as a **fixture file**, not as a library
+/// helper — a function that writes old schemas would put a downgrade path in production code to serve a
+/// test.
+const VERSION_TWO: &str = include_str!("../../np-core/tests/fixtures/schema-v2.sql");
 
 /// The receipt [`seed_version_two`] earns: exactly one row of each shape removed, and one destination
 /// NULLed. Five rows changed, which is the total the summary line names.
@@ -822,6 +761,10 @@ fn an_upgrade_that_removed_nothing_is_announced_nowhere() {
         serde_json::from_str(&run(&mut json_ws.command(&["scan", "--json"])).stdout())
             .expect("`--json` must print one JSON object");
     assert!(
+        report.get("upgrade_orphans").is_some(),
+        "the key is always present — one JSON shape for every scan, not one per outcome: {report}"
+    );
+    assert!(
         report["upgrade_orphans"].is_null(),
         "a cleanup that removed no rows has no loss to report: {report}"
     );
@@ -841,8 +784,59 @@ fn an_upgrade_that_removed_nothing_is_announced_nowhere() {
     assert_eq!(receipt(&db), NOTHING_REMOVED);
 }
 
-/// F21 §4.1, against the descriptor that produced the defect: stderr refuses every write while migration 3
-/// is running, and the upgrade still completes.
+/// The stdout half of the announcement, asserted where every platform can run it: the scan whose own open
+/// removed rows prints `removed N orphan row(s)` in its summary.
+///
+/// This is the positive assertion the `/dev/full` case below used to be the only home of. Gated on Linux,
+/// Windows ran every other F21 case through `--json`, so nothing there would fail if the summary line
+/// stopped being printed at all — and the summary is the channel a person actually reads.
+#[test]
+fn the_upgrading_scan_prints_the_orphans_it_removed() {
+    let ws = workspace();
+    seed_version_two(&ws.db_path());
+
+    let first = run(&mut ws.command(&["scan"]));
+    first.assert_success();
+    // Total and stored counts on one line, spelled as `np-cli`'s `print_summary` writes them.
+    assert!(
+        first.stdout().contains("removed 5 orphan row(s)"),
+        "the run that deleted five rows has to say so:\n{}",
+        first.stdout()
+    );
+    assert!(
+        first.stdout().contains(ORPHAN_RECEIPT),
+        "and name the shapes as `meta` records them:\n{}",
+        first.stdout()
+    );
+    // Once, on this channel. The stderr echo of the same sentence is deliberate (see
+    // `np_core::db::report_orphans`) and lands on the other descriptor; a second copy *here* would mean the
+    // summary grew a duplicate.
+    let lines = first
+        .stdout()
+        .lines()
+        .filter(|line| line.contains("orphan row(s)"))
+        .count();
+    assert_eq!(
+        lines,
+        1,
+        "one announcement line per run:\n{}",
+        first.stdout()
+    );
+
+    // And the line describes what actually happened: reopened through the normal path, the orphans are gone
+    // and their receipt is in `meta`.
+    let db = Db::open(&ws.db_path()).expect("test setup: open the upgraded database");
+    assert_only_the_orphans_went(&db);
+    assert_eq!(receipt(&db), ORPHAN_RECEIPT);
+}
+
+/// F21 §4.1, against a descriptor 2 that refuses every write while migration 3 runs: the upgrade still
+/// completes.
+///
+/// The refusing descriptor here is `/dev/full`, so the premise is `ENOSPC` on an **open** descriptor — not a
+/// closed one, which Rust's stdio handles report as a successful write (the premise check below is what
+/// keeps that distinction honest). Linux is where `/dev/full` exists; the summary line this run also asserts
+/// is pinned on every platform by `the_upgrading_scan_prints_the_orphans_it_removed`.
 ///
 /// Before the fix this run exited 101 — `report_orphans` panicked inside the migration's transaction, which
 /// rolled the deletes and the receipt back together, so the file stayed at version two and every later run
@@ -850,12 +844,13 @@ fn an_upgrade_that_removed_nothing_is_announced_nowhere() {
 /// message could not be printed either, so nothing else about the run was readable.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_scan_upgrades_with_descriptor_two_closed() {
+fn a_scan_upgrades_when_stderr_refuses_writes() {
     let ws = workspace();
     seed_version_two(&ws.db_path());
 
     // Premise first, as `a_scan_survives_a_stderr_that_refuses_every_write` learned: `/dev/null` accepts
-    // every write and so does a descriptor opened read-only, so only `/dev/full` actually refuses one.
+    // every write and so does a descriptor opened read-only, so only `/dev/full` actually refuses one. A
+    // closed descriptor would refuse nothing at all, which is why this case is named for refusal.
     if fs::write("/dev/full", "receipt").is_ok() {
         panic!("test premise: /dev/full accepted a write, so this case would prove nothing");
     }

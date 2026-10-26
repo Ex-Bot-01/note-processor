@@ -2,7 +2,8 @@
 
 Status: design for the first round of `m3/report-fidelity`'s F21 work. Backlog: `docs/backlog-m2-followups.md`
 F21; related: F22 (a refusal that exists only as one report line), R8 (`9541806`, which made every *other*
-post-commit stderr write non-fatal). Code: `crates/np-core/src/db.rs`'s `add_note_foreign_keys` → `report_orphans`.
+post-commit stderr write non-fatal). Code: `crates/np-core/src/db.rs`'s `add_note_foreign_keys` writes the receipt and
+`apply_migrations` echoes it, after the commit, through `report_orphans`.
 
 ## 1. The defect
 
@@ -29,6 +30,17 @@ never to hide. Consequences:
   which it does, in the same transaction, so a failed receipt rolls the cleanup back. Verify that with a test rather
   than trusting statement order: force the receipt write to fail (a read-only connection or a constraint) and assert
   no rows were deleted.
+- **The echo fires after the commit.** It lives in `apply_migrations`, printing the receipt that step's own
+  transaction wrote, and nothing anywhere before `tx.commit()` writes to a stream at all. Announcing from inside
+  the migration — where it started — said "removed N orphan row(s)" for rows a COMMIT can put back on its own
+  (`SQLITE_FULL`, a WAL that cannot be resumed), and said it again on every retry: exactly the false announcement
+  §3.1 refuses.
+  **No test pins that ordering, and none is claimed here.** Failing a COMMIT portably and deterministically is not
+  available in this workspace: a second connection holding the write lock, a read-only file, a `RAISE(ABORT)`
+  trigger and a page-count limit all refuse an *earlier statement*, so they pin "a failed migration says nothing"
+  (which `a_receipt_that_cannot_be_written_rolls_the_cleanup_back` does) without ever reaching the commit. The
+  guarantee is therefore the call site's position plus the durable receipt — the second is tested, the first is
+  reviewable at a glance. Whoever finds a portable way to fail a COMMIT should replace this sentence with the test.
 - The receipt is **history, not a queue**: it is never cleared, because "the upgrade removed N rows" stays true.
 
 ## 3. Surfacing it again without nagging forever
@@ -41,8 +53,13 @@ scan report. Rule: **a scan echoes the receipt only when its own process perform
 - `ScanReport` gains one additive field — `pub upgrade_orphans: Option<String>` — holding that stored value when this
   process did the cleanup **and the cleanup removed at least one row**, `None` otherwise. The stdout summary prints one
   line naming the total and the counts; `--json` carries the same string, read from the same field, so the two channels
-  cannot disagree. Nothing is repeated on later scans, because by then the user has been told once and the record is
-  still in `meta` for whoever asks with `sqlite3`.
+  cannot disagree — and carries it as a **present key holding `null`** when there is nothing to report, never as an
+  absent key: one shape is worth more to the one consumer than one fewer `null`, and `null` already answers "nothing
+  was removed".
+  Nothing is repeated on later scans. What that promises is narrower than "the user has been told": stdout may have
+  been closed on the very run that printed the line, and nothing detects that. What it promises is that **the fact
+  survives in `meta` and no stream is load-bearing** — repeating the line would buy no durability, only noise, and
+  silence hides nothing that `sqlite3` cannot still answer.
 - Why "this process" rather than "whenever the key is non-zero": a permanent one-line warning on every scan would
   train the user to ignore it, which is how real signals die. And why not clear the key after echoing: clearing makes
   the echo load-bearing again — if both streams fail once, the fact is gone.
@@ -68,8 +85,11 @@ differ at zero deliberately — the receipt records that the look happened, the 
 ## 4. Invariants
 
 1. **No panic on a refusing descriptor 2 anywhere in the upgrade path.** R8 established this for post-commit writes;
-   this round extends it to migration. A test must open an orphan-holding version-2 workspace with stderr closed and
-   assert the upgrade completes and `np scan` exits 0.
+   this round extends it to migration. A test must open an orphan-holding version-2 workspace with stderr **refusing
+   writes** and assert the upgrade completes and `np scan` exits 0. Refusing, not closed: the descriptor the test can
+   actually hand a child that fails is `/dev/full`, which is open and answers `ENOSPC`, while a closed or `/dev/null`
+   descriptor reports success — so the wording here says what the fixture proves, and the test checks its own premise
+   before believing it.
 2. **Deletion without a durable receipt is impossible.** Enforced by the same transaction, pinned by a test (§2).
 3. **`ScanReport` changes additively only**; catalog output and every file under `tests/golden/` stay byte-identical.
 4. **No new stream-dependent signal.** If this round needs to tell a person something that must survive, it goes in
@@ -77,20 +97,35 @@ differ at zero deliberately — the receipt records that the look happened, the 
 
 ## 5. Tests this round owes
 
-- Version-2 workspace with orphans, descriptor 2 closed (R8's `a2cd0ba` shows the technique — spawn directly, since
-  `assert_cmd` replaces inherited stdio): upgrade completes, exit success, rows gone, `meta` receipt present, stdout
-  summary names the orphan total.
+- Version-2 workspace with orphans, stderr refusing writes via `/dev/full` (R8's `a2cd0ba` shows the technique — spawn
+  directly, since `assert_cmd` replaces inherited stdio): upgrade completes, exit success, rows gone, `meta` receipt
+  present, stdout summary names the orphan total (`a_scan_upgrades_when_stderr_refuses_writes`, Linux-only because
+  `/dev/full` is).
+- **On every platform**, a plain `np scan` of that seeded workspace prints the announcement: one stdout line naming the
+  total and the stored counts, and the rows really gone (`the_upgrading_scan_prints_the_orphans_it_removed`). Without
+  it the positive assertion above existed only where `/dev/full` does — every other F21 case reads `--json` — so no
+  Windows run would notice the summary line disappearing.
 - Same workspace, second scan: no repeat line, `upgrade_orphans` is `None`, receipt still in `meta`.
 - Receipt-write failure: orphans survive (transaction rolled back), and the error surfaces as an error rather than a
   panic.
 - The existing `report_orphans` unit tests keep their assertions — they pin wording and the all-zero silence, none of
-  which changes; only the failure mode does.
+  which changes; only the failure mode does. Their input is now the stored receipt string rather than the private
+  counts struct, because that string is all the caller has after the commit — and it is the same string `--json` and
+  the summary line render, so the three channels cannot disagree about a number.
 - The all-zero case §3.1 settles: a fresh workspace's first scan has `upgrade_orphans == null`, prints no line, and its
   `meta` still holds the all-zero receipt. (`crates/np-cli/tests/cli.rs`,
   `an_upgrade_that_removed_nothing_is_announced_nowhere`.)
 - And the unit-level half of §4.1: a sink that returns `ENOSPC` for every write does not abort the migration
   (`crates/np-core/src/db.rs`, `a_sink_that_refuses_writes_does_not_abort_the_upgrade`). It cannot replace the
-  closed-descriptor case above, because only a real descriptor 2 pins the production call site.
+  refusing-descriptor case above, because only a real descriptor 2 pins the production call site.
+- The receipt survives the steps that follow it on the handle that ran the cleanup (`db.upgrade_orphans()` after
+  opening a version-two file, in `a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note`): migration 4
+  runs after the cleanup, and a loop that handed back the later step's nothing would leave the upgrading scan silent.
+
+The version-two schema this round seeds is one file, `crates/np-core/tests/fixtures/schema-v2.sql`, `include_str!`'d by
+both suites. It was two verbatim copies in two test binaries — one silent edit away from two different "version 2"s,
+with each suite upgrading a database the other never saw and both staying green. It stays a **test** fixture: reading
+old schemas from the library would put a downgrade path in production code to serve a test.
 
 ## 6. Gates
 

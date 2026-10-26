@@ -415,72 +415,15 @@ fn deleting_a_note_row_cascades_to_its_children_and_nulls_inbound_edges() {
 }
 
 /// The schema as of version 2 — the first two `MIGRATIONS` entries copied out verbatim, and
-/// deliberately **not** read from them. This fixture is history: migration 3 has to upgrade the shape
-/// an M1 database holds on disk, so it must not move when the code under test does.
-const VERSION_TWO: &str = r#"
-CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
-
-CREATE TABLE files (
-    rel       TEXT    PRIMARY KEY,
-    case_key  TEXT    NOT NULL UNIQUE,
-    abs       TEXT    NOT NULL,
-    hash      TEXT    NOT NULL,
-    size      INTEGER NOT NULL,
-    mtime     INTEGER NOT NULL,
-    state     TEXT    NOT NULL CHECK (state IN ('ok','stale')),
-    last_seen INTEGER NOT NULL
-);
-CREATE INDEX files_case_key ON files(case_key);
-
-CREATE TABLE notes (
-    id           INTEGER PRIMARY KEY,
-    rel          TEXT REFERENCES files(rel) ON UPDATE CASCADE,
-    title        TEXT,
-    title_source TEXT,
-    encoding     TEXT,
-    word_count   INTEGER,
-    body         TEXT
-);
-CREATE INDEX notes_rel ON notes(rel);
-
-CREATE TABLE headings (
-    note_id INTEGER NOT NULL,
-    level   INTEGER NOT NULL,
-    text    TEXT    NOT NULL,
-    line    INTEGER NOT NULL
-);
-
-CREATE TABLE tags (
-    note_id INTEGER NOT NULL,
-    tag     TEXT    NOT NULL
-);
-CREATE INDEX tags_tag ON tags(tag);
-
-CREATE TABLE links (
-    src_note_id INTEGER NOT NULL,
-    dst_note_id INTEGER,
-    kind        TEXT    NOT NULL CHECK (kind IN ('wiki','md','attachment')),
-    target      TEXT    NOT NULL,
-    line        INTEGER NOT NULL,
-    origin      TEXT    NOT NULL CHECK (origin IN ('prose','approved'))
-);
-CREATE INDEX links_dst_note_id ON links(dst_note_id);
-
-CREATE TABLE items (
-    note_id INTEGER NOT NULL,
-    text    TEXT    NOT NULL,
-    line    INTEGER NOT NULL,
-    state   TEXT    NOT NULL CHECK (state IN ('open','done','paused')),
-    marker  TEXT
-);
-
-CREATE TABLE meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-
-INSERT INTO schema_version (version) VALUES (1), (2);
-"#;
+/// deliberately **not** read from them. This fixture is history: migration 3 has to upgrade the shape an
+/// M1 database holds on disk, so it must not move when the code under test does.
+///
+/// One file rather than one copy per test binary, because `crates/np-cli/tests/cli.rs` seeds the same
+/// version-two file to drive the real binary: two verbatim copies of "version 2" are one silent edit away
+/// from two different schemas, and a migration test upgrading a shape nobody shipped would still be
+/// green. It is a *test* fixture — reading it into the library instead would put a downgrade path in
+/// production code to serve a test.
+const VERSION_TWO: &str = include_str!("fixtures/schema-v2.sql");
 
 /// Write a version-two database at `path` holding the three kinds of row migration 3 has to tell
 /// apart: children of two live notes, the children of one note whose file was reported gone
@@ -634,6 +577,17 @@ fn a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note() {
         receipt(&db),
         ONE_OF_EACH,
         "the cleanup reports what it deleted"
+    );
+
+    // The same value reaches the process that did the deleting through the handle, not a second read of
+    // `meta` — and it has to survive **every** later step: migration 4 runs after this one, and a loop that
+    // overwrote the receipt with the later step's nothing would leave the upgrading scan silent while
+    // `meta` still held the record (`only_the_scan_that_removed_the_orphans_announces_them` in
+    // `crates/np-cli/tests/cli.rs` covers the printed half of the same fact).
+    assert_eq!(
+        db.upgrade_orphans(),
+        Some(ONE_OF_EACH),
+        "the open that ran the cleanup still carries its receipt after the steps that followed"
     );
 
     // The constraint is live on the upgraded file, not merely declared.

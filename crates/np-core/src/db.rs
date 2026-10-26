@@ -160,9 +160,11 @@ pub const MIGRATIONS: &[Migration] = &[
 pub enum Migration {
     /// A SQL script, applied verbatim inside the step's own transaction.
     Sql(&'static str),
-    /// A step that cannot be written as a script — a table rebuild, or a cleanup whose counts have to
-    /// be reported — run inside the same kind of transaction. Returning an error rolls the whole step
-    /// back and leaves the recorded version where it was.
+    /// A step that cannot be written as a script — a table rebuild, or a cleanup whose counts have to be
+    /// reported — run inside the same kind of transaction. Saying those counts out loud is the runner's
+    /// job and not the step's: `apply_migrations` (a code span; that function is private) echoes a cleanup
+    /// only once its commit has landed, so nothing is announced about work that can still be rolled back.
+    /// Returning an error rolls the whole step back and leaves the recorded version where it was.
     ///
     /// The connection is handed over with `foreign_keys` switched off, because a rebuild needs it that
     /// way; every migration step runs under that switch and enforcement is back on afterwards.
@@ -426,7 +428,12 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<Option<String>, DbEr
         if let Some(value) = &receipt {
             report_orphans(&mut io::stderr(), value);
         }
-        orphans = receipt;
+        // At most one step can produce a receipt, so there is one value to hand back — but a later step's
+        // `None` must not clear it, or the scan that did the deleting reports nothing. Migration 4 runs
+        // right after this one; these two pin that it does not swallow the receipt —
+        // `only_the_scan_that_removed_the_orphans_announces_them` (np-cli: the printed half) and
+        // `a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note` (this crate: the handle).
+        orphans = receipt.or(orphans);
     }
     Ok(orphans)
 }
@@ -572,8 +579,9 @@ fn report_orphans(out: &mut dyn io::Write, receipt: &str) {
 ///
 /// The reader that pairs with `OrphanCleanup::value` (a code span, not a link: that type is private and
 /// rustdoc warns when public docs link to it), for every caller left holding only the stored
-/// string — the scan report, `np scan`'s summary line, and the stderr echo in [`report_orphans`], each
-/// of which names the total beside the counts (F21 §3). Every number in the value is summed whatever its label: the spelling is this module's own
+/// string — the scan report, `np scan`'s summary line, and the stderr echo in `report_orphans` (a code
+/// span, not a link: that function is private), each of which names the total beside the counts
+/// (F21 §3). Every number in the value is summed whatever its label: the spelling is this module's own
 /// and its labels are pinned by the tests around [`FK_ORPHANS_KEY`], so there is nothing here to
 /// validate — a fragment that will not parse as a count adds nothing rather than failing a report.
 pub fn orphan_total(value: &str) -> usize {
@@ -1471,7 +1479,10 @@ mod tests {
         // call site names stderr and survives a descriptor 2 that refuses writes — is
         // `a_scan_upgrades_when_stderr_refuses_writes` in `crates/np-cli/tests/cli.rs`; no in-process
         // test can reach descriptor 2.
-        report_orphans(&mut Refusing, "headings=1,tags=0,items=0,links_src=0,links_dst_null=0");
+        report_orphans(
+            &mut Refusing,
+            "headings=1,tags=0,items=0,links_src=0,links_dst_null=0",
+        );
     }
 
     #[test]

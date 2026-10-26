@@ -166,7 +166,13 @@ pub struct ScanReport {
     /// place, the echo stays a convenience and `meta` stays the record. That is also where the two part
     /// ways by design: an all-zero receipt **is** still written, because it proves the check ran, while
     /// this field reports a **loss** and has nothing to report at zero — so a fresh workspace's first scan
-    /// prints no line and carries no field, even though its database now holds `headings=0,tags=0,…`.
+    /// prints no line and its `--json` says `"upgrade_orphans": null`, even though its database now holds
+    /// `headings=0,tags=0,…`.
+    ///
+    /// **Null, not absent.** The key is there on every scan report whatever the outcome, because one JSON
+    /// shape is worth more to its one consumer than one fewer `null`: with the key suppressed at zero, a
+    /// reader cannot tell "nothing was removed" apart from "this build stopped reporting it", and every
+    /// reader grows a missing-key branch to answer a question `null` already answered.
     pub upgrade_orphans: Option<String>,
     /// Wall-clock milliseconds for the whole scan. Informational only — never in a generated file,
     /// where it would make every regeneration differ (spec §10).
