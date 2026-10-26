@@ -748,8 +748,12 @@ fn byte_path_keys(conn: &Connection) -> Result<(), DbError> {
 
     // Both tables are back under their own names, so the keys they name exist and the indexes land on the
     // live table. `files_rel` and `notes_rel` are lookup-only now — neither column is unique or a key any
-    // more — and round 1 needs both: row resolution (`SELECT id FROM files WHERE rel = ?1`) and `mark_stale`
-    // still ask about display text, once per file inside a scan's write phase.
+    // more. Round 1 needed both, because row resolution (`SELECT id FROM files WHERE rel = ?1`) and
+    // `mark_stale` asked about display text once per file inside the write phase; round 2 moved those readers
+    // to `rel_bytes`, so **no production statement queries either index any more** — they are maintained on
+    // every insert and update and read by nothing. They stay because dropping an index from an existing
+    // database is a second migration rather than a comment edit, and `the_schema_is_what_the_plan_mandates`
+    // pins the shape; their removal belongs to whatever next has a reason to rebuild these tables.
     conn.execute_batch(
         "CREATE INDEX files_case_bytes ON files(case_bytes);
          CREATE INDEX files_case_key   ON files(case_key);

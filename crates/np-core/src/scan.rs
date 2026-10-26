@@ -546,8 +546,9 @@ fn apply_changes(
                     written.uncovered += 1;
                 }
             }
-            // The path holds more than one note row, so nothing about it was rewritten (F13 §7). Its rows
-            // exist and stay whatever rules wrote them, which is exactly what a refresh has to remember.
+            // More than one note row sits on this path, so no note was re-parsed or rewritten (F13 §7; the
+            // registry row may already have moved — see [`Indexed::Duplicate`]). Its rows exist and stay
+            // whatever rules wrote them, which is exactly what a refresh has to remember.
             Indexed::Duplicate => {
                 written.skipped.push(rel.to_string());
                 if owes_a_reparse(db, &path, readable.is_markdown)? {
@@ -594,7 +595,15 @@ enum Indexed {
     Taken,
     /// More than one note row sits on this path's key — a legacy duplicate `notes.rel` never forbade
     /// (F13 §7). Picking one would rewrite that note's title, tags, items and links with the other's
-    /// contents, so nothing is written and the file is named in `skipped` instead.
+    /// contents, so no note is re-parsed or rewritten and the file is named in `skipped`.
+    ///
+    /// What *is* already written by the time this is decided, and what a reader must not be promised away:
+    /// for a renamed path `apply_move` has moved the `files` row and both notes rode its cascade, so their
+    /// display `rel` changed; and `upsert_file` has refreshed `hash`, `size`, `mtime` and `state`. The
+    /// registry row is therefore current while the two notes keep an older title, body, headings, tags,
+    /// items and prose edges — a deliberately mixed-age database, because every alternative either merges
+    /// two notes nobody asked to merge or stops the scan. Nothing heals this on its own: see
+    /// `docs/backlog-m2-followups.md` F19.
     Duplicate,
 }
 
@@ -1180,10 +1189,14 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// any of them would re-parse the whole corpus on every scan forever and repair nothing.
 ///
 /// What *can* still hold the version back indefinitely is stale data that exists and cannot be rewritten: a
-/// note whose
-/// rows are there but unreadable (a mode-000 `.md`, or one inside a directory nobody can enter), a live row
-/// hidden behind such a directory, and a move refused by an identity conflict — judged by the path it came
-/// from, since `classify` suppressed that path's `Removed` and its rows are still in the catalog. That loop
+/// note whose rows are there but unreadable (a mode-000 `.md`, or one inside a directory nobody can enter), a
+/// live row hidden behind such a directory, a move refused by an identity conflict — judged by the path it
+/// came from, since `classify` suppressed that path's `Removed` and its rows are still in the catalog — and
+/// **a legacy duplicate note pair** (`Indexed::Duplicate`). The first three clear when the obstruction does.
+/// A duplicate never does: no code merges two note rows, so such a workspace re-parses its whole corpus on
+/// every scan and prints the gap line each time. That is chosen over recording the version beside a note that
+/// was not re-parsed, which is F15's bug wearing a clean hat; the cost is named here rather than discovered,
+/// and `docs/backlog-m2-followups.md` F19 owns the migration that would heal it. That loop
 /// is worth paying for: those rows stay wrong until the obstruction clears, and the notice below names the
 /// count so this is never silent.
 fn refresh_covered(written: &Written, hidden_by_unreadable: usize) -> bool {

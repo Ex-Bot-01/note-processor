@@ -232,6 +232,52 @@ What these numbers can and cannot carry:
 - **Fix:** reject or clamp past a documented maximum (say 16) at config load, and say which in the error. **Done
   when:** an oversized indent fails `np scan` with a message naming the key instead of rendering oddly.
 
+## F18 — Windows has no byte identity at all, and its suite cannot show it
+
+- **Where:** `crates/np-core/src/path_keys.rs`'s `os_bytes`, the `#[cfg(not(unix))]` arm spelling bytes as
+  `to_string_lossy().into_owned().into_bytes()`, plus every `#[cfg(unix)]` test F13 added (`tests/scan.rs`'
+  Latin-1 round trip, twins and resolution-over-twins; `tests/db.rs`'s two migrated-lossy cases).
+- **Risk:** on Windows `rel_bytes == rel.as_bytes()` by construction, so F13's promise is not weaker there — it
+  is absent. Two names differing only where Rust cannot represent the unit collapse to one key **through**
+  round 2's own lookup: `SELECT id FROM files WHERE rel_bytes = ?1` finds the twin's row and `UPDATE`s over it,
+  no constraint fires, nothing reaches `skipped`. Round 2 also moved that platform's identity fold from Unicode
+  `case_key` to ASCII `case_bytes`, so a non-ASCII case rename is no longer followed either. A green
+  `windows-latest` job proves none of this either way: nothing in that suite can build a colliding name.
+- **Fix:** an explicit decision, not a slow drift — either encode the wide units as WTF-8 so bytes exist to key
+  on (changing `path_bytes`, `normalize_rel` and `rebase_abs` in one step, never `rel_bytes` alone), or say so
+  in user-facing docs and make Windows refuse to *silently* overwrite: detect a display-text collision there and
+  report it as `skipped` the way Unix does for byte collisions. **Do when:** on Windows, two names that differ
+  only in unrepresentable units either key apart or are named in the report — never silently merged.
+
+## F19 — a legacy duplicate note pair re-parses the whole corpus forever
+
+- **Where:** `crates/np-core/src/scan.rs`'s `Indexed::Duplicate` arm charging `written.uncovered` on every
+  scan, and `refresh_covered`, which therefore never returns true for such a workspace.
+- **Risk:** deliberate at the level of F15 (recording the parse version beside a note that was not re-parsed is
+  exactly F15's bug), but nothing heals it: no code merges two `notes` rows for one path, so every scan
+  re-parses every note and prints the refresh-gap line. On a large corpus that is a permanent several-hundred-ms
+  cost plus a warning nobody can act on, and the registry row keeps moving ahead of derived rows that never
+  change (mixed-age database, `Indexed::Duplicate`'s doc).
+- **Fix:** a migration or repair command that merges duplicate note rows for one `rel_bytes` — keeping the older
+  `notes.id` so derived rows stay attached, re-pointing edges that named the loser, and reporting what it merged
+  rather than choosing silently — after which the version records normally. Until then the cost is named in
+  `refresh_covered`'s doc, not discovered. **Do when:** a workspace holding a legacy duplicate converges to
+  `uncovered = 0` on the scan after the repair, and the repair names every pair it merged.
+
+## F20 — two report-side filters still compare display text
+
+- **Risk:** pre-existing shape, newly reachable. `scan.rs`'s `under_unreadable(&snapshot.rel, unreadable)` matches
+  a lossy display spelling against a list of lossy display spellings, so with twin *directory* names one
+  unreadable directory hides both twins from `known`: the readable twin can surface as a spurious `Added`, and
+  `hidden_by_unreadable` inflates enough to hold back the parse version. Separately, `skipped.sort();
+  skipped.dedup()` publishes one line for two byte-distinct refused files that share a display spelling — a
+  reduced form of §1's "the report cannot name the file it lost".
+- **Fix:** carry `rel_bytes` alongside the display spelling in both places (the unreadable set is built by the
+  walk, which already has bytes) and key the dedup on bytes while printing display text. Neither changes catalog
+  output, so goldens stay put; a fixture with twin directory names should pin both halves.
+  **Do when:** a workspace with `caf\xe9/` and `caf\xe8/`, one unreadable, reports exactly the rows it should
+  and names both refused paths on separate lines.
+
 ---
 
 ## Explicitly not in this backlog

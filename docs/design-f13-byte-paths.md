@@ -583,9 +583,13 @@ test compiles on Windows into a name that cannot be built, and passes by asserti
 - **Keys are typed.** One test per key column — `files.rel_bytes`, `files.case_bytes`, `notes.rel_bytes` —
   binding a `&str` and asserting `CHECK(typeof(…) = 'blob')` refuses it. The regression this plan cannot
   afford is a TEXT twin of a BLOB key: it conflicts with nothing and reports nothing (§4).
-- **One note row per file, pinned.** After a scan, and again after a move, no `notes.rel_bytes` carries two
-  rows (`GROUP BY rel_bytes HAVING COUNT(*) > 1` is empty). §3 removes `note_id`'s `LIMIT 1`, so this
-  assumption stops being hidden by a `LIMIT` and starts being tested. Same query, one assertion weaker and more
+- **No *new* duplicate, pinned — and legacy ones made visible.** After a scan, and again after a move,
+  `GROUP BY rel_bytes HAVING COUNT(*) > 1` must not have **grown**. Read literally the original wording
+  ("is empty") is unsatisfiable on a migrated workspace, and round 2's review caught the suite being judged
+  against it: `notes.rel` was never UNIQUE at v3, §7 copies both rows onto one key on purpose, and round 2
+  refuses to pick between them. What §3 actually removed `note_id`'s `LIMIT 1` to protect is the rule that an
+  identity lookup never chooses silently — which the duplicate-count query supports by naming the population
+  rather than by pretending it cannot exist. Same query, one assertion weaker and more
   important: **no `notes` row has `rel_bytes IS NULL`** after any write pass — the new-note insert of
   `scan.rs:769-773` is the only thing that can produce one (§3), and a keyless note matches nothing in the
   re-keyed join or cascade. The column stays nullable because migration 4 copies rows it did not write and must
@@ -675,8 +679,20 @@ test compiles on Windows into a name that cannot be built, and passes by asserti
 - **Windows stance, explicit.** Windows has no byte spelling — Rust hands out UTF-16 code units, and
   unpaired surrogates are the only lossy case (`config.rs:214-226` already says so). F13 therefore lands
   Unix fidelity only: `rel_bytes` is filled from `OsStrExt::as_bytes` on Unix and from the current lossy
-  text elsewhere, and the Windows gap stays a documented residual. Any later Windows fix must change
-  `path_bytes`, `normalize_rel` and `rebase_abs` together in one step (an WTF-8 encoding of the wide
+  text elsewhere, and the Windows gap stays a documented residual.
+
+  **Say what that costs rather than calling it a residual.** On Windows `rel_bytes == rel.as_bytes()` by
+  construction, so F13's promise is not weakened there — it is absent. Two names differing only where Rust
+  cannot represent the unit still collapse to one key, and after round 2 they collapse **through** the new
+  lookup: `SELECT id FROM files WHERE rel_bytes = ?1` finds the twin's row and `UPDATE`s over it, no constraint
+  fires, nothing reaches `skipped`. §1's failure survives on Windows with better furniture. Round 2 also moved
+  that platform's identity fold from Unicode `case_key` to ASCII `case_bytes` (`key_of`, `folded_row`), so a
+  non-ASCII case rename is no longer followed there either — see §5's accepted-regression pin, which must exist
+  precisely because it is Windows' whole rename-following story. A green `windows-latest` job is not evidence
+  against any of this: nothing in that suite can build a name that collides. Backlog wording should read **no
+  byte identity on Windows**, not "residual" — the column exists and is inert.
+
+  Any later Windows fix must change `path_bytes`, `normalize_rel` and `rebase_abs` together in one step (an WTF-8 encoding of the wide
   units), never `rel_bytes` alone — a half-moved Windows path would be written under one rule and read
   under another.
 
