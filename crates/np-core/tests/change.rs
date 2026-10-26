@@ -5,6 +5,7 @@
 
 use np_core::change::{classify, Change};
 use np_core::hash::Snapshot;
+use np_core::path_keys::{self, RelPath};
 
 /// Linux and macOS semantics: the filesystem distinguishes case, so `rel` identifies a
 /// file. This is what the scan passes as `case_sensitive`.
@@ -13,15 +14,23 @@ const CASE_SENSITIVE: bool = true;
 /// Passed explicitly rather than reached through `#[cfg]`, so it runs on this machine.
 const CASE_INSENSITIVE: bool = false;
 
-/// A snapshot as `walk` + `sha256_file` would produce it.
+/// A snapshot as `walk` + `sha256_file` would produce it: the byte keys are the display text's own bytes,
+/// which is what a walk records for an ASCII or valid-UTF-8 name.
 fn snap(rel: &str, hash: &str, size: u64, mtime: i64) -> Snapshot {
     Snapshot {
+        rel_bytes: path_keys::rel_bytes_of_display(rel),
+        case_bytes: path_keys::case_fold(rel.as_bytes()),
         rel: rel.to_string(),
         case_key: rel.to_lowercase(),
         hash: hash.to_string(),
         size,
         mtime,
     }
+}
+
+/// A path named both ways, as [`classify`]'s output names it.
+fn id(rel: &str) -> RelPath {
+    RelPath::from_display(rel)
 }
 
 #[test]
@@ -63,12 +72,7 @@ fn same_hash_new_path_is_moved() {
     // One entry, on the new path, and no `Removed` next to it: identity is preserved.
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
-        vec![(
-            "b/x.md".to_string(),
-            Change::Moved {
-                from: "a/x.md".to_string()
-            }
-        )]
+        vec![(id("b/x.md"), Change::Moved { from: id("a/x.md") })]
     );
 }
 
@@ -94,11 +98,46 @@ fn case_only_rename_on_a_case_sensitive_fs_is_a_move() {
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
         vec![(
-            "notes/x.md".to_string(),
+            id("notes/x.md"),
             Change::Moved {
-                from: "Notes/x.md".to_string()
+                from: id("Notes/x.md")
             }
         )]
+    );
+}
+
+/// §3's accepted regression, made evidence: on a case-insensitive filesystem a rename that changes only a
+/// non-ASCII letter's case is no longer followed, and the note detaches.
+///
+/// `key_of` takes `case_bytes` — the ASCII byte fold — when `case_sensitive` is false, and that fold leaves `Ä`
+/// and `ä` exactly as they are: two identities where a person renamed one file. The content changed too, so the
+/// hash rule cannot pair them either and what comes back is `Added` + `Removed` — §4.2's detaching shape, with
+/// a fresh `notes.id` and the old row marked stale in the same pass. Unchanged content would still have
+/// travelled, because unmatched snapshots pair by hash; that is why this fixture edits.
+///
+/// On Windows `key_of` *is* `case_bytes`, so for that platform this pair is not one corner of rename following,
+/// it is the whole story (`docs/backlog-m2-followups.md` F18). The other half of the same pair — `folded_row`
+/// no longer finding the row — lives in `scan.rs`'s `#[cfg(test)]` module, which is the only place that can
+/// reach a private function; `scan::run` cannot be driven this way at all, because it hardcodes case
+/// sensitivity as `!cfg!(windows)`.
+#[test]
+fn a_unicode_only_case_rename_on_windows_detaches_the_note() {
+    let known = vec![snap("Ämli.md", "h1", 5, 10)];
+    let found = vec![snap("ämli.md", "h2", 9, 20)];
+
+    // The premises, spelled out: one Unicode display fold, two ASCII byte folds. Before F13 both lookups read
+    // the first line and this rename was followed.
+    assert_eq!(known[0].case_key, found[0].case_key);
+    assert_ne!(known[0].case_bytes, found[0].case_bytes);
+
+    assert_eq!(
+        classify(&known, &found, CASE_INSENSITIVE),
+        vec![
+            // Byte order decides the output order: `Ä` (C3 84) before `ä` (C3 A4).
+            (id("Ämli.md"), Change::Removed),
+            (id("ämli.md"), Change::Added),
+        ],
+        "one renamed file, two identities and no move claim: the note detaches"
     );
 }
 
@@ -109,7 +148,7 @@ fn content_change_is_modified() {
 
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
-        vec![("a.md".to_string(), Change::Modified)]
+        vec![(id("a.md"), Change::Modified)]
     );
 }
 
@@ -120,7 +159,7 @@ fn missing_file_is_removed() {
 
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
-        vec![("b.md".to_string(), Change::Removed)]
+        vec![(id("b.md"), Change::Removed)]
     );
 }
 
@@ -131,7 +170,7 @@ fn new_file_is_added() {
 
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
-        vec![("new.md".to_string(), Change::Added)]
+        vec![(id("new.md"), Change::Added)]
     );
 }
 
@@ -172,7 +211,7 @@ fn unreadable_known_snapshot_never_produces_removed_or_moved() {
 
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
-        vec![("b.md".to_string(), Change::Added)]
+        vec![(id("b.md"), Change::Added)]
     );
 }
 
@@ -186,7 +225,7 @@ fn a_file_that_became_readable_is_added() {
 
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
-        vec![("a.md".to_string(), Change::Added)]
+        vec![(id("a.md"), Change::Added)]
     );
 }
 
@@ -199,10 +238,7 @@ fn duplicate_content_is_not_a_move() {
 
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
-        vec![
-            ("b.md".to_string(), Change::Removed),
-            ("c.md".to_string(), Change::Added),
-        ]
+        vec![(id("b.md"), Change::Removed), (id("c.md"), Change::Added),]
     );
 }
 
@@ -216,8 +252,8 @@ fn moved_and_edited_is_added_and_removed() {
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
         vec![
-            ("new/x.md".to_string(), Change::Added),
-            ("old/x.md".to_string(), Change::Removed),
+            (id("new/x.md"), Change::Added),
+            (id("old/x.md"), Change::Removed),
         ]
     );
 }
@@ -232,9 +268,9 @@ fn two_new_paths_sharing_a_hash_are_not_moves() {
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
         vec![
-            ("old.md".to_string(), Change::Removed),
-            ("p.md".to_string(), Change::Added),
-            ("q.md".to_string(), Change::Added),
+            (id("old.md"), Change::Removed),
+            (id("p.md"), Change::Added),
+            (id("q.md"), Change::Added),
         ]
     );
 }
@@ -253,11 +289,11 @@ fn two_claimants_for_one_path_prefer_the_closest_directory() {
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
         vec![
-            ("alpha/y.md".to_string(), Change::Removed),
+            (id("alpha/y.md"), Change::Removed),
             (
-                "notes/new/x.md".to_string(),
+                id("notes/new/x.md"),
                 Change::Moved {
-                    from: "notes/deep/x.md".to_string()
+                    from: id("notes/deep/x.md")
                 }
             ),
         ]
@@ -273,11 +309,11 @@ fn two_claimants_for_one_path_prefer_the_closest_directory() {
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
         vec![
-            ("notes/b/x.md".to_string(), Change::Removed),
+            (id("notes/b/x.md"), Change::Removed),
             (
-                "notes/new/x.md".to_string(),
+                id("notes/new/x.md"),
                 Change::Moved {
-                    from: "notes/a/x.md".to_string()
+                    from: id("notes/a/x.md")
                 }
             ),
         ]
@@ -295,7 +331,7 @@ fn snapshots_sharing_a_folded_key_are_paired_in_rel_order() {
 
     assert_eq!(
         classify(&known, &found, CASE_INSENSITIVE),
-        vec![("a.md".to_string(), Change::Modified)]
+        vec![(id("a.md"), Change::Modified)]
     );
 }
 
@@ -316,9 +352,9 @@ fn one_entry_per_path_and_sorted_by_rel() {
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
         vec![
-            ("m.md".to_string(), Change::Modified),
-            ("n.md".to_string(), Change::Added),
-            ("z.md".to_string(), Change::Removed),
+            (id("m.md"), Change::Modified),
+            (id("n.md"), Change::Added),
+            (id("z.md"), Change::Removed),
         ]
     );
 }
@@ -335,9 +371,9 @@ fn a_matched_pair_protects_its_new_hash_from_a_move_claim() {
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
         vec![
-            ("a.md".to_string(), Change::Modified),
-            ("b.md".to_string(), Change::Removed),
-            ("c.md".to_string(), Change::Added),
+            (id("a.md"), Change::Modified),
+            (id("b.md"), Change::Removed),
+            (id("c.md"), Change::Added),
         ]
     );
 }
@@ -353,9 +389,54 @@ fn an_unreadable_path_protects_its_known_hash_from_a_move_claim() {
 
     assert_eq!(
         classify(&known, &found, CASE_SENSITIVE),
-        vec![
-            ("b.md".to_string(), Change::Removed),
-            ("c.md".to_string(), Change::Added),
-        ]
+        vec![(id("b.md"), Change::Removed), (id("c.md"), Change::Added),]
     );
+}
+
+#[test]
+fn two_twins_are_two_identities_even_when_they_spell_themselves_alike() {
+    // F13 §4.1's failure, held away from the filesystem: `caf\xe8.md` and `caf\xe9.md` are two files whose
+    // display text is one string, `caf\u{FFFD}.md`. Keyed on that text they land in one bucket, get paired
+    // positionally, and the pass reports a change for bytes that never changed while dropping the file that
+    // actually went away — which is where a twin pair used to die whatever the columns were called.
+    let e8 = twin(b"caf\xe8.md", "h1", 5, 10);
+    let e9 = twin(b"caf\xe9.md", "h2", 6, 11);
+
+    // Nothing moved: two identities on each side, so nothing to report. A display key pairs `e8`'s known row
+    // with `e9`'s found row here and calls the difference a modification.
+    let same = classify(
+        &[e8.clone(), e9.clone()],
+        &[e8.clone(), e9.clone()],
+        CASE_SENSITIVE,
+    );
+    assert!(same.is_empty(), "two twins, nothing changed: {same:?}");
+
+    // One twin is gone: exactly one `Removed`, naming the bytes that left. The surviving twin is not also
+    // reported as its own modification.
+    let gone = classify(&[e8.clone(), e9.clone()], &[e9], CASE_SENSITIVE);
+    assert_eq!(
+        gone,
+        vec![(id_bytes(b"caf\xe8.md", "caf\u{fffd}.md"), Change::Removed)],
+        "one byte key removed, the other untouched"
+    );
+}
+
+/// A snapshot of a path whose raw bytes are not valid UTF-8, exactly as `walk` + `sha256_file` would hand
+/// it over: byte keys from the OS, display text decoded with a replacement character.
+fn twin(rel_bytes: &[u8], hash: &str, size: u64, mtime: i64) -> Snapshot {
+    let rel = String::from_utf8_lossy(rel_bytes).into_owned();
+    Snapshot {
+        rel_bytes: rel_bytes.to_vec(),
+        case_bytes: path_keys::case_fold(rel_bytes),
+        case_key: rel.to_lowercase(),
+        hash: hash.to_string(),
+        size,
+        mtime,
+        rel,
+    }
+}
+
+/// The pair for a raw-byte path, as [`classify`] names it.
+fn id_bytes(rel_bytes: &[u8], display: &str) -> RelPath {
+    RelPath::new(rel_bytes.to_vec(), display.to_string())
 }

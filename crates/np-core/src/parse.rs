@@ -22,6 +22,25 @@ use regex::Regex;
 
 use crate::links::{extract_links, RawLink};
 
+/// The parse rules this build writes derived rows with.
+///
+/// Bump this by one whenever a change to [`parse_markdown`], [`crate::items::extract_items`] or
+/// [`crate::links::extract_links`] changes what a note's stored headings, tags, items, links, word count
+/// or title come out as. Nothing else can notice such a change: [`crate::change`] compares file bytes, so
+/// a note nobody has edited since the old rules ran looks finished forever, and its rows would keep the
+/// old spelling while `INDEX.md` kept rendering it — stable, so nothing looks broken, and wrong.
+///
+/// [`mod@crate::scan`] compares this value with the one stored in the workspace database's `meta` table at
+/// scan start. When they differ it re-parses every note once and records this value again, which is how a
+/// rule change reaches a database written by an older build. A SQL migration cannot do that job: entries
+/// of [`crate::db::MIGRATIONS`] change tables and never read a note.
+///
+/// Version 1 is the first versioned build, so the value it has to describe is *absence*: a database from
+/// before this constant recorded nothing at all, which is not a version and therefore refreshes on its
+/// first scan. That single refresh is what carries R3's frontmatter-recognition (F7) and tag-display
+/// (F8) changes into the files M1 already indexed.
+pub const PARSE_VERSION: u32 = 1;
+
 /// Which source supplied a note's title, so the catalog can say where it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TitleSource {
@@ -37,7 +56,7 @@ pub enum TitleSource {
 
 impl TitleSource {
     /// The `notes.title_source` spelling, so the word that reaches the database is written here and
-    /// not at each call site — [`crate::scan`] stores it for every note it indexes.
+    /// not at each call site — [`mod@crate::scan`] stores it for every note it indexes.
     pub fn as_str(self) -> &'static str {
         match self {
             TitleSource::Frontmatter => "frontmatter",
@@ -71,9 +90,10 @@ pub struct NoteDoc {
     pub title_source: TitleSource,
     /// Whether the file opened with a recognised frontmatter block.
     pub frontmatter: bool,
-    /// Outline in document order, fenced blocks excluded.
+    /// Outline in document order, fenced blocks and any recognised frontmatter block excluded.
     pub headings: Vec<Heading>,
-    /// `#tags` from the frontmatter and the body: lowercased, unique, first-seen order kept.
+    /// `#tags` from the frontmatter and the body: unique ignoring case, first-seen order kept,
+    /// each shown with the spelling it was first written with.
     pub tags: Vec<String>,
     /// Whitespace-separated tokens of the body prose. Frontmatter is metadata and a fenced
     /// block is not prose, so neither counts — the same exclusion headings and tags get.
@@ -130,19 +150,38 @@ struct Frontmatter {
     /// the key is absent or its value is empty — a blank value must fall through to the next
     /// source, which is why [`pick_title`] needs no emptiness check on this branch.
     title: Option<String>,
-    /// `tags:` values as written; [`parse_markdown`] lowercases and deduplicates them.
+    /// `tags:` values as written; [`parse_markdown`] deduplicates them case-insensitively and
+    /// keeps this spelling for display.
     tags: Vec<String>,
     /// 1-based number of the first body line. Every line below it belongs to the block, so it
     /// is neither scanned for headings nor counted as words.
     body_start: usize,
-    /// `true` only when the file's very first line is exactly `---` **and** a closing `---`
-    /// line follows. Without the closing line the whole file is body.
+    /// `true` only when the file's very first line is exactly `---`, a closing `---` line follows,
+    /// and that region passes [`read_frontmatter`]'s test — it holds a [`key_line`] or nothing but
+    /// blank lines. Without the closing line, or with a content-only region, the whole file is body.
     recognised: bool,
 }
 
 /// The hand-rolled YAML subset of spec §9: a scalar `title:` and `tags:` as either an inline
 /// `[a, b]` list or an indented `- item` block. Every other key is ignored without error —
 /// frontmatter may hold anything the note editor puts there, and none of it may fail a scan.
+///
+/// **Which `---` regions are frontmatter** (M2 backlog F7). Two fences are not enough evidence:
+/// a markdown note may open with a thematic break, and reading its first section as metadata
+/// would silently drop that section from the outline, the word count and the item scan. So the
+/// region between the opening `---` and the next `---` line counts as frontmatter only when it
+///
+/// - holds at least one [`key_line`], or
+/// - holds nothing but blank lines.
+///
+/// The empty case stays recognised because there is no content to lose: an editor that writes a
+/// metadata-only note (`---\n---`) loses nothing, and the two fence lines are the only difference
+/// in the word count. Everything else — prose, a heading, a comment, a list item — is markdown
+/// this parser would have ignored while hiding it from the body, so such a region is body.
+///
+/// The decision is made at the first closing fence and nowhere else: a region that fails the test
+/// is not retried against a later `---`, so the whole file is body, exactly as for an unterminated
+/// opening fence.
 fn read_frontmatter(raw: &str) -> Frontmatter {
     let absent = || Frontmatter {
         title: None,
@@ -159,12 +198,21 @@ fn read_frontmatter(raw: &str) -> Frontmatter {
     let mut head = absent();
     // `true` while the indented `- item` list under a bare `tags:` is still being read.
     let mut block_tags = false;
+    // The two halves of the F7 test, collected on the way to the closing fence.
+    let mut keyed = false;
+    let mut blank_only = true;
     for (number, text) in rest {
         if text == "---" {
+            // Anything with content and no `key:` before this fence is a thematic break.
+            if !keyed && !blank_only {
+                return absent();
+            }
             head.body_start = number + 1;
             head.recognised = true;
             return head;
         }
+        keyed |= key_line(text);
+        blank_only &= text.trim().is_empty();
         if let Some(value) = text.strip_prefix("title:") {
             block_tags = false;
             if head.title.is_none() {
@@ -192,6 +240,31 @@ fn read_frontmatter(raw: &str) -> Frontmatter {
 
     // Unterminated: no block, and the body starts at line 1 so nothing is swallowed.
     absent()
+}
+
+/// Whether this line makes the `---` region above it plausible frontmatter: a `key:` at column 0.
+///
+/// The whole test is the text before the first `:` — non-empty, and nothing but key characters
+/// (letters, digits, `_`, `-`, `.`). That one rule rejects every shape that has to stay markdown,
+/// without naming them one by one: a heading or YAML comment (`# Not metadata:` puts `#` outside
+/// the key class), a block-list item (`- item:` starts with `-` and a space), and an indented or
+/// quoted key, which is rejected **on purpose** — [`read_frontmatter`] reads values only at column
+/// 0 and strips no quotes from a key, so recognising such a block would hide lines from the body
+/// in exchange for parsing nothing. A word followed by `: ` at column 0 (`Anwesend: Ana, Bo`) does
+/// count, which is what YAML itself makes of that spelling; a prose line with a space or punctuation
+/// before its colon (`Erste Zeit: 12`, `see this: really`) does not, because the run before the
+/// colon is not a single key token.
+fn key_line(text: &str) -> bool {
+    match text.find(':') {
+        Some(colon) => {
+            let key = &text[..colon];
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        }
+        None => false,
+    }
 }
 
 /// Which source wins the title, in the plan's order: frontmatter, first usable heading,
@@ -364,8 +437,15 @@ fn unquote(value: &str) -> &str {
     }
 }
 
-/// Tags in first-seen order, lowercased and deduplicated — the three rules applied in one
-/// place so frontmatter tags and body tags behave identically.
+/// Tags in first-seen order, deduplicated ignoring case, and shown as written — the three rules
+/// applied in one place so frontmatter tags and body tags behave identically.
+///
+/// Identity and display are separate on purpose (M2 backlog F8): [`case_key`] decides whether two
+/// spellings are one tag, while `order` keeps the text the author wrote, so `#ÄNER-TAG` followed by
+/// `#äner-tag` yields the single tag `ÄNER-TAG`. Folding touches the key only and never the order:
+/// [`crate::scan`] stores tags in this Vec's order and [`crate::scan::note_tags`] reads them back
+/// `ORDER BY note_id, rowid`, which is what makes a catalog line reproducible — inserting by key or
+/// sorting by it would rewrite those lines.
 #[derive(Default)]
 struct TagList {
     order: Vec<String>,
@@ -374,15 +454,37 @@ struct TagList {
 
 impl TagList {
     fn push(&mut self, tag: &str) {
-        let folded = tag.to_lowercase();
-        if self.seen.insert(folded.clone()) {
-            self.order.push(folded);
+        if self.seen.insert(case_key(tag)) {
+            self.order.push(tag.to_string());
         }
     }
 
     fn into_tags(self) -> Vec<String> {
         self.order
     }
+}
+
+/// The identity of a tag: `str::to_lowercase`, the full Unicode **lowercase mapping**, kept rather
+/// than swapped for `to_ascii_lowercase` (which folds only `A`–`Z` and would leave `#ÄNER-TAG` beside
+/// `#äner-tag`) or for a case *fold*.
+///
+/// The F8 report blamed ASCII folding, and that half does not reproduce on `3f86529`: the dedup key
+/// was already `to_lowercase`. What was missing is that the folded text was also the *displayed*
+/// text, so a note's own spelling never reached `INDEX.md` — which is what [`TagList`] now keeps
+/// separate. Which folding is used stays written down because it is equally visible there:
+///
+/// - `ß` lowercases to itself, so `#straße` and `#STRASSE` stay **two** tags. A case *fold* (the
+///   `Case_Folding` table, simple or full) maps `ß` to `ss` and would merge them; merging a German
+///   author's deliberate `ß` spelling into an `ss` spelling is not bought here. The expansion only
+///   happens on the uppercase side (`ß` → `SS`), which this folding never takes.
+/// - `İ` (U+0130) lowercases to `i` + U+0307 COMBINING DOT ABOVE, so `#İSTANBUL` matches itself in
+///   any case but not `#istanbul`. That is the mapping's own behaviour, kept rather than worked
+///   around.
+///
+/// [`crate::items`] folds its markers with `to_lowercase` for the same reason, so the crate has one
+/// folding and one spelling of it.
+fn case_key(tag: &str) -> String {
+    tag.to_lowercase()
 }
 
 /// `^(#{1,6})\\s+(.*)$`, compiled once per process — a pattern must never be rebuilt inside the

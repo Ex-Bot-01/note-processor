@@ -2,11 +2,23 @@
 //!
 //! Nothing here reads or writes the real user config/data dir: every case that
 //! could create files passes an explicit config path or a `data_dir` inside a
-//! `tempfile::TempDir`, and no test sets process environment variables.
+//! `tempfile::TempDir`. The four cases that exercise the OS fallbacks install their own
+//! environment instead ([`TestEnv`]), because cargo gives a test process whatever `$HOME` the
+//! developer's shell happens to hold — and a stripped CI shell holds nothing, which is a different
+//! result from the one the product produces.
 
+use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
+// The same harness `crates/np-core/tests/db.rs` uses against a workspace database; see that file's
+// header note on why the hold times and the handoff are shared.
+mod common;
+
+use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
     config_file_path, CatalogConfig, Config, ConfigError, MarkerConfig, WorkspaceRegistry,
 };
@@ -31,6 +43,92 @@ fn config_with_data_dir(dir: &Path) -> Config {
     let body = format!("data_dir = {}\n", toml_str(&dir.display().to_string()));
     let path = write_config(dir, &body);
     Config::load(Some(&path)).expect("test setup: load config")
+}
+
+/// Every variable `config_file_path` and `default_data_dir` consult, on either platform.
+const ENV_KEYS: [&str; 5] = [
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
+
+/// Serialises the cases that rewrite the process environment.
+///
+/// Cargo runs the cases in this file on parallel threads while environment variables belong to the
+/// whole process, so an installed set of directories has to stay installed for exactly one case.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// One case's worth of process environment, pointing at throwaway config and data directories.
+///
+/// A config file that does not name a `data_dir` means the OS one, and `config_file_path` reads the
+/// same variables, so such a case cannot be hermetic without owning them: on a machine where `$HOME`
+/// and the XDG pair are unset, `Config::load` refuses an empty data dir
+/// (`ConfigError::MissingField("data_dir")`, which is the deliberate product behaviour), while a
+/// developer's own `~/.config/note-processor/config.toml` would silently change what the assertions
+/// see. Both failure modes are the environment leaking into the test, so both are removed here
+/// rather than skipped around.
+///
+/// The same isolation the CLI integration tests get from `Command::env`
+/// (`crates/np-cli/tests/cli.rs:38`) comes from `env::set_var` here, guarded by [`ENV_LOCK`]; the
+/// previous values go back on drop. No other case in this file reads the environment — each passes
+/// an explicit config path or a `data_dir` inside its own `TempDir`.
+struct TestEnv {
+    /// Held until the values are restored, so no second case installs over ours. A poisoned lock can
+    /// only come from a case that already failed, so its contents are taken regardless.
+    _guard: MutexGuard<'static, ()>,
+    /// Kept alive so both directories outlive every read of them.
+    _tmp: TempDir,
+    /// What each variable held before, restored on drop.
+    previous: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl TestEnv {
+    /// Install temp config and data dirs under a fresh `TempDir` for the calling case.
+    fn install() -> Self {
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().expect("test setup: tempdir");
+        let previous = ENV_KEYS
+            .iter()
+            .map(|key| (*key, env::var_os(key)))
+            .collect();
+        // All five spellings the two lookups accept, on every platform: the XDG pair for unix,
+        // `APPDATA`/`LOCALAPPDATA` for Windows, and `HOME` as the fallback underneath them.
+        env::set_var("HOME", tmp.path());
+        env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
+        env::set_var("XDG_DATA_HOME", Self::data_dir_of(&tmp));
+        env::set_var("APPDATA", tmp.path().join("config"));
+        env::set_var("LOCALAPPDATA", Self::data_dir_of(&tmp));
+        Self {
+            _guard: guard,
+            _tmp: tmp,
+            previous,
+        }
+    }
+
+    /// The data dir the installed environment names, on either platform.
+    fn data_dir(&self) -> PathBuf {
+        Self::data_dir_of(&self._tmp)
+    }
+
+    fn data_dir_of(tmp: &TempDir) -> PathBuf {
+        tmp.path().join("data")
+    }
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        // Runs while `_guard` is still held: field drops come after `Drop::drop`.
+        for (key, value) in &self.previous {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+    }
 }
 
 #[test]
@@ -83,6 +181,8 @@ fn default_marker_lists_are_the_global_constraints_list() {
 
 #[test]
 fn toml_overrides_and_keeps_defaults() {
+    // The file names no `data_dir`, so this case reads the OS one and has to own it.
+    let _env = TestEnv::install();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = write_config(tmp.path(), "catalog.max_entries_per_file = 50\n");
 
@@ -95,6 +195,8 @@ fn toml_overrides_and_keeps_defaults() {
 
 #[test]
 fn empty_config_file_keeps_defaults() {
+    // Same as above: an empty file names no `data_dir`, so the environment supplies it.
+    let _env = TestEnv::install();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = write_config(tmp.path(), "");
 
@@ -136,27 +238,34 @@ fn explicit_missing_config_file_is_an_io_error() {
 
 #[test]
 fn no_config_file_means_defaults() {
-    // `load(None)` reads this machine's config path; only assert when nothing is
-    // there, so the test never depends on (or touches) a real user config.
-    let Some(path) = config_file_path() else {
-        return;
-    };
-    if path.exists() {
-        eprintln!("skipping: real config file at {}", path.display());
-        return;
-    }
+    // The environment belongs to this case, so "no config file there" is a premise it can assert
+    // rather than a condition it prints a skip line for. A printed skip would prove nothing: libtest
+    // captures stderr for a *passing* test, so CI could never tell this branch from a real run.
+    let env = TestEnv::install();
+    let path = config_file_path().expect("a supported runner names a config directory");
+    assert!(
+        !path.exists(),
+        "the isolated config dir must hold no config file, found {}",
+        path.display()
+    );
 
     let cfg = Config::load(None).expect("a missing default config file is not an error");
 
     assert_eq!(cfg.catalog, CatalogConfig::default());
     assert_eq!(cfg.markers, MarkerConfig::default());
+    assert_eq!(
+        cfg.data_dir,
+        env.data_dir(),
+        "the data dir comes from the installed environment, never a real one"
+    );
 }
 
 #[test]
 fn config_file_path_points_at_note_processor_config() {
-    let Some(path) = config_file_path() else {
-        return;
-    };
+    // A supported runner always names a config directory (`HOME`/XDG on unix, `APPDATA` on Windows),
+    // so a `None` here is the environment going missing — a broken fixture, not a platform to skip.
+    let _env = TestEnv::install();
+    let path = config_file_path().expect("a supported runner names a config directory");
     assert!(
         path.ends_with(Path::new("note-processor").join("config.toml")),
         "expected .../note-processor/config.toml, got {}",
@@ -270,6 +379,139 @@ fn registry_records_and_bumps_last_seen() {
         )
         .expect("test: read first_seen");
     assert_eq!(first_seen, 100);
+}
+
+/// Take the write lock on the registry file from a second handle — the other `np` run that WAL and the
+/// busy timeout exist for. It opens after the registry exists, so no schema write races with assertions.
+fn hold_registry_lock(data_dir: &Path) -> Connection {
+    let holder = Connection::open(data_dir.join("workspaces.sqlite"))
+        .expect("test: open the registry file again");
+    hold_write_lock(
+        |sql| holder.execute_batch(sql),
+        "INSERT INTO workspaces (workspace, first_seen, last_seen) VALUES ('/held/notes', 1, 1)",
+    );
+    holder
+}
+
+/// The payload this binary needs back from the writer thread: the registry itself, because the
+/// assertions read its rows afterwards. `db.rs` returns a bare statement result, so only the shape of
+/// the outcome stays local; the handoff and the timings come from [`common::contended`].
+type Recorded = (Result<(), ConfigError>, WorkspaceRegistry);
+
+/// Call `record` on `registry` while `holder` holds the lock, then commit the holder.
+///
+/// The waiting `record` cannot run on this thread — only this thread can release the lock it is blocked
+/// on — so the registry travels to the writer and back inside [`Recorded`].
+fn record_while_locked(
+    holder: Connection,
+    registry: WorkspaceRegistry,
+    hold: Duration,
+) -> Contention<Recorded> {
+    contended(
+        hold,
+        move || {
+            let mut registry = registry;
+            let recorded = registry.record(Path::new("/waiting/notes"), 200);
+            (recorded, registry)
+        },
+        || {
+            holder
+                .execute_batch("COMMIT")
+                .expect("test: release the write lock");
+        },
+    )
+}
+
+/// The driver failure behind a [`ConfigError`], if there is one: the registry wraps SQLite errors in
+/// `io::Error::other` (see `From<rusqlite::Error> for ConfigError`), so a typed match has to unwrap
+/// that rather than compare the message text.
+fn sqlite_error(err: &ConfigError) -> Option<&rusqlite::Error> {
+    match err {
+        ConfigError::Io(io_err) => io_err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rusqlite::Error>()),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_registry_write_waits_for_another_connection_instead_of_failing_busy() {
+    // The registry sits in the shared data dir and is written by every command, so it is the file two
+    // overlapping `np` runs are most likely to reach at the same moment. Same shape as the
+    // workspace-database case in `crates/np-core/tests/db.rs`: one connection holds a write transaction,
+    // another writes while it does, and the second must wait instead of reporting `SQLITE_BUSY`.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let registry = WorkspaceRegistry::open(tmp.path()).expect("registry should open");
+    let holder = hold_registry_lock(tmp.path());
+
+    let contention = record_while_locked(holder, registry, Duration::from_millis(HOLD_MS));
+    let (recorded, registry) = contention.outcome;
+    recorded.expect("the registry write has to wait for the lock, not fail with SQLITE_BUSY");
+    // A diagnostic, not a discriminator, for the same reason as the workspace-database case beside it in
+    // `tests/db.rs`: `common::contended` sleeps the whole `HOLD_MS` before releasing and `waited` starts
+    // before that sleep, so a write that got the lock back is over half the hold by construction. The
+    // registry's real discriminator is `the_registry_busy_timeout_is_the_same_short_one`; this figure is
+    // printed because one near zero would mean the harness stopped measuring.
+    assert!(
+        contention.waited >= Duration::from_millis(HOLD_MS / 2),
+        "record() returned after {:?}, so it never waited for the held lock",
+        contention.waited
+    );
+
+    let recent = registry.recent().expect("recent");
+    assert_eq!(recent.len(), 2, "both writes land: {recent:?}");
+    assert!(
+        recent[0].0.ends_with("waiting/notes"),
+        "the write that waited is the most recent one: {recent:?}"
+    );
+}
+
+#[test]
+fn the_registry_busy_timeout_is_the_same_short_one() {
+    // Why this case sits beside the one above: rusqlite installs its own 5000 ms timeout on every
+    // connection it opens (`rusqlite-0.40.2/src/inner_connection.rs:118`), so patience alone would not
+    // notice the registry pragma going missing. The hold sits between the two values —
+    // `HOLD_PAST_TIMEOUT_MS` is 3000 ms, past our 1800 ms and well inside those five seconds — so the
+    // case stays a discriminator rather than a tautology: `record` has to come back refusing while the
+    // holder still has the transaction, which a driver-default connection would have waited out. That
+    // gap is also what proves the value set in `WorkspaceRegistry::open` is the one in force. The
+    // workspace-database equivalent is
+    // `the_busy_timeout_in_force_is_this_crates_and_not_the_drivers_default` in
+    // `crates/np-core/tests/db.rs`; both connections read the same constant.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let registry = WorkspaceRegistry::open(tmp.path()).expect("registry should open");
+    let holder = hold_registry_lock(tmp.path());
+
+    let contention = record_while_locked(
+        holder,
+        registry,
+        Duration::from_millis(HOLD_PAST_TIMEOUT_MS),
+    );
+
+    let (recorded, _registry) = contention.outcome;
+    let err =
+        recorded.expect_err("a lock held past the configured timeout has to be refused eventually");
+    // The typed code, not the message: `database is locked` is driver wording and could change under
+    // us, and only the code says the refusal was "the lock is held" rather than some other failure.
+    assert!(
+        matches!(
+            sqlite_error(&err),
+            Some(rusqlite::Error::SqliteFailure(fault, _))
+                if fault.code == rusqlite::ErrorCode::DatabaseBusy
+        ),
+        "expected SQLITE_BUSY, got {err:?}"
+    );
+    // Half our timeout below, the driver's default above: the give-up has to land near 1800 ms.
+    assert!(
+        contention.inside_call >= Duration::from_millis(900),
+        "record() gave up after {:?}, which is not the ~1800 ms this crate asks for",
+        contention.inside_call
+    );
+    assert!(
+        contention.inside_call < Duration::from_millis(4500),
+        "record() waited {:?}, i.e. something nearer rusqlite's own 5 s default than our value",
+        contention.inside_call
+    );
 }
 
 #[test]

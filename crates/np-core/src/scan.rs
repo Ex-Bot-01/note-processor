@@ -3,24 +3,40 @@
 //! [`scan`] is the only place in the crate that reads files, writes SQLite and renders the catalog at
 //! once, so it owns the ordering rules the individual stages cannot express on their own:
 //!
-//! - **One transaction for the database, files written after it commits.** The registry row, the note
+//! - **One transaction for the database, files written after it commits.** The workspace row, the note
 //!   row and everything derived from its text either all move to this scan's state or none of them do.
+//!   (The registry line in `config.rs`'s database sits outside that set on purpose: it is written on a second
+//!   connection after [`crate::db`] commits, so a registry failure exits 1 over work that is already durable,
+//!   and the next scan reconciles it — the alternative was one transaction across two databases.)
 //!   `INDEX.md` cannot join a SQLite transaction, so the catalog is rendered inside that transaction,
 //!   its name list is committed with it, and only then does the filesystem work start. A scan that dies
 //!   halfway leaves the previous catalog readable instead of half-rewritten, and never leaves a delete
-//!   list that lags the files on disk (see [`set_index_list`] and [`write_index_files`] for the order).
-//! - **Unknown is not absent.** A directory the walk could not enter, and a file that vanished or was
-//!   rewritten between the walk and the read, is named in [`ScanReport::skipped`] and keeps the row it
-//!   already has (Review Focus 5). Reporting either as `Removed` would stale live notes because of a
-//!   permission error or a race.
+//!   list that lags the files on disk (see `set_index_list` and `write_index_files` for the order).
+//! - **Unknown is not absent.** A directory the walk could not enter, a file that vanished or was
+//!   rewritten between the walk and the read, and a name whose byte spelling cannot be held (F18) are named
+//!   in [`ScanReport::skipped`] and keep the row they already have (Review Focus 5). Reporting any of them
+//!   as `Removed` would stale live notes because of a permission error, a race, or a name this program
+//!   refuses to guess at.
+//! - **Parse rules reach notes that did not change.** Byte comparison cannot see a rule change, so
+//!   `meta` records the parse rules version the rows were written with and a scan that finds a different
+//!   value re-parses every markdown note once (see [`PARSE_VERSION_KEY`]). Classification stays the
+//!   truth about the *files*: such a scan still reports its notes as unchanged.
 //! - **The catalog reads live rows only.** Entries and [`ScanReport::notes`] come from
 //!   `files.state = 'ok'`; [`crate::db::note_counts`] stays the unfiltered database truth, because a
 //!   stale note is hidden from the catalog, not forgotten (spec §2).
 //! - **`INDEX.md` and its shards are the only names this module creates, and it deletes only the ones
-//!   that open with its own generated header** (spec §7): a name alone never licenses a removal. Every
-//!   write goes through a temporary file plus `rename`, and no note body is ever opened for writing.
+//!   that open with its own generated header** (spec §7): a name alone never licenses a removal — with
+//!   **one exception, our own temporaries**. A leftover `<generated>.tmp` from a killed write is cleared by
+//!   `clear_temp_corpses` on the naming rule alone: that spelling is one nothing else produces, and a
+//!   half-written temporary has no complete header to fingerprint. The F13 §1 review flagged the apparent
+//!   contradiction; it is a naming-trust decision rather than an oversight, stated here so the rule above can
+//!   be read literally. The
+//!   names themselves come from [`index_names`], which owns their spelling; what this module owns is the
+//!   fingerprint deciding which of them are ours to replace. Every write goes through a temporary file
+//!   plus `rename`, and no note body is ever opened for writing.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -35,9 +51,11 @@ use crate::change::{classify, Change};
 use crate::config::{abs_path, Config, ConfigError, MarkerConfig, WorkspaceRegistry};
 use crate::db::{self, Db, DbError, LIVE_EDGE, PROSE_ORIGIN};
 use crate::hash::{sha256_bytes, sha256_file, Snapshot};
+use crate::index_names;
 use crate::items::{extract_items, ItemCandidate};
 use crate::links::{resolve, store_links, RawLink};
-use crate::parse::{body_start, parse_markdown, NoteDoc};
+use crate::parse::{body_start, parse_markdown, NoteDoc, PARSE_VERSION};
+use crate::path_keys::{os_bytes, RelPath};
 use crate::walk::{self, DiscoveredFile, WalkOptions};
 
 /// The UTF-8 byte order mark: dropped before decoding for parsing, kept in the bytes that are hashed.
@@ -50,16 +68,22 @@ const ENCODING_LOSSY: &str = "lossy";
 /// `meta` key holding the index files this program has published, newline-separated. The previous list
 /// is what lets a rescan delete the shards it no longer produces.
 const INDEX_FILES_KEY: &str = "index_files";
-/// The catalog's entry point, which [`catalog::render`] returns first and every reader opens. It is
-/// renamed **last** (see [`write_index_files`]): an entry point naming shards that were never written is
-/// a broken catalog, while one that is merely old is still a correct one.
-const CATALOG_ENTRY: &str = "INDEX.md";
+/// `meta` key holding the value of [`crate::parse::PARSE_VERSION`] that this workspace's derived rows
+/// were written with. Absent means "written before this mechanism existed", which is not a version to
+/// compare against and therefore refreshes; see the comparison in `refresh_needed`.
+pub const PARSE_VERSION_KEY: &str = "parse_version";
 /// Suffix of the temporary file every catalog write goes through before its `rename`.
 const TEMP_SUFFIX: &str = ".tmp";
 
 /// A note re-parsed by one scan: its path and the links its text holds, which is everything
-/// [`store_note_links`] needs once the whole corpus is up to date.
-type Parsed = (String, Vec<RawLink>);
+/// [`store_note_links`] needs once the whole corpus is up to date. The path travels in both spellings so the
+/// id lookup that follows can go by bytes (F13 §4.1).
+type Parsed = (RelPath, Vec<RawLink>);
+
+/// The two spellings of one found file, as the write pass and the link pass both need them.
+fn path_of(snapshot: &Snapshot) -> RelPath {
+    RelPath::new(snapshot.rel_bytes.clone(), snapshot.rel.clone())
+}
 
 /// What can fail while scanning a workspace.
 #[derive(Debug, Error)]
@@ -103,7 +127,8 @@ pub struct ScanReport {
     /// Paths the registry already had exactly as they are.
     pub unchanged: usize,
     /// Paths this scan could not index and left untouched: directories it could not read, files that
-    /// vanished or changed between walk and read, paths whose identity is already taken, a catalog
+    /// vanished or changed between walk and read, paths whose identity is already taken, a name the byte
+    /// spelling cannot hold (F18 — one line per affected display spelling), a catalog
     /// temporary it could not remove (see `clear_temp_corpses`), and a root entry wearing a generated
     /// catalog name that this program did not publish — left on disk and named here instead of deleted.
     /// Sorted, deduplicated, spelled as `rel`.
@@ -167,23 +192,39 @@ pub fn scan_with_inject(
     let walked = walk::walk(&root, &WalkOptions::default())?;
     after_walk(&root);
 
-    // A directory that could not be entered holds files that are unknown rather than absent: their
-    // known rows stay out of the comparison (see [`known_rows`]) and the directory itself is what the
-    // report names.
+    // A directory whose contents the walk did not read holds files that are unknown rather than absent — it
+    // could not be entered, or its **own name** was refused (F18), which hides the same subtree. Their known
+    // rows stay out of the comparison (see [`known_rows`]) and the directory itself is what the report names.
+    // A refused *file* name is the same rule about one path instead of a region: it is not indexed this scan,
+    // its row keeps what it holds, and the path is named here too.
     skipped.extend(walked.unreadable.iter().cloned());
+    skipped.extend(walked.unrepresentable.iter().cloned());
     let found = read_found(&walked.files, &mut skipped);
     let snapshots: Vec<Snapshot> = found.iter().map(|found| found.snapshot.clone()).collect();
 
     let db = Db::open(&cfg.workspace_db(&root))?;
+    // Which rules wrote the rows on disk. Read before anything is written, so this one scan both does the
+    // re-parse and records what it re-parsed with: `classify` compares bytes and knows nothing about the
+    // rules that turn those bytes into headings, tags, items and links, so without this a note nobody has
+    // edited since an older build ran would keep its old derived rows forever (F15).
+    let stored = parse_version(&db)?;
+    let refresh = refresh_needed(stored);
     let now = now_secs();
-    let changes = classify(
-        &known_rows(&db, &walked.unreadable)?,
-        &snapshots,
-        !cfg!(windows),
-    );
+    let (known, hidden_by_unknown) = known_rows(&db, &walked.unreadable, &walked.unrepresentable)?;
+    let changes = classify(&known, &snapshots, !cfg!(windows));
 
     let tx = db.0.unchecked_transaction().map_err(DbError::from)?;
-    let written = apply_changes(&db, &found, &changes, now, !cfg!(windows), &cfg.markers)?;
+    let written = apply_changes(
+        &db,
+        &found,
+        &changes,
+        refresh,
+        now,
+        !cfg!(windows),
+        &cfg.markers,
+    )?;
+    // Decided here, before anything else writes, from what the write pass actually delivered.
+    let record_version = refresh && refresh_covered(&written, hidden_by_unknown);
     // Resolution waits for that pass so a link can land on a file that only appeared in this scan, and
     // comes after the stale-marking so nothing resolves onto a note that just left the live set.
     store_note_links(&db, &written.parsed)?;
@@ -201,7 +242,22 @@ pub fn scan_with_inject(
     // so a kill between this commit and the writes below still leaves every stranded shard named.
     let rendered = catalog::render(&entries, &cfg.catalog);
     set_index_list(&db, &rendered)?;
+    if record_version {
+        // Recorded in the same transaction as the rows it describes: a scan that dies halfway has to
+        // refresh again rather than leave half the corpus labelled as current. An up-to-date database
+        // writes nothing here, so the steady-state scan pays one `SELECT` and no extra `INSERT`.
+        set_meta(&db, PARSE_VERSION_KEY, &PARSE_VERSION.to_string())?;
+    }
     tx.commit().map_err(DbError::from)?;
+    // After the commit, so nothing is announced about a scan that rolled itself back — the same rule
+    // [`crate::db::report_orphans`] follows. The report's own counts stay the classification truth; this
+    // is the only place a person learns that a scan with nothing to report did real work.
+    report_refresh(&mut io::stderr(), stored, written.refreshed);
+    if refresh && !record_version {
+        // Without this line a workspace with one unreadable directory would re-parse its whole corpus on
+        // every scan in silence, which looks exactly like the version never being written by accident.
+        report_refresh_gap(&mut io::stderr(), written.uncovered + hidden_by_unknown);
+    }
 
     // A root entry that wears one of our names but is not ours stays on disk and reaches the report, so
     // the user hears about the collision instead of losing the file.
@@ -238,8 +294,16 @@ struct Written {
     unchanged: usize,
     /// Paths whose identity was already held by another row (see [`apply_changes`]).
     skipped: Vec<String>,
+    /// Notes this scan re-parsed **only** because the parse rules moved on — a file `classify` called
+    /// unchanged. Deliberately absent from [`ScanReport`], whose counts stay the classification truth and
+    /// whose JSON shape the CLI tests pin; [`report_refresh`] is where it becomes visible.
+    refreshed: usize,
     /// Every note re-parsed here, for [`store_note_links`].
     parsed: Vec<Parsed>,
+    /// Notes this scan owed a write and never delivered one: unreadable as the walk saw it, or lost to an
+    /// identity conflict. Only meaningful during a refresh, where it decides whether the new rules may be
+    /// recorded — see [`refresh_covered`].
+    uncovered: usize,
 }
 
 /// One discovered file as this scan saw it: identity from the walk, digest and note text from the read
@@ -254,6 +318,9 @@ struct Found {
     /// Decoded note text; `None` for a file that could not be read or is not markdown, since an
     /// attachment is hashed, tracked and linkable but never parsed (spec §10).
     text: Option<String>,
+    /// Whether the walk called this a note at all. [`apply_changes`] needs it to charge a missed path
+    /// only when a parse was actually owed — see [`refresh_covered`].
+    is_markdown: bool,
     /// Whether `text` arrived through lossy decoding.
     lossy: bool,
 }
@@ -261,6 +328,19 @@ struct Found {
 /// Whether this scan holds the file's contents, as opposed to knowing only that it saw the path.
 fn is_unknown(found: &Found) -> bool {
     found.snapshot.hash.is_empty()
+}
+
+/// Whether skipping `rel` leaves **stale** derived rows behind — the only thing a refresh can repair.
+///
+/// A markdown path with no `notes` row has nothing to re-label. An unreadable new file is indexed as
+/// `Added` on whichever scan can next read it, whatever the recorded version says, and the loser of a case
+/// collision (`a.md` against `A.md`, one `case_key`) is refused at insert and holds no row of its own in the
+/// normal case — two raw names that decode lossily to the same `rel` do produce a path refused over a row that
+/// exists, and that one *is* charged, which is the safe direction. Charging either would hold
+/// the rules version back forever over rows that do not exist, re-parsing the whole corpus on every scan
+/// to repair nothing — the same mistake the attachment filter above already avoids, one level deeper.
+fn owes_a_reparse(db: &Db, path: &RelPath, is_markdown: bool) -> Result<bool, DbError> {
+    Ok(is_markdown && !matches!(note_row(db, path)?, NoteRow::Missing))
 }
 
 /// Read every discovered file, re-stating each one first, and name the unreadable ones in `skipped`.
@@ -297,6 +377,7 @@ fn read_one(file: &DiscoveredFile) -> Found {
         snapshot: Snapshot::new(file, String::new()),
         abs: file.abs.clone(),
         text: None,
+        is_markdown: file.is_markdown,
         lossy: false,
     };
     let open = walk::to_open_path(&file.abs);
@@ -326,6 +407,7 @@ fn read_one(file: &DiscoveredFile) -> Found {
         snapshot: Snapshot::new(file, hash),
         abs: file.abs.clone(),
         text,
+        is_markdown: file.is_markdown,
         lossy,
     }
 }
@@ -344,8 +426,8 @@ fn decode(bytes: &[u8]) -> (String, bool) {
     }
 }
 
-/// The registry rows `classify` compares against: live rows, minus anything under a directory the walk
-/// could not read.
+/// The registry rows `classify` compares against: live rows, minus anything whose path this scan could not
+/// look at — a subtree under an unreadable directory, or one refused name (F18).
 ///
 /// Stale rows stay out because their absence was already reported; leaving them in would count one
 /// deleted file as `removed` on every later scan. Dropping them is also what lets such a file come back
@@ -354,38 +436,97 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 ///
 /// The unreadable directories are the other half of the same caution: files below one were never seen,
 /// so their rows must reach neither a `Removed` nor a move (Task 4 handoff), and leaving them in would
-/// stale a whole subtree over one transient permission error.
-fn known_rows(db: &Db, unreadable: &[String]) -> Result<Vec<Snapshot>, DbError> {
+/// stale a whole subtree over one transient permission error. A refused name is the third piece of the same
+/// rule ([`is_unknown_path`], F18): the file is there, but its identity could not be spelled, so its row
+/// keeps what it has instead of being marked stale for want of a key. A refused **directory** needs no fourth
+/// rule: [`crate::walk`] records it in `unreadable`, because an unspellable name makes every path below it
+/// unkeyable too — the same hole an unreadable one cuts, by the same prefix.
+///
+/// The note test correlates on `rel_bytes`: with twins a note belonging to either file would otherwise
+/// answer for both, and that boolean feeds the refresh-coverage decision, which decides whether
+/// [`PARSE_VERSION_KEY`] gets recorded (F13 §3).
+///
+/// The count alongside the rows is how many live **note** rows that unknown-path filter dropped — nothing else
+/// reports them, since they appear nowhere in `found` — which is how [`scan_with_inject`] knows a
+/// parse-rule refresh never reached part of the corpus. Any row with no note behind it is excluded by the
+/// `EXISTS` — attachments and never-yet-parsed paths alike: no parse rule can stale rows that do not exist,
+/// so counting one would pin the version forever over work that is not owed.
+fn known_rows(
+    db: &Db,
+    unreadable: &[String],
+    unrepresentable: &[String],
+) -> Result<(Vec<Snapshot>, usize), DbError> {
+    // Both key columns come back, because this is the database side of a byte-keyed comparison: hand out
+    // display text here and every non-UTF-8 row reads as removed-and-re-added on every scan forever, which is
+    // §1's never-converges symptom manufactured by the fix (F13 §4.1).
     let mut statement = db.0.prepare(
-        "SELECT rel, case_key, hash, size, mtime FROM files WHERE state = 'ok' ORDER BY rel",
+        "SELECT f.rel_bytes, f.case_bytes, f.rel, f.case_key, f.hash, f.size, f.mtime,
+                EXISTS (SELECT 1 FROM notes n WHERE n.rel_bytes = f.rel_bytes)
+         FROM files f WHERE f.state = 'ok' ORDER BY f.rel_bytes",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok(Snapshot {
-            rel: row.get(0)?,
-            case_key: row.get(1)?,
-            hash: row.get(2)?,
-            size: row.get::<_, i64>(3)?.max(0) as u64,
-            mtime: row.get(4)?,
-        })
+        Ok((
+            Snapshot {
+                rel_bytes: row.get(0)?,
+                case_bytes: row.get(1)?,
+                rel: row.get(2)?,
+                case_key: row.get(3)?,
+                hash: row.get(4)?,
+                size: row.get::<_, i64>(5)?.max(0) as u64,
+                mtime: row.get(6)?,
+            },
+            row.get::<_, bool>(7)?,
+        ))
     })?;
     // Read out fully here, so the write pass never runs with a read open across it.
     let mut known = Vec::new();
+    let mut hidden = 0_usize;
     for row in rows {
-        let snapshot = row?;
-        if !under_unreadable(&snapshot.rel, unreadable) {
+        let (snapshot, is_note) = row?;
+        if is_unknown_path(&snapshot.rel, unreadable, unrepresentable) {
+            if is_note {
+                hidden += 1;
+            }
+        } else {
             known.push(snapshot);
         }
     }
-    Ok(known)
+    Ok((known, hidden))
 }
 
-/// Whether `rel` sits inside a directory the walk could not read, which makes its absence from the found
-/// list meaningless. `"."` is how [`crate::walk`] spells the workspace root itself, and that leaves
-/// nothing knowable at all.
+/// Whether `rel` sits inside a directory whose contents this walk never saw, which makes its absence from the
+/// found list meaningless — either the walk could not enter it, or the directory's own name was refused below
+/// ([`crate::walk::Walked::unreadable`] carries both shapes, F18). `"."` is how [`crate::walk`] spells the
+/// workspace root itself, and that leaves nothing knowable at all.
 fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
     unreadable
         .iter()
         .any(|dir| dir == "." || rel.starts_with(&format!("{dir}/")))
+}
+
+/// Whether `rel` names a path this scan must not judge absent, from the two lists [`crate::walk`] reports.
+///
+/// They describe different shapes of "unknown" and so match differently: an unreadable **directory** hides a
+/// whole subtree, hence [`under_unreadable`]'s prefix rule, while a refused name
+/// ([`crate::walk::Walked::unrepresentable`], F18) is one file rather than a region, hence exact equality.
+/// A refused **directory** belongs to the first list rather than the second
+/// ([`crate::walk::Walked::unreadable`]), and that is not a convenience: its name is the first component of
+/// every path below it, so none of those can be keyed either and the whole subtree needs the prefix rule.
+/// Every arm here suppresses `Removed` for the same reason — the scan did not see that path, which is not
+/// evidence it stopped existing.
+///
+/// A refused name is compared as display text, and that costs nothing on the only platform that can produce
+/// one: Windows builds its key from `to_string_lossy`, so a refused path's `rel_bytes` *are* these bytes
+/// (F18). The consequence worth stating is the twin — a live row whose own spelling is the same lossy text
+/// is dropped from the comparison alongside the refused path, so such a scan counts that twin as `Added` and
+/// refreshes its own row instead of risking a `Removed` against a path this scan just refused. Churn, never an
+/// overwrite — but do not read that as Unix sitting outside this arm. **No *refused* name can reach either list
+/// there** (`path_keys::name_is_lossless` is `true` for every byte a Unix filename holds), yet the prefix rule still
+/// fires on any unreadable directory, and F20's twin-directory case — two directories whose names differ only in
+/// bytes that display as one `U+FFFD` — drops a live row through here on Linux today. F18 widened who lands in
+/// these lists; it did not create the matching imprecision, and F20 owns it.
+fn is_unknown_path(rel: &str, unreadable: &[String], unrepresentable: &[String]) -> bool {
+    unrepresentable.iter().any(|name| name == rel) || under_unreadable(rel, unreadable)
 }
 
 /// Write this scan's changes: every readable file's registry row refreshed, contents re-indexed where
@@ -396,35 +537,83 @@ fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
 /// database and be re-hashed by every later scan forever (Task 4 handoff).
 ///
 /// A path whose identity is already held by another row — two files named `a.md` and `A.md` on a
-/// case-sensitive filesystem, where `files.case_key` stays unique and nothing picks a winner — is
-/// reported under `skipped` and left out of the counts instead of aborting the scan (ruling P3).
+/// case-sensitive filesystem, where `files.case_bytes` stays unique and nothing picks a winner — is
+/// reported under `skipped` and left out of the counts instead of aborting the scan (ruling P3). So is a path
+/// holding more than one note row ([`NoteRow::Duplicate`]), which no constraint can see.
+///
+/// The pending map is keyed on bytes, like every other identity in the pass (F13 §4.1): keyed on display
+/// `rel`, two twins read back **the same change** from one slot whatever the columns are called.
 fn apply_changes(
     db: &Db,
     found: &[Found],
-    changes: &[(String, Change)],
+    changes: &[(RelPath, Change)],
+    refresh: bool,
     now: i64,
     case_sensitive: bool,
     markers: &MarkerConfig,
 ) -> Result<Written, ScanError> {
     let mut written = Written::default();
-    let pending: HashMap<&str, &Change> = changes
+    let pending: HashMap<&[u8], &Change> = changes
         .iter()
-        .map(|(rel, change)| (rel.as_str(), change))
+        .map(|(path, change)| (path.rel_bytes.as_slice(), change))
         .collect();
 
     for readable in found {
         let rel = readable.snapshot.rel.as_str();
+        let path = path_of(&readable.snapshot);
         // An unknown path is already named in the report and contributed only its marker to
         // `classify`; there is nothing here to write, and counting it either way would be a guess.
         if is_unknown(readable) {
+            // Nothing to write, but a refresh has to remember a missed note *whose rows already exist*:
+            // those still hold whatever an older build wrote. An attachment, or a note that never got a
+            // row, is charged never — there is nothing stale to repair, so charging it would pin the
+            // version forever and re-parse the whole corpus on every scan for nothing.
+            if owes_a_reparse(db, &path, readable.is_markdown)? {
+                written.uncovered += 1;
+            }
             continue;
         }
         // `Removed` is keyed on a path that is not in `found`, so it cannot reach this lookup.
-        let change = pending.get(rel).copied();
-        match index_file(db, readable, change, now, case_sensitive, markers)? {
-            Indexed::Taken => written.skipped.push(rel.to_string()),
+        let change = pending.get(readable.snapshot.rel_bytes.as_slice()).copied();
+        match index_file(db, readable, change, refresh, now, case_sensitive, markers)? {
+            Indexed::Taken => {
+                written.skipped.push(rel.to_string());
+                // A note that lost an identity conflict keeps the rows it already had, so the refresh is
+                // not finished — but only the *winner* of a collision has rows, and charging the loser
+                // would hold the version back over nothing to repair.
+                //
+                // A refused **move** is judged by the path it came from, not the one it wanted. `classify`
+                // suppresses the source's `Removed` because a move is never also a deletion, so that row
+                // stays live with its pre-refresh data while the destination holds nothing at all: reading
+                // `rel` here would report full coverage over a note left behind stale.
+                let owed = match change {
+                    Some(Change::Moved { from }) => owes_a_reparse(db, from, true)?,
+                    _ => owes_a_reparse(db, &path, readable.is_markdown)?,
+                };
+                if owed {
+                    written.uncovered += 1;
+                }
+            }
+            // More than one note row sits on this path, so no note was re-parsed or rewritten (F13 §7; the
+            // registry row may already have moved — see [`Indexed::Duplicate`]). Its rows exist and stay
+            // whatever rules wrote them, which is exactly what a refresh has to remember.
+            Indexed::Duplicate => {
+                written.skipped.push(rel.to_string());
+                if owes_a_reparse(db, &path, readable.is_markdown)? {
+                    written.uncovered += 1;
+                }
+            }
             Indexed::Done(links) => {
                 if let Some(parsed) = links {
+                    // `Some` here means the text was re-parsed, and a note `classify` did not call
+                    // changed can only have been re-parsed because of `refresh`. An attachment yields
+                    // `None`, so it is never counted. A path that had no note row before this scan does
+                    // count: the refresh is writing its derived rows for the first time, which is work
+                    // the receipt describes — hence "path(s)" in [`report_refresh`] rather than a
+                    // promise that every one of them was already a note.
+                    if refresh && matches!(change, None | Some(Change::Removed)) {
+                        written.refreshed += 1;
+                    }
                     written.parsed.push(parsed);
                 }
                 match change {
@@ -437,9 +626,9 @@ fn apply_changes(
         }
     }
 
-    for (rel, change) in changes {
+    for (path, change) in changes {
         if matches!(change, Change::Removed) {
-            db::mark_stale(db, rel)?;
+            db::mark_stale(db, &path.rel_bytes)?;
             written.removed += 1;
         }
     }
@@ -452,24 +641,40 @@ enum Indexed {
     Done(Option<Parsed>),
     /// Another path holds this identity, so nothing about this row was touched.
     Taken,
+    /// More than one note row sits on this path's key — a legacy duplicate `notes.rel` never forbade
+    /// (F13 §7). Picking one would rewrite that note's title, tags, items and links with the other's
+    /// contents, so no note is re-parsed or rewritten and the file is named in `skipped`.
+    ///
+    /// What *is* already written by the time this is decided, and what a reader must not be promised away:
+    /// for a renamed path `apply_move` has moved the `files` row and both notes rode its cascade, so their
+    /// display `rel` changed; and `upsert_file` has refreshed `hash`, `size`, `mtime` and `state`. The
+    /// registry row is therefore current while the two notes keep an older title, body, headings, tags,
+    /// items and prose edges — a deliberately mixed-age database, because every alternative either merges
+    /// two notes nobody asked to merge or stops the scan. Nothing heals this on its own: see
+    /// `docs/backlog-m2-followups.md` F19.
+    Duplicate,
 }
 
-/// Bring one found file's row up to date and re-index its contents when they changed.
+/// Bring one found file's row up to date and re-index its contents when they changed, or when `refresh`
+/// says the rules that wrote its derived rows are no longer this build's.
 fn index_file(
     db: &Db,
     readable: &Found,
     change: Option<&Change>,
+    refresh: bool,
     now: i64,
     case_sensitive: bool,
     markers: &MarkerConfig,
 ) -> Result<Indexed, ScanError> {
     let snapshot = &readable.snapshot;
-    let rel = snapshot.rel.as_str();
+    let path = path_of(snapshot);
     match change {
         Some(Change::Moved { from }) => {
-            // One row moves and `notes.rel` follows by cascade, which is what keeps a renamed note the
-            // same note with its links attached (see [`crate::db`]).
-            if let Err(err) = db::apply_move(db, from, rel, now) {
+            // One row of `files` moves, and [`db::apply_move`] rewrites that note's own `rel` for it:
+            // migration 4 removed `notes.rel`'s foreign key, so the display column has no cascade left to
+            // ride. Identity is what survives a rename either way — `notes.rel_bytes` follows its parent —
+            // which is what keeps a renamed note the same note with its links attached (see [`crate::db`]).
+            if let Err(err) = db::apply_move(db, from, &path, now) {
                 return conflict_or_err(err, Indexed::Taken);
             }
         }
@@ -477,10 +682,10 @@ fn index_file(
             if !case_sensitive {
                 // Identity first: on a case-insensitive filesystem the row may sit under another
                 // spelling of the same name — a case-only rename emits no change at all — and upserting
-                // over it would trip `files.case_key UNIQUE` instead of renaming the note that is still
+                // over it would trip `files.case_bytes UNIQUE` instead of renaming the note that is still
                 // the same note (Task 4 handoff).
-                if let Some(old) = folded_row(db, &snapshot.case_key, rel)? {
-                    if let Err(err) = db::apply_move(db, &old, rel, now) {
+                if let Some(old) = folded_row(db, &snapshot.case_bytes, &snapshot.rel_bytes)? {
+                    if let Err(err) = db::apply_move(db, &old, &path, now) {
                         return conflict_or_err(err, Indexed::Taken);
                     }
                 }
@@ -496,18 +701,32 @@ fn index_file(
     // path. Missing rows are rebuilt whatever `classify` said: a file that changed extension into `.md`
     // while keeping its bytes is a `Moved`, and would otherwise stay unparsed forever.
     if let Some(text) = &readable.text {
-        let rewritten = matches!(change, Some(Change::Added | Change::Modified));
-        if rewritten || note_id(db, rel)?.is_none() {
-            let doc = parse_markdown(text, file_stem(rel));
+        // `refresh` rewrites a note whose bytes did not change: the whole point of F15 is that its
+        // derived rows were written by rules this build no longer has.
+        let rewritten = refresh || matches!(change, Some(Change::Added | Change::Modified));
+        // One id lookup per note, resolved here — after any move above has been applied, which is
+        // what lets [`db::apply_move`] have rewritten `notes.rel` onto the new path (migration 4 removed the
+        // foreign key that used to do it). The same answer
+        // decides whether a note without a row is rebuilt (`is_none()` below) and whether
+        // [`store_note`] updates or inserts; looking it up again inside `store_note` was F10.
+        let existing = match note_row(db, &path)? {
+            NoteRow::Missing => None,
+            NoteRow::One(id) => Some(id),
+            NoteRow::Duplicate => return Ok(Indexed::Duplicate),
+        };
+        if rewritten || existing.is_none() {
+            let doc = parse_markdown(text, file_stem(&path.rel));
             let links = doc.links.clone();
             let items = extract_items(text, markers);
-            store_note(db, rel, text, &doc, &items, readable.lossy)?;
-            return Ok(Indexed::Done(Some((rel.to_string(), links))));
+            store_note(db, &path, existing, text, &doc, &items, readable.lossy)?;
+            return Ok(Indexed::Done(Some((path, links))));
         }
     } else {
         // Nothing to parse, so this is an attachment. Any note row still sitting on this path is a
         // leftover from the rename that made it one (see [`delete_note_row`]).
-        delete_note_row(db, rel)?;
+        if !delete_note_row(db, &path)? {
+            return Ok(Indexed::Duplicate);
+        }
     }
     Ok(Indexed::Done(None))
 }
@@ -515,18 +734,43 @@ fn index_file(
 /// Delete the note row that a path this scan read as an attachment still carries.
 ///
 /// A byte-identical rename that drops the extension (`note.md` → `note.txt`) is a `Moved`, and
-/// [`db::apply_move`] lets `notes.rel` cascade onto the new path — but an attachment is never parsed, so
+/// [`db::apply_move`] rewrites `notes.rel` onto the new path — but an attachment is never parsed, so
 /// nothing overwrote that row. Left in place it renders as `- [[Title]](note.txt)` and is counted as a
 /// live note, against "tracked but never catalogued" (spec §10), so the row goes with what hangs off it.
 ///
 /// Only this note's `origin = 'prose'` edges go too: an approved edge is an input and not derived output
 /// (spec §10). Edges pointing *in* lose their destination rather than being deleted, because they are
-/// another note's prose and stay countable as unresolved. Rewriting them is not optional bookkeeping:
-/// `dst_note_id` carries no foreign key and SQLite hands a deleted rowid to the next INSERT, so an edge
-/// left behind would eventually claim an unrelated note as its destination.
-fn delete_note_row(db: &Db, rel: &str) -> Result<(), DbError> {
-    let Some(id) = note_id(db, rel)? else {
-        return Ok(());
+/// another note's prose and stay countable as unresolved.
+///
+/// Migration 3 gave every one of these five statements a twin in the schema — each child table cascades
+/// off `notes(id)`, and `links.dst_note_id` is `ON DELETE SET NULL`. The hand-written ones stay: they
+/// name in the code what is about to happen, and they hold whatever a connection's `foreign_keys` pragma
+/// happens to say. Two places the schema now reaches further are worth knowing from here:
+///
+/// - The cascade takes **every** outgoing edge, so an approved one leaves with its source note. A foreign
+///   key cannot be conditional, and an edge whose source row is gone has nothing to point at; M1 writes no
+///   approved edges (`store_links` is called with `prose` only), so today the two agree exactly. If a later
+///   milestone starts writing them, this is the decision to revisit.
+/// - An orphan can no longer survive this function at all. SQLite hands a deleted rowid to the next
+///   INSERT, so an inbound edge left pointing at a dead note would eventually claim an unrelated note as
+///   its destination — which is precisely what `dst_note_id`'s foreign key now rules out.
+///
+/// Returns `false` when the path carries **more than one** note row and nothing was deleted: choosing which
+/// of two notes to destroy is the same guess F13 §7 refuses, so the caller reports the file instead.
+/// `true` means the path is now free of note rows — whether or not one was there, since "already none" is
+/// the state this call wanted.
+fn delete_note_row(db: &Db, path: &RelPath) -> Result<bool, DbError> {
+    let note = note_row(db, path)?;
+    // Two rows on one key: there is no honest choice about which to destroy.
+    if matches!(note, NoteRow::Duplicate) {
+        return Ok(false);
+    }
+    let Some(id) = (match note {
+        NoteRow::One(id) => Some(id),
+        _ => None,
+    }) else {
+        // No note row behind an attachment path, which is already the state wanted.
+        return Ok(true);
     };
     db.0.execute("DELETE FROM headings WHERE note_id = ?1", params![id])?;
     db.0.execute("DELETE FROM tags WHERE note_id = ?1", params![id])?;
@@ -540,7 +784,7 @@ fn delete_note_row(db: &Db, rel: &str) -> Result<(), DbError> {
         params![id],
     )?;
     db.0.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
-    Ok(())
+    Ok(true)
 }
 
 /// Turn a constraint violation into "this path is skipped"; anything else stays an error.
@@ -554,8 +798,9 @@ fn conflict_or_err<T>(err: DbError, taken: T) -> Result<T, ScanError> {
 /// Whether a failed write means another row already holds this path's identity — the one failure that is
 /// a fact about the workspace rather than a broken scan.
 ///
-/// `files.rel` and `files.case_key` are both unique, so two paths can claim one note and no rule here may
-/// pick a winner; SQLite reports that as a constraint violation on either statement.
+/// `files.rel_bytes` and `files.case_bytes` are both unique — since migration 4 they, not the display
+/// columns, carry identity — so two paths can claim one note and no rule here may pick a winner; SQLite
+/// reports that as a constraint violation on either statement.
 fn is_identity_conflict(err: &DbError) -> bool {
     matches!(
         err,
@@ -570,13 +815,23 @@ fn is_identity_conflict(err: &DbError) -> bool {
 }
 
 /// The `rel` of a live row holding `case_key` under a different spelling of the same path.
-fn folded_row(db: &Db, case_key: &str, rel: &str) -> Result<Option<String>, DbError> {
+/// The row holding `case_bytes` under a different byte key — the one a rename has to follow. Matched on the
+/// ASCII byte fold and returning both spellings of the row it finds (F13 §3): once this matched the Unicode
+/// display fold it handed back a *twin* as "another spelling of the same name", and [`index_file`] then moved
+/// a row between two files that both exist. The accepted price is in [`crate::path_keys::case_fold`]'s doc:
+/// a rename that changes only a non-ASCII letter's case stops being followed here.
+fn folded_row(db: &Db, case_bytes: &[u8], rel_bytes: &[u8]) -> Result<Option<RelPath>, DbError> {
     Ok(db
         .0
         .query_row(
-            "SELECT rel FROM files WHERE case_key = ?1 AND rel != ?2",
-            params![case_key, rel],
-            |row| row.get(0),
+            "SELECT rel_bytes, rel FROM files WHERE case_bytes = ?1 AND rel_bytes != ?2",
+            params![case_bytes, rel_bytes],
+            |row| {
+                Ok(RelPath::new(
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            },
         )
         .optional()?)
 }
@@ -589,9 +844,23 @@ fn folded_row(db: &Db, case_key: &str, rel: &str) -> Result<Option<String>, DbEr
 /// that appended would duplicate every row on every rescan and break byte-identical regeneration. Only
 /// this note's `origin = 'prose'` links go; an approved edge is an input and not derived output (spec
 /// §10), so a rescan must never undo one.
+///
+/// `existing` is the note row behind `rel` as [`index_file`] resolved it — `None` when there is none
+/// yet. The id is passed in rather than looked up here because [`index_file`] needs the same answer
+/// to decide whether to re-parse at all, and before F10 the duplicate existed on exactly one branch:
+/// its `rewritten || note_id(db, rel)?.is_none()` short-circuits on `Added | Modified`, so a changed
+/// note did its only lookup inside this function — only a row-less note, where `rewritten` is false
+/// and `is_none()` alone decides, was asked the question twice.
+///
+/// No fresh read is required between that lookup and here: [`db::upsert_file`] runs *before* it, not
+/// between, and writes `files` only, so nothing has touched `notes` in the meantime — and when
+/// `existing` is `None`, [`db::insert_note`] mints the id itself, so none is needed after the write either —
+/// and that call is where the note's byte key is written, not here (see its doc for why the insert lives in
+/// `db`).
 fn store_note(
     db: &Db,
-    rel: &str,
+    path: &RelPath,
+    existing: Option<i64>,
     text: &str,
     doc: &NoteDoc,
     items: &[ItemCandidate],
@@ -604,7 +873,7 @@ fn store_note(
     let body = body_text(text, body_start(text));
     let words = i64::try_from(doc.words).unwrap_or(i64::MAX);
 
-    let id = match note_id(db, rel)? {
+    let id = match existing {
         Some(id) => {
             db.0.execute(
                 "UPDATE notes
@@ -621,21 +890,15 @@ fn store_note(
             )?;
             id
         }
-        None => {
-            db.0.execute(
-                "INSERT INTO notes (rel, title, title_source, encoding, word_count, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    rel,
-                    doc.title,
-                    doc.title_source.as_str(),
-                    encoding,
-                    words,
-                    body
-                ],
-            )?;
-            db.0.last_insert_rowid()
-        }
+        None => db::insert_note(
+            db,
+            path,
+            &doc.title,
+            doc.title_source.as_str(),
+            encoding,
+            words,
+            body,
+        )?,
     };
 
     db.0.execute("DELETE FROM headings WHERE note_id = ?1", params![id])?;
@@ -676,13 +939,32 @@ fn store_note(
     Ok(())
 }
 
-/// The note row behind one `rel`, if it has one. Its id is what every derived row hangs off.
-fn note_id(db: &Db, rel: &str) -> Result<Option<i64>, DbError> {
-    Ok(db
-        .0
-        .prepare_cached("SELECT id FROM notes WHERE rel = ?1 LIMIT 1")?
-        .query_row(params![rel], |row| row.get(0))
-        .optional()?)
+/// The note row one path owns, read by byte key.
+#[derive(Debug)]
+enum NoteRow {
+    /// No note behind the path yet — an attachment, or a note this scan has not written.
+    Missing,
+    /// The normal case: exactly one row, whose id every derived row hangs off.
+    One(i64),
+    /// More than one row on the key. Legal at version 3 (`notes.rel` was never `UNIQUE`) and copied onto one
+    /// `rel_bytes` by migration 4, so this is a population the reader has to name rather than pretend not to
+    /// have (F13 §7).
+    Duplicate,
+}
+
+/// How many note rows sit behind one path's byte key, and which one if there is a single answer.
+///
+/// **No `LIMIT 1`** (F13 §3): the old single-row read is what made a legacy duplicate silently *wrong* rather
+/// than loud — it handed one file's title, tags, items and links to the other file's note. Refusing with an
+/// error was the other wrong answer: it would make a workspace holding one old duplicate impossible to scan
+/// ever again. So the count travels back to the caller, which reports the file under `skipped`, rewrites no
+/// note, and carries on.
+fn note_row(db: &Db, path: &RelPath) -> Result<NoteRow, DbError> {
+    Ok(match db::note_ids(db, &path.rel_bytes)?.as_slice() {
+        [] => NoteRow::Missing,
+        [only] => NoteRow::One(*only),
+        _ => NoteRow::Duplicate,
+    })
 }
 
 /// Place and store the links of every note this scan re-parsed.
@@ -697,17 +979,31 @@ fn store_note_links(db: &Db, parsed: &[Parsed]) -> Result<(), DbError> {
     store_links(db, &resolved, PROSE_ORIGIN)
 }
 
-/// `case_key` → `rel` for every live file: the corpus [`crate::links::resolve`] places targets in.
-fn live_corpus(db: &Db) -> Result<BTreeMap<String, String>, DbError> {
-    let mut statement =
-        db.0.prepare("SELECT case_key, rel FROM files WHERE state = 'ok' ORDER BY case_key, rel")?;
+/// `case_key` → every live row carrying that fold: the corpus [`crate::links::resolve`] places targets in.
+///
+/// Each entry is a [`RelPath`], so a placed target names the row it landed on rather than a spelling two
+/// rows may share; matching still happens entirely on display text, which is the author's question (F13 §4.1).
+///
+/// A `Vec` rather than the one `rel` an earlier build kept, because `files.case_key` stopped being unique
+/// with migration 4 (F13 §3): `Ämli.md` beside `ämli.md` is two files whose display fold is one string, so
+/// `insert` would have handed the fold to whichever row was read last and a link naming that fold would land
+/// on it by iteration order. Listing both is what lets resolution see the ambiguity and decline, exactly as
+/// [`crate::links`] already models an ambiguous basename. A fold with one owner still resolves.
+fn live_corpus(db: &Db) -> Result<BTreeMap<String, Vec<RelPath>>, DbError> {
+    let mut statement = db.0.prepare(
+        "SELECT case_key, rel_bytes, rel FROM files WHERE state = 'ok'
+         ORDER BY case_key, rel_bytes",
+    )?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            RelPath::new(row.get::<_, Vec<u8>>(1)?, row.get::<_, String>(2)?),
+        ))
     })?;
-    let mut corpus: BTreeMap<String, String> = BTreeMap::new();
+    let mut corpus: BTreeMap<String, Vec<RelPath>> = BTreeMap::new();
     for row in rows {
-        let (case_key, rel) = row?;
-        corpus.insert(case_key, rel);
+        let (case_key, path) = row?;
+        corpus.entry(case_key).or_default().push(path);
     }
     Ok(corpus)
 }
@@ -717,23 +1013,28 @@ fn live_corpus(db: &Db) -> Result<BTreeMap<String, String>, DbError> {
 /// Live rows only, joined through `files`, so a stale note leaves the catalog while its rows stay in the
 /// database (spec §2). Tags come back in insertion order, which is the note's own order, because the
 /// renderer prints them as written.
+/// The join and the order are both on `rel_bytes` (F13 §3). On display `rel` two rows on each side of one
+/// spelling is a cross product, so the catalog gained duplicate entries carrying wrong link counts; and for
+/// twins that spelling is *identical*, so a display `ORDER BY` orders nothing and the rendered bytes fell to
+/// whichever row SQLite happened to read.
 fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
     let mut statement = db.0.prepare(
-        "SELECT n.id, n.rel, n.title, f.size
-           FROM notes n JOIN files f ON f.rel = n.rel
+        "SELECT n.id, n.rel_bytes, n.rel, n.title, f.size
+           FROM notes n JOIN files f ON f.rel_bytes = n.rel_bytes
           WHERE f.state = 'ok'
-          ORDER BY n.rel",
+          ORDER BY n.rel_bytes",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, i64>(3)?.max(0) as u64,
-        ))
+        Ok(LiveNote {
+            id: row.get::<_, i64>(0)?,
+            rel_bytes: row.get::<_, Vec<u8>>(1)?,
+            rel: row.get::<_, String>(2)?,
+            title: row.get::<_, Option<String>>(3)?,
+            size: row.get::<_, i64>(4)?.max(0) as u64,
+        })
     })?;
     // Read out fully before the counts run, so no read is open across another statement.
-    let mut live: Vec<(i64, String, Option<String>, u64)> = Vec::new();
+    let mut live: Vec<LiveNote> = Vec::new();
     for row in rows {
         live.push(row?);
     }
@@ -757,17 +1058,36 @@ fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
 
     Ok(live
         .into_iter()
-        .map(|(id, rel, title, size)| CatalogEntry {
-            title: title
+        .map(|note| CatalogEntry {
+            title: note
+                .title
                 .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| file_name(&rel).to_string()),
-            size_human: catalog::size_human(size),
-            tags: tags.get(&id).cloned().unwrap_or_default(),
-            out: count_of(&out, id),
-            inc: count_of(&inc, id),
-            rel,
+                .unwrap_or_else(|| file_name(&note.rel).to_string()),
+            size_human: catalog::size_human(note.size),
+            tags: tags.get(&note.id).cloned().unwrap_or_default(),
+            out: count_of(&out, note.id),
+            inc: count_of(&inc, note.id),
+            rel_bytes: note.rel_bytes,
+            rel: note.rel,
         })
         .collect())
+}
+
+/// One live note as [`catalog_entries`] reads it, before its counts and tags are attached.
+///
+/// A name rather than a five-field tuple: the row now carries both spellings of its path, and which of them
+/// renders (`rel`) and which only orders (`rel_bytes`) is the distinction worth keeping visible here.
+struct LiveNote {
+    /// The note row's id — what the link counts and tags are keyed on.
+    id: i64,
+    /// The byte key, for `ORDER BY` and for nothing a reader sees.
+    rel_bytes: Vec<u8>,
+    /// The display path, which is what the entry links to.
+    rel: String,
+    /// Stored title; `None` or empty means the entry takes its file name.
+    title: Option<String>,
+    /// File size in bytes, rendered through [`catalog::size_human`].
+    size: u64,
 }
 
 /// One `SELECT note_id, COUNT(*)` pair into a lookup.
@@ -808,8 +1128,10 @@ fn note_tags(db: &Db) -> Result<HashMap<i64, Vec<String>>, DbError> {
 /// counting those would bury the "notes I could not place" signal (see [`crate::links::store_links`]).
 ///
 /// A destination that exists but is stale counts here, because it is a note nobody can reach: links are
-/// re-resolved only for notes this scan re-parsed, so an edge into a deleted note keeps its old
-/// `dst_note_id` until its source is edited. [`crate::db::unresolved_targets`] answers the list this scan
+/// re-resolved only for notes this scan re-parsed, so an edge into a stale note keeps its old
+/// `dst_note_id` until its source is edited. An edge into a note row that was actually *deleted* arrives
+/// by the other door: migration 3's `ON DELETE SET NULL` empties it, and an empty destination counts here
+/// as well. [`crate::db::unresolved_targets`] answers the list this scan
 /// reports beside this number as [`ScanReport::unresolved_targets`], and both are read from one
 /// transaction — that query asks the same question with the same [`LIVE_EDGE`] predicate and the same
 /// [`PROSE_ORIGIN`] filter, neither spelling its own literal — an approved edge is an input, and once
@@ -828,17 +1150,40 @@ fn unresolved_links(db: &Db) -> Result<i64, DbError> {
 
 /// The index files this workspace holds from the last scan, from [`INDEX_FILES_KEY`].
 fn index_list(db: &Db) -> Result<Vec<String>, DbError> {
-    let stored: Option<String> =
-        db.0.query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            params![INDEX_FILES_KEY],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let stored = meta_value(db, INDEX_FILES_KEY)?;
     // One name per line, and no names at all when the value is an empty list rather than absent.
     Ok(stored.map_or_else(Vec::new, |value| {
         value.lines().map(str::to_string).collect()
     }))
+}
+
+/// One `meta` value as this program wrote it: `None` when the key was never written or holds NULL.
+///
+/// The column is read as `Option<String>` deliberately. A row holding NULL is what anyone gets after
+/// poking at the database by hand, and reading it as a plain `String` turns that into
+/// `InvalidColumnType` — an error that fails the whole scan, contradicting what [`parse_version`]
+/// promises two lines below its own name.
+fn meta_value(db: &Db, key: &str) -> Result<Option<String>, DbError> {
+    Ok(db
+        .0
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The one `meta` upsert this module writes, shared by the published index-file list and the parse rules
+/// version, so neither invents its own conflict clause.
+fn set_meta(db: &Db, key: &str, value: &str) -> Result<(), DbError> {
+    db.0.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 /// Record the index files this scan publishes, so a later scan knows which shards to delete.
@@ -853,12 +1198,120 @@ fn set_index_list(db: &Db, rendered: &[(String, String)]) -> Result<(), DbError>
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    db.0.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)
-         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        params![INDEX_FILES_KEY, value],
-    )?;
-    Ok(())
+    set_meta(db, INDEX_FILES_KEY, &value)
+}
+
+/// The parse rules version this workspace recorded under [`PARSE_VERSION_KEY`].
+///
+/// `None` covers "the key is absent" and "the value is not a number this build can read" — a NULL, a
+/// hand-edited file, a spelling from a future version. Both mean the same thing here: the stored rows
+/// carry no label this build can trust, so they are rewritten and the truth recorded.
+fn parse_version(db: &Db) -> Result<Option<u32>, DbError> {
+    Ok(meta_value(db, PARSE_VERSION_KEY)?.and_then(|value| value.trim().parse().ok()))
+}
+
+/// Whether this scan has to re-parse every markdown note it reads.
+///
+/// Equality with [`PARSE_VERSION`] and nothing else means up to date. A database holding a *higher* value
+/// is rewritten here too, and the recorded value moves back to what this build actually wrote: guessing
+/// that newer rows are still valid would leave data labelled with rules this binary does not have, and one
+/// full re-parse is cheap next to a catalog that quietly disagrees with the code that renders it.
+fn refresh_needed(stored: Option<u32>) -> bool {
+    stored != Some(PARSE_VERSION)
+}
+
+/// Whether a refresh reached every note it owed new derived rows.
+///
+/// Two ways to miss one, neither visible in [`ScanReport`]: a file that changed or became unreadable
+/// between the walk and the read (`uncovered`, since the write pass skips its marker), and a live row this
+/// scan could not look at — under a directory it could not enter, or carrying a name it refused (F18) —
+/// which [`known_rows`] drops so it cannot be mistaken for deleted (`hidden_by_unknown`). Recording the
+/// version over either would label rows as current that an older build wrote, permanently — the exact
+/// failure F15 exists to prevent, reintroduced by the fix.
+/// Retrying is the cheaper fault: one subtree stays stale until it becomes readable again, and the scan
+/// after that records the version once the corpus is covered.
+///
+/// Notes with existing rows only, on both sides. Three things are deliberately not charged, because no
+/// parse rule can stale what does not exist: an unreadable image or mode-000 download folder, a markdown
+/// path that has never had a `notes` row (it is indexed as `Added` whenever it next becomes readable), and
+/// the loser of a case collision, which is refused at insert and normally holds no row of its own. Charging
+/// any of them would re-parse the whole corpus on every scan forever and repair nothing.
+///
+/// What *can* still hold the version back indefinitely is stale data that exists and cannot be rewritten: a
+/// note whose rows are there but unreadable (a mode-000 `.md`, or one inside a directory nobody can enter), a
+/// live row hidden behind such a directory, **a name this build refuses for good** (F18: while that spelling
+/// stays unrepresentable no scan can index it — a refused *file* leaves its own rows owing, a refused
+/// *directory* leaves everything below it owing — so they keep whatever an older build wrote and only renaming
+/// the path clears the debt), a move refused by an identity conflict — judged by the path it came from, since
+/// `classify` suppressed that path's `Removed` and its rows are still in the catalog — and **a legacy
+/// duplicate note pair** (`Indexed::Duplicate`). The unreadable ones clear when the obstruction does.
+/// A refused name and a duplicate never do on their own: no code renames a file and no code merges two note
+/// rows, so such a workspace re-parses its whole corpus on every scan and prints the gap line each time. That
+/// is chosen over recording the version beside a note that was not re-parsed, which is F15's bug wearing a
+/// clean hat; the cost is named here rather than discovered, and `docs/backlog-m2-followups.md` F19 owns the
+/// migration that would heal the duplicate. That loop
+/// is worth paying for: those rows stay wrong until the obstruction clears, and the notice below names the
+/// count so this is never silent.
+fn refresh_covered(written: &Written, hidden_by_unknown: usize) -> bool {
+    written.uncovered == 0 && hidden_by_unknown == 0
+}
+
+/// Say out loud that a scan re-parsed notes whose files did not change — unless there is nothing to say.
+///
+/// The report itself stays silent on purpose ([`ScanReport`] counts what classification decided, and its
+/// JSON shape is pinned by the CLI tests), so without this line a rule change would reach a workspace and
+/// rewrite every derived row in it while `np scan` printed `modified 0`. stderr only, for the same reason
+/// the orphan receipt is: `--json` must keep stdout parseable.
+///
+/// The sink is a parameter because stderr cannot be redirected in-process — the standard library offers no
+/// way to replace the global handle — so the tests in this module drive the formatting directly, exactly as
+/// [`crate::db`] does for its receipt. What they cannot pin is that the production call site names stderr,
+/// nor what a scan does when that descriptor will not accept the line: both are pinned by
+/// `a_parse_rule_change_reports_the_re_parse_on_stderr` and
+/// `a_scan_survives_a_stderr_that_refuses_every_write` in `crates/np-cli/tests/cli.rs`, which run the real
+/// binary.
+///
+/// **A write that fails is dropped, here and in [`report_refresh_gap`], and that is deliberate.** Both are
+/// called after `tx.commit()`: the rows, the note, the published index list and — when the corpus was fully
+/// covered — the recorded rules version are already durable. Failing a scan because a line could not be
+/// printed would turn work that succeeded into exit 101 or a `ScanError` over a courtesy notice, which is what
+/// an unusable descriptor 2 means in practice: a detached terminal, a service running with stderr nowhere,
+/// a device refusing writes. The cost of dropping it is one lost announcement about work already done, and the
+/// next scan prints it again while the version still lags.
+///
+/// [`crate::db::report_orphans`] still unwraps on a refused write. It is left alone on purpose: its line is
+/// printed inside the migration transaction, so nothing has been committed when it runs and a process that
+/// dies there leaves the file as it was — a different decision from the one above, and not this change's to
+/// revisit.
+fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
+    // Zero means the refresh cost nothing extra: a first scan re-parses nothing it was not going to parse
+    // as added anyway. "Rules moved, nothing to do" is not news.
+    if notes == 0 {
+        return;
+    }
+    // Dropped, not unwrapped: see the note above on why a stderr that will not take this line is not a scan
+    // failure.
+    let _ = writeln!(
+        out,
+        "note-processor: re-parsed {notes} unchanged path(s) for parse rules v{PARSE_VERSION} (database held {})",
+        stored.map_or_else(|| "nothing".to_string(), |version| format!("v{version}")),
+    );
+}
+
+/// Say out loud that a refresh could not label the corpus, so the next scan will try again.
+///
+/// stderr for the same reason as [`report_refresh`]: stdout stays machine-readable JSON. `missed` counts
+/// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory or
+/// a refused name — and the write result is dropped for the reason spelled out on [`report_refresh`].
+fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
+    if missed == 0 {
+        return;
+    }
+    // Dropped for the same reason as [`report_refresh`]'s write.
+    let _ = writeln!(
+        out,
+        "note-processor: parse rules v{PARSE_VERSION} not recorded — {missed} note(s) were not re-parsed this scan; the next scan will retry"
+    );
 }
 
 /// Write the rendered catalog and delete the shards this scan no longer produces.
@@ -872,7 +1325,7 @@ fn set_index_list(db: &Db, rendered: &[(String, String)]) -> Result<(), DbError>
 ///    never written while superseded shards of another generation survived beside them.
 /// 3. Superseded names, only once the entry point that no longer mentions them is live.
 ///
-/// The names removed in step 3 come from [`superseded_names`] — the directory and `meta` together — rather
+/// The paths removed in step 3 come from [`superseded_names`] — the directory and `meta` together — rather
 /// than from `meta` alone. A name already gone from disk is the state this call wanted, which is what
 /// makes [`set_index_list`] safe to commit ahead of these writes.
 ///
@@ -889,15 +1342,17 @@ fn write_index_files(
     // a root that cannot be listed fails the scan before it has touched anything.
     let superseded = superseded_names(root, rendered, previous)?;
 
-    for (name, contents) in rendered.iter().filter(|(name, _)| name != CATALOG_ENTRY) {
+    let entry_point = index_names::ENTRY;
+    for (name, contents) in rendered.iter().filter(|(name, _)| *name != entry_point) {
         publish(root, name, contents)?;
     }
-    for (name, contents) in rendered.iter().filter(|(name, _)| name == CATALOG_ENTRY) {
+    for (name, contents) in rendered.iter().filter(|(name, _)| *name == entry_point) {
         publish(root, name, contents)?;
     }
 
-    for name in superseded.delete {
-        let path = root.join(&name);
+    // Every path here is the one the listing produced, never `root.join` of a display spelling: two root
+    // entries can share one lossy spelling and only one of them is the file the verdict was about.
+    for path in superseded.delete {
         match fs::remove_file(&path) {
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(ScanError::Io { path, source }),
@@ -908,7 +1363,19 @@ fn write_index_files(
 }
 
 /// The generated names this workspace holds that this scan does not publish: what `meta` lists and what
-/// is actually sitting in the root, unioned.
+/// is actually sitting in the root, unioned and judged **one directory entry at a time**.
+///
+/// Each entry is keyed by its file-name bytes ([`os_bytes`]), not by its display text. Two byte-distinct
+/// entries whose names UTF-8 cannot hold — `INDEX-\xff.md` beside `INDEX-\xef\xbf\xbd.md` — lose to the same
+/// `U+FFFD` spelling, and a verdict taken on that spelling answers for whichever one readdir happened to
+/// reach first: it can unlink a header-less foreign file at its twin's bytes, or leave our own shard alive
+/// in silence. That is F13 §1 on the one code path here that deletes files (see
+/// `docs/design-f13-byte-paths.md`), so identity is compared as bytes end to end and the lossy text is kept
+/// only for what is genuinely a display question — [`index_names::is_generated_index`] and the report line.
+///
+/// Which leaves one asymmetry to know about: **verdicts are per entry, report lines are not.** `foreign`
+/// carries display text and [`ScanReport::skipped`] dedups it, so two byte-distinct foreign twins publish a
+/// single line. Read that count as "names needing attention", never as "files on disk".
 ///
 /// `meta` alone is not enough. It is committed inside the scan's transaction (see [`set_index_list`]), so
 /// a kill between that commit and the writes in [`write_index_files`] leaves it naming only the
@@ -916,14 +1383,22 @@ fn write_index_files(
 /// would ever delete it. The listing sees reality instead, and the union covers both directions — which
 /// is also what lets `meta` be committed ahead of the files.
 ///
-/// Both sources are filtered by [`walk::is_generated_index`], which only decides what is *worth asking
-/// about*. What decides what is ours to remove is the file's own fingerprint: a candidate is deleted only
-/// when it is a regular file opening with exactly [`catalog::HEADER`] (see [`np_published`]). A name that
-/// merely looks generated belongs to somebody else — a hand-written `INDEX-old.md` in the root is never
-/// indexed, because [`walk`] excludes these names, so deleting it would destroy a note no scan ever wrote
-/// (spec §7). Such a candidate, and a directory wearing the name, are returned for the report instead:
-/// the user learns about the collision, and a `remove_file` that could only answer `IsADirectory` never
-/// breaks every later scan of the workspace.
+/// Both sources are filtered by [`index_names::is_generated_index`], which only decides what is *worth
+/// asking about*. What decides what is ours to remove is the file's own fingerprint: a candidate is deleted only
+/// when it is a regular file opening with [`catalog::HEADER`] byte for byte, in either its LF or its CRLF
+/// spelling (see [`np_published`]). A name that merely looks generated belongs to somebody else — a
+/// hand-written `INDEX-old.md` in the root is never indexed, because [`walk`] excludes these names, so
+/// deleting it would destroy a note no scan ever wrote (spec §7). Such a candidate, and a directory
+/// wearing the name, are returned for the report instead: the user learns about the collision, and a
+/// `remove_file` that could only answer `IsADirectory` never breaks every later scan of the workspace.
+///
+/// The fingerprint is read as the *whole* identity signal, and that has one accepted consequence: a file
+/// carrying those two header lines under a generated name **is** deleted even when this program never
+/// published it and a person wrote the prose. Authorship is not recoverable from anything else on disk —
+/// separating an edited shard from a hand-written note would mean rendering the corpus and comparing
+/// bytes, the guess the fingerprint exists to avoid — so the header decides, not who typed the body.
+/// `a_hand_written_file_carrying_our_header_under_a_generated_name_is_deleted` pins that as intended
+/// behaviour, and `docs/backlog-m2-followups.md` records it as an accepted residual.
 ///
 /// A `meta` name no longer on disk appears in neither list. Its absence is already the state this call
 /// wanted — which is exactly how the delete loop in [`write_index_files`] reads an
@@ -937,47 +1412,68 @@ fn superseded_names(
         path: root.to_path_buf(),
         source,
     })?;
-    // Every generated-looking name in the root, tagged with whether it is ours. The verdict is taken while
+    // Every generated-looking entry in the root, tagged with whether it is ours. The verdict is taken while
     // the listing runs, because `entry.file_type` is the cheapest answer to "file or directory" and a
     // second `stat` would race with whatever renamed the entry between the two calls.
-    let mut present: Vec<(String, bool)> = Vec::new();
+    let mut present: Vec<Listed> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| ScanError::Io {
             path: root.to_path_buf(),
             source,
         })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !walk::is_generated_index(&name) {
+        let name = entry.file_name();
+        let display = name.to_string_lossy().into_owned();
+        if !index_names::is_generated_index(&display) {
             continue;
         }
         // The file type is asked before the contents: a directory has no header to read, and letting
         // `File::open` answer for it would pretend a directory could be this program's output.
-        let ours =
-            entry.file_type().is_ok_and(|kind| kind.is_file()) && np_published(&entry.path());
-        present.push((name, ours));
+        let path = entry.path();
+        let ours = entry.file_type().is_ok_and(|kind| kind.is_file()) && np_published(&path);
+        present.push(Listed {
+            name_bytes: os_bytes(&name),
+            path,
+            display,
+            ours,
+        });
     }
 
-    // The union the crash window needs: what `meta` names and what the root holds. A name in either list
-    // is judged by what is actually on disk, never by which list produced it.
-    let mut names: Vec<String> = present.iter().map(|(name, _)| name.clone()).collect();
-    names.extend(
+    // The union the crash window needs: what `meta` names and what the root holds. A key in either list
+    // is judged by what is actually on disk, never by which list produced it. One sort and dedup on the
+    // byte keys is also what keeps the deletion set free of duplicates: every entry below is one `root.join`
+    // away from its name, so distinct name bytes mean distinct paths.
+    let mut keys: Vec<Vec<u8>> = present
+        .iter()
+        .map(|listed| listed.name_bytes.clone())
+        .collect();
+    keys.extend(
         previous
             .iter()
-            .filter(|name| walk::is_generated_index(name))
-            .cloned(),
+            .filter(|name| index_names::is_generated_index(name))
+            .map(|name| os_bytes(OsStr::new(name))),
     );
-    names.sort();
-    names.dedup();
+    keys.sort();
+    keys.dedup();
+
+    // What this scan publishes, spelled the same way. `publish` writes a name's bytes as the file name, so
+    // a key equal to one of these *is* the file just written; an entry that merely displays like a published
+    // name is a different file and stays a candidate under its own fingerprint.
+    let published: Vec<Vec<u8>> = rendered
+        .iter()
+        .map(|(name, _)| os_bytes(OsStr::new(name)))
+        .collect();
 
     let mut superseded = Superseded::default();
-    for name in names {
-        if rendered.iter().any(|(published, _)| published == &name) {
+    for key in keys {
+        if published.contains(&key) {
             continue;
         }
-        match present.iter().find(|(found, _)| *found == name) {
-            Some((_, true)) => superseded.delete.push(name),
-            // On disk, but not ours: a foreign note or a directory wearing one of our names.
-            Some((_, false)) => superseded.foreign.push(name),
+        match present.iter().find(|listed| listed.name_bytes == key) {
+            // Ours, unlinked at the path this entry actually has.
+            Some(listed) if listed.ours => superseded.delete.push(listed.path.clone()),
+            // On disk, but not ours: a foreign note or a directory wearing one of our names. Reported as
+            // display text because a report line is a display question (F13 §3).
+            Some(listed) => superseded.foreign.push(listed.display.clone()),
             // Named by `meta` and already gone — the state this call wanted, which is how the delete loop
             // in [`write_index_files`] reads an [`io::ErrorKind::NotFound`]. Reporting it would name a
             // collision that is nothing but a shard this program never got round to writing.
@@ -987,32 +1483,75 @@ fn superseded_names(
     Ok(superseded)
 }
 
+/// One generated-looking root entry as the listing saw it: enough to judge it, enough to act on it.
+struct Listed {
+    /// Identity: the file name's OS bytes, which keep two entries sharing a lossy spelling apart. Windows
+    /// has no byte spelling, so its key is the lossy text and twins stay collapsed there — F13 §5's
+    /// residual, not a new one.
+    name_bytes: Vec<u8>,
+    /// What gets unlinked, straight from `entry.path()` — the bytes this entry really has on disk.
+    path: PathBuf,
+    /// The lossy display spelling: what [`index_names::is_generated_index`] reads and what the report names.
+    display: String,
+    /// Whether it is a regular file opening with [`catalog::HEADER`]: ours to remove.
+    ours: bool,
+}
+
 /// The generated names one scan found in its root that it does not publish, split by who owns them.
 #[derive(Default)]
 struct Superseded {
-    /// Files this program published in an earlier generation: safe to unlink.
-    delete: Vec<String>,
-    /// Entries wearing a generated name that this program did not publish: left on disk and reported.
+    /// Files this program published in an earlier generation: safe to unlink. Real paths from the listing,
+    /// because a display spelling can name a different entry than the one the verdict judged.
+    delete: Vec<PathBuf>,
+    /// Entries wearing a generated name that this program did not publish: left on disk and reported, in
+    /// the display text a report line is written in.
     foreign: Vec<String>,
 }
 
-/// Whether `path` opens with exactly the bytes [`catalog::render`] puts at the top of every file it
-/// publishes — two header lines, byte for byte. That is how a scan tells its own output from a note that
-/// happens to be called `INDEX-something.md`.
+/// Whether `path` opens with the bytes [`catalog::render`] puts at the top of every file it publishes —
+/// two header lines, byte for byte, in either the LF or the CRLF spelling. That is how a scan tells its
+/// own output from a note that happens to be called `INDEX-something.md`.
 ///
 /// Only those bytes are read, so a candidate's size never decides what a scan costs, and every failure —
-/// unreadable, shorter than the header, an I/O error, a CRLF file somebody else rewrote — answers "not
-/// ours". The bias is deliberate: guessing wrong keeps a stale shard on disk rather than deleting a note.
+/// unreadable, shorter than the header, an I/O error — answers "not ours". The bias is deliberate:
+/// guessing wrong keeps a stale shard on disk rather than deleting a note.
+///
+/// CRLF is accepted because identity lives in the two header lines and nowhere else: a checkout, editor
+/// or sync tool that rewrote the line endings of a shard np published leaves the catalog intact, and
+/// refusing it would strand that shard in `skipped` forever. The same rule is why nothing after the
+/// header is examined — prose cannot change who wrote the file — and why the match stays line-exact: any
+/// other byte difference in those two lines, including a half-converted header, is not ours.
 fn np_published(path: &Path) -> bool {
     let mut source = match fs::File::open(path) {
         Ok(source) => source,
         Err(_) => return false,
     };
-    let mut head = [0u8; catalog::HEADER.len()];
-    match source.read_exact(&mut head) {
-        Ok(()) => head[..] == *catalog::HEADER.as_bytes(),
-        Err(_) => false,
+    // The longer of the two accepted spellings sets the window. A file that ends earlier simply yields
+    // fewer bytes, which is how a published shard whose header is its whole content still matches.
+    let mut head = [0u8; catalog::HEADER_CRLF.len()];
+    let read = match read_prefix(&mut source, &mut head) {
+        Ok(read) => read,
+        Err(_) => return false,
+    };
+    let head = &head[..read];
+    head.starts_with(catalog::HEADER.as_bytes())
+        || head.starts_with(catalog::HEADER_CRLF.as_bytes())
+}
+
+/// Fill `buf` from `source`, stopping at the end of the file. Returns how many bytes `buf` holds; an I/O
+/// error is reported so the caller can answer its own question with "not ours".
+fn read_prefix(source: &mut fs::File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut read = 0;
+    while read < buf.len() {
+        match source.read(&mut buf[read..]) {
+            // End of file: fewer bytes than asked for, which is an answer rather than a failure.
+            Ok(0) => break,
+            Ok(got) => read += got,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
     }
+    Ok(read)
 }
 
 /// Move one rendered file into place through a temporary name, so a reader never sees it half-written
@@ -1033,7 +1572,7 @@ fn publish(root: &Path, name: &str, contents: &str) -> Result<(), ScanError> {
 
 /// Remove the `INDEX*.tmp` files a rename that died left behind.
 ///
-/// A temporary name is not one [`walk::is_generated_index`] recognises, so an orphaned corpse left by a
+/// A temporary name is not one [`index_names::is_generated_index`] recognises, so an orphaned corpse left by a
 /// killed `rename` would be walked, hashed and catalogued-as-nothing as an ordinary attachment, and
 /// nothing would ever clean it up. That is why [`scan`] calls this before the walk rather than where the
 /// temporaries are made: cleaned up on the way out, the corpse would still be indexed once by its own
@@ -1047,7 +1586,8 @@ fn publish(root: &Path, name: &str, contents: &str) -> Result<(), ScanError> {
 /// when the walk looks — and the next scan tries again.
 ///
 /// One limitation to know before someone widens this: cleanup is **root-only**, while
-/// [`walk::is_generated_index`] excludes generated names only at depth 1 — so a `notes/INDEX.md.tmp`
+/// [`index_names::is_generated_index`] is applied by [`crate::walk`] to root-level names only (depth 1) —
+/// so a `notes/INDEX.md.tmp`
 /// would be indexed as an attachment forever. It is unreachable today because [`publish`] joins the root
 /// alone and no other code makes these names.
 fn clear_temp_corpses(root: &Path) -> Result<Vec<String>, ScanError> {
@@ -1078,7 +1618,7 @@ fn remove_corpses(
             continue;
         };
         let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        if !walk::is_generated_index(stem) || is_dir {
+        if !index_names::is_generated_index(stem) || is_dir {
             continue;
         }
         if let Err(source) = remove(&entry.path()) {
@@ -1135,10 +1675,227 @@ fn now_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{remove_corpses, remove_file};
+    use super::{
+        folded_row, is_unknown_path, known_rows, np_published, refresh_covered, remove_corpses,
+        remove_file, report_refresh, report_refresh_gap, Written, PARSE_VERSION,
+    };
+    use crate::catalog::{HEADER, HEADER_CRLF};
+    use crate::db::{self, upsert_file, Db};
+    use crate::hash::Snapshot;
+    use crate::path_keys::{self, RelPath};
     use std::fs;
     use std::io::{self, ErrorKind};
     use std::path::Path;
+
+    /// A snapshot as [`crate::walk`] + `sha256_file` would produce it for a name that is valid UTF-8: both
+    /// byte keys derived from the spelling's own bytes.
+    fn snap(rel: &str) -> Snapshot {
+        Snapshot {
+            rel_bytes: path_keys::rel_bytes_of_display(rel),
+            case_bytes: path_keys::case_fold(rel.as_bytes()),
+            rel: rel.to_string(),
+            case_key: path_keys::display_fold(rel),
+            hash: "h".to_string(),
+            size: 4,
+            mtime: 10,
+        }
+    }
+
+    /// §3's accepted regression, as evidence rather than a paragraph: the ASCII byte fold cannot bridge a
+    /// Unicode-only case pair, so [`folded_row`] misses a rename that changes only a non-ASCII letter's case.
+    ///
+    /// Before round 2 this lookup ran on the Unicode display `case_key`, where `Ämli.md` and `ämli.md` are one
+    /// fold and the rename was followed onto the existing row. Matched on `case_bytes` it finds nothing, so the
+    /// caller upserts a second row — and [`crate::change::key_of`] is `case_bytes` under `case_sensitive =
+    /// false`, which means **on Windows this pair is the entire rename-following story**, not one corner of it
+    /// (`docs/backlog-m2-followups.md` F18). Two seams keep this out of the integration tests: `folded_row` is
+    /// private, and `scan::run` hardcodes case sensitivity as `!cfg!(windows)`; the classify half of the same
+    /// pair — the note detaching into `Added` + `Removed` — is pinned in `crates/np-core/tests/change.rs`.
+    #[test]
+    fn the_ascii_fold_cannot_follow_a_unicode_only_case_rename() {
+        let db = Db::in_memory().expect("in-memory database");
+        upsert_file(&db, &snap("Ämli.md"), Path::new("/ws/Ämli.md"), 1)
+            .expect("test setup: store the row under its capital-Ä spelling");
+
+        let renamed = snap("ämli.md");
+        // The premises, spelled out: one Unicode fold, two ASCII folds. It is the first of these that used to
+        // decide this lookup, and the second that decides it now.
+        assert_eq!(renamed.case_key, path_keys::display_fold("Ämli.md"));
+        assert_ne!(
+            renamed.case_bytes,
+            path_keys::case_fold("Ämli.md".as_bytes())
+        );
+
+        assert_eq!(
+            folded_row(&db, &renamed.case_bytes, &renamed.rel_bytes).expect("the lookup runs"),
+            None,
+            "`Ämli.md` → `ämli.md` is a rename this lookup no longer follows"
+        );
+
+        // Control, so the answer above is about the pair rather than about the fixture: an ASCII-only rename
+        // shares one `case_bytes` and is still followed onto the row it came from.
+        upsert_file(&db, &snap("Aemli.md"), Path::new("/ws/Aemli.md"), 1)
+            .expect("test setup: store the ASCII twin pair's row");
+        let ascii = snap("aemli.md");
+        assert_eq!(
+            folded_row(&db, &ascii.case_bytes, &ascii.rel_bytes).expect("the lookup runs"),
+            Some(RelPath::new(b"Aemli.md".to_vec(), "Aemli.md".to_string())),
+            "an ASCII case rename is still followed"
+        );
+    }
+
+    // F18's protective half, on the platform that cannot refuse a real name: the two lists `crate::walk`
+    // reports are built by hand here, exactly as that walk builds them, because no Linux filesystem can put
+    // an unpaired surrogate in a file name. What they must never do is over-reach — every one of these tests
+    // names the paths that stay visible alongside the refused one.
+    //
+    // The refusal has two arms and they are not interchangeable: a refused **file** suppresses its own `rel`
+    // alone, and a refused **directory** suppresses its whole subtree by prefix. Getting either wrong is the
+    // silent overwrite F18 exists to stop (too narrow) or a catalog that stops noticing real deletions
+    // (too wide).
+
+    /// The exact arm: one refused file, and four neighbours that must keep being judged.
+    #[test]
+    fn a_refused_name_suppresses_only_its_own_rel() {
+        let refused = ["notes/caf\u{fffd}.md".to_string()];
+
+        assert!(
+            is_unknown_path("notes/caf\u{fffd}.md", &[], &refused),
+            "the refused path itself is unknown to this scan"
+        );
+
+        // Each of these shares something with the refused name, which is exactly why equality is the rule:
+        // widening it to a prefix would hide a live note from `classify`, from move resolution, and from the
+        // stale-marking that keeps a removed file out of the catalog.
+        for rel in [
+            "notes/caf\u{fffd}.md.bak", // same spelling as a prefix, one more extension
+            "notes/other.md",           // its sibling in the same directory
+            "notes/sub/caf\u{fffd}.md", // the same file name one level down elsewhere
+            "caf\u{fffd}.md",           // the same spelling at the root
+        ] {
+            assert!(
+                !is_unknown_path(rel, &[], &refused),
+                "{rel} is another path"
+            );
+        }
+    }
+
+    /// The prefix arm, fed the way [`crate::walk`] now feeds it: a refused **directory** goes into the
+    /// unreadable list, because its name is the first component of every path below it and none of those can
+    /// be keyed either. Suppressed by exact equality instead, every row in that subtree would be reported
+    /// `Removed` by the next scan.
+    #[test]
+    fn a_refused_directory_suppresses_every_row_below_it() {
+        let dirs = ["notes/caf\u{fffd}".to_string()];
+
+        assert!(
+            is_unknown_path("notes/caf\u{fffd}/a.md", &dirs, &[]),
+            "a child of the refused directory"
+        );
+        assert!(
+            is_unknown_path("notes/caf\u{fffd}/deep/deeper/b.md", &dirs, &[]),
+            "at any depth: the walk never entered at all"
+        );
+        // Only what is *below* it. A directory whose name merely starts with the same bytes is a different
+        // subtree, and the refused spelling itself is not suppressed — no file row can be keyed by a
+        // directory's path, so there is nothing here that needs suppressing.
+        assert!(
+            !is_unknown_path("notes/caf\u{fffd}x/a.md", &dirs, &[]),
+            "a sibling that shares the prefix bytes"
+        );
+        assert!(!is_unknown_path("notes/other/a.md", &dirs, &[]));
+        assert!(!is_unknown_path("notes/caf\u{fffd}", &dirs, &[]));
+    }
+
+    /// A registry row for `rel` with one note behind it: the shape [`known_rows`] counts as **hidden**, and
+    /// the only shape that can hold [`PARSE_VERSION`] back.
+    fn plant_note(db: &Db, rel: &str) {
+        upsert_file(db, &snap(rel), &Path::new("/ws").join(rel), 1)
+            .expect("test setup: registry row");
+        db::insert_note(
+            db,
+            &RelPath::from_display(rel),
+            "t",
+            "filename",
+            "utf-8",
+            3,
+            "body",
+        )
+        .expect("test setup: note row");
+    }
+
+    /// The charge behind the suppression: a hidden note is one the refresh never re-parsed, so recording the
+    /// new rules over it would label rows an older build wrote as current (F15). `known_rows` drops the row so
+    /// `classify` cannot call it `Removed` **and** counts it here — one comparison, both halves of the promise.
+    #[test]
+    fn a_note_behind_a_refused_path_is_charged_to_the_refresh_that_missed_it() {
+        let db = Db::in_memory().expect("in-memory database");
+        // The refused subtree: two notes at different depths, plus an attachment that owes no parse.
+        plant_note(&db, "notes/caf\u{fffd}/a.md");
+        plant_note(&db, "notes/caf\u{fffd}/deep/b.md");
+        upsert_file(
+            &db,
+            &snap("notes/caf\u{fffd}/image.png"),
+            Path::new("/ws/notes/caf\u{fffd}/image.png"),
+            1,
+        )
+        .expect("test setup: an attachment row with no note behind it");
+        // Two notes this scan does see, one of them in the same parent directory as the refused one.
+        plant_note(&db, "notes/peer.md");
+        plant_note(&db, "elsewhere/c.md");
+
+        // A refused directory, recorded as [`crate::walk`] records it.
+        let dirs = ["notes/caf\u{fffd}".to_string()];
+        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
+
+        assert_eq!(
+            known.iter().map(|row| row.rel.as_str()).collect::<Vec<_>>(),
+            ["elsewhere/c.md", "notes/peer.md"],
+            "the refused subtree reaches neither `Removed` nor a move, and its neighbours still do"
+        );
+        assert_eq!(
+            hidden, 2,
+            "one charge per hidden note — the attachment behind the same refusal owes nothing"
+        );
+
+        // The other arm, fed a refused *file*: exactly its own row disappears and is charged.
+        let (known, hidden) =
+            known_rows(&db, &[], &["notes/peer.md".to_string()]).expect("the rows read back again");
+        assert_eq!(hidden, 1, "one refused note, one charge");
+        assert!(
+            !known.iter().any(|row| row.rel == "notes/peer.md"),
+            "the refused path is out of the comparison"
+        );
+        assert_eq!(
+            known.iter().map(|row| row.rel.as_str()).collect::<Vec<_>>(),
+            [
+                "elsewhere/c.md",
+                "notes/caf\u{fffd}/a.md",
+                "notes/caf\u{fffd}/deep/b.md",
+                "notes/caf\u{fffd}/image.png",
+            ],
+            "read that directory as reachable and only the refused file itself disappears"
+        );
+
+        // And the charge is what withholds the version. Both halves of `refresh_covered` are pinned because
+        // the notice the user sees prints their sum (`written.uncovered + hidden_by_unknown`).
+        assert!(
+            !refresh_covered(&Written::default(), hidden),
+            "a refresh that never reached a note may not label its rules current"
+        );
+        assert!(
+            refresh_covered(&Written::default(), 0),
+            "with nothing hidden, the version is recorded"
+        );
+        let missed_write = Written {
+            uncovered: 1,
+            ..Written::default()
+        };
+        assert!(
+            !refresh_covered(&missed_write, 0),
+            "the write-pass half still holds on its own"
+        );
+    }
 
     /// A root holding one `INDEX.md.tmp` corpse and one file that merely looks similar.
     fn root_with(names: &[&str]) -> tempfile::TempDir {
@@ -1147,6 +1904,107 @@ mod tests {
             fs::write(tmp.path().join(name), "stale\n").expect("test setup: plant a file");
         }
         tmp
+    }
+
+    /// The deletion fingerprint accepts exactly two spellings of the header and nothing else.
+    #[test]
+    fn the_published_fingerprint_is_ours_in_either_line_ending_only() {
+        // Drift guard first: the accepted CRLF spelling is `HEADER` with Windows line endings and nothing
+        // more, so rewording the header cannot leave one spelling silently unrecognised.
+        assert_eq!(HEADER.replace('\n', "\r\n"), HEADER_CRLF);
+
+        let root = tempfile::TempDir::new().expect("test setup: tempdir");
+        let cases: [(&str, String, bool); 8] = [
+            ("lf.md", format!("{HEADER}one entry\n"), true),
+            // A published file with no entries is the header and nothing else.
+            ("lf-bare.md", HEADER.to_string(), true),
+            ("crlf.md", format!("{HEADER_CRLF}one entry\r\n"), true),
+            ("crlf-bare.md", HEADER_CRLF.to_string(), true),
+            // Neither accepted spelling, whatever a reader might guess from the bytes: a header
+            // converted on one line only, a header with other words in it, too little of a header to
+            // read, and an ordinary note.
+            (
+                "mixed.md",
+                "# INDEX\r\n_generated by note-processor; do not edit_\nbody\n".to_string(),
+                false,
+            ),
+            (
+                "reworded.md",
+                "# INDEX\r\n_generated by somebody else; do not edit_\r\nbody\r\n".to_string(),
+                false,
+            ),
+            ("short.md", "# IND".to_string(), false),
+            ("note.md", "# Meine Notizen\nbody\n".to_string(), false),
+        ];
+
+        for (name, body, ours) in &cases {
+            let path = root.path().join(name);
+            fs::write(&path, body).expect("test setup: write a candidate");
+            assert_eq!(
+                np_published(&path),
+                *ours,
+                "{name} opens {body:?}, which is {}ours",
+                if *ours { "" } else { "not " }
+            );
+        }
+
+        // A candidate that cannot be opened at all answers "not ours" rather than failing the scan.
+        assert!(
+            !np_published(&root.path().join("absent.md")),
+            "an unreadable candidate is not a deletion licence"
+        );
+    }
+
+    /// The refresh receipt: one line naming the count and both versions, silence when there is nothing to
+    /// report. Pinned through a sink because stderr cannot be redirected in-process.
+    #[test]
+    fn the_refresh_receipt_names_the_count_and_both_versions() {
+        let mut out = Vec::new();
+        report_refresh(&mut out, Some(3), 12);
+        assert_eq!(
+            String::from_utf8(out).expect("the receipt is utf-8"),
+            format!(
+                "note-processor: re-parsed 12 unchanged path(s) for parse rules v{PARSE_VERSION} \
+                 (database held v3)\n"
+            ),
+        );
+
+        // A database written before the mechanism existed says so instead of claiming a version zero.
+        let mut out = Vec::new();
+        report_refresh(&mut out, None, 1);
+        assert!(
+            String::from_utf8_lossy(&out).contains("database held nothing"),
+            "{out:?}"
+        );
+
+        // Every first scan of an empty-or-all-added workspace passes through here with nothing to say.
+        let mut out = Vec::new();
+        report_refresh(&mut out, None, 0);
+        assert!(
+            out.is_empty(),
+            "a refresh that re-parsed nothing is not news: {out:?}"
+        );
+    }
+
+    /// The incomplete-refresh notice: one line naming what was missed, silence when nothing was.
+    #[test]
+    fn an_incomplete_refresh_says_the_version_was_not_recorded() {
+        let mut out = Vec::new();
+        report_refresh_gap(&mut out, 3);
+        assert_eq!(
+            String::from_utf8(out).expect("the notice is utf-8"),
+            format!(
+                "note-processor: parse rules v{PARSE_VERSION} not recorded — 3 note(s) were not re-parsed this scan; the next scan will retry\n"
+            ),
+        );
+
+        // A covering refresh has nothing to apologise for.
+        let mut out = Vec::new();
+        report_refresh_gap(&mut out, 0);
+        assert!(
+            out.is_empty(),
+            "a covered refresh is not a problem: {out:?}"
+        );
     }
 
     #[test]

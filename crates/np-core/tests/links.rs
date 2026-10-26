@@ -1,9 +1,9 @@
 //! Link extraction, resolution, and the `links` rows Task 9 counts and Task 10 reports.
 //!
-//! Extraction is asserted on inline text and on the committed fixtures; resolution on a corpus
-//! map spelled exactly the way Task 10 builds it (`case_key` → `rel`); storing on SQL against an
-//! in-memory database, for the same reason `tests/db.rs` reads rows back — what later tasks rely
-//! on is the state of the rows, not the return value of a helper.
+//! Extraction is asserted on inline text and on the committed fixtures; resolution on a corpus map
+//! spelled exactly the way a scan builds it (`case_key` → every rel carrying that fold); storing on SQL
+//! against an in-memory database, for the same reason `tests/db.rs` reads rows back — what later tasks
+//! rely on is the state of the rows, not the return value of a helper.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,6 +14,7 @@ use np_core::db::{note_counts, upsert_file, Db, DbError};
 use np_core::hash::Snapshot;
 use np_core::links::{extract_links, resolve, store_links, LinkKind, RawLink, ResolvedLink};
 use np_core::parse::parse_markdown;
+use np_core::path_keys::RelPath;
 
 /// Contents of one fixture note, byte for byte as stored. `german-note.md` is kept with `\r\n`
 /// and the others with `\n`, which is what makes [`line_numbers_stable_across_endings`] a check
@@ -56,11 +57,20 @@ fn found(links: &[RawLink]) -> Vec<(&str, LinkKind, usize)> {
         .collect()
 }
 
-/// A corpus map in the shape Task 10 builds it: `case_key` → `rel`.
-fn corpus(rels: &[&str]) -> BTreeMap<String, String> {
-    rels.iter()
-        .map(|rel| (rel.to_lowercase(), (*rel).to_string()))
-        .collect()
+/// A corpus map in the shape a scan builds it: `case_key` → every live row carrying that fold. Two rels
+/// that fold onto one key are therefore two candidates rather than one overwriting the other (F13 §3). Each
+/// candidate carries its byte key beside the display text, because that is what a placed target writes.
+fn corpus(rels: &[&str]) -> BTreeMap<String, Vec<RelPath>> {
+    let mut map: BTreeMap<String, Vec<RelPath>> = BTreeMap::new();
+    for rel in rels {
+        map.entry(rel.to_lowercase()).or_default().push(path(rel));
+    }
+    map
+}
+
+/// One path in both spellings, as a walk would record them for an ASCII or valid-UTF-8 name.
+fn path(rel: &str) -> RelPath {
+    RelPath::from_display(rel)
 }
 
 /// One `[[target]]` as the resolver receives it.
@@ -88,9 +98,9 @@ fn placed(links: &[ResolvedLink]) -> Vec<(&str, &str, &str)> {
         .iter()
         .map(|link| {
             (
-                link.src_rel.as_str(),
+                link.src.rel.as_str(),
                 link.target.as_str(),
-                link.dst_rel.as_deref().unwrap_or("-"),
+                link.dst.as_ref().map(|dst| dst.rel.as_str()).unwrap_or("-"),
             )
         })
         .collect()
@@ -99,10 +109,12 @@ fn placed(links: &[ResolvedLink]) -> Vec<(&str, &str, &str)> {
 /// A registry row plus the note row Task 10 would write for it, as the note's id.
 fn add_note(db: &Db, rel: &str) -> i64 {
     add_file(db, rel);
+    // The byte key is written here as well, because this fixture is a writer: migration 4 made the identity
+    // a BLOB column, and a note whose key is missing has no identity for any reader to find.
     db.0.execute(
-        "INSERT INTO notes (rel, title, title_source, encoding, word_count, body)
-         VALUES (?1, ?2, 'filename', 'utf-8', 3, 'body')",
-        rusqlite::params![rel, rel],
+        "INSERT INTO notes (rel_bytes, rel, title, title_source, encoding, word_count, body)
+         VALUES (?1, ?2, ?2, 'filename', 'utf-8', 3, 'body')",
+        rusqlite::params![rel.as_bytes(), rel],
     )
     .expect("test setup: note row");
     db.0.last_insert_rowid()
@@ -114,6 +126,8 @@ fn add_file(db: &Db, rel: &str) {
     upsert_file(
         db,
         &Snapshot {
+            rel_bytes: rel.as_bytes().to_vec(),
+            case_bytes: np_core::path_keys::case_fold(rel.as_bytes()),
             rel: rel.to_string(),
             case_key: rel.to_lowercase(),
             hash: "h".to_string(),
@@ -220,7 +234,7 @@ fn resolution_order() {
         "assets/gamma.png",
     ]);
     let links = vec![(
-        "index.md".to_string(),
+        path("index.md"),
         vec![
             md("notes/a.md", 1), // exact rel, despite the ambiguous basename
             md("NOTES/A.MD", 2), // case-insensitive rel
@@ -254,7 +268,7 @@ fn resolution_order() {
         (
             resolved[0].kind,
             resolved[0].line,
-            resolved[0].src_rel.as_str()
+            resolved[0].src.rel.as_str()
         ),
         (LinkKind::Md, 1, "index.md")
     );
@@ -265,10 +279,7 @@ fn ambiguous_basename_is_unresolved() {
     let corpus = corpus(&["x/a.md", "y/a.md"]);
     let resolved = resolve(
         &corpus,
-        &[(
-            "index.md".to_string(),
-            extract_links("link to [[a]] here\n"),
-        )],
+        &[(path("index.md"), extract_links("link to [[a]] here\n"))],
     );
     assert_eq!(
         placed(&resolved),
@@ -540,11 +551,11 @@ fn unknown_origin_is_refused() {
     add_note(&db, "index.md");
     add_note(&db, "notes/a.md");
     let links = [ResolvedLink {
-        src_rel: "index.md".to_string(),
+        src: path("index.md"),
         target: "notes/a.md".to_string(),
         kind: LinkKind::Md,
         line: 1,
-        dst_rel: Some("notes/a.md".to_string()),
+        dst: Some(path("notes/a.md")),
     }];
 
     let err = store_links(&db, &links, "notes")
@@ -575,33 +586,33 @@ fn store_links_maps_rels_to_note_ids() {
 
     let links = [
         ResolvedLink {
-            src_rel: "index.md".to_string(),
+            src: path("index.md"),
             target: "notes/a.md".to_string(),
             kind: LinkKind::Md,
             line: 3,
-            dst_rel: Some("notes/a.md".to_string()),
+            dst: Some(path("notes/a.md")),
         },
         ResolvedLink {
-            src_rel: "index.md".to_string(),
+            src: path("index.md"),
             target: "Missing".to_string(),
             kind: LinkKind::Wiki,
             line: 4,
-            dst_rel: None,
+            dst: None,
         },
         ResolvedLink {
-            src_rel: "index.md".to_string(),
+            src: path("index.md"),
             target: "assets/i.png".to_string(),
             kind: LinkKind::Attachment,
             line: 5,
-            dst_rel: Some("assets/i.png".to_string()),
+            dst: Some(path("assets/i.png")),
         },
         ResolvedLink {
             // Sourced from a file with no note row: an orphan link row would be garbage.
-            src_rel: "assets/i.png".to_string(),
+            src: path("assets/i.png"),
             target: "Missing2".to_string(),
             kind: LinkKind::Wiki,
             line: 1,
-            dst_rel: None,
+            dst: None,
         },
     ];
     store_links(&db, &links, "prose").expect("store the links of one note");

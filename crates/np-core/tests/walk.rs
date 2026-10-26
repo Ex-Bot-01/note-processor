@@ -275,18 +275,30 @@ fn an_unreadable_directory_is_reported_not_silently_missing() {
         ("secret/deep/b.md", "b"),
     ]);
     let secret = tmp.path().join("secret");
+    // The mode the directory actually arrived with. `TempDir` creates it as `0o777 & !umask`, so a
+    // hardcoded 0o755 would *widen* permissions on a runner with a restrictive umask (0o077 gives
+    // 0o700); whatever was there is what the guard puts back.
+    let found_mode = fs::metadata(&secret)
+        .expect("test setup: read the directory mode")
+        .permissions()
+        .mode()
+        & 0o7777; // only the permission bits travel back; the file-type bits are not ours to set
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o0))
         .expect("test setup: chmod 0 the subdirectory");
+    // Declared before any assertion so the mode goes back on every path out of this test,
+    // panic included; `TempDir` cleanup cannot remove a tree holding a mode-0 directory.
+    let _readable_again = ReadableAgain {
+        dir: secret.clone(),
+        mode: found_mode,
+    };
     if fs::read_dir(&secret).is_ok() {
         // Running as root (common in containers) reads a mode-0 directory anyway.
         eprintln!("skipping: this machine can read a mode-0 directory");
-        restore_mode(&secret);
         return;
     }
 
     let walked = walk(tmp.path(), &WalkOptions::default())
         .expect("one unreadable directory must not fail the walk");
-    restore_mode(&secret);
 
     assert_eq!(rels_from(&walked.files), ["keep.md"]);
     assert_eq!(
@@ -294,14 +306,56 @@ fn an_unreadable_directory_is_reported_not_silently_missing() {
         ["secret"],
         "the unreadable directory is named by its rel-style path"
     );
+
+    // Restoration asserted rather than assumed: dropping the guard here runs it early, and what comes
+    // back has to be the mode this machine made — `0o700` under a `0o077` umask, where restoring a fixed
+    // `0o755` would have handed group and other read+execute on a directory nobody asked for. The mode of
+    // a sibling made by the same umask is the premise, so a hardcoded value cannot pass this quietly.
+    drop(_readable_again);
+    let restored = fs::metadata(&secret)
+        .expect("test: re-read the directory mode")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        restored, found_mode,
+        "the guard restores the mode it captured"
+    );
+    let plain = tmp.path().join("plain");
+    fs::create_dir(&plain).expect("test setup: a directory made by this umask");
+    assert_eq!(
+        restored,
+        fs::metadata(&plain)
+            .expect("test: read the sibling mode")
+            .permissions()
+            .mode()
+            & 0o7777,
+        "and that mode is this machine's own, not an assumed one"
+    );
+}
+
+/// Restores `dir` to the mode it carried when the guard was created.
+///
+/// A mode-0 directory makes `TempDir::drop` fail, and a leaked one stays unwritable on the
+/// machine forever, so the restoration may not depend on reaching the end of a test body.
+/// The mode travels in rather than being assumed: restoring a fixed 0o755 would grant read and
+/// execute to group and other on a runner whose umask made the directory narrower to begin with.
+#[cfg(unix)]
+struct ReadableAgain {
+    dir: PathBuf,
+    /// The permission bits `fs::metadata` reported before the test chmod'd the directory.
+    mode: u32,
 }
 
 #[cfg(unix)]
-fn restore_mode(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
+impl Drop for ReadableAgain {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
-        .expect("test teardown: make the directory removable again");
+        // Best effort: `Drop` must not panic, and a failure here only repeats the leak the
+        // guard exists to prevent.
+        let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(self.mode));
+    }
 }
 
 /// Sibling of `symlink_loop_does_not_hang`, which cannot see `follow_links`: walkdir's
@@ -345,4 +399,154 @@ fn extra_excludes_are_honoured_at_every_depth() {
 
     assert_eq!(rels_from(&walked.files), ["keep.md"]);
     assert!(walked.unreadable.is_empty(), "nothing was unreadable");
+}
+
+/// Nothing a normal tree can name is refused: [`Walked::unrepresentable`] stays empty, and every file on
+/// disk reaches [`Walked::files`].
+///
+/// The F18 refusal has to be inert for names the platform spells exactly, so this runs on both platforms CI
+/// builds — and on Unix it includes the raw-byte population F13 exists for (`caf\xe9.md`), because a
+/// mitigation that silently skipped a real Unix note would cost more than the Windows overwrite it prevents.
+/// The other direction — a name that *is* refused — needs a lone surrogate, which only Windows can put in a
+/// file name; that is [`an_unpaired_surrogate_name_is_refused`], and its absence from this machine's run is
+/// exactly why `path_keys::has_unpaired_surrogate`'s units are the coverage of the rule.
+#[test]
+fn nothing_a_normal_tree_can_name_is_refused() {
+    let tmp = tree(&[
+        ("notes/a.md", "a"),
+        ("caf\u{e9}.md", "cafe, spelled in UTF-8"),
+        ("UPPER.MD", "u"),
+    ]);
+    // The same name as raw bytes rather than as text: on Unix that is a *second*, distinct file, and the
+    // walk must key it exactly like every other one.
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(b"caf\xe9.md".to_vec());
+        fs::write(tmp.path().join(&raw), b"latin-1").expect("test setup: write raw-byte name");
+    }
+
+    let walked = walk(tmp.path(), &WalkOptions::default()).expect("walk must succeed");
+
+    assert!(
+        walked.unrepresentable.is_empty(),
+        "no ordinary name may be refused: {:?}",
+        walked.unrepresentable
+    );
+    // Three names from the tree, plus the raw-byte one only Unix can build.
+    let expected = if cfg!(unix) { 4 } else { 3 };
+    assert_eq!(
+        walked.files.len(),
+        expected,
+        "every file on disk is indexed: {:?}",
+        rels_from(&walked.files)
+    );
+}
+
+/// F18's refusal at the level of a real file — **written for a Windows machine to run, not for Linux CI.**
+///
+/// This cannot execute here: the module is compiled out on Linux, and no Linux syscall can hand `create()` an
+/// unpaired surrogate. So do not count this test as coverage of the rule — `path_keys`' predicate units are
+/// what CI runs and what F18's design doc names as the part that carries the weight. On a Windows box
+/// (`cargo test --test walk`) it is the end-to-end check: two live names differing only in an unpaired
+/// surrogate, which `to_string_lossy` spells identically, must both stay out of the catalog rather than one
+/// overwriting the other's row.
+///
+/// If even Windows refuses to *create* such a name, the test says so on stderr and returns without asserting:
+/// a silent pass here would be indistinguishable from the coverage this test cannot provide on Linux.
+#[cfg(windows)]
+#[test]
+fn an_unpaired_surrogate_name_is_refused() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    // The overwrite pair: `caf<U+D800>.md` and `caf<U+D801>.md` are two names, one lossy spelling.
+    let twin = |surrogate: u16| -> OsString {
+        OsString::from_wide(
+            &"caf"
+                .encode_utf16()
+                .chain([surrogate])
+                .chain(".md".encode_utf16())
+                .collect::<Vec<u16>>(),
+        )
+    };
+    let twins = [twin(0xD800), twin(0xD801)];
+    for (index, name) in twins.iter().enumerate() {
+        if let Err(err) = fs::write(tmp.path().join(name), format!("note {index}")) {
+            eprintln!(
+                "NOT COVERAGE: this Windows refused to create a name holding an unpaired surrogate \
+                 ({err}); run this test by hand and rely on the path_keys units meanwhile"
+            );
+            return;
+        }
+    }
+    // A *complete* pair is U+10000 — one ordinary character, and an ordinary name.
+    fs::write(tmp.path().join("\u{10000}.md"), "kept").expect("test setup: write valid-pair name");
+
+    let walked = walk(tmp.path(), &WalkOptions::default()).expect("walk must succeed");
+
+    for name in &twins {
+        assert!(
+            fs::metadata(tmp.path().join(name)).is_ok(),
+            "the refused file is on disk, so this is a refusal and not a missing entry"
+        );
+    }
+    assert_eq!(
+        rels_from(&walked.files),
+        ["\u{10000}.md"],
+        "neither twin is indexed; the valid pair is"
+    );
+    // One line for two files: the report names display spellings, and both twins share this one.
+    assert_eq!(walked.unrepresentable, ["caf\u{fffd}.md"]);
+}
+
+/// The directory shape of the same refusal, which is the half that used to survive: a directory named with an
+/// unpaired surrogate was **descended**, so its children keyed as `dir\u{fffd}/n.md` and two such directories —
+/// or one beside a directory literally named U+FFFD — shared `rel_bytes`, and the row lookup overwrote one note
+/// with the other. Manual-run rules as above: no CI can create the name, so this is the shape to run by hand on
+/// a Windows machine, and it says `NOT COVERAGE` rather than passing quietly if the OS declines to make one.
+#[cfg(windows)]
+#[test]
+fn an_unpaired_surrogate_directory_is_never_entered() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let dir_name = OsString::from_wide(
+        &"caf"
+            .encode_utf16()
+            .chain([0xD800u16])
+            .collect::<Vec<u16>>(),
+    );
+    let inside = tmp.path().join(&dir_name).join("n.md");
+    if fs::create_dir(tmp.path().join(&dir_name)).is_err() || fs::write(&inside, "note").is_err() {
+        eprintln!(
+            "NOT COVERAGE: this Windows refused to create a directory holding an unpaired surrogate; \
+             run this test by hand and rely on the `walk` unit seam meanwhile"
+        );
+        return;
+    }
+
+    let walked =
+        walk(tmp.path(), &WalkOptions::default()).expect("a refusal is not a walk failure");
+
+    assert!(
+        inside.is_file(),
+        "the file still exists below the refused directory: this is a refusal, not an absent tree"
+    );
+    assert!(
+        rels_from(&walked.files).is_empty(),
+        "nothing below a refused directory may be indexed: {:?}",
+        rels_from(&walked.files)
+    );
+    // Recorded once, as the directory's own display spelling, in the list the scan matches by **prefix** — so
+    // every row below it stays unknown rather than becoming a `Removed` this scan cannot support.
+    assert_eq!(walked.unreadable, ["caf\u{fffd}".to_string()]);
+    assert!(
+        walked.unrepresentable.is_empty(),
+        "a directory is a prefix, not one refused file: {:?}",
+        walked.unrepresentable
+    );
 }

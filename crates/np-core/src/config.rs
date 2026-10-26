@@ -10,6 +10,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::db::BUSY_TIMEOUT_MS;
+
 /// Name of the registry database inside the data dir.
 const REGISTRY_FILE: &str = "workspaces.sqlite";
 /// Leading bytes of the workspace-path digest used as its database file name,
@@ -217,7 +219,10 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 }
 
 /// The bytes of a path as the OS holds them. Windows paths are UTF-16 and reach this program as
-/// text, so its spelling stays lossy — see [`Config::workspace_db`].
+/// text, so its spelling stays lossy — see [`Config::workspace_db`]. This arm covers *any* non-Unix target, not
+/// Windows alone: wherever it applies, two paths differing only in units Rust cannot represent share one
+/// database. F18 §3 refuses such a name *inside* a workspace and never the root's own name, which is relative to
+/// nothing, so that collision is the one level the refusal does not reach.
 #[cfg(not(unix))]
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
@@ -295,17 +300,25 @@ pub struct WorkspaceRegistry {
 impl WorkspaceRegistry {
     /// Open the registry in `data_dir`, creating the directory and the table on
     /// first use.
+    ///
+    /// The registry is written by every command and shared by every run of this program, so it gets the
+    /// two connection pragmas a workspace database sets that apply here — WAL, because a scan and an
+    /// `np` run overlap on one data dir, and `BUSY_TIMEOUT_MS` (a code span, because the constant is
+    /// `pub(crate)`), so the later one waits rather than failing with `SQLITE_BUSY`. It declares no
+    /// foreign keys, so it asks for nothing else. The timeout comes first in the batch so it also covers
+    /// the `CREATE TABLE` below.
     pub fn open(data_dir: &Path) -> Result<WorkspaceRegistry, ConfigError> {
         fs::create_dir_all(data_dir)?;
         let conn = Connection::open(data_dir.join(REGISTRY_FILE))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+        conn.execute_batch(&format!(
+            "PRAGMA busy_timeout={BUSY_TIMEOUT_MS};
+             PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS workspaces (
                  workspace  TEXT    PRIMARY KEY,
                  first_seen INTEGER NOT NULL,
                  last_seen  INTEGER NOT NULL
-             );",
-        )?;
+             );"
+        ))?;
         Ok(Self { conn })
     }
 
