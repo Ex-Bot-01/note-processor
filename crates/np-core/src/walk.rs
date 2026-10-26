@@ -92,6 +92,17 @@ pub struct Walked {
     /// deleted: they are unknown, not absent, and reporting them as Removed would mark
     /// live notes stale.
     pub unreadable: Vec<String>,
+    /// `/`-normalised paths, spelled like `rel`, of **files whose own name** the byte key cannot hold —
+    /// on Windows, a name carrying an unpaired surrogate, which `path_keys::name_is_lossless` refuses (F18).
+    /// They are left out of [`Walked::files`] rather than indexed under a key two different names may share.
+    ///
+    /// The two lists answer the same question and differ only in what they name: [`Self::unreadable`] holds
+    /// **directories this walk could not enter**, so everything below one is unknown, while this list holds
+    /// **one file** whose contents were never in doubt — only its identity is unspellable. Both mean "unknown
+    /// is not absent", and a caller must suppress `Removed` for both: [`mod@crate::scan`] names every entry in
+    /// [`crate::ScanReport::skipped`] and keeps the row each path already has. Empty on Unix, where
+    /// `os_bytes` is exact and no name can fail the test.
+    pub unrepresentable: Vec<String>,
 }
 
 /// Discover every tracked file under `root`, sorted by `case_key` then the byte
@@ -110,6 +121,11 @@ pub struct Walked {
 /// rest of the workspace is still discovered, and an individual entry whose metadata
 /// vanishes mid-walk (deleted, permission revoked) is skipped so one bad file cannot
 /// lose the walk.
+///
+/// A file whose **own name** cannot survive the byte spelling ([`crate::path_keys`] refuses it, F18) is not
+/// indexed either: it is named in [`Walked::unrepresentable`] and left out of [`Walked::files`], because
+/// indexing it would mean keying it by a lossy spelling another live name may already hold. That is a
+/// refusal on one platform only — on Unix `os_bytes` is exact, so nothing reaches this list.
 pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Walked, WalkError> {
     // `read_dir`, not `metadata`: stat succeeds on a directory nobody may read, and an
     // unreadable root must not be reported as an empty workspace.
@@ -134,6 +150,7 @@ pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Walked, WalkError> {
 
     let mut files: Vec<DiscoveredFile> = Vec::new();
     let mut unreadable: Vec<String> = Vec::new();
+    let mut unrepresentable: Vec<String> = Vec::new();
     for item in walker {
         let entry = match item {
             Ok(entry) => entry,
@@ -150,6 +167,14 @@ pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Walked, WalkError> {
         if entry.depth() == 0 || !entry.file_type().is_file() {
             continue;
         }
+        // F18's refusal, before anything is keyed: a name the byte spelling cannot hold would take its key
+        // from U+FFFD, and round 2's lookup would then rewrite whichever twin already owns that key. Never
+        // index it — name it, and let the scan keep the row it has. Always false on Unix, where the OS bytes
+        // are the key (`path_keys::name_is_lossless`).
+        if !path_keys::name_is_lossless(entry.file_name()) {
+            unrepresentable.push(entry_rel(&entry, root));
+            continue;
+        }
         if let Some(file) = record(&entry, root) {
             files.push(file);
         }
@@ -158,7 +183,20 @@ pub fn walk(root: &Path, opts: &WalkOptions) -> Result<Walked, WalkError> {
     sort_found(&mut files);
     unreadable.sort();
     unreadable.dedup();
-    Ok(Walked { files, unreadable })
+    unrepresentable.sort();
+    unrepresentable.dedup();
+    Ok(Walked {
+        files,
+        unreadable,
+        unrepresentable,
+    })
+}
+
+/// The `rel` spelling of one entry, which is how both report lists name a path.
+fn entry_rel(entry: &DirEntry, root: &Path) -> String {
+    let abs = entry.path();
+    let (_rel_bytes, rel, _display) = normalize_rel(abs.strip_prefix(root).unwrap_or(abs));
+    rel
 }
 
 /// Relative spelling of a directory the walk could not read. The root itself has no

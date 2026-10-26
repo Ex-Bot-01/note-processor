@@ -12,10 +12,11 @@
 //!   its name list is committed with it, and only then does the filesystem work start. A scan that dies
 //!   halfway leaves the previous catalog readable instead of half-rewritten, and never leaves a delete
 //!   list that lags the files on disk (see `set_index_list` and `write_index_files` for the order).
-//! - **Unknown is not absent.** A directory the walk could not enter, and a file that vanished or was
-//!   rewritten between the walk and the read, is named in [`ScanReport::skipped`] and keeps the row it
-//!   already has (Review Focus 5). Reporting either as `Removed` would stale live notes because of a
-//!   permission error or a race.
+//! - **Unknown is not absent.** A directory the walk could not enter, a file that vanished or was
+//!   rewritten between the walk and the read, and a name whose byte spelling cannot be held (F18) are named
+//!   in [`ScanReport::skipped`] and keep the row they already have (Review Focus 5). Reporting any of them
+//!   as `Removed` would stale live notes because of a permission error, a race, or a name this program
+//!   refuses to guess at.
 //! - **Parse rules reach notes that did not change.** Byte comparison cannot see a rule change, so
 //!   `meta` records the parse rules version the rows were written with and a scan that finds a different
 //!   value re-parses every markdown note once (see [`PARSE_VERSION_KEY`]). Classification stays the
@@ -126,7 +127,8 @@ pub struct ScanReport {
     /// Paths the registry already had exactly as they are.
     pub unchanged: usize,
     /// Paths this scan could not index and left untouched: directories it could not read, files that
-    /// vanished or changed between walk and read, paths whose identity is already taken, a catalog
+    /// vanished or changed between walk and read, paths whose identity is already taken, a name the byte
+    /// spelling cannot hold (F18 — one line per affected display spelling), a catalog
     /// temporary it could not remove (see `clear_temp_corpses`), and a root entry wearing a generated
     /// catalog name that this program did not publish — left on disk and named here instead of deleted.
     /// Sorted, deduplicated, spelled as `rel`.
@@ -192,8 +194,10 @@ pub fn scan_with_inject(
 
     // A directory that could not be entered holds files that are unknown rather than absent: their
     // known rows stay out of the comparison (see [`known_rows`]) and the directory itself is what the
-    // report names.
+    // report names. A name the byte spelling cannot hold is the same rule about one file instead of a
+    // subtree (F18): it is not indexed this scan, its row keeps what it holds, and the path is named here.
     skipped.extend(walked.unreadable.iter().cloned());
+    skipped.extend(walked.unrepresentable.iter().cloned());
     let found = read_found(&walked.files, &mut skipped);
     let snapshots: Vec<Snapshot> = found.iter().map(|found| found.snapshot.clone()).collect();
 
@@ -205,7 +209,7 @@ pub fn scan_with_inject(
     let stored = parse_version(&db)?;
     let refresh = refresh_needed(stored);
     let now = now_secs();
-    let (known, hidden_by_unreadable) = known_rows(&db, &walked.unreadable)?;
+    let (known, hidden_by_unknown) = known_rows(&db, &walked.unreadable, &walked.unrepresentable)?;
     let changes = classify(&known, &snapshots, !cfg!(windows));
 
     let tx = db.0.unchecked_transaction().map_err(DbError::from)?;
@@ -219,7 +223,7 @@ pub fn scan_with_inject(
         &cfg.markers,
     )?;
     // Decided here, before anything else writes, from what the write pass actually delivered.
-    let record_version = refresh && refresh_covered(&written, hidden_by_unreadable);
+    let record_version = refresh && refresh_covered(&written, hidden_by_unknown);
     // Resolution waits for that pass so a link can land on a file that only appeared in this scan, and
     // comes after the stale-marking so nothing resolves onto a note that just left the live set.
     store_note_links(&db, &written.parsed)?;
@@ -251,7 +255,7 @@ pub fn scan_with_inject(
     if refresh && !record_version {
         // Without this line a workspace with one unreadable directory would re-parse its whole corpus on
         // every scan in silence, which looks exactly like the version never being written by accident.
-        report_refresh_gap(&mut io::stderr(), written.uncovered + hidden_by_unreadable);
+        report_refresh_gap(&mut io::stderr(), written.uncovered + hidden_by_unknown);
     }
 
     // A root entry that wears one of our names but is not ours stays on disk and reaches the report, so
@@ -421,8 +425,8 @@ fn decode(bytes: &[u8]) -> (String, bool) {
     }
 }
 
-/// The registry rows `classify` compares against: live rows, minus anything under a directory the walk
-/// could not read.
+/// The registry rows `classify` compares against: live rows, minus anything whose path this scan could not
+/// look at — a subtree under an unreadable directory, or one refused name (F18).
 ///
 /// Stale rows stay out because their absence was already reported; leaving them in would count one
 /// deleted file as `removed` on every later scan. Dropping them is also what lets such a file come back
@@ -431,18 +435,24 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 ///
 /// The unreadable directories are the other half of the same caution: files below one were never seen,
 /// so their rows must reach neither a `Removed` nor a move (Task 4 handoff), and leaving them in would
-/// stale a whole subtree over one transient permission error.
+/// stale a whole subtree over one transient permission error. A refused name is the third piece of the same
+/// rule ([`is_unknown_path`], F18): the file is there, but its identity could not be spelled, so its row
+/// keeps what it has instead of being marked stale for want of a key.
 ///
 /// The note test correlates on `rel_bytes`: with twins a note belonging to either file would otherwise
 /// answer for both, and that boolean feeds the refresh-coverage decision, which decides whether
 /// [`PARSE_VERSION_KEY`] gets recorded (F13 §3).
 ///
-/// The count alongside the rows is how many live **note** rows that second filter dropped — nothing else
+/// The count alongside the rows is how many live **note** rows that unknown-path filter dropped — nothing else
 /// reports them, since they appear nowhere in `found` — which is how [`scan_with_inject`] knows a
 /// parse-rule refresh never reached part of the corpus. Any row with no note behind it is excluded by the
 /// `EXISTS` — attachments and never-yet-parsed paths alike: no parse rule can stale rows that do not exist,
 /// so counting one would pin the version forever over work that is not owed.
-fn known_rows(db: &Db, unreadable: &[String]) -> Result<(Vec<Snapshot>, usize), DbError> {
+fn known_rows(
+    db: &Db,
+    unreadable: &[String],
+    unrepresentable: &[String],
+) -> Result<(Vec<Snapshot>, usize), DbError> {
     // Both key columns come back, because this is the database side of a byte-keyed comparison: hand out
     // display text here and every non-UTF-8 row reads as removed-and-re-added on every scan forever, which is
     // §1's never-converges symptom manufactured by the fix (F13 §4.1).
@@ -470,7 +480,7 @@ fn known_rows(db: &Db, unreadable: &[String]) -> Result<(Vec<Snapshot>, usize), 
     let mut hidden = 0_usize;
     for row in rows {
         let (snapshot, is_note) = row?;
-        if under_unreadable(&snapshot.rel, unreadable) {
+        if is_unknown_path(&snapshot.rel, unreadable, unrepresentable) {
             if is_note {
                 hidden += 1;
             }
@@ -488,6 +498,24 @@ fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
     unreadable
         .iter()
         .any(|dir| dir == "." || rel.starts_with(&format!("{dir}/")))
+}
+
+/// Whether `rel` names a path this scan must not judge absent, from the two lists [`crate::walk`] reports.
+///
+/// They describe different shapes of "unknown" and so match differently: an unreadable **directory** hides a
+/// whole subtree, hence [`under_unreadable`]'s prefix rule, while a refused name
+/// ([`crate::walk::Walked::unrepresentable`], F18) is one file rather than a region, hence exact equality.
+/// Both suppress `Removed` for the same reason — the scan did not see that path, which is not evidence it
+/// stopped existing.
+///
+/// A refused name is compared as display text, and that costs nothing on the only platform that can produce
+/// one: Windows builds its key from `to_string_lossy`, so a refused path's `rel_bytes` *are* these bytes
+/// (F18). The consequence worth stating is the twin — a live row whose own spelling is the same lossy text
+/// is dropped from the comparison alongside the refused path, so such a scan counts that twin as `Added` and
+/// refreshes its own row instead of risking a `Removed` against a path this scan just refused. Churn on one
+/// platform, never an overwrite; on Unix both lists are empty and nothing here fires.
+fn is_unknown_path(rel: &str, unreadable: &[String], unrepresentable: &[String]) -> bool {
+    unrepresentable.iter().any(|name| name == rel) || under_unreadable(rel, unreadable)
 }
 
 /// Write this scan's changes: every readable file's registry row refreshed, contents re-indexed where
@@ -1184,10 +1212,11 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// Whether a refresh reached every note it owed new derived rows.
 ///
 /// Two ways to miss one, neither visible in [`ScanReport`]: a file that changed or became unreadable
-/// between the walk and the read (`uncovered`, since the write pass skips its marker), and a live row
-/// under a directory the walk could not enter (`hidden_by_unreadable`, dropped by [`known_rows`] so it
-/// cannot be mistaken for deleted). Recording the version over either would label rows as current that
-/// an older build wrote, permanently — the exact failure F15 exists to prevent, reintroduced by the fix.
+/// between the walk and the read (`uncovered`, since the write pass skips its marker), and a live row this
+/// scan could not look at — under a directory it could not enter, or carrying a name it refused (F18) —
+/// which [`known_rows`] drops so it cannot be mistaken for deleted (`hidden_by_unknown`). Recording the
+/// version over either would label rows as current that an older build wrote, permanently — the exact
+/// failure F15 exists to prevent, reintroduced by the fix.
 /// Retrying is the cheaper fault: one subtree stays stale until it becomes readable again, and the scan
 /// after that records the version once the corpus is covered.
 ///
@@ -1208,8 +1237,8 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// and `docs/backlog-m2-followups.md` F19 owns the migration that would heal it. That loop
 /// is worth paying for: those rows stay wrong until the obstruction clears, and the notice below names the
 /// count so this is never silent.
-fn refresh_covered(written: &Written, hidden_by_unreadable: usize) -> bool {
-    written.uncovered == 0 && hidden_by_unreadable == 0
+fn refresh_covered(written: &Written, hidden_by_unknown: usize) -> bool {
+    written.uncovered == 0 && hidden_by_unknown == 0
 }
 
 /// Say out loud that a scan re-parsed notes whose files did not change — unless there is nothing to say.
@@ -1257,8 +1286,8 @@ fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
 /// Say out loud that a refresh could not label the corpus, so the next scan will try again.
 ///
 /// stderr for the same reason as [`report_refresh`]: stdout stays machine-readable JSON. `missed` counts
-/// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory — and
-/// the write result is dropped for the reason spelled out on [`report_refresh`].
+/// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory or
+/// a refused name — and the write result is dropped for the reason spelled out on [`report_refresh`].
 fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
     if missed == 0 {
         return;

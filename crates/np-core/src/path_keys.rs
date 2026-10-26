@@ -23,6 +23,11 @@
 //! Both spellings of a path travel together, so they are one type: [`RelPath`]. A change list, a link corpus
 //! or a write call that named only one of them would either lose the identity (text alone, which is F13) or
 //! lose the line the report renders (bytes alone, which nobody can read).
+//!
+//! One thing this module cannot do is spell a Windows name exactly: its paths are UTF-16 code units and
+//! `os_bytes` has to fall back to lossy text there. `name_is_lossless` is the refusal that keeps an
+//! unspellable name from overwriting the twin whose key it collides with (F18) — a refusal, not byte
+//! identity, which stays open in `docs/backlog-m2-followups.md`.
 
 use std::ffi::OsStr;
 
@@ -135,6 +140,77 @@ pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
 #[cfg(not(unix))]
 pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
     name.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Whether a UTF-16 spelling holds a surrogate that is not part of a pair.
+///
+/// A high surrogate (`U+D800..=U+DBFF`) is only meaningful immediately followed by a low one
+/// (`U+DC00..=U+DFFF`); the two together spell one `char`. Anything else — a high with no low behind it, a
+/// low with no high in front of it — converts to no character at all, so `os_bytes`' lossy arm replaces
+/// it with U+FFFD and two different OS names land on one byte key (F18). Two highs in a row leave the first
+/// unpaired for exactly that reason: only the pair `high, low` is consumed together.
+///
+/// Pure over `u16`, and public so it stays testable on every platform: only Windows can reach this shape
+/// through a filesystem, and `name_is_lossless`'s Unix arm answers `true` without looking, so without a
+/// callable predicate F18's rule would be covered by nothing that CI can run.
+pub fn has_unpaired_surrogate(units: &[u16]) -> bool {
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        if !is_high_surrogate(unit) {
+            // A low surrogate here has no high in front of it: either nothing preceded it, or the preceding
+            // high was already consumed by the pair before that one.
+            if is_low_surrogate(unit) {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        // The low unit has to be the *immediately* following one; a pair travels together, so it is
+        // skipped as one step and the next iteration starts on the first unit after it.
+        let paired = units.get(index + 1).copied().is_some_and(is_low_surrogate);
+        if !paired {
+            return true;
+        }
+        index += 2;
+    }
+    false
+}
+
+/// Whether `unit` is a high (leading) surrogate.
+fn is_high_surrogate(unit: u16) -> bool {
+    (0xD800..=0xDBFF).contains(&unit)
+}
+
+/// Whether `unit` is a low (trailing) surrogate.
+fn is_low_surrogate(unit: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&unit)
+}
+
+/// Whether one OS name survives this module's byte spelling unchanged.
+///
+/// The Unix arm returns `true` for **every** input, and that is a fact about the platform rather than a
+/// shortcut: [`os_bytes`]'s Unix arm takes the bytes straight out of the `OsStr`, so the key *is* the name
+/// and there is no lossy step for a predicate to catch — not for a raw non-UTF-8 byte, and not for anything
+/// else a path can hold. Checking here could therefore only ever refuse a file Unix indexes correctly today,
+/// which F18 names as the worse failure (a silently skipped note costs more than the overwrite this refusal
+/// prevents), so this answer is pinned by a test rather than by the argument above.
+///
+/// The other arm is Windows's — the only non-Unix target this program builds for, and the platform whose
+/// paths are UTF-16 code units (see [`os_bytes`]). There a name holding an unpaired surrogate reaches
+/// `to_string_lossy` as U+FFFD, so two names can share one key and round 2's lookup overwrites the twin's
+/// row without any constraint firing. Such a name is refused instead: [`crate::walk`] leaves it out of the
+/// catalog, its existing row untouched, and names it in the report (F18 §3).
+#[cfg(unix)]
+pub(crate) fn name_is_lossless(_name: &OsStr) -> bool {
+    true
+}
+
+/// [`name_is_lossless`] for a platform whose names arrive as UTF-16 code units.
+#[cfg(not(unix))]
+pub(crate) fn name_is_lossless(name: &OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    !has_unpaired_surrogate(&name.encode_wide().collect::<Vec<u16>>())
 }
 
 #[cfg(test)]
