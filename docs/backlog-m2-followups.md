@@ -127,7 +127,11 @@ Order of attack, round by round — each round is one task brief with its own re
 - **Resolved in `42bf672` plus its review round.** Width comes from `unicode-width`, pinned exactly (`=0.2.2`) so a
   Unicode revision cannot move a wrap point silently, with the relied-upon widths asserted in `pinned_display_widths_of_
   the_rendered_shapes`. The review caught that the budget ignored the continuation indent — a wrapped entry reached 101
-  visible columns against a 100-column promise — now deducted (`wrap`'s `prefix`) and pinned at indents 0, 2 and 5.
+  visible columns against a 100-column promise — the indent is now charged before a token is appended to a
+  continuation line, pinned at indents 0, 2 and 5. One exemption stays deliberately: a single token wider than the
+  columns left on its line keeps a line of its own (spec §14 forbids breaking inside a path), so that line may reach
+  `COLUMN_LIMIT + indent`; documented on `wrap` and pinned by
+  `an_over_wide_token_on_a_continuation_line_reaches_the_documented_ceiling`.
   **No golden was regenerated**: every committed golden is ASCII or single-width, so the wrap points did not move; the
   wide-character fixture that *would* change bytes is filed as F16 rather than smuggled in here.
 
@@ -207,14 +211,26 @@ What these numbers can and cannot carry:
 
 ## F16 — no wide-character fixture in the golden corpus
 
-- **Where:** `crates/np-core/tests/golden/` holds ASCII titles only, so a width regression can only be caught by the
-  unit tests in `tests/catalog.rs`, never by the byte-for-byte golden check.
+- **Where:** repo-root `tests/golden/` (the golden directory is resolved at `crates/np-core/tests/catalog.rs:948`) contains no **two-column**
+  title — em dash and umlaut are there and are single-width — so a width regression can only be caught by the unit
+  tests in `tests/catalog.rs`, never by the byte-for-byte golden check. The shared corpus that would need the new note
+  lives in `tests/fixtures/corpus`.
 - **Why it is not done in F12:** adding a CJK or emoji title changes more than one file — it moves wrap points, can land
   in a different bucket and therefore change shard names, and both `cli` and `scan` goldens embed the generated file
   list. That is a deliberate regeneration across several fixtures and must be its own commit with its own review.
 - **Fix:** add one wide-titled note to the shared corpus, regenerate every affected golden in a single commit, and
   confirm the independent verifier still reports `GOLDEN CHECK: pass` against the new bytes. **Done when:** the golden
   corpus contains at least one two-column title and CI is green on both runners.
+
+## F17 — `continuation_indent` is accepted unclamped
+
+- **Where:** `crates/np-core/src/config.rs:52` takes any `usize`, and `wrap` charges it as the prefix of every
+  continuation line.
+- **Risk:** pre-existing, not introduced by F12. An indent near or above `COLUMN_LIMIT` defeats the column budget on
+  its own — every continuation line is over the limit before its first token — so a typo in `config.toml` silently
+  produces one-token-per-line output with no warning.
+- **Fix:** reject or clamp past a documented maximum (say 16) at config load, and say which in the error. **Done
+  when:** an oversized indent fails `np scan` with a message naming the key instead of rendering oddly.
 
 ---
 

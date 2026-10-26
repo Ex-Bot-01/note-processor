@@ -179,10 +179,16 @@ fn entry_line(entry: &CatalogEntry) -> String {
 
 /// Wrap one logical line at [`COLUMN_LIMIT`] columns: break before the token that would cross
 /// the limit, indent continuation lines by `indent` spaces. The budget counts the rendered line, so a
-/// continuation line has its indent deducted before the first token. A token longer than the limit is
-/// kept whole on a line of its own rather than split.
+/// continuation line has its indent charged before the next token is appended.
 ///
-/// Width is measured in display columns (UAX #11, via `unicode-width`), not characters: a CJK
+/// **The one exemption:** a token wider than the columns left on its line — more than `COLUMN_LIMIT` on the
+/// first line, more than `COLUMN_LIMIT - indent` on a continuation — keeps a line of its own rather than
+/// being split (spec §14 forbids breaking inside a path), so that single-token line can reach
+/// `COLUMN_LIMIT + indent` columns. There is no alternative break point without splitting the token or
+/// dropping the indent, and both change published bytes.
+///
+/// Width is measured in display columns (UAX #11 via `unicode-width`, which carries Unicode 17.0.0 tables),
+/// not characters: a CJK
 /// ideograph or emoji occupies two columns and a combining mark none, so counting characters let a
 /// non-ASCII title overflow the budget by roughly one column per wide character. The measurement
 /// reads nothing but these bytes — no terminal, locale or environment — which is what keeps a

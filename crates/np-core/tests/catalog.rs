@@ -596,7 +596,14 @@ fn pinned_display_widths_of_the_rendered_shapes() {
     // Multi-scalar shapes, which is where a width-table revision actually bites: a flag pair, a
     // skin-tone modifier and a family built with ZWJ are each one grapheme whose column count is a
     // policy decision inside the dependency, not something this crate can derive.
-    assert_eq!("🇯🇵".width(), 2, "a flag pair renders as one glyph");
+    // A flag pair is two regional-indicator scalars of one column each; 0.2.2 reaches 2 by summing them,
+    // not by treating the pair as one glyph — worth knowing, because a future rule that zeroes the first
+    // scalar would change this to 1 and move wrap points.
+    assert_eq!(
+        "🇯🇵".width(),
+        2,
+        "a regional-indicator pair sums to two columns"
+    );
     assert_eq!(
         "👍🏽".width(),
         2,
@@ -613,6 +620,51 @@ fn pinned_display_widths_of_the_rendered_shapes() {
     // as knowledge — titles and tags reach the catalog verbatim and nothing here strips them.
     assert_eq!("\t".width(), 1, "a control character is charged one column");
     assert_eq!("\u{200b}".width(), 0, "a zero-width space is charged none");
+    // A heart with the emoji variation selector: a very plausible shape in a real title, and the width
+    // comes from a VS16 rule rather than from the base character's own class.
+    assert_eq!(
+        "\u{2764}\u{fe0f}".width(),
+        2,
+        "a text heart becomes an emoji under VS16"
+    );
+}
+
+/// The documented exemption, pinned: a token too wide for the columns left on its line keeps a line of
+/// its own, so that one line may reach `COLUMN_LIMIT + indent` visible columns. There is no other break
+/// point without splitting the token (spec §14 forbids it inside a path) or dropping the indent, and both
+/// would change published bytes.
+#[test]
+fn an_over_wide_token_on_a_continuation_line_reaches_the_documented_ceiling() {
+    // The renderer prefixes a tag with '#', so a 99-character tag becomes a 100-column token: exactly the
+    // width that fits the first line's budget and nothing else.
+    let wide = "a".repeat(99);
+    let crowded = CatalogEntry {
+        tags: vec![wide.clone(), "x".to_string()],
+        ..entry("T", "r.md", "1 B", &[], 0, 0)
+    };
+    let layout = CatalogConfig {
+        max_entries_per_file: 600,
+        continuation_indent: 2,
+    };
+
+    let rendered = render(std::slice::from_ref(&crowded), &layout);
+    let lines: Vec<&str> = body(contents(&rendered, "INDEX.md")).lines().collect();
+
+    assert_eq!(
+        lines[1],
+        format!("  #{wide}"),
+        "the over-wide tag gets its own continuation line: {lines:?}"
+    );
+    assert_eq!(
+        columns(lines[1]),
+        102,
+        "100 columns of token plus a two-column indent — the ceiling `wrap` documents"
+    );
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(
+        lines[2], "  #x · →0 ←0",
+        "the next tag starts a third line rather than joining one already at the ceiling"
+    );
 }
 
 #[test]
