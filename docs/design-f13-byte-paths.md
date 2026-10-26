@@ -132,7 +132,19 @@ those three sentences are load-bearing, and the first review round found each of
   same name" that a rename has to follow. What it changes: the identity fold is no longer Unicode-folded,
   so `Äpfel.md` beside `äpfel.md` — two genuinely different files on a case-sensitive filesystem, which
   today collide on `case_key UNIQUE` and lose one of them to `skipped` — gets two rows. On a case-insensitive
-  filesystem that pair cannot both exist, so nothing loosens where the fold exists to do work.
+  filesystem that pair cannot both exist.
+  **What that costs, said plainly instead of waved through.** The old fold did two jobs and the ASCII byte
+  fold keeps only one. It keeps P3's `skipped` report (`a.md` beside `A.md` still collides) and it keeps
+  rename-following for *ASCII* case changes; it does not keep rename-following for a non-ASCII one. On a
+  case-insensitive filesystem `Ämli.md` → `ämli.md` alters no byte in `A`–`Z`, so the re-keyed `folded_row`
+  — which matches `case_bytes` after this change (§3's list) — no longer finds the row that today's Unicode
+  `case_key` finds, and no rename is attempted. If the content changed as well, `classify`'s hash pairing
+  cannot bridge them either (different hashes mean no move claim, `change.rs:128-137`), so the note detaches:
+  a freshly minted `notes.id` under the new spelling, the old row left behind and going `stale` on the next
+  scan once the walk lists only one file for that path, and every edge into the old note reported unresolved
+  until its sources re-parse. This plan accepts that regression rather than claiming the fold is free: there is
+  no byte spelling of a Unicode case fold, so one column cannot both keep P3's ASCII guard and keep Unicode
+  rename-following. §5 pins the detached-note behaviour as it will be, so a later fix has something to break.
 - **The display fold stays Unicode, because it is a different fact.** `links::resolve` places a target by
   `case_key` with `target.to_lowercase()` (`links.rs:405-414`), which folds `ÄPFEL` onto `äpfel`; that is a
   question about how an author spells a name, not about which file it is, and it must not move with the
@@ -140,7 +152,10 @@ those three sentences are load-bearing, and the first review round found each of
   (BLOB, ASCII fold of OS bytes, identity guard) are **two facts with two names**, not two spellings of one
   fact — and both are derived in one place, the walker (`walk.rs:235-241`), under the `index_names` lesson
   from F11 (`crates/np-core/src/index_names.rs`): no call site hand-derives either, and neither is written
-  without the other. `case_key UNIQUE` disappears with that division of labour — twins share a display fold by
+  without the other. That one place gets a name rather than staying a paragraph: `crates/np-core/src/path_keys.rs`,
+  holding `rel_bytes` (OS bytes of the component list), `case_fold` (the ASCII byte fold), `display` (the lossy
+  text) and `display_fold` (`str::to_lowercase`). The walker calls it, and migration 4's copy loop calls the same
+  functions; §7 makes the module a round-1 deliverable because round 1 is the round that writes keys. `case_key UNIQUE` disappears with that division of labour — twins share a display fold by
   definition — leaving `case_bytes` the only uniqueness on a fold, while `case_key` keeps its index for
   resolution's sake alone.
 - **(b) inherits the shared list below, in full.** Once two live rows may share a display spelling, "find
@@ -173,18 +188,37 @@ option; a subset re-keyed is the bug moved, not fixed.
   `case_bytes` in the same statement as the display pair, so the four columns cannot diverge.
 - **`rebase_abs`** (`db.rs:779-796`) — suffix surgery on the display `abs`. It stays text work, because its
   output is the display column; but it must run off the byte key's own row, and rebasing a *shared* display
-  spelling hands one new `abs` to two files. Under (b) the byte-exact absolute path stops being stored at
-  all: it is the workspace root plus `rel_bytes`, which is what makes `abs` genuinely cosmetic instead of
-  "display, plus the authority nobody reads".
+  spelling hands one new `abs` to two files. What (b) changes about `abs`, said so that it cannot contradict
+  §4's SQL: **the column stays and keeps being written** — migration 4 copies it verbatim (`db.rs:72`) and
+  `upsert_file` binds lossy text into it exactly as today (`db.rs:653`). What stops being stored is the
+  **byte-exact** absolute path: nothing persists root + bytes anywhere, so a caller that needs the real path
+  recomputes it from `rel_bytes`, and `abs` becomes genuinely cosmetic instead of "display, plus the authority
+  nobody reads".
 - **`note_id`** (`scan.rs:824-831`) and the same statement inside `links::store_links` (`links.rs:504-520`)
   — `SELECT id FROM notes WHERE rel = ?1 LIMIT 1`. The `LIMIT 1` is what makes today's answer silently wrong
   instead of loud: with twins it hands one file's text to the other note, rewriting its title, tags, items
   and links. Fix: select by `rel_bytes`, and **drop the `LIMIT 1`** so a future duplicate fails with
   `ExecuteMultipleValues` rather than picking a row; §5 pins the one-note-per-file assumption that today's
   `LIMIT` hides.
+- **`store_note`'s insert** (`scan.rs:769-773`) — `INSERT INTO notes (rel, title, title_source, encoding,
+  word_count, body)`, and the **only writer of `notes.rel`** in the program. It is a writer rather than a reader,
+  which is why it belongs on this list at all: under (b) that statement is what puts values into the note side of
+  the identity, and leaving it alone means every note created after the switch carries no byte key — NULL in a
+  column whose re-keyed join (`scan.rs:864-870`), foreign key + `ON UPDATE CASCADE` (§4) and re-keyed `note_id`
+  all compare on bytes, so a keyless note row matches nothing and silently detaches from its file. That is F13
+  reproduced by the fix, on every workspace, starting with the first new note. Fix: name `rel_bytes` in that
+  column list and bind it **as bytes** (`Vec<u8>`, §4's `CHECK`) beside the display `rel`, and move the insert
+  behind a bytes-typed call in `db.rs` so no `scan.rs` site can write a note key at all (§4's writer list).
 - **the catalog join** (`scan.rs:864-870`) — `FROM notes n JOIN files f ON f.rel = n.rel`. Two rows on each
   side of one display spelling is a cross product, so the catalog gains duplicate entries carrying wrong
   link counts. Fix: join on `rel_bytes`; §5 covers the ordering this exposes.
+- **the catalog's order** (`scan.rs:869`, `catalog.rs:132-139`) — `ORDER BY n.rel` and `sort_key`'s final
+  tie-break `(bucket, lowercased title, rel)` are both display-keyed, and §5's ordering test needs byte keys in
+  both places: for twins the display text is *identical*, so a display tie-break orders nothing and the rendered
+  bytes fall to whichever row SQLite happened to read. Fix: `ORDER BY n.rel_bytes`, and the same byte key as
+  `sort_key`'s last component — which requires something byte-typed to order on, because `CatalogEntry` is built
+  from `rel` alone today (`scan.rs:904-913`). It gains `rel_bytes: Vec<u8>`, read by `sort_key` only and never
+  rendered (`entry_line` prints `rel`, `catalog.rs:163-177`), so the goldens stay byte-identical.
 - **`LIVE_EDGE`** (`db.rs:805-807`) — `notes dn JOIN files df ON df.rel = dn.rel …`, reached from
   `unresolved_targets` and from `scan::unresolved_links`. Same cross product, plus a stale twin answering
   for a live one, so the count and the list printed under it can disagree. Fix: join on `rel_bytes`.
@@ -195,7 +229,8 @@ option; a subset re-keyed is the bug moved, not fixed.
 - **`folded_row`** (`scan.rs:704-716`) — `SELECT rel FROM files WHERE case_key = ?1 AND rel != ?2`. Once the
   display fold is shared by twins it returns *the twin* as "another spelling of the same name", and
   `index_file` (`scan.rs:590-600`) then calls `apply_move` between two files that both exist. Fix: match on
-  `case_bytes` and return `rel_bytes`, so only a genuine ASCII-case twin is offered as a rename source.
+  `case_bytes` and return `rel_bytes`, so only a genuine ASCII-case twin is offered as a rename source — at the
+  price named in the residual above: a non-ASCII case rename stops being followed once this matches bytes.
 - **`live_corpus`** (`scan.rs:845-857`) — a `BTreeMap<case_key, rel>` filled with `insert`, so the second
   twin silently replaces the first and the link corpus holds one candidate where the workspace has two.
   That breaks this section's own promise: a target naming the shared lossy spelling would resolve onto
@@ -302,8 +337,20 @@ exact child shapes: dropping `notes` with the pragma on took headings 3→0, tag
 while leaving `files` untouched; with it off, every row stayed. Nothing reports it. The next scan re-derives
 nothing that it does not re-parse, and every published byte in `INDEX.md` moves — tags vanish from entry
 lines (`catalog.rs:163-177`), link counts fall to zero — with no error anywhere. `DROP TABLE files` is the
-loud half of the pair by comparison: `notes.rel REFERENCES files(rel)` carries no `ON DELETE` action, so
-dropping a parent that still has note rows fails outright.
+louder half of the pair by comparison: `notes.rel REFERENCES files(rel)` carries no `ON DELETE` action, so
+dropping a parent that still has note rows fails outright — **louder, not safe**, for the reason below.
+
+**`DROP TABLE files` has the same shape, and neither drop can vouch for itself.** `files` is the parent, so it
+fails only where a *note* row still points at it. An attachment — a `files` row with no note — has no child at
+all, so nothing checks its survival: if the Rust copy loop loses one (a conversion that skipped a row, a bound
+parameter that silently mismatched), `PRAGMA foreign_key_check` still passes afterwards, because there is no key
+left to violate, and `DROP TABLE files` destroys the row with no error, no report line and no way to notice
+except a catalog entry that never comes back. The same argument covers `notes`: an id whose children were never
+written has nothing left to cascade. So the step asserts **before each drop** that the replacement table holds
+exactly as many rows as the one it is about to destroy — `SELECT COUNT(*) FROM files` against
+`SELECT COUNT(*) FROM files_new`, then the same pair for `notes` — and returns its own error naming both counts
+when they differ, which rolls the step back. A count cannot prove that the *right* rows survived; that is what
+§5's per-row key comparison is for. The count is what turns a silent shrink into an aborted migration.
 
 The step cannot switch enforcement off to protect itself, because `migrate` sets
 `PRAGMA foreign_keys = OFF` *outside* the transaction precisely for the reason that it has no effect inside
@@ -328,12 +375,25 @@ first leaned on: bytes bound from Rust, `CHECK(typeof(…) = 'blob')` on all thr
 fails at the write instead of at review, and no `CAST` in the `files` path at all — a cast is how a string
 gets to look like a key.
 
-**Which module owns every bind.** All three key columns are written from `crate::db` and nowhere else:
-`upsert_file` (`db.rs:636`), `apply_move` (`db.rs:685`) and `mark_stale` (`db.rs:718`) take byte keys as
-parameters, and migration 4's own copy loop is the fourth writer. That constrains §3's shared list: the
-statements in it that live in `scan.rs` — `note_id`, `folded_row`, `known_rows`, `catalog_entries`,
-`live_corpus` — move behind a bytes-typed call in `db.rs` or take a `&[u8]` parameter, so "bind this key as
-TEXT" stops being a call any of them can write. The `CHECK` is the backstop; the API shape is the design.
+**Two owners, both named: one for the folds, one for the binds.**
+
+- **The folds belong to `crate::path_keys`** (`crates/np-core/src/path_keys.rs`, §3): `rel_bytes`, `case_fold`,
+  `display`, `display_fold`. Nothing else in the crate defines a fold; the walker calls these and migration 4's
+  copy loop calls the same ones, so a key is never derived twice under two rules. This module has to exist before
+  any statement writes a key, which is why it is round 1's first deliverable (§7).
+- **The binds belong to `crate::db`.** The writers of the three key columns are `upsert_file` (`db.rs:636`,
+  `files.rel_bytes` + `case_bytes`), `apply_move` (`db.rs:685`, both, in the same statement as the display pair),
+  **`store_note`'s insert** (`scan.rs:769-773`, `notes.rel_bytes`) — which today lives in `scan.rs` and moves
+  behind a bytes-typed `db` call so no scan-side site can bind a key — and migration 4's own copy loop.
+  `mark_stale` (`db.rs:718`) is **not** on that list: it writes only `state` (`db.rs:719`) and merely *takes* a
+  byte key to match on. An earlier draft of this section counted it as a writer while missing the one above,
+  which is exactly how a lookup gets mistaken for the statement that has to change.
+
+That split is what constrains §3's shared list: the statements in it that live in `scan.rs` — `note_id`,
+`folded_row`, `known_rows`, `catalog_entries`, `live_corpus` — move behind a bytes-typed call in `db.rs` or take
+a `&[u8]` parameter, so "bind this key as TEXT" stops being a call any of them can write. The `CHECK` is the
+backstop; the API shape is the design. §5 states the check for both halves of this claim, because "one module
+owns it" and "no cast survives" are otherwise unfalsifiable sentences.
 
 Byte-stability of the copy rests on the same two things R2b ruled on (`fix(db): copy
 migration rows in rowid order…`, `3f86529`): `ORDER BY rowid` on every copy, so the rowids a rebuild hands
@@ -343,15 +403,16 @@ and `notes.id` carried rather than re-minted, because every derived row hangs of
 `meta` beside `fk_orphans` (`db.rs:341`): `paths_lossy = 'files=N,notes=M'`, counting the rows whose display
 text holds U+FFFD, written even when zero, for the same reason F5's is ("looked and found none" must be
 tellable apart from "never upgraded") — and read as §4.2 describes, because that count is the only way a
-person can tell next scan's expected churn from a regression.
+person can tell the first byte-keyed scan's expected churn from a regression.
 
 Parse-version interaction: this is schema-only, like every entry here (`docs/backlog-m2-followups.md`,
 F15: "a SQL migration cannot do this — migrations here are schema-only"), so `PARSE_VERSION` stays `1`
 (`crates/np-core/src/parse.rs:42`) and `refresh_needed` must not fire (`scan.rs:1043-1050`). Derived rows
 are not rewritten by migration 4: carry `hash`, `size`, `mtime`, `state` verbatim, and derive display text
 with the *same* lossy rule so `classify` sees the same `rel` strings it saw before. That buys "the first
-post-migration scan reports nothing changed" for a workspace with no non-UTF-8 name and for that workspace
-only — §4.2 is what happens in the other case, and §6 carries both halves.
+post-migration scan reports nothing changed" for **every** workspace — including one holding a non-UTF-8 name,
+because migration 4 changes no comparison and no reader looks at the new columns yet (§7). §4.2 is what happens
+in the round that does read them, and §6 carries both halves.
 
 ### 4.1 Byte identity has to travel walk → digest → classify → apply_changes
 
@@ -389,35 +450,66 @@ title, not a byte sequence — and §3 already says what happens when two files 
 thing that changes there is `live_corpus` keeping both candidates (§3's list), so ambiguity is detected
 rather than resolved by whoever was read last.
 
-### 4.2 What the first scan after migration 4 reports
+### 4.2 The churn, and which round owns it
 
 **What the migrated key is.** Migration cannot invent bytes it never held (§2), so an existing row's
 `rel_bytes` is the UTF-8 encoding of its stored display text. For an ASCII or valid-UTF-8 name those are the
 OS bytes, and nothing moves: `classify` matches on the same spelling, `hash`/`size`/`mtime` were carried
 verbatim, the scan reports every file unchanged, and the goldens are byte-identical.
 
-**Where a non-UTF-8 name exists, expect churn.** A row stored as `caf\uFFFD.md` migrates to bytes
-`63 61 66 EF BF BD 2E 6D 64`. The next walk computes the real OS bytes, `63 61 66 E9 2E 6D 64`. Those are
-different byte keys, so `classify` sees a path that vanished and a path that appeared: **one `Removed`, one
-`Added`**, not "nothing changed". That is the swallowed twin coming back, which §2 already said needs a
-rescan; it is honest churn rather than new loss, and it converges — the migrated row goes `stale`, keeps its
-children and leaves the catalog (`catalog_entries` filters `f.state = 'ok'`, `scan.rs:864-870`), while the
-byte-keyed row is live from this scan on.
+**Which round owns it: not migration 4.** Migration 4 changes no comparison, so the scan immediately after it
+reports every file unchanged in *every* workspace — including one whose real name is `caf\xe9.md`, because
+`classify` still matches on display text (`change.rs:164-169`) and that text did not move. The churn belongs to
+the round that first writes OS bytes into `rel_bytes` — §7's round 1, whose `upsert_file` binds them — and it
+becomes something a person can read in a report only on the first scan that *compares* byte keys against a
+migrated key: §7's round 2, reached without an intervening scan.
 
-Two consequences of that one-time event are worth naming rather than discovering. The re-added note is a
-**fresh `notes.id`**, so edges pointing into the old row now name a stale file and land in
-`unresolved_links` (`LIVE_EDGE`, `db.rs:805-807`) until their sources are re-parsed — which happens when a
-source's content changes or when `PARSE_VERSION` moves, not on this scan. And the derived rows come from a
-re-parse rather than from the carried-over ones, so a workspace that had hand-edited children on the stale
-row keeps them in the database but publishes the re-derived set.
+**Round 1's own version of the event is silent.** Round 1 writes OS bytes while every reader still matches
+display text, so its first scan quietly rewrites a migrated lossy `rel_bytes` to the real bytes — every readable
+file is upserted on every scan (`scan.rs:471-473`, called at `scan.rs:605`) — and reports nothing at all. §5
+pins that silence; it is a fact to test, not a promise to keep. It has one consequence worth naming: a workspace
+scanned between the two rounds arrives at round 2 with its byte keys already correct, and reports nothing
+changed there either.
+
+**What the first byte-keyed scan of a lossy workspace reports.** A row migrated from `caf\uFFFD.md` holds
+`63 61 66 EF BF BD 2E 6D 64`; the walk computes `63 61 66 E9 2E 6D 64`. Two byte keys, one file on disk,
+identical display text. Because `classify` pairs unmatched snapshots **by hash** (`change.rs:70-76`, with the
+claims resolved at `change.rs:122-149`), unchanged content means equal hashes and therefore a single
+**`Moved { from }`**, not a `Removed` + `Added` pair. It is a *repeated* `Moved` until the byte key is actually
+rewritten: `from` and `to` carry the same display spelling here, so a write pass that still expresses a rename
+in display text renames the row onto itself, leaves `rel_bytes` holding the lossy value, and pairs the same two
+keys again next scan — forever, which is §1's never-converges symptom manufactured rather than fixed.
+§4.1's byte-carrying change list and §3's re-keyed `apply_move` are what stop the repeat. Where the content
+changed as well, the hashes differ, no move claim exists (`change.rs:128-137`), and the shape is the original
+**`Removed` + `Added`**. On §1's actual workspace — one row carrying `caf\xe9.md`'s digest, two real files on
+disk — the first byte-keyed scan therefore reports one `Moved` (the path whose hash survives) plus one `Added`
+(the twin nobody ever wrote), which is the swallowed path coming back that §2 said needs a rescan. Either shape
+is honest churn rather than new loss, and it converges: a `Removed` row goes `stale`, keeps its children and
+leaves the catalog (`catalog_entries` filters `f.state = 'ok'`, `scan.rs:864-870`), while the byte-keyed row is
+live from this scan on.
+
+Two consequences of that one-time event are worth naming rather than discovering. Where the shape is `Removed`
++ `Added`, the re-added note is a **fresh `notes.id`**, so edges pointing into the old row now name a stale file
+and land in `unresolved_links` (`LIVE_EDGE`, `db.rs:805-807`) until their sources are re-parsed — which happens
+when a source's content changes or when `PARSE_VERSION` moves, not on this scan — and its derived rows come from
+a re-parse rather than from the carried-over ones, so a workspace that had hand-edited children on the stale row
+keeps them in the database but publishes the re-derived set. Where the shape is `Moved`, the id survives:
+`apply_move` takes the note with it through `ON UPDATE CASCADE` (`db.rs:89`) and nothing detaches — one more
+reason §4.1's byte-carrying change list is not optional, since a display-keyed pass turns what should have been
+the quiet shape into the loud one, on every scan.
 
 **How it reads against the receipt.** This is what `paths_lossy = 'files=N,notes=M'` is for. It names the
-workspaces holding rows whose display text contains U+FFFD, so a person can predict about `N` such
-Removed/Added pairs before scanning and explain them afterwards; where the receipt reads `files=0`, a
-`Removed` in the next scan is a bug rather than a migration artefact. That makes the receipt worth pinning in
-§5's migration test, not merely writing.
+workspaces holding rows whose display text contains U+FFFD, so a person can predict about `N` paths reporting a
+`Moved` — or a `Removed` + `Added` pair where the content changed too — on the first byte-keyed scan, and
+explain them afterwards; where the receipt reads `files=0`, a `Moved` for a path nobody renamed is a bug rather
+than a migration artefact. That makes the receipt worth pinning in §5's migration test, not merely writing.
 
 ## 5. Test plan
+
+Every bullet here that builds a name with `OsStrExt::from_bytes` — the round trip, both twins, the ASCII-case
+half of the fold test, the twin ordering and resolution items — carries `#[cfg(unix)]`, as the existing non-UTF-8
+tests already do (`crates/np-core/tests/walk.rs:144`, `crates/np-core/tests/config.rs:564`). Without it the same
+test compiles on Windows into a name that cannot be built, and passes by asserting nothing.
 
 - **Latin-1 round trip.** Build a name with `OsStrExt::from_bytes(b"caf\xe9.md")`, scan, and assert
   `files.rel_bytes` equals those exact bytes and that rebuilding a `PathBuf` from them opens the file —
@@ -434,6 +526,16 @@ Removed/Added pairs before scanning and explain them afterwards; where the recei
   and one `skipped` entry — the ASCII byte fold keeps ruling P3 — while `Ämli.md` beside `ämli.md` produces
   *two* rows, which is the behaviour change §3 accepts out loud. And a link `[[ÄMLI]]` still resolves onto
   `Ämli.md`, because the display fold stays Unicode.
+  - **The residual that goes with it, pinned as behaviour.** A case-insensitive filesystem renaming `Ämli.md`
+    onto `ämli.md` — no byte in `A`–`Z` changes — must be shown to miss `folded_row` (§3 re-keys it onto
+    `case_bytes`), and the same pair with changed content must be shown to miss `classify`'s hash rule, so the
+    note detaches: a fresh `notes.id`, the old row left behind and going `stale` on the following scan, edges
+    into it reported unresolved. Assert exactly that, so the accepted regression is evidence rather than a
+    paragraph (§3's residual). Two seams make this awkward on purpose, and the test names them: `folded_row` is
+    private (`scan.rs:704`), so this half lives in a `#[cfg(test)]` unit module beside it rather than in the
+    integration tests; and the scan path hardcodes case sensitivity as `!cfg!(windows)` (`scan.rs:193`,
+    `scan.rs:202`), so no Linux CI can drive it through `scan::run` — the `classify` half goes through
+    `crates/np-core/tests/change.rs`, which already passes the flag by hand (`crates/np-core/tests/change.rs:10`).
 - **Catalog order for twins is pinned, not incidental.** Two live twins with the same title give the rendered
   order twice and compare bytes: it must be identical, and must come from the byte key in `ORDER BY` and
   `sort_key` (`catalog.rs:82`, `catalog.rs:133-139`) rather than from whichever rowid SQLite happened to
@@ -444,7 +546,20 @@ Removed/Added pairs before scanning and explain them afterwards; where the recei
   afford is a TEXT twin of a BLOB key: it conflicts with nothing and reports nothing (§4).
 - **One note row per file, pinned.** After a scan, and again after a move, no `notes.rel_bytes` carries two
   rows (`GROUP BY rel_bytes HAVING COUNT(*) > 1` is empty). §3 removes `note_id`'s `LIMIT 1`, so this
-  assumption stops being hidden by a `LIMIT` and starts being tested.
+  assumption stops being hidden by a `LIMIT` and starts being tested. Same query, one assertion weaker and more
+  important: **no `notes` row has `rel_bytes IS NULL`** after any write pass — the new-note insert of
+  `scan.rs:769-773` is the only thing that can produce one (§3), and a keyless note matches nothing in the
+  re-keyed join or cascade. The column stays nullable because migration 4 copies rows it did not write and must
+  not abort on them (`db.rs:85-92` allows a NULL `rel` today), which is precisely why the property is tested
+  here instead of constrained in the schema.
+- **Two claims about the code, each with a stated check.** "No `CAST` survives" and "one module owns both folds"
+  are otherwise unfalsifiable, so both get a grep a person can run: (a)
+  `grep -n "CAST(" crates/np-core/src/db.rs` matches only migration 4's own notes copy (`CAST(rel AS BLOB)`,
+  §4) and nothing in the steady-state write path — `upsert_file`, `apply_move`, the moved note insert;
+  (b) `grep -rn "fn .*fold\|to_lowercase" crates/np-core/src/*.rs` names a fold only inside
+  `crates/np-core/src/path_keys.rs`, plus a row-level assertion that every stored row satisfies
+  `case_bytes = path_keys::case_fold(rel_bytes)` and `case_key = rel.to_lowercase()`, which is what "the same two
+  functions wrote both columns" means when it is tested.
 - **Resolution stays honest.** A note linking `[[caf.md]]` with both twins present yields one
   `unresolved_targets` entry, not a guess; deleting one twin resolves it onto the survivor. This is the test
   that fails if `live_corpus` still collapses twins into one map entry (§3's list).
@@ -455,23 +570,50 @@ Removed/Added pairs before scanning and explain them afterwards; where the recei
 - **Migration test** on a hand-built version-3 database, following the `VERSION_TWO` fixture pattern
   (`crates/np-core/tests/db.rs:394-459`, `seed_version_two` at `:471`): ASCII and UTF-8 rows byte-identical
   after upgrade, `notes.id` unchanged, a stale note keeps its children (R2b's second ruling), the receipt is
-  written, and a file with a dangling `notes.rel_bytes` refuses to open. Four things this bullet used to leave
-  out:
+  written, and a file with a dangling `notes.rel_bytes` refuses to open. Six things this bullet has to cover:
   - **Pin the row counts of all four child tables** — `headings`, `tags`, `items`, `links` — before and after
     migration 4, not merely "a stale note keeps its children". Those are the four cascades §4's `DROP TABLE`
     hazard runs through, and a partial cascade that still leaves *some* children would pass the weaker claim.
+  - **Pin the counts of the two rebuilt tables too**: `COUNT(*)` of `files` and of `notes`, old versus new,
+    before each drop (§4). A child-table count cannot see a lost *attachment* row — it has no children, so
+    nothing cascades and `PRAGMA foreign_key_check` stays clean while the drop destroys it. Include a fixture
+    holding one attachment with no note row, which is exactly the row only this assertion can catch.
   - **Pin the refusal**: run the step with `PRAGMA foreign_keys = ON` and assert it errors out having touched
     nothing — child counts unchanged, `schema_version` unmoved, the file byte-identical if that is cheap to
-    assert.
+    assert. This needs a named direct-call seam, because nothing reachable through `Db::open` can observe it:
+    `migrate` forces the pragma off before the loop (`db.rs:301`) and the pragma has no effect inside a
+    transaction (`db.rs:296-303`). The seam already exists — `MIGRATIONS` is a `pub const` (`db.rs:64`) of a
+    `pub enum Migration` (`db.rs:153`), so the test destructures the fourth entry
+    (`let Migration::Code(step) = MIGRATIONS[3]`, the step fn named `byte_path_keys` in §4) and calls it on a
+    connection whose pragma the test set to `ON` outside any transaction.
+  - **Pin that the `foreign_key_check` gate refuses, not merely passes.** §4's gate is a defence only if
+    something can be turned away by it, so hand-build a version-3 fixture holding one `notes` row whose `rel`
+    names no `files` row — writable with the pragma off, which is how orphans got in once enough for migration 3
+    to count them (`FK_ORPHANS_KEY`, `db.rs:341`) — and assert the step returns its own error, leaves
+    `schema_version` where it was and changes no count. A test that only ever runs the gate on clean data proves
+    nothing about it.
   - **Pin that every key came from its own row**: after upgrade, each row's `rel_bytes` equals the bytes of
     that same row's `rel`, across several rows with different names. One bound parameter for `case_bytes`
     passes a one-row fixture and fails this.
   - **Pin the receipt** (`paths_lossy`) on a fixture holding one U+FFFD row as well as the zero case.
+- **Round 1's first scan is silent, and says so.** On a round-1 build (keys written, readers still display-keyed)
+  over the `caf\uFFFD.md` row above: the scan reports every file unchanged — no `Moved`, no `Removed`, no
+  `Added` — *and* `files.rel_bytes` now holds `63 61 66 E9 2E 6D 64`. Both halves matter: the first is §4.2's
+  claim that migration changes no comparison, the second is round 1's whole job (the keys converge to OS bytes
+  without a reader noticing).
 - **Migration, then scan.** On that hand-built database holding a row displayed as `caf\uFFFD.md` over a
-  workspace whose real file is `caf\xe9.md`: the first scan reports exactly one `Removed` and one `Added`
-  (§4.2), the receipt names that workspace beforehand, the stale row keeps its children and leaves the
-  catalog, and the scan after that reports nothing changed. Without this test §4.2's promise is a paragraph
-  rather than a fact.
+  workspace whose real file is `caf\xe9.md`, driven straight into a round-2 build with no scan in between — the
+  only route where a migrated lossy key is ever compared (§4.2): the first byte-keyed scan reports exactly one
+  `Moved` and nothing else, because the content did not change and `classify` pairs by hash (`change.rs:70-76`);
+  the receipt named that workspace beforehand; `notes.id` survives the move and keeps its children; the scan after
+  that reports nothing changed, which is the assertion that the byte key was actually rewritten rather than
+  re-derived every time. Then the same fixture with the file's **content** changed as well: there the first scan
+  reports one `Removed` and one `Added`, the re-added note carries a fresh `notes.id`, the stale row keeps its
+  children and leaves the catalog, and the edges into the old note appear in `unresolved_links` (§4.2). A third
+  shape is worth pinning because it is §1's real workspace: one migrated row carrying `caf\xe9.md`'s digest with
+  both twins on disk gives one `Moved` plus one `Added`, and two live rows by the second scan. Without these,
+  §4.2's promise is a paragraph rather than a fact — and the `Removed`-only version of this test, which is what
+  this plan first claimed, would fail on unchanged content.
 - **What SQLite calls an identity clash.** One test capturing the constraint name in the message *and* the
   extended code rusqlite surfaces for both an `upsert_file` clash and an `apply_move` clash, so the answer is
   evidence in a test file instead of a sentence here. Not load-bearing — `is_identity_conflict`
@@ -498,19 +640,31 @@ Removed/Added pairs before scanning and explain them afterwards; where the recei
       `note_id` in `scan.rs` and in `links.rs`, the catalog join, `LIVE_EDGE`, `known_rows`' `EXISTS`,
       `folded_row`, `live_corpus` — and `upsert_file`'s conflict target is `rel_bytes`. One of them left
       display-keyed is the bug, not a subset of the fix.
+- [ ] Every **writer** of a key writes it: `upsert_file` and `apply_move` bind `rel_bytes`/`case_bytes`, and
+      `store_note`'s insert (`scan.rs:769-773`) names `notes.rel_bytes` and binds it as bytes beside the display
+      `rel` (§3 — a note created without a key matches nothing in the re-keyed join, FK or cascade). After any
+      write pass, no `notes` row has `rel_bytes IS NULL`.
+- [ ] Every ordering site keys on bytes: `ORDER BY n.rel_bytes` (`scan.rs:869`) and `sort_key`'s last component
+      (`catalog.rs:132-139`), which means `CatalogEntry` carries a byte-typed `rel_bytes` to order on
+      (`scan.rs:904-913`) that nothing renders.
 - [ ] All three key columns carry `CHECK(typeof(…) = 'blob')`, every bind of a key is `&[u8]`/`Vec<u8>`, and
-      no `CAST` survives in the `files` write path.
+      no `CAST` survives in the `files` write path — checked by the grep §5 states, not by rereading this file.
 - [ ] Migration 4 is one `MIGRATIONS` entry, rebuilds only `files` and `notes`, copies `files` rowid-by-rowid
       in Rust with a per-row byte fold (no `INSERT … SELECT`, no single bound key), refuses to run when
-      `PRAGMA foreign_keys` reads `1`, pins all four child-table counts, gates on `PRAGMA foreign_key_check`,
-      and writes its receipt.
-- [ ] A workspace with no non-UTF-8 name reports nothing changed after migration 4; one with `N` flagged rows
-      reports exactly the churn §4.2 predicts and converges on the scan after.
+      `PRAGMA foreign_keys` reads `1`, asserts old-vs-new `COUNT(*)` before **each** drop (both `files` and
+      `notes`, so a lost attachment cannot be dropped away silently), pins all four child-table counts, gates on
+      `PRAGMA foreign_key_check` — with a test that shows the gate refusing, not just passing — and writes its
+      receipt.
+- [ ] Migration 4 itself reports nothing changed in **every** workspace, flagged or not (§4.2); the churn §4.2
+      describes belongs to the round that first compares byte keys, where a workspace with `N` flagged rows
+      reports about `N` `Moved` paths (or `Removed` + `Added` where content changed too) and converges on the
+      scan after.
 - [ ] Catalog order is deterministic for twins, from the byte key in `ORDER BY` and `sort_key`, not from a
       rowid nobody chose.
 - [ ] Every committed golden in `tests/golden/` is unchanged, byte for byte, in the same commit.
-- [ ] One module owns the (bytes, display) pair *and* both folds — `rel_bytes`/`case_bytes` and
-      `rel`/`case_key`; no call site hand-derives display text from bytes or a fold from either.
+- [ ] One named module owns the (bytes, display) pair *and* both folds — `crate::path_keys`, holding
+      `rel_bytes`/`case_fold` and `display`/`display_fold` (§4); no call site hand-derives display text from
+      bytes or a fold from either, and §5's grep is the check that this stayed true.
 - [ ] The `workspaces.workspace` key of the registry database is written down in the backlog as its own item
       (§2), not folded into this one.
 - [ ] Gates green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
@@ -526,29 +680,62 @@ bytes while the stored key is still display text, every non-UTF-8 row reads as r
 scan forever — §1's never-converges symptom, manufactured rather than fixed. That is the same half-moved rule
 this plan already refuses on Windows (§5): a key written under one rule and read under another.
 
-**Round 1 — schema only; nothing reads the new keys.** Migration 4 exactly as §4 describes it: both tables
-rebuilt with byte keys and their `CHECK`s, the rowid loop, the receipt, the `PRAGMA foreign_keys` guard — and
-no query changed to use any of it. Proves on its own: every golden byte-identical; every migrated row's
-`rel_bytes` equals the bytes of that row's own display `rel`; a version-3 file opens, passes
-`PRAGMA foreign_key_check`, keeps all four child-table counts and every `notes.id`; the receipt is written
-even at zero; the step refuses when enforcement is on. It changes no report line, because nothing reads the
-columns yet.
+**Round 1 — schema plus the statements that write keys; no reader touched.** Migration 4 exactly as §4
+describes it (both tables rebuilt with byte keys and their `CHECK`s, the rowid loop, the per-drop count
+assertions, the receipt, the `PRAGMA foreign_keys` guard), **plus** `path_keys` (§4) and the three statements
+that put values into key columns: `upsert_file`, `apply_move` and `store_note`'s insert (§3), each deriving both
+keys through that one module and binding them as bytes. Reads stay display-keyed, `upsert_file`'s conflict target
+stays `ON CONFLICT (rel)` (`db.rs:640`), and no query in §3's shared list changes — that is round 2's work, and
+it moves with its readers.
+
+**Why the writers cannot wait for round 2.** Two reasons, either of them fatal to a schema-only round 1.
+First, it would not run at all: `rel_bytes` and `case_bytes` are `NOT NULL UNIQUE` (§4) and `upsert_file`
+(`db.rs:638-645`) supplies neither, so the first upsert after migration 4 fails with
+`SQLITE_CONSTRAINT_NOTNULL` — which `is_identity_conflict` (`scan.rs:690-702`) does not accept as an identity
+clash, so it is not a `skipped` entry but a scan that ends in error, on every workspace, from the first file it
+writes. Second, migration 4 drops `files.case_key UNIQUE`, and that constraint is what rules P3's `skipped`
+report today (`db.rs:72`, `scan.rs:688-702`); a round that removes it before anything writes `case_bytes` deletes
+P3 outright, so `a.md` beside `A.md` would get two live rows and one note. Writing both keys in round 1 keeps the
+guard at ASCII-fold strength from the moment the old one goes away.
+
+Keeping the conflict target on `rel` here is deliberate, not an oversight: moving it to `rel_bytes` while
+`note_id`, the catalog join and `known_rows` still match display text creates exactly the half-moved state this
+section refuses below — two rows sharing one display spelling, one note between them, and a `LIMIT 1` deciding
+which file owns it.
+
+**What round 1 proves on its own.** Every golden byte-identical; every migrated row's `rel_bytes` equals the
+bytes of that row's own display `rel`, and after one scan every live row's `rel_bytes` holds the **OS** bytes of
+its path (§5); a version-3 file opens, passes `PRAGMA foreign_key_check`, keeps all four child-table counts plus
+`COUNT(*)` of `files` and `notes` old-versus-new and every `notes.id`; the receipt is written even at zero; the
+step refuses when enforcement is on, and refuses when the `foreign_key_check` gate finds a violation. Two
+report-line facts belong here as well, and neither is "nothing": an ASCII-case pair (`a.md` beside `A.md`) still
+lands in `skipped`, caught by `case_bytes UNIQUE` where `case_key UNIQUE` caught it before; and a Unicode-only
+pair (`Ämli.md` beside `ämli.md`) **stops** being skipped and gets two rows, because the fold that caught it left
+with the schema (§3's residual). A non-UTF-8 workspace reports nothing changed — its keys are repaired silently,
+because no reader compares them yet (§4.2).
+
+**What round 1 cannot prove.** Nothing about identity. Twins still collapse into one row, because `classify`,
+`known_rows` and the pending map still key on display text and the upsert still conflicts on `rel`. F13 is still
+open at the end of round 1; that is what makes the split honest rather than a way of shipping half a fix twice.
 
 **Round 2 — byte identity end to end.** §4.1's pipeline change plus every statement in §3's shared list,
 in one commit: the walk emits bytes, the digest carries them, `classify` indexes on them, `apply_changes`
-keys its pending map and its writes on them, and the display fold stays only where authors look. Proves on its
-own: §6's twin items — two rows, two notes, two catalog entries, both files openable from what was stored,
-the second scan reporting zero changes, twins landing in `unresolved_targets` rather than resolving by
-accident, deterministic catalog order.
+keys its pending map and its writes on them, `upsert_file`'s conflict target moves to `rel_bytes`, the catalog
+orders on it (`ORDER BY n.rel_bytes` at `scan.rs:869`, `sort_key` and `CatalogEntry.rel_bytes`), and the display
+fold stays only where authors look. Proves on its own: §6's twin items — two rows, two notes, two catalog
+entries, both files openable from what was stored, the second scan reporting zero changes, twins landing in
+`unresolved_targets` rather than resolving by accident, deterministic catalog order — and it owns §4.2's churn
+for every workspace that reaches it without an intervening scan.
 
-**Which one reverts alone.** Round 2. Dropping it leaves round 1's columns sitting unread, exactly as they
-were the day round 1 shipped — inert, no data loss, goldens unmoved. Round 1 does not revert once round 2 has
-run: by then the byte keys *are* the identity, and removing them is a second migration that has to invent
-display text out of bytes it cannot un-lossy. That asymmetry is the argument for this order, not a preference
-about which round gets the interesting work.
+**Which one reverts alone.** Round 2. Dropping it leaves round 1's keys being written and read by nobody — inert,
+no data loss, goldens unmoved, exactly the state they were in the day round 1 shipped. Round 1 does not revert
+once round 2 has run: by then the byte keys *are* the identity, and removing them is a second migration that has
+to invent display text out of bytes it cannot un-lossy. That asymmetry is the argument for this order, not a
+preference about which round gets the interesting work.
 
 **What must not be split out.** Any subset of §3's shared list on its own: re-keying `note_id` while
 `mark_stale` still matches display text moves the bug rather than fixing it, and a partially re-keyed database
-is precisely the state in which two rows and one note disagree silently. Nor may round 1 define the byte fold
-without naming its owner — `case_bytes` is derived beside `walk`'s display fold from the moment it exists,
-or round 2 will find two rules doing one job in two modules.
+is precisely the state in which two rows and one note disagree silently. Nor may round 1 write a key without
+naming the module that derives it: `path_keys` (§4) lands in the same commit as the first statement that binds
+`rel_bytes`/`case_bytes`, or round 2 will find two rules doing one job in two modules. And the conflict target
+may not be moved ahead of its readers, for the reason given above.
