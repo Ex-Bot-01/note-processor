@@ -1150,6 +1150,80 @@ fn a_byte_identical_rename_into_md_creates_the_missing_note_row() {
 }
 
 #[test]
+fn a_rename_carries_the_note_and_its_rendered_target() {
+    // Since migration 4, `notes.rel` is an ordinary TEXT column: its foreign key and its
+    // `ON UPDATE CASCADE` — the only thing that ever maintained that column — are gone (F13 §4), and
+    // `apply_move` took over the job as a statement of its own. Drop that statement and nothing reports a
+    // problem: the report still says nothing but `moved: 1`, while `known_rows` — which also asks about a
+    // note by display text — finds none for the new path, so a *second* note row is minted under it and the
+    // original one is orphaned on the dead path, invisible to the display-keyed join. All three halves are
+    // asserted together for that reason (F13 §5), and the id is asserted with them because the renderable
+    // half alone cannot see this failure.
+    let ws = scratch(&[("old.md", "# Umzug\n")], 600);
+    let first = scan(&ws.root, &ws.cfg).expect("first scan");
+    assert_eq!(first.notes, 1, "{first:?}");
+    let note_id = scalar(&ws.db(), "SELECT id FROM notes WHERE rel = 'old.md'");
+    assert!(
+        entry_line(&ws.root, "old.md").is_some(),
+        "premise: the note starts out catalogued: {}",
+        index_text(&ws.root)
+    );
+
+    // Byte-identical, so `classify` pairs the two paths by hash and reports one move with no content churn.
+    fs::rename(ws.root.join("old.md"), ws.root.join("new.md")).expect("test: rename the note");
+    let report = scan(&ws.root, &ws.cfg).expect("scan after the rename");
+    assert_eq!(report.moved, 1, "{report:?}");
+    assert_eq!(report.added, 0, "{report:?}");
+    assert_eq!(report.removed, 0, "{report:?}");
+
+    let db = ws.db();
+    // One: the registry row carries the new path and no row keeps the old one.
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE rel = 'new.md'"),
+        1
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE rel = 'old.md'"),
+        0,
+        "the old path is renamed, not duplicated"
+    );
+    // Two: the note's display target moved with those bytes — on the row it already was, since a second
+    // row minted under the new name would be a detached note wearing a live catalog entry.
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes WHERE rel = 'new.md'"),
+        1,
+        "the note followed its file"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes WHERE rel = 'old.md'"),
+        0,
+        "no note row may be left behind on the path that is gone"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT id FROM notes WHERE rel = 'new.md'"),
+        note_id,
+        "the same note, not a fresh one beside a stale old row"
+    );
+    // Three: what a person reads. The entry has to point at the new path and no generated file may still
+    // name the old one — §5's third half, and once readers key on bytes (round 2) the only half a reader of
+    // `INDEX.md` can be shown.
+    let line = entry_line(&ws.root, "new.md").unwrap_or_else(|| {
+        panic!(
+            "the renamed note must be catalogued: {}",
+            index_text(&ws.root)
+        )
+    });
+    assert!(line.contains("Umzug"), "{line}");
+    for (name, bytes) in generated_catalog(&ws.root) {
+        let text = String::from_utf8(bytes).expect("test: the catalog is UTF-8");
+        assert!(
+            !text.contains("old.md"),
+            "{name} still renders the path that no longer exists: {text}"
+        );
+    }
+}
+
+#[test]
 fn edge_into_a_deleted_note_reads_as_unresolved() {
     // Two notes linked together, in a corpus small enough to read the entry line off the catalog.
     let ws = scratch(

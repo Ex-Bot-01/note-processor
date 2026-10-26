@@ -15,11 +15,13 @@ use std::time::Duration;
 mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
+use np_core::config::Config;
 use np_core::db::{
     apply_move, mark_stale, note_counts, upsert_file, Db, DbError, Migration, NoteCounts,
     FK_ORPHANS_KEY, MIGRATIONS, PATHS_LOSSY_KEY,
 };
-use np_core::hash::Snapshot;
+use np_core::hash::{sha256_file, Snapshot};
+use np_core::scan;
 use tempfile::TempDir;
 
 /// A snapshot as `walk` + [`np_core::hash::sha256_file`] would produce it: `case_key` is
@@ -974,6 +976,31 @@ fn seed_lossy_version_three(path: &Path) {
     .expect("test setup: seed the lossy row");
 }
 
+/// Write a version-three database holding one row for `rel` whose `hash` and `size` are the ones really on
+/// disk, plus that file's note row.
+///
+/// [`seed_lossy_version_three`] cannot be reused here: its digests are placeholders (`'hl'`), which a scan
+/// would read as modified content. `mtime` stays an impossible `1` on purpose — the cheap trigger has to
+/// *fail*, so the silence this fixture buys comes from the content hash matching, not from a size-and-mtime
+/// shortcut.
+fn seed_scanned_lossy_version_three(path: &Path, rel: &str, hash: &str, size: i64) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_THREE)
+        .expect("test setup: version-three schema");
+    conn.execute(
+        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, 'ok', 90)",
+        rusqlite::params![rel, rel.to_lowercase(), format!("/ws/{rel}"), hash, size],
+    )
+    .expect("test setup: seed the scanned lossy row");
+    conn.execute(
+        "INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body)
+         VALUES (4, ?1, 'Cafe', 'filename', 'utf-8', 1, 'body')",
+        rusqlite::params![rel],
+    )
+    .expect("test setup: seed the scanned lossy note");
+}
+
 /// The tables whose rows migration 4 must neither lose nor duplicate — the two it rebuilds and the four
 /// whose cascades [`np_core::db::MIGRATIONS`]' fourth step could otherwise ride.
 const COUNTED_TABLES: &[&str] = &["files", "notes", "headings", "tags", "items", "links"];
@@ -1347,6 +1374,94 @@ fn the_lossy_receipt_counts_files_and_notes_in_both_shapes() {
         lossy_receipt(&db),
         "files=1,notes=1",
         "the count names both tables, so a flagged path is never read as an unflagged one"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_migrated_lossy_path_scans_silent_and_keeps_its_lossy_key() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // Round 1's two promises about the workspace F13 §1 is built from: the file on disk is `caf\xe9.md`
+    // and every row written about it spells itself `caf\u{FFFD}.md`.
+    //
+    // (1) Migration 4 changes no comparison (§4.2), so the first scan after the upgrade reports exactly what
+    //     the scan that wrote these rows reported: nothing changed, nothing added, nothing removed.
+    // (2) Round 1 derives both keys from `s.rel` and never from the byte-exact `abs` a writer is handed (§7),
+    //     so `files.rel_bytes` holds the bytes of the *display* spelling. That half is the pin: switch
+    //     `upsert_file` to `abs` and keys go byte-exact for every rewritten row while `note_id`, the catalog
+    //     join and `known_rows` still match lossy text — the half-moved state §7 refuses, invisible to every
+    //     other test here because round 1 reads nothing but display text.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace directory");
+    let on_disk = root.join(OsString::from_vec(b"caf\xe9.md".to_vec()));
+    fs::write(&on_disk, "# Cafe\n").expect("test setup: write the non-UTF-8 named note");
+
+    // The lossy spelling of that name — what `walk` records as `rel`, and all a version-three row can hold.
+    let display = "caf\u{FFFD}.md";
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+    let db_path = cfg.workspace_db(&root);
+    fs::create_dir_all(
+        db_path
+            .parent()
+            .expect("test setup: the workspace database sits in a directory"),
+    )
+    .expect("test setup: database directory");
+    let hash = sha256_file(&on_disk).expect("test setup: hash the note the way a scan does");
+    let size = fs::metadata(&on_disk)
+        .expect("test setup: read the note's size")
+        .len() as i64;
+    seed_scanned_lossy_version_three(&db_path, display, &hash, size);
+    assert_eq!(
+        rusqlite::Connection::open(&db_path)
+            .expect("test: read the fixture's version")
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("test: the fixture records its versions"),
+        3,
+        "premise: this is a version-three file, so the scan below runs migration 4 on its way in"
+    );
+
+    let report = scan(&root, &cfg).expect("the first scan after migration 4");
+    assert!(report.skipped.is_empty(), "{report:?}");
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 0, 0),
+        "a migrated row is not a changed row: {report:?}"
+    );
+    assert_eq!(
+        report.unchanged, 1,
+        "the one file was already known exactly as it is: {report:?}"
+    );
+    assert_eq!(
+        report.notes, 1,
+        "and its note row came through the upgrade: {report:?}"
+    );
+
+    let db = Db::open(&db_path).expect("test: reopen the migrated database");
+    let key: Vec<u8> =
+        db.0.query_row(
+            "SELECT rel_bytes FROM files WHERE rel = ?1",
+            rusqlite::params![display],
+            |row| row.get(0),
+        )
+        .expect("the lossy row carries a byte key after a round-1 scan");
+    assert_eq!(
+        key,
+        vec![0x63, 0x61, 0x66, 0xEF, 0xBF, 0xBD, 0x2E, 0x6D, 0x64],
+        "round 1 keys on `s.rel` (F13 §7): the bytes of the display spelling, U+FFFD included"
+    );
+    assert_ne!(
+        key,
+        vec![0x63, 0x61, 0x66, 0xE9, 0x2E, 0x6D, 0x64],
+        "the byte-exact name on disk is round 2's key; writing it here would put new rows under one rule \
+         and every read under another"
     );
 }
 
