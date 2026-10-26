@@ -442,12 +442,16 @@ fn crowded_wide_tokens_stay_inside_the_column_budget() {
     assert!(lines.len() > 1, "a wide crowded entry must wrap: {lines:?}");
     for line in &lines {
         assert!(columns(line) <= 100, "{} columns: {line:?}", columns(line));
-        assert!(
-            line.chars().count() < columns(line),
-            "a wrapped line should carry wide characters, whose columns a character count misses: \
-             {line:?}"
-        );
     }
+    // Some line must carry wide characters — that is what this fixture exists to exercise — but not
+    // every line does: the tail of a wrap can be pure ASCII, and asserting it per line would fail on
+    // fixture luck with a message blaming the wrong thing.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.chars().count() < columns(line)),
+        "at least one wrapped line must carry wide characters: {lines:?}"
+    );
     assert_eq!(
         body(contents(&rendered, "INDEX.md"))
             .trim_end()
@@ -542,6 +546,39 @@ fn ascii_wrap_point_did_not_move() {
     assert!(lines[1].starts_with("  #tag9"), "{lines:?}");
 }
 
+/// Every rendered column is budgeted, including the ones a continuation line spends before its first
+/// token. Omitting the indent let a wrapped entry reach `COLUMN_LIMIT + indent` columns while still
+/// passing a per-line content check — F12's "within 100 columns" is about what a reader sees.
+#[test]
+fn a_continuation_line_fits_the_budget_including_its_indent() {
+    // Eight-column tags, none of them an over-long token, so every line owes its width to wrapping.
+    let tags: Vec<String> = (1..=20).map(|index| format!("tag{index:05}")).collect();
+    let crowded = CatalogEntry {
+        tags,
+        ..entry("T", "r.md", "1 B", &[], 0, 0)
+    };
+
+    for indent in [0_usize, 2, 5] {
+        let layout = CatalogConfig {
+            max_entries_per_file: 600,
+            continuation_indent: indent,
+        };
+        let rendered = render(std::slice::from_ref(&crowded), &layout);
+        let lines: Vec<&str> = body(contents(&rendered, "INDEX.md")).lines().collect();
+        assert!(
+            lines.len() > 1,
+            "twenty tags must wrap at indent {indent}: {lines:?}"
+        );
+        for line in &lines {
+            assert!(
+                columns(line) <= 100,
+                "indent {indent}: {} columns on a 100-column budget: {line:?}",
+                columns(line)
+            );
+        }
+    }
+}
+
 /// The `unicode-width` behaviour `catalog::wrap` depends on. The dependency is pinned exactly in
 /// the workspace manifest; this is its behavioural half: an upgrade that reclassifies one of these
 /// characters fails here instead of moving a wrap point and changing published bytes silently.
@@ -556,6 +593,26 @@ fn pinned_display_widths_of_the_rendered_shapes() {
     // calling `UnicodeWidthStr::width` rather than `width_cjk`, because two columns here would
     // rewrite every committed golden.
     assert_eq!("·—→←".width(), 4, "the line format's own separators");
+    // Multi-scalar shapes, which is where a width-table revision actually bites: a flag pair, a
+    // skin-tone modifier and a family built with ZWJ are each one grapheme whose column count is a
+    // policy decision inside the dependency, not something this crate can derive.
+    assert_eq!("🇯🇵".width(), 2, "a flag pair renders as one glyph");
+    assert_eq!(
+        "👍🏽".width(),
+        2,
+        "a skin-tone modifier does not double the width"
+    );
+    assert_eq!(
+        "👨\u{200d}👩".width(),
+        2,
+        "a ZWJ family is one glyph, not two"
+    );
+    // What characters that take up no ink actually cost: a control character is measured as one column
+    // (a stray tab in a title spends a column of budget, which is fair), while a zero-width space
+    // measures none, so a title carrying one gets marginally more room than it looks to deserve. Pinned
+    // as knowledge — titles and tags reach the catalog verbatim and nothing here strips them.
+    assert_eq!("\t".width(), 1, "a control character is charged one column");
+    assert_eq!("\u{200b}".width(), 0, "a zero-width space is charged none");
 }
 
 #[test]

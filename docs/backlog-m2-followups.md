@@ -124,6 +124,12 @@ Order of attack, round by round — each round is one task brief with its own re
 - **Fix:** measure with display width (East Asian wide, combining marks, emoji) while keeping the wrap point a pure
   function of bytes so byte-stability holds. **Done when:** a CJK-titled note renders within 100 *columns* and the
   golden files are regenerated deliberately in their own commit.
+- **Resolved in `42bf672` plus its review round.** Width comes from `unicode-width`, pinned exactly (`=0.2.2`) so a
+  Unicode revision cannot move a wrap point silently, with the relied-upon widths asserted in `pinned_display_widths_of_
+  the_rendered_shapes`. The review caught that the budget ignored the continuation indent — a wrapped entry reached 101
+  visible columns against a 100-column promise — now deducted (`wrap`'s `prefix`) and pinned at indents 0, 2 and 5.
+  **No golden was regenerated**: every committed golden is ASCII or single-width, so the wrap points did not move; the
+  wide-character fixture that *would* change bytes is filed as F16 rather than smuggled in here.
 
 ## Measurement protocol for the performance items (F9, F10)
 
@@ -198,6 +204,17 @@ What these numbers can and cannot carry:
 - **Fix:** store raw bytes for `rel` (BLOB or TEXT with a byte-preserving encoding) on Unix and keep the display
   string derived; add a migration and a round-trip test using a latin-1 path name. **Done when:** two paths that
   differ only in invalid UTF-8 bytes get distinct rows and both resolve.
+
+## F16 — no wide-character fixture in the golden corpus
+
+- **Where:** `crates/np-core/tests/golden/` holds ASCII titles only, so a width regression can only be caught by the
+  unit tests in `tests/catalog.rs`, never by the byte-for-byte golden check.
+- **Why it is not done in F12:** adding a CJK or emoji title changes more than one file — it moves wrap points, can land
+  in a different bucket and therefore change shard names, and both `cli` and `scan` goldens embed the generated file
+  list. That is a deliberate regeneration across several fixtures and must be its own commit with its own review.
+- **Fix:** add one wide-titled note to the shared corpus, regenerate every affected golden in a single commit, and
+  confirm the independent verifier still reports `GOLDEN CHECK: pass` against the new bytes. **Done when:** the golden
+  corpus contains at least one two-column title and CI is green on both runners.
 
 ---
 

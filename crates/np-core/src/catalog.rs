@@ -178,8 +178,9 @@ fn entry_line(entry: &CatalogEntry) -> String {
 }
 
 /// Wrap one logical line at [`COLUMN_LIMIT`] columns: break before the token that would cross
-/// the limit, indent continuation lines by `indent` spaces. A token longer than the limit is kept
-/// whole on a line of its own rather than split.
+/// the limit, indent continuation lines by `indent` spaces. The budget counts the rendered line, so a
+/// continuation line has its indent deducted before the first token. A token longer than the limit is
+/// kept whole on a line of its own rather than split.
 ///
 /// Width is measured in display columns (UAX #11, via `unicode-width`), not characters: a CJK
 /// ideograph or emoji occupies two columns and a combining mark none, so counting characters let a
@@ -190,11 +191,16 @@ fn entry_line(entry: &CatalogEntry) -> String {
 fn wrap(line: &str, indent: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
     for token in line.split(' ') {
+        // A continuation line spends `indent` columns on its prefix before its first token, so those
+        // columns are already gone when deciding whether the next token still fits. Leaving the prefix
+        // out of the budget let a wrapped entry reach `COLUMN_LIMIT + indent` on screen — 101 visible
+        // columns against a 100-column promise.
+        let prefix = if lines.len() > 1 { indent } else { 0 };
         let current = lines.last_mut();
         match current {
             None => lines.push(token.to_string()),
             Some(current) => {
-                let width = current.width() + 1 + token.width();
+                let width = current.width() + prefix + 1 + token.width();
                 if width > COLUMN_LIMIT {
                     lines.push(token.to_string());
                 } else {
