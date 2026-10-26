@@ -503,7 +503,9 @@ fn an_incomplete_refresh_reports_the_gap_on_stderr() {
 ///
 /// Both receipts are put in front of it at once — one unreadable note makes the refresh incomplete, so the
 /// count line and the gap line are both due — which is what keeps this from passing with only one of the two
-/// write sites made non-fatal.
+/// write sites made non-fatal. That "both are due" is itself a premise, so it is asserted below as well: on a
+/// runner that reads a 0o000 file anyway (a privileged user) the refresh completes, only the count line is
+/// ever written, and one non-fatal write site would be enough to pass.
 ///
 /// This case deliberately does **not** go through [`run`]: that helper captures stdout *and* stderr so the
 /// other cases can assert on them, and a test whose subject is descriptor 2 has to place the descriptor
@@ -546,6 +548,14 @@ fn a_scan_survives_a_stderr_that_refuses_every_write() {
         "a scan must not fail because stderr refused its receipt: stdout `{}`, stderr `{}`",
         survived.stdout(),
         survived.stderr()
+    );
+    // The second premise, from the other end: the gap line was actually owed. The plain summary prints the
+    // skipped paths on stdout, so a run that missed nothing — a privileged runner reading the 0o000 note —
+    // fails here instead of passing with only the count line in front of the refusing descriptor.
+    assert!(
+        survived.stdout().contains(BLOCKED_NOTE),
+        "the gap line was never due: nothing was missed:\n{}",
+        survived.stdout()
     );
     // The work is committed and still reported where it can be read.
     assert!(
