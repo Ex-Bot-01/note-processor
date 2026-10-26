@@ -192,10 +192,11 @@ pub fn scan_with_inject(
     let walked = walk::walk(&root, &WalkOptions::default())?;
     after_walk(&root);
 
-    // A directory that could not be entered holds files that are unknown rather than absent: their
-    // known rows stay out of the comparison (see [`known_rows`]) and the directory itself is what the
-    // report names. A name the byte spelling cannot hold is the same rule about one file instead of a
-    // subtree (F18): it is not indexed this scan, its row keeps what it holds, and the path is named here.
+    // A directory whose contents the walk did not read holds files that are unknown rather than absent — it
+    // could not be entered, or its **own name** was refused (F18), which hides the same subtree. Their known
+    // rows stay out of the comparison (see [`known_rows`]) and the directory itself is what the report names.
+    // A refused *file* name is the same rule about one path instead of a region: it is not indexed this scan,
+    // its row keeps what it holds, and the path is named here too.
     skipped.extend(walked.unreadable.iter().cloned());
     skipped.extend(walked.unrepresentable.iter().cloned());
     let found = read_found(&walked.files, &mut skipped);
@@ -437,7 +438,9 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// so their rows must reach neither a `Removed` nor a move (Task 4 handoff), and leaving them in would
 /// stale a whole subtree over one transient permission error. A refused name is the third piece of the same
 /// rule ([`is_unknown_path`], F18): the file is there, but its identity could not be spelled, so its row
-/// keeps what it has instead of being marked stale for want of a key.
+/// keeps what it has instead of being marked stale for want of a key. A refused **directory** needs no fourth
+/// rule: [`crate::walk`] records it in `unreadable`, because an unspellable name makes every path below it
+/// unkeyable too — the same hole an unreadable one cuts, by the same prefix.
 ///
 /// The note test correlates on `rel_bytes`: with twins a note belonging to either file would otherwise
 /// answer for both, and that boolean feeds the refresh-coverage decision, which decides whether
@@ -505,8 +508,11 @@ fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
 /// They describe different shapes of "unknown" and so match differently: an unreadable **directory** hides a
 /// whole subtree, hence [`under_unreadable`]'s prefix rule, while a refused name
 /// ([`crate::walk::Walked::unrepresentable`], F18) is one file rather than a region, hence exact equality.
-/// Both suppress `Removed` for the same reason — the scan did not see that path, which is not evidence it
-/// stopped existing.
+/// A refused **directory** belongs to the first list rather than the second
+/// ([`crate::walk::Walked::unreadable`]), and that is not a convenience: its name is the first component of
+/// every path below it, so none of those can be keyed either and the whole subtree needs the prefix rule.
+/// Every arm here suppresses `Removed` for the same reason — the scan did not see that path, which is not
+/// evidence it stopped existing.
 ///
 /// A refused name is compared as display text, and that costs nothing on the only platform that can produce
 /// one: Windows builds its key from `to_string_lossy`, so a refused path's `rel_bytes` *are* these bytes
