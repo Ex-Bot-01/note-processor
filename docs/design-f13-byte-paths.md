@@ -204,9 +204,13 @@ option; a subset re-keyed is the bug moved, not fixed.
 - **`note_id`** (`scan.rs:824-831`) and the same statement inside `links::store_links` (`links.rs:504-520`)
   — `SELECT id FROM notes WHERE rel = ?1 LIMIT 1`. The `LIMIT 1` is what makes today's answer silently wrong
   instead of loud: with twins it hands one file's text to the other note, rewriting its title, tags, items
-  and links. Fix: select by `rel_bytes`, and **drop the `LIMIT 1`** so a future duplicate fails with
-  `ExecuteMultipleValues` rather than picking a row; §5 pins the one-note-per-file assumption that today's
-  `LIMIT` hides.
+  and links. Fix: select by `rel_bytes`, and **read every id for that key instead of `LIMIT 1`** — then act on
+  the count. Exactly one row is the normal path; more than one is an identity conflict, so the file goes to
+  `skipped` under a reason naming the duplicate and **no note is rewritten**, while the scan carries on.
+  Two wrong answers are ruled out here on purpose: silently picking corrupts a note's whole derived set, and
+  letting `ExecuteMultipleValues` escape turns a legacy workspace into one that can never be scanned again —
+  the same reasoning that makes [`crate::db`] refuse rather than guess at migration time, applied where the
+  user can still act on it. §5 pins the population this rule covers.
 - **`store_note`'s insert** (`scan.rs:769-773`) — `INSERT INTO notes (rel, title, title_source, encoding,
   word_count, body)`, and the **only writer of `notes.rel`** in the program. It is a writer rather than a reader,
   which is why it belongs on this list at all: under (b) that statement is what puts values into the note side of
@@ -802,11 +806,14 @@ for every workspace that reaches it without an intervening scan.
 
 One hazard arrives with it, and round 2 must not discover it late: **`notes` can legitimately hold two rows for one
 path.** `notes.rel` was never `UNIQUE` at version 3, so a legacy database may carry duplicate note rows for the same
-file; migration 4 copies both onto the same `rel_bytes`, which has no `UNIQUE` there by design. Every identity lookup
-round 2 writes must therefore say what it does with more than one row — an explicit `LIMIT 1` with the tie-break
-named, or an aggregate — because a bare `query_row` on a two-row key is not a wrong answer but a scan error. §5 asks
-for the two properties that make the population visible (`GROUP BY rel_bytes HAVING COUNT(*) > 1`, and no
-`rel_bytes IS NULL` after a write pass) for exactly this reason.
+file; migration 4 copies both onto the same `rel_bytes`, which has no `UNIQUE` there by design. Round 2's rule for
+that population is in §3's `note_id` item — **read every id, and treat more than one as an identity conflict**: the
+file goes to `skipped` naming the duplicate, nothing is rewritten, the scan continues. Neither silent pick nor loud
+abort is acceptable, so neither is what round 2 writes. Two consequences for the suite: §5 asks for the two
+properties that make the population visible (`GROUP BY rel_bytes HAVING COUNT(*) > 1`, and no `rel_bytes IS NULL`
+after a write pass), and `two_note_rows_on_one_path_…` keeps its opening premise ("a legacy duplicate must not fail
+the scan") while its later assertions are **amended in round 2** to expect the duplicate path reported rather than
+indexed quietly. A test that freezes today's silent choice is the one thing this hazard must not keep.
 
 **Which one reverts alone.** Round 2. Dropping it leaves round 1's keys being written and read by nobody — inert,
 no data loss, goldens unmoved, exactly the state they were in the day round 1 shipped. Round 1 does not revert

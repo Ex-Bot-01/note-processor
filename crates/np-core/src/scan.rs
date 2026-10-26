@@ -473,7 +473,7 @@ fn under_unreadable(rel: &str, unreadable: &[String]) -> bool {
 /// database and be re-hashed by every later scan forever (Task 4 handoff).
 ///
 /// A path whose identity is already held by another row — two files named `a.md` and `A.md` on a
-/// case-sensitive filesystem, where `files.case_key` stays unique and nothing picks a winner — is
+/// case-sensitive filesystem, where `files.case_bytes` stays unique and nothing picks a winner — is
 /// reported under `skipped` and left out of the counts instead of aborting the scan (ruling P3).
 fn apply_changes(
     db: &Db,
@@ -592,7 +592,7 @@ fn index_file(
             if !case_sensitive {
                 // Identity first: on a case-insensitive filesystem the row may sit under another
                 // spelling of the same name — a case-only rename emits no change at all — and upserting
-                // over it would trip `files.case_key UNIQUE` instead of renaming the note that is still
+                // over it would trip `files.case_bytes UNIQUE` instead of renaming the note that is still
                 // the same note (Task 4 handoff).
                 if let Some(old) = folded_row(db, &snapshot.case_key, rel)? {
                     if let Err(err) = db::apply_move(db, &old, rel, now) {
@@ -615,7 +615,8 @@ fn index_file(
         // derived rows were written by rules this build no longer has.
         let rewritten = refresh || matches!(change, Some(Change::Added | Change::Modified));
         // One id lookup per note, resolved here — after any move above has been applied, which is
-        // what lets `notes.rel ON UPDATE CASCADE` have caught up with the path. The same answer
+        // what lets [`db::apply_move`] have rewritten `notes.rel` onto the new path (migration 4 removed the
+        // foreign key that used to do it). The same answer
         // decides whether a note without a row is rebuilt (`is_none()` below) and whether
         // [`store_note`] updates or inserts; looking it up again inside `store_note` was F10.
         let existing = note_id(db, rel)?;
