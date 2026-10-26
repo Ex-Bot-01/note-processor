@@ -3285,3 +3285,173 @@ fn a_migrated_text_keyed_row_behind_an_unreadable_directory_is_not_reported_remo
         "the refresh that finally covered the corpus is allowed to record"
     );
 }
+
+/// **F23's fence.** A display-keyed row whose own file is *inside* the unreadable directory, with a readable byte
+/// twin beside it that this scan indexes for the first time. Hiding the row here is correct: the listed twin really
+/// is a new file, and the note behind the blocked directory really is unknown rather than absent.
+///
+/// This is the case that **proved the obvious fix unsafe**. "Skip the fallback when the walk listed a path with this
+/// display text" looks like it cures F23's duplicate rows, and here it produces `removed: 1` — a live note staled and
+/// dropped from the catalog while `PARSE_VERSION` is recorded over rows nobody re-parsed (design-f20 §4.2). A lossy
+/// key holds no byte spelling, so nothing computable in `known_rows` can tell this configuration from the one
+/// [`known_defect_a_readable_display_keyed_path_duplicates_its_own_row`] documents: hand those two scans the same
+/// inputs to `known_rows` and the right verdicts are opposite.
+///
+/// Any future fix that makes this test report `removed: 1`, or moves the note off its id, has destroyed a live note.
+#[cfg(unix)]
+#[test]
+fn a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_NINE:?}; \
+             the matcher units in `scan::tests` still cover both arms"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    // Migration 4's shape: the row for real bytes `63 61 66 E9 …` keyed from its own lossy display text.
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, outdated_parse_version());
+    let legacy_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(legacy_note_id > 0, "test setup: the note exists to keep");
+    drop(db);
+
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the legacy row's own directory on this runner \
+             (a privileged user?), so nothing was hidden from this scan"
+        );
+        return;
+    }
+    // The twin appears only now, so it is listed with no row of its own — and it displays exactly the text the
+    // display-keyed row holds. Its **body differs** from the hidden note's on purpose: identical content would let
+    // `classify` pair them by hash and report a tidy `Moved`, which would hide the whole question. The dangerous
+    // configuration is a twin that shares a display spelling and nothing else, and that is what this fixture builds.
+    assert!(
+        plant_twin_dir(&ws.root, TWIN_DIR_EIGHT),
+        "test setup: plant the readable twin"
+    );
+    fs::write(
+        byte_name(&ws.root, TWIN_DIR_EIGHT).join("note.md"),
+        "# Quite Another Heading\n\nThe body shares nothing with the hidden note.\n",
+    )
+    .expect("test setup: give the twin its own content");
+
+    let report = scan(&ws.root, &ws.cfg).expect("a blocked directory must not fail the scan");
+    assert_eq!(
+        (report.added, report.moved, report.removed),
+        (1, 0, 0),
+        "the twin is new work; the hidden note is neither a move nor a removal: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'")
+        ),
+        1,
+        "the fence: the display-keyed row stays live — `removed: 1` here means a live note was destroyed"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        legacy_note_id,
+        "and it stays the same note, not a fresh id behind a re-added path"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(outdated_parse_version()),
+        "the hidden note is charged to a refresh that could not reach it"
+    );
+}
+
+/// **F23's harm, pinned as a defect rather than as desired behaviour.** The same display-keyed row, with the
+/// unreadable directory now on the *other* twin: this scan reads the row's own path, yet the fallback still hides it,
+/// because a display spelling has many byte twins and the row records none of them. With nothing to pair against,
+/// the listed file indexes as `Added`, so one physical file ends up with two live `files` rows and two `notes` rows —
+/// two catalog entries, links and headings free to diverge between the ids — and `hidden_by_unknown` holds
+/// `PARSE_VERSION` back until somebody renames or removes the twin. **No scan clears either half.**
+///
+/// Removing the fallback does "fix" this case — with it gone the scan pairs by hash and reports a clean `Moved: 1`,
+/// one live row, which is exactly why the narrow rule looked like a cure. It is not: the same change turns the
+/// configuration in
+/// [`a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`] into `added: 1, removed: 1`,
+/// destroying a live note. Delete this test in the same commit that fixes F23; do not let it harden into a guard on
+/// the bug.
+#[cfg(unix)]
+#[test]
+fn known_defect_a_readable_display_keyed_path_duplicates_its_own_row() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_NINE:?}; \
+             F23 stays unpinned on this runner"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    // The blocked directory is the twin; the display-keyed row's own path is perfectly readable this scan.
+    assert!(
+        plant_twin_dir(&ws.root, TWIN_DIR_EIGHT),
+        "test setup: plant the twin that will be blocked"
+    );
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_EIGHT));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_EIGHT)) {
+        eprintln!("NOT COVERAGE: 0o000 did not deny access to the twin on this runner");
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("the defect must not fail the scan");
+    assert_eq!(
+        (report.added, report.moved, report.removed),
+        (1, 0, 0),
+        "the readable path is re-indexed as new work instead of pairing with its own row: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM files WHERE rel = 'caf\u{fffd}/note.md' AND state = 'ok'"
+        ),
+        2,
+        "one physical file, two live registry rows — F23's duplicate"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM notes WHERE rel = 'caf\u{fffd}/note.md'"
+        ),
+        2,
+        "and two live notes rows for it: one under the lossy key {LOSSY_KEY}, one the re-indexed path created"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(outdated_parse_version()),
+        "the hidden row also holds the parse version back, every scan, until the twin is renamed"
+    );
+}
