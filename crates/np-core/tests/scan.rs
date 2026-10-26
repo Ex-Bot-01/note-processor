@@ -2676,3 +2676,126 @@ fn a_superseded_shard_and_its_foreign_twin_are_judged_by_their_own_bytes() {
         "{published} is republished"
     );
 }
+
+/// The other direction of the same union: `meta` names a superseded shard that is **no longer on disk**.
+///
+/// This is the property that licenses `set_index_list` committing the name list inside the transaction,
+/// ahead of the writes it describes — a list that *leads* reality costs nothing, because a name already gone
+/// is exactly the state the delete loop wanted. Silence is the only sensible answer here: reporting the name
+/// would put a collision in front of the user that they cannot look at, and treating it as an error would
+/// break every later scan of a workspace whose shard an editor or a sync tool removed.
+#[test]
+fn a_superseded_shard_that_is_already_gone_from_disk_is_silent_and_not_fatal() {
+    let ws = scratch(
+        &[
+            ("a.md", "one\n"),
+            ("b.md", "two\n"),
+            ("c.md", "three\n"),
+            ("d.md", "four\n"),
+        ],
+        2,
+    );
+    let first = scan(&ws.root, &ws.cfg).expect("scan that shards");
+    assert_eq!(first.index_files.len(), 3, "{first:?}");
+    // Premise: `meta` names both shards, so the one deleted below is genuinely a name left behind — this is
+    // the committed-ahead list, not a disk-only candidate.
+    assert_eq!(index_files_meta(&ws.db()), first.index_files);
+
+    fs::remove_file(ws.root.join("c.md")).expect("test: shrink the corpus");
+    fs::remove_file(ws.root.join("d.md")).expect("test: shrink the corpus");
+    // Both shards are now superseded; one of them is also gone from disk by hand, which is the state a scan
+    // meets when something else cleared a shard it still has to account for.
+    let gone = first.index_files[1].clone();
+    fs::remove_file(ws.root.join(&gone)).expect("test: remove a published shard");
+
+    let second = scan(&ws.root, &ws.cfg)
+        .expect("a superseded name already gone from disk must not fail the scan");
+
+    assert!(
+        second.skipped.is_empty(),
+        "a shard that is simply absent is not a collision anybody can inspect: {:?}",
+        second.skipped
+    );
+    // The ordinary path still runs beside it: the sibling shard, still on disk and carrying our header, is
+    // deleted as always, and this generation's list replaces the stale one.
+    assert_eq!(second.index_files, vec!["INDEX.md".to_string()]);
+    assert!(
+        !ws.root.join(&first.index_files[2]).exists(),
+        "the superseded shard still on disk is deleted as usual: {:?}",
+        generated_catalog(&ws.root)
+    );
+    assert!(!ws.root.join(&gone).exists(), "{gone} stays gone");
+    assert_eq!(index_files_meta(&ws.db()), vec!["INDEX.md".to_string()]);
+}
+
+/// The F13 §1 twin pair again with a **directory** on the foreign side, which is the case that puts the
+/// file-type check to work: it runs per entry, off the listing, before anything is opened. A verdict taken on
+/// the shared display text would answer for whichever entry readdir reached first, and either answer is a
+/// bug — ours unlinked at nothing (the directory's verdict), or `remove_file` on a directory answering
+/// `IsADirectory` rather than `NotFound`, which is not survivable by any later scan of the workspace.
+#[cfg(unix)]
+#[test]
+fn a_directory_twinning_our_published_shard_is_judged_by_its_own_bytes() {
+    let ws = scratch(&[("a.md", "one\n"), ("b.md", "two\n")], 1);
+    let first = scan(&ws.root, &ws.cfg).expect("scan that shards");
+    assert_eq!(first.index_files.len(), 3, "{first:?}");
+
+    // Our own published shard, moved to the raw-byte twin spelling: same bytes, a name this scan will not
+    // produce, so it is ours and superseded.
+    let published = first.index_files[1].clone();
+    let ours = byte_name(&ws.root, TWIN_RAW);
+    fs::rename(ws.root.join(&published), &ours)
+        .expect("test: rename a published shard to its twin spelling");
+    // The foreign twin is a directory wearing the other byte spelling of the same display text, with prose of
+    // its own inside. np publishes files and unlinks files; it never opens or removes a directory here.
+    let dir = byte_name(&ws.root, TWIN_ENCODED);
+    fs::create_dir(&dir).expect("test: plant a directory under the twin spelling");
+    let inside = dir.join("inside.md");
+    fs::write(&inside, "somebody else's prose\n").expect("test: write the directory's content");
+
+    let second = scan(&ws.root, &ws.cfg).expect("a directory twin must not fail the scan");
+
+    // Untouched as a directory, and untouched inside: nothing fingerprinted it or tried to unlink it.
+    assert!(
+        dir.is_dir(),
+        "np never removes a directory, however much its name looks like ours: {:?}",
+        second.skipped
+    );
+    assert_eq!(
+        fs::read(&inside).expect("test: re-read the file inside the directory"),
+        b"somebody else's prose\n",
+        "and nothing below it is opened or rewritten"
+    );
+
+    // Our shard keeps its own verdict and is unlinked at the path the listing produced. Had the directory's
+    // verdict covered both entries sharing the display text, this file would have survived in silence.
+    assert!(
+        !ours.exists(),
+        "a superseded shard np can prove it published is unlinked at its own path: {:?}",
+        second.skipped
+    );
+
+    // The collision is reported once, in the display text a report line can hold — and it is the only thing
+    // this scan had to say about the root.
+    let display = String::from_utf8_lossy(TWIN_ENCODED).into_owned();
+    assert_eq!(
+        second.skipped,
+        vec![display.clone()],
+        "the directory has to be named and nothing else reported"
+    );
+
+    // Both twins stay out of the corpus on their generated name — the walk prunes the directory at depth 1,
+    // so its own content is never indexed either — and the shard this scan publishes is written again.
+    assert_eq!(second.notes, 2, "{second:?}");
+    assert_eq!(second.index_files, first.index_files, "{second:?}");
+    assert!(
+        ws.root.join(&published).is_file(),
+        "{published} is republished"
+    );
+
+    // And it is stable rather than fatal: a directory nothing may delete must not turn the next scan into an
+    // error, which is the failure mode this branch exists to avoid.
+    let third = scan(&ws.root, &ws.cfg).expect("a rescan with the directory still in place");
+    assert!(dir.is_dir(), "the directory outlives a second scan");
+    assert_eq!(third.skipped, vec![display], "{third:?}");
+}
