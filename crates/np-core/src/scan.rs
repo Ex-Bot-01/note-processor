@@ -836,17 +836,23 @@ fn store_note_links(db: &Db, parsed: &[Parsed]) -> Result<(), DbError> {
     store_links(db, &resolved, PROSE_ORIGIN)
 }
 
-/// `case_key` → `rel` for every live file: the corpus [`crate::links::resolve`] places targets in.
-fn live_corpus(db: &Db) -> Result<BTreeMap<String, String>, DbError> {
+/// `case_key` → every live path carrying that fold: the corpus [`crate::links::resolve`] places targets in.
+///
+/// A `Vec` rather than the one `rel` an earlier build kept, because `files.case_key` stopped being unique
+/// with migration 4 (F13 §3): `Ämli.md` beside `ämli.md` is two files whose display fold is one string, so
+/// `insert` would have handed the fold to whichever row was read last and a link naming that fold would land
+/// on it by iteration order. Listing both is what lets resolution see the ambiguity and decline, exactly as
+/// [`crate::links`] already models an ambiguous basename. A fold with one owner still resolves.
+fn live_corpus(db: &Db) -> Result<BTreeMap<String, Vec<String>>, DbError> {
     let mut statement =
         db.0.prepare("SELECT case_key, rel FROM files WHERE state = 'ok' ORDER BY case_key, rel")?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    let mut corpus: BTreeMap<String, String> = BTreeMap::new();
+    let mut corpus: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for row in rows {
         let (case_key, rel) = row?;
-        corpus.insert(case_key, rel);
+        corpus.entry(case_key).or_default().push(rel);
     }
     Ok(corpus)
 }

@@ -1,9 +1,9 @@
 //! Link extraction, resolution, and the `links` rows Task 9 counts and Task 10 reports.
 //!
-//! Extraction is asserted on inline text and on the committed fixtures; resolution on a corpus
-//! map spelled exactly the way Task 10 builds it (`case_key` → `rel`); storing on SQL against an
-//! in-memory database, for the same reason `tests/db.rs` reads rows back — what later tasks rely
-//! on is the state of the rows, not the return value of a helper.
+//! Extraction is asserted on inline text and on the committed fixtures; resolution on a corpus map
+//! spelled exactly the way a scan builds it (`case_key` → every rel carrying that fold); storing on SQL
+//! against an in-memory database, for the same reason `tests/db.rs` reads rows back — what later tasks
+//! rely on is the state of the rows, not the return value of a helper.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -56,11 +56,16 @@ fn found(links: &[RawLink]) -> Vec<(&str, LinkKind, usize)> {
         .collect()
 }
 
-/// A corpus map in the shape Task 10 builds it: `case_key` → `rel`.
-fn corpus(rels: &[&str]) -> BTreeMap<String, String> {
-    rels.iter()
-        .map(|rel| (rel.to_lowercase(), (*rel).to_string()))
-        .collect()
+/// A corpus map in the shape a scan builds it: `case_key` → every rel carrying that fold. Two rels that
+/// fold onto one key are therefore two candidates rather than one overwriting the other (F13 §3).
+fn corpus(rels: &[&str]) -> BTreeMap<String, Vec<String>> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for rel in rels {
+        map.entry(rel.to_lowercase())
+            .or_default()
+            .push((*rel).to_string());
+    }
+    map
 }
 
 /// One `[[target]]` as the resolver receives it.

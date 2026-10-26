@@ -364,25 +364,27 @@ pub struct ResolvedLink {
 
 /// Place every target in the corpus, never guessing.
 ///
-/// `corpus` is the map Task 10 builds — `case_key` → `rel`, one entry per case-folded path — and
-/// `links` one `(src_rel, links)` entry per note, so a resolved list needs no second pass to know
-/// who wrote each link. Each target is placed in exactly this order:
+/// `corpus` is the map a scan builds — `case_key` → every live path carrying that fold — and `links`
+/// one `(src_rel, links)` entry per note, so a resolved list needs no second pass to know who wrote
+/// each link. Each target is placed in exactly this order:
 ///
 /// 1. **exact `rel`**, the spelling the registry uses;
-/// 2. **case-insensitively** by `case_key`, which is what a case-insensitive filesystem types;
+/// 2. **case-insensitively** by `case_key`, which is what a case-insensitive filesystem types — and,
+///    like every step here, a fold several paths share places nothing;
 /// 3. **by unique basename**, so `[[Beta]]` finds `deep/nested/Beta.md`. Each file is indexed
 ///    under its lowercased file name *and* that name without its extension, because a wikilink
 ///    usually omits `.md` while an attachment target keeps it.
 ///
 /// More than one candidate at any step stays unresolved — two `a.md` files in different directories
-/// make the target `a` ambiguous, and so does a note `a.md` beside an image `a.png`. Nothing prefers
+/// make the target `a` ambiguous, and so does a note `a.md` beside an image `a.png`, or two paths that
+/// differ only in case (`Ämli.md` beside `ämli.md`) and therefore share one `case_key`. Nothing prefers
 /// one kind over another: a wikilink may legitimately name an attachment, so preferring `.md` would
 /// break a real link rather than guess well. **The author's way out is to spell the path** —
 /// `[[notes/a.md]]` or `[text](notes/a.md)` is exact and wins over the ambiguity — which is what a
 /// later report should suggest next to an unresolved target. An unknown target is unresolved the same
 /// way, and an empty corpus resolves nothing without failing.
 pub fn resolve(
-    corpus: &BTreeMap<String, String>,
+    corpus: &BTreeMap<String, Vec<String>>,
     links: &[(String, Vec<RawLink>)],
 ) -> Vec<ResolvedLink> {
     let basenames = basename_index(corpus);
@@ -403,15 +405,22 @@ pub fn resolve(
 
 /// The corpus path one target names, in the order [`resolve`] documents.
 fn resolve_target(
-    corpus: &BTreeMap<String, String>,
+    corpus: &BTreeMap<String, Vec<String>>,
     basenames: &HashMap<String, Vec<String>>,
     target: &str,
 ) -> Option<String> {
-    // One `case_key` lookup answers both of the first two steps: `case_key` is unique in the
-    // registry, so what is found here is either spelled exactly as the target (step 1) or its only
-    // case variant (step 2).
-    if let Some(rel) = corpus.get(&target.to_lowercase()) {
-        return Some(rel.clone());
+    // One `case_key` lookup answers both of the first two steps: what is found here is either spelled
+    // exactly as the target (step 1) or its only case variant (step 2) — but only when one path owns
+    // that fold. `files.case_key UNIQUE` is gone (F13 §3), so `Ämli.md` and `ämli.md` can both be live
+    // rows under the same fold, and then the fold names no file: falling through to step 3 hands the
+    // pair to its "held by several paths" decline instead of resolving onto whichever row the corpus
+    // map happened to keep.
+    if let Some(rel) = corpus
+        .get(&target.to_lowercase())
+        .filter(|candidates| candidates.len() == 1)
+        .map(|candidates| candidates[0].clone())
+    {
+        return Some(rel);
     }
     // Step 3. A file name held by several paths is not resolvable by anybody's rule.
     basenames
@@ -424,19 +433,21 @@ fn resolve_target(
 /// both `beta.md` and `beta`. A `Vec` longer than one entry is what makes a target ambiguous, and
 /// a file whose name has no extension contributes one key rather than two — inserting the same
 /// path twice under one key would make it ambiguous against itself.
-fn basename_index(corpus: &BTreeMap<String, String>) -> HashMap<String, Vec<String>> {
+fn basename_index(corpus: &BTreeMap<String, Vec<String>>) -> HashMap<String, Vec<String>> {
     let mut index: HashMap<String, Vec<String>> = HashMap::new();
-    for rel in corpus.values() {
-        let name = file_name(rel);
-        let name_key = name.to_lowercase();
-        index.entry(name_key.clone()).or_default().push(rel.clone());
-        let stem = match extension(name) {
-            Some(extension) => &name[..name.len() - extension.len() - 1],
-            None => name,
-        };
-        let stem_key = stem.to_lowercase();
-        if stem_key != name_key {
-            index.entry(stem_key).or_default().push(rel.clone());
+    for rels in corpus.values() {
+        for rel in rels {
+            let name = file_name(rel);
+            let name_key = name.to_lowercase();
+            index.entry(name_key.clone()).or_default().push(rel.clone());
+            let stem = match extension(name) {
+                Some(extension) => &name[..name.len() - extension.len() - 1],
+                None => name,
+            };
+            let stem_key = stem.to_lowercase();
+            if stem_key != name_key {
+                index.entry(stem_key).or_default().push(rel.clone());
+            }
         }
     }
     index

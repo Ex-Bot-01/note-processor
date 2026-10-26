@@ -1553,6 +1553,21 @@ fn folds_case(root: &Path) -> bool {
         < 2
 }
 
+/// Whether this filesystem folds a name and its case variant into one file, counted over the entries whose
+/// Unicode fold is `folded`. [`folds_case`] is the same gate for the ASCII pair `a.md` / `A.md`; a pair whose
+/// difference is not ASCII (`Ämli.md` / `ämli.md`) needs `to_lowercase` to see one name at all. Same reason:
+/// a case-insensitive checkout wrote a single file at setup time, so a test that needs both spellings says so
+/// instead of passing on a premise it never had.
+#[cfg(unix)]
+fn folds_the_pair(root: &Path, folded: &str) -> bool {
+    fs::read_dir(root)
+        .expect("test setup: read the workspace")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().to_lowercase() == folded)
+        .count()
+        < 2
+}
+
 /// Restore a captured permission mode on drop, so a failing assertion cannot leave a tempdir unreadable
 /// for the cleaner.
 #[cfg(unix)]
@@ -2048,6 +2063,75 @@ fn a_case_collision_with_no_row_behind_it_does_not_hold_the_version_back() {
         recorded_parse_version(&ws.db()),
         Some(PARSE_VERSION),
         "a refused path with no rows behind it must not pin the rules version"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_naming_a_fold_two_live_paths_share_resolves_to_neither() {
+    // Migration 4 dropped `files.case_key UNIQUE` so two live rows may share one display fold (F13 §3) —
+    // `Ämli.md` beside `ämli.md`, both folding to `ämli.md`. A target that folds onto that string names two
+    // files, and resolution's rule is to decline: the alternative is an edge onto whichever row the corpus
+    // map kept, decided by read order.
+    //
+    // `[[DEEP/ÄMLI.MD]]` belongs in the same note because it is the other half of the rule. Its fold has
+    // exactly one owner while three paths claim the file name `Ämli.md`, so it resolves on the display fold —
+    // which stays Unicode (F13 §3) — and fails loudly if that step is ever turned into a blanket decline.
+    let ws = scratch(
+        &[
+            ("Ämli.md", "# Ämli\n"),
+            ("ämli.md", "# ämli\n"),
+            ("deep/Ämli.md", "# Deep Ämli\n"),
+            ("index.md", "Siehe [[ÄMLI.MD]] und [[DEEP/ÄMLI.MD]].\n"),
+        ],
+        600,
+    );
+    let report = scan(&ws.root, &ws.cfg).expect("a shared fold must not fail the scan");
+    if folds_the_pair(&ws.root, "ämli.md") {
+        eprintln!(
+            "skip: this filesystem folds Ämli.md and ämli.md into one file, so no fold is shared"
+        );
+        return;
+    }
+
+    // Premise: the registry holds both spellings as live rows under one `case_key`, neither refused. Without
+    // two owners of the fold there is nothing here for resolution to decline.
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM files WHERE state = 'ok' AND case_key = 'ämli.md'"
+        ),
+        2,
+        "both spellings have to be live rows for their fold to be shared"
+    );
+    assert!(
+        report.skipped.is_empty(),
+        "a shared fold is not an identity clash: {report:?}"
+    );
+
+    // Both edges are written; only one of them may land on a row. `?` beside the other is the declined one —
+    // naming it is what tells "declined" apart from "landed on the twin that happened to be read last".
+    assert_eq!(
+        texts(
+            &db,
+            "SELECT l.target || '->' || COALESCE(dst.rel, '?')
+               FROM links l LEFT JOIN notes dst ON dst.id = l.dst_note_id ORDER BY 1"
+        ),
+        [
+            "DEEP/ÄMLI.MD->deep/Ämli.md".to_string(),
+            "ÄMLI.MD->?".to_string()
+        ],
+        "a fold the corpus shares resolves to neither twin, and a fold with one owner still resolves"
+    );
+    assert_eq!(
+        report.unresolved_links, 1,
+        "the declined target is the missing-note signal: {report:?}"
+    );
+    let targets = db::unresolved_targets(&db).expect("test: unresolved targets");
+    assert!(
+        targets.iter().any(|target| target == "ÄMLI.MD"),
+        "the target nobody owns has to be nameable: {targets:?}"
     );
 }
 
