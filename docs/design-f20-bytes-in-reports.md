@@ -72,10 +72,16 @@ pub struct UnknownPath {
    **The exception round 1 had to add** (review `d2cbf5de`): a row whose stored key *is* its display text has no byte
    spelling left to match, so it is compared text against text — migration 4 keyed every row through
    `rel_bytes_of_display`, and without the fallback a live note behind an unreadable directory went back to being
-   reported `Removed`. Over-hiding such a row is churn; under-hiding it is data loss. The class is **not** only
-   migrated rows: a name genuinely holding `U+FFFD`, and every Windows lossy name, qualify permanently — there the
-   text arm and the byte arm agree anyway. A migrated row leaves the class when a scan pairs its path by hash so
-   `apply_move` rewrites `rel_bytes`; an unchanged row keeps its key forever, so no doc may call this transitional.
+   reported `Removed`. Under-hiding such a row is data loss; over-hiding it is **not** automatically harmless, and this
+   document said it was. When the row's own path is readable while an unreadable twin shares its display spelling,
+   hiding the row leaves the listed file with nothing to pair against: it indexes as `Added`, so one physical file ends
+   up with two live `files` rows and two `notes` rows, and `hidden_by_unknown` holds `PARSE_VERSION` back until the
+   twin is renamed — no scan clears it. The narrower rule was probed and rejected because it produces `removed: 1` in
+   the other configuration, where the row's own file really is behind the blocked directory; both cases feed
+   `known_rows` identical inputs. **F23** owns that ambiguity. The class is **not** only migrated rows either: a name
+   genuinely holding `U+FFFD`, and every Windows lossy name, qualify permanently — there the text arm and the byte arm
+   agree anyway. A migrated row leaves the class when a scan pairs its path by hash so `apply_move` rewrites
+   `rel_bytes`; an unchanged row keeps its key forever, so no doc may call this transitional.
 3. **No new fold or key definition outside `path_keys`.** This round consumes `rel_bytes`; it defines no spelling of
    its own. If a builder needs bytes it calls `normalize_rel`, never `to_string_lossy().into_bytes()`.
 4. **Charge once.** After the fix, one note behind one unknown path is charged in exactly one of

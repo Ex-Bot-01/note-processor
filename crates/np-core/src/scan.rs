@@ -659,12 +659,19 @@ fn key_is_display_derived(rel: &str, rel_bytes: &[u8]) -> bool {
 /// a path that only ever existed as text.
 ///
 /// Matching these against such a row's `rel` is deliberately **wider** than the byte comparison, and only for
-/// those rows: one `caf\u{FFFD}` entry then hides it whichever twin its bytes came from, so the note can be
-/// over-hidden — left out of `known`, out of one refresh, reported nothing — where strict byte
-/// matching would have called it `Removed`. That asymmetry is the whole argument: over-hiding is churn that
-/// heals on the next scan that can read the directory, while a false `Removed` stales a live note, drops it from
-/// the catalog, under-charges the refresh gap so [`PARSE_VERSION_KEY`] is recorded over rows nobody re-parsed,
-/// and — per F13 §4.2 — brings the note back as a **second `notes.id`** when the directory opens again.
+/// those rows: one `caf\u{FFFD}` entry then hides it whichever twin its bytes came from. The asymmetry is the whole
+/// argument — a false `Removed` stales a live note, drops it from the catalog, under-charges the refresh gap so
+/// [`PARSE_VERSION_KEY`] is recorded over rows nobody re-parsed, and (F13 §4.2) brings the note back as a **second
+/// `notes.id`** when the directory opens again.
+///
+/// **Do not call that over-hiding harmless, and do not call it self-healing.** When the row's own path is readable
+/// while an unreadable twin shares its display spelling — which a lossy key cannot distinguish from the case this
+/// fallback exists for — hiding the row leaves the listed path with no row to pair with, so it indexes as a spurious
+/// `Added`: two live `files` and `notes` rows for one file, and `hidden_by_unknown` holds [`PARSE_VERSION_KEY`] back
+/// until somebody renames or removes the twin. **No scan clears that.** Backlog **F23** owns the ambiguity — no
+/// predicate computable here can separate the two cases, because a display spelling has many byte twins and a lossy
+/// key records none of them — and requires both configurations pinned as fixtures: one naming the duplicate-row harm,
+/// one fencing the safety that any future fix must not trade away.
 fn display_spelled(paths: &[UnknownPath]) -> Vec<UnknownPath> {
     paths
         .iter()
