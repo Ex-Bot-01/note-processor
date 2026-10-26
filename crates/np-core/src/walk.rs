@@ -279,6 +279,7 @@ pub(crate) fn epoch_secs(meta: &fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{is_excluded, normalize_rel, sort_found, DiscoveredFile};
+    use crate::path_keys;
     use std::path::Path;
 
     #[test]

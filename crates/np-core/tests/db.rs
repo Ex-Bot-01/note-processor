@@ -80,11 +80,15 @@ fn rejects(db: &Db, sql: &str, column: &str) {
 }
 
 /// A note row for `rel` with the minimum the schema needs, returning its id.
+///
+/// The byte key is bound as bytes here exactly because [`a_string_bind_is_refused_from_every_key_column`]
+/// shows what happens otherwise: a BLOB column accepts TEXT unless something refuses it, and this fixture
+/// would then hand a note a key no reader can see.
 fn insert_note(db: &Db, rel: &str, title: &str) -> i64 {
     db.0.execute(
-        "INSERT INTO notes (rel, title, title_source, encoding, word_count, body)
-         VALUES (?1, ?2, 'filename', 'utf-8', 3, 'body text')",
-        rusqlite::params![rel, title],
+        "INSERT INTO notes (rel_bytes, rel, title, title_source, encoding, word_count, body)
+         VALUES (?1, ?2, ?3, 'filename', 'utf-8', 3, 'body text')",
+        rusqlite::params![rel.as_bytes(), rel, title],
     )
     .expect("test setup: note row");
     db.0.last_insert_rowid()
@@ -197,20 +201,29 @@ fn the_schema_is_what_the_plan_mandates() {
     assert_eq!(
         indexes,
         [
+            // Migration 4's pair of byte-key indexes, the display-fold index it kept for link resolution,
+            // and `files_rel` — new, and load-bearing: `rel` lost its unique constraint, so without this
+            // index round 1's row resolution and `mark_stale` would scan the table once per file.
+            "files_case_bytes",
             "files_case_key",
+            "files_rel",
             "links_dst_note_id",
             "notes_rel",
-            "tags_tag"
+            "notes_rel_bytes",
+            "tags_tag",
         ]
     );
 
     // Column names in declaration order: Tasks 8-10 address them by name, so a rename here
     // breaks them rather than merely differing.
     for (table, declared) in [
-        ("files", "rel case_key abs hash size mtime state last_seen"),
+        (
+            "files",
+            "id rel_bytes case_bytes rel case_key abs hash size mtime state last_seen",
+        ),
         (
             "notes",
-            "id rel title title_source encoding word_count body",
+            "id rel_bytes rel title title_source encoding word_count body",
         ),
         ("headings", "note_id level text line"),
         ("tags", "note_id tag"),
@@ -235,8 +248,8 @@ fn the_schema_is_what_the_plan_mandates() {
     // program would read as neither live nor stale.
     rejects(
         &db,
-        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen)
-         VALUES ('a.md', 'a.md', '/ws/a.md', 'h', 1, 1, 'gone', 1)",
+        "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES (x'612e6d64', x'612e6d64', 'a.md', 'a.md', '/ws/a.md', 'h', 1, 1, 'gone', 1)",
         "files.state",
     );
     rejects(
@@ -1104,10 +1117,19 @@ fn wal_and_foreign_keys_are_set_where_they_are_legal() {
 }
 
 /// A `files` row insert needing no child table — these cases measure locks, not the schema.
+///
+/// Both byte keys are spelled as `x'…'` literals because migration 4 made them `NOT NULL`, and this statement
+/// runs on a raw connection where no Rust writer is in front of it. The hex is the ASCII spelling of `rel`,
+/// which is all these fixtures name.
 fn insert_file(rel: &str) -> String {
+    let bytes = rel
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     format!(
-        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen)
-         VALUES ('{rel}', '{rel}', '/ws/{rel}', 'hash', 1, 1, 'ok', 1)"
+        "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES (x'{bytes}', x'{bytes}', '{rel}', '{rel}', '/ws/{rel}', 'hash', 1, 1, 'ok', 1)"
     )
 }
 
@@ -1275,8 +1297,9 @@ fn the_busy_timeout_in_force_is_this_crates_and_not_the_drivers_default() {
 fn a_note_row_has_to_name_a_known_file() {
     let db = Db::in_memory().expect("in-memory database");
 
-    // `notes.rel REFERENCES files(rel)` is what makes an orphan note impossible; the same
-    // key is what `apply_move` cascades along. Like the `PRAGMA foreign_keys` readings in
+    // `notes.rel_bytes REFERENCES files(rel_bytes)` is what makes an orphan note impossible now that migration 4
+    // moved the key off display text; it is also the key `apply_move`'s cascade rides. Like the
+    // `PRAGMA foreign_keys` readings in
     // `wal_and_foreign_keys_are_set_where_they_are_legal`, this fires on the bundled build's
     // default too, so it does not prove the pragma — only that the constraint is declared.
     let err = insert_note_err(&db, "never-seen.md");
@@ -1312,10 +1335,12 @@ fn link_row(db: &Db) -> (i64, i64, Option<i64>, String, String, i64, String) {
 
 /// A note insert that is expected to fail, so the test can assert on the driver error.
 fn insert_note_err(db: &Db, rel: &str) -> rusqlite::Error {
+    // The byte key is supplied so this still measures the **foreign key**: without it the insert would die on
+    // `typeof(rel_bytes) = 'blob'` and the test would pass for the wrong reason.
     db.0.execute(
-        "INSERT INTO notes (rel, title, title_source, encoding, word_count, body)
-         VALUES (?1, 'x', 'filename', 'utf-8', 1, 'body')",
-        rusqlite::params![rel],
+        "INSERT INTO notes (rel_bytes, rel, title, title_source, encoding, word_count, body)
+         VALUES (?1, ?2, 'x', 'filename', 'utf-8', 1, 'body')",
+        rusqlite::params![rel.as_bytes(), rel],
     )
     .expect_err("an orphan note must fail")
 }

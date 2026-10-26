@@ -99,10 +99,12 @@ fn placed(links: &[ResolvedLink]) -> Vec<(&str, &str, &str)> {
 /// A registry row plus the note row Task 10 would write for it, as the note's id.
 fn add_note(db: &Db, rel: &str) -> i64 {
     add_file(db, rel);
+    // The byte key is written here as well, because this fixture is a writer: migration 4 made the identity
+    // a BLOB column, and a note whose key is missing has no identity for any reader to find.
     db.0.execute(
-        "INSERT INTO notes (rel, title, title_source, encoding, word_count, body)
-         VALUES (?1, ?2, 'filename', 'utf-8', 3, 'body')",
-        rusqlite::params![rel, rel],
+        "INSERT INTO notes (rel_bytes, rel, title, title_source, encoding, word_count, body)
+         VALUES (?1, ?2, ?2, 'filename', 'utf-8', 3, 'body')",
+        rusqlite::params![rel.as_bytes(), rel],
     )
     .expect("test setup: note row");
     db.0.last_insert_rowid()
