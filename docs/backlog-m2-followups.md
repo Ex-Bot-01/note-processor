@@ -278,6 +278,22 @@ What these numbers can and cannot carry:
   **Do when:** a workspace with `caf\xe9/` and `caf\xe8/`, one unreadable, reports exactly the rows it should
   and names both refused paths on separate lines.
 
+## F21 — a refusing stderr can block the first upgrade of an orphan-holding workspace
+
+- **Where:** `crates/np-core/src/db.rs`'s `report_orphans`, which unwraps when its write fails, and the
+  migration step that calls it inside the transaction.
+- **Risk:** a pre-F5 workspace holding orphan notes, opened with descriptor 2 refusing writes (`|& head`, a
+  detached service, `/dev/full`), panics mid-migration — so the upgrade never completes. The keep-the-panic
+  reasoning on record is "never delete rows unannounced", which is defensible; but its stated reason ("losing
+  the announcement silently is the silence this function exists to avoid") is weaker than the code makes it,
+  because the same receipt is written durably into `meta` two lines before the print. So the panic protects a
+  signal that is already stored, at the cost of refusing the upgrade entirely.
+- **Fix:** keep "never delete unannounced", but make the announcement not depend on a stream: verify the
+  `meta` receipt was written (it is, in the same transaction) and treat a failed stderr write as degraded
+  rather than fatal — or defer the print until after commit and let the next scan retry it, which is what F13
+  round 7 did for the refresh receipts. **Do when:** an orphan-holding version-2 workspace upgrades with
+  descriptor 2 closed, and `np scan` afterwards still surfaces the orphan count.
+
 ---
 
 ## Explicitly not in this backlog

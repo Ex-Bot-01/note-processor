@@ -3,8 +3,11 @@
 //! [`scan`] is the only place in the crate that reads files, writes SQLite and renders the catalog at
 //! once, so it owns the ordering rules the individual stages cannot express on their own:
 //!
-//! - **One transaction for the database, files written after it commits.** The registry row, the note
+//! - **One transaction for the database, files written after it commits.** The workspace row, the note
 //!   row and everything derived from its text either all move to this scan's state or none of them do.
+//!   (The registry line in `config.rs`'s database sits outside that set on purpose: it is written on a second
+//!   connection after [`crate::db`] commits, so a registry failure exits 1 over work that is already durable,
+//!   and the next scan reconciles it — the alternative was one transaction across two databases.)
 //!   `INDEX.md` cannot join a SQLite transaction, so the catalog is rendered inside that transaction,
 //!   its name list is committed with it, and only then does the filesystem work start. A scan that dies
 //!   halfway leaves the previous catalog readable instead of half-rewritten, and never leaves a delete
@@ -21,7 +24,12 @@
 //!   `files.state = 'ok'`; [`crate::db::note_counts`] stays the unfiltered database truth, because a
 //!   stale note is hidden from the catalog, not forgotten (spec §2).
 //! - **`INDEX.md` and its shards are the only names this module creates, and it deletes only the ones
-//!   that open with its own generated header** (spec §7): a name alone never licenses a removal. The
+//!   that open with its own generated header** (spec §7): a name alone never licenses a removal — with
+//!   **one exception, our own temporaries**. A leftover `<generated>.tmp` from a killed write is cleared by
+//!   `clear_temp_corpses` on the naming rule alone: that spelling is one nothing else produces, and a
+//!   half-written temporary has no complete header to fingerprint. The F13 §1 review flagged the apparent
+//!   contradiction; it is a naming-trust decision rather than an oversight, stated here so the rule above can
+//!   be read literally. The
 //!   names themselves come from [`index_names`], which owns their spelling; what this module owns is the
 //!   fingerprint deciding which of them are ours to replace. Every write goes through a temporary file
 //!   plus `rename`, and no note body is ever opened for writing.
@@ -1320,6 +1328,10 @@ fn write_index_files(
 /// in silence. That is F13 §1 on the one code path here that deletes files (see
 /// `docs/design-f13-byte-paths.md`), so identity is compared as bytes end to end and the lossy text is kept
 /// only for what is genuinely a display question — [`index_names::is_generated_index`] and the report line.
+///
+/// Which leaves one asymmetry to know about: **verdicts are per entry, report lines are not.** `foreign`
+/// carries display text and [`ScanReport::skipped`] dedups it, so two byte-distinct foreign twins publish a
+/// single line. Read that count as "names needing attention", never as "files on disk".
 ///
 /// `meta` alone is not enough. It is committed inside the scan's transaction (see [`set_index_list`]), so
 /// a kill between that commit and the writes in [`write_index_files`] leaves it naming only the
