@@ -137,6 +137,9 @@ pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
 
 /// The bytes of one name or path. Windows paths are UTF-16 code units and reach this program as text, so its
 /// spelling stays lossy — the same stance [`crate::config`] takes for the workspace key (F13 §5).
+///
+/// `not(unix)` is wider than Windows, so this is also the spelling of any other target the crate is built for;
+/// [`name_is_lossless`] is where that costs something.
 #[cfg(not(unix))]
 pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
     name.to_string_lossy().into_owned().into_bytes()
@@ -196,21 +199,39 @@ fn is_low_surrogate(unit: u16) -> bool {
 /// which F18 names as the worse failure (a silently skipped note costs more than the overwrite this refusal
 /// prevents), so this answer is pinned by a test rather than by the argument above.
 ///
-/// The other arm is Windows's — the only non-Unix target this program builds for, and the platform whose
-/// paths are UTF-16 code units (see [`os_bytes`]). There a name holding an unpaired surrogate reaches
-/// `to_string_lossy` as U+FFFD, so two names can share one key and round 2's lookup overwrites the twin's
-/// row without any constraint firing. Such a name is refused instead: [`crate::walk`] leaves it out of the
-/// catalog, its existing row untouched, and names it in the report (F18 §3).
+/// The other arm is Windows's, the platform whose paths are UTF-16 code units (see [`os_bytes`]). There a
+/// name holding an unpaired surrogate reaches `to_string_lossy` as U+FFFD, so two names can share one key and
+/// round 2's lookup overwrites the twin's row without any constraint firing. Such a name is refused instead:
+/// [`crate::walk`] leaves it out of the catalog, its existing row untouched, and names it in the report
+/// (F18 §3).
 #[cfg(unix)]
 pub(crate) fn name_is_lossless(_name: &OsStr) -> bool {
     true
 }
 
-/// [`name_is_lossless`] for a platform whose names arrive as UTF-16 code units.
-#[cfg(not(unix))]
+/// [`name_is_lossless`] for Windows.
+///
+/// Gated on `windows` rather than `not(unix)` because that is what its body needs: `encode_wide` comes from
+/// `std::os::windows::ffi`, which exists on no other target, so a wider gate would not be a fallback — it
+/// would be a build failure on a platform this function says nothing about.
+#[cfg(windows)]
 pub(crate) fn name_is_lossless(name: &OsStr) -> bool {
     use std::os::windows::ffi::OsStrExt;
     !has_unpaired_surrogate(&name.encode_wide().collect::<Vec<u16>>())
+}
+
+/// [`name_is_lossless`] for a target that is neither Unix nor Windows — one this program has never been
+/// built, tested or shipped for, and whose name representation this module cannot read.
+///
+/// `true`, which buys a compile and promises nothing: [`os_bytes`]'s non-Unix spelling still runs through
+/// `to_string_lossy` here, so such a target has **no byte identity and no refusal guarantee either** — two
+/// names that decode to the same lossy text share one key, and the overwrite F18 refuses on Windows stays
+/// possible. That is the honest statement of an untested platform, and it is deliberately not the Unix answer
+/// above: Unix returns `true` because its keys are exact, which nothing here can claim for a target whose
+/// names it cannot inspect.
+#[cfg(all(not(unix), not(windows)))]
+pub(crate) fn name_is_lossless(_name: &OsStr) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -292,6 +313,42 @@ mod tests {
         }
         // The units just outside the surrogate range are ordinary characters.
         assert!(!has_unpaired_surrogate(&[0xD7FF, 0xE000]));
+    }
+
+    /// The outer edge of each surrogate range, which every test above leaves untested by construction: they
+    /// use `HIGH = 0xD800` and `LOW = 0xDC00`, the two *lowest* units of their ranges, so a range written one
+    /// unit short (`..=0xDBFE`, `..=0xDFFE`) passes all of them while refusing real names.
+    #[test]
+    fn the_top_of_each_surrogate_range_is_inside_it() {
+        // The last high surrogate: alone it spells no character, so Windows must refuse it.
+        assert!(
+            has_unpaired_surrogate(&[0xDBFF]),
+            "U+DBFF is a leading surrogate with nothing behind it"
+        );
+        // And it pairs normally — with the last low surrogate as its partner, which is the only combination
+        // that pins both upper bounds at once. Narrow either range by one and this pair stops being a pair.
+        assert!(
+            !has_unpaired_surrogate(&[0xDBFF, 0xDFFF]),
+            "U+DBFF U+DFFF is one character, not two orphans"
+        );
+
+        // The last low surrogate is still a trailing surrogate: on its own it has no high in front of it, and
+        // behind a complete pair it is still the one nobody claimed.
+        assert!(
+            has_unpaired_surrogate(&[0xDFFF]),
+            "U+DFFF alone spells no character"
+        );
+        assert!(
+            has_unpaired_surrogate(&[0xD800, 0xDC00, 0xDFFF]),
+            "the pair consumed its high, so U+DFFF is unpaired"
+        );
+
+        // Widening either range by one would be the opposite mistake: these two are ordinary text, and a name
+        // built from them plus a genuine pair must stay indexable.
+        assert!(
+            !has_unpaired_surrogate(&[0xD7FF, 0xDBFF, 0xDFFF, 0xE000]),
+            "U+D7FF and U+E000 are characters, not surrogates"
+        );
     }
 
     /// Every name Unix can hand the walk is lossless, because `os_bytes` takes its bytes from the `OsStr`

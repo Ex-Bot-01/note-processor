@@ -1234,13 +1234,16 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 ///
 /// What *can* still hold the version back indefinitely is stale data that exists and cannot be rewritten: a
 /// note whose rows are there but unreadable (a mode-000 `.md`, or one inside a directory nobody can enter), a
-/// live row hidden behind such a directory, a move refused by an identity conflict — judged by the path it
-/// came from, since `classify` suppressed that path's `Removed` and its rows are still in the catalog — and
-/// **a legacy duplicate note pair** (`Indexed::Duplicate`). The first three clear when the obstruction does.
-/// A duplicate never does: no code merges two note rows, so such a workspace re-parses its whole corpus on
-/// every scan and prints the gap line each time. That is chosen over recording the version beside a note that
-/// was not re-parsed, which is F15's bug wearing a clean hat; the cost is named here rather than discovered,
-/// and `docs/backlog-m2-followups.md` F19 owns the migration that would heal it. That loop
+/// live row hidden behind such a directory, **a name this build refuses for good** (F18: while the file keeps
+/// that spelling no scan can index it, so its rows keep whatever an older build wrote and only renaming the
+/// file clears the debt), a move refused by an identity conflict — judged by the path it came from, since
+/// `classify` suppressed that path's `Removed` and its rows are still in the catalog — and **a legacy
+/// duplicate note pair** (`Indexed::Duplicate`). The unreadable ones clear when the obstruction does.
+/// A refused name and a duplicate never do on their own: no code renames a file and no code merges two note
+/// rows, so such a workspace re-parses its whole corpus on every scan and prints the gap line each time. That
+/// is chosen over recording the version beside a note that was not re-parsed, which is F15's bug wearing a
+/// clean hat; the cost is named here rather than discovered, and `docs/backlog-m2-followups.md` F19 owns the
+/// migration that would heal the duplicate. That loop
 /// is worth paying for: those rows stay wrong until the obstruction clears, and the notice below names the
 /// count so this is never silent.
 fn refresh_covered(written: &Written, hidden_by_unknown: usize) -> bool {
@@ -1667,11 +1670,11 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        folded_row, np_published, remove_corpses, remove_file, report_refresh, report_refresh_gap,
-        PARSE_VERSION,
+        folded_row, is_unknown_path, known_rows, np_published, refresh_covered, remove_corpses,
+        remove_file, report_refresh, report_refresh_gap, Written, PARSE_VERSION,
     };
     use crate::catalog::{HEADER, HEADER_CRLF};
-    use crate::db::{upsert_file, Db};
+    use crate::db::{self, upsert_file, Db};
     use crate::hash::Snapshot;
     use crate::path_keys::{self, RelPath};
     use std::fs;
@@ -1732,6 +1735,159 @@ mod tests {
             folded_row(&db, &ascii.case_bytes, &ascii.rel_bytes).expect("the lookup runs"),
             Some(RelPath::new(b"Aemli.md".to_vec(), "Aemli.md".to_string())),
             "an ASCII case rename is still followed"
+        );
+    }
+
+    // F18's protective half, on the platform that cannot refuse a real name: the two lists `crate::walk`
+    // reports are built by hand here, exactly as that walk builds them, because no Linux filesystem can put
+    // an unpaired surrogate in a file name. What they must never do is over-reach — every one of these tests
+    // names the paths that stay visible alongside the refused one.
+    //
+    // The refusal has two arms and they are not interchangeable: a refused **file** suppresses its own `rel`
+    // alone, and a refused **directory** suppresses its whole subtree by prefix. Getting either wrong is the
+    // silent overwrite F18 exists to stop (too narrow) or a catalog that stops noticing real deletions
+    // (too wide).
+
+    /// The exact arm: one refused file, and four neighbours that must keep being judged.
+    #[test]
+    fn a_refused_name_suppresses_only_its_own_rel() {
+        let refused = ["notes/caf\u{fffd}.md".to_string()];
+
+        assert!(
+            is_unknown_path("notes/caf\u{fffd}.md", &[], &refused),
+            "the refused path itself is unknown to this scan"
+        );
+
+        // Each of these shares something with the refused name, which is exactly why equality is the rule:
+        // widening it to a prefix would hide a live note from `classify`, from move resolution, and from the
+        // stale-marking that keeps a removed file out of the catalog.
+        for rel in [
+            "notes/caf\u{fffd}.md.bak", // same spelling as a prefix, one more extension
+            "notes/other.md",           // its sibling in the same directory
+            "notes/sub/caf\u{fffd}.md", // the same file name one level down elsewhere
+            "caf\u{fffd}.md",           // the same spelling at the root
+        ] {
+            assert!(
+                !is_unknown_path(rel, &[], &refused),
+                "{rel} is another path"
+            );
+        }
+    }
+
+    /// The prefix arm, fed the way [`crate::walk`] now feeds it: a refused **directory** goes into the
+    /// unreadable list, because its name is the first component of every path below it and none of those can
+    /// be keyed either. Suppressed by exact equality instead, every row in that subtree would be reported
+    /// `Removed` by the next scan.
+    #[test]
+    fn a_refused_directory_suppresses_every_row_below_it() {
+        let dirs = ["notes/caf\u{fffd}".to_string()];
+
+        assert!(
+            is_unknown_path("notes/caf\u{fffd}/a.md", &dirs, &[]),
+            "a child of the refused directory"
+        );
+        assert!(
+            is_unknown_path("notes/caf\u{fffd}/deep/deeper/b.md", &dirs, &[]),
+            "at any depth: the walk never entered at all"
+        );
+        // Only what is *below* it. A directory whose name merely starts with the same bytes is a different
+        // subtree, and the refused spelling itself is not suppressed — no file row can be keyed by a
+        // directory's path, so there is nothing here that needs suppressing.
+        assert!(
+            !is_unknown_path("notes/caf\u{fffd}x/a.md", &dirs, &[]),
+            "a sibling that shares the prefix bytes"
+        );
+        assert!(!is_unknown_path("notes/other/a.md", &dirs, &[]));
+        assert!(!is_unknown_path("notes/caf\u{fffd}", &dirs, &[]));
+    }
+
+    /// A registry row for `rel` with one note behind it: the shape [`known_rows`] counts as **hidden**, and
+    /// the only shape that can hold [`PARSE_VERSION`] back.
+    fn plant_note(db: &Db, rel: &str) {
+        upsert_file(db, &snap(rel), &Path::new("/ws").join(rel), 1)
+            .expect("test setup: registry row");
+        db::insert_note(
+            db,
+            &RelPath::from_display(rel),
+            "t",
+            "filename",
+            "utf-8",
+            3,
+            "body",
+        )
+        .expect("test setup: note row");
+    }
+
+    /// The charge behind the suppression: a hidden note is one the refresh never re-parsed, so recording the
+    /// new rules over it would label rows an older build wrote as current (F15). `known_rows` drops the row so
+    /// `classify` cannot call it `Removed` **and** counts it here — one comparison, both halves of the promise.
+    #[test]
+    fn a_note_behind_a_refused_path_is_charged_to_the_refresh_that_missed_it() {
+        let db = Db::in_memory().expect("in-memory database");
+        // The refused subtree: two notes at different depths, plus an attachment that owes no parse.
+        plant_note(&db, "notes/caf\u{fffd}/a.md");
+        plant_note(&db, "notes/caf\u{fffd}/deep/b.md");
+        upsert_file(
+            &db,
+            &snap("notes/caf\u{fffd}/image.png"),
+            Path::new("/ws/notes/caf\u{fffd}/image.png"),
+            1,
+        )
+        .expect("test setup: an attachment row with no note behind it");
+        // Two notes this scan does see, one of them in the same parent directory as the refused one.
+        plant_note(&db, "notes/peer.md");
+        plant_note(&db, "elsewhere/c.md");
+
+        // A refused directory, recorded as [`crate::walk`] records it.
+        let dirs = ["notes/caf\u{fffd}".to_string()];
+        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
+
+        assert_eq!(
+            known.iter().map(|row| row.rel.as_str()).collect::<Vec<_>>(),
+            ["elsewhere/c.md", "notes/peer.md"],
+            "the refused subtree reaches neither `Removed` nor a move, and its neighbours still do"
+        );
+        assert_eq!(
+            hidden, 2,
+            "one charge per hidden note — the attachment behind the same refusal owes nothing"
+        );
+
+        // The other arm, fed a refused *file*: exactly its own row disappears and is charged.
+        let (known, hidden) =
+            known_rows(&db, &[], &["notes/peer.md".to_string()]).expect("the rows read back again");
+        assert_eq!(hidden, 1, "one refused note, one charge");
+        assert!(
+            !known.iter().any(|row| row.rel == "notes/peer.md"),
+            "the refused path is out of the comparison"
+        );
+        assert_eq!(
+            known.iter().map(|row| row.rel.as_str()).collect::<Vec<_>>(),
+            [
+                "elsewhere/c.md",
+                "notes/caf\u{fffd}/a.md",
+                "notes/caf\u{fffd}/deep/b.md",
+                "notes/caf\u{fffd}/image.png",
+            ],
+            "read that directory as reachable and only the refused file itself disappears"
+        );
+
+        // And the charge is what withholds the version. Both halves of `refresh_covered` are pinned because
+        // the notice the user sees prints their sum (`written.uncovered + hidden_by_unknown`).
+        assert!(
+            !refresh_covered(&Written::default(), hidden),
+            "a refresh that never reached a note may not label its rules current"
+        );
+        assert!(
+            refresh_covered(&Written::default(), 0),
+            "with nothing hidden, the version is recorded"
+        );
+        let missed_write = Written {
+            uncovered: 1,
+            ..Written::default()
+        };
+        assert!(
+            !refresh_covered(&missed_write, 0),
+            "the write-pass half still holds on its own"
         );
     }
 
