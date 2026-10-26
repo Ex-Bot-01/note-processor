@@ -30,6 +30,9 @@ fn entry(title: &str, rel: &str, size: &str, tags: &[&str], out: u32, inc: u32) 
     CatalogEntry {
         title: title.to_string(),
         rel: rel.to_string(),
+        // The order tie-break, which nothing renders. For these fixtures the byte key is the display text's
+        // own bytes, exactly as a walk would record them for an ASCII or valid-UTF-8 name (F13 §3).
+        rel_bytes: rel.as_bytes().to_vec(),
         size_human: size.to_string(),
         tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
         out,

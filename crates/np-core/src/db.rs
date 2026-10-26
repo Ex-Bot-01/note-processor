@@ -1097,7 +1097,9 @@ pub fn apply_move(db: &Db, from: &RelPath, to: &RelPath, now: i64) -> Result<(),
     // rename keyed on that text would drag both notes through this statement.
     let (id, abs): (i64, String) =
         db.0.prepare_cached("SELECT id, abs FROM files WHERE rel_bytes = ?1")?
-            .query_row(params![&from.rel_bytes], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(params![&from.rel_bytes], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .map_err(|err| match err {
                 rusqlite::Error::QueryReturnedNoRows => DbError::MissingRel {
                     rel: from.rel.clone(),

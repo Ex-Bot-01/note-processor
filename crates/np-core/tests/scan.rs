@@ -2343,3 +2343,241 @@ fn an_up_to_date_database_reparses_only_what_changed() {
         "the note nobody edited stays exactly as stale as it was"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F13 round 2: identity keyed on the OS bytes, end to end.
+//
+// Both cases build their file names with `OsStringExt::from_vec`, so both are `#[cfg(unix)]` — on Windows
+// the same name cannot be built at all and the test would pass by asserting nothing (F13 §5).
+// ---------------------------------------------------------------------------
+
+/// A workspace holding exactly `files` (raw OS bytes of the name → contents). The `&str`-named [`scratch`]
+/// cannot express a name UTF-8 cannot hold, which is the whole subject here.
+#[cfg(unix)]
+fn scratch_bytes(files: &[(&[u8], &str)]) -> Workspace {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: create scratch workspace");
+    for (name, contents) in files {
+        fs::write(root.join(OsString::from_vec((*name).to_vec())), contents)
+            .expect("test setup: write a byte-named note");
+    }
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+    Workspace {
+        _tmp: tmp,
+        root,
+        cfg,
+    }
+}
+
+/// The bytes one query returns, as hex — so a failure prints `636166E9…` rather than a replacement
+/// character that has already lost the fact under test.
+#[cfg(unix)]
+fn key_hex(open: &Db, sql: &str) -> String {
+    texts(open, sql)
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "<no row>".to_string())
+}
+
+/// §5's round trip: a name built from Latin-1 bytes is stored as **those** bytes, and the stored key
+/// rebuilds a path that opens the file. The registry's answer to
+/// `workspace_db_separates_a_non_utf8_path_from_its_lossy_spelling`, for the workspace database rather than
+/// the workspace key — and the assertion round 1 could not make, because its writers only ever saw text.
+#[cfg(unix)]
+#[test]
+fn a_latin1_name_is_stored_as_its_os_bytes_and_reopens_the_file() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let ws = scratch_bytes(&[(b"caf\xe9.md", "# Cafe\n")]);
+    let report = scan(&ws.root, &ws.cfg).expect("scan a workspace holding one Latin-1 name");
+    assert!(report.skipped.is_empty(), "{report:?}");
+    assert_eq!((report.added, report.notes), (1, 1), "{report:?}");
+
+    let db = ws.db();
+    // `files.rel_bytes` is the exact OS bytes — no U+FFFD anywhere in them.
+    assert_eq!(
+        key_hex(&db, "SELECT hex(rel_bytes) FROM files"),
+        "636166E92E6D64",
+        "the identity column holds `caf\\xe9.md`, not the bytes of its lossy spelling"
+    );
+    // The note carries the same key, so it hangs off this file rather than off the display text.
+    assert_eq!(
+        key_hex(&db, "SELECT hex(rel_bytes) FROM notes"),
+        "636166E92E6D64",
+        "a note keyed on the display spelling would match nothing the join compares"
+    );
+
+    // The round trip that F13 §1 says was impossible: rebuild a path from what the database stored and open
+    // it. Before, the row's `abs` was `/ws/caf\u{FFFD}.md` — a path that exists nowhere.
+    let stored: Vec<u8> =
+        db.0.query_row("SELECT rel_bytes FROM files", [], |row| row.get(0))
+            .expect("test: read the stored key");
+    let rebuilt = ws.root.join(PathBuf::from(OsString::from_vec(stored)));
+    assert_eq!(
+        fs::read(&rebuilt).expect("the stored key has to name the file on disk"),
+        b"# Cafe\n"
+    );
+
+    // Display text stays honest and stays what the catalog renders: the report line and the entry both spell
+    // the lossy name, because that is a display question (F13 §3).
+    assert_eq!(texts(&db, "SELECT rel FROM files"), ["caf\u{fffd}.md"]);
+    let rendered = index_text(&ws.root);
+    let entries = entry_lines(&rendered);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(
+        entries[0].contains("caf\u{fffd}.md"),
+        "the catalog renders display text: {}",
+        entries[0]
+    );
+}
+
+/// §5's twin pair: `caf\xe8.md` beside `caf\xe9.md` — two files, one display spelling. Round 1 collapsed
+/// them into one row whose digest belonged to whichever name sorted last, published a target that opens
+/// nothing, and never converged.
+#[cfg(unix)]
+#[test]
+fn two_twins_get_two_rows_two_notes_and_two_catalog_entries() {
+    let ws = scratch_bytes(&[(b"caf\xe8.md", "# Cafe\n"), (b"caf\xe9.md", "# Cafe\n")]);
+    let first = scan(&ws.root, &ws.cfg).expect("a twin pair must not fail the scan");
+    assert!(
+        first.skipped.is_empty(),
+        "two byte-distinct paths are not an identity clash: {first:?}"
+    );
+    assert_eq!(
+        (first.added, first.modified, first.moved, first.removed),
+        (2, 0, 0, 0),
+        "both twins are indexed: {first:?}"
+    );
+    assert_eq!(first.notes, 2, "neither note was swallowed: {first:?}");
+
+    let db = ws.db();
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM files"), 2);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM notes"), 2);
+    // Both rows display the identical text — that is the point — and both keys are present and distinct.
+    assert_eq!(
+        texts(&db, "SELECT rel FROM files ORDER BY rel_bytes"),
+        ["caf\u{fffd}.md", "caf\u{fffd}.md"],
+        "display text is what the twins share, not identity"
+    );
+    assert_eq!(
+        texts(&db, "SELECT hex(rel_bytes) FROM files ORDER BY rel_bytes"),
+        ["636166E82E6D64", "636166E92E6D64"],
+        "two byte keys, ordered by the key rather than by a rowid nobody chose"
+    );
+
+    // Two catalog entries whose rendered bytes are identical: same title, same target. Nothing here can tell
+    // them apart by eye, which is exactly why their order has to come from the byte key.
+    let rendered = index_text(&ws.root);
+    let lines = entry_lines(&rendered);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        lines[0], lines[1],
+        "both entries render the same display text"
+    );
+
+    // Convergence — §6's second item. Today this workspace reported `added: 2` on every scan forever.
+    let second = scan(&ws.root, &ws.cfg).expect("test: second scan");
+    assert_eq!(
+        (
+            second.added,
+            second.modified,
+            second.moved,
+            second.removed,
+            second.unchanged
+        ),
+        (0, 0, 0, 0, 2),
+        "the pair converges on the scan after: {second:?}"
+    );
+    assert!(second.skipped.is_empty(), "{second:?}");
+
+    // And the published bytes are stable across a further scan: the order came from `ORDER BY n.rel_bytes`
+    // and `sort_key`'s byte tie-break, not from whichever row SQLite read first.
+    let rendered_again = index_text(&ws.root);
+    assert_eq!(rendered, rendered_again, "catalog bytes are stable");
+    scan(&ws.root, &ws.cfg).expect("test: third scan");
+    assert_eq!(
+        index_text(&ws.root),
+        rendered,
+        "a third scan reproduces the same bytes"
+    );
+}
+
+/// §5's resolution rule over a twin pair, which is the behaviour that forces `links::store_links` to resolve
+/// note ids by bytes: while both twins are live a target naming their shared spelling names two files and
+/// stays unresolved; once one is gone it must land on the survivor — whose **display text is still identical
+/// to the stale twin's**, so an id lookup keyed on that text would find two note rows and guess.
+#[cfg(unix)]
+#[test]
+fn a_target_naming_two_twins_declines_and_then_resolves_onto_the_survivor() {
+    let ws = scratch_bytes(&[
+        (b"caf\xe8.md", "# Cafe eight\n"),
+        (b"caf\xe9.md", "# Cafe nine\n"),
+        // The link is spelled the way an author would spell what they can see: the display text both twins
+        // share, replacement character and all. Resolution matches on that text; only the answer is bytes.
+        (b"index.md".as_slice(), "See [[caf\u{fffd}.md]].\n"),
+    ]);
+    let first = scan(&ws.root, &ws.cfg).expect("test: first scan");
+    assert!(first.skipped.is_empty(), "{first:?}");
+
+    let db = ws.db();
+    // Declined, not guessed: one unresolved target and no edge onto either twin.
+    assert_eq!(
+        first.unresolved_targets,
+        vec!["caf\u{fffd}.md".to_string()],
+        "{first:?}"
+    );
+    assert_eq!(
+        placed_edges(&db),
+        ["caf\u{fffd}.md->?".to_string()],
+        "a spelling two live rows share resolves to neither"
+    );
+    drop(db);
+
+    // One twin goes. Its row and its note stay (stale), so the display text is now held twice over — once
+    // live, once stale — and only the byte key tells them apart.
+    remove_twin(&ws.root, b"caf\xe8.md");
+    fs::write(ws.root.join("index.md"), "See [[caf\u{fffd}.md]] again.\n")
+        .expect("test: edit the source note");
+    let second = scan(&ws.root, &ws.cfg).expect("test: scan after the deletion");
+    assert!(second.skipped.is_empty(), "{second:?}");
+
+    let db = ws.db();
+    assert_eq!(
+        placed_edges(&db),
+        ["caf\u{fffd}.md->636166E92E6D64".to_string()],
+        "the edge lands on the surviving twin's row, not on its stale twin's identically spelled note"
+    );
+    assert_eq!(second.unresolved_links, 0, "{second:?}");
+}
+
+/// Every stored edge as `target->hex(destination key)`, with `?` for one that stayed unresolved. The
+/// destination is named by **bytes**, because the two twins' display text is one string and cannot tell an
+/// assertion which row an edge landed on. (`hex(NULL)` is `''` in this SQLite, hence the explicit `CASE`.)
+#[cfg(unix)]
+fn placed_edges(db: &Db) -> Vec<String> {
+    texts(
+        db,
+        "SELECT l.target || '->' || CASE WHEN l.dst_note_id IS NULL THEN '?'
+                                         ELSE hex(f.rel_bytes) END
+           FROM links l LEFT JOIN notes n ON n.id = l.dst_note_id
+           LEFT JOIN files f ON f.rel_bytes = n.rel_bytes
+          ORDER BY 1",
+    )
+}
+
+/// Delete a file whose name UTF-8 cannot hold.
+#[cfg(unix)]
+fn remove_twin(root: &Path, name: &[u8]) {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    fs::remove_file(root.join(OsString::from_vec(name.to_vec())))
+        .expect("test setup: remove one twin");
+}

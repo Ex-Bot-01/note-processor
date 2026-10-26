@@ -21,6 +21,7 @@ use np_core::db::{
     FK_ORPHANS_KEY, MIGRATIONS, PATHS_LOSSY_KEY,
 };
 use np_core::hash::{sha256_file, Snapshot};
+use np_core::path_keys::RelPath;
 use np_core::scan;
 use tempfile::TempDir;
 
@@ -28,6 +29,8 @@ use tempfile::TempDir;
 /// the lowercased `rel`.
 fn snap(rel: &str, hash: &str) -> Snapshot {
     Snapshot {
+        rel_bytes: np_core::path_keys::rel_bytes_of_display(rel),
+        case_bytes: np_core::path_keys::case_fold(rel.as_bytes()),
         rel: rel.to_string(),
         case_key: rel.to_lowercase(),
         hash: hash.to_string(),
@@ -86,6 +89,11 @@ fn rejects(db: &Db, sql: &str, column: &str) {
 /// The byte key is bound as bytes here exactly because [`a_string_bind_is_refused_from_every_key_column`]
 /// shows what happens otherwise: a BLOB column accepts TEXT unless something refuses it, and this fixture
 /// would then hand a note a key no reader can see.
+/// The pair for a path spelled as text, which is what these fixtures hold.
+fn path(rel: &str) -> RelPath {
+    RelPath::from_display(rel)
+}
+
 fn insert_note(db: &Db, rel: &str, title: &str) -> i64 {
     db.0.execute(
         "INSERT INTO notes (rel_bytes, rel, title, title_source, encoding, word_count, body)
@@ -1005,6 +1013,13 @@ fn seed_scanned_lossy_version_three(path: &Path, rel: &str, hash: &str, size: i6
         rusqlite::params![rel],
     )
     .expect("test setup: seed the scanned lossy note");
+    // One derived row, so a test can tell "the note was carried" apart from "the note was re-minted and
+    // re-parsed": children hang off `notes.id`, which a move must not touch.
+    conn.execute(
+        "INSERT INTO headings (note_id, level, text, line) VALUES (4, 1, 'Cafe', 1)",
+        [],
+    )
+    .expect("test setup: seed the note's child row");
 }
 
 /// The tables whose rows migration 4 must neither lose nor duplicate — the two it rebuilds and the four
@@ -1499,30 +1514,35 @@ fn the_lossy_receipt_counts_files_and_notes_in_both_shapes() {
     );
 }
 
+/// §4.2's churn, which is round 2's to own: the first **byte-keyed** scan of a workspace whose stored key
+/// came from lossy display text.
+///
+/// The fixture is a version-3 database holding one row displayed as `caf\u{FFFD}.md` over a workspace whose
+/// real file is `caf\xe9.md`, driven straight into this build with no scan in between — the only route by
+/// which a migrated key is ever compared. Migration 4 could only copy what the row held, so it wrote
+/// `63 61 66 EF BF BD 2E 6D 64`; the walk computes `63 61 66 E9 2E 6D 64`. Two byte keys, one file on disk,
+/// identical display text.
+///
+/// Because `classify` pairs unmatched snapshots **by hash**, unchanged content means one `Moved` — not a
+/// `Removed` + `Added` pair — and it is the *quiet* shape only because §4.1's change list carries bytes: a
+/// pass that expressed the rename in display text would rename the row onto itself and pair the same two
+/// keys again forever, which is §1's never-converges symptom manufactured by the fix. So the assertions are:
+/// one `Moved` and nothing else, the real bytes in the key, the note carried with its id and its child rows,
+/// and a following scan with nothing to report.
 #[cfg(unix)]
 #[test]
-fn a_migrated_lossy_path_scans_silent_and_keeps_its_lossy_key() {
+fn a_migrated_lossy_key_is_rewritten_by_the_first_byte_keyed_scan() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
-    // Round 1's two promises about the workspace F13 §1 is built from: the file on disk is `caf\xe9.md`
-    // and every row written about it spells itself `caf\u{FFFD}.md`.
-    //
-    // (1) Migration 4 changes no comparison (§4.2), so the first scan after the upgrade reports exactly what
-    //     the scan that wrote these rows reported: nothing changed, nothing added, nothing removed.
-    // (2) Round 1 derives both keys from `s.rel` and never from the byte-exact `abs` a writer is handed (§7),
-    //     so `files.rel_bytes` holds the bytes of the *display* spelling. That half is the pin: switch
-    //     `upsert_file` to `abs` and keys go byte-exact for every rewritten row while `note_id`, the catalog
-    //     join and `known_rows` still match lossy text — the half-moved state §7 refuses, invisible to every
-    //     other test here because round 1 reads nothing but display text.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let root = tmp.path().join("ws");
     fs::create_dir_all(&root).expect("test setup: workspace directory");
     let on_disk = root.join(OsString::from_vec(b"caf\xe9.md".to_vec()));
     fs::write(&on_disk, "# Cafe\n").expect("test setup: write the non-UTF-8 named note");
 
-    // The lossy spelling of that name — what `walk` records as `rel`, and all a version-three row can hold.
-    let display = "caf\u{FFFD}.md";
+    // The lossy spelling of that name — what a version-3 `rel` could hold, and what the row still displays.
+    let display = "caf\u{fffd}.md";
     let cfg = Config {
         data_dir: tmp.path().join("data"),
         ..Config::default()
@@ -1547,55 +1567,150 @@ fn a_migrated_lossy_path_scans_silent_and_keeps_its_lossy_key() {
             })
             .expect("test: the fixture records its versions"),
         3,
-        "premise: this is a version-three file, so the scan below runs migration 4 on its way in"
+        "premise: a version-three file, so the scan below runs migration 4 on its way in"
     );
 
-    let report = scan(&root, &cfg).expect("the first scan after migration 4");
+    let report = scan(&root, &cfg).expect("the first byte-keyed scan of a lossy workspace");
     assert!(report.skipped.is_empty(), "{report:?}");
     assert_eq!(
         (report.added, report.modified, report.moved, report.removed),
-        (0, 0, 0, 0),
-        "a migrated row is not a changed row: {report:?}"
+        (0, 0, 1, 0),
+        "unchanged content under a second byte key is one `Moved`, and nothing else: {report:?}"
     );
     assert_eq!(
-        report.unchanged, 1,
-        "the one file was already known exactly as it is: {report:?}"
-    );
-    assert_eq!(
-        report.notes, 1,
-        "and its note row came through the upgrade: {report:?}"
+        report.unchanged, 0,
+        "the row did change — its key moved: {report:?}"
     );
 
     let db = Db::open(&db_path).expect("test: reopen the migrated database");
+    // The receipt named this workspace before any comparison ran (migration 4 writes it on the way in), which
+    // is how a person tells this `Moved` from a regression: `files=1` predicts about one such path.
+    assert_eq!(
+        lossy_receipt(&db),
+        "files=1,notes=1",
+        "the flagged row is what the churn belongs to"
+    );
     let key: Vec<u8> =
         db.0.query_row(
             "SELECT rel_bytes FROM files WHERE rel = ?1",
             rusqlite::params![display],
             |row| row.get(0),
         )
-        .expect("the lossy row carries a byte key after a round-1 scan");
+        .expect("the lossy row carries a byte key");
     assert_eq!(
         key,
-        vec![0x63, 0x61, 0x66, 0xEF, 0xBF, 0xBD, 0x2E, 0x6D, 0x64],
-        "round 1 keys on `s.rel` (F13 §7): the bytes of the display spelling, U+FFFD included"
-    );
-    assert_ne!(
-        key,
         vec![0x63, 0x61, 0x66, 0xE9, 0x2E, 0x6D, 0x64],
-        "the byte-exact name on disk is round 2's key; writing it here would put new rows under one rule \
-         and every read under another"
+        "the walk's real bytes replaced the bytes of the display spelling"
+    );
+
+    // Identity survived the rewrite rather than being re-minted: same `notes.id`, its child row still hung
+    // off it, and the note now displays the path the catalog renders.
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM headings WHERE note_id = 4"),
+        1,
+        "the move carried the note and everything derived from it"
+    );
+    assert_eq!(
+        scalar::<String>(&db, "SELECT title FROM notes WHERE id = 4"),
+        "Cafe",
+        "one note row, moved rather than replaced"
+    );
+    drop(db);
+
+    // Convergence — the assertion that the key was actually **rewritten** rather than re-derived every pass.
+    let again = scan(&root, &cfg).expect("test: second scan");
+    assert_eq!(
+        (
+            again.added,
+            again.modified,
+            again.moved,
+            again.removed,
+            again.unchanged
+        ),
+        (0, 0, 0, 0, 1),
+        "the churn is one-time: {again:?}"
+    );
+    assert!(again.skipped.is_empty(), "{again:?}");
+}
+
+/// §4.2's third shape, which is §1's actual workspace: one migrated row carrying `caf\xe9.md`'s digest with
+/// **both** twins on disk. The row can only answer for one of them — the other was never written at all, its
+/// title and tags and links simply lost — so the first byte-keyed scan reports one `Moved` (the path whose
+/// hash survives) plus one `Added` (the twin nobody ever wrote). That is the swallowed path coming back, and
+/// §2 says only a rescan can bring it.
+#[cfg(unix)]
+#[test]
+fn a_migrated_row_over_two_twins_reports_one_move_and_brings_the_lost_note_back() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace directory");
+    let e9 = root.join(OsString::from_vec(b"caf\xe9.md".to_vec()));
+    let e8 = root.join(OsString::from_vec(b"caf\xe8.md".to_vec()));
+    fs::write(&e9, "# Cafe nine\n").expect("test setup: write the twin the row knows");
+    fs::write(&e8, "# Cafe eight\n").expect("test setup: write the twin that was never indexed");
+
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+    let db_path = cfg.workspace_db(&root);
+    fs::create_dir_all(db_path.parent().expect("test setup: database directory"))
+        .expect("test setup: database directory");
+    // The row holds the byte-largest path's digest, which is what F13 §1 observed on the real workspace.
+    let hash = sha256_file(&e9).expect("test setup: hash the surviving twin");
+    let size = fs::metadata(&e9)
+        .expect("test setup: read the surviving twin")
+        .len() as i64;
+    seed_scanned_lossy_version_three(&db_path, "caf\u{fffd}.md", &hash, size);
+
+    let report = scan(&root, &cfg).expect("the first byte-keyed scan over a twin pair");
+    assert!(report.skipped.is_empty(), "{report:?}");
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (1, 0, 1, 0),
+        "one path travels onto its real key, the other is indexed for the first time: {report:?}"
+    );
+    assert_eq!(
+        report.notes, 2,
+        "both notes are live by this scan: {report:?}"
+    );
+
+    let db = Db::open(&db_path).expect("test: reopen the workspace");
+    assert_eq!(
+        names(
+            &db,
+            "SELECT hex(rel_bytes) || '=' || title FROM files f JOIN notes n USING (rel_bytes) ORDER BY f.rel_bytes"
+        ),
+        [
+            // The lower key is the twin that was never written: fresh row, fresh note, re-derived content.
+            "636166E82E6D64=Cafe eight".to_string(),
+            // The higher key is the migrated row, renamed onto its real bytes with its note carried — and
+            // re-parsed, because a version-3 database holds no parse-rules label (F15), so this scan
+            // refreshes every note it touches. Same `notes.id`, which is what "carried" means here.
+            "636166E92E6D64=Cafe nine".to_string(),
+        ],
+        "two live rows by the first scan, each with its own note"
+    );
+    drop(db);
+
+    let again = scan(&root, &cfg).expect("test: second scan");
+    assert_eq!(
+        (again.added, again.moved, again.removed, again.unchanged),
+        (0, 0, 0, 2),
+        "the churn is one-time and the pair converges: {again:?}"
     );
 }
 
 #[test]
 fn upsert_file_keys_come_from_rel_and_never_from_abs() {
-    // F13 §7's rule for round 1's writers, isolated to one write. Breaking it is not invisible today: one
-    // such mutation turns 53 tests red across four binaries. But each of those failures belongs to whatever
-    // *it* measures — every fixture's `abs` is its `rel` under a `/ws/` prefix, so they all notice at once —
-    // and the one row spelled differently on purpose, in
-    // `a_migrated_lossy_path_scans_silent_and_keeps_its_lossy_key`, is `#[cfg(unix)]`, so a Windows CI has no
-    // pin here at all. This test writes nothing else and hands the writer an `abs` sharing no bytes with the
-    // `rel`, so it can fail for exactly one reason.
+    // The key travels on the snapshot; the byte-exact `abs` this writer is still handed is display material
+    // only (`abs.to_string_lossy()` into the `abs` column). Re-deriving a key from it would silently disagree
+    // with the walk for any name that does not round-trip. This test hands `upsert_file` an `abs` sharing no
+    // bytes with the snapshot's path, so it can fail for exactly one reason — and every other fixture here
+    // spells its `abs` as `/ws/` + `rel`, where the two routes look identical.
     let db = Db::in_memory().expect("in-memory database");
     upsert_file(
         &db,
@@ -1656,15 +1771,17 @@ fn seed_duplicate_notes_version_three(path: &Path, rel: &str, hash: &str, size: 
 fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a_bare_query_row() {
     // `notes.rel` was never UNIQUE at version 3, so a legacy database may carry two note rows for one file,
     // and migration 4 copies both onto one `rel_bytes` — which has no UNIQUE there by design (F13 §7). This
-    // is the population every identity lookup round 2 writes has to plan for: an explicit `LIMIT 1` with the
-    // tie-break named, or an aggregate, because a bare `query_row` on such a key is **not a wrong answer but
-    // a scan error**. Today's `note_id` answers with `LIMIT 1` (`scan.rs`), and re-keying that lookup onto
-    // `rel_bytes` does not shrink the population: both rows carry the same key, so the round that moves it
-    // inherits the same requirement.
+    // is the population every identity lookup now plans for: a bare `query_row` on such a key is **not a wrong
+    // answer but a scan error** (`ExecuteMultipleValues`), and `LIMIT 1` is a silent pick that rewrites one
+    // note's title, tags, items and links with the other file's. So [`np_core::db::note_ids`] reads every id
+    // and the scan acts on the count.
     //
-    // The two §5 properties that make the population visible:
-    // (1) the migration neither collapses the pair into one row nor refuses it: both survive, on one key;
-    // (2) after a write pass no note row carries a NULL `rel_bytes`, so none can hide from the re-keyed join.
+    // Round 2 amended the second half of this test (F13 §7): what used to be "indexed quietly" is now
+    // reported. Three things are pinned:
+    // (1) the legacy duplicate neither fails the scan nor gets a silent winner — the file is named in
+    //     `skipped` and **no note is rewritten**;
+    // (2) the migration neither collapses the pair into one row nor refuses it: both survive, on one key;
+    // (3) after a write pass no note row carries a NULL `rel_bytes`, so none can hide from the re-keyed join.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let root = tmp.path().join("ws");
     fs::create_dir_all(&root).expect("test setup: workspace directory");
@@ -1703,7 +1820,13 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
     );
 
     let report = scan(&root, &cfg).expect("a legacy duplicate must not fail the scan");
-    assert!(report.skipped.is_empty(), "{report:?}");
+    // (1) The duplicate is named, by the spelling a person can match against their workspace, and the scan
+    // carried on to `fresh.md`. Nothing about `dup.md` was counted: it was refused, not indexed.
+    assert_eq!(
+        report.skipped,
+        vec!["dup.md".to_string()],
+        "the file holding two note rows is the thing this scan could not index: {report:?}"
+    );
     assert_eq!(
         (report.added, report.modified, report.moved, report.removed),
         (1, 0, 0, 0),
@@ -1711,6 +1834,20 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
     );
 
     let db = Db::open(&db_path).expect("test: reopen the migrated database");
+    // ... and neither of the two rows was rewritten. Had one been picked, its title would now be `Dup` —
+    // what this file's own text says — because the scan parses the file, not the row it refused to touch.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT id || ':' || title || ':' || body FROM notes ORDER BY id"
+        ),
+        [
+            "4:Dup first:first".to_string(),
+            "9:Dup second:second".to_string(),
+            "10:Fresh:# Fresh\n".to_string(),
+        ],
+        "no note was rewritten, and the untouched pair still reads as the legacy fixture wrote it"
+    );
     // (1) Both legacy rows, both ids, one key — and `fresh.md`'s brand-new note keyed the same way.
     assert_eq!(
         names(
@@ -1730,7 +1867,7 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
         "the two notes hang off one `files` row's key, which is what makes the key non-unique by design"
     );
 
-    // (2) §5's weaker, more important half: no keyless note after a write pass. A NULL key matches nothing
+    // (3) §5's weaker, more important half: no keyless note after a write pass. A NULL key matches nothing
     // the re-keyed join, cascade and lookup compare on bytes.
     assert_eq!(
         scalar::<i64>(&db, "SELECT COUNT(*) FROM notes WHERE rel_bytes IS NULL"),
@@ -1771,7 +1908,7 @@ fn move_keeps_note_identity() {
 
     // An earlier scan reported this path gone. `classify` can only emit `Moved` for a path that
     // is there now, so the move has to bring the row back into the live set.
-    mark_stale(&db, from).expect("mark the file stale first");
+    mark_stale(&db, from.as_bytes()).expect("mark the file stale first");
     assert_eq!(
         scalar::<String>(
             &db,
@@ -1782,8 +1919,8 @@ fn move_keeps_note_identity() {
 
     apply_move(
         &db,
-        from,
-        to,
+        &path(from),
+        &path(to),
         // A move is also a sighting, so `last_seen` moves with it.
         1_700_000_600,
     )
@@ -1870,7 +2007,8 @@ fn apply_move_reports_rows_it_cannot_rewrite() {
     let db = Db::in_memory().expect("in-memory database");
 
     // A path the registry never saw: failing loudly beats a move that silently did nothing.
-    let missing = apply_move(&db, "gone.md", "here.md", 1).expect_err("unknown rel is a bug");
+    let missing =
+        apply_move(&db, &path("gone.md"), &path("here.md"), 1).expect_err("unknown rel is a bug");
     assert!(
         missing.to_string().contains("gone.md"),
         "the error names the path: {missing}"
@@ -1884,7 +2022,8 @@ fn apply_move_reports_rows_it_cannot_rewrite() {
         [],
     )
     .expect("test setup: unrelated abs");
-    let err = apply_move(&db, "a.md", "b.md", 2).expect_err("an unrebasable abs is a bug");
+    let err =
+        apply_move(&db, &path("a.md"), &path("b.md"), 2).expect_err("an unrebasable abs is a bug");
     assert!(
         matches!(err, DbError::BadAbs { .. }),
         "expected BadAbs, got {err}"
@@ -1903,7 +2042,7 @@ fn stale_then_reappear_rejoins() {
     insert_note(&db, "a.md", "A");
     let rowid = scalar::<i64>(&db, "SELECT rowid FROM files WHERE rel = 'a.md'");
 
-    mark_stale(&db, "a.md").expect("mark stale");
+    mark_stale(&db, b"a.md").expect("mark stale");
     assert_eq!(
         scalar::<String>(&db, "SELECT state FROM files WHERE rel = 'a.md'"),
         "stale"
@@ -2011,7 +2150,7 @@ fn note_counts_tallies_rows_without_loading_them() {
     );
 
     // A stale file is hidden from the catalog, not deleted, so its rows keep counting.
-    mark_stale(&db, "b.md").expect("mark stale");
+    mark_stale(&db, b"b.md").expect("mark stale");
     assert_eq!(note_counts(&db).expect("counts after a delete").notes, 2);
 }
 

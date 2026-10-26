@@ -697,9 +697,11 @@ fn index_file(
 /// - An orphan can no longer survive this function at all. SQLite hands a deleted rowid to the next
 ///   INSERT, so an inbound edge left pointing at a dead note would eventually claim an unrelated note as
 ///   its destination — which is precisely what `dst_note_id`'s foreign key now rules out.
+///
 /// Returns `false` when the path carries **more than one** note row and nothing was deleted: choosing which
 /// of two notes to destroy is the same guess F13 §7 refuses, so the caller reports the file instead.
-/// `true` means the path is now free of note rows, whether or not one was there.
+/// `true` means the path is now free of note rows — whether or not one was there, since "already none" is
+/// the state this call wanted.
 fn delete_note_row(db: &Db, path: &RelPath) -> Result<bool, DbError> {
     let note = note_row(db, path)?;
     // Two rows on one key: there is no honest choice about which to destroy.
@@ -966,16 +968,16 @@ fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
           ORDER BY n.rel_bytes",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, i64>(4)?.max(0) as u64,
-        ))
+        Ok(LiveNote {
+            id: row.get::<_, i64>(0)?,
+            rel_bytes: row.get::<_, Vec<u8>>(1)?,
+            rel: row.get::<_, String>(2)?,
+            title: row.get::<_, Option<String>>(3)?,
+            size: row.get::<_, i64>(4)?.max(0) as u64,
+        })
     })?;
     // Read out fully before the counts run, so no read is open across another statement.
-    let mut live: Vec<(i64, Vec<u8>, String, Option<String>, u64)> = Vec::new();
+    let mut live: Vec<LiveNote> = Vec::new();
     for row in rows {
         live.push(row?);
     }
@@ -999,18 +1001,36 @@ fn catalog_entries(db: &Db) -> Result<Vec<CatalogEntry>, DbError> {
 
     Ok(live
         .into_iter()
-        .map(|(id, rel_bytes, rel, title, size)| CatalogEntry {
-            title: title
+        .map(|note| CatalogEntry {
+            title: note
+                .title
                 .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| file_name(&rel).to_string()),
-            size_human: catalog::size_human(size),
-            tags: tags.get(&id).cloned().unwrap_or_default(),
-            out: count_of(&out, id),
-            inc: count_of(&inc, id),
-            rel_bytes,
-            rel,
+                .unwrap_or_else(|| file_name(&note.rel).to_string()),
+            size_human: catalog::size_human(note.size),
+            tags: tags.get(&note.id).cloned().unwrap_or_default(),
+            out: count_of(&out, note.id),
+            inc: count_of(&inc, note.id),
+            rel_bytes: note.rel_bytes,
+            rel: note.rel,
         })
         .collect())
+}
+
+/// One live note as [`catalog_entries`] reads it, before its counts and tags are attached.
+///
+/// A name rather than a five-field tuple: the row now carries both spellings of its path, and which of them
+/// renders (`rel`) and which only orders (`rel_bytes`) is the distinction worth keeping visible here.
+struct LiveNote {
+    /// The note row's id — what the link counts and tags are keyed on.
+    id: i64,
+    /// The byte key, for `ORDER BY` and for nothing a reader sees.
+    rel_bytes: Vec<u8>,
+    /// The display path, which is what the entry links to.
+    rel: String,
+    /// Stored title; `None` or empty means the entry takes its file name.
+    title: Option<String>,
+    /// File size in bytes, rendered through [`catalog::size_human`].
+    size: u64,
 }
 
 /// One `SELECT note_id, COUNT(*)` pair into a lookup.

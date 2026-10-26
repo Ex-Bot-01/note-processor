@@ -95,7 +95,7 @@ pub struct Walked {
 }
 
 /// Discover every tracked file under `root`, sorted by `case_key` then the byte
-/// identity `rel_bytes` (see [`sort_found`] for why the byte key needs no further tie-break).
+/// identity `rel_bytes` (see `sort_found` for why the byte key needs no further tie-break).
 ///
 /// All regular files come back, markdown or not. Symlinks are neither followed nor
 /// recorded, so a link back to a parent directory cannot loop and a link to a file is

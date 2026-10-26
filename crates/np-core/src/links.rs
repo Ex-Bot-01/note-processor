@@ -454,7 +454,10 @@ fn basename_index(corpus: &BTreeMap<String, Vec<RelPath>>) -> HashMap<String, Ve
         for path in paths {
             let name = file_name(&path.rel);
             let name_key = name.to_lowercase();
-            index.entry(name_key.clone()).or_default().push(path.clone());
+            index
+                .entry(name_key.clone())
+                .or_default()
+                .push(path.clone());
             let stem = match extension(name) {
                 Some(extension) => &name[..name.len() - extension.len() - 1],
                 None => name,

@@ -42,7 +42,7 @@ pub struct CatalogEntry {
     /// Workspace-relative path, already in the `/`-separated spelling used inside markdown. This is what
     /// the entry renders.
     pub rel: String,
-    /// The same path as bytes — read by [`sort_key`] as the last tie-break and rendered by nothing (F13 §3).
+    /// The same path as bytes — read by `sort_key` as the last tie-break and rendered by nothing (F13 §3).
     /// Two live twins spell `rel` identically, so a display tie-break orders nothing and the rendered bytes
     /// would fall to whichever row SQLite happened to read.
     pub rel_bytes: Vec<u8>,

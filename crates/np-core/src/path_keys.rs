@@ -171,7 +171,10 @@ mod tests {
             rel_bytes_of_display("caf\u{fffd}.md"),
             vec![0x63, 0x61, 0x66, 0xEF, 0xBF, 0xBD, 0x2E, 0x6D, 0x64]
         );
-        assert_eq!(rel_bytes_of_display("café.md"), "café.md".as_bytes().to_vec());
+        assert_eq!(
+            rel_bytes_of_display("café.md"),
+            "café.md".as_bytes().to_vec()
+        );
         assert_eq!(RelPath::from_display("a.md").rel_bytes, b"a.md".to_vec());
     }
 

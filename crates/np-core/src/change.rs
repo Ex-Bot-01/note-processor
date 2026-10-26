@@ -143,7 +143,12 @@ pub fn classify(
         match claim {
             Some(before) => {
                 moved_from.insert(before.rel_bytes.as_slice());
-                changes.push((path_of(added), Change::Moved { from: path_of(before) }));
+                changes.push((
+                    path_of(added),
+                    Change::Moved {
+                        from: path_of(before),
+                    },
+                ));
             }
             None => changes.push((path_of(added), Change::Added)),
         }
@@ -228,8 +233,7 @@ fn closest_to<'a>(candidates: &[&'a Snapshot], added: &Snapshot) -> Option<&'a S
             Some(held) => {
                 let mine = shared_dirs(&candidate.rel_bytes, &added.rel_bytes);
                 let theirs = shared_dirs(&held.rel_bytes, &added.rel_bytes);
-                mine > theirs
-                    || (mine == theirs && candidate.rel_bytes < held.rel_bytes)
+                mine > theirs || (mine == theirs && candidate.rel_bytes < held.rel_bytes)
             }
         };
         if better {
