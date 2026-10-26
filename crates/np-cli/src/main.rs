@@ -1,6 +1,7 @@
 //! `np` — command line entry point for note-processor.
 
 use std::error::Error;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -35,7 +36,11 @@ fn main() -> ExitCode {
         Command::Scan { workspace, json } => match scan_workspace(&workspace, json) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("np: {err}");
+                // Written through a handle with the result dropped, for the reason `np_core::scan` gives for
+                // its own stderr receipt: `eprintln!` panics when descriptor 2 refuses the write, which would
+                // replace a reportable failure with exit 101 and a panic message that cannot be printed
+                // either. The exit code is the part the caller can still observe, so it stays FAILURE.
+                let _ = writeln!(io::stderr(), "np: {err}");
                 ExitCode::FAILURE
             }
         },
@@ -44,9 +49,10 @@ fn main() -> ExitCode {
 
 /// Index `workspace` and print its report.
 ///
-/// Every failure leaves as one message on stderr and exit code 1. A configuration that names no data
-/// dir is reported as the missing value it is, because [`Config::load`] refuses rather than deriving
-/// `workspaces/<hash>.sqlite` next to the current directory.
+/// Every failure leaves as one message on stderr and exit code 1 — the message is best effort, because a
+/// descriptor that refuses writes must not cost the caller the exit code (see the call site in `main`). A
+/// configuration that names no data dir is reported as the missing value it is, because [`Config::load`]
+/// refuses rather than deriving `workspaces/<hash>.sqlite` next to the current directory.
 fn scan_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     let cfg = match Config::load(None) {
         Ok(cfg) => cfg,
@@ -62,30 +68,35 @@ fn scan_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
 }
 
 /// The human-readable form of a report: one aligned line per counted field, then the details.
+///
+/// Every line goes to one locked stdout handle with its result dropped, so a descriptor that refuses writes
+/// (a closed pipe, `/dev/full`) cannot turn a scan whose work is committed into the panic `println!` would
+/// raise — exit 101 over a summary nobody can read. The bytes on stdout are exactly what they were.
 fn print_summary(report: &ScanReport) {
-    println!("added      {}", report.added);
-    println!("modified   {}", report.modified);
-    println!("moved      {}", report.moved);
-    println!("removed    {}", report.removed);
-    println!("unchanged  {}", report.unchanged);
-    println!("notes      {}", report.notes);
-    print!("unresolved {}", report.unresolved_links);
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "added      {}", report.added);
+    let _ = writeln!(out, "modified   {}", report.modified);
+    let _ = writeln!(out, "moved      {}", report.moved);
+    let _ = writeln!(out, "removed    {}", report.removed);
+    let _ = writeln!(out, "unchanged  {}", report.unchanged);
+    let _ = writeln!(out, "notes      {}", report.notes);
+    let _ = write!(out, "unresolved {}", report.unresolved_links);
     if report.unresolved_links > 0 {
         // An ambiguous target is left unresolved instead of guessed, so the number alone is not
         // actionable. Spelling the path usually is (`np_core::links::resolve` matches an exact rel first) —
         // except for a pair differing only in case, whose spellings fold identically and so place neither.
-        print!(" — a target matched more than one file or none; spell its path to place it, e.g. [[notes/a.md]]");
+        let _ = write!(out, " — a target matched more than one file or none; spell its path to place it, e.g. [[notes/a.md]]");
     }
-    println!();
+    let _ = writeln!(out);
     // The targets behind that count, spelled as their author wrote them. The scan reads both from one
     // transaction, so this list can never answer a different question than the number above it.
     for target in &report.unresolved_targets {
-        println!("  {target}");
+        let _ = writeln!(out, "  {target}");
     }
-    println!("skipped    {}", report.skipped.len());
+    let _ = writeln!(out, "skipped    {}", report.skipped.len());
     for path in &report.skipped {
-        println!("  {path}");
+        let _ = writeln!(out, "  {path}");
     }
-    println!("index      {}", report.index_files.join(", "));
-    println!("elapsed    {} ms", report.elapsed_ms);
+    let _ = writeln!(out, "index      {}", report.index_files.join(", "));
+    let _ = writeln!(out, "elapsed    {} ms", report.elapsed_ms);
 }

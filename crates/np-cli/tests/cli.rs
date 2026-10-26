@@ -269,23 +269,29 @@ fn rescan_is_a_no_op_and_exits_zero() {
     assert_eq!(again["notes"], CORPUS_NOTES);
 }
 
-#[test]
-fn missing_data_dir_is_a_configuration_error_not_a_panic() {
-    let ws = workspace();
-    // No data dir from the environment and no config file to supply one: every path the program
-    // would derive would land next to the current directory, so it must refuse instead.
+/// `np scan <root>` with every place the binary can find a data dir or a config file **cleared**, so
+/// configuration loading has nothing to resolve and the run is on the CLI's error path.
+///
+/// Cleared rather than redirected: on Windows the data dir comes from `%LOCALAPPDATA%` and the config dir
+/// from `%APPDATA%`, so an unset XDG pair alone would still find a developer's real directories.
+fn scan_without_a_data_dir(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_np"));
-    // Cleared rather than redirected: on Windows the data dir comes from `%LOCALAPPDATA%` and the config
-    // dir from `%APPDATA%`, so an unset XDG pair alone would still find a developer's real directories.
     cmd.env("XDG_DATA_HOME", "")
         .env("LOCALAPPDATA", "")
         .env("HOME", "")
         .env("XDG_CONFIG_HOME", "")
         .env("APPDATA", "")
         .arg("scan")
-        .arg(&ws.root);
+        .arg(root);
+    cmd
+}
 
-    let failed = run(&mut cmd);
+#[test]
+fn missing_data_dir_is_a_configuration_error_not_a_panic() {
+    let ws = workspace();
+    // No data dir from the environment and no config file to supply one: every path the program
+    // would derive would land next to the current directory, so it must refuse instead.
+    let failed = run(&mut scan_without_a_data_dir(&ws.root));
 
     assert_eq!(
         failed.code(),
@@ -564,4 +570,48 @@ fn a_scan_survives_a_stderr_that_refuses_every_write() {
         survived.stdout()
     );
     assert!(ws.index().is_file(), "the catalog is still written");
+}
+
+/// (d) The same refusing descriptor one layer up: the CLI's own error message. `np_core` may decline to
+/// print anything, but a failure that reaches `main` still has to leave through exit code 1 — with
+/// `eprintln!` it panicked instead, so the process died as 101 with no message about the configuration
+/// error it had already worked out. Linux-only for the reason given on the receipt case above.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_error_is_reported_rather_than_panicked_when_stderr_refuses_it() {
+    let ws = workspace();
+    // Premise: the descriptor has to refuse, or there is nothing here to survive.
+    if fs::write("/dev/full", "error").is_ok() {
+        panic!("test premise: /dev/full accepted a write, so this case would prove nothing");
+    }
+
+    // Spawned directly rather than through [`run`]: `Command::output` replaces the inherited stdio with its
+    // own pipes, which silently undoes the descriptor 2 this case is about and lets the test pass whatever
+    // the binary does with it.
+    let mut cmd = scan_without_a_data_dir(&ws.root);
+    let argv = format!("{cmd:?}");
+    let output = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .expect("test setup: open /dev/full for writing"),
+        ))
+        .spawn()
+        .unwrap_or_else(|err| panic!("cannot start `{argv}`: {err}"))
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("cannot wait for `{argv}`: {err}"));
+    let refused = Run { argv, output };
+
+    // 101 is the answer this fixture produced before the fix — a panic inside the error handler, over a
+    // refusal `missing_data_dir_is_a_configuration_error_not_a_panic` shows the CLI reports properly.
+    assert_eq!(
+        refused.code(),
+        1,
+        "a refusing stderr must cost the message, never the exit code: stdout `{}`, stderr `{}`",
+        refused.stdout(),
+        refused.stderr()
+    );
 }
