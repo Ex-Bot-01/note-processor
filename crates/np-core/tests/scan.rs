@@ -1622,6 +1622,163 @@ fn a_stale_parse_version_reparses_every_unchanged_note() {
     );
 }
 
+/// The heading texts stored for one note, in the order the parser wrote them.
+///
+/// Hand-built fixtures rewrite this table to imitate rows an older parser left behind, so it also proves
+/// a refresh reached the note it was able to read.
+fn heading_texts(open: &np_core::db::Db, rel: &str) -> Vec<String> {
+    let mut statement = open
+        .0
+        .prepare(
+            "SELECT h.text FROM headings h JOIN notes n ON n.id = h.note_id \
+             WHERE n.rel = ?1 ORDER BY h.rowid",
+        )
+        .expect("test: prepare the heading read");
+    let rows = statement
+        .query_map([rel], |row| row.get::<_, String>(0))
+        .expect("test: read headings");
+    rows.map(|row| row.expect("test: heading row")).collect()
+}
+
+/// Wipe one note's derived headings: the shape an older parser leaves behind, so a refresh has something
+/// visible to put back.
+fn forget_headings(open: &np_core::db::Db, rel: &str) {
+    open.0
+        .execute(
+            "DELETE FROM headings WHERE note_id = (SELECT id FROM notes WHERE rel = ?1)",
+            [rel],
+        )
+        .expect("test: wipe the derived headings");
+    assert!(
+        heading_texts(open, rel).is_empty(),
+        "test setup: no headings left for {rel}"
+    );
+}
+
+#[test]
+fn a_refresh_that_missed_a_note_leaves_the_parse_version_unrecorded() {
+    // F15's own failure mode, reintroduced by the fix if this is not pinned: a scan that re-parses most of
+    // the corpus but skips one path must not label the whole database current. The skipped note keeps the
+    // rows an older build wrote, and once the version says "current" nothing revisits them again.
+    let ws = scratch(
+        &[
+            ("covered.md", "---\n# Covered Heading\n---\n\nprose\n"),
+            ("missed.md", "---\n# Missed Heading\n---\n\nprose\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    let db = ws.db();
+    forget_headings(&db, "covered.md");
+    record_parse_version(&db, PARSE_VERSION - 1);
+    drop(db);
+
+    // `missed.md` disappears between the walk and the read: unknown, so this scan writes nothing for it.
+    let report = scan_with_inject(&ws.root, &ws.cfg, |root| {
+        fs::remove_file(root.join("missed.md")).expect("test hook: vanish one note");
+    })
+    .expect("a mutated file must not fail the scan");
+    assert!(
+        report.skipped.iter().any(|skipped| skipped == "missed.md"),
+        "the uncovered path must be named: {:?}",
+        report.skipped
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        heading_texts(&db, "covered.md"),
+        vec!["Covered Heading".to_string()],
+        "the notes this scan could reach still get refreshed"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION - 1),
+        "a refresh that did not cover the corpus must not label it current"
+    );
+    drop(db);
+
+    // With nothing in the way, the next scan finishes the job and records once.
+    fs::write(
+        ws.root.join("missed.md"),
+        "---\n# Missed Heading\n---\n\nprose\n",
+    )
+    .expect("test: put the note back");
+    scan(&ws.root, &ws.cfg).expect("scan that completes the refresh");
+    assert_eq!(
+        recorded_parse_version(&ws.db()),
+        Some(PARSE_VERSION),
+        "a covering refresh must record, or every later scan re-parses forever"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refresh_blocked_by_an_unreadable_directory_leaves_the_version_unrecorded() {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+
+    // The other way a note escapes a refresh without reaching `skipped` as a written path: its directory
+    // cannot be entered, so its live row is dropped by `known_rows` and never appears in `found` at all.
+    let ws = scratch(
+        &[
+            ("top.md", "---\n# Top Heading\n---\n\nprose\n"),
+            ("deep/low.md", "# Low\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    let db = ws.db();
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, PARSE_VERSION - 1);
+    drop(db);
+
+    let locked = ws.root.join("deep");
+    let found_mode = fs::metadata(&locked)
+        .expect("test setup: read the directory mode")
+        .permissions()
+        .mode()
+        & 0o7777;
+    fs::set_permissions(&locked, Permissions::from_mode(0o000)).expect("test: chmod 000");
+    struct Restore {
+        dir: PathBuf,
+        mode: u32,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.dir, Permissions::from_mode(self.mode));
+        }
+    }
+    let _restore = Restore {
+        dir: locked.clone(),
+        mode: found_mode,
+    };
+
+    scan(&ws.root, &ws.cfg).expect("an unreadable directory must not fail the scan");
+
+    let db = ws.db();
+    assert_eq!(
+        heading_texts(&db, "top.md"),
+        vec!["Top Heading".to_string()],
+        "the reachable note must still be refreshed"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION - 1),
+        "rows hidden behind an unreadable directory are not covered by this refresh"
+    );
+    drop(db);
+
+    drop(_restore);
+    scan(&ws.root, &ws.cfg).expect("scan after the directory opens again");
+    assert_eq!(
+        recorded_parse_version(&ws.db()),
+        Some(PARSE_VERSION),
+        "once the subtree is visible again the refresh must complete"
+    );
+}
+
 #[test]
 fn a_null_meta_value_is_read_as_no_label_rather_than_failing_the_scan() {
     // Someone who pokes at the database by hand can leave `NULL` in `meta.value`. Both readers here

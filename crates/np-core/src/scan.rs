@@ -190,11 +190,8 @@ pub fn scan_with_inject(
     let stored = parse_version(&db)?;
     let refresh = refresh_needed(stored);
     let now = now_secs();
-    let changes = classify(
-        &known_rows(&db, &walked.unreadable)?,
-        &snapshots,
-        !cfg!(windows),
-    );
+    let (known, hidden_by_unreadable) = known_rows(&db, &walked.unreadable)?;
+    let changes = classify(&known, &snapshots, !cfg!(windows));
 
     let tx = db.0.unchecked_transaction().map_err(DbError::from)?;
     let written = apply_changes(
@@ -206,6 +203,8 @@ pub fn scan_with_inject(
         !cfg!(windows),
         &cfg.markers,
     )?;
+    // Decided here, before anything else writes, from what the write pass actually delivered.
+    let record_version = refresh && refresh_covered(&written, hidden_by_unreadable);
     // Resolution waits for that pass so a link can land on a file that only appeared in this scan, and
     // comes after the stale-marking so nothing resolves onto a note that just left the live set.
     store_note_links(&db, &written.parsed)?;
@@ -223,7 +222,7 @@ pub fn scan_with_inject(
     // so a kill between this commit and the writes below still leaves every stranded shard named.
     let rendered = catalog::render(&entries, &cfg.catalog);
     set_index_list(&db, &rendered)?;
-    if refresh {
+    if record_version {
         // Recorded in the same transaction as the rows it describes: a scan that dies halfway has to
         // refresh again rather than leave half the corpus labelled as current. An up-to-date database
         // writes nothing here, so the steady-state scan pays one `SELECT` and no extra `INSERT`.
@@ -234,6 +233,11 @@ pub fn scan_with_inject(
     // [`crate::db::report_orphans`] follows. The report's own counts stay the classification truth; this
     // is the only place a person learns that a scan with nothing to report did real work.
     report_refresh(&mut io::stderr(), stored, written.refreshed);
+    if refresh && !record_version {
+        // Without this line a workspace with one unreadable directory would re-parse its whole corpus on
+        // every scan in silence, which looks exactly like the version never being written by accident.
+        report_refresh_gap(&mut io::stderr(), written.uncovered + hidden_by_unreadable);
+    }
 
     // A root entry that wears one of our names but is not ours stays on disk and reaches the report, so
     // the user hears about the collision instead of losing the file.
@@ -276,6 +280,10 @@ struct Written {
     refreshed: usize,
     /// Every note re-parsed here, for [`store_note_links`].
     parsed: Vec<Parsed>,
+    /// Notes this scan owed a write and never delivered one: unreadable as the walk saw it, or lost to an
+    /// identity conflict. Only meaningful during a refresh, where it decides whether the new rules may be
+    /// recorded — see [`refresh_covered`].
+    uncovered: usize,
 }
 
 /// One discovered file as this scan saw it: identity from the walk, digest and note text from the read
@@ -391,7 +399,11 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// The unreadable directories are the other half of the same caution: files below one were never seen,
 /// so their rows must reach neither a `Removed` nor a move (Task 4 handoff), and leaving them in would
 /// stale a whole subtree over one transient permission error.
-fn known_rows(db: &Db, unreadable: &[String]) -> Result<Vec<Snapshot>, DbError> {
+///
+/// The count alongside the rows is how many live rows that second filter dropped. Nothing else reports
+/// them — they appear nowhere in `found`, so no later pass sees them — and [`scan_with_inject`] needs
+/// them to know that a parse-rule refresh never reached part of the corpus.
+fn known_rows(db: &Db, unreadable: &[String]) -> Result<(Vec<Snapshot>, usize), DbError> {
     let mut statement = db.0.prepare(
         "SELECT rel, case_key, hash, size, mtime FROM files WHERE state = 'ok' ORDER BY rel",
     )?;
@@ -406,13 +418,16 @@ fn known_rows(db: &Db, unreadable: &[String]) -> Result<Vec<Snapshot>, DbError> 
     })?;
     // Read out fully here, so the write pass never runs with a read open across it.
     let mut known = Vec::new();
+    let mut hidden = 0_usize;
     for row in rows {
         let snapshot = row?;
-        if !under_unreadable(&snapshot.rel, unreadable) {
+        if under_unreadable(&snapshot.rel, unreadable) {
+            hidden += 1;
+        } else {
             known.push(snapshot);
         }
     }
-    Ok(known)
+    Ok((known, hidden))
 }
 
 /// Whether `rel` sits inside a directory the walk could not read, which makes its absence from the found
@@ -454,12 +469,19 @@ fn apply_changes(
         // An unknown path is already named in the report and contributed only its marker to
         // `classify`; there is nothing here to write, and counting it either way would be a guess.
         if is_unknown(readable) {
+            // Nothing to write, but a refresh has to remember that this one was missed: its derived rows
+            // still hold whatever an older build wrote for them.
+            written.uncovered += 1;
             continue;
         }
         // `Removed` is keyed on a path that is not in `found`, so it cannot reach this lookup.
         let change = pending.get(rel).copied();
         match index_file(db, readable, change, refresh, now, case_sensitive, markers)? {
-            Indexed::Taken => written.skipped.push(rel.to_string()),
+            Indexed::Taken => {
+                written.skipped.push(rel.to_string());
+                // Same reason as the unknown path above: this note keeps the rows it already had.
+                written.uncovered += 1;
+            }
             Indexed::Done(links) => {
                 if let Some(parsed) = links {
                     // `Some` here means the text was re-parsed, and a note `classify` did not call
@@ -979,6 +1001,19 @@ fn refresh_needed(stored: Option<u32>) -> bool {
     stored != Some(PARSE_VERSION)
 }
 
+/// Whether a refresh reached every note it owed new derived rows.
+///
+/// Two ways to miss one, neither visible in [`ScanReport`]: a file that changed or became unreadable
+/// between the walk and the read (`uncovered`, since the write pass skips its marker), and a live row
+/// under a directory the walk could not enter (`hidden_by_unreadable`, dropped by [`known_rows`] so it
+/// cannot be mistaken for deleted). Recording the version over either would label rows as current that
+/// an older build wrote, permanently — the exact failure F15 exists to prevent, reintroduced by the fix.
+/// Retrying is the cheaper fault: one subtree stays stale until it becomes readable again, and the scan
+/// after that records the version once the corpus is covered.
+fn refresh_covered(written: &Written, hidden_by_unreadable: usize) -> bool {
+    written.uncovered == 0 && hidden_by_unreadable == 0
+}
+
 /// Say out loud that a scan re-parsed notes whose files did not change — unless there is nothing to say.
 ///
 /// The report itself stays silent on purpose ([`ScanReport`] counts what classification decided, and its
@@ -989,6 +1024,21 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// The sink is a parameter because stderr cannot be redirected in-process — the standard library offers no
 /// way to replace the global handle — so the tests in this module drive the formatting directly, exactly as
 /// [`crate::db`] does for its receipt. What they cannot pin is that the production call site names stderr.
+/// Say out loud that a refresh could not label the corpus, so the next scan will try again.
+///
+/// stderr for the same reason as [`report_refresh`]: stdout stays machine-readable JSON. `missed` counts
+/// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory.
+fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
+    if missed == 0 {
+        return;
+    }
+    writeln!(
+        out,
+        "note-processor: parse rules v{PARSE_VERSION} not recorded — {missed} path(s) were not re-parsed this scan; the next scan will retry"
+    )
+    .expect("printing the incomplete-refresh notice to stderr");
+}
+
 fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
     // Zero means the refresh cost nothing extra: a first scan re-parses nothing it was not going to parse
     // as added anyway. "Rules moved, nothing to do" is not news.
@@ -1312,7 +1362,10 @@ fn now_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{np_published, remove_corpses, remove_file, report_refresh, PARSE_VERSION};
+    use super::{
+        np_published, remove_corpses, remove_file, report_refresh, report_refresh_gap,
+        PARSE_VERSION,
+    };
     use crate::catalog::{HEADER, HEADER_CRLF};
     use std::fs;
     use std::io::{self, ErrorKind};
@@ -1404,6 +1457,27 @@ mod tests {
         assert!(
             out.is_empty(),
             "a refresh that re-parsed nothing is not news: {out:?}"
+        );
+    }
+
+    /// The incomplete-refresh notice: one line naming what was missed, silence when nothing was.
+    #[test]
+    fn an_incomplete_refresh_says_the_version_was_not_recorded() {
+        let mut out = Vec::new();
+        report_refresh_gap(&mut out, 3);
+        assert_eq!(
+            String::from_utf8(out).expect("the notice is utf-8"),
+            format!(
+                "note-processor: parse rules v{PARSE_VERSION} not recorded — 3 path(s) were not re-parsed this scan; the next scan will retry\n"
+            ),
+        );
+
+        // A covering refresh has nothing to apologise for.
+        let mut out = Vec::new();
+        report_refresh_gap(&mut out, 0);
+        assert!(
+            out.is_empty(),
+            "a covered refresh is not a problem: {out:?}"
         );
     }
 
