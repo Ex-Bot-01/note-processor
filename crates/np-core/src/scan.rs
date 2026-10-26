@@ -315,8 +315,8 @@ fn is_unknown(found: &Found) -> bool {
 /// A markdown path with no `notes` row has nothing to re-label. An unreadable new file is indexed as
 /// `Added` on whichever scan can next read it, whatever the recorded version says, and the loser of a case
 /// collision (`a.md` against `A.md`, one `case_key`) is refused at insert and holds no row of its own in the
-/// normal case — a database written before tags were folded by Unicode case can hold a row the new key
-/// refuses, and that one *is* charged, which is the safe direction. Charging either would hold
+/// normal case — two raw names that decode lossily to the same `rel` do produce a path refused over a row that
+/// exists, and that one *is* charged, which is the safe direction. Charging either would hold
 /// the rules version back forever over rows that do not exist, re-parsing the whole corpus on every scan
 /// to repair nothing — the same mistake the attachment filter above already avoids, one level deeper.
 fn owes_a_reparse(db: &Db, rel: &str, is_markdown: bool) -> Result<bool, DbError> {
@@ -1058,10 +1058,11 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// Notes with existing rows only, on both sides. Three things are deliberately not charged, because no
 /// parse rule can stale what does not exist: an unreadable image or mode-000 download folder, a markdown
 /// path that has never had a `notes` row (it is indexed as `Added` whenever it next becomes readable), and
-/// the loser of a case collision, which never gets a row at all. Charging any of them would re-parse the
-/// whole corpus on every scan forever and repair nothing.
+/// the loser of a case collision, which is refused at insert and normally holds no row of its own. Charging
+/// any of them would re-parse the whole corpus on every scan forever and repair nothing.
 ///
-/// What *can* still hold the version back is stale data that exists and cannot be rewritten: a note whose
+/// What *can* still hold the version back indefinitely is stale data that exists and cannot be rewritten: a
+/// note whose
 /// rows are there but unreadable (a mode-000 `.md`, or one inside a directory nobody can enter), a live row
 /// hidden behind such a directory, and a move refused by an identity conflict — judged by the path it came
 /// from, since `classify` suppressed that path's `Removed` and its rows are still in the catalog. That loop

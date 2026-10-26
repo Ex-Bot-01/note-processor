@@ -1460,6 +1460,25 @@ fn record_parse_version(open: &Db, version: u32) {
     );
 }
 
+/// Whether this filesystem folds `a.md` and `A.md` into one file. A case-insensitive checkout made a single
+/// file at setup time, so nothing can ever collide there: the tests that need two distinct spellings say so
+/// out loud rather than failing a premise they could never satisfy — or, worse, passing while proving
+/// nothing.
+#[cfg(unix)]
+fn folds_case(root: &Path) -> bool {
+    fs::read_dir(root)
+        .expect("test setup: read the workspace")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("a.md")
+        })
+        .count()
+        < 2
+}
+
 /// Restore a captured permission mode on drop, so a failing assertion cannot leave a tempdir unreadable
 /// for the cleaner.
 #[cfg(unix)]
@@ -1849,6 +1868,10 @@ fn a_refused_move_does_not_label_the_note_it_left_behind_current() {
         600,
     );
     scan(&ws.root, &ws.cfg).expect("test: first scan");
+    if folds_case(&ws.root) {
+        eprintln!("skip: this filesystem folds a.md and A.md into one file, so nothing collides");
+        return;
+    }
 
     fs::rename(ws.root.join("old.md"), ws.root.join("a.md"))
         .expect("test: move the bytes onto a colliding name");
@@ -1921,20 +1944,9 @@ fn a_case_collision_with_no_row_behind_it_does_not_hold_the_version_back() {
     // Which of the two the scanner refuses is an internal detail, so read it back from the registry rather
     // than guess: exactly one of them has no row. On a case-insensitive checkout the pair folded into one
     // file at setup time and neither is refused — that runner says so out loud instead of passing vacuously.
-    // Gate on the filesystem rather than the registry. On a checkout that folds case the setup made one
-    // file out of the pair, and the registry would then show exactly one of the two missing — which reads
-    // as a collision this scan refused, not as a fixture that never existed.
-    let folded = fs::read_dir(&ws.root)
-        .expect("test setup: read the workspace")
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("a.md")
-        })
-        .count();
-    if folded < 2 {
+    // The gate is the filesystem, not the registry: on a folding checkout exactly one spelling is missing
+    // from `files` too, which reads as a collision this scan refused rather than a fixture that never was.
+    if folds_case(&ws.root) {
         eprintln!("skip: this filesystem folds a.md and A.md into one file, so nothing collides");
         return;
     }
