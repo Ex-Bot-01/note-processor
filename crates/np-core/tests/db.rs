@@ -922,6 +922,9 @@ INSERT INTO schema_version (version) VALUES (1), (2), (3);
 ///   old-versus-new `COUNT(*)` of `files` can see that row (F13 §4);
 /// - one `state = 'stale'` row and a note whose children survive anyway, with **gaps in the note ids**
 ///   (`1, 2, 5, 7`) so a re-mint hands out `1, 2, 3, 4` and fails;
+/// - **gaps in the `files` rowids** (`2, 3, 4, 9, 11, 13`) for the same reason: migration 4's copy carries
+///   each rowid into the new `id` column, and consecutive rowids are exactly what letting SQLite re-mint
+///   `1..=n` would produce, so a gapless fixture cannot tell the two apart;
 /// - note 1 and the stale note 5 each have child rows in all four derived tables, which are the four
 ///   cascades `DROP TABLE notes` would ride with enforcement on.
 fn seed_version_three(path: &Path) {
@@ -929,13 +932,15 @@ fn seed_version_three(path: &Path) {
     conn.execute_batch(VERSION_THREE)
         .expect("test setup: version-three schema");
     conn.execute_batch(
-        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
-            ('a.md', 'a.md', '/ws/a.md', 'ha', 11, 101, 'ok', 901),
-            ('b.md', 'b.md', '/ws/b.md', 'hb', 12, 102, 'ok', 902),
-            ('c.md', 'c.md', '/ws/c.md', 'hc', 13, 103, 'stale', 903),
-            ('img/logo.png', 'img/logo.png', '/ws/img/logo.png', 'hp', 14, 104, 'ok', 904),
-            ('Straße/Ärger.md', 'straße/ärger.md', '/ws/Straße/Ärger.md', 'hs', 15, 105, 'ok', 905),
-            ('STRASSE-ẞ.md', 'strasse-ß.md', '/ws/STRASSE-ẞ.md', 'ht', 16, 106, 'ok', 906);
+        "-- The rowids are named and gapped on purpose: `files.id` is what round 2 resolves rows by, so a
+         -- copy that dropped the explicit id and let SQLite mint 1..=n has to be caught here.
+         INSERT INTO files (rowid, rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
+            (2, 'a.md', 'a.md', '/ws/a.md', 'ha', 11, 101, 'ok', 901),
+            (3, 'b.md', 'b.md', '/ws/b.md', 'hb', 12, 102, 'ok', 902),
+            (4, 'c.md', 'c.md', '/ws/c.md', 'hc', 13, 103, 'stale', 903),
+            (9, 'img/logo.png', 'img/logo.png', '/ws/img/logo.png', 'hp', 14, 104, 'ok', 904),
+            (11, 'Straße/Ärger.md', 'straße/ärger.md', '/ws/Straße/Ärger.md', 'hs', 15, 105, 'ok', 905),
+            (13, 'STRASSE-ẞ.md', 'strasse-ß.md', '/ws/STRASSE-ẞ.md', 'ht', 16, 106, 'ok', 906);
          INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
             (1, 'a.md', 'A', 'filename', 'utf-8', 3, 'a'),
             (2, 'b.md', 'B', 'filename', 'utf-8', 3, 'b'),
@@ -1021,6 +1026,24 @@ fn file_table_counts(path: &Path) -> Vec<i64> {
         .collect()
 }
 
+/// The `files` rows' identity pairs — display path beside the rowid that addressed the row — read from a
+/// bare connection before the upgrade.
+///
+/// Migration 4's copy loop names the id it inserts, so this is the pair every row has to still answer with
+/// afterwards (`rel || ':' || id`). No other assertion in the upgrade test can see it: a step that dropped
+/// the id column and let SQLite hand out `1..=n` keeps every count, key, child row and column value intact.
+fn file_row_ids(path: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(path).expect("read the fixture's file ids");
+    let mut statement = conn
+        .prepare("SELECT rel || ':' || rowid FROM files ORDER BY rowid")
+        .expect("test setup: read the fixture's file ids");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("file id rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("file id values")
+}
+
 /// What each fixture row of `files` has to hold after the upgrade: its display fold and its byte key.
 ///
 /// Both are spelled out instead of computed, because they *are* the assertion. `case_bytes` is the
@@ -1086,10 +1109,23 @@ fn a_version_three_database_upgrades_without_moving_anything() {
     seed_version_three(&path);
 
     let before = file_table_counts(&path);
+    let ids_before = file_row_ids(&path);
     assert_eq!(
         before,
         vec![6, 4, 3, 4, 2, 4],
         "files, notes, headings, tags, items, links: the fixture is what this test claims to have written"
+    );
+    assert_eq!(
+        ids_before,
+        [
+            "a.md:2",
+            "b.md:3",
+            "c.md:4",
+            "img/logo.png:9",
+            "Straße/Ärger.md:11",
+            "STRASSE-ẞ.md:13",
+        ],
+        "the fixture's rowids are gapped, so a re-minted 1..=6 cannot read as a preserved id"
     );
 
     let db = Db::open(&path).expect("the normal open runs migration 4");
@@ -1138,6 +1174,15 @@ fn a_version_three_database_upgrades_without_moving_anything() {
         names(&db, "SELECT id || ':' || rel FROM notes ORDER BY id"),
         ["1:a.md", "2:b.md", "5:c.md", "7:Straße/Ärger.md",],
         "no note was re-minted and none changed its display path"
+    );
+
+    // The same claim for `files.id`, which the copy loop also names explicitly. Round 1 reads nothing by that
+    // id, so a step that let SQLite re-mint `1..=n` would keep this whole test green — while round 2 resolves
+    // every row through it (F13 §4). The gapped fixture rowids are what makes the pair discriminating.
+    assert_eq!(
+        names(&db, "SELECT rel || ':' || id FROM files ORDER BY id"),
+        ids_before,
+        "every `files` row keeps the id that addressed it before the upgrade"
     );
 
     // The four cascading children, still attached to the same notes. Counts alone would pass a migration
@@ -1540,6 +1585,158 @@ fn a_migrated_lossy_path_scans_silent_and_keeps_its_lossy_key() {
 }
 
 #[test]
+fn upsert_file_keys_come_from_rel_and_never_from_abs() {
+    // F13 §7's rule for round 1's writers, isolated to one write. Breaking it is not invisible today: one
+    // such mutation turns 53 tests red across four binaries. But each of those failures belongs to whatever
+    // *it* measures — every fixture's `abs` is its `rel` under a `/ws/` prefix, so they all notice at once —
+    // and the one row spelled differently on purpose, in
+    // `a_migrated_lossy_path_scans_silent_and_keeps_its_lossy_key`, is `#[cfg(unix)]`, so a Windows CI has no
+    // pin here at all. This test writes nothing else and hands the writer an `abs` sharing no bytes with the
+    // `rel`, so it can fail for exactly one reason.
+    let db = Db::in_memory().expect("in-memory database");
+    upsert_file(
+        &db,
+        &snap("a.md", "h1"),
+        // Not `/ws/a.md`: an abs-derived key would read as a different path, not as the same one prefixed.
+        Path::new("/ws/OTHER-name.md"),
+        1,
+    )
+    .expect("upsert a row whose abs names some other file entirely");
+
+    // Hex rather than bytes: a failure then reads `612E6D64` against `2F77732F4F544845522D6E616D652E6D64`,
+    // which names the mistake without needing a decode table beside it.
+    assert_eq!(
+        scalar::<String>(&db, "SELECT hex(rel_bytes) FROM files"),
+        "612E6D64",
+        "rel_bytes is `a.md`'s own bytes; the writer may not take the key from the abs it is handed"
+    );
+    assert_eq!(
+        scalar::<String>(&db, "SELECT hex(case_bytes) FROM files"),
+        "612E6D64",
+        "and the ASCII-case fold is that key's fold, not the abs's"
+    );
+}
+
+/// Write a version-three database holding **two `notes` rows for one path** — legal at that version, because
+/// `notes.rel` carried no `UNIQUE` (F13 §7) — beside a second file on disk that has no row at all.
+///
+/// The pair is deliberate: the duplicate exercises migration 4's copy (`CAST(rel AS BLOB)` per row) while
+/// `fresh.md` exercises the one writer that can invent a keyless note, [`np_core::db::insert_note`].
+fn seed_duplicate_notes_version_three(path: &Path, rel: &str, hash: &str, size: i64) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_THREE)
+        .expect("test setup: version-three schema");
+    conn.execute(
+        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, 'ok', 90)",
+        rusqlite::params![rel, rel.to_lowercase(), format!("/ws/{rel}"), hash, size],
+    )
+    .expect("test setup: seed the duplicated-note file row");
+    // `mtime` is an impossible `1` on purpose: the cheap size-and-mtime trigger has to fail so a scan
+    // compares the real digest above and reads this file as unchanged. The note is then not rewritten, which
+    // keeps property (1) below a statement about migration 4's copy rather than about `store_note`.
+    let mut statement = conn
+        .prepare(
+            "INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body)
+             VALUES (?1, ?2, ?3, 'filename', 'utf-8', 1, ?4)",
+        )
+        .expect("test setup: prepare the note insert");
+    // Two rows, one path, non-consecutive ids — every shape `notes.rel`'s missing `UNIQUE` allowed.
+    for (id, title, body) in [(4, "Dup first", "first"), (9, "Dup second", "second")] {
+        statement
+            .execute(rusqlite::params![id, rel, title, body])
+            .expect("test setup: two note rows for one path");
+    }
+}
+
+#[test]
+fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a_bare_query_row() {
+    // `notes.rel` was never UNIQUE at version 3, so a legacy database may carry two note rows for one file,
+    // and migration 4 copies both onto one `rel_bytes` — which has no UNIQUE there by design (F13 §7). This
+    // is the population every identity lookup round 2 writes has to plan for: an explicit `LIMIT 1` with the
+    // tie-break named, or an aggregate, because a bare `query_row` on such a key is **not a wrong answer but
+    // a scan error**. Today's `note_id` answers with `LIMIT 1` (`scan.rs`), and re-keying that lookup onto
+    // `rel_bytes` does not shrink the population: both rows carry the same key, so the round that moves it
+    // inherits the same requirement.
+    //
+    // The two §5 properties that make the population visible:
+    // (1) the migration neither collapses the pair into one row nor refuses it: both survive, on one key;
+    // (2) after a write pass no note row carries a NULL `rel_bytes`, so none can hide from the re-keyed join.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace directory");
+    fs::write(root.join("dup.md"), "# Dup\n").expect("test setup: write the duplicated note");
+    // No row of its own: this is the file whose note [`np_core::db::insert_note`] mints during the scan.
+    fs::write(root.join("fresh.md"), "# Fresh\n").expect("test setup: write the unregistered note");
+
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+    let db_path = cfg.workspace_db(&root);
+    fs::create_dir_all(
+        db_path
+            .parent()
+            .expect("test setup: the workspace database sits in a directory"),
+    )
+    .expect("test setup: database directory");
+    let dup = root.join("dup.md");
+    let hash = sha256_file(&dup).expect("test setup: hash the note the way a scan does");
+    let size = fs::metadata(&dup)
+        .expect("test setup: read the note's size")
+        .len() as i64;
+    seed_duplicate_notes_version_three(&db_path, "dup.md", &hash, size);
+    assert_eq!(
+        rusqlite::Connection::open(&db_path)
+            .expect("test: read the fixture's note rows")
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE rel = 'dup.md'",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .expect("test: the fixture records its notes"),
+        2,
+        "premise: version three really would hold two rows for one path"
+    );
+
+    let report = scan(&root, &cfg).expect("a legacy duplicate must not fail the scan");
+    assert!(report.skipped.is_empty(), "{report:?}");
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (1, 0, 0, 0),
+        "premise: `fresh.md` has to reach the new-note insert for this to measure that writer too: {report:?}"
+    );
+
+    let db = Db::open(&db_path).expect("test: reopen the migrated database");
+    // (1) Both legacy rows, both ids, one key — and `fresh.md`'s brand-new note keyed the same way.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT rel || ':' || id || ':' || hex(rel_bytes) FROM notes ORDER BY rel, id"
+        ),
+        [
+            "dup.md:4:6475702E6D64",
+            "dup.md:9:6475702E6D64",
+            "fresh.md:10:66726573682E6D64",
+        ],
+        "both legacy rows survive onto the one byte key, and the note this scan minted carries a key as well"
+    );
+    assert_eq!(
+        scalar::<String>(&db, "SELECT hex(rel_bytes) FROM files WHERE rel = 'dup.md'"),
+        "6475702E6D64",
+        "the two notes hang off one `files` row's key, which is what makes the key non-unique by design"
+    );
+
+    // (2) §5's weaker, more important half: no keyless note after a write pass. A NULL key matches nothing
+    // the re-keyed join, cascade and lookup compare on bytes.
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes WHERE rel_bytes IS NULL"),
+        0,
+        "a note row with no byte key is F13 reproduced by the fix"
+    );
+}
+
+#[test]
 fn move_keeps_note_identity() {
     let db = Db::in_memory().expect("in-memory database");
     // An umlaut in the path is deliberate: `case_key` has to follow `walk`'s Rust
@@ -1628,6 +1825,28 @@ fn move_keeps_note_identity() {
         ),
         to.to_lowercase(),
         "case_key is lowercased the same way walk.rs lowercases it"
+    );
+    // The two byte keys moved with the display pair (F13 §5: `case_bytes = case_fold(rel_bytes)`, both
+    // written by the same statement). They are asserted on this row precisely because its name carries a
+    // non-ASCII capital: a fold that reached for `str::to_lowercase` would rewrite `Ü` to `ü` here while
+    // leaving every assertion above — including `case_key`, which *is* the Unicode fold — untouched.
+    assert_eq!(
+        scalar::<Vec<u8>>(
+            &db,
+            &format!("SELECT rel_bytes FROM files WHERE rel = '{to}'")
+        ),
+        to.as_bytes().to_vec(),
+        "rel_bytes is the bytes of the new rel"
+    );
+    assert_eq!(
+        scalar::<Vec<u8>>(
+            &db,
+            &format!("SELECT case_bytes FROM files WHERE rel = '{to}'")
+        ),
+        // The ASCII `N` folds; the `Ü` (\xc3\x9c) keeps its bytes. That is the whole difference between this
+        // column and the `case_key` above, spelled out rather than recomputed.
+        b"n\xc3\xb6tes/\xc3\x9cbersetzt.md".to_vec(),
+        "case_bytes is the ASCII-only fold of those bytes"
     );
     assert_eq!(
         scalar::<String>(&db, &format!("SELECT abs FROM files WHERE rel = '{to}'")),
@@ -2010,11 +2229,14 @@ fn a_note_row_has_to_name_a_known_file() {
     // `wal_and_foreign_keys_are_set_where_they_are_legal`, this fires on the bundled build's
     // default too, so it does not prove the pragma — only that the constraint is declared.
     let err = insert_note_err(&db, "never-seen.md");
+    // The extended code, as [`refuses_orphan`] does it: `ConstraintViolation` alone is also what the
+    // `typeof(rel_bytes) = 'blob'` CHECK answers with, so a bind that drifted back to TEXT would keep this
+    // test green while it measured the CHECK instead of the key.
     assert!(
         matches!(
             &err,
             rusqlite::Error::SqliteFailure(fault, _)
-                if fault.code == rusqlite::ErrorCode::ConstraintViolation
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
         ),
         "expected the foreign key to fire, got {err}"
     );

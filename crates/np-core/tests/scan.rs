@@ -2041,15 +2041,22 @@ fn a_case_collision_with_no_row_behind_it_does_not_hold_the_version_back() {
     }
 
     let db = ws.db();
-    let refused = ["a.md", "A.md"]
+    // Exactly one of the pair may be refused. Returning here when both spellings hold a row — which is what
+    // this test used to do — is precisely the state dropping `case_bytes UNIQUE` would produce, so the guard
+    // that exists to catch that change could only ever wave it through (F13 §3's P3 residual). Which of the
+    // two loses is an internal detail (it is whichever row was written first), so only the count is pinned.
+    let missing: Vec<&str> = ["a.md", "A.md"]
         .into_iter()
-        .find(|rel| state(&db, rel).is_none());
-    let Some(refused) = refused else {
-        eprintln!(
-            "skip: both spellings hold rows, so this build's identity rule does not fold them"
-        );
-        return;
-    };
+        .filter(|rel| state(&db, rel).is_none())
+        .collect();
+    assert_eq!(
+        missing.len(),
+        1,
+        "one of the pair has to hold a row and the other has to be refused; a.md = {:?}, A.md = {:?}",
+        state(&db, "a.md"),
+        state(&db, "A.md")
+    );
+    let refused = missing[0];
     record_parse_version(&db, outdated_parse_version());
     drop(db);
 
