@@ -13,6 +13,7 @@ use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::index_names;
+use crate::path_keys;
 
 /// Paths of this many characters or more need the Windows extended-length prefix
 /// (spec §11: `\\?\` above 260 chars).
@@ -236,7 +237,9 @@ fn record(entry: &DirEntry, root: &Path) -> Option<DiscoveredFile> {
     let meta = entry.metadata().ok()?;
     let abs = entry.path().to_path_buf();
     let (rel, _display) = normalize_rel(abs.strip_prefix(root).unwrap_or(&abs));
-    let case_key = rel.to_lowercase();
+    // Through `path_keys` rather than a local `to_lowercase`: this is the display fold that `files.case_key`
+    // stores and link resolution reads, so it has one owner for the whole crate (F13 §4).
+    let case_key = path_keys::display_fold(&rel);
     let is_markdown = case_key.ends_with(MARKDOWN_SUFFIX);
     Some(DiscoveredFile {
         rel,
@@ -348,7 +351,7 @@ mod tests {
     fn file(rel: &str, abs: &str) -> DiscoveredFile {
         DiscoveredFile {
             rel: rel.to_string(),
-            case_key: rel.to_lowercase(),
+            case_key: path_keys::display_fold(rel),
             abs: Path::new(abs).to_path_buf(),
             size: 0,
             mtime: 0,

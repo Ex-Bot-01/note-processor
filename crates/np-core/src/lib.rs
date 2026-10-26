@@ -9,6 +9,7 @@ pub mod index_names;
 pub mod items;
 pub mod links;
 pub mod parse;
+pub mod path_keys;
 pub mod scan;
 pub mod walk;
 

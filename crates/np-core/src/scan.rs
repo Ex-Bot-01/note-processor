@@ -730,8 +730,9 @@ fn folded_row(db: &Db, case_key: &str, rel: &str) -> Result<Option<String>, DbEr
 ///
 /// No fresh read is required between that lookup and here: [`db::upsert_file`] runs *before* it, not
 /// between, and writes `files` only, so nothing has touched `notes` in the meantime — and when
-/// `existing` is `None`, the `INSERT` below mints the id itself via `last_insert_rowid`, so none is
-/// needed after the write either.
+/// `existing` is `None`, [`db::insert_note`] mints the id itself, so none is needed after the write either —
+/// and that call is where the note's byte key is written, not here (see its doc for why the insert lives in
+/// `db`).
 fn store_note(
     db: &Db,
     rel: &str,
@@ -765,21 +766,15 @@ fn store_note(
             )?;
             id
         }
-        None => {
-            db.0.execute(
-                "INSERT INTO notes (rel, title, title_source, encoding, word_count, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    rel,
-                    doc.title,
-                    doc.title_source.as_str(),
-                    encoding,
-                    words,
-                    body
-                ],
-            )?;
-            db.0.last_insert_rowid()
-        }
+        None => db::insert_note(
+            db,
+            rel,
+            &doc.title,
+            doc.title_source.as_str(),
+            encoding,
+            words,
+            body,
+        )?,
     };
 
     db.0.execute("DELETE FROM headings WHERE note_id = ?1", params![id])?;
