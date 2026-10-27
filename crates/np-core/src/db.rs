@@ -21,7 +21,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use thiserror::Error;
 
 use crate::hash::Snapshot;
@@ -58,10 +58,11 @@ pub(crate) const BUSY_TIMEOUT_MS: u32 = 1800;
 /// ahead of this list is refused rather than trusted — a newer file read by an older binary
 /// would otherwise be written to a schema this code does not know.
 ///
-/// Four entries rather than one, split along the lines that matter (`files` + `notes` are the
+/// Five entries rather than one, split along the lines that matter (`files` + `notes` are the
 /// registry and the note's identity; everything after them is derived from a note's contents
 /// and can be rebuilt from the file; the third adds the keys between those two groups; the fourth
-/// re-keys the registry's own pair onto bytes), so the
+/// re-keys the registry's own pair onto bytes; the fifth folds the duplicate note rows that key may
+/// have inherited), so the
 /// version bookkeeping has more than one row to prove itself with. Later milestones append an
 /// entry here; they do not edit one — migration 3 exists precisely because a database on disk has
 /// already applied the first two, and SQLite cannot add a constraint to a table that is there.
@@ -153,6 +154,10 @@ pub const MIGRATIONS: &[Migration] = &[
     // `files` and `notes` gain byte keys (F13). Also not a script, for the same reason plus one more: the
     // ASCII-case fold of a byte key is Rust's, and SQL has no equivalent that a copy could call.
     Migration::Code(byte_path_keys),
+    // The duplicate note rows version 3 allowed (F19). Not a script either: the survivor is chosen per key
+    // and its incoming edges are re-pointed rather than dropped, which is a loop with a receipt, not a
+    // statement.
+    Migration::Code(merge_duplicate_notes),
 ];
 
 /// One step of the schema, as one entry of [`MIGRATIONS`].
@@ -262,17 +267,31 @@ pub enum DbError {
 /// The connection is public because Task 10 runs a whole scan inside one transaction, which
 /// needs the [`Connection`] itself rather than a helper this module would have to grow.
 ///
-/// The second field is what an upgrade tells *its own process* about itself ([`Db::upgrade_orphans`]).
-/// It is not part of the file and it is not read back out of the file on demand: it is this open's
-/// memory, so a second `Db::open` of the same database starts with nothing to announce.
+/// The second field is what an upgrade tells *its own process* about itself ([`Db::upgrade_orphans`],
+/// [`Db::merged_notes`]). It is not part of the file and it is not read back out of the file on demand: it
+/// is this open's memory, so a second `Db::open` of the same database starts with nothing to announce.
 #[derive(Debug)]
 pub struct Db(
     /// The live connection, public for Task 10's whole-scan transaction.
     pub Connection,
-    /// The orphan receipt this open wrote, when — and only when — it ran that cleanup itself.
-    /// Read through [`Db::upgrade_orphans`].
-    Option<String>,
+    /// What this open's own migration steps wrote into `meta`, field by field. Read through
+    /// [`Db::upgrade_orphans`] and [`Db::merged_notes`].
+    Carried,
 );
+
+/// The receipts of the migration steps **this** open ran, one field per step that writes one.
+///
+/// A struct rather than two positional `Option<String>`s on [`Db`] because the two values are the same type
+/// and mean different things: swapped, every test around either announcement would stay green while the
+/// scan reported a merge as an orphan cleanup. Default is "this open migrated nothing", which is every
+/// ordinary open.
+#[derive(Debug, Default)]
+struct Carried {
+    /// The [`FK_ORPHANS_KEY`] receipt, when this open ran migration 3.
+    orphans: Option<String>,
+    /// The [`NOTE_MERGE_KEY`] receipt, when this open ran migration 5.
+    merges: Option<String>,
+}
 
 impl Db {
     /// Open `path`, creating its directories and applying any pending migration.
@@ -303,8 +322,8 @@ impl Db {
              PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;"
         ))?;
-        let upgrade_orphans = migrate(&conn)?;
-        Ok(Db(conn, upgrade_orphans))
+        let carried = migrate(&conn)?;
+        Ok(Db(conn, carried))
     }
 
     /// An empty database in memory, migrated the same way a file one is. For tests.
@@ -315,8 +334,8 @@ impl Db {
         conn.execute_batch(&format!(
             "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}; PRAGMA foreign_keys = ON;"
         ))?;
-        let upgrade_orphans = migrate(&conn)?;
-        Ok(Db(conn, upgrade_orphans))
+        let carried = migrate(&conn)?;
+        Ok(Db(conn, carried))
     }
 }
 
@@ -330,13 +349,25 @@ impl Db {
     /// value is worth printing is the reader's question — [`crate::ScanReport::upgrade_orphans`] answers
     /// it, and drops the all-zero case that proves only that the check ran.
     pub fn upgrade_orphans(&self) -> Option<&str> {
-        self.1.as_deref()
+        self.1.orphans.as_deref()
+    }
+
+    /// The receipt this open wrote under [`NOTE_MERGE_KEY`], when — and only when — **this** open ran
+    /// migration 5; `None` for every open that found the schema already migrated.
+    ///
+    /// Carried on the handle for the same reason [`Db::upgrade_orphans`] is, and with the same division of
+    /// labour: the stored value is never cleared, so "merged N duplicate row(s)" stays true for the life of
+    /// the file, while whether it is worth saying out loud is the reader's question —
+    /// [`crate::ScanReport::merged_notes`] answers it and drops the `merged=0` case that proves only that
+    /// the check ran.
+    pub fn merged_notes(&self) -> Option<&str> {
+        self.1.merges.as_deref()
     }
 }
 
-/// Apply every migration whose version is above what the file recorded, returning the orphan receipt
-/// when one of *these* steps wrote one (see [`ORPHAN_CLEANUP_VERSION`] and [`Db::upgrade_orphans`]).
-fn migrate(conn: &Connection) -> Result<Option<String>, DbError> {
+/// Apply every migration whose version is above what the file recorded, returning the receipts of the
+/// steps *these* ran (see [`ORPHAN_CLEANUP_VERSION`], [`NOTE_MERGE_VERSION`] and [`Carried`]).
+fn migrate(conn: &Connection) -> Result<Carried, DbError> {
     // The bookkeeping table is not itself a migration entry: it has to exist before the first
     // entry can be recorded in it.
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")?;
@@ -365,9 +396,9 @@ fn migrate(conn: &Connection) -> Result<Option<String>, DbError> {
     // The receipt travels out through `applied`, but the `?` stays where it is: enforcement has to go
     // back on before any migration error leaves this function, and a failed open keeps no handle that
     // could read the value anyway.
-    let orphans = applied?;
+    let carried = applied?;
     restored?;
-    Ok(orphans)
+    Ok(carried)
 }
 
 /// The 1-based [`MIGRATIONS`] entry that removes orphan rows and writes their receipt — entry 3,
@@ -381,10 +412,18 @@ fn migrate(conn: &Connection) -> Result<Option<String>, DbError> {
 /// `crates/np-core/tests/db.rs` would then trip over.
 const ORPHAN_CLEANUP_VERSION: i64 = 3;
 
-/// Apply every migration above `from`, one transaction each, remembering the orphan receipt if one of
-/// those steps wrote it — and echoing that receipt **after** the step commits, never from inside it.
-fn apply_migrations(conn: &Connection, from: i64) -> Result<Option<String>, DbError> {
-    let mut orphans = None;
+/// The 1-based [`MIGRATIONS`] entry that folds duplicate note rows together and writes its receipt — entry
+/// 5, [`merge_duplicate_notes`].
+///
+/// Named for the same reason [`ORPHAN_CLEANUP_VERSION`] is, and with the same guard: reading
+/// [`NOTE_MERGE_KEY`] back answers `QueryReturnedNoRows` if that step ever moves off this version or stops
+/// recording its receipt, so the drift fails an open rather than silently losing the announcement.
+const NOTE_MERGE_VERSION: i64 = 5;
+
+/// Apply every migration above `from`, one transaction each, remembering a step's receipt when one of
+/// those steps wrote it — and echoing each receipt **after** that step commits, never from inside it.
+fn apply_migrations(conn: &Connection, from: i64) -> Result<Carried, DbError> {
+    let mut carried = Carried::default();
     for (index, migration) in MIGRATIONS.iter().enumerate() {
         let version = index as i64 + 1;
         if version <= from {
@@ -400,14 +439,16 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<Option<String>, DbEr
         }
         // Read back **inside** the step's own transaction, so this is exactly the value that step
         // wrote rather than a later reader's guess at it — and `query_row` has no answer for a
-        // missing row, so a step reordered off [`ORPHAN_CLEANUP_VERSION`], or one stopped from
-        // recording its cleanup, fails the open loudly instead of quietly losing the announcement.
-        let receipt = if version == ORPHAN_CLEANUP_VERSION {
-            Some(tx.query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![FK_ORPHANS_KEY],
-                |row| row.get::<_, String>(0),
-            )?)
+        // missing row, so a step reordered off [`ORPHAN_CLEANUP_VERSION`] or [`NOTE_MERGE_VERSION`], or one
+        // stopped from recording its receipt, fails the open loudly instead of quietly losing the
+        // announcement.
+        let orphan_receipt = if version == ORPHAN_CLEANUP_VERSION {
+            Some(read_receipt(&tx, FK_ORPHANS_KEY)?)
+        } else {
+            None
+        };
+        let merge_receipt = if version == NOTE_MERGE_VERSION {
+            Some(read_receipt(&tx, NOTE_MERGE_KEY)?)
         } else {
             None
         };
@@ -423,19 +464,37 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<Option<String>, DbEr
         // printed anywhere before this line, so a step that rolled itself back — at any statement,
         // including this commit — is silent. That silence rests on call-site position rather than on
         // a test: no portable way to fail a COMMIT here is known (F21 §2 says so plainly), and the
-        // durable receipt in `meta` is what the promise actually rests on. `receipt` is scoped to one
-        // iteration, so no later step can re-echo an earlier one.
-        if let Some(value) = &receipt {
+        // durable receipt in `meta` is what the promise actually rests on. Both receipts are scoped to one
+        // iteration, so no later step can re-echo an earlier one — and F19's merge follows the same rule for
+        // the same reason: a merge announced before its commit is a merge that may not have happened.
+        if let Some(value) = &orphan_receipt {
             report_orphans(&mut io::stderr(), value);
         }
-        // At most one step can produce a receipt, so there is one value to hand back — but a later step's
-        // `None` must not clear it, or the scan that did the deleting reports nothing. Migration 4 runs
-        // right after this one; these two pin that it does not swallow the receipt —
-        // `only_the_scan_that_removed_the_orphans_announces_them` (np-cli: the printed half) and
-        // `a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note` (this crate: the handle).
-        orphans = receipt.or(orphans);
+        if let Some(value) = &merge_receipt {
+            report_merges(&mut io::stderr(), value);
+        }
+        // At most one step can produce a receipt of each kind, so there is one value per field to hand back
+        // — but a later step's `None` must not clear an earlier one, or the scan that did the work reports
+        // nothing. Migration 4 and 5 run right after migration 3; these two pin that they do not swallow the
+        // orphan receipt — `only_the_scan_that_removed_the_orphans_announces_them` (np-cli: the printed half)
+        // and `a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note` (this crate: the handle).
+        carried.orphans = orphan_receipt.or(carried.orphans);
+        carried.merges = merge_receipt.or(carried.merges);
     }
-    Ok(orphans)
+    Ok(carried)
+}
+
+/// One receipt value as its own step wrote it, read back from `meta` inside that step's transaction.
+///
+/// A missing row is an error and not a `None`: the step whose version [`apply_migrations`] matched promised
+/// to write this key, so a silent absence means the receipt — and with it the announcement, and the proof
+/// the check ran — never reached the file.
+fn read_receipt(tx: &Transaction, key: &str) -> Result<String, DbError> {
+    Ok(tx.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )?)
 }
 
 /// `meta` key recording what migration 3 removed to make its constraints possible.
@@ -1017,6 +1076,248 @@ fn lossy_rows(conn: &Connection, table: &str) -> Result<i64, DbError> {
     )?)
 }
 
+/// `meta` key recording what migration 5 merged, so the deletion has a record beside the one migration 3
+/// keeps for its own.
+///
+/// Beside [`FK_ORPHANS_KEY`] and [`PATHS_LOSSY_KEY`] for the same reason: no logger exists, and a person
+/// reading a scan report weeks later has to be able to tell "this file held a duplicate pair and it was
+/// folded away" apart from "this file never had one". The value is `merged=N;paths=a.md,b.md`, written
+/// **even when nothing was merged** — `merged=0` is the record that the check ran (F21 §2's lesson), and N
+/// counts the note rows folded into a survivor rather than the number of paths, because a path holding three
+/// rows lost two of them.
+pub const NOTE_MERGE_KEY: &str = "note_merges";
+
+/// How many display spellings one [`NOTE_MERGE_KEY`] receipt names — the same eight F22 caps its loss record
+/// at, for the same reason: the count is the fact and the names are only where to look.
+const MERGE_NAME_CAP: usize = 8;
+
+/// Migration 5 — the duplicate note rows version 3 left behind are merged into one row each (F19).
+///
+/// Why a merge and not a permanent charge: `notes.rel` carried no `UNIQUE`, so one path could hold two note
+/// rows, migration 4 copied both onto one `rel_bytes`, and every scan since has answered that key with
+/// the scan's reader (`crate::scan::Indexed::Duplicate`, a code span: that enum is private) — charging
+/// `uncovered` forever, withholding the parse version forever,
+/// re-parsing the whole corpus on every run and printing a refresh gap nobody can act on (F19 §1). The charge
+/// was right while there was no exit; this is the exit.
+///
+/// The rule, stated rather than left to chance (F19 §2):
+///
+/// - **Winner = `MIN(id)`.** The oldest row is the one derived rows already hang off, so keeping it keeps the
+///   corpus attached. Content loses, and that is survivable *because* the version was already withheld: the
+///   next scan rewrites title, body, headings, tags, items and edges for every note from what is on disk.
+/// - **Incoming edges are re-pointed to the winner, never nulled.** Other notes' prose is not re-parsed, so a
+///   NULL target would lose a resolved link permanently — the distinction migration 3 drew between CASCADE
+///   (an edge from a note that is gone) and SET NULL (a target that is gone) does not apply when the target
+///   still exists under another id.
+/// - **Nothing needs deduplicating after the re-point.** No child table carries a unique constraint —
+///   `headings`, `tags`, `items` are plain and `links` has none either (see migration 2) — so moving an edge
+///   onto the winner cannot collide with anything, and two edges that now look alike are two mentions of one
+///   note, which is what the writer would have stored anyway. A defensive dedup here can never fire.
+///
+/// **The deletes are by hand, not by cascade.** F19 §2 expected the loser's derived rows to go with its row,
+/// and that is the outcome; the mechanism cannot be the schema's, because [`migrate`] runs every step with
+/// `PRAGMA foreign_keys = OFF` — a pragma that cannot be changed inside a transaction — and SQLite performs
+/// no `ON DELETE CASCADE` while it is off (verified: deleting a parent with the pragma off leaves its
+/// cascading children standing). Deleting the loser without its children would commit orphan `headings`,
+/// `tags`, `items` and `links.src_note_id` rows into a file whose enforcement is back ON the moment this step
+/// commits — the silent re-adoption [`add_note_foreign_keys`] exists to end. So the six statements below are
+/// migration 3's shapes, spelled out: the loser's own derived rows and outgoing edges go with it, its inbound
+/// edges move to the winner.
+///
+/// Because those deletes are the only thing between a loser row and its children, the step closes with
+/// `PRAGMA foreign_key_check` like migrations 3 and 4 — see the check's own comment for why it matters more here
+/// than it does anywhere else in this file.
+///
+/// The receipt goes into `meta` **inside this transaction** (F19 §4.1): a merge that cannot announce itself
+/// does not happen. [`apply_migrations`] echoes it after the commit, never from here.
+fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
+    // Every read happens before the first write, and each query is fully collected rather than iterated:
+    // SQLite refuses a write on a connection that still has a row-producing statement open (the same
+    // discipline as [`copy_files_rows`]).
+    let groups = duplicate_groups(conn)?;
+    let merged = groups.iter().map(|group| group.losers.len()).sum::<usize>();
+    for group in &groups {
+        for loser in &group.losers {
+            conn.execute(
+                "UPDATE links SET dst_note_id = ?1 WHERE dst_note_id = ?2",
+                params![group.winner, loser],
+            )?;
+            conn.execute("DELETE FROM headings WHERE note_id = ?1", params![loser])?;
+            conn.execute("DELETE FROM tags WHERE note_id = ?1", params![loser])?;
+            conn.execute("DELETE FROM items WHERE note_id = ?1", params![loser])?;
+            // Every outgoing edge, `approved` included — the same ruling migration 3 wrote into the schema,
+            // where a foreign key cannot be conditional either.
+            conn.execute("DELETE FROM links WHERE src_note_id = ?1", params![loser])?;
+            conn.execute("DELETE FROM notes WHERE id = ?1", params![loser])?;
+        }
+    }
+
+    if let Some((table, rowid, parent)) = first_violation(conn)? {
+        // Migrations 3 and 4 run this check because a *rebuild* could misplace a row. Here it is the only
+        // defence against the deletes above being softened: a code step runs with enforcement off, so no
+        // `ON DELETE CASCADE` fires behind them and a skipped or narrowed delete leaves a `note_id` pointing at
+        // a row that is gone — into a file whose enforcement is back ON the moment this transaction commits,
+        // where an id can be re-adopted by the next `INSERT`. No later scan re-checks those keys, so this is
+        // the one place anything would notice. Returning rolls the merge and its receipt back together, which
+        // leaves the file at version four to try again rather than committing a half-merged corpus.
+        //
+        // One consequence worth naming: the pragma answers about the **whole file** and this step runs it
+        // unconditionally, so a workspace damaged by anything else — a child row whose note is simply gone —
+        // now refuses to open at the four-to-five step where version four opened it, which is deliberate,
+        // pinned by `the_merge_gate_refuses_damage_that_no_merge_could_have_caused` (a file with **no pair**, so
+        // narrowing this check to `merged > 0` fails there) and by
+        // `the_merge_gate_refuses_a_child_row_whose_note_is_gone` (the same damage beside a pair). Its only exit
+        // is the message itself (table, rowid, parent) because §7 of `docs/design-f19-note-merge.md` rules out a
+        // repair command. The check is not scoped to rows this merge touched.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check()",
+            [],
+            |row| row.get(0),
+        )?;
+        return Err(DbError::ForeignKeys {
+            count,
+            table,
+            rowid,
+            parent,
+        });
+    }
+
+    let paths: Vec<String> = groups.iter().map(|group| group.display.clone()).collect();
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![NOTE_MERGE_KEY, merge_receipt(merged, &paths)],
+    )?;
+    Ok(())
+}
+
+/// One byte key that holds more than one note row: the survivor, the rows folded into it, and the name the
+/// receipt gives them.
+struct DuplicateNotes {
+    /// The surviving row's display `rel`. Names in the receipt are display text and identify no path (F20 §1)
+    /// — they say where to look.
+    display: String,
+    /// `MIN(id)`: the oldest row, which keeps its id and therefore its derived rows (F19 §2).
+    winner: i64,
+    /// Every other id on the key, ascending.
+    losers: Vec<i64>,
+}
+
+/// Every `rel_bytes` holding more than one note row, with its winner and losers.
+///
+/// Ordered by the **byte key**, which is what makes one database produce one receipt; display spellings can
+/// tie where bytes do not (F20 §1), the key cannot.
+///
+/// Rows whose key is NULL are left alone — and today none can exist. `notes.rel_bytes` carries
+/// `CHECK (typeof(rel_bytes) = 'blob')` from migration 4 onward and `typeof(NULL)` is `'null'`, so a keyless row
+/// is unwritable by this program or by anything speaking plain SQL to the file; **that constraint, not this
+/// clause, is what protects those rows, which is why no test pins the clause and none can be written.** It stays
+/// as defence in depth for whoever changes that: `GROUP BY` gathers **every** NULL into one group, two keyless
+/// notes are two unrelated files, and folding them deletes one of their note rows outright. The same reasoning
+/// is in `docs/design-f19-note-merge.md` §3 step 1.
+fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateNotes>, DbError> {
+    let keys: Vec<Vec<u8>> = {
+        let mut statement = conn.prepare(
+            "SELECT rel_bytes FROM notes
+              WHERE rel_bytes IS NOT NULL
+              GROUP BY rel_bytes
+             HAVING COUNT(*) > 1
+             ORDER BY rel_bytes",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut groups = Vec::with_capacity(keys.len());
+    for rel_bytes in keys {
+        let ids: Vec<i64> = {
+            let mut statement =
+                conn.prepare("SELECT id FROM notes WHERE rel_bytes = ?1 ORDER BY id")?;
+            let rows = statement.query_map(params![&rel_bytes], |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        // `HAVING COUNT(*) > 1` already promised at least two ids here, so `losers` is never empty; the
+        // pattern is total rather than an `expect`, because arriving with one id must merge nothing instead
+        // of deleting somebody's only note row.
+        let Some((winner, losers)) = ids.split_first() else {
+            continue;
+        };
+        groups.push(DuplicateNotes {
+            display: survivor_display(conn, *winner, &rel_bytes)?,
+            winner: *winner,
+            losers: losers.to_vec(),
+        });
+    }
+    Ok(groups)
+}
+
+/// The spelling one merged path is named by in the receipt.
+///
+/// `notes.rel` is a display column and nullable (F13 §4), so a hand-made row can lack it; the byte key's own
+/// lossy spelling is the fallback, because the receipt points at a path rather than identifying one. Without it
+/// such a merge would record `merged=1;paths=` — a fold whose path cannot be named. Pinned by
+/// `a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key` in `crates/np-core/tests/db.rs`.
+fn survivor_display(conn: &Connection, winner: i64, rel_bytes: &[u8]) -> Result<String, DbError> {
+    let stored: Option<Option<String>> = conn
+        .query_row(
+            "SELECT rel FROM notes WHERE id = ?1",
+            params![winner],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(stored
+        .flatten()
+        .unwrap_or_else(|| String::from_utf8_lossy(rel_bytes).into_owned()))
+}
+
+/// The stored [`NOTE_MERGE_KEY`] spelling: `merged=N;paths=a.md,b.md`, the names capped at
+/// [`MERGE_NAME_CAP`] and already in key order from [`duplicate_groups`].
+fn merge_receipt(merged: usize, paths: &[String]) -> String {
+    let named: Vec<&str> = paths
+        .iter()
+        .take(MERGE_NAME_CAP)
+        .map(String::as_str)
+        .collect();
+    format!("merged={merged};paths={}", named.join(","))
+}
+
+/// How many note rows a stored [`NOTE_MERGE_KEY`] receipt says were merged away.
+///
+/// The reader that pairs with `merge_receipt` (a code span, not a link: that function is private), for
+/// every caller left holding only the stored string — the scan report's field and the stderr echo here. Like
+/// [`orphan_total`] it parses its own format rather than carrying a second number around: one value, three
+/// readers, no way for them to disagree. A fragment that will not parse as a count adds nothing.
+pub fn merge_total(value: &str) -> usize {
+    value
+        .split(';')
+        .find_map(|part| part.strip_prefix("merged="))
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Echo the stored merge receipt to `out` — [`std::io::stderr`] in production — unless nothing was merged.
+///
+/// The same shape, sink and dropped-write rule as [`report_orphans`], for the same reasons: stderr cannot be
+/// captured in-process because this runs inside [`Db::open`] before a test could redirect descriptor 2, so the
+/// sink is a parameter and this module's two tests pin both halves through it —
+/// `the_merge_receipt_is_echoed_once_rows_have_been_folded` (one line naming the total beside the stored
+/// receipt) and `a_merge_that_folded_nothing_writes_no_line` (silence at zero, which is what keeps every
+/// ordinary command quiet while `merged=0` still lands in `meta` as proof the check ran). What they cannot pin
+/// is that the production call site names stderr, nor that it runs after the commit — see [`apply_migrations`],
+/// where the same no-portable-COMMIT-failure argument as F21 §2 applies. And a failed write must not roll back
+/// (or abort) an upgrade whose deletions are durable in `meta` under [`NOTE_MERGE_KEY`].
+fn report_merges(out: &mut dyn io::Write, receipt: &str) {
+    let merged = merge_total(receipt);
+    if merged == 0 {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "note-processor: merged {} duplicate note row(s) into the oldest row for their path ({})",
+        merged, receipt,
+    );
+}
+
 /// Record a file that is there now — or bring a known row back to `state = 'ok'`.
 ///
 /// A path re-upserted after [`mark_stale`] rejoins the live set on the row it already has, so its `id` never
@@ -1386,7 +1687,7 @@ pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{orphan_total, rebase_abs, report_orphans, OrphanCleanup};
+    use super::{orphan_total, rebase_abs, report_merges, report_orphans, OrphanCleanup};
 
     #[test]
     fn rebase_abs_swaps_the_rel_suffix() {
@@ -1523,6 +1824,36 @@ mod tests {
             "headings=0,tags=0,items=0,links_src=0,links_dst_null=0",
         );
         assert!(out.is_empty(), "all zeros has to stay silent");
+    }
+
+    #[test]
+    fn the_merge_receipt_is_echoed_once_rows_have_been_folded() {
+        // The merge half of the stderr visibility path, pinned through the sink for the same reason
+        // `report_orphans` is: this runs inside [`Db::open`], before any test could redirect descriptor 2. The
+        // input is the stored spelling because that string is what [`apply_migrations`] holds after the commit,
+        // and the count printed beside it is read back out of it — one value, three readers (F21 §3's rule).
+        let mut out = Vec::new();
+        report_merges(&mut out, "merged=2;paths=a.md,b.md");
+        assert_eq!(
+            String::from_utf8(out).expect("the receipt is text"),
+            "note-processor: merged 2 duplicate note row(s) into the oldest row for their path \
+             (merged=2;paths=a.md,b.md)\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_that_folded_nothing_writes_no_line() {
+        // The other half, and the only thing standing between this echo and a line on every fresh workspace:
+        // `merged=0` still lands in `meta` as the record that the check ran, while stderr stays quiet. Delete
+        // the zero guard in `report_merges` and this test is what fails — **and now a CLI case fails with it**:
+        // `the_upgrading_scan_prints_the_merged_pair_on_stdout` asserts that an upgrade with nothing to fold says
+        // nothing on stderr. The old claim here was "no integration test can see descriptor 2", which this repo
+        // contradicts in three places — the child's stderr is read throughout `crates/np-cli/tests/cli.rs`, and
+        // F21 grew precisely this assertion for the orphan echo — so what is true is narrower: no CLI case
+        // asserted it **until now**.
+        let mut out = Vec::new();
+        report_merges(&mut out, "merged=0;paths=");
+        assert!(out.is_empty(), "`merged=0` states no work done: {out:?}");
     }
 
     #[test]

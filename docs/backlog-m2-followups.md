@@ -273,16 +273,40 @@ What these numbers can and cannot carry:
 
 - **Where:** `crates/np-core/src/scan.rs`'s `Indexed::Duplicate` arm charging `written.uncovered` on every
   scan, and `refresh_covered`, which therefore never returns true for such a workspace.
-- **Risk:** deliberate at the level of F15 (recording the parse version beside a note that was not re-parsed is
-  exactly F15's bug), but nothing heals it: no code merges two `notes` rows for one path, so every scan
-  re-parses every note and prints the refresh-gap line. On a large corpus that is a permanent several-hundred-ms
-  cost plus a warning nobody can act on, and the registry row keeps moving ahead of derived rows that never
-  change (mixed-age database, `Indexed::Duplicate`'s doc).
-- **Fix:** a migration or repair command that merges duplicate note rows for one `rel_bytes` — keeping the older
-  `notes.id` so derived rows stay attached, re-pointing edges that named the loser, and reporting what it merged
-  rather than choosing silently — after which the version records normally. Until then the cost is named in
-  `refresh_covered`'s doc, not discovered. **Do when:** a workspace holding a legacy duplicate converges to
-  `uncovered = 0` on the scan after the repair, and the repair names every pair it merged.
+- **Risk (as filed, against a build that had no exit):** deliberate at the level of F15 (recording the parse
+  version beside a note that was not re-parsed is exactly F15's bug), but nothing healed it: no code merged two
+  `notes` rows for one path, so every scan re-parsed every note and printed the refresh-gap line. On a large
+  corpus that was a permanent several-hundred-ms cost plus a warning nobody can act on, and the registry row
+  kept moving ahead of derived rows that never changed (mixed-age database, `Indexed::Duplicate`'s doc).
+- **Fix:** a migration that merges duplicate note rows for one `rel_bytes` — keeping the older `notes.id` so
+  derived rows stay attached, re-pointing edges that named the loser, and reporting what it merged rather than
+  choosing silently — after which the version records normally. **A `np repair` command was considered and ruled
+  out** (design §7): this program's only command is `np scan`, whose open already runs every schema fact, and a
+  user-facing second path through the same logic is a second thing to keep in agreement with the first. So do not
+  build one on the strength of this entry — the entry is closed, and migration 5 at open is the merge path.
+  **Do when:** a workspace holding a legacy duplicate converges to `uncovered = 0` on the scan after the repair,
+  and the repair names every pair it merged. **Met** by `a_merged_duplicate_pair_clears_the_charge_and_records_
+  the_parse_version` and `the_scan_that_merges_reports_the_string_it_stored`.
+- **Shipped (`9821dbb`, `4f0f5b3`, `e4495c3`, `7212e56`, `docs/design-f19-note-merge.md`): migration 5 folds the
+  pair at open, and announces it in the transaction that deletes.** Migration 5 (`merge_duplicate_notes`) groups
+  by `rel_bytes` — never by display text, so it cannot reach across F23's display twins — keeps `MIN(id)` because
+  that is the row derived rows already hang off, re-points `links.dst_note_id` onto the winner instead of nulling
+  it (other notes' prose is not re-parsed, so a NULL target is a resolved link lost permanently), and deletes the
+  loser's `headings`, `tags`, `items` and outgoing edges **by hand**: enforcement is off inside a code step, so no
+  `ON DELETE CASCADE` fires behind it, and `PRAGMA foreign_key_check` in the same transaction is what turns a
+  softened delete into a refused open. The receipt lands in `meta` under `note_merges` — `merged=N;paths=…`, names
+  capped at eight and ordered by byte key — written even at zero, because `merged=0` is the record that the check
+  ran; only the open that merged echoes it, on stderr and as `ScanReport::merged_notes`, so stdout, `--json` and
+  the durable record are one string (F21 §3's rule again). Convergence is asserted rather than hoped for, and
+  `Indexed::Duplicate` survives because a pair another tool writes *after* migration 5 has run is still permanent:
+  there is no second pass and no `UNIQUE` index on `notes(rel_bytes)` (design §7 keeps that choice deliberately
+  open so F13 §7's reader stays testable), so the reader still names such a pair instead of picking a winner.
+  **One pin this entry cannot have yet:** migration 5's `WHERE rel_bytes IS NOT NULL` arm has no fixture, and a run
+  that went looking for one established why — `notes.rel_bytes` carries `CHECK (typeof(rel_bytes) = 'blob')`, and
+  `typeof(NULL)` is `'null'`, so no writer can leave a note row keyless in any file migration 4 touched. That CHECK
+  is the protection; the clause is defence in depth, and **F-5's keyless-row pin becomes possible only when some
+  future migration admits keyless note rows.** What is pinned instead is the reachable half of the same shape: a
+  merged survivor with no `rel` at all (`a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key`).
 
 ## F20 — two report-side filters still compare display text
 
@@ -432,6 +456,23 @@ What these numbers can and cannot carry:
   a "Do when" that demands recording the version mid-obstruction: `refresh_covered` withholding it is the safety, not
   the bug. Until then, do not describe the fallback's over-hiding as churn that heals: it does not.
 ---
+
+## F24 — the two merge tests carry the same assertions twice
+
+- **Where:** `crates/np-core/tests/db.rs` —
+  `merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge` and
+  `a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges` repeat five blocks verbatim: the
+  survivor is `MIN(id)`, the winner's heading/tag/item survived, the four-shape loop over what the loser left,
+  the re-pointed incoming edge, and the receipt string.
+- **Risk:** drift, in the direction that hides a hole rather than showing one. This round closed exactly that: the
+  version-three copy of `SELECT COUNT(*) FROM links WHERE src_note_id = 9` could never fail because only the
+  version-four fixture planted the loser's outgoing edge — one fixture gained a row, the other's assertion went on
+  reading as coverage.
+- **Fix:** extract an `assert_merged_pair_folded(&db)` helper, the way `crates/np-cli/tests/cli.rs` already has
+  `assert_only_the_orphans_went`. Deliberately **not** done in this round: keeping each test's own failure messages
+  ("the edge crossed the rebuild and the merge together" is not the claim the version-four case makes) costs most
+  of the saving, so the honest extraction is under twenty lines and would flatten those messages to buy it.
+  **Do when:** the next change to migration 5's delete list — take it then, with both fixtures in front of you.
 
 ## Explicitly not in this backlog
 

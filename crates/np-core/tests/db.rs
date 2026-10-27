@@ -7,7 +7,7 @@
 //! module must not grow an API just to make its own tests shorter.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // The hold times and the writer/holder handoff live in `tests/common/mod.rs`, which `tests/config.rs`
@@ -18,7 +18,7 @@ use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_
 use np_core::config::Config;
 use np_core::db::{
     apply_move, mark_stale, note_counts, upsert_file, Db, DbError, Migration, NoteCounts,
-    FK_ORPHANS_KEY, MIGRATIONS, PATHS_LOSSY_KEY,
+    FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
 };
 use np_core::hash::{sha256_file, Snapshot};
 use np_core::path_keys::RelPath;
@@ -1947,52 +1947,62 @@ fn upsert_file_keys_come_from_rel_and_never_from_abs() {
     );
 }
 
-/// Write a version-three database holding **two `notes` rows for one path** — legal at that version, because
-/// `notes.rel` carried no `UNIQUE` (F13 §7) — beside a second file on disk that has no row at all.
+/// Plant **two `notes` rows for one path** on a database whose migrations have already run.
 ///
-/// The pair is deliberate: the duplicate exercises migration 4's copy (`CAST(rel AS BLOB)` per row) while
-/// `fresh.md` exercises the one writer that can invent a keyless note, [`np_core::db::insert_note`].
-fn seed_duplicate_notes_version_three(path: &Path, rel: &str, hash: &str, size: i64) {
-    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
-    conn.execute_batch(VERSION_THREE)
-        .expect("test setup: version-three schema");
-    conn.execute(
-        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, 'ok', 90)",
+/// This used to be a version-three fixture. Migration 5 (F19) merges any pair it can see at open time, so the
+/// only way to meet a pair *as a pair* is to write one after the migrations ran — which is exactly the
+/// population `docs/design-f19-note-merge.md` §3 says the reader exists for: a database another tool wrote.
+///
+/// The values are the ones the old fixture used, so the assertions below read as they always did: ids 4 and 9
+/// (non-consecutive, because that is what a legacy file looks like) beside one `files` row whose `hash` matches
+/// the note on disk and whose `mtime` is an impossible `1`. That mtime makes the cheap size-and-mtime trigger
+/// fail so the digest is compared and `classify` calls the file unchanged: a note that is *not* rewritten is
+/// what keeps property (1) below a statement about the reader rather than about `store_note`.
+fn plant_duplicate_notes_after_migration(db: &Db, rel: &str, hash: &str, size: i64) {
+    // A hex literal, not a bind: `rel_bytes` is a BLOB under a `typeof(rel_bytes) = 'blob'` CHECK, and a TEXT
+    // bind is refused rather than quietly matching (F13 §4). `dup.md` is ASCII, so its case fold is itself.
+    let key = "X'6475702E6D64'";
+    db.0.execute(
+        &format!(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state,
+                                last_seen)
+             VALUES ({key}, {key}, ?1, ?2, ?3, ?4, ?5, 1, 'ok', 90)"
+        ),
         rusqlite::params![rel, rel.to_lowercase(), format!("/ws/{rel}"), hash, size],
     )
     .expect("test setup: seed the duplicated-note file row");
-    // `mtime` is an impossible `1` on purpose: the cheap size-and-mtime trigger has to fail so a scan
-    // compares the real digest above and reads this file as unchanged. The note is then not rewritten, which
-    // keeps property (1) below a statement about migration 4's copy rather than about `store_note`.
-    let mut statement = conn
-        .prepare(
-            "INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body)
-             VALUES (?1, ?2, ?3, 'filename', 'utf-8', 1, ?4)",
-        )
-        .expect("test setup: prepare the note insert");
-    // Two rows, one path, non-consecutive ids — every shape `notes.rel`'s missing `UNIQUE` allowed.
     for (id, title, body) in [(4, "Dup first", "first"), (9, "Dup second", "second")] {
-        statement
-            .execute(rusqlite::params![id, rel, title, body])
-            .expect("test setup: two note rows for one path");
+        db.0.execute(
+            &format!(
+                "INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body)
+                 VALUES (?1, {key}, ?2, ?3, 'filename', 'utf-8', 1, ?4)"
+            ),
+            rusqlite::params![id, rel, title, body],
+        )
+        .expect("test setup: two note rows for one path");
     }
 }
 
 #[test]
 fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a_bare_query_row() {
-    // `notes.rel` was never UNIQUE at version 3, so a legacy database may carry two note rows for one file,
-    // and migration 4 copies both onto one `rel_bytes` — which has no UNIQUE there by design (F13 §7). This
-    // is the population every identity lookup now plans for: a bare `query_row` on such a key is **not a wrong
-    // answer but a scan error** (`ExecuteMultipleValues`), and `LIMIT 1` is a silent pick that rewrites one
-    // note's title, tags, items and links with the other file's. So [`np_core::db::note_ids`] reads every id
-    // and the scan acts on the count.
+    // `notes.rel` was never UNIQUE, so one path can hold two note rows and `rel_bytes` carries no UNIQUE to
+    // refuse it (F13 §7). This is the population every identity lookup now plans for: a bare `query_row` on
+    // such a key is **not a wrong answer but a scan error** (`ExecuteMultipleValues`), and `LIMIT 1` is a
+    // silent pick that rewrites one note's title, tags, items and links with the other file's. So
+    // [`np_core::db::note_ids`] reads every id and the scan acts on the count.
     //
-    // Round 2 amended the second half of this test (F13 §7): what used to be "indexed quietly" is now
-    // reported. Three things are pinned:
-    // (1) the legacy duplicate neither fails the scan nor gets a silent winner — the file is named in
-    //     `skipped` and **no note is rewritten**;
-    // (2) the migration neither collapses the pair into one row nor refuses it: both survive, on one key;
+    // F19 amended *how the pair gets here*, not what is pinned about reading it. It used to arrive through
+    // migration 4's mechanical key copy, and the test then pinned that no migration made an unannounced
+    // identity call. Migration 5 is a different act: it merges such a pair onto `MIN(id)`, re-points incoming
+    // edges instead of nulling them, and writes its receipt in the same transaction — an announced repair,
+    // not the silent pick F13 refused (`docs/design-f19-note-merge.md` §2 and §4; the F19 section below
+    // this test pins that merge). Three things stay pinned, and (1) and (3) are unchanged in substance:
+    // (1) a pair that exists when a scan runs neither fails the scan nor gets a silent winner — the file is
+    //     named in `skipped` and **no note is rewritten**;
+    // (2) migration 5 does not chase a pair that appears after it ran, and nothing else folds one either: both
+    //     rows survive on one key. That reachability is deliberate — §7 keeps `notes(rel_bytes)` free of a
+    //     UNIQUE index so this defensive arm stays a state the reader can be shown rather than dead code
+    //     maintained by hand;
     // (3) after a write pass no note row carries a NULL `rel_bytes`, so none can hide from the re-keyed join.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let root = tmp.path().join("ws");
@@ -2006,18 +2016,15 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
         ..Config::default()
     };
     let db_path = cfg.workspace_db(&root);
-    fs::create_dir_all(
-        db_path
-            .parent()
-            .expect("test setup: the workspace database sits in a directory"),
-    )
-    .expect("test setup: database directory");
+    // Migrated to completion *before* the pair exists, so what follows is a database another tool wrote into.
+    let db = Db::open(&db_path).expect("test setup: migrate the database, then plant beside it");
     let dup = root.join("dup.md");
     let hash = sha256_file(&dup).expect("test setup: hash the note the way a scan does");
     let size = fs::metadata(&dup)
         .expect("test setup: read the note's size")
         .len() as i64;
-    seed_duplicate_notes_version_three(&db_path, "dup.md", &hash, size);
+    plant_duplicate_notes_after_migration(&db, "dup.md", &hash, size);
+    drop(db);
     assert_eq!(
         rusqlite::Connection::open(&db_path)
             .expect("test: read the fixture's note rows")
@@ -2028,10 +2035,10 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
             )
             .expect("test: the fixture records its notes"),
         2,
-        "premise: version three really would hold two rows for one path"
+        "premise: the current schema really does accept two rows for one path"
     );
 
-    let report = scan(&root, &cfg).expect("a legacy duplicate must not fail the scan");
+    let report = scan(&root, &cfg).expect("a duplicate pair must not fail the scan");
     // (1) The duplicate is named, by the spelling a person can match against their workspace, and the scan
     // carried on to `fresh.md`. Nothing about `dup.md` was counted: it was refused, not indexed.
     assert_eq!(
@@ -2058,9 +2065,9 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
             "9:Dup second:second".to_string(),
             "10:Fresh:# Fresh\n".to_string(),
         ],
-        "no note was rewritten, and the untouched pair still reads as the legacy fixture wrote it"
+        "no note was rewritten, and the untouched pair still reads as it was planted"
     );
-    // (1) Both legacy rows, both ids, one key — and `fresh.md`'s brand-new note keyed the same way.
+    // (1) Both rows, both ids, one key — and `fresh.md`'s brand-new note keyed the same way.
     assert_eq!(
         names(
             &db,
@@ -2071,12 +2078,23 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
             "dup.md:9:6475702E6D64",
             "fresh.md:10:66726573682E6D64",
         ],
-        "both legacy rows survive onto the one byte key, and the note this scan minted carries a key as well"
+        "both rows survive onto the one byte key, and the note this scan minted carries a key as well"
     );
     assert_eq!(
         scalar::<String>(&db, "SELECT hex(rel_bytes) FROM files WHERE rel = 'dup.md'"),
         "6475702E6D64",
         "the two notes hang off one `files` row's key, which is what makes the key non-unique by design"
+    );
+    // (2) The new half of the contract. Migration 5 ran on this file — and recorded that it merged nothing,
+    // because the pair did not exist yet. It does not run again, so a pair written afterwards is never folded
+    // quietly: it is named by every scan until whoever wrote it is dealt with (F19 §3).
+    assert_eq!(
+        scalar::<String>(
+            &db,
+            &format!("SELECT value FROM meta WHERE key = '{NOTE_MERGE_KEY}'")
+        ),
+        "merged=0;paths=".to_string(),
+        "the merge is recorded as done and empty while a pair still stands: no second pass, no silent winner"
     );
 
     // (3) §5's weaker, more important half: no keyless note after a write pass. A NULL key matches nothing
@@ -2085,6 +2103,840 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
         scalar::<i64>(&db, "SELECT COUNT(*) FROM notes WHERE rel_bytes IS NULL"),
         0,
         "a note row with no byte key is F13 reproduced by the fix"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F19 — migration 5 merges the duplicate note rows version 3 allowed. No production API makes a pair
+// any more (`insert_note` mints one row per path and `note_ids` reads them all), so every fixture below
+// builds one with raw SQL, on a schema that is otherwise current.
+// ---------------------------------------------------------------------------
+
+/// The byte key of `dup.md`, as the hex literal SQLite needs for a `BLOB` column (F13 §4: a TEXT bind
+/// would fail the `typeof(rel_bytes) = 'blob'` check rather than quietly match).
+const DUP_BYTES: &str = "X'6475702E6D64'";
+/// The byte key of `third.md`, the note that links to the loser.
+const THIRD_BYTES: &str = "X'74686972642E6D64'";
+/// The byte keys of the two paths in [`seed_two_duplicate_groups_at_version_four`]. `a.md` sorts first as a
+/// key while being planted second, which is what makes its position in the receipt a statement about ordering.
+const A_MD_BYTES: &str = "X'612E6D64'";
+/// The byte key of `b.md` — later as a key, earlier everywhere else.
+const B_MD_BYTES: &str = "X'622E6D64'";
+/// The byte key of `solo.md` — a path holding exactly one note row, used where a fixture must have **no pair**.
+const SOLO_BYTES: &str = "X'736F6C6F2E6D64'";
+/// A byte key with no exact display spelling: `a\xE4b.md`, where `\xE4` is not valid UTF-8 on its own. Its
+/// lossy spelling — the one this program stores in a display column for such a name — is `a\u{FFFD}b.md`, and
+/// that is the string [`seed_keyless_display_pair_at_version_four`]'s receipt has to produce.
+const LOSSY_BYTES: &str = "X'61E4622E6D64'";
+/// The lossy spelling of [`LOSSY_BYTES`], spelled by hand rather than computed, so the assertion that reads it
+/// is an expectation and not a second call to the code under test.
+const LOSSY_DISPLAY: &str = "a\u{FFFD}b.md";
+
+/// Plant F19 §5's shape and leave the file claiming version four, so the next open runs migration 5:
+/// one `rel_bytes` holding two note rows (ids 4 and 9 — the winner is 4 by `MIN(id)`, and the ids are
+/// non-consecutive because that is what a legacy file looks like), derived rows hanging off **both**, and
+/// an incoming edge from a third note to each of them.
+///
+/// Planted on a current schema rather than copied from a version-three script: migration 5 writes no DDL,
+/// only row moves, so "version four plus a pair" is exactly the file that step meets in the wild, and
+/// deleting its recorded `schema_version` row reproduces that without a third hand-copied schema to keep
+/// in step (this file already carries two of those, which is one too many to grow).
+fn seed_duplicate_pair_at_version_four(path: &Path) {
+    let db = Db::open(path).expect("test setup: create the current schema");
+    db.0.execute_batch(
+        &format!(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+             VALUES ({DUP_BYTES}, {DUP_BYTES}, 'dup.md', 'dup.md', '/ws/dup.md', 'h1', 5, 1, 'ok', 9),
+                    ({THIRD_BYTES}, {THIRD_BYTES}, 'third.md', 'third.md', '/ws/third.md', 'h2', 5, 1, 'ok', 9);
+             INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body) VALUES
+                (4,  {DUP_BYTES}, 'dup.md', 'Dup first',  'filename', 'utf-8', 1, 'first'),
+                (9,  {DUP_BYTES}, 'dup.md', 'Dup second', 'filename', 'utf-8', 1, 'second'),
+                (12, {THIRD_BYTES}, 'third.md', 'Third',  'filename', 'utf-8', 1, 'third');
+             INSERT INTO headings (note_id, level, text, line) VALUES
+                (4, 1, 'First heading', 1), (9, 2, 'Second heading', 3), (12, 1, 'Third heading', 1);
+             INSERT INTO tags (note_id, tag) VALUES (4, 'first-tag'), (9, 'second-tag');
+             INSERT INTO items (note_id, text, line, state, marker) VALUES
+                (4, 'first task', 2, 'open', '- [ ]'), (9, 'second task', 4, 'done', '- [x]');
+             INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+                (4, 12, 'wiki', 'Third', 3, 'prose'),
+                (9, 12, 'wiki', 'Third', 5, 'prose'),
+                (12, 4, 'wiki', 'Dup first', 2, 'prose'),
+                (12, 9, 'wiki', 'Dup second', 3, 'prose');"
+        ),
+    )
+    .expect("test setup: plant two note rows on one key, their derived rows and the edges around them");
+    // Rewind past migration 5 — and past the receipt its step wrote while this file was still empty. A
+    // genuine version-four file has no `note_merges` row at all, and leaving a `merged=0` one behind would
+    // let that step take its upsert's update arm instead of recording itself, which is the difference
+    // between "never checked" and "checked and found none" (F21 §2).
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+        4,
+        "test setup: migration 5 has not run here"
+    );
+}
+
+/// Plant the population real legacy workspaces actually arrive with — **version three**, holding two `notes`
+/// rows for one `rel`, which was legal there because `notes.rel` carried no `UNIQUE` (F13 §7) — and leave the
+/// file claiming version three so the next open runs migration 4 *and* migration 5 in one pass.
+///
+/// [`seed_duplicate_pair_at_version_four`] cannot stand in for this. It plants its pair on a schema migration 4
+/// has already rebuilt, so nothing in it says that migration 4's `CAST(rel AS BLOB)` copy is what folds the two
+/// rows onto one `rel_bytes`, nor that migration 5 then merges them in the same open. That order is
+/// load-bearing rather than incidental: run the merge first and the pair is copied afterwards, into a file
+/// already recorded as merged, with nothing left to heal it — which is how a reordered [`MIGRATIONS`] list
+/// would lose somebody's note rows.
+fn seed_duplicate_notes_at_version_three(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_THREE)
+        .expect("test setup: version-three schema");
+    conn.execute_batch(
+        "-- One `files` row per path (version three keyed those by `rel TEXT PRIMARY KEY`) and two note rows
+         -- for `dup.md`, ids non-consecutive because that is what a legacy file looks like. Winner 4, loser 9.
+         INSERT INTO files (rowid, rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
+            (2, 'dup.md', 'dup.md', '/ws/dup.md', 'h1', 5, 1, 'ok', 9),
+            (7, 'third.md', 'third.md', '/ws/third.md', 'h2', 5, 1, 'ok', 9);
+         INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
+            (4, 'dup.md', 'Dup first',  'filename', 'utf-8', 1, 'first'),
+            (9, 'dup.md', 'Dup second', 'filename', 'utf-8', 1, 'second'),
+            (12, 'third.md', 'Third',   'filename', 'utf-8', 1, 'third');
+         -- Derived rows on both halves of the pair, so 'the winner kept its corpus' is an assertion rather
+         -- than a hope: one edge into each of them from the third note, and one edge **out of the loser** (9 ->
+         -- 12), which mirrors the version-four fixture and is what makes the merge's outgoing-edge delete visible
+         -- here too. Without that row the loop asking `links WHERE src_note_id = 9` can never fail.
+         INSERT INTO headings (note_id, level, text, line) VALUES
+            (4, 1, 'First heading', 1), (9, 2, 'Second heading', 3), (12, 1, 'Third heading', 1);
+         INSERT INTO tags (note_id, tag) VALUES (4, 'first-tag'), (9, 'second-tag');
+         INSERT INTO items (note_id, text, line, state, marker) VALUES
+            (4, 'first task', 2, 'open', '- [ ]'), (9, 'second task', 4, 'done', '- [x]');
+         INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+            (12, 4, 'wiki', 'Dup first', 2, 'prose'),
+            (12, 9, 'wiki', 'Dup second', 3, 'prose'),
+            (9, 12, 'wiki', 'Third', 5, 'prose');",
+    )
+    .expect("test setup: plant a version-three pair on one path");
+    assert_eq!(
+        conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| row
+            .get::<_, i64>(0))
+            .expect("test setup: read the fixture's version"),
+        3,
+        "test setup: migrations 4 and 5 both have to run on the open below"
+    );
+}
+
+/// Plant a database holding **more than one** duplicate group and leave it claiming version four: `b.md` with
+/// two note rows (ids 3 and 5) and `a.md` with **three** (ids 7, 9 and 11).
+///
+/// The shape is chosen so the receipt's two degrees of freedom cannot both be satisfied by an accident:
+///
+/// - **the count is rows folded, not paths** — three losers across two keys, so `merged` has to read 3 while
+///   `paths` names 2. A group of three is the only way to tell those apart, and every other fixture here holds
+///   exactly one pair, where both numbers would be 1;
+/// - **the names are not in arrival order and not in winner-id order** — `b.md` is planted first and carries the
+///   *lower* ids, so a receipt built from either of those reads `b.md,a.md`. That is all this fixture excludes: it
+///   does **not** pin the explicit `ORDER BY rel_bytes` in [`duplicate_groups`], because `GROUP BY` over that
+///   indexed column already yields ascending key order and deleting the clause keeps every test green (run, then
+///   restored). The clause is the statement of intent — one database, one receipt, whatever the planner chooses —
+///   and it stays for that reason, not because anything here would notice.
+fn seed_two_duplicate_groups_at_version_four(path: &Path) {
+    let db = Db::open(path).expect("test setup: create the current schema");
+    db.0.execute_batch(
+        &format!(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+             VALUES ({B_MD_BYTES}, {B_MD_BYTES}, 'b.md', 'b.md', '/ws/b.md', 'h1', 5, 1, 'ok', 9),
+                    ({A_MD_BYTES}, {A_MD_BYTES}, 'a.md', 'a.md', '/ws/a.md', 'h2', 5, 1, 'ok', 9);
+             -- `b.md` first, and on the lower ids: see [`seed_two_duplicate_groups_at_version_four`]'s second
+             -- bullet — the receipt must not be able to come out in this order.
+             INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body) VALUES
+                (3,  {B_MD_BYTES}, 'b.md', 'B first',  'filename', 'utf-8', 1, 'b1'),
+                (5,  {B_MD_BYTES}, 'b.md', 'B second', 'filename', 'utf-8', 1, 'b2'),
+                (7,  {A_MD_BYTES}, 'a.md', 'A first',  'filename', 'utf-8', 1, 'a1'),
+                (9,  {A_MD_BYTES}, 'a.md', 'A second', 'filename', 'utf-8', 1, 'a2'),
+                (11, {A_MD_BYTES}, 'a.md', 'A third',  'filename', 'utf-8', 1, 'a3');"
+        ),
+    )
+    .expect("test setup: plant two duplicate groups, one of them a triple");
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+}
+
+/// Plant **nine** duplicate groups — nine paths, two note rows each — and leave the file claiming version four.
+///
+/// One degree of freedom more than [`seed_two_duplicate_groups_at_version_four`] exercises: the receipt names at
+/// most `MERGE_NAME_CAP` (eight) spellings, and no other fixture here holds enough groups for that list to be
+/// truncated — so the cap could be changed to any number today and nothing would notice. The keys are planted `g9.md` first and `g1.md` last, so a receipt assembled from arrival order would
+/// have to name `g9.md` — the one path this fixture expects truncated away.
+fn seed_nine_duplicate_groups_at_version_four(path: &Path) {
+    let db = Db::open(path).expect("test setup: create the current schema");
+    let mut file_rows = String::new();
+    let mut note_rows = String::new();
+    for index in (1..=9).rev() {
+        let rel = format!("g{index}.md");
+        let hex = rel
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        file_rows.push_str(&format!(
+            "(x'{hex}', x'{hex}', '{rel}', '{rel}', '/ws/{rel}', 'h{index}', 5, 1, 'ok', 9),"
+        ));
+        note_rows.push_str(&format!(
+            "({}, x'{hex}', '{rel}', 'first',  'filename', 'utf-8', 1, 'a'),\
+             ({}, x'{hex}', '{rel}', 'second', 'filename', 'utf-8', 1, 'b'),",
+            index * 10,
+            index * 10 + 1
+        ));
+    }
+    file_rows.pop(); // the trailing comma of the last VALUES row
+    note_rows.pop();
+    db.0.execute_batch(&format!(
+        "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES {file_rows};
+         INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body)
+         VALUES {note_rows};"
+    ))
+    .expect("test setup: plant nine duplicate groups");
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+}
+
+/// Plant a duplicate pair whose survivor carries **no display text at all** and leave the file claiming
+/// version four: two note rows on one byte key that is not valid UTF-8, both with `rel` NULL.
+///
+/// `notes.rel` is nullable (F13 §4), so this half of F19's receipt shape *is* plantable — unlike a row with a
+/// NULL `rel_bytes`, which migration 4 forbids: the rebuilt column carries
+/// `CHECK (typeof(rel_bytes) = 'blob')` and `typeof(NULL)` is `'null'`, so no writer — this program or a tool
+/// holding nothing but SQL — can leave a note row keyless. The pair here is the reachable case: the key names
+/// the path, only the human-readable spelling is missing.
+fn seed_keyless_display_pair_at_version_four(path: &Path) {
+    let db = Db::open(path).expect("test setup: create the current schema");
+    db.0.execute_batch(
+        &format!(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+             VALUES ({LOSSY_BYTES}, {LOSSY_BYTES}, '{LOSSY_DISPLAY}', '{LOSSY_DISPLAY}',
+                     '/ws/{LOSSY_DISPLAY}', 'h1', 5, 1, 'ok', 9);
+             -- Both rows lack `rel`, so the fallback is reached whichever of them survives; ids are 6 and 8
+             -- because which row is the winner must not decide whether the receipt can name the path at all.
+             INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body) VALUES
+                (6, {LOSSY_BYTES}, NULL, 'first',  'filename', 'utf-8', 1, 'one'),
+                (8, {LOSSY_BYTES}, NULL, 'second', 'filename', 'utf-8', 1, 'two');"
+        ),
+    )
+    .expect("test setup: plant a keyless-display pair on one byte key");
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+}
+
+/// The [`NOTE_MERGE_KEY`] receipt as the file holds it.
+fn merge_receipt_of(db: &Db) -> String {
+    scalar(
+        db,
+        &format!("SELECT value FROM meta WHERE key = '{NOTE_MERGE_KEY}'"),
+    )
+}
+
+/// A workspace holding `dup.md` and `third.md` over a database [`seed_duplicate_pair_at_version_four`]
+/// planted — the shape one `np scan` run therefore repairs as it opens.
+fn merged_pair_workspace(tmp: &TempDir) -> (PathBuf, Config) {
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace directory");
+    fs::write(root.join("dup.md"), "# Dup\n").expect("test setup: write dup.md");
+    fs::write(root.join("third.md"), "# Third\n").expect("test setup: write third.md");
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+    seed_duplicate_pair_at_version_four(&cfg.workspace_db(&root));
+    (root, cfg)
+}
+
+#[test]
+fn merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge() {
+    // F19 §4.2: row identity survives and link resolution survives, both asserted against the rows rather
+    // than inferred from a report count.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_pair_at_version_four(&path);
+
+    let db = Db::open(&path).expect("the open runs migration 5");
+
+    // One row remains, and it is the oldest: `MIN(id)`, the one derived rows already hang off.
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {DUP_BYTES} ORDER BY id"
+            )
+        ),
+        ["4".to_string()],
+        "the survivor is MIN(id), not a silent pick or the newest row"
+    );
+
+    // The loser's derived rows are gone, and only the loser's. Asserted per shape because a merge that
+    // deleted the *winner*'s children would otherwise be invisible here.
+    for sql in [
+        "SELECT COUNT(*) FROM headings WHERE note_id = 9",
+        "SELECT COUNT(*) FROM tags WHERE note_id = 9",
+        "SELECT COUNT(*) FROM items WHERE note_id = 9",
+        "SELECT COUNT(*) FROM links WHERE src_note_id = 9",
+    ] {
+        assert_eq!(
+            scalar::<i64>(&db, sql),
+            0,
+            "{sql}: the loser's own rows went with it"
+        );
+    }
+    assert_eq!(
+        names(&db, "SELECT text FROM headings WHERE note_id = 4"),
+        ["First heading".to_string()],
+        "the winner keeps the rows that were already hanging off it"
+    );
+    assert_eq!(
+        names(&db, "SELECT tag FROM tags WHERE note_id = 4"),
+        ["first-tag".to_string()],
+        "and its tags, which is what a `MAX(id)` survivor would lose"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM items WHERE note_id = 4"),
+        1
+    );
+
+    // The edge that mattered: another note's prose pointed at the loser. Its target still exists, under
+    // the winner's id, so it is re-pointed — never nulled (F19 §2).
+    assert_eq!(
+        names(
+            &db,
+            "SELECT COALESCE(CAST(dst_note_id AS TEXT), 'NULL') FROM links
+              WHERE src_note_id = 12 AND target = 'Dup second'"
+        ),
+        ["4".to_string()],
+        "the incoming edge names the winner; a NULL here is a resolved link lost permanently"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            "SELECT COUNT(*) FROM links WHERE dst_note_id IS NOT NULL AND dst_note_id = 9"
+        ),
+        0,
+        "no edge still claims a row that is gone"
+    );
+    // The third note's own prose is intact in both directions, and the winner's outgoing edge rode along
+    // untouched: four edges went in, one (the loser's outgoing) came out.
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM links"),
+        3,
+        "only the loser's own outgoing edge disappeared"
+    );
+
+    // The receipt, read under the constant it is written under so a renamed key fails here.
+    assert_eq!(merge_receipt_of(&db), "merged=1;paths=dup.md");
+}
+
+#[test]
+fn the_receipt_counts_folded_rows_across_groups_and_names_paths_in_key_order() {
+    // The receipt shape at more than its smallest point. Every other merge fixture holds one pair, where
+    // `merged` and the name list are both a single 1 and cannot be told apart; here three rows fold out of two
+    // keys, and the keys are planted in the opposite order to the one the receipt has to print.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_two_duplicate_groups_at_version_four(&path);
+
+    let db = Db::open(&path).expect("the open runs migration 5 over both groups");
+
+    assert_eq!(
+        merge_receipt_of(&db),
+        "merged=3;paths=a.md,b.md",
+        "three rows folded, two paths named, names in byte-key order — not arrival order"
+    );
+
+    // The receipt's arithmetic checked against the rows it describes: one survivor per key, each the oldest on
+    // that key, and nothing else left behind.
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {A_MD_BYTES} ORDER BY id"
+            )
+        ),
+        ["7".to_string()],
+        "the triple left its MIN(id) standing"
+    );
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {B_MD_BYTES} ORDER BY id"
+            )
+        ),
+        ["3".to_string()],
+        "and the pair left its own"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"),
+        2,
+        "five rows in, two out: `merged=3` is the difference, not a path count"
+    );
+}
+
+#[test]
+fn the_receipt_names_eight_paths_and_counts_every_fold_beyond_them() {
+    // The cap, which every other fixture leaves unexercised because none of them holds eight names: nine keys
+    // fold nine rows, and the receipt has to carry `merged=9` beside a name list that stops at eight. That split
+    // is the product (`merge_receipt`'s own rule, inherited from F22's loss record): the count is the fact and
+    // the names are only where to look, so truncation must never shave the number — and `merge_total`, which the
+    // report field and the stderr echo both parse out of this same string, would then be reading a lie.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_nine_duplicate_groups_at_version_four(&path);
+
+    let db = Db::open(&path).expect("the open runs migration 5 over nine groups");
+
+    assert_eq!(
+        merge_receipt_of(&db),
+        "merged=9;paths=g1.md,g2.md,g3.md,g4.md,g5.md,g6.md,g7.md,g8.md",
+        "nine rows folded, eight names in key order — `g9.md` is the path the cap drops"
+    );
+
+    // The unnamed ninth path was merged all the same: a name list that stops short must not be read as work that
+    // did not happen, and its survivor is still `MIN(id)` like every other group's.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT CAST(id AS TEXT) FROM notes WHERE rel = 'g9.md' ORDER BY id"
+        ),
+        ["90".to_string()],
+        "the path the receipt does not name still kept its oldest row"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"),
+        9,
+        "eighteen rows in, nine out: `merged=9` counts folds, not names"
+    );
+}
+
+#[test]
+fn a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key() {
+    // `survivor_display`'s fallback, the half of F19's receipt that is reachable: `notes.rel` is nullable, so a
+    // merged path can arrive with no display text of its own. An empty name here is a merge that folded rows
+    // nobody can point at — `merged=1;paths=` reads as one unnamed path, and the count would be the only fact
+    // left. The expected spelling is written out (`LOSSY_DISPLAY`), not derived from the key.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_keyless_display_pair_at_version_four(&path);
+
+    let db = Db::open(&path).expect("the open runs migration 5");
+
+    // The precondition, so the fallback below cannot be credited to a stored `rel` that was there all along.
+    assert_eq!(
+        scalar::<String>(
+            &db,
+            "SELECT COALESCE(rel, '<none>') FROM notes WHERE id = 6"
+        ),
+        "<none>",
+        "test setup: the survivor has no display text of its own"
+    );
+
+    assert_eq!(
+        merge_receipt_of(&db),
+        format!("merged=1;paths={LOSSY_DISPLAY}"),
+        "the byte key's lossy spelling names the path when the row cannot"
+    );
+
+    // And the fallback changes only the name: the fold itself still keeps `MIN(id)` and drops the other row.
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {LOSSY_BYTES} ORDER BY id"
+            )
+        ),
+        ["6".to_string()],
+        "the unnamed survivor is still the oldest row on the key"
+    );
+}
+
+#[test]
+fn a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges() {
+    // The jump real legacy workspaces make. Every other F19 fixture plants its pair on a finished schema and
+    // rewinds one version row, so none of them says that migration 4's copy is what puts two rows on one
+    // `rel_bytes` **and** migration 5 folds them, in the same open (see
+    // [`seed_duplicate_notes_at_version_three`]). Reorder those two steps and this test is what fails: the pair
+    // arrives after the merge has run, into a file already recorded as merged, and nothing heals it.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_notes_at_version_three(&path);
+
+    let db = Db::open(&path).expect("one open runs migration 4 and then migration 5");
+
+    // Both steps landed: the file is current, and the pair sits on one byte key — which is migration 4's doing
+    // (`CAST(rel AS BLOB)` per row), and the precondition migration 5 merges on.
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+        5
+    );
+    assert_eq!(
+        scalar::<String>(&db, "SELECT hex(rel_bytes) FROM files WHERE rel = 'dup.md'"),
+        "6475702E6D64",
+        "migration 4 keyed the path, and both note rows copied onto that one key"
+    );
+
+    // One row remains at the lower id: `MIN(id)`, the row migration 4 carried across untouched.
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {DUP_BYTES} ORDER BY id"
+            )
+        ),
+        ["4".to_string()],
+        "the merge ran on the pair migration 4 had just copied, keeping the oldest row"
+    );
+
+    // The winner's derived rows survived both steps — its heading, tag and item are the ones the fixture wrote
+    // — and the loser's are gone rather than orphaned into the rebuilt tables.
+    assert_eq!(
+        names(&db, "SELECT text FROM headings WHERE note_id = 4"),
+        ["First heading".to_string()]
+    );
+    assert_eq!(
+        names(&db, "SELECT tag FROM tags WHERE note_id = 4"),
+        ["first-tag".to_string()]
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM items WHERE note_id = 4"),
+        1
+    );
+    for sql in [
+        "SELECT COUNT(*) FROM headings WHERE note_id = 9",
+        "SELECT COUNT(*) FROM tags WHERE note_id = 9",
+        "SELECT COUNT(*) FROM items WHERE note_id = 9",
+        "SELECT COUNT(*) FROM links WHERE src_note_id = 9",
+    ] {
+        assert_eq!(scalar::<i64>(&db, sql), 0, "{sql}: the loser left nothing");
+    }
+
+    // And the third note's edge into the loser came through both steps and names the winner — a NULL here is a
+    // resolved link lost permanently (F19 §2), and one naming 9 is an id that no longer exists.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT COALESCE(CAST(dst_note_id AS TEXT), 'NULL') FROM links
+              WHERE src_note_id = 12 AND target = 'Dup second'"
+        ),
+        ["4".to_string()],
+        "the edge crossed the rebuild and the merge together"
+    );
+
+    assert_eq!(merge_receipt_of(&db), "merged=1;paths=dup.md");
+}
+
+#[test]
+fn the_scan_that_merges_reports_the_string_it_stored() {
+    // The report field and `meta` are one value, not two recomputations of it (F21 §3's rule, applied to
+    // F19's deletion): whatever a person is told, they can compare against the record.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let (root, cfg) = merged_pair_workspace(&tmp);
+
+    let report = scan(&root, &cfg).expect("a legacy pair must not fail the scan");
+
+    let stored = merge_receipt_of(&Db::open(&cfg.workspace_db(&root)).expect("reopen"));
+    assert_eq!(stored, "merged=1;paths=dup.md");
+    assert_eq!(
+        report.merged_notes.as_deref(),
+        Some(stored.as_str()),
+        "{report:?}"
+    );
+    // And the pair is gone by the time the report is written, so nothing about `dup.md` was refused.
+    assert!(report.skipped.is_empty(), "{report:?}");
+
+    let db = Db::open(&cfg.workspace_db(&root)).expect("reopen");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes WHERE rel = 'dup.md'"),
+        1,
+        "one row per path once the merge has run"
+    );
+}
+
+#[test]
+fn a_second_open_announces_the_merge_nowhere_and_keeps_the_receipt() {
+    // F21's once-per-process rule, so this cannot become a permanent one-line warning: the announcement is
+    // this open's memory, while `meta` stays the record — and clearing it would make the line load-bearing.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_pair_at_version_four(&path);
+
+    let first = Db::open(&path).expect("the first open merges");
+    assert_eq!(first.merged_notes(), Some("merged=1;paths=dup.md"));
+    drop(first);
+
+    let second = Db::open(&path).expect("the second open runs nothing new");
+    assert_eq!(
+        second.merged_notes(),
+        None,
+        "a merge announced on every open is a warning nobody can act on"
+    );
+    assert_eq!(merge_receipt_of(&second), "merged=1;paths=dup.md");
+}
+
+#[test]
+fn a_merge_that_cannot_record_its_receipt_leaves_both_note_rows() {
+    // F19 §4.1, pinned the way F21 §4.2 pins migration 3: refuse the `meta` write and ask whether any row
+    // went. Statement order would let a refactor move the receipt past the deletes' commit, or soften its
+    // failure into a warning, and keep every other test green.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_pair_at_version_four(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("test setup: reopen the fixture");
+        // Nothing has claimed `NOTE_MERGE_KEY` yet, so this is an ordinary `INSERT` and the trigger fires
+        // — while migration 5's selects, re-points and deletes all still run.
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_merge_receipt BEFORE INSERT ON meta
+             BEGIN SELECT RAISE(ABORT, 'no merge receipt here'); END;",
+        )
+        .expect("test setup: refuse writes to `meta`");
+    }
+
+    let err = Db::open(&path).expect_err("a merge that cannot record its receipt must not commit");
+    // Reaching this line is half the assertion: an error, not a panic.
+    assert!(
+        matches!(
+            &err,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(fault, _))
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        ),
+        "expected the receipt write itself to be refused, got {err}"
+    );
+    assert!(
+        err.to_string().contains("no merge receipt here"),
+        "the error has to name the refusal: {err}"
+    );
+
+    // Read through a plain connection: `Db::open` still refuses this file.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    assert_eq!(
+        one("SELECT COUNT(*) FROM notes WHERE hex(rel_bytes) = '6475702E6D64'"),
+        2,
+        "both note rows survived a merge whose receipt was refused"
+    );
+    assert_eq!(
+        one("SELECT COUNT(*) FROM headings WHERE note_id = 9"),
+        1,
+        "the loser's derived rows are still there: nothing was deleted unannounced"
+    );
+    assert_eq!(
+        one("SELECT dst_note_id FROM links WHERE src_note_id = 12 AND target = 'Dup second'"),
+        9,
+        "and the incoming edge still names the row it was written against"
+    );
+    assert_eq!(
+        one(&format!(
+            "SELECT COUNT(*) FROM meta WHERE key = '{NOTE_MERGE_KEY}'"
+        )),
+        0,
+        "a refused receipt wrote nothing"
+    );
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        4,
+        "the step recorded nothing, so a later run can retry the merge"
+    );
+}
+
+#[test]
+fn a_database_with_nothing_to_merge_records_that_the_check_ran() {
+    // `merged=0` is the record that migration 5 looked (F21 §2's lesson), while the report field reports
+    // work done and therefore stays `None` — so "this file was never checked" and "nothing was found" stay
+    // tellable apart from either channel alone.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace directory");
+    fs::write(root.join("a.md"), "# A\n").expect("test setup: write a note");
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+
+    let report = scan(&root, &cfg).expect("a clean workspace scans");
+
+    let db = Db::open(&cfg.workspace_db(&root)).expect("reopen");
+    assert_eq!(merge_receipt_of(&db), "merged=0;paths=");
+    assert!(
+        report.merged_notes.is_none(),
+        "`merged=0` states no work done: {report:?}"
+    );
+}
+
+#[test]
+fn the_merge_gate_refuses_a_child_row_whose_note_is_gone() {
+    // Migration 5's `PRAGMA foreign_key_check`, seen from the only side that can reach it. Its deletes are
+    // explicit rather than cascading — enforcement is off inside a code step (see `merge_duplicate_notes`) —
+    // so this pragma is what turns "one of those deletes was softened" into a refused open instead of a
+    // committed orphan idling until the next `INSERT` re-adopts its id. No later scan re-checks those keys.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_pair_at_version_four(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("test setup: reopen the fixture");
+        // Enforcement off to plant this at all, exactly as in
+        // `the_byte_key_gate_refuses_a_note_whose_file_row_is_gone`: only a writer outside this program leaves
+        // a child row whose note is gone. The rowid is named so the error below can be pinned to *this* row.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("test setup: relax keys for the fixture");
+        conn.execute(
+            "INSERT INTO headings (rowid, note_id, level, text, line)
+             VALUES (777, 999, 1, 'Dangling', 2)",
+            [],
+        )
+        .expect("test setup: a heading row whose note never existed");
+        assert_eq!(
+            conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| row
+                .get::<_, i64>(0))
+                .expect("fixture query reads a number"),
+            4,
+            "test setup: only migration 5 can run on the open below, so the refusal cannot belong to an earlier step"
+        );
+    }
+
+    let err = Db::open(&path).expect_err("a child row outside its parent has to refuse the merge");
+    assert!(
+        matches!(
+            &err,
+            DbError::ForeignKeys { count, table, parent, rowid }
+                if *count == 1
+                    && table == "headings"
+                    && parent == "notes"
+                    && *rowid == 777
+        ),
+        "expected the check to name the dangling heading (rowid 777) and the parent it misses, got {err}"
+    );
+
+    // And refusing means refusing: the deletes roll back with the refusal, so the file keeps its pair and
+    // records nothing — §4.1's "nothing is merged unannounced" from this side of the transaction.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    assert_eq!(
+        one("SELECT COUNT(*) FROM notes WHERE hex(rel_bytes) = '6475702E6D64'"),
+        2,
+        "both note rows survived a step that refused its own work"
+    );
+    assert_eq!(
+        one(&format!(
+            "SELECT COUNT(*) FROM meta WHERE key = '{NOTE_MERGE_KEY}'"
+        )),
+        0,
+        "a refused step wrote no receipt"
+    );
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        4,
+        "the step recorded nothing, so a later run can retry the merge"
+    );
+}
+
+#[test]
+fn the_merge_gate_refuses_damage_that_no_merge_could_have_caused() {
+    // The word this step's comment and design §3 step 2 both commit to: the whole-file `PRAGMA foreign_key_check`
+    // runs **unconditionally**, "whether or not it merged anything". Every other gate case seeds a pair, so each
+    // of them stays green with the check wrapped in `if merged > 0`. This file holds one note row for one path —
+    // nothing to merge, no delete statement runs, and the dangling row below cannot be this step's doing.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    {
+        let db = Db::open(&path).expect("test setup: create the current schema");
+        db.0.execute_batch(
+            &format!(
+                "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+                 VALUES ({SOLO_BYTES}, {SOLO_BYTES}, 'solo.md', 'solo.md', '/ws/solo.md', 'h1', 5, 1, 'ok', 9);
+                 INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body)
+                    VALUES (4, {SOLO_BYTES}, 'solo.md', 'Solo', 'filename', 'utf-8', 1, 'one');"
+            ),
+        )
+        .expect("test setup: one path holding one note row");
+        // Enforcement off to plant the damage at all, exactly as in the case above: only a writer outside this
+        // program leaves a child row whose note is gone. The rowid is named so the error can be pinned to it.
+        db.0.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("test setup: relax keys for the fixture");
+        db.0.execute(
+            "INSERT INTO headings (rowid, note_id, level, text, line)
+             VALUES (888, 999, 1, 'Dangling', 2)",
+            [],
+        )
+        .expect("test setup: a heading row whose note never existed");
+        db.0.execute_batch(&format!(
+            "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+             DELETE FROM schema_version WHERE version = 5;"
+        ))
+        .expect("test setup: rewind the file to version four");
+
+        // The precondition that gives this test its teeth, in the shape `duplicate_groups` asks: no group at all,
+        // so `merged` is 0 and every delete in the step is skipped.
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                "SELECT COUNT(*) FROM (SELECT rel_bytes FROM notes
+                  WHERE rel_bytes IS NOT NULL GROUP BY rel_bytes HAVING COUNT(*) > 1)"
+            ),
+            0,
+            "test setup: nothing for migration 5 to merge, which is the whole point of this fixture"
+        );
+        assert_eq!(
+            scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+            4,
+            "test setup: only migration 5 can run on the open below"
+        );
+    }
+
+    let err = Db::open(&path).expect_err("damage survives no merge yet still refuses the open");
+    assert!(
+        matches!(
+            &err,
+            DbError::ForeignKeys { count, table, parent, rowid }
+                if *count == 1
+                    && table == "headings"
+                    && parent == "notes"
+                    && *rowid == 888
+        ),
+        "the check has to run and name the dangling heading (rowid 888) even though this step merged nothing, got {err}"
+    );
+
+    // And a refusal that did no work still records nothing: version four, no receipt, so a repaired file can retry.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    assert_eq!(
+        one(&format!(
+            "SELECT COUNT(*) FROM meta WHERE key = '{NOTE_MERGE_KEY}'"
+        )),
+        0,
+        "a refused step wrote no receipt"
+    );
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        4,
+        "the step recorded nothing, so a later run can retry the merge"
     );
 }
 
