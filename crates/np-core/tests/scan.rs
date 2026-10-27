@@ -3294,8 +3294,9 @@ fn a_migrated_text_keyed_row_behind_an_unreadable_directory_is_not_reported_remo
 /// display text" looks like it cures F23's duplicate rows, and here it produces `removed: 1` — a live note staled and
 /// dropped from the catalog while `PARSE_VERSION` is recorded over rows nobody re-parsed (design-f20 §4.2). A lossy
 /// key holds no byte spelling, so nothing computable in `known_rows` can tell this configuration from the one
-/// [`known_defect_a_readable_display_keyed_path_duplicates_its_own_row`] documents: hand those two scans the same
-/// inputs to `known_rows` and the right verdicts are opposite.
+/// [`a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version`] used to document: hand those two scans
+/// the same inputs to `known_rows` and the right verdicts were opposite. That fixture now pins the healing, which only
+/// happens when content agrees — the unpairable variant is still this configuration's twin in everything but outcome.
 ///
 /// Any future fix that makes this test report `removed: 1`, or moves the note off its id, has destroyed a live note.
 #[cfg(unix)]
@@ -3379,24 +3380,30 @@ fn a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin
     );
 }
 
-/// **F23's harm, pinned as a defect rather than as desired behaviour.** The same display-keyed row, with the
-/// unreadable directory now on the *other* twin: this scan reads the row's own path, yet the fallback still hides it,
-/// because a display spelling has many byte twins and the row records none of them. With nothing to pair against,
-/// the listed file indexes as `Added`, so one physical file ends up with two live `files` rows and two `notes` rows —
-/// two catalog entries, links and headings free to diverge between the ids — and `hidden_by_unknown` holds
-/// `PARSE_VERSION` back until somebody renames or removes the twin. **No scan clears either half.**
+/// **F23's harm, healed.** The same display-keyed row with the unreadable directory now on the *other* twin: this
+/// scan reads the row's own path. The ambiguous row is no longer deleted from the scan's view — it is marked, admitted
+/// to classification because a listed readable path spells itself exactly as the row does and matches its stored hash,
+/// and content settles what hiding could not. The listed file pairs with its own row as a `Moved`, `apply_move` re-keys
+/// it from real bytes, and the workspace ends with **one** live registry row, one note row at the id it already had,
+/// and the parse version recorded because the reason it was withheld is gone.
 ///
-/// Removing the fallback does "fix" this case — with it gone the scan pairs by hash and reports a clean `Moved: 1`,
-/// one live row, which is exactly why the narrow rule looked like a cure. It is not: the same change turns the
-/// configuration in
-/// [`a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`] into `added: 1, removed: 1`,
-/// destroying a live note. Delete this test in the same commit that fixes F23; do not let it harden into a guard on
-/// the bug.
+/// This replaced a fixture that pinned the opposite — two live rows, the version withheld until somebody renamed the
+/// twin — which F23's backlog entry instructed whoever fixed it to delete rather than let harden into a guard on the
+/// bug. What does **not** heal here is the residue: a row whose content changed while it was unindexable has no hash
+/// agreement, nothing claims it, and the duplicate pair reappears. That half is still open in F23, and this test's
+/// silence about it is not a claim that it is fixed.
+///
+/// The fence beside this —
+/// [`a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`] — is what keeps the healing honest:
+/// there the readable twin carries *different* content, so nothing may claim it, and a live note survives with its
+/// version withheld. Those two tests together are the reason "hide less" had to become "mark instead of delete".
 #[cfg(unix)]
 #[test]
-fn known_defect_a_readable_display_keyed_path_duplicates_its_own_row() {
+fn a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version() {
     assert_twin_dirs();
     const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    /// `c a f E9 / n o t e . m d` — the path's real bytes, which the row carries once the move re-keys it.
+    const REAL_KEY: &str = "636166E92F6E6F74652E6D64";
 
     let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
     if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
@@ -3412,6 +3419,14 @@ fn known_defect_a_readable_display_keyed_path_duplicates_its_own_row() {
     rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
     forget_headings(&db, "top.md");
     record_parse_version(&db, outdated_parse_version());
+    let legacy_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(
+        legacy_note_id > 0,
+        "test setup: there is a note row for this path to keep"
+    );
     drop(db);
 
     // The blocked directory is the twin; the display-keyed row's own path is perfectly readable this scan.
@@ -3425,34 +3440,792 @@ fn known_defect_a_readable_display_keyed_path_duplicates_its_own_row() {
         return;
     }
 
-    let report = scan(&ws.root, &ws.cfg).expect("the defect must not fail the scan");
+    let report = scan(&ws.root, &ws.cfg).expect("a blocked directory must not fail the scan");
     assert_eq!(
         (report.added, report.moved, report.removed),
-        (1, 0, 0),
-        "the readable path is re-indexed as new work instead of pairing with its own row: {report:?}"
+        (0, 1, 0),
+        "the readable path pairs with its own row instead of minting a second one: {report:?}"
     );
 
     let db = ws.db();
     assert_eq!(
         scalar(
             &db,
-            "SELECT COUNT(*) FROM files WHERE rel = 'caf\u{fffd}/note.md' AND state = 'ok'"
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{REAL_KEY}' AND state = 'ok'")
         ),
-        2,
-        "one physical file, two live registry rows — F23's duplicate"
+        1,
+        "one live registry row for one physical file, keyed by the path's real bytes"
     );
     assert_eq!(
         scalar(
             &db,
-            "SELECT COUNT(*) FROM notes WHERE rel = 'caf\u{fffd}/note.md'"
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}'")
         ),
+        0,
+        "and nothing left behind under the display-derived key: it was a lie about bytes, and it is gone"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{REAL_KEY}'")
+        ),
+        legacy_note_id,
+        "the note keeps its id, so headings, tags, items and links stayed attached to it"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION),
+        "the charge clears with the reason it was withheld — this is what separates a repair from a warning"
+    );
+}
+
+/// **F23 §5.0: the second resolution route — discharge by *match*, with no re-key anywhere.** Design §2 says a
+/// row resolves either by claim (`Moved`, re-keyed from real bytes) or by **match** (its own display path listed
+/// this pass with a non-empty hash), and every fixture above takes the first route. This one takes the second,
+/// built from the class that takes it permanently rather than once: a directory whose name really does hold the
+/// bytes `EF BF BD`. An ordinary scan keys that path from the walk's own bytes, and those bytes **are** its
+/// display text, so [`np_core::scan`]'s `key_is_display_derived` is true with no migration 4 rewrite in the
+/// file's history — which is also every lossily-named row on Windows, universally. Block a sibling `caf\xE9`
+/// (another directory, same display spelling `caf\u{FFFD}`, different bytes) and the row is ambiguous; its own
+/// path was nevertheless listed readable, so §2's match route discharges it.
+///
+/// Four things are pinned, in design §5.0's order: no `Added` and no duplicate row; `PARSE_VERSION` recorded with
+/// **no `Moved` in the report at all** (a definition of "resolved" that required `Moved` would charge this class
+/// every scan forever — §3's own forbidden outcome, and what mutation (5) attacks); the note keeps its id *and*
+/// its key, because this route never re-keys; and neither charge source fired, so the sum stayed zero. The last
+/// one is read from the version, which is the only integration-side observable of §3's sum: a charge from the
+/// byte-keyed arm would withhold it exactly as an unresolved mark does, so recording it proves both arms were
+/// empty over a refresh that demonstrably ran.
+#[cfg(unix)]
+#[test]
+fn a_row_keyed_from_its_own_lossy_bytes_discharges_by_match_without_a_move() {
+    assert_twin_dirs();
+    /// `c a f EF BF BD`: a directory name whose OS bytes are the encoded replacement character, so it spells
+    /// itself exactly as the lossy twin `caf\xE9` does while being a different directory.
+    const LOSSY_DIR: &[u8] = b"caf\xEF\xBF\xBD";
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    // The premise that makes this a twin pair at all, asserted rather than assumed: byte-distinct directories,
+    // one display spelling. Without it the blocked sibling would not be ambiguous with this row.
+    assert_ne!(LOSSY_DIR, TWIN_DIR_NINE);
+    assert_eq!(
+        String::from_utf8_lossy(LOSSY_DIR).into_owned(),
+        String::from_utf8_lossy(TWIN_DIR_NINE).into_owned(),
+        "the fixture has to produce one display spelling for two directories"
+    );
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_note_dir(&ws.root, LOSSY_DIR, "# Twin Heading\n") {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {LOSSY_DIR:?}, so no row here is \
+             keyed from its own display bytes and the match route would go untested"
+        );
+        return;
+    }
+    let first = scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+    assert_eq!((first.added, first.notes), (2, 2), "{first:?}");
+
+    // Premise on the row itself, not on a helper's name: this key came off the disk — no
+    // `rekey_row_like_migration_four` was called anywhere in this fixture — and it still equals the bytes of its
+    // own display text, which is precisely what makes the row ambiguous once a twin is blocked.
+    let db = ws.db();
+    assert_eq!(
+        key_hex(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE rel = 'caf\u{fffd}/note.md' ORDER BY rel_bytes"
+        ),
+        LOSSY_KEY,
+        "test setup: an ordinary scan keyed this row from bytes that are its own display text"
+    );
+    let note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(
+        note_id > 0,
+        "test setup: the lossy-keyed path has a note to keep"
+    );
+    // Visible refresh work on a path this scan can always read, so "the version was recorded" below means the
+    // charge cleared — not that no refresh was owed.
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    // The sibling, planted only now and blocked at once: a genuinely different directory with the same display
+    // spelling, holding its own file. Its body is irrelevant to the scan — it cannot read past the directory name
+    // — but it matters to the fixture: this is a second physical note, so the row really is ambiguous rather than
+    // merely oddly keyed.
+    assert!(
+        plant_note_dir(&ws.root, TWIN_DIR_NINE, "# Quite Another Heading\n"),
+        "test setup: plant the sibling directory"
+    );
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the sibling on this runner (a privileged user?), so no \
+             row was ambiguous this pass and there was nothing to discharge"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("an unreadable sibling must not fail the scan");
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the blocked sibling is named, and it is the only thing the scan has to say: {report:?}"
+    );
+    // Assertion 1, and the second half of assertion 2: the listed path minted no second row (**no `Added`**), and
+    // nothing travelled either — **no `Moved` anywhere in this report**, which is what separates discharge by
+    // match from discharge by claim.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 0, 0),
+        "the row paired with its own path by identity: no duplicate row, and no re-keying move to create one: {report:?}"
+    );
+
+    let db = ws.db();
+    // Assertion 1's other half and assertion 3: one live row, still under the key it started on — this route
+    // never re-keys — holding the same note id it always had.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "one live row for one physical file"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
         2,
-        "and two live notes rows for it: one under the lossy key {LOSSY_KEY}, one the re-indexed path created"
+        "and no second row anywhere: the duplicate rows F23 exists to stop are absent"
+    );
+    assert_eq!(
+        texts(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE rel = 'caf\u{fffd}/note.md' ORDER BY rel_bytes"
+        ),
+        [LOSSY_KEY],
+        "the row kept its key: discharge by match leaves the stored bytes alone"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        note_id,
+        "and its id, so headings, tags, items and links stayed attached"
+    );
+
+    // Assertion 4: §3's sum is zero this pass — neither the byte-keyed arm nor an unresolved mark charged it.
+    // The version is the only observable of that sum from outside the crate, and it reads zero only when both
+    // arms do; a precedence rule that let one row charge twice would leave this line withheld. The heading read
+    // first proves the refresh actually ran, so a recorded version means coverage rather than an empty scan.
+    assert_eq!(
+        heading_texts(&db, "top.md"),
+        vec!["Top Heading".to_string()],
+        "the note this scan could read was refreshed: {report:?}"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION),
+        "a marked row that resolved by match charges nothing, in either source — §3's sum is what gates this write"
+    );
+}
+
+/// **The permanent class with changed content — the state where design §3 and §4 met and had to be reconciled.**
+/// Same fixture shape as [`a_row_keyed_from_its_own_lossy_bytes_discharges_by_match_without_a_move`], but the note's
+/// body is edited while its twin is blocked, so its hash no longer matches the stored one. §2's scoping therefore
+/// refuses admission (it demands display equality **and** hash equality), and what settles it instead is that the row's
+/// own path is listed and readable: `upsert_file` resolves by `rel_bytes`, which for this class *is* the stored key, so
+/// the file re-joins its own row rather than minting a second one. §3's `matched` exclusion is what stops the row being
+/// charged as unresolved ambiguity while nothing about it stayed stale.
+///
+/// This is the residue's neighbour, not the residue: F23's unsolved case is a **migration-keyed** row whose bytes are
+/// display text but whose real path is byte-distinct — there is no listing that resolves to its key, and the duplicate
+/// pair returns. Here the key still matches reality, which is why content changing is survivable.
+#[cfg(unix)]
+#[test]
+fn a_permanent_class_row_whose_content_changed_while_a_twin_is_blocked_rejoins_its_own_row() {
+    assert_twin_dirs();
+    const LOSSY_DIR: &[u8] = b"caf\xEF\xBF\xBD";
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_note_dir(&ws.root, LOSSY_DIR, "# Twin Heading\n") {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {LOSSY_DIR:?}, so nothing here is \
+             keyed from its own display bytes"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    let note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    assert!(
+        plant_note_dir(&ws.root, TWIN_DIR_NINE, "# Quite Another Heading\n"),
+        "test setup: plant the sibling directory"
+    );
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!("NOT COVERAGE: 0o000 did not deny access to the sibling on this runner");
+        return;
+    }
+
+    // The edit that breaks hash agreement. Admission is now refused (§2), and only the listing of its own path can
+    // settle the row.
+    fs::write(
+        byte_name(&ws.root, LOSSY_DIR).join("note.md"),
+        "# Edited While Blocked\n\nThe body no longer matches what the row stores.\n",
+    )
+    .expect("test setup: edit the note");
+
+    let report =
+        scan(&ws.root, &ws.cfg).expect("an edited lossy-named note must not fail the scan");
+    // Measured, not assumed: classification calls the path `Added` — the row was pre-dropped, so nothing was there
+    // to pair with — and that is also what makes this safe rather than duplicating.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (1, 0, 0, 0),
+        "the edited path is new work on its own account; nothing was moved and nothing was removed: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'")
+        ),
+        1,
+        "one live row, because `upsert_file` resolves by `rel_bytes` and for this class the stored key *is* the real          bytes — the `Added` re-joined the row it already had instead of minting a second one: {report:?}"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        note_id,
+        "same note id: headings, tags, items and links stayed attached through an edit nobody could pair on"
+    );
+    assert_eq!(
+        report.notes, 2,
+        "and the catalog still counts two notes, not three — no duplicate entry for one file: {report:?}"
+    );
+
+    // §3's `matched` exclusion, pinned from outside: the row was marked and unresolved by hash, yet its own readable
+    // listing means nothing stayed stale, so neither source charges it and the version is writable. Delete that
+    // exclusion and this line goes back to the outdated value — a note charged forever for work this scan did.
+    assert_eq!(
+        heading_texts(&db, "top.md"),
+        vec!["Top Heading".to_string()],
+        "the readable note really was refreshed, so a recorded version means coverage: {report:?}"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION),
+        "a marked row listed and read on its own key charges nothing"
+    );
+    let losses = recorded_losses(&db);
+    assert!(
+        losses.contains("ambiguous=0"),
+        "and the durable record agrees with the charge rather than inventing a worry: {losses}"
+    );
+}
+
+/// **F23 §5.4: the byte-identical twin, priced in the same breath as it is bought.** The fence fixture and this
+/// one differ in exactly one respect: the readable look-alike carries the **same bytes** as the note behind the
+/// obstruction. `known_rows` is handed configurations that are identical by construction — one display-derived key,
+/// one unreadable sibling spelling it, one listed readable path with that display text and that hash — so no
+/// predicate here can prefer one over the other, and §2's rule lets this row claim the twin.
+///
+/// What that buys is the reason the rule is worth it: **no duplicate rows** and **one catalog entry** while the
+/// directory stays blocked, instead of two live `files` rows and two `notes` rows for what a reader sees as one
+/// note. What it costs is asserted here rather than left to inference, because §8's first review round found the
+/// original design understating exactly this cell:
+///
+/// - `moved: 1` where **nothing moved** — two physical files are on disk after the scan and two were on disk
+///   before it; what travelled is the row, not the note; and
+/// - the row has left its own key, so nothing tracks the file still sitting inside the obstruction. A deletion
+///   there is then **unreported** — F20 §1's harm class, accepted under design §2's table, and built below as a
+///   second scan rather than described in prose.
+#[cfg(unix)]
+#[test]
+fn a_byte_identical_twin_is_claimed_and_the_file_it_leaves_behind_goes_unreported() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    /// One body, written twice. [`plant_note_dir`]'s own reason for taking a body is that distinct bodies keep
+    /// `classify` from pairing twins; this fixture asks for that pairing on purpose.
+    const SHARED_BODY: &str = "# Twin Heading\n";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_note_dir(&ws.root, TWIN_DIR_NINE, SHARED_BODY) {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_NINE:?}, so there is no \
+             hidden note for a look-alike to be byte-identical to"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    // Migration 4's shape, as in the fence fixture: the row for real bytes `63 61 66 E9 …` keyed from its own
+    // lossy display text.
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    let note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(
+        note_id > 0,
+        "test setup: the hidden note exists to be re-homed"
+    );
+    drop(db);
+
+    // The readable twin, planted now with **the hidden note's own bytes**, then the obstruction closed. Identical
+    // content is the whole difference from the fence fixture, and it is not a choice: §2's table has no row for
+    // "and also make the bodies differ", because `known_rows` cannot ask.
+    assert!(
+        plant_note_dir(&ws.root, TWIN_DIR_EIGHT, SHARED_BODY),
+        "test setup: plant the byte-identical twin"
+    );
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the hidden note's directory on this runner (a privileged \
+             user?), so the row was never ambiguous and nothing could claim it"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("a blocked directory must not fail the scan");
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the obstruction is named, and only it: {report:?}"
+    );
+    // The cost, stated first: `moved: 1` where nothing moved. Nothing was renamed between these two scans — the
+    // twin arrived new and the hidden note never left its directory.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 1, 0),
+        "the row claims a look-alike it has never been on: a move reported over a file that did not travel: {report:?}"
+    );
+
+    let db = ws.db();
+    // What the claim buys: one live row for one display path and one catalog entry, where hiding the row used to
+    // leave two of each. This is §2's whole argument for claiming, so it is pinned on the same scan as its price.
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM files WHERE rel = 'caf\u{fffd}/note.md' AND state = 'ok'"
+        ),
+        1,
+        "no duplicate rows for one display path, which is what the claim was bought for"
+    );
+    assert_eq!(report.notes, 2, "{report:?}");
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes"),
+        2,
+        "one catalog entry while blocked: the note is neither swallowed nor doubled"
+    );
+    assert_eq!(
+        entry_lines(&index_text(&ws.root)).len(),
+        2,
+        "and the published catalog agrees with the row count"
+    );
+
+    // The rest of the price, on the same rows: the id is homed on a **different physical file**, and it has left
+    // the key that named the file inside the obstruction. Other notes' links now resolve to the twin.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        0,
+        "the row left its own key — the premise for the silence asserted below, not an incidental detail"
+    );
+    assert_eq!(
+        texts(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE rel = 'caf\u{fffd}/note.md' ORDER BY rel_bytes"
+        ),
+        [TWIN_EIGHT_KEY],
+        "it sits on the twin's bytes now: `63 61 66 E8 …`, a different file from the one it describes no more"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{TWIN_EIGHT_KEY}'")
+        ),
+        note_id,
+        "the same id, re-homed: every link that named this note now names the twin's rendering of it"
+    );
+    drop(db);
+
+    // The harm, **built** rather than inferred. Open the obstruction, delete the file still inside it, close it
+    // again — the state a user reaches by unblocking a directory for one moment and losing something in it.
+    drop(_blocked);
+    fs::remove_file(byte_name(&ws.root, TWIN_DIR_NINE).join("note.md"))
+        .expect("test setup: delete the note still inside the obstruction");
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 would not deny the obstruction a second time on this runner"
+        );
+        return;
+    }
+
+    let report =
+        scan(&ws.root, &ws.cfg).expect("a deletion behind the obstruction must not fail the scan");
+    // This silence is **F20 §1's harm class — a gone file nobody reports — accepted under design §2's table.** It
+    // is asserted as an outcome because reading `moved: 1` above as "the note travelled" is the one wrong answer
+    // this configuration can produce: a file was lost two scans in a row and the report says nothing about either.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 0, 0),
+        "nothing tracks the file inside the obstruction once its row has claimed a look-alike, so its deletion is \
+         unreported: F20 §1's harm class, taken on knowingly by §2's table — {report:?}"
+    );
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the directory is still named, and that is the whole trace a lost file leaves here: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes"),
+        2,
+        "the catalog still shows the note, backed by one file where it used to be two — quiet, not wrong, and \
+         quiet about a loss"
+    );
+}
+
+/// **F23 §5.5: the unrelated look-alike. This is the regression test for §2's display scoping** — the only
+/// assertion standing between this design and a note re-homed onto a stranger's file.
+///
+/// `classify` matches a claim on **hash alone** (`claimants.get(added.hash)` over every unmatched known row) and its
+/// `present_hashes` guard cannot fire here: that set is seeded from known rows whose *key* matches an unreadable
+/// listing, and a display-derived key never equals a real-bytes listing key. So without §2's scoping clause, any
+/// readable path anywhere in the corpus with byte-identical content — a `# Title` stub, a blank template, a
+/// re-exported note, all common in a notes corpus — would claim the hidden row: `moved: 1`, the id homed on somebody
+/// else's file, and nothing left tracking what sits inside the obstruction. The second design review called that a
+/// worse wrong answer than the one F23 set out to fix, and named this configuration as the hole; it is promoted from
+/// the temporary `COMMIT-0 PROBE` (which only printed the baseline) to a permanent fixture for exactly that reason.
+///
+/// Pinned: `added: 1` with **`moved: 0`** — the stranger's bytes are indexed as the new file they are; the hidden row
+/// is still live on its own display-derived key, same id; and no catalog entry is lost, because refusing admission is
+/// today's pre-drop, not a deletion. Mutation (3) deletes the scoping clause and must turn the first assertion below
+/// red with `moved: 1`.
+#[cfg(unix)]
+#[test]
+fn an_unrelated_look_alike_carrying_the_hidden_bytes_is_added_and_never_claims_them() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    /// `n o t e s / l o o k a l i k e . m d` — an unconnected path: different directory, different name, nothing
+    /// about it resembles the hidden note except its bytes.
+    const LOOKALIKE_KEY: &str = "6E6F7465732F6C6F6F6B616C696B652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_NINE:?}, so there is no \
+             hidden row for a stranger to try to claim"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    let hidden_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(
+        hidden_note_id > 0,
+        "test setup: the hidden note exists to be protected"
+    );
+    drop(db);
+
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the hidden note's directory on this runner (a privileged \
+             user?), so its row was never ambiguous and no claim could have been attempted"
+        );
+        return;
+    }
+    // The stranger: byte-identical to the hidden note, spelled `notes/lookalike.md`. Same hash `classify` would
+    // pair on, none of the display text §2 requires.
+    fs::create_dir_all(ws.root.join("notes")).expect("test setup: notes/");
+    fs::write(ws.root.join("notes/lookalike.md"), "# Twin Heading\n")
+        .expect("test setup: the look-alike, byte-identical to the hidden note");
+
+    let report = scan(&ws.root, &ws.cfg).expect("the look-alike must not fail the scan");
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the obstruction is named, so the row really was ambiguous this pass: {report:?}"
+    );
+    // The assertion mutation (3) must break. Identical content alone does not admit a claim; the look-alike is
+    // indexed as the new file it is.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (1, 0, 0, 0),
+        "the stranger's bytes are `Added` on their own account: §2's scoping refuses the claim, and `moved: 1` here \
+         would mean a live note was re-homed onto somebody else's file — {report:?}"
+    );
+
+    let db = ws.db();
+    // The hidden row survives on the key it holds — refused admission is today's pre-drop, and §4 keeps its
+    // `Removed` stripped, so this is neither a stale-ing nor a re-add.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "the hidden row is still live on its own key"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        hidden_note_id,
+        "and it is the same note, not a fresh id behind a re-added path"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOOKALIKE_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "two physical files, two rows: the outcome §2 must not trade away while it heals N′"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        3,
+        "and no third row appeared for the path behind the obstruction"
+    );
+    // No catalog entry lost: the hidden note, the look-alike and `top.md` are all still rendered.
+    assert_eq!(report.notes, 3, "{report:?}");
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes"),
+        3,
+        "no catalog entry lost: the hidden note is charged, not dropped"
+    );
+    assert!(
+        entry_line(&ws.root, "notes/lookalike.md").is_some(),
+        "the new path is in the catalog on its own title"
+    );
+}
+
+/// **§4's post-strip, which nothing else reached until mutation (1) proved it.** An ambiguous row can be admitted and
+/// still go unclaimed: `classify` refuses a move when the content is shared by more than one new path
+/// (`added_count != 1`) or already exists somewhere that did not go away. That is this fixture — the hidden note's
+/// bytes appear at **two** readable paths, so neither can claim the row, and the row would otherwise be reported
+/// `Removed` while its file sits unreadable behind an obstruction: a live note staled by a scan that could not see it.
+///
+/// Before this test existed, deleting `strip_marked_removals` entirely left all 290 tests green — the safety property
+/// F23 is built around was pinned by nothing. Mutation (1) is now aimed at this fixture.
+#[cfg(unix)]
+#[test]
+fn two_readable_paths_sharing_the_hidden_bytes_claim_neither_and_the_row_survives_their_removal() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    let body = "# Twin Heading\n";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!("NOT COVERAGE: this filesystem refused to create {TWIN_DIR_NINE:?}, so nothing is hidden here");
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    record_parse_version(&db, outdated_parse_version());
+    let hidden_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(hidden_note_id > 0, "test setup: the note exists to keep");
+    drop(db);
+
+    // Two readable paths, one body. The display twin admits the row to classification (§2's scoping is satisfied by
+    // `caf\xe8/note.md`, which spells itself exactly as the row does); the second path makes the claim impossible.
+    assert!(
+        plant_twin_dir(&ws.root, TWIN_DIR_EIGHT),
+        "test setup: plant the display twin"
+    );
+    fs::write(byte_name(&ws.root, TWIN_DIR_EIGHT).join("note.md"), body)
+        .expect("test setup: give the display twin the hidden bytes");
+    fs::create_dir_all(ws.root.join("notes")).expect("test setup: notes/");
+    fs::write(ws.root.join("notes/copy.md"), body)
+        .expect("test setup: a second path with the same bytes");
+
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the row's own directory on this runner"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("two look-alikes must not fail the scan");
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (2, 0, 0, 0),
+        "content shared by two new paths is two new files, not one note travelling — and above all it is not a \
+         removal of the row neither of them claimed: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "the ambiguous row is still live: its file is unreadable, not gone"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        hidden_note_id,
+        "and it is the same note — `removed: 1` here would have staled it and dropped it from the catalog"
     );
     assert_eq!(
         recorded_parse_version(&db),
         Some(outdated_parse_version()),
-        "the hidden row also holds the parse version back, every scan, until the twin is renamed"
+        "the ambiguity is unresolved, so the charge stays: surviving is not the same as being settled"
+    );
+
+    // …and the durable record says so (§6): `ambiguous` is rendered from exactly the population that withheld the
+    // version above, so a person who reads the record tomorrow learns what the missing version meant. Asserted here
+    // rather than in the M fence, which design §5.3 keeps free of edits.
+    let losses = recorded_losses(&db);
+    assert!(
+        losses.contains("ambiguous=1"),
+        "one unsettled row, recorded: {losses}"
+    );
+    assert!(
+        losses.contains("caf\u{fffd}/note.md"),
+        "and it names the note by display text, which is all a lossy key can offer: {losses}"
+    );
+}
+
+/// **§4's stale-row rule, which mutation (6) showed was unpinned.** `known_rows` reads live rows only, but
+/// `upsert_file` resolves a path by `rel_bytes` with no state filter and reactivates a stale row keeping its id — that
+/// is how a returning file rejoins its note. So a claim onto a key a **stale** row holds hits `apply_move`'s UNIQUE,
+/// comes back `Indexed::Taken`, returns early, and leaves the path in `skipped` with `owes_a_reparse` charging every
+/// refresh: a stuck state nothing clears, caused by a rule that was checking the wrong population.
+#[cfg(unix)]
+#[test]
+fn a_claim_onto_a_key_a_stale_row_holds_is_refused_rather_than_sticking_the_path_in_skipped() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    let body = "# Twin Heading\n";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!("NOT COVERAGE: this filesystem refused to create {TWIN_DIR_NINE:?}, so nothing is hidden here");
+        return;
+    }
+    assert!(
+        plant_twin_dir(&ws.root, TWIN_DIR_EIGHT),
+        "test setup: the twin path that will hold a stale row"
+    );
+    fs::write(byte_name(&ws.root, TWIN_DIR_EIGHT).join("note.md"), body)
+        .expect("test setup: write the twin's note");
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan indexes both paths");
+
+    let db = ws.db();
+    let twin_note_id = scalar(
+        &db,
+        "SELECT id FROM notes WHERE rel_bytes = X'636166E82F6E6F74652E6D64'",
+    );
+    assert!(twin_note_id > 0, "test setup: the twin has a note row");
+    // What a blocked-directory scan leaves behind: the row survives with `state = 'stale'`, its file absent from the
+    // listing. Written directly because the obstruction here is about to move to the *other* twin, and the stale row
+    // has to be in place before that scan runs.
+    db::mark_stale(&db, b"caf\xe8/note.md").expect("test setup: stale the twin's row");
+
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    record_parse_version(&db, outdated_parse_version());
+    let hidden_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    drop(db);
+
+    // The twin's path is readable again and carries the hidden note's bytes, so it spells the ambiguous row exactly —
+    // except that its own key is already held, stale, by the row above.
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the row's own directory on this runner"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("a stale twin must not fail the scan");
+    assert_eq!(
+        report.moved, 0,
+        "nothing moved: the claim was refused: {report:?}"
+    );
+    assert!(
+        !report.skipped.iter().any(|name| name.ends_with("note.md")),
+        "the readable path is not parked in `skipped` — that is where an identity conflict strands it, charging every \
+         refresh with nothing to clear it: {report:?}"
+    );
+
+    let db = ws.db();
+    let twin_state: String =
+        db.0.query_row(
+            "SELECT state FROM files WHERE rel_bytes = X'636166E82F6E6F74652E6D64'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("test: the twin's row is still there");
+    assert_eq!(
+        twin_state, "ok",
+        "the stale row came back to life on its own key, keeping its id — the ordinary returning-file route"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT id FROM notes WHERE rel_bytes = X'636166E82F6E6F74652E6D64'"
+        ),
+        twin_note_id,
+        "the same note, not a fresh id behind a re-add"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        hidden_note_id,
+        "and the ambiguous row is untouched on its own key: refusing a claim changes nothing about it"
     );
 }
 
@@ -3549,7 +4322,7 @@ fn an_unreadable_directory_is_recorded_as_a_loss_of_that_exact_kind() {
     let db = ws.db();
     assert_eq!(
         recorded_losses(&db),
-        "unreadable=1;unkeyable=0;duplicates=0;names=blocked",
+        "unreadable=1;unkeyable=0;duplicates=0;ambiguous=0;names=blocked",
         "the record has to say which kind of loss this was: {:?}",
         report.skipped
     );
@@ -3586,7 +4359,7 @@ fn a_scan_that_loses_nothing_overwrites_the_record_an_earlier_scan_left() {
     let first = scan(&ws.root, &ws.cfg).expect("test setup: first scan");
     assert_eq!(
         recorded_losses(&ws.db()),
-        "unreadable=0;unkeyable=0;duplicates=0;names=",
+        "unreadable=0;unkeyable=0;duplicates=0;ambiguous=0;names=",
         "an empty record is written, not skipped"
     );
     assert_eq!(losses(&first.unindexable), None, "{first:?}");
@@ -3605,7 +4378,7 @@ fn a_scan_that_loses_nothing_overwrites_the_record_an_earlier_scan_left() {
         let lost = scan(&ws.root, &ws.cfg).expect("test setup: a losing scan");
         assert_eq!(
             recorded_losses(&ws.db()),
-            "unreadable=1;unkeyable=0;duplicates=0;names=blocked",
+            "unreadable=1;unkeyable=0;duplicates=0;ambiguous=0;names=blocked",
             "test setup: the record has to be worth overwriting: {lost:?}"
         );
     }
@@ -3621,7 +4394,7 @@ fn a_scan_that_loses_nothing_overwrites_the_record_an_earlier_scan_left() {
     let db = ws.db();
     assert_eq!(
         recorded_losses(&db),
-        "unreadable=0;unkeyable=0;duplicates=0;names=",
+        "unreadable=0;unkeyable=0;duplicates=0;ambiguous=0;names=",
         "the fixed workspace stops reporting a loss it no longer has"
     );
     assert_eq!(
@@ -3663,9 +4436,12 @@ fn plant_note_dir(root: &Path, dir: &[u8], body: &str) -> bool {
 ///
 /// Two twins of `caf\xE9` / `caf\xE8` give one display path with two live rows — and note what that is **not**:
 /// these are two different files with two different bodies, correctly indexed, which is the innocent shape a
-/// duplicate count cannot distinguish from F23's harm. [`known_defect_a_readable_display_keyed_path_duplicates_its_own_row`]
-/// ends in one physical file holding two rows; [`a_duplicated_note_from_f23_reaches_the_record`] builds that shape
-/// instead, through `rekey_row_like_migration_four`, so both the innocent and the harmful case are pinned. Beside
+/// duplicate count cannot distinguish from F23's harm. **What is no longer pinned, said plainly:** since F23 healed the
+/// pairable case, no fixture drives an F23-shaped row into `duplicates=1` — the shape that used to do it
+/// (`a_healed_pair_leaves_no_duplicate_in_the_record_but_still_names_the_loss`, formerly the harm fixture) now converges
+/// to one live row and `duplicates=0`. The residue — content changed while unindexable — is the configuration that would,
+/// and design §6 defers it. So this test pins the innocent shape and the stale-row filter only; do not read it as coverage
+/// of the harmful one. Beside
 /// them sits a second pair whose rows are one live and **one stale**: that path appears once in
 /// the catalog, so it is not a duplicate, and it is the assertion that pins `state = 'ok'`. Drop the filter
 /// and this case reports two duplicates and names `old\u{FFFD}/note.md`, which is a note nobody has twice.
@@ -3728,7 +4504,7 @@ fn the_duplicate_count_names_a_display_path_with_two_live_rows_and_not_one_with_
     let duplicate = format!("{TWIN_DIR_DISPLAY}/note.md");
     assert_eq!(
         recorded_losses(&db),
-        format!("unreadable=0;unkeyable=0;duplicates=1;names={duplicate}"),
+        format!("unreadable=0;unkeyable=0;duplicates=1;ambiguous=0;names={duplicate}"),
         "the duplicated path is named and the stale one is not"
     );
     assert_eq!(
@@ -3866,7 +4642,7 @@ fn names_order_a_duplicated_path_before_an_unreadable_directory() {
     let db = ws.db();
     assert_eq!(
         recorded_losses(&db),
-        format!("unreadable=1;unkeyable=0;duplicates=1;names={duplicate},blocked"),
+        format!("unreadable=1;unkeyable=0;duplicates=1;ambiguous=0;names={duplicate},blocked"),
         "the duplicated path is named first: it has no other channel, `blocked` is in `skipped` too"
     );
     assert_eq!(
@@ -3876,13 +4652,19 @@ fn names_order_a_duplicated_path_before_an_unreadable_directory() {
     );
 }
 
-/// The **harmful** duplicate, not the innocent one: F23's one physical file holding two live rows, built the way
-/// F23 builds it — a row re-keyed to its own lossy display text, then re-indexed from real bytes while a twin
-/// directory is blocked. The record has to see this shape too, or `duplicates` would count only the innocent case
-/// and the defect would stay invisible behind a look-alike count.
+/// F23's shape, as the record sees it **after** the heal: a row re-keyed to its own lossy display text, then paired
+/// with its real bytes while a twin directory is blocked. It used to assert `duplicates=1` here, which was the defect
+/// reaching the record; now the pair folds on the way through, so the honest assertion is that the duplicate count
+/// falls to zero **and** the blocked directory keeps its name — quieter by exactly what was fixed, not quiet.
+///
+/// **Coverage this leaves open, stated rather than hidden:** no fixture now shows an F23-shaped row *arriving* at
+/// `duplicates=1`, because the shape that used to produce it heals. The residue — content changed while unindexable,
+/// so nothing claims the row and the pair survives — is the configuration that would, and it is owed by
+/// `docs/design-f23-ambiguous-rows.md` §5.4/§5.6. Until one of those lands, the duplicate counter's F23 population is
+/// pinned only by the innocent-twin fixtures above.
 #[cfg(unix)]
 #[test]
-fn a_duplicated_note_from_f23_reaches_the_record() {
+fn a_healed_pair_leaves_no_duplicate_in_the_record_but_still_names_the_loss() {
     let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
     if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
         eprintln!("NOT COVERAGE: this filesystem refused to create {TWIN_DIR_NINE:?}, so F23 cannot be built");
@@ -3906,26 +4688,31 @@ fn a_duplicated_note_from_f23_reaches_the_record() {
 
     let report = scan(&ws.root, &ws.cfg).expect("F23's shape must not fail the scan");
     let db = ws.db();
+    // F19's branch changed this fixture's expectation from two live rows to one, and the reason is the whole point of
+    // the record: it answers what **this scan leaves behind**, because `duplicated_rels` runs inside the write
+    // transaction after the changes land. A pair that healed on the way through is not a loss this scan made, so the
+    // duplicate count goes to zero and the unreadable directory keeps its name in the record either way — the
+    // workspace does not go quiet, it gets quieter by exactly what was fixed.
     assert_eq!(
         scalar(
             &db,
             "SELECT COUNT(*) FROM files WHERE rel = 'caf\u{fffd}/note.md' AND state = 'ok'"
         ),
-        2,
-        "one physical file, two live rows — the state F23 leaves behind"
+        1,
+        "the pair folded onto one row this scan, so the record has no duplicate to report"
     );
     let losses = recorded_losses(&db);
     assert!(
-        losses.starts_with("unreadable=1;unkeyable=0;duplicates=1;"),
-        "the duplicate reaches the record: {losses}"
+        losses.starts_with("unreadable=1;unkeyable=0;duplicates=0;"),
+        "the loss that remains is the blocked directory, not a pair that no longer exists: {losses}"
     );
     assert!(
-        losses.contains("caf\u{fffd}/note.md"),
-        "and names the path it happened to: {losses}"
+        losses.contains("caf\u{fffd}"),
+        "and it is still named, so the record does not go quiet just because one count fell to zero: {losses}"
     );
     assert_eq!(
         report.unindexable.as_ref().expect("some").duplicates,
-        1,
+        0,
         "the same count on both channels: {report:?}"
     );
 }

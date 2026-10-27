@@ -1212,7 +1212,7 @@ fn an_unreadable_directory_prints_one_record_line() {
 
     let losing = run(&mut ws.command(&["scan"]));
     losing.assert_success();
-    let expected = "unreadable=1;unkeyable=0;duplicates=0;names=lost";
+    let expected = "unreadable=1;unkeyable=0;duplicates=0;ambiguous=0;names=lost";
     assert!(
         losing.stdout().contains(&record_line(expected)),
         "`{}` missing from:\n{}",
@@ -1228,8 +1228,9 @@ fn an_unreadable_directory_prints_one_record_line() {
         .count();
     assert_eq!(lines, 1, "one record line per run:\n{}", losing.stdout());
 
-    // The same counts on the machine-readable channel, as an object of four fields — including `names`, so a
-    // reader gets the path and not only the number.
+    // The same counts on the machine-readable channel, as an object of five fields — including `names`, so a
+    // reader gets the path and not only the number. `ambiguous` is F23's: notes whose registry row could not be
+    // matched to a byte spelling this scan, the same population that holds the parse version back.
     let json = run(&mut ws.command(&["scan", "--json"]));
     json.assert_success();
     let report: serde_json::Value =
@@ -1237,6 +1238,7 @@ fn an_unreadable_directory_prints_one_record_line() {
     assert_eq!(report["unindexable"]["unreadable"], 1, "{report}");
     assert_eq!(report["unindexable"]["unkeyable"], 0, "{report}");
     assert_eq!(report["unindexable"]["duplicates"], 0, "{report}");
+    assert_eq!(report["unindexable"]["ambiguous"], 0, "{report}");
     assert_eq!(
         report["unindexable"]["names"].as_array().map(Vec::len),
         Some(1),
