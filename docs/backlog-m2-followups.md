@@ -457,6 +457,23 @@ What these numbers can and cannot carry:
   the bug. Until then, do not describe the fallback's over-hiding as churn that heals: it does not.
 ---
 
+## F24 — the two merge tests carry the same assertions twice
+
+- **Where:** `crates/np-core/tests/db.rs` —
+  `merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge` and
+  `a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges` repeat five blocks verbatim: the
+  survivor is `MIN(id)`, the winner's heading/tag/item survived, the four-shape loop over what the loser left,
+  the re-pointed incoming edge, and the receipt string.
+- **Risk:** drift, in the direction that hides a hole rather than showing one. This round closed exactly that: the
+  version-three copy of `SELECT COUNT(*) FROM links WHERE src_note_id = 9` could never fail because only the
+  version-four fixture planted the loser's outgoing edge — one fixture gained a row, the other's assertion went on
+  reading as coverage.
+- **Fix:** extract an `assert_merged_pair_folded(&db)` helper, the way `crates/np-cli/tests/cli.rs` already has
+  `assert_only_the_orphans_went`. Deliberately **not** done in this round: keeping each test's own failure messages
+  ("the edge crossed the rebuild and the merge together" is not the claim the version-four case makes) costs most
+  of the saving, so the honest extraction is under twenty lines and would flatten those messages to buy it.
+  **Do when:** the next change to migration 5's delete list — take it then, with both fixtures in front of you.
+
 ## Explicitly not in this backlog
 
 Embeddings and clustering, compression into `processed/`, item timelines and tick extraction, the daemon, API,
