@@ -2179,6 +2179,8 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
         4,
         "test setup: migration 5 has not run here"
     );
+    // The population itself, asserted rather than remembered (F24 §3).
+    assert_planted_pair(&db.0);
 }
 
 /// Plant the population real legacy workspaces actually arrive with — **version three**, holding two `notes`
@@ -2227,6 +2229,7 @@ fn seed_duplicate_notes_at_version_three(path: &Path) {
         3,
         "test setup: migrations 4 and 5 both have to run on the open below"
     );
+    assert_planted_pair(&conn);
 }
 
 /// Plant a database holding **more than one** duplicate group and leave it claiming version four: `b.md` with
@@ -2363,6 +2366,108 @@ fn merged_pair_workspace(tmp: &TempDir) -> (PathBuf, Config) {
     (root, cfg)
 }
 
+/// The four shapes the loser of a merge owned, named so a failure says **which** shape still has rows rather than
+/// reporting one bare zero. `merged_pair_facts` measures them in this order.
+const LOSER_HEADINGS: &str = "SELECT COUNT(*) FROM headings WHERE note_id = 9";
+const LOSER_TAGS: &str = "SELECT COUNT(*) FROM tags WHERE note_id = 9";
+const LOSER_ITEMS: &str = "SELECT COUNT(*) FROM items WHERE note_id = 9";
+const LOSER_OUTGOING_LINKS: &str = "SELECT COUNT(*) FROM links WHERE src_note_id = 9";
+const LOSER_SHAPES: [&str; 4] = [
+    LOSER_HEADINGS,
+    LOSER_TAGS,
+    LOSER_ITEMS,
+    LOSER_OUTGOING_LINKS,
+];
+
+/// What a merged pair leaves on disk, **measured once** so the two fixtures that plant this shape ask the same
+/// questions the same way (F24 §3). The struct holds no verdicts: every field is a reading, and each fixture compares it
+/// with its own message, because "the survivor is `MIN(id)`, not a silent pick" and "the merge ran on the pair migration 4
+/// had just copied" are different claims about the same number. Folding them into one shared assertion — or into a
+/// `check_merged_pair(db, is_v3: bool)` — is what this design note rejects, and why the fixtures stay separate functions.
+struct MergedPairFacts {
+    survivor_ids: Vec<String>,
+    winner_headings: Vec<String>,
+    winner_tags: Vec<String>,
+    winner_items: i64,
+    /// One entry per shape in [`LOSER_SHAPES`], as (the query that measured it, rows left).
+    loser_residue: Vec<(&'static str, i64)>,
+    /// `COALESCE`d so a nulled edge reads `"NULL"` here instead of vanishing from the comparison.
+    incoming_edge_target: String,
+    receipt: String,
+}
+
+fn merged_pair_facts(db: &Db) -> MergedPairFacts {
+    MergedPairFacts {
+        survivor_ids: names(
+            db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {DUP_BYTES} ORDER BY id"
+            ),
+        ),
+        winner_headings: names(db, "SELECT text FROM headings WHERE note_id = 4"),
+        winner_tags: names(db, "SELECT tag FROM tags WHERE note_id = 4"),
+        winner_items: scalar(db, "SELECT COUNT(*) FROM items WHERE note_id = 4"),
+        loser_residue: LOSER_SHAPES
+            .iter()
+            .map(|sql| (*sql, scalar::<i64>(db, sql)))
+            .collect(),
+        incoming_edge_target: scalar::<String>(
+            db,
+            "SELECT COALESCE(CAST(dst_note_id AS TEXT), 'NULL') FROM links
+              WHERE src_note_id = 12 AND target = 'Dup second'",
+        ),
+        receipt: merge_receipt_of(db),
+    }
+}
+
+/// Prove the pair is really planted before anything merges it. Version three and version four seeders both end here,
+/// and the queries stay inside what **both** schemas have — `notes.rel`, never `rel_bytes`, which version three does not
+/// own (`db.rs`'s `VERSION_THREE`). This is the half of F24 the backlog's incident was about: the recorded hole was an
+/// unasserted precondition, and both seeders plant the loser's outgoing edge today only because someone remembered to.
+/// Delete that one `INSERT` from either fixture and this fails at the edit; before it, the merge assertions went on
+/// reading as coverage while asking a question the data could not answer.
+fn assert_planted_pair(conn: &rusqlite::Connection) {
+    let count = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .unwrap_or_else(|e| panic!("test setup: {sql} — {e}"))
+    };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM notes WHERE rel = 'dup.md'"),
+        2,
+        "test setup: two note rows on one path is the population migration 5 exists to fold"
+    );
+    let ids: Vec<String> = conn
+        .prepare("SELECT CAST(id AS TEXT) FROM notes WHERE rel = 'dup.md' ORDER BY id")
+        .expect("test setup: read the planted ids")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("test setup: iterate the planted ids")
+        .map(|row| row.expect("test setup: one planted id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["4".to_string(), "9".to_string()],
+        "test setup: winner 4 and loser 9, so `MIN(id)` has a rule to follow rather than a coincidence to match"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM links WHERE src_note_id = 9"),
+        1,
+        "test setup: the loser owns an outgoing edge — without this row the merge's outgoing-edge delete is \
+         unobservable and every assertion about it is a tautology"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM links WHERE src_note_id = 12 AND dst_note_id = 9"),
+        1,
+        "test setup: another note points **at** the loser, which is what makes re-pointing rather than nulling a claim"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM headings WHERE note_id = 4")
+            + count("SELECT COUNT(*) FROM tags WHERE note_id = 4")
+            + count("SELECT COUNT(*) FROM items WHERE note_id = 4"),
+        3,
+        "test setup: the winner owns a heading, a tag and an item, so 'the survivor kept its corpus' is a comparison"
+    );
+}
+
 #[test]
 fn merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge() {
     // F19 §4.2: row identity survives and link resolution survives, both asserted against the rows rather
@@ -2373,58 +2478,48 @@ fn merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge() 
 
     let db = Db::open(&path).expect("the open runs migration 5");
 
+    let facts = merged_pair_facts(&db);
+
     // One row remains, and it is the oldest: `MIN(id)`, the one derived rows already hang off.
     assert_eq!(
-        names(
-            &db,
-            &format!(
-                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {DUP_BYTES} ORDER BY id"
-            )
-        ),
+        facts.survivor_ids,
         ["4".to_string()],
         "the survivor is MIN(id), not a silent pick or the newest row"
     );
 
-    // The loser's derived rows are gone, and only the loser's. Asserted per shape because a merge that
-    // deleted the *winner*'s children would otherwise be invisible here.
-    for sql in [
-        "SELECT COUNT(*) FROM headings WHERE note_id = 9",
-        "SELECT COUNT(*) FROM tags WHERE note_id = 9",
-        "SELECT COUNT(*) FROM items WHERE note_id = 9",
-        "SELECT COUNT(*) FROM links WHERE src_note_id = 9",
-    ] {
-        assert_eq!(
-            scalar::<i64>(&db, sql),
-            0,
-            "{sql}: the loser's own rows went with it"
-        );
-    }
+    // The loser's derived rows are gone, and only the loser's — one entry per shape rather than one summed zero, so a
+    // merge that deleted the *winner*'s children cannot hide behind arithmetic.
     assert_eq!(
-        names(&db, "SELECT text FROM headings WHERE note_id = 4"),
+        facts.loser_residue,
+        [
+            (LOSER_HEADINGS, 0),
+            (LOSER_TAGS, 0),
+            (LOSER_ITEMS, 0),
+            (LOSER_OUTGOING_LINKS, 0),
+        ],
+        "every shape the loser owned, each named by the query that measured it"
+    );
+    assert_eq!(
+        facts.winner_headings,
         ["First heading".to_string()],
         "the winner keeps the rows that were already hanging off it"
     );
     assert_eq!(
-        names(&db, "SELECT tag FROM tags WHERE note_id = 4"),
+        facts.winner_tags,
         ["first-tag".to_string()],
         "and its tags, which is what a `MAX(id)` survivor would lose"
     );
-    assert_eq!(
-        scalar::<i64>(&db, "SELECT COUNT(*) FROM items WHERE note_id = 4"),
-        1
-    );
+    assert_eq!(facts.winner_items, 1);
 
     // The edge that mattered: another note's prose pointed at the loser. Its target still exists, under
     // the winner's id, so it is re-pointed — never nulled (F19 §2).
     assert_eq!(
-        names(
-            &db,
-            "SELECT COALESCE(CAST(dst_note_id AS TEXT), 'NULL') FROM links
-              WHERE src_note_id = 12 AND target = 'Dup second'"
-        ),
-        ["4".to_string()],
+        facts.incoming_edge_target, "4",
         "the incoming edge names the winner; a NULL here is a resolved link lost permanently"
     );
+
+    // Two claims this fixture alone makes: nothing still points at the id that is gone, and the edge count says the
+    // loser's *outgoing* edge is the only one that disappeared (four went in).
     assert_eq!(
         scalar::<i64>(
             &db,
@@ -2433,8 +2528,6 @@ fn merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge() 
         0,
         "no edge still claims a row that is gone"
     );
-    // The third note's own prose is intact in both directions, and the winner's outgoing edge rode along
-    // untouched: four edges went in, one (the loser's outgoing) came out.
     assert_eq!(
         scalar::<i64>(&db, "SELECT COUNT(*) FROM links"),
         3,
@@ -2442,7 +2535,7 @@ fn merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge() 
     );
 
     // The receipt, read under the constant it is written under so a renamed key fails here.
-    assert_eq!(merge_receipt_of(&db), "merged=1;paths=dup.md");
+    assert_eq!(facts.receipt, "merged=1;paths=dup.md");
 }
 
 #[test]
@@ -2593,54 +2686,39 @@ fn a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges() {
         "migration 4 keyed the path, and both note rows copied onto that one key"
     );
 
+    let facts = merged_pair_facts(&db);
+
     // One row remains at the lower id: `MIN(id)`, the row migration 4 carried across untouched.
     assert_eq!(
-        names(
-            &db,
-            &format!(
-                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {DUP_BYTES} ORDER BY id"
-            )
-        ),
+        facts.survivor_ids,
         ["4".to_string()],
         "the merge ran on the pair migration 4 had just copied, keeping the oldest row"
     );
 
     // The winner's derived rows survived both steps — its heading, tag and item are the ones the fixture wrote
     // — and the loser's are gone rather than orphaned into the rebuilt tables.
+    assert_eq!(facts.winner_headings, ["First heading".to_string()]);
+    assert_eq!(facts.winner_tags, ["first-tag".to_string()]);
+    assert_eq!(facts.winner_items, 1);
     assert_eq!(
-        names(&db, "SELECT text FROM headings WHERE note_id = 4"),
-        ["First heading".to_string()]
+        facts.loser_residue,
+        [
+            (LOSER_HEADINGS, 0),
+            (LOSER_TAGS, 0),
+            (LOSER_ITEMS, 0),
+            (LOSER_OUTGOING_LINKS, 0),
+        ],
+        "the loser left nothing behind across a schema rebuild **and** a merge"
     );
-    assert_eq!(
-        names(&db, "SELECT tag FROM tags WHERE note_id = 4"),
-        ["first-tag".to_string()]
-    );
-    assert_eq!(
-        scalar::<i64>(&db, "SELECT COUNT(*) FROM items WHERE note_id = 4"),
-        1
-    );
-    for sql in [
-        "SELECT COUNT(*) FROM headings WHERE note_id = 9",
-        "SELECT COUNT(*) FROM tags WHERE note_id = 9",
-        "SELECT COUNT(*) FROM items WHERE note_id = 9",
-        "SELECT COUNT(*) FROM links WHERE src_note_id = 9",
-    ] {
-        assert_eq!(scalar::<i64>(&db, sql), 0, "{sql}: the loser left nothing");
-    }
 
     // And the third note's edge into the loser came through both steps and names the winner — a NULL here is a
     // resolved link lost permanently (F19 §2), and one naming 9 is an id that no longer exists.
     assert_eq!(
-        names(
-            &db,
-            "SELECT COALESCE(CAST(dst_note_id AS TEXT), 'NULL') FROM links
-              WHERE src_note_id = 12 AND target = 'Dup second'"
-        ),
-        ["4".to_string()],
+        facts.incoming_edge_target, "4",
         "the edge crossed the rebuild and the merge together"
     );
 
-    assert_eq!(merge_receipt_of(&db), "merged=1;paths=dup.md");
+    assert_eq!(facts.receipt, "merged=1;paths=dup.md");
 }
 
 #[test]
