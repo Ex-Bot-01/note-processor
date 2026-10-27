@@ -119,6 +119,12 @@ Then:
 - Announcement once per process, like F21: a second open reports `None`, while the receipt stays in `meta`.
 - Receipt-write failure: both note rows survive and the failure surfaces as an error, not a panic.
 - Zero merges still writes `merged=0` (the check ran) and leaves the report field `None`.
+- The receipt's name cap. `MERGE_NAME_CAP = 8` is inherited from F22's loss record, and every fixture above holds
+  one or two paths — so the cap was prose-only until this round: nine groups folding nine rows have to print
+  `merged=9` beside a name list that stops at eight
+  (`the_receipt_names_eight_paths_and_counts_every_fold_beyond_them`). It is exercised rather than asserted, on the
+  reasoning that the count and the names are two different promises and only one of them is truncated: moving the
+  constant by one fails exactly that test and nothing else.
 - F13 §7's existing duplicate-reader tests must keep passing **unchanged** — they pin the reader that names a pair this
   migration no longer allows in our own databases, and if one of them has to change, that is a signal the design is wrong:
   stop and report.
@@ -156,6 +162,23 @@ The standing list, no subsetting: `cargo fmt --check`; `cargo clippy --all-targe
 → `GOLDEN CHECK: pass`. CI green on Linux **and** Windows is part of "green"; nothing under `tests/golden/` is ever
 regenerated. Because this round touches a hot path only at open time, re-run the ignored release benchmark in A/B/A form
 against the merge base and report raw numbers — no percentage from a single sample.
+
+**Recorded here rather than left in a transcript.** `cargo test --release -p np-core --test perf -- --ignored
+--nocapture`, three runs per position, cold = first run after a fresh build of that revision, warm = the runs after
+it; milliseconds, whole numbers as reported.
+
+| position | cold | warm |
+| --- | --- | --- |
+| base `cfdf6a2` (M4 merge base) | 377 / 379 / 377 | 63 / 64 / 63 |
+| head `7212e56`, first pass | 380 / 380 / 388 | 63 / 63 / 63 |
+| head `7212e56`, return leg (A/B/A back on head) | 379 / 380 / 381 | 63 / 63 / 63 |
+
+**The limit, stated in the same breath as the numbers:** `two_pass_scan_over_two_thousand_notes` opens a database
+that is already migrated, so **migration 5 never runs inside the measured window** — these are steady-state figures
+for an ordinary scan after the merge, and they say nothing about the one-time cost at open, which is the only thing
+this round added to the hot path. Read that way they are what was expected: every head run lands within 11 ms of
+the base cold figures (most within 3) and warm is identical at 63 ms. No percentage is claimed from samples this
+size, and no claim here rests on them.
 
 ## 7. Deliberately not in this round
 

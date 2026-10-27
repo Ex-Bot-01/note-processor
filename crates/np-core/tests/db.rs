@@ -2268,6 +2268,48 @@ fn seed_two_duplicate_groups_at_version_four(path: &Path) {
     .expect("test setup: rewind the file to version four");
 }
 
+/// Plant **nine** duplicate groups — nine paths, two note rows each — and leave the file claiming version four.
+///
+/// One degree of freedom more than [`seed_two_duplicate_groups_at_version_four`] exercises: the receipt names at
+/// most `MERGE_NAME_CAP` (eight) spellings, and no other fixture here holds enough groups for that list to be
+/// truncated — so the cap could be changed to any number today and nothing would notice. The keys are planted `g9.md` first and `g1.md` last, so a receipt assembled from arrival order would
+/// have to name `g9.md` — the one path this fixture expects truncated away.
+fn seed_nine_duplicate_groups_at_version_four(path: &Path) {
+    let db = Db::open(path).expect("test setup: create the current schema");
+    let mut file_rows = String::new();
+    let mut note_rows = String::new();
+    for index in (1..=9).rev() {
+        let rel = format!("g{index}.md");
+        let hex = rel
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        file_rows.push_str(&format!(
+            "(x'{hex}', x'{hex}', '{rel}', '{rel}', '/ws/{rel}', 'h{index}', 5, 1, 'ok', 9),"
+        ));
+        note_rows.push_str(&format!(
+            "({}, x'{hex}', '{rel}', 'first',  'filename', 'utf-8', 1, 'a'),\
+             ({}, x'{hex}', '{rel}', 'second', 'filename', 'utf-8', 1, 'b'),",
+            index * 10,
+            index * 10 + 1
+        ));
+    }
+    file_rows.pop(); // the trailing comma of the last VALUES row
+    note_rows.pop();
+    db.0.execute_batch(&format!(
+        "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES {file_rows};
+         INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body)
+         VALUES {note_rows};"
+    ))
+    .expect("test setup: plant nine duplicate groups");
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+}
+
 /// Plant a duplicate pair whose survivor carries **no display text at all** and leave the file claiming
 /// version four: two note rows on one byte key that is not valid UTF-8, both with `rel` NULL.
 ///
@@ -2446,6 +2488,42 @@ fn the_receipt_counts_folded_rows_across_groups_and_names_paths_in_key_order() {
         scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"),
         2,
         "five rows in, two out: `merged=3` is the difference, not a path count"
+    );
+}
+
+#[test]
+fn the_receipt_names_eight_paths_and_counts_every_fold_beyond_them() {
+    // The cap, which every other fixture leaves unexercised because none of them holds eight names: nine keys
+    // fold nine rows, and the receipt has to carry `merged=9` beside a name list that stops at eight. That split
+    // is the product (`merge_receipt`'s own rule, inherited from F22's loss record): the count is the fact and
+    // the names are only where to look, so truncation must never shave the number — and `merge_total`, which the
+    // report field and the stderr echo both parse out of this same string, would then be reading a lie.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_nine_duplicate_groups_at_version_four(&path);
+
+    let db = Db::open(&path).expect("the open runs migration 5 over nine groups");
+
+    assert_eq!(
+        merge_receipt_of(&db),
+        "merged=9;paths=g1.md,g2.md,g3.md,g4.md,g5.md,g6.md,g7.md,g8.md",
+        "nine rows folded, eight names in key order — `g9.md` is the path the cap drops"
+    );
+
+    // The unnamed ninth path was merged all the same: a name list that stops short must not be read as work that
+    // did not happen, and its survivor is still `MIN(id)` like every other group's.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT CAST(id AS TEXT) FROM notes WHERE rel = 'g9.md' ORDER BY id"
+        ),
+        ["90".to_string()],
+        "the path the receipt does not name still kept its oldest row"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"),
+        9,
+        "eighteen rows in, nine out: `merged=9` counts folds, not names"
     );
 }
 

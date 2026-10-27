@@ -1616,6 +1616,14 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// migrated file — is permanent again, because migration 5 does not take a second pass and this reader still
 /// refuses to pick a winner. That loop is worth paying for: those rows stay wrong until the obstruction clears,
 /// and the notice below names the count so this is never silent.
+///
+/// Read that healing narrowly, because it is the scope boundary of this paragraph: it covers
+/// [`Indexed::Duplicate`] — **two note rows on one byte key** — and no other duplicate. F23's duplicate is another
+/// shape and this branch does not reach it: two live `files` **and** `notes` rows for one file, which
+/// [`display_spelled`] *creates* when a readable path hides behind an unreadable twin sharing its lossy display
+/// spelling, and which that comment states flatly — **no scan clears that.** A workspace can therefore still hold
+/// the parse version back on a duplicate forever; "duplicates are healed at open" is not a sentence to carry past
+/// here.
 fn refresh_covered(written: &Written, hidden_by_unknown: usize) -> bool {
     written.uncovered == 0 && hidden_by_unknown == 0
 }
