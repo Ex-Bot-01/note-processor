@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::process::{Command, Output};
 
 use np_core::config::Config;
-use np_core::db::{Db, FK_ORPHANS_KEY};
+use np_core::db::{Db, FK_ORPHANS_KEY, NOTE_MERGE_KEY};
 use np_core::parse::PARSE_VERSION;
 use tempfile::TempDir;
 
@@ -944,6 +944,181 @@ fn only_the_scan_that_removed_the_orphans_announces_them() {
     let db = Db::open(&ws.db_path()).expect("test setup: open the upgraded database");
     assert_only_the_orphans_went(&db);
     assert_eq!(receipt(&db), ORPHAN_RECEIPT);
+}
+
+// ---------------------------------------------------------------------------
+// F19: the duplicate-note merge, on the channels only this binary has.
+//
+// `crates/np-core/tests/db.rs` pins the merge against the rows; nothing here pinned that a person running
+// `np scan` is *told* about it. That is exactly the hole F21's review found for the orphan line: its only
+// positive assertion about the summary sat behind `#[cfg(target_os = "linux")]`, so on Windows every case
+// went through `--json` and no test would have failed had the stdout line stopped being printed at all. The
+// case below is the same pin for `merge      merged=N;paths=…`, ungated, plus its `--json` half and the
+// once-per-database rule.
+// ---------------------------------------------------------------------------
+
+/// The byte keys of the two planted paths, as hex literals for the `BLOB` columns (F13 §4: a TEXT bind fails
+/// the `typeof(rel_bytes) = 'blob'` check rather than quietly matching).
+const DUP_BYTES: &str = "X'6475702E6D64'";
+/// The byte key of `third.md`, the note that links to both rows.
+const THIRD_BYTES: &str = "X'74686972642E6D64'";
+/// The receipt [`seed_duplicate_pair_at_version_four`] earns — and the exact string both channels must carry,
+/// because `meta`, stdout and `--json` render one value rather than three computations of it (F21 §3).
+const MERGE_RECEIPT: &str = "merged=1;paths=dup.md";
+
+/// Add `dup.md` and `third.md` to a workspace copy, then leave its database holding **two note rows on
+/// `dup.md`'s byte key** while claiming version four — the file migration 5 meets in the wild.
+///
+/// Derived rows hang off both rows and a third note links to each of them, so a merge that deleted the wrong
+/// row, or forgot a shape, changes what this workspace looks like afterwards rather than passing quietly.
+/// The seeding duplicates `crates/np-core/tests/db.rs`'s helper for the same reason [`VERSION_TWO`] and
+/// [`seed_version_two`] are duplicated: no production API makes a pair any more, and a shared helper that
+/// wrote old schemas would put a downgrade path in the library to serve a test.
+///
+/// Planted on the current schema rather than copied from a version-three script — migration 5 writes no DDL,
+/// only row moves — so deleting its recorded version row and the receipt its step wrote while the file was
+/// still empty reproduces a genuine version-four file without a third hand-copied schema to keep in step.
+fn seed_duplicate_pair_at_version_four(ws: &Workspace) {
+    fs::write(ws.root.join("dup.md"), "# Dup\n").expect("test setup: write dup.md");
+    fs::write(ws.root.join("third.md"), "# Third\n").expect("test setup: write third.md");
+    let db = Db::open(&ws.db_path()).expect("test setup: create the current schema");
+    // The real absolute paths of the two files just written, so nothing downstream reads a row pointing at a
+    // directory that does not exist. SQLite string literals do not treat `\` as an escape, so a Windows
+    // tempdir path embeds unchanged.
+    let abs = |name: &str| ws.root.join(name).to_string_lossy().into_owned();
+    db.0.execute_batch(&format!(
+        "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+         VALUES ({DUP_BYTES}, {DUP_BYTES}, 'dup.md', 'dup.md', '{}', 'h1', 5, 1, 'ok', 9),
+                ({THIRD_BYTES}, {THIRD_BYTES}, 'third.md', 'third.md', '{}', 'h2', 5, 1, 'ok', 9);
+         INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body) VALUES
+            (4,  {DUP_BYTES}, 'dup.md', 'Dup first',  'filename', 'utf-8', 1, 'first'),
+            (9,  {DUP_BYTES}, 'dup.md', 'Dup second', 'filename', 'utf-8', 1, 'second'),
+            (12, {THIRD_BYTES}, 'third.md', 'Third',  'filename', 'utf-8', 1, 'third');
+         INSERT INTO headings (note_id, level, text, line) VALUES
+            (4, 1, 'First heading', 1), (9, 2, 'Second heading', 3), (12, 1, 'Third heading', 1);
+         INSERT INTO tags (note_id, tag) VALUES (4, 'first-tag'), (9, 'second-tag');
+         INSERT INTO items (note_id, text, line, state, marker) VALUES
+            (4, 'first task', 2, 'open', '- [ ]'), (9, 'second task', 4, 'done', '- [x]');
+         INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+            (4, 12, 'wiki', 'Third', 3, 'prose'),
+            (9, 12, 'wiki', 'Third', 5, 'prose'),
+            (12, 4, 'wiki', 'Dup first', 2, 'prose'),
+            (12, 9, 'wiki', 'Dup second', 3, 'prose');",
+        abs("dup.md"),
+        abs("third.md")
+    ))
+    .expect("test setup: plant two note rows on one key, their derived rows and the edges around them");
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+        4,
+        "test setup: migration 5 has not run here"
+    );
+}
+
+/// The [`NOTE_MERGE_KEY`] receipt as the file holds it, read under the constant it is written under so a
+/// renamed key fails here rather than reading `NULL`.
+fn merge_receipt(db: &Db) -> String {
+    scalar(
+        db,
+        &format!("SELECT value FROM meta WHERE key = '{NOTE_MERGE_KEY}'"),
+    )
+}
+
+/// The stdout half of F19's announcement, asserted where every platform runs it — the pin F21's review asked
+/// for and this file never grew for the merge line.
+///
+/// Three things, in order: the upgrading run prints the line naming the merged path; `--json` carries the
+/// identical string under `merged_notes`; and no later scan of that workspace announces it on either channel
+/// while `meta` keeps the receipt forever.
+#[test]
+fn the_upgrading_scan_prints_the_merged_pair_on_stdout() {
+    // Two workspaces because the announcement belongs to the one run whose own `Db::open` did the merging: a
+    // database can only be upgraded once, so whichever channel is asked first has to be answered by a file
+    // that has not been asked yet.
+    let ws = workspace();
+    seed_duplicate_pair_at_version_four(&ws);
+
+    let first = run(&mut ws.command(&["scan"]));
+    first.assert_success();
+    assert!(
+        first.stdout().contains(MERGE_RECEIPT),
+        "the run whose open folded a pair onto its oldest row has to name the merged path:\n{}",
+        first.stdout()
+    );
+    // The whole line, once: label and stored value spelled as `print_summary` writes them. Asserting the
+    // vector rather than counting one substring means neither a missing line nor a second copy of it passes.
+    let summary = first.stdout();
+    let lines: Vec<&str> = summary
+        .lines()
+        .filter(|line| line.contains("merged="))
+        .collect();
+    assert_eq!(
+        lines,
+        ["merge      merged=1;paths=dup.md"],
+        "one announcement line per run, on the channel a person reads:\n{summary}"
+    );
+
+    // And the line describes what actually happened to this workspace: one row for the path, receipt kept.
+    let db = Db::open(&ws.db_path()).expect("test setup: open the merged database");
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM notes WHERE rel_bytes = {DUP_BYTES}")
+        ),
+        1,
+        "the pair is one row once the merge has run"
+    );
+    assert_eq!(merge_receipt(&db), MERGE_RECEIPT);
+
+    // The other channel, on a file that still needs merging: the same string `meta` holds, not a re-spelling.
+    let json_ws = workspace();
+    seed_duplicate_pair_at_version_four(&json_ws);
+    let upgrading = run(&mut json_ws.command(&["scan", "--json"]));
+    upgrading.assert_success();
+    let report: serde_json::Value =
+        serde_json::from_str(&upgrading.stdout()).expect("`--json` must print one JSON object");
+    assert_eq!(
+        report["merged_notes"].as_str(),
+        Some(MERGE_RECEIPT),
+        "the upgrading scan carries the receipt it wrote: {}",
+        upgrading.stdout()
+    );
+
+    // Once per database, not a fixture on every report (F21's rule, and the reason a permanent line here
+    // would be a warning nobody can act on). The key stays present and null: one JSON shape for every scan.
+    let later = run(&mut json_ws.command(&["scan", "--json"]));
+    later.assert_success();
+    let again: serde_json::Value =
+        serde_json::from_str(&later.stdout()).expect("`--json` must print one JSON object");
+    assert!(
+        again.get("merged_notes").is_some(),
+        "the key is always present, whatever the outcome: {again}"
+    );
+    assert!(
+        again["merged_notes"].is_null(),
+        "a scan that merged nothing has nothing to announce: {again}"
+    );
+
+    let printed = run(&mut json_ws.command(&["scan"]));
+    printed.assert_success();
+    assert!(
+        !printed.stdout().contains("merged="),
+        "the receipt is history, not a queue; a line on every scan trains the reader to ignore it:\n{}",
+        printed.stdout()
+    );
+
+    // Never cleared: the echo is a copy of a record that outlives it.
+    let db = Db::open(&json_ws.db_path()).expect("test setup: open the merged database");
+    assert_eq!(
+        merge_receipt(&db),
+        MERGE_RECEIPT,
+        "the durable receipt survives every later scan"
+    );
 }
 
 /// The record line as `np`'s summary writes it: the label, then the value `meta` holds verbatim — one string

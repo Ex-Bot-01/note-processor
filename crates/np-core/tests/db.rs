@@ -2414,6 +2414,76 @@ fn a_database_with_nothing_to_merge_records_that_the_check_ran() {
 }
 
 #[test]
+fn the_merge_gate_refuses_a_child_row_whose_note_is_gone() {
+    // Migration 5's `PRAGMA foreign_key_check`, seen from the only side that can reach it. Its deletes are
+    // explicit rather than cascading — enforcement is off inside a code step (see `merge_duplicate_notes`) —
+    // so this pragma is what turns "one of those deletes was softened" into a refused open instead of a
+    // committed orphan idling until the next `INSERT` re-adopts its id. No later scan re-checks those keys.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_pair_at_version_four(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("test setup: reopen the fixture");
+        // Enforcement off to plant this at all, exactly as in
+        // `the_byte_key_gate_refuses_a_note_whose_file_row_is_gone`: only a writer outside this program leaves
+        // a child row whose note is gone. The rowid is named so the error below can be pinned to *this* row.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("test setup: relax keys for the fixture");
+        conn.execute(
+            "INSERT INTO headings (rowid, note_id, level, text, line)
+             VALUES (777, 999, 1, 'Dangling', 2)",
+            [],
+        )
+        .expect("test setup: a heading row whose note never existed");
+        assert_eq!(
+            conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| row
+                .get::<_, i64>(0))
+                .expect("fixture query reads a number"),
+            4,
+            "test setup: only migration 5 can run on the open below, so the refusal cannot belong to an earlier step"
+        );
+    }
+
+    let err = Db::open(&path).expect_err("a child row outside its parent has to refuse the merge");
+    assert!(
+        matches!(
+            &err,
+            DbError::ForeignKeys { count, table, parent, rowid }
+                if *count == 1
+                    && table == "headings"
+                    && parent == "notes"
+                    && *rowid == 777
+        ),
+        "expected the check to name the dangling heading (rowid 777) and the parent it misses, got {err}"
+    );
+
+    // And refusing means refusing: the deletes roll back with the refusal, so the file keeps its pair and
+    // records nothing — §4.1's "nothing is merged unannounced" from this side of the transaction.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    assert_eq!(
+        one("SELECT COUNT(*) FROM notes WHERE hex(rel_bytes) = '6475702E6D64'"),
+        2,
+        "both note rows survived a step that refused its own work"
+    );
+    assert_eq!(
+        one(&format!(
+            "SELECT COUNT(*) FROM meta WHERE key = '{NOTE_MERGE_KEY}'"
+        )),
+        0,
+        "a refused step wrote no receipt"
+    );
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        4,
+        "the step recorded nothing, so a later run can retry the merge"
+    );
+}
+
+#[test]
 fn move_keeps_note_identity() {
     let db = Db::in_memory().expect("in-memory database");
     // An umlaut in the path is deliberate: `case_key` has to follow `walk`'s Rust
