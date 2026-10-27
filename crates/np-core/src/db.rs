@@ -1165,7 +1165,9 @@ fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
         // One consequence worth naming: the pragma answers about the **whole file** and this step runs it
         // unconditionally, so a workspace damaged by anything else — a child row whose note is simply gone —
         // now refuses to open at the four-to-five step where version four opened it, which is deliberate,
-        // pinned by `the_merge_gate_refuses_a_child_row_whose_note_is_gone`, and its only exit is the message
+        // pinned by `the_merge_gate_refuses_damage_that_no_merge_could_have_caused` (a file with **no pair**, so
+        // narrowing this check to `merged > 0` fails there) and by
+        // `the_merge_gate_refuses_a_child_row_whose_note_is_gone` (the same damage beside a pair), and its only exit is the message
         // itself (table, rowid, parent) because §7 of `docs/design-f19-note-merge.md` rules out a repair
         // command. The check is not scoped to rows this merge touched.
         let count: i64 = conn.query_row(

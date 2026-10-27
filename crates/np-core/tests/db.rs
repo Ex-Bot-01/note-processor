@@ -2122,6 +2122,8 @@ const THIRD_BYTES: &str = "X'74686972642E6D64'";
 const A_MD_BYTES: &str = "X'612E6D64'";
 /// The byte key of `b.md` — later as a key, earlier everywhere else.
 const B_MD_BYTES: &str = "X'622E6D64'";
+/// The byte key of `solo.md` — a path holding exactly one note row, used where a fixture must have **no pair**.
+const SOLO_BYTES: &str = "X'736F6C6F2E6D64'";
 /// A byte key with no exact display spelling: `a\xE4b.md`, where `\xE4` is not valid UTF-8 on its own. Its
 /// lossy spelling — the one this program stores in a display column for such a name — is `a\u{FFFD}b.md`, and
 /// that is the string [`seed_keyless_display_pair_at_version_four`]'s receipt has to produce.
@@ -2753,6 +2755,92 @@ fn the_merge_gate_refuses_a_child_row_whose_note_is_gone() {
         2,
         "both note rows survived a step that refused its own work"
     );
+    assert_eq!(
+        one(&format!(
+            "SELECT COUNT(*) FROM meta WHERE key = '{NOTE_MERGE_KEY}'"
+        )),
+        0,
+        "a refused step wrote no receipt"
+    );
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        4,
+        "the step recorded nothing, so a later run can retry the merge"
+    );
+}
+
+#[test]
+fn the_merge_gate_refuses_damage_that_no_merge_could_have_caused() {
+    // The word this step's comment and design §3 step 2 both commit to: the whole-file `PRAGMA foreign_key_check`
+    // runs **unconditionally**, "whether or not it merged anything". Every other gate case seeds a pair, so each
+    // of them stays green with the check wrapped in `if merged > 0`. This file holds one note row for one path —
+    // nothing to merge, no delete statement runs, and the dangling row below cannot be this step's doing.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    {
+        let db = Db::open(&path).expect("test setup: create the current schema");
+        db.0.execute_batch(
+            &format!(
+                "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+                 VALUES ({SOLO_BYTES}, {SOLO_BYTES}, 'solo.md', 'solo.md', '/ws/solo.md', 'h1', 5, 1, 'ok', 9);
+                 INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body)
+                    VALUES (4, {SOLO_BYTES}, 'solo.md', 'Solo', 'filename', 'utf-8', 1, 'one');"
+            ),
+        )
+        .expect("test setup: one path holding one note row");
+        // Enforcement off to plant the damage at all, exactly as in the case above: only a writer outside this
+        // program leaves a child row whose note is gone. The rowid is named so the error can be pinned to it.
+        db.0.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("test setup: relax keys for the fixture");
+        db.0.execute(
+            "INSERT INTO headings (rowid, note_id, level, text, line)
+             VALUES (888, 999, 1, 'Dangling', 2)",
+            [],
+        )
+        .expect("test setup: a heading row whose note never existed");
+        db.0.execute_batch(&format!(
+            "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+             DELETE FROM schema_version WHERE version = 5;"
+        ))
+        .expect("test setup: rewind the file to version four");
+
+        // The precondition that gives this test its teeth, in the shape `duplicate_groups` asks: no group at all,
+        // so `merged` is 0 and every delete in the step is skipped.
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                "SELECT COUNT(*) FROM (SELECT rel_bytes FROM notes
+                  WHERE rel_bytes IS NOT NULL GROUP BY rel_bytes HAVING COUNT(*) > 1)"
+            ),
+            0,
+            "test setup: nothing for migration 5 to merge, which is the whole point of this fixture"
+        );
+        assert_eq!(
+            scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+            4,
+            "test setup: only migration 5 can run on the open below"
+        );
+    }
+
+    let err = Db::open(&path).expect_err("damage survives no merge yet still refuses the open");
+    assert!(
+        matches!(
+            &err,
+            DbError::ForeignKeys { count, table, parent, rowid }
+                if *count == 1
+                    && table == "headings"
+                    && parent == "notes"
+                    && *rowid == 888
+        ),
+        "the check has to run and name the dangling heading (rowid 888) even though this step merged nothing, got {err}"
+    );
+
+    // And a refusal that did no work still records nothing: version four, no receipt, so a repaired file can retry.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
     assert_eq!(
         one(&format!(
             "SELECT COUNT(*) FROM meta WHERE key = '{NOTE_MERGE_KEY}'"

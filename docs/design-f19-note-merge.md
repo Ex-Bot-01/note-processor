@@ -71,8 +71,10 @@ Migration 5, `merge_duplicate_notes`, inside its own transaction like every othe
    answers about the **whole file** and the step runs it whether or not it merged anything, so a workspace damaged by
    something with no bearing on a duplicate pair — a `headings` row whose `note_id` names nothing — now refuses to open
    at the four-to-five step where version four opened it happily. That is intended (the damage is real, an orphan id is
-   re-adopted by the next `INSERT`, and no later scan re-checks those keys), and it is pinned by
-   `the_merge_gate_refuses_a_child_row_whose_note_is_gone`. It also has no in-program exit: §7 rules out the repair
+   re-adopted by the next `INSERT`, and no later scan re-checks those keys), and "unconditionally" is pinned twice:
+   `the_merge_gate_refuses_damage_that_no_merge_could_have_caused` plants the damage on a file holding **no pair at
+   all**, so wrapping the check in `if merged > 0` fails there, and `the_merge_gate_refuses_a_child_row_whose_note_is_gone`
+   pins the same refusal beside a pair. It also has no in-program exit: §7 rules out the repair
    command that would be one, so the refusal text — table, rowid, parent — is itself the diagnosis.
 3. Write a receipt into `meta` under `NOTE_MERGE_KEY = "note_merges"` **in the same transaction**, in the compact style
    of `FK_ORPHANS_KEY`: `merged=N;paths=a.md,b.md` with at most eight display spellings, ordered by path so one database
