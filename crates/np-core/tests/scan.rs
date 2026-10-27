@@ -3927,6 +3927,187 @@ fn an_unrelated_look_alike_carrying_the_hidden_bytes_is_added_and_never_claims_t
     );
 }
 
+/// **§4's post-strip, which nothing else reached until mutation (1) proved it.** An ambiguous row can be admitted and
+/// still go unclaimed: `classify` refuses a move when the content is shared by more than one new path
+/// (`added_count != 1`) or already exists somewhere that did not go away. That is this fixture — the hidden note's
+/// bytes appear at **two** readable paths, so neither can claim the row, and the row would otherwise be reported
+/// `Removed` while its file sits unreadable behind an obstruction: a live note staled by a scan that could not see it.
+///
+/// Before this test existed, deleting `strip_marked_removals` entirely left all 290 tests green — the safety property
+/// F23 is built around was pinned by nothing. Mutation (1) is now aimed at this fixture.
+#[cfg(unix)]
+#[test]
+fn two_readable_paths_sharing_the_hidden_bytes_claim_neither_and_the_row_survives_their_removal() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    let body = "# Twin Heading\n";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!("NOT COVERAGE: this filesystem refused to create {TWIN_DIR_NINE:?}, so nothing is hidden here");
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    record_parse_version(&db, outdated_parse_version());
+    let hidden_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(hidden_note_id > 0, "test setup: the note exists to keep");
+    drop(db);
+
+    // Two readable paths, one body. The display twin admits the row to classification (§2's scoping is satisfied by
+    // `caf\xe8/note.md`, which spells itself exactly as the row does); the second path makes the claim impossible.
+    assert!(
+        plant_twin_dir(&ws.root, TWIN_DIR_EIGHT),
+        "test setup: plant the display twin"
+    );
+    fs::write(byte_name(&ws.root, TWIN_DIR_EIGHT).join("note.md"), body)
+        .expect("test setup: give the display twin the hidden bytes");
+    fs::create_dir_all(ws.root.join("notes")).expect("test setup: notes/");
+    fs::write(ws.root.join("notes/copy.md"), body)
+        .expect("test setup: a second path with the same bytes");
+
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the row's own directory on this runner"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("two look-alikes must not fail the scan");
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (2, 0, 0, 0),
+        "content shared by two new paths is two new files, not one note travelling — and above all it is not a \
+         removal of the row neither of them claimed: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "the ambiguous row is still live: its file is unreadable, not gone"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        hidden_note_id,
+        "and it is the same note — `removed: 1` here would have staled it and dropped it from the catalog"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(outdated_parse_version()),
+        "the ambiguity is unresolved, so the charge stays: surviving is not the same as being settled"
+    );
+}
+
+/// **§4's stale-row rule, which mutation (6) showed was unpinned.** `known_rows` reads live rows only, but
+/// `upsert_file` resolves a path by `rel_bytes` with no state filter and reactivates a stale row keeping its id — that
+/// is how a returning file rejoins its note. So a claim onto a key a **stale** row holds hits `apply_move`'s UNIQUE,
+/// comes back `Indexed::Taken`, returns early, and leaves the path in `skipped` with `owes_a_reparse` charging every
+/// refresh: a stuck state nothing clears, caused by a rule that was checking the wrong population.
+#[cfg(unix)]
+#[test]
+fn a_claim_onto_a_key_a_stale_row_holds_is_refused_rather_than_sticking_the_path_in_skipped() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    let body = "# Twin Heading\n";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!("NOT COVERAGE: this filesystem refused to create {TWIN_DIR_NINE:?}, so nothing is hidden here");
+        return;
+    }
+    assert!(
+        plant_twin_dir(&ws.root, TWIN_DIR_EIGHT),
+        "test setup: the twin path that will hold a stale row"
+    );
+    fs::write(byte_name(&ws.root, TWIN_DIR_EIGHT).join("note.md"), body)
+        .expect("test setup: write the twin's note");
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan indexes both paths");
+
+    let db = ws.db();
+    let twin_note_id = scalar(
+        &db,
+        "SELECT id FROM notes WHERE rel_bytes = X'636166E82F6E6F74652E6D64'",
+    );
+    assert!(twin_note_id > 0, "test setup: the twin has a note row");
+    // What a blocked-directory scan leaves behind: the row survives with `state = 'stale'`, its file absent from the
+    // listing. Written directly because the obstruction here is about to move to the *other* twin, and the stale row
+    // has to be in place before that scan runs.
+    db::mark_stale(&db, b"caf\xe8/note.md").expect("test setup: stale the twin's row");
+
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    record_parse_version(&db, outdated_parse_version());
+    let hidden_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    drop(db);
+
+    // The twin's path is readable again and carries the hidden note's bytes, so it spells the ambiguous row exactly —
+    // except that its own key is already held, stale, by the row above.
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the row's own directory on this runner"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("a stale twin must not fail the scan");
+    assert_eq!(
+        report.moved, 0,
+        "nothing moved: the claim was refused: {report:?}"
+    );
+    assert!(
+        !report.skipped.iter().any(|name| name.ends_with("note.md")),
+        "the readable path is not parked in `skipped` — that is where an identity conflict strands it, charging every \
+         refresh with nothing to clear it: {report:?}"
+    );
+
+    let db = ws.db();
+    let twin_state: String =
+        db.0.query_row(
+            "SELECT state FROM files WHERE rel_bytes = X'636166E82F6E6F74652E6D64'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("test: the twin's row is still there");
+    assert_eq!(
+        twin_state, "ok",
+        "the stale row came back to life on its own key, keeping its id — the ordinary returning-file route"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT id FROM notes WHERE rel_bytes = X'636166E82F6E6F74652E6D64'"
+        ),
+        twin_note_id,
+        "the same note, not a fresh id behind a re-add"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        hidden_note_id,
+        "and the ambiguous row is untouched on its own key: refusing a claim changes nothing about it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // F22 — a scan's losses get a durable record, not just a line.
 //
