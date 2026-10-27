@@ -408,54 +408,57 @@ What these numbers can and cannot carry:
 
 ## F23 — a display-text key cannot say which byte twin its row is for
 
-- **Where:** `crates/np-core/src/scan.rs`'s `key_is_display_derived` fallback in `known_rows`, and the rows migration
-  4 keyed through `path_keys::rel_bytes_of_display` (`db.rs`). A name genuinely holding `U+FFFD`, and every lossy
-  Windows name, are in this class permanently; only a hash-paired `Moved` (so `apply_move` rewrites `rel_bytes`) lets
-  a migrated row out.
-- **Risk — two configurations, identical inputs to `known_rows`, opposite right answers.** Both start from one stored
-  row keyed `63 61 66 EF BF BD 2F …` with display `caf\u{FFFD}/note.md`, and an unreadable directory whose display
-  spelling is the same:
-  - **N′ — the row's own file IS the readable path.** The fallback hides the row, so nothing pairs with the listed
-    file: it indexes as `Added` and the workspace ends with **two live `files` rows and two `notes` rows for one
-    physical file**, two catalog entries, and links/headings able to diverge between the ids.
-    `hidden_by_unknown` also holds `PARSE_VERSION` back, so every scan re-parses the corpus — F15's class — until
-    someone renames or removes the twin. **No scan clears either half.**
-  - **M — the row's own file is inside the blocked directory** and the readable path is its unindexed twin. Here
-    hiding the row is *correct*: the scan reports `added: 1`, the note survives, and the version stays withheld.
-  Any predicate that stops hiding N′ (for instance "the walk listed a path with this display text") also stops hiding
-  M, which reports `removed: 1`, stales a live note, drops it from the catalog and records `PARSE_VERSION` over rows
-  nobody re-parsed. That is why the fallback stays as wide as it is: **a lossy key carries no byte spelling, so nothing
-  computable at `known_rows` distinguishes the two.** The naive fix was tried, probed against both cases, and rejected.
-- **Evidence for rejecting the narrow patch** (`skip the fallback when the found set carries that display text`), so
-  nobody re-derives it: disable `key_is_display_derived` and both fixtures move in opposite directions. The harm case
-  becomes a clean `Moved: 1` — one live row, which is exactly why the patch looks right — while the fence case becomes
-  **`added: 1, removed: 1`**: a live note reported gone as its look-alike is indexed. The fence's twin deliberately
-  carries a different body from the hidden note; with identical content `classify` pairs them by hash, reports
-  `Moved: 1`, and the fixture proves nothing (that mistake was made and caught by mutation during this round).
-- **Fix candidates, with their costs.** (i) Pair by content hash the way `apply_move` does — needs the blocked path to
-  become readable at least once, so it repairs rather than prevents, and cannot help a workspace whose twin stays
-  unreadable forever. (ii) Found-side suppression: when a listed path's display text matches a row hidden by the
-  fallback, skip that path and name it in `skipped`, trading duplicate rows for a readable file left unindexed while
-  its twin is unreadable — this changes what a scan is allowed to omit, so it needs its own spec rather than arriving
-  inside a hardening round, **and it legitimately rewrites the fence fixture's `(added, moved, removed) == (1, 0, 0)`
-  into `added: 0` plus a `skipped` name**: that edit is expected under (ii) and must be justified in the commit body,
-  not made silently. (iii) A future schema step that refuses display-derived keys — re-key every row from OS bytes or
-  flag the workspace for a full re-index — costs a migration plus one complete re-parse of every flagged workspace,
-  and must say what happens to rows F23 already duplicated (merge them onto one id, or refuse and ask).
-- **Runner caveat:** both fixtures early-return with `NOT COVERAGE` when the filesystem refuses latin-1 directory
-  names or `chmod 000` fails to deny access (a privileged runner), so a green CI run is not proof they executed.
-  Validate any F23 fix on a runner where `denied()` is true and say which one in the PR.
-- **Pinned by:** `crates/np-core/tests/scan.rs::known_defect_a_readable_display_keyed_path_duplicates_its_own_row`
-  (the harm: two live `files` rows, two `notes` rows, version withheld) and
-  `crates/np-core/tests/scan.rs::a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`
-  (the fence: any fix reporting `removed: 1` there destroyed a live note). The harm fixture is to be **deleted** in the
-  commit that fixes this entry.
-- **Do when:** a workspace with `caf\xe9/` blocked beside `caf\xe8/`, holding one display-keyed row, ends up with
-  exactly one live `files` row and one `notes` row for that path **once the obstruction is gone** — while the twin is
-  still blocked, some charge to `hidden_by_unknown` remains correct and `PARSE_VERSION` stays withheld, so do not write
-  a "Do when" that demands recording the version mid-obstruction: `refresh_covered` withholding it is the safety, not
-  the bug. Until then, do not describe the fallback's over-hiding as churn that heals: it does not.
----
+- **Half shipped.** The row is no longer deleted from the scan's view: `known_rows` marks it, an ambiguous row may never
+  produce `Removed`, and it may be claimed by content through the ordinary `Moved` route so `apply_move` re-keys
+  `rel_bytes` from real bytes. A legacy workspace whose note has **not** been edited since migration now converges: one
+  live `files` row, one `notes` row at the id it already had, and `PARSE_VERSION` recorded — pinned by
+  `a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version`, which replaced the fixture that used to pin
+  the defect (this entry instructed whoever fixed it to delete that fixture rather than let it harden into a guard on the
+  bug; it was replaced instead, so the same test now pins the healing). A row whose key already equals its OS bytes — a
+  name genuinely holding `U+FFFD`, and every lossy name on Windows — discharges by **match**, with no move at all:
+  `a_row_keyed_from_its_own_lossy_bytes_discharges_by_match_without_a_move`. The durable record gained `ambiguous=N`,
+  rendered from exactly the population that holds the version back, so a person reading `meta` tomorrow learns what a
+  withheld version meant. **Shipped (m6 commits `684ddb8`..`b953be0`, `docs/design-f23-ambiguous-rows.md`).**
+- **The claim is scoped to the look-alike, and that is load-bearing.** `classify` matches a move on **hash alone**, and its
+  `present_hashes` guard cannot fire for a display-derived key (that set is seeded from known rows whose *key* matches an
+  unreadable listing). So admission requires a listed readable path that spells the row exactly **and** matches its stored
+  hash. Without that clause any readable path anywhere with byte-identical content — a `# Title` stub, a blank template, a
+  re-exported note — claims the hidden row: `moved: 1`, the id homed on somebody else's file. Mutation proves it: delete
+  the scoping test and `an_unrelated_look_alike_carrying_the_hidden_bytes_is_added_and_never_claims_them` reports
+  `moved: 1`.
+- **Still open — the residue.** A row whose **content changed while it was unindexable** has no hash agreement, nothing
+  claims it, and the duplicate pair returns exactly as before. Two live rows for one file, version withheld, until someone
+  renames or removes the twin. This is not a corner: the obstruction can outlast the edit.
+- **Why the naive rule stays rejected.** N′ (the row's own file is the readable path) and M (the row's file is inside the
+  blocked directory, the readable path being a different file that displays identically) hand `known_rows` identical
+  inputs and need opposite answers. Any predicate there that stops hiding N′ also stops hiding M, which reports
+  `removed: 1`, stales a live note, drops it from the catalog and records `PARSE_VERSION` over rows nobody re-parsed. The
+  fence for that is `a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`; its twin carries a
+  **different body** deliberately, because identical content lets `classify` pair them and the fixture proves nothing.
+- **Fix candidates for the residue, with their costs.** (i) **Durable file identity** — store what the OS calls the file
+  (`ino`/`dev` on Unix, volume serial + file index on NTFS) at every successful index and decide N′ against M by identity
+  instead of content. It resolves the residue including content-changed-while-hidden, and it is the right next step. Costs:
+  a migration, platform code, files where identity is unavailable or recycled (exFAT/FAT without `FileIdInfo`, network
+  mounts), and no Windows claim until one has been run on Windows (F18's standing lesson). (ii) **Found-side suppression**
+  — skip a readable path whose display text matches an unresolved row and name it in `skipped`: no duplicate rows, but a
+  genuinely different file goes unindexed, which costs real coverage to buy tidiness, and it changes what a scan is allowed
+  to omit — its own spec, not a hardening round. Under (ii) the fence's `added: 1` legitimately becomes `added: 0` plus a
+  named skip; that edit must be chosen on purpose and justified, never made silently. (iii) A schema step refusing
+  display-derived keys — re-key from OS bytes or flag for full re-index — costs a migration plus one complete re-parse of
+  every flagged workspace and must say what happens to rows F23 already duplicated.
+- **Costs this round accepted, not hid.** In the byte-identical-twin configuration the row claims the twin: `moved: 1`
+  where nothing moved, one fewer catalog entry while the obstruction stands, and — because the row has left its own key —
+  a later deletion inside the obstruction is never reported. Pinned with its harm named by
+  `a_byte_identical_twin_is_claimed_and_the_file_it_leaves_behind_goes_unreported`. Unavoidable: the two configurations are
+  identical to `known_rows` by construction.
+- **Runner caveat:** the fixtures here early-return with `NOT COVERAGE` when the filesystem refuses latin-1 directory names
+  or `chmod 000` fails to deny access (a privileged runner), so a green CI run is not proof they executed. Validate any F23
+  change on a runner where `denied()` is true and name it — command, head SHA, host and euid — in the PR. Baseline for this
+  round: scan suite green with **zero** `NOT COVERAGE` lines on host `pi`, euid 1000.
+- **Do when (rest of it):** a workspace with `caf\xe9/` blocked beside `caf\xe8/`, holding one display-keyed row whose
+  content changed while blocked, ends with exactly one live `files` row and one `notes` row for that path **once the
+  obstruction is gone**. While the twin is blocked some charge to the hidden count remains correct and `PARSE_VERSION`
+  stays withheld — that withholding is the safety, not the bug.
 
 ## F24 — the two merge tests carry the same assertions twice
 

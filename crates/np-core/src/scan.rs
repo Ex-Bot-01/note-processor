@@ -250,14 +250,26 @@ pub struct Unindexable {
     /// **This is a question, not an accusation.** Two genuinely different files can share a display spelling —
     /// latin-1 `caf\xE9/note.md` beside `caf\xE8/note.md`, both readable, both correctly indexed — and they land
     /// here exactly as F23's one-file-two-rows does. It also counts attachments, which have no catalog entry at
-    /// all. So read it as "look at these paths" and confirm with `sqlite3` before deleting anything: the count is
-    /// deliberately **unexplained**, because why a path holds two rows is F23's ambiguity and a count naming a
-    /// cause would be re-deciding it here (F22 §4.5).
+    /// all. So read it as "look at these paths" and confirm with `sqlite3` before deleting anything (F22 §4.5).
+    ///
+    /// It used to promise to be "deliberately unexplained"; [`Self::ambiguous`] beside it now names one possible
+    /// cause, so this count stays what it is — a pointer at paths — and the reader who wants the reason reads the
+    /// other field.
     pub duplicates: usize,
+    /// Notes whose registry row is **keyed from display text** and could not be settled this scan (F23): the walk
+    /// could not read their own path, and no listed readable path both spells them exactly and matches their stored
+    /// hash, so nothing could say which byte spelling the row belongs to.
+    ///
+    /// `N` is exactly the population that holds [`PARSE_VERSION_KEY`] back — this field is rendered *from* that
+    /// count and never read back into a deletion or version decision, the same rule F21 argues for: ask a day later
+    /// and the record has to say what the withheld version meant.
+    pub ambiguous: usize,
     /// Up to eight display spellings, most actionable first: [`Self::unkeyable`] paths, then
-    /// [`Self::duplicates`] ones, then [`Self::unreadable`] directories. A refused name and a duplicated path have
-    /// no other channel — the duplicate count is the *only* place F23's "this note appears twice" surfaces — while
-    /// an unreadable directory is also named in [`ScanReport::skipped`], so it can afford to lose cap room.
+    /// [`Self::duplicates`] ones, then [`Self::ambiguous`] notes, then [`Self::unreadable`] directories. A refused
+    /// name and a duplicated path have no other channel, and an ambiguous note is named here because its only other
+    /// signal is a version this workspace cannot record; an unreadable directory is also named in
+    /// [`ScanReport::skipped`], so it gives up cap room first. One list, one cap — a second capped field would invite
+    /// an unbounded value.
     ///
     /// Names are display text, so **a name here identifies no path**: two byte-distinct paths can share one
     /// lossy spelling (F20 §1) and then two entries look alike, exactly as two `skipped` lines do. It says
@@ -272,10 +284,11 @@ impl Unindexable {
     /// this record and must not invent a second spelling of it.
     pub fn value(&self) -> String {
         format!(
-            "unreadable={};unkeyable={};duplicates={};names={}",
+            "unreadable={};unkeyable={};duplicates={};ambiguous={};names={}",
             self.unreadable,
             self.unkeyable,
             self.duplicates,
+            self.ambiguous,
             self.names.join(","),
         )
     }
@@ -283,6 +296,10 @@ impl Unindexable {
     /// Whether this scan lost nothing at all, which is the case [`ScanReport::unindexable`] reports as
     /// `None` while `meta` still records it as zeros — "looked and found none" staying distinguishable from
     /// "this workspace was never scanned by a build that looks" (F22 §2).
+    ///
+    /// [`Self::ambiguous`] is deliberately absent. Marking a row needs an unreadable look-alike prefix
+    /// (`under_unreadable` reads only that list), so `ambiguous > 0` implies `unreadable >= 1`, which already makes
+    /// this false: the field can never be the sole reason a record exists, and adding it here would suggest it could.
     fn is_empty(&self) -> bool {
         self.unreadable == 0 && self.unkeyable == 0 && self.duplicates == 0
     }
@@ -298,14 +315,16 @@ fn unindexable_record(
     unreadable: &[UnknownPath],
     unkeyable: &[UnknownPath],
     duplicates: &[String],
+    ambiguous: &[String],
 ) -> Unindexable {
     // Ordered by kind rather than merged, and capped in that order: refused names and duplicated paths have no
-    // other channel at all, while an unreadable directory is also named in `ScanReport::skipped`, so it gives up
-    // cap room first.
+    // other channel at all, an ambiguous note's only other signal is a withheld parse version, while an unreadable
+    // directory is also named in `ScanReport::skipped`, so it gives up cap room first.
     let names = unkeyable
         .iter()
         .map(|path| path.display.clone())
         .chain(duplicates.iter().cloned())
+        .chain(ambiguous.iter().cloned())
         .chain(unreadable.iter().map(|path| path.display.clone()))
         .take(NAME_CAP)
         .collect();
@@ -313,6 +332,7 @@ fn unindexable_record(
         unreadable: unreadable.len(),
         unkeyable: unkeyable.len(),
         duplicates: duplicates.len(),
+        ambiguous: ambiguous.len(),
         names,
     }
 }
@@ -461,7 +481,12 @@ pub fn scan_with_inject(
     // position F21's receipt echo established, and for the same reason: a scan that rolled itself back has
     // nothing to announce. Written on every scan, including one that lost nothing, because the record is
     // current state and an old value left standing is a false accusation (F22 §2).
-    let losses = unindexable_record(&walked.unreadable, &walked.unrepresentable, &duplicates);
+    let losses = unindexable_record(
+        &walked.unreadable,
+        &walked.unrepresentable,
+        &duplicates,
+        &ambiguous,
+    );
     let record = losses.value();
     record_unindexable(&db, &record);
 
@@ -985,10 +1010,12 @@ fn is_unknown_path(
 /// byte spelling for a UTF-16 name. In those cases the text arm is just the byte arm again — same bytes, same
 /// answer — which is why widening here costs nothing they were not already paying.
 ///
-/// A migrated row leaves the class only when a scan sees its path **and** pairs it by hash, so
-/// [`crate::db::apply_move`] rewrites `rel_bytes` from the walk (F13 §4.2's one-time churn). Nothing else does:
-/// an unchanged row is refreshed in place and keeps the key it has, so this fallback is not transitional for the
-/// cases above — say "until someone renames it", not "until the next scan".
+/// A migrated row leaves the class when a scan sees its path **and** pairs with it — by identity, or since F23 by
+/// content through [`known_rows`]' scoping, which routes the pair through [`crate::db::apply_move`] so `rel_bytes`
+/// becomes the walk's bytes (F13 §4.2's one-time churn). Nothing else does: an unchanged row is refreshed in place and
+/// keeps the key it has, so this fallback is not transitional for the cases above — say "until someone renames it", not
+/// "until the next scan". What F23 changed is not membership but consequence: a row still in the class is now marked
+/// rather than deleted, which is what lets content settle identity at all.
 ///
 /// The refused-name arm gets no text side, deliberately: a refusal entry's own bytes are lossy wherever refusals
 /// happen (Windows keys them from `to_string_lossy`, so they already equal a qualifying row's key and the byte arm
@@ -1008,14 +1035,19 @@ fn key_is_display_derived(rel: &str, rel_bytes: &[u8]) -> bool {
 /// [`PARSE_VERSION_KEY`] is recorded over rows nobody re-parsed, and (F13 §4.2) brings the note back as a **second
 /// `notes.id`** when the directory opens again.
 ///
-/// **Do not call that over-hiding harmless, and do not call it self-healing.** When the row's own path is readable
-/// while an unreadable twin shares its display spelling — which a lossy key cannot distinguish from the case this
-/// fallback exists for — hiding the row leaves the listed path with no row to pair with, so it indexes as a spurious
-/// `Added`: two live `files` and `notes` rows for one file, and `hidden_by_unknown` holds [`PARSE_VERSION_KEY`] back
-/// until somebody renames or removes the twin. **No scan clears that.** Backlog **F23** owns the ambiguity — no
-/// predicate computable here can separate the two cases, because a display spelling has many byte twins and a lossy
-/// key records none of them — and requires both configurations pinned as fixtures: one naming the duplicate-row harm,
-/// one fencing the safety that any future fix must not trade away.
+/// **Do not call that over-hiding harmless.** When the row's own path is readable while an unreadable twin shares its
+/// display spelling, hiding the row left the listed path with no row to pair with, so it indexed as a spurious `Added`:
+/// two live `files` and `notes` rows for one file, with the version withheld forever. **F23 closed that half here** —
+/// not by narrowing this predicate, which cannot tell the cases apart, but by marking the row instead of deleting it so
+/// [`crate::change::classify`] can pair them on content: see `docs/design-f23-ambiguous-rows.md` §2 and
+/// `a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version`.
+///
+/// What still stands, and is why the width stays: no predicate computable at this point separates the two cases, because
+/// a display spelling has many byte twins and a lossy key records none of them. A row whose **content changed** while it
+/// was unindexable has nothing to pair on, so its duplicate pair returns; and the case this fallback exists for — the
+/// row's own file inside the obstruction, a different file readable outside it — must keep hiding, which is what
+/// `a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin` fences. Backlog **F23** remains open
+/// for the residue and names durable file identity as the way through it.
 fn display_spelled(paths: &[UnknownPath]) -> Vec<UnknownPath> {
     paths
         .iter()
@@ -2852,12 +2884,18 @@ mod tests {
         ];
         let blocked = [raw(b"caf\xE9")];
         let duplicates = ["dup/a.md".to_string(), "dup/b.md".to_string()];
-        let record = unindexable_record(&blocked, &refused, &duplicates);
+        let ambiguous = ["lost/note.md".to_string()];
+        let record = unindexable_record(&blocked, &refused, &duplicates, &ambiguous);
 
         assert_eq!(
             (record.unreadable, record.unkeyable, record.duplicates),
             (1, 2, 2),
             "three kinds of loss, three counts — merged they would say only \"5\""
+        );
+        assert_eq!(
+            record.ambiguous,
+            1,
+            "and F23's fourth kind: a note whose row could not be matched to a byte spelling this scan"
         );
         assert_eq!(
             record.names,
@@ -2866,17 +2904,19 @@ mod tests {
                 "zebra.md",
                 "dup/a.md",
                 "dup/b.md",
+                "lost/note.md",
                 "caf\u{fffd}",
             ],
-            // A refused name and a duplicated path have no other channel; an unreadable directory is also
-            // named in `ScanReport::skipped`, so it gives up the last cap slot.
-            "unkeyable first, then duplicated paths, then unreadable directories"
+            // A refused name and a duplicated path have no other channel; an ambiguous note's only other signal is
+            // a parse version its workspace cannot record; an unreadable directory is also named in
+            // `ScanReport::skipped`, so it gives up the last cap slot.
+            "unkeyable first, then duplicated paths, then ambiguous notes, then unreadable directories"
         );
         // The stored spelling, pinned whole — `meta`, `np scan`'s line and this struct read one format, so a
         // person comparing yesterday's terminal against today's record is comparing one string.
         assert_eq!(
             record.value(),
-            "unreadable=1;unkeyable=2;duplicates=2;names=caf\u{fffd}.md,zebra.md,dup/a.md,dup/b.md,caf\u{fffd}",
+            "unreadable=1;unkeyable=2;duplicates=2;ambiguous=1;names=caf\u{fffd}.md,zebra.md,dup/a.md,dup/b.md,lost/note.md,caf\u{fffd}",
         );
 
         // The cap: five refused, four unreadable, three duplicated is twelve losses and eight names. What falls
@@ -2888,11 +2928,17 @@ mod tests {
                 .collect()
         };
         let many_duplicates: Vec<String> = (0..3).map(|index| format!("dup{index}.md")).collect();
-        let capped = unindexable_record(&spelled("dir", 4), &spelled("no", 5), &many_duplicates);
+        let some_ambiguous: Vec<String> = (0..2).map(|index| format!("lost{index}.md")).collect();
+        let capped = unindexable_record(
+            &spelled("dir", 4),
+            &spelled("no", 3),
+            &many_duplicates,
+            &some_ambiguous,
+        );
         assert_eq!(
             (capped.unreadable, capped.unkeyable, capped.duplicates),
-            (4, 5, 3),
-            "the counts still say twelve while the names say eight"
+            (4, 3, 3),
+            "the counts say twelve while the names say eight"
         );
         assert_eq!(
             capped.names.len(),
@@ -2901,24 +2947,29 @@ mod tests {
              `meta` row without limit"
         );
         assert_eq!(
-            &capped.names[..5],
-            ["no0.md", "no1.md", "no2.md", "no3.md", "no4.md"],
+            &capped.names[..3],
+            ["no0.md", "no1.md", "no2.md"],
             "every refused name survives before any directory's"
         );
         assert_eq!(
-            &capped.names[5..],
+            &capped.names[3..6],
             ["dup0.md", "dup1.md", "dup2.md"],
-            "then every duplicated path, and the four directories are what the cap cost — they are in              `skipped` too"
+            "then every duplicated path"
+        );
+        assert_eq!(
+            &capped.names[6..],
+            ["lost0.md", "lost1.md"],
+            "then the ambiguous notes, and the four directories are what the cap cost — they are in `skipped` too"
         );
 
         // Nothing lost: `is_empty` is what makes the report field `None`, while the value is still the full
         // all-zero spelling — a fixed workspace has to overwrite an older complaint rather than leave it
         // standing there accusing somebody (F22 §2).
-        let clean = unindexable_record(&[], &[], &[]);
+        let clean = unindexable_record(&[], &[], &[], &[]);
         assert!(clean.is_empty(), "nothing lost is nothing reported");
         assert_eq!(
             clean.value(),
-            "unreadable=0;unkeyable=0;duplicates=0;names="
+            "unreadable=0;unkeyable=0;duplicates=0;ambiguous=0;names="
         );
         assert!(clean.names.is_empty());
 
@@ -2926,10 +2977,15 @@ mod tests {
         // of any kind. `walk::Walked::unrepresentable` is empty on Unix by construction, so a real run's
         // record reads `unkeyable=0` here for the same reason — the non-zero arm above is Windows-only and
         // unexecuted.
-        let unix = unindexable_record(&blocked, &[], &[]);
+        let unix = unindexable_record(&blocked, &[], &[], &[]);
         assert_eq!(
             unix.unkeyable, 0,
             "Unix refuses no name, so no scan run here can raise this count"
+        );
+        assert_eq!(
+            unix.ambiguous, 0,
+            "and a workspace with nothing ambiguous records nothing — the field is rendered from the count that \
+             holds the parse version back, not from a guess about it"
         );
         assert!(!unix.is_empty(), "one unreadable directory is still a loss");
     }

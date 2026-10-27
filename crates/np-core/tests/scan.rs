@@ -4011,6 +4011,19 @@ fn two_readable_paths_sharing_the_hidden_bytes_claim_neither_and_the_row_survive
         Some(outdated_parse_version()),
         "the ambiguity is unresolved, so the charge stays: surviving is not the same as being settled"
     );
+
+    // …and the durable record says so (§6): `ambiguous` is rendered from exactly the population that withheld the
+    // version above, so a person who reads the record tomorrow learns what the missing version meant. Asserted here
+    // rather than in the M fence, which design §5.3 keeps free of edits.
+    let losses = recorded_losses(&db);
+    assert!(
+        losses.contains("ambiguous=1"),
+        "one unsettled row, recorded: {losses}"
+    );
+    assert!(
+        losses.contains("caf\u{fffd}/note.md"),
+        "and it names the note by display text, which is all a lossy key can offer: {losses}"
+    );
 }
 
 /// **§4's stale-row rule, which mutation (6) showed was unpinned.** `known_rows` reads live rows only, but
@@ -4201,7 +4214,7 @@ fn an_unreadable_directory_is_recorded_as_a_loss_of_that_exact_kind() {
     let db = ws.db();
     assert_eq!(
         recorded_losses(&db),
-        "unreadable=1;unkeyable=0;duplicates=0;names=blocked",
+        "unreadable=1;unkeyable=0;duplicates=0;ambiguous=0;names=blocked",
         "the record has to say which kind of loss this was: {:?}",
         report.skipped
     );
@@ -4238,7 +4251,7 @@ fn a_scan_that_loses_nothing_overwrites_the_record_an_earlier_scan_left() {
     let first = scan(&ws.root, &ws.cfg).expect("test setup: first scan");
     assert_eq!(
         recorded_losses(&ws.db()),
-        "unreadable=0;unkeyable=0;duplicates=0;names=",
+        "unreadable=0;unkeyable=0;duplicates=0;ambiguous=0;names=",
         "an empty record is written, not skipped"
     );
     assert_eq!(losses(&first.unindexable), None, "{first:?}");
@@ -4257,7 +4270,7 @@ fn a_scan_that_loses_nothing_overwrites_the_record_an_earlier_scan_left() {
         let lost = scan(&ws.root, &ws.cfg).expect("test setup: a losing scan");
         assert_eq!(
             recorded_losses(&ws.db()),
-            "unreadable=1;unkeyable=0;duplicates=0;names=blocked",
+            "unreadable=1;unkeyable=0;duplicates=0;ambiguous=0;names=blocked",
             "test setup: the record has to be worth overwriting: {lost:?}"
         );
     }
@@ -4273,7 +4286,7 @@ fn a_scan_that_loses_nothing_overwrites_the_record_an_earlier_scan_left() {
     let db = ws.db();
     assert_eq!(
         recorded_losses(&db),
-        "unreadable=0;unkeyable=0;duplicates=0;names=",
+        "unreadable=0;unkeyable=0;duplicates=0;ambiguous=0;names=",
         "the fixed workspace stops reporting a loss it no longer has"
     );
     assert_eq!(
@@ -4380,7 +4393,7 @@ fn the_duplicate_count_names_a_display_path_with_two_live_rows_and_not_one_with_
     let duplicate = format!("{TWIN_DIR_DISPLAY}/note.md");
     assert_eq!(
         recorded_losses(&db),
-        format!("unreadable=0;unkeyable=0;duplicates=1;names={duplicate}"),
+        format!("unreadable=0;unkeyable=0;duplicates=1;ambiguous=0;names={duplicate}"),
         "the duplicated path is named and the stale one is not"
     );
     assert_eq!(
@@ -4518,7 +4531,7 @@ fn names_order_a_duplicated_path_before_an_unreadable_directory() {
     let db = ws.db();
     assert_eq!(
         recorded_losses(&db),
-        format!("unreadable=1;unkeyable=0;duplicates=1;names={duplicate},blocked"),
+        format!("unreadable=1;unkeyable=0;duplicates=1;ambiguous=0;names={duplicate},blocked"),
         "the duplicated path is named first: it has no other channel, `blocked` is in `skipped` too"
     );
     assert_eq!(
