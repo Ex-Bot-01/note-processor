@@ -2167,6 +2167,51 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
     );
 }
 
+/// Plant the population real legacy workspaces actually arrive with — **version three**, holding two `notes`
+/// rows for one `rel`, which was legal there because `notes.rel` carried no `UNIQUE` (F13 §7) — and leave the
+/// file claiming version three so the next open runs migration 4 *and* migration 5 in one pass.
+///
+/// [`seed_duplicate_pair_at_version_four`] cannot stand in for this. It plants its pair on a schema migration 4
+/// has already rebuilt, so nothing in it says that migration 4's `CAST(rel AS BLOB)` copy is what folds the two
+/// rows onto one `rel_bytes`, nor that migration 5 then merges them in the same open. That order is
+/// load-bearing rather than incidental: run the merge first and the pair is copied afterwards, into a file
+/// already recorded as merged, with nothing left to heal it — which is how a reordered [`MIGRATIONS`] list
+/// would lose somebody's note rows.
+fn seed_duplicate_notes_at_version_three(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
+    conn.execute_batch(VERSION_THREE)
+        .expect("test setup: version-three schema");
+    conn.execute_batch(
+        "-- One `files` row per path (version three keyed those by `rel TEXT PRIMARY KEY`) and two note rows
+         -- for `dup.md`, ids non-consecutive because that is what a legacy file looks like. Winner 4, loser 9.
+         INSERT INTO files (rowid, rel, case_key, abs, hash, size, mtime, state, last_seen) VALUES
+            (2, 'dup.md', 'dup.md', '/ws/dup.md', 'h1', 5, 1, 'ok', 9),
+            (7, 'third.md', 'third.md', '/ws/third.md', 'h2', 5, 1, 'ok', 9);
+         INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body) VALUES
+            (4, 'dup.md', 'Dup first',  'filename', 'utf-8', 1, 'first'),
+            (9, 'dup.md', 'Dup second', 'filename', 'utf-8', 1, 'second'),
+            (12, 'third.md', 'Third',   'filename', 'utf-8', 1, 'third');
+         -- Derived rows on both halves of the pair, so 'the winner kept its corpus' is an assertion rather
+         -- than a hope, and one edge into each of them from the third note.
+         INSERT INTO headings (note_id, level, text, line) VALUES
+            (4, 1, 'First heading', 1), (9, 2, 'Second heading', 3), (12, 1, 'Third heading', 1);
+         INSERT INTO tags (note_id, tag) VALUES (4, 'first-tag'), (9, 'second-tag');
+         INSERT INTO items (note_id, text, line, state, marker) VALUES
+            (4, 'first task', 2, 'open', '- [ ]'), (9, 'second task', 4, 'done', '- [x]');
+         INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+            (12, 4, 'wiki', 'Dup first', 2, 'prose'),
+            (12, 9, 'wiki', 'Dup second', 3, 'prose');",
+    )
+    .expect("test setup: plant a version-three pair on one path");
+    assert_eq!(
+        conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| row
+            .get::<_, i64>(0))
+            .expect("test setup: read the fixture's version"),
+        3,
+        "test setup: migrations 4 and 5 both have to run on the open below"
+    );
+}
+
 /// The [`NOTE_MERGE_KEY`] receipt as the file holds it.
 fn merge_receipt_of(db: &Db) -> String {
     scalar(
@@ -2269,6 +2314,78 @@ fn merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge() 
     );
 
     // The receipt, read under the constant it is written under so a renamed key fails here.
+    assert_eq!(merge_receipt_of(&db), "merged=1;paths=dup.md");
+}
+
+#[test]
+fn a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges() {
+    // The jump real legacy workspaces make. Every other F19 fixture plants its pair on a finished schema and
+    // rewinds one version row, so none of them says that migration 4's copy is what puts two rows on one
+    // `rel_bytes` **and** migration 5 folds them, in the same open (see
+    // [`seed_duplicate_notes_at_version_three`]). Reorder those two steps and this test is what fails: the pair
+    // arrives after the merge has run, into a file already recorded as merged, and nothing heals it.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_notes_at_version_three(&path);
+
+    let db = Db::open(&path).expect("one open runs migration 4 and then migration 5");
+
+    // Both steps landed: the file is current, and the pair sits on one byte key — which is migration 4's doing
+    // (`CAST(rel AS BLOB)` per row), and the precondition migration 5 merges on.
+    assert_eq!(scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"), 5);
+    assert_eq!(
+        scalar::<String>(&db, "SELECT hex(rel_bytes) FROM files WHERE rel = 'dup.md'"),
+        "6475702E6D64",
+        "migration 4 keyed the path, and both note rows copied onto that one key"
+    );
+
+    // One row remains at the lower id: `MIN(id)`, the row migration 4 carried across untouched.
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {DUP_BYTES} ORDER BY id"
+            )
+        ),
+        ["4".to_string()],
+        "the merge ran on the pair migration 4 had just copied, keeping the oldest row"
+    );
+
+    // The winner's derived rows survived both steps — its heading, tag and item are the ones the fixture wrote
+    // — and the loser's are gone rather than orphaned into the rebuilt tables.
+    assert_eq!(
+        names(&db, "SELECT text FROM headings WHERE note_id = 4"),
+        ["First heading".to_string()]
+    );
+    assert_eq!(
+        names(&db, "SELECT tag FROM tags WHERE note_id = 4"),
+        ["first-tag".to_string()]
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM items WHERE note_id = 4"),
+        1
+    );
+    for sql in [
+        "SELECT COUNT(*) FROM headings WHERE note_id = 9",
+        "SELECT COUNT(*) FROM tags WHERE note_id = 9",
+        "SELECT COUNT(*) FROM items WHERE note_id = 9",
+        "SELECT COUNT(*) FROM links WHERE src_note_id = 9",
+    ] {
+        assert_eq!(scalar::<i64>(&db, sql), 0, "{sql}: the loser left nothing");
+    }
+
+    // And the third note's edge into the loser came through both steps and names the winner — a NULL here is a
+    // resolved link lost permanently (F19 §2), and one naming 9 is an id that no longer exists.
+    assert_eq!(
+        names(
+            &db,
+            "SELECT COALESCE(CAST(dst_note_id AS TEXT), 'NULL') FROM links
+              WHERE src_note_id = 12 AND target = 'Dup second'"
+        ),
+        ["4".to_string()],
+        "the edge crossed the rebuild and the merge together"
+    );
+
     assert_eq!(merge_receipt_of(&db), "merged=1;paths=dup.md");
 }
 
