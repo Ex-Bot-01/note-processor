@@ -1281,9 +1281,14 @@ pub fn merge_total(value: &str) -> usize {
 /// Echo the stored merge receipt to `out` — [`std::io::stderr`] in production — unless nothing was merged.
 ///
 /// The same shape, sink and dropped-write rule as [`report_orphans`], for the same reasons: stderr cannot be
-/// captured in-process because this runs inside [`Db::open`] before a test could redirect descriptor 2, so
-/// the unit tests below pin both halves through the parameter; and a failed write must not roll back (or
-/// abort) an upgrade whose deletions are durable in `meta` under [`NOTE_MERGE_KEY`].
+/// captured in-process because this runs inside [`Db::open`] before a test could redirect descriptor 2, so the
+/// sink is a parameter and this module's two tests pin both halves through it —
+/// `the_merge_receipt_is_echoed_once_rows_have_been_folded` (one line naming the total beside the stored
+/// receipt) and `a_merge_that_folded_nothing_writes_no_line` (silence at zero, which is what keeps every
+/// ordinary command quiet while `merged=0` still lands in `meta` as proof the check ran). What they cannot pin
+/// is that the production call site names stderr, nor that it runs after the commit — see [`apply_migrations`],
+/// where the same no-portable-COMMIT-failure argument as F21 §2 applies. And a failed write must not roll back
+/// (or abort) an upgrade whose deletions are durable in `meta` under [`NOTE_MERGE_KEY`].
 fn report_merges(out: &mut dyn io::Write, receipt: &str) {
     let merged = merge_total(receipt);
     if merged == 0 {
@@ -1665,7 +1670,7 @@ pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{orphan_total, rebase_abs, report_orphans, OrphanCleanup};
+    use super::{orphan_total, rebase_abs, report_merges, report_orphans, OrphanCleanup};
 
     #[test]
     fn rebase_abs_swaps_the_rel_suffix() {
@@ -1802,6 +1807,32 @@ mod tests {
             "headings=0,tags=0,items=0,links_src=0,links_dst_null=0",
         );
         assert!(out.is_empty(), "all zeros has to stay silent");
+    }
+
+    #[test]
+    fn the_merge_receipt_is_echoed_once_rows_have_been_folded() {
+        // The merge half of the stderr visibility path, pinned through the sink for the same reason
+        // `report_orphans` is: this runs inside [`Db::open`], before any test could redirect descriptor 2. The
+        // input is the stored spelling because that string is what [`apply_migrations`] holds after the commit,
+        // and the count printed beside it is read back out of it — one value, three readers (F21 §3's rule).
+        let mut out = Vec::new();
+        report_merges(&mut out, "merged=2;paths=a.md,b.md");
+        assert_eq!(
+            String::from_utf8(out).expect("the receipt is text"),
+            "note-processor: merged 2 duplicate note row(s) into the oldest row for their path \
+             (merged=2;paths=a.md,b.md)\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_that_folded_nothing_writes_no_line() {
+        // The other half, and the only thing standing between this echo and a line on every fresh workspace:
+        // `merged=0` still lands in `meta` as the record that the check ran, while stderr stays quiet. Delete
+        // the zero guard in `report_merges` and this test is what fails — no integration test can see
+        // descriptor 2, so nothing else would notice.
+        let mut out = Vec::new();
+        report_merges(&mut out, "merged=0;paths=");
+        assert!(out.is_empty(), "`merged=0` states no work done: {out:?}");
     }
 
     #[test]
