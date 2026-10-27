@@ -7,7 +7,7 @@
 //! module must not grow an API just to make its own tests shorter.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // The hold times and the writer/holder handoff live in `tests/common/mod.rs`, which `tests/config.rs`
@@ -2103,6 +2103,313 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
         scalar::<i64>(&db, "SELECT COUNT(*) FROM notes WHERE rel_bytes IS NULL"),
         0,
         "a note row with no byte key is F13 reproduced by the fix"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F19 — migration 5 merges the duplicate note rows version 3 allowed. No production API makes a pair
+// any more (`insert_note` mints one row per path and `note_ids` reads them all), so every fixture below
+// builds one with raw SQL, on a schema that is otherwise current.
+// ---------------------------------------------------------------------------
+
+/// The byte key of `dup.md`, as the hex literal SQLite needs for a `BLOB` column (F13 §4: a TEXT bind
+/// would fail the `typeof(rel_bytes) = 'blob'` check rather than quietly match).
+const DUP_BYTES: &str = "X'6475702E6D64'";
+/// The byte key of `third.md`, the note that links to the loser.
+const THIRD_BYTES: &str = "X'74686972642E6D64'";
+
+/// Plant F19 §5's shape and leave the file claiming version four, so the next open runs migration 5:
+/// one `rel_bytes` holding two note rows (ids 4 and 9 — the winner is 4 by `MIN(id)`, and the ids are
+/// non-consecutive because that is what a legacy file looks like), derived rows hanging off **both**, and
+/// an incoming edge from a third note to each of them.
+///
+/// Planted on a current schema rather than copied from a version-three script: migration 5 writes no DDL,
+/// only row moves, so "version four plus a pair" is exactly the file that step meets in the wild, and
+/// deleting its recorded `schema_version` row reproduces that without a third hand-copied schema to keep
+/// in step (this file already carries two of those, which is one too many to grow).
+fn seed_duplicate_pair_at_version_four(path: &Path) {
+    let db = Db::open(path).expect("test setup: create the current schema");
+    db.0.execute_batch(
+        &format!(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+             VALUES ({DUP_BYTES}, {DUP_BYTES}, 'dup.md', 'dup.md', '/ws/dup.md', 'h1', 5, 1, 'ok', 9),
+                    ({THIRD_BYTES}, {THIRD_BYTES}, 'third.md', 'third.md', '/ws/third.md', 'h2', 5, 1, 'ok', 9);
+             INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body) VALUES
+                (4,  {DUP_BYTES}, 'dup.md', 'Dup first',  'filename', 'utf-8', 1, 'first'),
+                (9,  {DUP_BYTES}, 'dup.md', 'Dup second', 'filename', 'utf-8', 1, 'second'),
+                (12, {THIRD_BYTES}, 'third.md', 'Third',  'filename', 'utf-8', 1, 'third');
+             INSERT INTO headings (note_id, level, text, line) VALUES
+                (4, 1, 'First heading', 1), (9, 2, 'Second heading', 3), (12, 1, 'Third heading', 1);
+             INSERT INTO tags (note_id, tag) VALUES (4, 'first-tag'), (9, 'second-tag');
+             INSERT INTO items (note_id, text, line, state, marker) VALUES
+                (4, 'first task', 2, 'open', '- [ ]'), (9, 'second task', 4, 'done', '- [x]');
+             INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
+                (4, 12, 'wiki', 'Third', 3, 'prose'),
+                (9, 12, 'wiki', 'Third', 5, 'prose'),
+                (12, 4, 'wiki', 'Dup first', 2, 'prose'),
+                (12, 9, 'wiki', 'Dup second', 3, 'prose');"
+        ),
+    )
+    .expect("test setup: plant two note rows on one key, their derived rows and the edges around them");
+    // Rewind past migration 5 — and past the receipt its step wrote while this file was still empty. A
+    // genuine version-four file has no `note_merges` row at all, and leaving a `merged=0` one behind would
+    // let that step take its upsert's update arm instead of recording itself, which is the difference
+    // between "never checked" and "checked and found none" (F21 §2).
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+        4,
+        "test setup: migration 5 has not run here"
+    );
+}
+
+/// The [`NOTE_MERGE_KEY`] receipt as the file holds it.
+fn merge_receipt_of(db: &Db) -> String {
+    scalar(
+        db,
+        &format!("SELECT value FROM meta WHERE key = '{NOTE_MERGE_KEY}'"),
+    )
+}
+
+/// A workspace holding `dup.md` and `third.md` over a database [`seed_duplicate_pair_at_version_four`]
+/// planted — the shape one `np scan` run therefore repairs as it opens.
+fn merged_pair_workspace(tmp: &TempDir) -> (PathBuf, Config) {
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace directory");
+    fs::write(root.join("dup.md"), "# Dup\n").expect("test setup: write dup.md");
+    fs::write(root.join("third.md"), "# Third\n").expect("test setup: write third.md");
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+    seed_duplicate_pair_at_version_four(&cfg.workspace_db(&root));
+    (root, cfg)
+}
+
+#[test]
+fn merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge() {
+    // F19 §4.2: row identity survives and link resolution survives, both asserted against the rows rather
+    // than inferred from a report count.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_pair_at_version_four(&path);
+
+    let db = Db::open(&path).expect("the open runs migration 5");
+
+    // One row remains, and it is the oldest: `MIN(id)`, the one derived rows already hang off.
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {DUP_BYTES} ORDER BY id"
+            )
+        ),
+        ["4".to_string()],
+        "the survivor is MIN(id), not a silent pick or the newest row"
+    );
+
+    // The loser's derived rows are gone, and only the loser's. Asserted per shape because a merge that
+    // deleted the *winner*'s children would otherwise be invisible here.
+    for sql in [
+        "SELECT COUNT(*) FROM headings WHERE note_id = 9",
+        "SELECT COUNT(*) FROM tags WHERE note_id = 9",
+        "SELECT COUNT(*) FROM items WHERE note_id = 9",
+        "SELECT COUNT(*) FROM links WHERE src_note_id = 9",
+    ] {
+        assert_eq!(
+            scalar::<i64>(&db, sql),
+            0,
+            "{sql}: the loser's own rows went with it"
+        );
+    }
+    assert_eq!(
+        names(&db, "SELECT text FROM headings WHERE note_id = 4"),
+        ["First heading".to_string()],
+        "the winner keeps the rows that were already hanging off it"
+    );
+    assert_eq!(
+        names(&db, "SELECT tag FROM tags WHERE note_id = 4"),
+        ["first-tag".to_string()],
+        "and its tags, which is what a `MAX(id)` survivor would lose"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM items WHERE note_id = 4"),
+        1
+    );
+
+    // The edge that mattered: another note's prose pointed at the loser. Its target still exists, under
+    // the winner's id, so it is re-pointed — never nulled (F19 §2).
+    assert_eq!(
+        names(
+            &db,
+            "SELECT COALESCE(CAST(dst_note_id AS TEXT), 'NULL') FROM links
+              WHERE src_note_id = 12 AND target = 'Dup second'"
+        ),
+        ["4".to_string()],
+        "the incoming edge names the winner; a NULL here is a resolved link lost permanently"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            "SELECT COUNT(*) FROM links WHERE dst_note_id IS NOT NULL AND dst_note_id = 9"
+        ),
+        0,
+        "no edge still claims a row that is gone"
+    );
+    // The third note's own prose is intact in both directions, and the winner's outgoing edge rode along
+    // untouched: four edges went in, one (the loser's outgoing) came out.
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM links"),
+        3,
+        "only the loser's own outgoing edge disappeared"
+    );
+
+    // The receipt, read under the constant it is written under so a renamed key fails here.
+    assert_eq!(merge_receipt_of(&db), "merged=1;paths=dup.md");
+}
+
+#[test]
+fn the_scan_that_merges_reports_the_string_it_stored() {
+    // The report field and `meta` are one value, not two recomputations of it (F21 §3's rule, applied to
+    // F19's deletion): whatever a person is told, they can compare against the record.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let (root, cfg) = merged_pair_workspace(&tmp);
+
+    let report = scan(&root, &cfg).expect("a legacy pair must not fail the scan");
+
+    let stored = merge_receipt_of(&Db::open(&cfg.workspace_db(&root)).expect("reopen"));
+    assert_eq!(stored, "merged=1;paths=dup.md");
+    assert_eq!(
+        report.merged_notes.as_deref(),
+        Some(stored.as_str()),
+        "{report:?}"
+    );
+    // And the pair is gone by the time the report is written, so nothing about `dup.md` was refused.
+    assert!(report.skipped.is_empty(), "{report:?}");
+
+    let db = Db::open(&cfg.workspace_db(&root)).expect("reopen");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes WHERE rel = 'dup.md'"),
+        1,
+        "one row per path once the merge has run"
+    );
+}
+
+#[test]
+fn a_second_open_announces_the_merge_nowhere_and_keeps_the_receipt() {
+    // F21's once-per-process rule, so this cannot become a permanent one-line warning: the announcement is
+    // this open's memory, while `meta` stays the record — and clearing it would make the line load-bearing.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_pair_at_version_four(&path);
+
+    let first = Db::open(&path).expect("the first open merges");
+    assert_eq!(first.merged_notes(), Some("merged=1;paths=dup.md"));
+    drop(first);
+
+    let second = Db::open(&path).expect("the second open runs nothing new");
+    assert_eq!(
+        second.merged_notes(),
+        None,
+        "a merge announced on every open is a warning nobody can act on"
+    );
+    assert_eq!(merge_receipt_of(&second), "merged=1;paths=dup.md");
+}
+
+#[test]
+fn a_merge_that_cannot_record_its_receipt_leaves_both_note_rows() {
+    // F19 §4.1, pinned the way F21 §4.2 pins migration 3: refuse the `meta` write and ask whether any row
+    // went. Statement order would let a refactor move the receipt past the deletes' commit, or soften its
+    // failure into a warning, and keep every other test green.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_duplicate_pair_at_version_four(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("test setup: reopen the fixture");
+        // Nothing has claimed `NOTE_MERGE_KEY` yet, so this is an ordinary `INSERT` and the trigger fires
+        // — while migration 5's selects, re-points and deletes all still run.
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_merge_receipt BEFORE INSERT ON meta
+             BEGIN SELECT RAISE(ABORT, 'no merge receipt here'); END;",
+        )
+        .expect("test setup: refuse writes to `meta`");
+    }
+
+    let err = Db::open(&path).expect_err("a merge that cannot record its receipt must not commit");
+    // Reaching this line is half the assertion: an error, not a panic.
+    assert!(
+        matches!(
+            &err,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(fault, _))
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        ),
+        "expected the receipt write itself to be refused, got {err}"
+    );
+    assert!(
+        err.to_string().contains("no merge receipt here"),
+        "the error has to name the refusal: {err}"
+    );
+
+    // Read through a plain connection: `Db::open` still refuses this file.
+    let conn = rusqlite::Connection::open(&path).expect("the refused file is still readable");
+    let one = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("fixture query reads a number")
+    };
+    assert_eq!(
+        one("SELECT COUNT(*) FROM notes WHERE hex(rel_bytes) = '6475702E6D64'"),
+        2,
+        "both note rows survived a merge whose receipt was refused"
+    );
+    assert_eq!(
+        one("SELECT COUNT(*) FROM headings WHERE note_id = 9"),
+        1,
+        "the loser's derived rows are still there: nothing was deleted unannounced"
+    );
+    assert_eq!(
+        one("SELECT dst_note_id FROM links WHERE src_note_id = 12 AND target = 'Dup second'"),
+        9,
+        "and the incoming edge still names the row it was written against"
+    );
+    assert_eq!(
+        one(&format!(
+            "SELECT COUNT(*) FROM meta WHERE key = '{NOTE_MERGE_KEY}'"
+        )),
+        0,
+        "a refused receipt wrote nothing"
+    );
+    assert_eq!(
+        one("SELECT MAX(version) FROM schema_version"),
+        4,
+        "the step recorded nothing, so a later run can retry the merge"
+    );
+}
+
+#[test]
+fn a_database_with_nothing_to_merge_records_that_the_check_ran() {
+    // `merged=0` is the record that migration 5 looked (F21 §2's lesson), while the report field reports
+    // work done and therefore stays `None` — so "this file was never checked" and "nothing was found" stay
+    // tellable apart from either channel alone.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace directory");
+    fs::write(root.join("a.md"), "# A\n").expect("test setup: write a note");
+    let cfg = Config {
+        data_dir: tmp.path().join("data"),
+        ..Config::default()
+    };
+
+    let report = scan(&root, &cfg).expect("a clean workspace scans");
+
+    let db = Db::open(&cfg.workspace_db(&root)).expect("reopen");
+    assert_eq!(merge_receipt_of(&db), "merged=0;paths=");
+    assert!(
+        report.merged_notes.is_none(),
+        "`merged=0` states no work done: {report:?}"
     );
 }
 

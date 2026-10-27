@@ -3929,3 +3929,184 @@ fn a_duplicated_note_from_f23_reaches_the_record() {
         "the same count on both channels: {report:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F19 — the merge that ends the duplicate pair's permanent charge. The fixtures are hand-built with raw
+// SQL because no production API makes a pair any more; `crates/np-core/tests/db.rs` pins what the merge
+// leaves in the rows, and these two pin what it changes for the scan.
+// ---------------------------------------------------------------------------
+
+/// Plant a second note row beside the one a scan wrote for `rel`, with derived rows of its own and one
+/// outgoing edge — the pair version 3 allowed because `notes.rel` was never `UNIQUE` (F13 §7).
+///
+/// The key is copied from the existing row rather than spelled out, so what is planted is a duplicate of
+/// *this* path's byte key whatever that path is. Returns the planted id, which is the larger one: the
+/// merge must keep the older row.
+fn plant_legacy_pair(open: &Db, rel: &str) -> i64 {
+    let winner: i64 = open
+        .0
+        .query_row("SELECT id FROM notes WHERE rel = ?1", [rel], |row| {
+            row.get(0)
+        })
+        .expect("test setup: the scanned note has a row");
+    let loser = winner + 1000;
+    open.0
+        .execute_batch(&format!(
+            "INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body)
+             SELECT {loser}, rel_bytes, rel, 'Legacy second', 'filename', 'utf-8', 1, 'second'
+               FROM notes WHERE id = {winner};
+             INSERT INTO headings (note_id, level, text, line) VALUES ({loser}, 2, 'Second heading', 3);
+             INSERT INTO tags (note_id, tag) VALUES ({loser}, 'legacy-tag');
+             INSERT INTO items (note_id, text, line, state, marker)
+             VALUES ({loser}, 'legacy task', 4, 'open', '- [ ]');
+             INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
+             VALUES ({loser}, {winner}, 'wiki', 'Legacy first', 5, 'prose');"
+        ))
+        .expect("test setup: plant the second note row and its derived rows");
+    assert_eq!(
+        scalar(
+            open,
+            &format!("SELECT COUNT(*) FROM notes WHERE rel = '{rel}'")
+        ),
+        2,
+        "test setup: two note rows on one key"
+    );
+    loser
+}
+
+/// Rewind the file past migration 5 so the **next** open runs it, and drop the receipt that step wrote when
+/// the file was still empty — a version-four database holds neither (see `seed_duplicate_pair_at_version_four`
+/// in `crates/np-core/tests/db.rs`).
+fn rewind_past_the_merge(open: &Db) {
+    open.0
+        .execute_batch(&format!(
+            "DELETE FROM meta WHERE key = '{}';
+             DELETE FROM schema_version WHERE version = 5;",
+            db::NOTE_MERGE_KEY
+        ))
+        .expect("test setup: rewind past migration 5");
+    assert_eq!(
+        scalar(open, "SELECT MAX(version) FROM schema_version"),
+        4,
+        "test setup: migration 5 has not run here"
+    );
+}
+
+#[test]
+fn a_merged_duplicate_pair_clears_the_charge_and_records_the_parse_version() {
+    // F19 §4.3, and the test that says the defect is gone rather than documented. Before the merge the pair
+    // charged `uncovered` on every scan, so `refresh_covered` never held, the parse version was withheld
+    // forever and the whole corpus re-parsed each run. After it: one scan covers everything, records the
+    // rules it wrote with, and the scan after that has nothing to do.
+    let ws = scratch(
+        &[
+            (
+                "dup.md",
+                "---\n# Dup Heading\n---\n\n#dup-tag\n\n- [ ] task\n",
+            ),
+            ("other.md", "# Other Heading\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    let db = ws.db();
+    plant_legacy_pair(&db, "dup.md");
+    rewind_past_the_merge(&db);
+    // A legacy workspace never recorded the rules its rows were written under, so a refresh is owed — the
+    // state F19 §1 describes, with the pair sitting on top of it.
+    forget_parse_version(&db);
+    drop(db);
+
+    let report = scan(&ws.root, &ws.cfg).expect("the merge happens at this open");
+    assert_eq!(
+        report.merged_notes.as_deref(),
+        Some("merged=1;paths=dup.md"),
+        "the run that merged is the run that says so: {report:?}"
+    );
+    // The charge is gone, and with it the reason the version was withheld: nothing was refused, so nothing
+    // was left uncovered.
+    assert!(
+        report.skipped.is_empty(),
+        "the pair is merged before the write pass reaches it: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION),
+        "a refresh that covered everything records the rules it wrote with"
+    );
+    let rows = child_rowids(&db);
+    drop(db);
+
+    // And it stays cleared. Without the merge this workspace re-parsed both notes on every scan forever,
+    // because the version could never be recorded — the cost F19 §1 names, pinned here as "the next scan
+    // writes no derived row at all".
+    let again = scan(&ws.root, &ws.cfg).expect("test: second scan");
+    assert!(again.merged_notes.is_none(), "once per process: {again:?}");
+    assert!(again.skipped.is_empty(), "{again:?}");
+    let db = ws.db();
+    assert_eq!(
+        child_rowids(&db),
+        rows,
+        "the refresh does not come back for another pass"
+    );
+    assert_eq!(recorded_parse_version(&db), Some(PARSE_VERSION));
+}
+
+#[test]
+fn an_unmerged_duplicate_pair_still_charges_the_refresh_and_withholds_the_version() {
+    // The reader F13 §7 wrote stays live: migration 5 only runs once, so a database **another tool** wrote
+    // can still arrive holding a pair with nothing left to merge it. Refusing to guess then has to stay
+    // expensive — the note is not rewritten, the path is named, and the parse version stays unrecorded — or
+    // F15's mislabelling returns through the door F19 just closed.
+    let ws = scratch(
+        &[
+            (
+                "dup.md",
+                "---\n# Dup Heading\n---\n\n#dup-tag\n\n- [ ] task\n",
+            ),
+            ("other.md", "# Other Heading\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    let db = ws.db();
+    let loser = plant_legacy_pair(&db, "dup.md");
+    // Deliberately *not* rewound: migration 5 is recorded as done, so this pair is the permanent kind.
+    forget_parse_version(&db);
+    drop(db);
+
+    let report = scan(&ws.root, &ws.cfg).expect("a legacy pair must not fail the scan");
+    assert!(
+        report.merged_notes.is_none(),
+        "nothing was merged on this open: {report:?}"
+    );
+    assert_eq!(
+        report.skipped,
+        vec!["dup.md".to_string()],
+        "the path holding two rows is named, not guessed at: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        recorded_parse_version(&db),
+        None,
+        "a note nobody re-parsed cannot be labelled as re-parsed (F15)"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes WHERE rel = 'dup.md'"),
+        2,
+        "and both rows are still there: the reader refuses to pick one to rewrite"
+    );
+    assert_eq!(
+        texts(
+            &db,
+            &format!("SELECT title FROM notes WHERE id = {loser} ORDER BY id")
+        ),
+        ["Legacy second".to_string()],
+        "the planted row keeps what it was written with"
+    );
+}
