@@ -1032,9 +1032,10 @@ fn merge_receipt(db: &Db) -> String {
 /// The stdout half of F19's announcement, asserted where every platform runs it — the pin F21's review asked
 /// for and this file never grew for the merge line.
 ///
-/// Three things, in order: the upgrading run prints the line naming the merged path; `--json` carries the
-/// identical string under `merged_notes`; and no later scan of that workspace announces it on either channel
-/// while `meta` keeps the receipt forever.
+/// Four things, in order: the upgrading run prints the line naming the merged path; `--json` carries the
+/// identical string under `merged_notes`; no later scan of that workspace announces it on **either** channel
+/// while `meta` keeps the receipt forever; and an upgrade with nothing to fold stays silent on stderr, which is
+/// the CLI half of the zero guard in `db::report_merges`.
 #[test]
 fn the_upgrading_scan_prints_the_merged_pair_on_stdout() {
     // Two workspaces because the announcement belongs to the one run whose own `Db::open` did the merging: a
@@ -1111,6 +1112,13 @@ fn the_upgrading_scan_prints_the_merged_pair_on_stdout() {
         "the receipt is history, not a queue; a line on every scan trains the reader to ignore it:\n{}",
         printed.stdout()
     );
+    // The other channel of the same promise: `report_merges` writes to stderr, so "never again" has to hold
+    // there too — stdout alone only rules out the summary line. F21's orphan case does this for `orphan row(s)`.
+    assert!(
+        !printed.stderr().contains("merged="),
+        "a later scan has nothing to announce on stderr either:\n{}",
+        printed.stderr()
+    );
 
     // Never cleared: the echo is a copy of a record that outlives it.
     let db = Db::open(&json_ws.db_path()).expect("test setup: open the merged database");
@@ -1118,6 +1126,50 @@ fn the_upgrading_scan_prints_the_merged_pair_on_stdout() {
         merge_receipt(&db),
         MERGE_RECEIPT,
         "the durable receipt survives every later scan"
+    );
+
+    // The zero guard, on the one run that can reach it. `report_merges` is called only by the open that actually
+    // ran migration 5, so a later scan cannot catch a missing guard however often it runs: this workspace
+    // upgrades now, finds no pair, writes `merged=0;paths=` to `meta`, and must print nothing. Delete the guard
+    // in `report_merges` and this assertion fails beside `a_merge_that_folded_nothing_writes_no_line`.
+    let quiet_ws = workspace();
+    rewind_to_version_four_without_a_pair(&quiet_ws);
+    let quiet = run(&mut quiet_ws.command(&["scan"]));
+    quiet.assert_success();
+    assert!(
+        !quiet.stderr().contains("merged="),
+        "`merged=0` states no work done — its record is `meta`, not stderr:\n{}",
+        quiet.stderr()
+    );
+    let db = Db::open(&quiet_ws.db_path()).expect("test setup: open the upgraded database");
+    assert_eq!(
+        merge_receipt(&db),
+        "merged=0;paths=",
+        "silent, but still recorded: \"looked and found none\" is not \"never looked\""
+    );
+}
+
+/// Leave a workspace's database claiming version four with **nothing to merge**, so the next `np scan` really
+/// runs migration 5 and finds no pair — the run that has to stay quiet on stderr.
+///
+/// The file is unindexed, which is what makes it pair-free: `notes` holds no rows at all, so `duplicate_groups`
+/// cannot answer with a group whatever the corpus on disk looks like.
+fn rewind_to_version_four_without_a_pair(ws: &Workspace) {
+    let db = Db::open(&ws.db_path()).expect("test setup: create the current schema");
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+        4,
+        "test setup: migration 5 has not run here"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"),
+        0,
+        "test setup: nothing for migration 5 to merge"
     );
 }
 

@@ -1161,15 +1161,14 @@ fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
         // the one place anything would notice. Returning rolls the merge and its receipt back together, which
         // leaves the file at version four to try again rather than committing a half-merged corpus.
         //
-        //
         // One consequence worth naming: the pragma answers about the **whole file** and this step runs it
         // unconditionally, so a workspace damaged by anything else — a child row whose note is simply gone —
         // now refuses to open at the four-to-five step where version four opened it, which is deliberate,
         // pinned by `the_merge_gate_refuses_damage_that_no_merge_could_have_caused` (a file with **no pair**, so
         // narrowing this check to `merged > 0` fails there) and by
-        // `the_merge_gate_refuses_a_child_row_whose_note_is_gone` (the same damage beside a pair), and its only exit is the message
-        // itself (table, rowid, parent) because §7 of `docs/design-f19-note-merge.md` rules out a repair
-        // command. The check is not scoped to rows this merge touched.
+        // `the_merge_gate_refuses_a_child_row_whose_note_is_gone` (the same damage beside a pair). Its only exit
+        // is the message itself (table, rowid, parent) because §7 of `docs/design-f19-note-merge.md` rules out a
+        // repair command. The check is not scoped to rows this merge touched.
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_foreign_key_check()",
             [],
@@ -1846,8 +1845,12 @@ mod tests {
     fn a_merge_that_folded_nothing_writes_no_line() {
         // The other half, and the only thing standing between this echo and a line on every fresh workspace:
         // `merged=0` still lands in `meta` as the record that the check ran, while stderr stays quiet. Delete
-        // the zero guard in `report_merges` and this test is what fails — no integration test can see
-        // descriptor 2, so nothing else would notice.
+        // the zero guard in `report_merges` and this test is what fails — **and now a CLI case fails with it**:
+        // `the_upgrading_scan_prints_the_merged_pair_on_stdout` asserts that an upgrade with nothing to fold says
+        // nothing on stderr. The old claim here was "no integration test can see descriptor 2", which this repo
+        // contradicts in three places — the child's stderr is read throughout `crates/np-cli/tests/cli.rs`, and
+        // F21 grew precisely this assertion for the orphan echo — so what is true is narrower: no CLI case
+        // asserted it **until now**.
         let mut out = Vec::new();
         report_merges(&mut out, "merged=0;paths=");
         assert!(out.is_empty(), "`merged=0` states no work done: {out:?}");

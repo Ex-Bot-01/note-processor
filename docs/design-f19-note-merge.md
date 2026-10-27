@@ -7,8 +7,10 @@ announcement, F13 §7 (the reader that names duplicates rather than pretending n
 ## 1. The defect
 
 Version 3 never put `UNIQUE` on `notes.rel`, so a path could hold more than one note row; migration 4 copied both onto
-one `rel_bytes`. Nothing merges them. The scan's reader sees the pair and returns `Indexed::Duplicate`, which charges
-`written.uncovered` **on every scan**, so `refresh_covered` never returns true: the parse version is withheld forever,
+one `rel_bytes`. **Nothing merged them — as filed, against a build that had no exit**; migration 5 (§3) is the
+exit this round adds, and everything below describes the build before it. The scan's reader sees the pair and
+returns `Indexed::Duplicate`, which charges `written.uncovered` **on every scan**, so `refresh_covered` never
+returns true: the parse version is withheld forever,
 every note in the workspace re-parses each run (a permanent several-hundred-millisecond cost on a large corpus), the
 refresh-gap line prints with nothing the user can do about it, and the registry row keeps advancing past derived rows
 that never change — a mixed-age database by design.
