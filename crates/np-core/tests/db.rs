@@ -2237,8 +2237,12 @@ fn seed_duplicate_notes_at_version_three(path: &Path) {
 /// - **the count is rows folded, not paths** — three losers across two keys, so `merged` has to read 3 while
 ///   `paths` names 2. A group of three is the only way to tell those apart, and every other fixture here holds
 ///   exactly one pair, where both numbers would be 1;
-/// - **the names are ordered by byte key** — `b.md` is planted first and carries the *lower* ids, so any receipt
-///   built from arrival order or winner-id order reads `b.md,a.md`. Only `ORDER BY rel_bytes` answers `a.md,b.md`.
+/// - **the names are not in arrival order and not in winner-id order** — `b.md` is planted first and carries the
+///   *lower* ids, so a receipt built from either of those reads `b.md,a.md`. That is all this fixture excludes: it
+///   does **not** pin the explicit `ORDER BY rel_bytes` in [`duplicate_groups`], because `GROUP BY` over that
+///   indexed column already yields ascending key order and deleting the clause keeps every test green (run, then
+///   restored). The clause is the statement of intent — one database, one receipt, whatever the planner chooses —
+///   and it stays for that reason, not because anything here would notice.
 fn seed_two_duplicate_groups_at_version_four(path: &Path) {
     let db = Db::open(path).expect("test setup: create the current schema");
     db.0.execute_batch(
