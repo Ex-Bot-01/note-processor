@@ -272,3 +272,9 @@ The standing list, no subsetting: `cargo fmt --check`; `cargo clippy --all-targe
 ignored release benchmark A/B/A against the merge base and record raw numbers **with what they cannot see**, in F19 §6's
 style: `two_pass_scan_over_two_thousand_notes` has no unreadable directory and no display-derived key, so it measures only
 the common path where the new code is one boolean test on rows that are not ambiguous.
+
+**Measured, A/B/A against `79bba56` (`two_pass_scan_over_two_thousand_notes --ignored`, host `pi`, euid 1000):** head cold
+395/387/388 then 388/385/385 ms, warm 64/64/65 then 63/64/64; base cold 383/384/387/384, warm 64/64/66/70. The ranges
+overlap and the second head block sits on the base numbers, so no cost is measurable at 2k notes — with the limit stated in
+the same breath as the numbers: this corpus contains no unreadable directory and no display-derived key, so `admits` never
+runs and the new code is one boolean test per row. It is evidence about the common path only.
