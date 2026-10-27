@@ -28,6 +28,12 @@ v4 seeder planted the loser's outgoing edge. One fixture gained a row; the other
 **not** duplicated assertion text, but an *unasserted precondition*. Extracting the assertion text would have left it
 exactly where it was.
 
+**Current state, so nobody hunts a hole that has been closed:** both seeders plant that edge today
+(`seed_duplicate_pair_at_version_four` at `db.rs:2162`, `seed_duplicate_notes_at_version_three` at `db.rs:2220`, the latter
+with a comment naming this exact failure). Nothing is broken right now. Which is precisely why the second half of F24 belongs
+to this item rather than to "already fixed": the row is there because a human remembered to put it there, and no assertion
+would notice its removal.
+
 So F24 has two halves, and only the second one is interesting:
 
 1. **Measure once.** A helper reads the facts; each test asserts them.
@@ -62,7 +68,10 @@ assert_planted_pair(&conn);   // two rows on `dup.md` (4 live-shape, 9), one edg
 ```
 
 `assert_planted_pair` takes a `&rusqlite::Connection`, which both seeders already hold (`db.0` in the v4 case, its own
-connection in the v3 case), so no fixture has to open the file twice or reorder migrations.
+connection in the v3 case), so no fixture has to open the file twice or reorder migrations. **It queries `rel = 'dup.md'`,
+never `rel_bytes`:** version three's `notes` has no key column at all (`db.rs:898-907`), so a shared premise check must stay
+inside the intersection of the two schemas — the same constraint that makes `ids on the key` a *post-merge* fact in §1 rather
+than a planted one.
 
 **Why not one shared test function taking a flag.** The two fixtures exist to make *different* claims — one is about the
 merge, one about migration 4 and 5 landing in a single open. A `fn check_merged_pair(db, is_v3: bool)` would either grow a
@@ -75,13 +84,18 @@ the drift it prevents is already prevented by having one query site.
 
 ## 4. Acceptance
 
-1. Each of the five SQL blocks exists **once** in `crates/np-core/tests/db.rs`.
+1. The five SQL blocks are reached from **one call site each**. Not "the text appears once in the file": a third
+   near-identical incoming-edge query lives in `a_merge_that_cannot_record_its_receipt_leaves_both_note_rows`
+   (`db.rs:2745`) and asserts the *pre*-merge state (`dst_note_id` still 9). That one must stay, and it is a different claim,
+   not a missed duplicate.
 2. Both fixtures still assert every fact they assert today — no assertion is dropped to make the extraction fit. Verify by
-   listing each test's `assert_eq!` count before and after; it must not fall.
-3. Deleting any single assertion block turns red **exactly one** test, never both silently-green — checked per block.
-4. Mutation: stop re-pointing incoming edges in migration 5 → **both** fixtures fail (they share the fact but keep their own
-   claim). Mutation: delete the loser's outgoing-edge `INSERT` from *one* seeder → that seeder's `assert_planted_pair` fails,
-   and it must fail even if every merge assertion is deleted. This is the mutation that F24 was filed for.
+   listing each test's `assert_eq!` count before and after; it must not fall (baseline: 9 and 9, seeders 1 and 1).
+3. **Per measured fact, break the production behaviour and watch who goes red** — removal proves nothing, since deleting an
+   assertion makes tests pass. Migration 5 mutations to run: stop re-pointing incoming edges → both fixtures red; skip the
+   loser's derived-row deletes → both red; keep the loser row (no fold) → both red plus the receipt count.
+4. The premise mutation F24 exists for: delete the loser's outgoing-edge `INSERT` from **one** seeder (both plant it today,
+   `db.rs:2162` and `db.rs:2220`) → that seeder's `assert_planted_pair` fails, and it must fail even with every merge
+   assertion deleted. Before this change the same edit leaves the suite green, which is the hole.
 5. Gates as usual; goldens unmoved; suite total does not drop (it may rise by the premise assertions).
 
 ## 5. Explicitly out of scope
