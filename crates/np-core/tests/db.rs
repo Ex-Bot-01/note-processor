@@ -2117,6 +2117,11 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
 const DUP_BYTES: &str = "X'6475702E6D64'";
 /// The byte key of `third.md`, the note that links to the loser.
 const THIRD_BYTES: &str = "X'74686972642E6D64'";
+/// The byte keys of the two paths in [`seed_two_duplicate_groups_at_version_four`]. `a.md` sorts first as a
+/// key while being planted second, which is what makes its position in the receipt a statement about ordering.
+const A_MD_BYTES: &str = "X'612E6D64'";
+/// The byte key of `b.md` — later as a key, earlier everywhere else.
+const B_MD_BYTES: &str = "X'622E6D64'";
 
 /// Plant F19 §5's shape and leave the file claiming version four, so the next open runs migration 5:
 /// one `rel_bytes` holding two note rows (ids 4 and 9 — the winner is 4 by `MIN(id)`, and the ids are
@@ -2210,6 +2215,41 @@ fn seed_duplicate_notes_at_version_three(path: &Path) {
         3,
         "test setup: migrations 4 and 5 both have to run on the open below"
     );
+}
+
+/// Plant a database holding **more than one** duplicate group and leave it claiming version four: `b.md` with
+/// two note rows (ids 3 and 5) and `a.md` with **three** (ids 7, 9 and 11).
+///
+/// The shape is chosen so the receipt's two degrees of freedom cannot both be satisfied by an accident:
+///
+/// - **the count is rows folded, not paths** — three losers across two keys, so `merged` has to read 3 while
+///   `paths` names 2. A group of three is the only way to tell those apart, and every other fixture here holds
+///   exactly one pair, where both numbers would be 1;
+/// - **the names are ordered by byte key** — `b.md` is planted first and carries the *lower* ids, so any receipt
+///   built from arrival order or winner-id order reads `b.md,a.md`. Only `ORDER BY rel_bytes` answers `a.md,b.md`.
+fn seed_two_duplicate_groups_at_version_four(path: &Path) {
+    let db = Db::open(path).expect("test setup: create the current schema");
+    db.0.execute_batch(
+        &format!(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+             VALUES ({B_MD_BYTES}, {B_MD_BYTES}, 'b.md', 'b.md', '/ws/b.md', 'h1', 5, 1, 'ok', 9),
+                    ({A_MD_BYTES}, {A_MD_BYTES}, 'a.md', 'a.md', '/ws/a.md', 'h2', 5, 1, 'ok', 9);
+             -- `b.md` first, and on the lower ids: see [`seed_two_duplicate_groups_at_version_four`]'s second
+             -- bullet — the receipt must not be able to come out in this order.
+             INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body) VALUES
+                (3,  {B_MD_BYTES}, 'b.md', 'B first',  'filename', 'utf-8', 1, 'b1'),
+                (5,  {B_MD_BYTES}, 'b.md', 'B second', 'filename', 'utf-8', 1, 'b2'),
+                (7,  {A_MD_BYTES}, 'a.md', 'A first',  'filename', 'utf-8', 1, 'a1'),
+                (9,  {A_MD_BYTES}, 'a.md', 'A second', 'filename', 'utf-8', 1, 'a2'),
+                (11, {A_MD_BYTES}, 'a.md', 'A third',  'filename', 'utf-8', 1, 'a3');"
+        ),
+    )
+    .expect("test setup: plant two duplicate groups, one of them a triple");
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
 }
 
 /// The [`NOTE_MERGE_KEY`] receipt as the file holds it.
@@ -2318,6 +2358,52 @@ fn merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge() 
 }
 
 #[test]
+fn the_receipt_counts_folded_rows_across_groups_and_names_paths_in_key_order() {
+    // The receipt shape at more than its smallest point. Every other merge fixture holds one pair, where
+    // `merged` and the name list are both a single 1 and cannot be told apart; here three rows fold out of two
+    // keys, and the keys are planted in the opposite order to the one the receipt has to print.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_two_duplicate_groups_at_version_four(&path);
+
+    let db = Db::open(&path).expect("the open runs migration 5 over both groups");
+
+    assert_eq!(
+        merge_receipt_of(&db),
+        "merged=3;paths=a.md,b.md",
+        "three rows folded, two paths named, names in byte-key order — not arrival order"
+    );
+
+    // The receipt's arithmetic checked against the rows it describes: one survivor per key, each the oldest on
+    // that key, and nothing else left behind.
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {A_MD_BYTES} ORDER BY id"
+            )
+        ),
+        ["7".to_string()],
+        "the triple left its MIN(id) standing"
+    );
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {B_MD_BYTES} ORDER BY id"
+            )
+        ),
+        ["3".to_string()],
+        "and the pair left its own"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"),
+        2,
+        "five rows in, two out: `merged=3` is the difference, not a path count"
+    );
+}
+
+#[test]
 fn a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges() {
     // The jump real legacy workspaces make. Every other F19 fixture plants its pair on a finished schema and
     // rewinds one version row, so none of them says that migration 4's copy is what puts two rows on one
@@ -2332,7 +2418,10 @@ fn a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges() {
 
     // Both steps landed: the file is current, and the pair sits on one byte key — which is migration 4's doing
     // (`CAST(rel AS BLOB)` per row), and the precondition migration 5 merges on.
-    assert_eq!(scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"), 5);
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
+        5
+    );
     assert_eq!(
         scalar::<String>(&db, "SELECT hex(rel_bytes) FROM files WHERE rel = 'dup.md'"),
         "6475702E6D64",
