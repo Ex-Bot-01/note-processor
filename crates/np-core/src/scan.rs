@@ -1835,12 +1835,13 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// and the notice below names the count so this is never silent.
 ///
 /// Read that healing narrowly, because it is the scope boundary of this paragraph: it covers
-/// [`Indexed::Duplicate`] — **two note rows on one byte key** — and no other duplicate. F23's duplicate is another
-/// shape and this branch does not reach it: two live `files` **and** `notes` rows for one file, which
-/// [`display_spelled`] *creates* when a readable path hides behind an unreadable twin sharing its lossy display
-/// spelling, and which that comment states flatly — **no scan clears that.** A workspace can therefore still hold
-/// the parse version back on a duplicate forever; "duplicates are healed at open" is not a sentence to carry past
-/// here.
+/// [`Indexed::Duplicate`] — **two note rows on one byte key** — and no other duplicate. F23's duplicate is another shape,
+/// two live `files` **and** `notes` rows for one file behind a lossy display spelling, and F23 healed only the half where
+/// content still agrees: a row whose **content changed while its path was unindexable** has nothing to pair on, so the
+/// pair returns and this function keeps withholding the version — permanently for a migration-keyed row, whose stored key
+/// matches no listing (`docs/design-f23-ambiguous-rows.md` §6 names durable file identity as the way through). "Duplicate
+/// rows are healed" is therefore not a sentence to carry past here; "the ones this program can prove are one file are
+/// healed" is.
 fn refresh_covered(written: &Written, hidden_by_unknown: usize) -> bool {
     written.uncovered == 0 && hidden_by_unknown == 0
 }

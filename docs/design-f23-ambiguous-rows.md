@@ -90,6 +90,14 @@ naturally disjoint:
   from "did we strip a `Removed`" would charge zero times for a marked row that `classify` filtered out before ever emitting
   one, and an uncharged stale row is exactly the F15 class this project keeps paying to avoid.
 
+**Which clause wins when they disagree.** Admission (§4's pre-drop) decides only whether a row enters `known`; discharge
+(§3's match route) is decided independently, from what the walk listed. So a row can be **refused admission and still
+discharge**: the permanent class — a name whose OS bytes really are its display text — has its own path listed under the very
+key it stores, so `upsert_file` re-joins the file to its row even when content changed and no claim was possible, and nothing
+stayed stale. That is not a loophole to close; charging there would bill a note for work the scan did. Pinned by
+`a_permanent_class_row_whose_content_changed_while_a_twin_is_blocked_rejoins_its_own_row`, which is also the only fixture
+that fails when §3's `matched` exclusion is deleted on its own.
+
 ## 4. Where the mark lives (enforcement point)
 
 `classify` keeps its signature and its semantics — it is `pub` with ~30 call sites in `tests/change.rs`, and teaching it a
@@ -272,6 +280,10 @@ The standing list, no subsetting: `cargo fmt --check`; `cargo clippy --all-targe
 ignored release benchmark A/B/A against the merge base and record raw numbers **with what they cannot see**, in F19 §6's
 style: `two_pass_scan_over_two_thousand_notes` has no unreadable directory and no display-derived key, so it measures only
 the common path where the new code is one boolean test on rows that are not ambiguous.
+
+Runner identification, which §5.7 demands because `chmod 000` does not deny a privileged user: host `pi`, euid 1000, head
+`ebaa17f`, commands `cargo test --workspace` (exit 0 with no `test result: FAILED` line anywhere) and
+`cargo test -p np-core --test scan -- --nocapture` (zero `NOT COVERAGE` lines, so every permission-dependent fixture ran).
 
 **Measured, A/B/A against `79bba56` (`two_pass_scan_over_two_thousand_notes --ignored`, host `pi`, euid 1000):** head cold
 395/387/388 then 388/385/385 ms, warm 64/64/65 then 63/64/64; base cold 383/384/387/384, warm 64/64/66/70. The ranges

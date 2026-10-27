@@ -3294,8 +3294,9 @@ fn a_migrated_text_keyed_row_behind_an_unreadable_directory_is_not_reported_remo
 /// display text" looks like it cures F23's duplicate rows, and here it produces `removed: 1` — a live note staled and
 /// dropped from the catalog while `PARSE_VERSION` is recorded over rows nobody re-parsed (design-f20 §4.2). A lossy
 /// key holds no byte spelling, so nothing computable in `known_rows` can tell this configuration from the one
-/// [`known_defect_a_readable_display_keyed_path_duplicates_its_own_row`] documents: hand those two scans the same
-/// inputs to `known_rows` and the right verdicts are opposite.
+/// [`a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version`] used to document: hand those two scans
+/// the same inputs to `known_rows` and the right verdicts were opposite. That fixture now pins the healing, which only
+/// happens when content agrees — the unpairable variant is still this configuration's twin in everything but outcome.
 ///
 /// Any future fix that makes this test report `removed: 1`, or moves the note off its id, has destroyed a live note.
 #[cfg(unix)]
@@ -3630,6 +3631,113 @@ fn a_row_keyed_from_its_own_lossy_bytes_discharges_by_match_without_a_move() {
         recorded_parse_version(&db),
         Some(PARSE_VERSION),
         "a marked row that resolved by match charges nothing, in either source — §3's sum is what gates this write"
+    );
+}
+
+/// **The permanent class with changed content — the state where design §3 and §4 met and had to be reconciled.**
+/// Same fixture shape as [`a_row_keyed_from_its_own_lossy_bytes_discharges_by_match_without_a_move`], but the note's
+/// body is edited while its twin is blocked, so its hash no longer matches the stored one. §2's scoping therefore
+/// refuses admission (it demands display equality **and** hash equality), and what settles it instead is that the row's
+/// own path is listed and readable: `upsert_file` resolves by `rel_bytes`, which for this class *is* the stored key, so
+/// the file re-joins its own row rather than minting a second one. §3's `matched` exclusion is what stops the row being
+/// charged as unresolved ambiguity while nothing about it stayed stale.
+///
+/// This is the residue's neighbour, not the residue: F23's unsolved case is a **migration-keyed** row whose bytes are
+/// display text but whose real path is byte-distinct — there is no listing that resolves to its key, and the duplicate
+/// pair returns. Here the key still matches reality, which is why content changing is survivable.
+#[cfg(unix)]
+#[test]
+fn a_permanent_class_row_whose_content_changed_while_a_twin_is_blocked_rejoins_its_own_row() {
+    assert_twin_dirs();
+    const LOSSY_DIR: &[u8] = b"caf\xEF\xBF\xBD";
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_note_dir(&ws.root, LOSSY_DIR, "# Twin Heading\n") {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {LOSSY_DIR:?}, so nothing here is \
+             keyed from its own display bytes"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    let note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    assert!(
+        plant_note_dir(&ws.root, TWIN_DIR_NINE, "# Quite Another Heading\n"),
+        "test setup: plant the sibling directory"
+    );
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!("NOT COVERAGE: 0o000 did not deny access to the sibling on this runner");
+        return;
+    }
+
+    // The edit that breaks hash agreement. Admission is now refused (§2), and only the listing of its own path can
+    // settle the row.
+    fs::write(
+        byte_name(&ws.root, LOSSY_DIR).join("note.md"),
+        "# Edited While Blocked\n\nThe body no longer matches what the row stores.\n",
+    )
+    .expect("test setup: edit the note");
+
+    let report =
+        scan(&ws.root, &ws.cfg).expect("an edited lossy-named note must not fail the scan");
+    // Measured, not assumed: classification calls the path `Added` — the row was pre-dropped, so nothing was there
+    // to pair with — and that is also what makes this safe rather than duplicating.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (1, 0, 0, 0),
+        "the edited path is new work on its own account; nothing was moved and nothing was removed: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'")
+        ),
+        1,
+        "one live row, because `upsert_file` resolves by `rel_bytes` and for this class the stored key *is* the real          bytes — the `Added` re-joined the row it already had instead of minting a second one: {report:?}"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        note_id,
+        "same note id: headings, tags, items and links stayed attached through an edit nobody could pair on"
+    );
+    assert_eq!(
+        report.notes, 2,
+        "and the catalog still counts two notes, not three — no duplicate entry for one file: {report:?}"
+    );
+
+    // §3's `matched` exclusion, pinned from outside: the row was marked and unresolved by hash, yet its own readable
+    // listing means nothing stayed stale, so neither source charges it and the version is writable. Delete that
+    // exclusion and this line goes back to the outdated value — a note charged forever for work this scan did.
+    assert_eq!(
+        heading_texts(&db, "top.md"),
+        vec!["Top Heading".to_string()],
+        "the readable note really was refreshed, so a recorded version means coverage: {report:?}"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION),
+        "a marked row listed and read on its own key charges nothing"
+    );
+    let losses = recorded_losses(&db);
+    assert!(
+        losses.contains("ambiguous=0"),
+        "and the durable record agrees with the charge rather than inventing a worry: {losses}"
     );
 }
 
@@ -4328,9 +4436,12 @@ fn plant_note_dir(root: &Path, dir: &[u8], body: &str) -> bool {
 ///
 /// Two twins of `caf\xE9` / `caf\xE8` give one display path with two live rows — and note what that is **not**:
 /// these are two different files with two different bodies, correctly indexed, which is the innocent shape a
-/// duplicate count cannot distinguish from F23's harm. [`known_defect_a_readable_display_keyed_path_duplicates_its_own_row`]
-/// ends in one physical file holding two rows; [`a_duplicated_note_from_f23_reaches_the_record`] builds that shape
-/// instead, through `rekey_row_like_migration_four`, so both the innocent and the harmful case are pinned. Beside
+/// duplicate count cannot distinguish from F23's harm. **What is no longer pinned, said plainly:** since F23 healed the
+/// pairable case, no fixture drives an F23-shaped row into `duplicates=1` — the shape that used to do it
+/// (`a_healed_pair_leaves_no_duplicate_in_the_record_but_still_names_the_loss`, formerly the harm fixture) now converges
+/// to one live row and `duplicates=0`. The residue — content changed while unindexable — is the configuration that would,
+/// and design §6 defers it. So this test pins the innocent shape and the stale-row filter only; do not read it as coverage
+/// of the harmful one. Beside
 /// them sits a second pair whose rows are one live and **one stale**: that path appears once in
 /// the catalog, so it is not a duplicate, and it is the assertion that pins `state = 'ok'`. Drop the filter
 /// and this case reports two duplicates and names `old\u{FFFD}/note.md`, which is a note nobody has twice.

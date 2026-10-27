@@ -418,7 +418,8 @@ What these numbers can and cannot carry:
   name genuinely holding `U+FFFD`, and every lossy name on Windows — discharges by **match**, with no move at all:
   `a_row_keyed_from_its_own_lossy_bytes_discharges_by_match_without_a_move`. The durable record gained `ambiguous=N`,
   rendered from exactly the population that holds the version back, so a person reading `meta` tomorrow learns what a
-  withheld version meant. **Shipped (m6 commits `684ddb8`..`b953be0`, `docs/design-f23-ambiguous-rows.md`).**
+  withheld version meant. **Shipped on `m6/ambiguous-rows` (`347dc2c`..`ebaa17f`; the branch was rewritten to reword two `wip:` subjects, so any
+  earlier SHA quoted for it no longer resolves), `docs/design-f23-ambiguous-rows.md`).**
 - **The claim is scoped to the look-alike, and that is load-bearing.** `classify` matches a move on **hash alone**, and its
   `present_hashes` guard cannot fire for a display-derived key (that set is seeded from known rows whose *key* matches an
   unreadable listing). So admission requires a listed readable path that spells the row exactly **and** matches its stored
