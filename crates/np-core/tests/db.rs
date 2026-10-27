@@ -18,7 +18,7 @@ use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_
 use np_core::config::Config;
 use np_core::db::{
     apply_move, mark_stale, note_counts, upsert_file, Db, DbError, Migration, NoteCounts,
-    FK_ORPHANS_KEY, MIGRATIONS, PATHS_LOSSY_KEY,
+    FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
 };
 use np_core::hash::{sha256_file, Snapshot};
 use np_core::path_keys::RelPath;
@@ -1947,52 +1947,62 @@ fn upsert_file_keys_come_from_rel_and_never_from_abs() {
     );
 }
 
-/// Write a version-three database holding **two `notes` rows for one path** — legal at that version, because
-/// `notes.rel` carried no `UNIQUE` (F13 §7) — beside a second file on disk that has no row at all.
+/// Plant **two `notes` rows for one path** on a database whose migrations have already run.
 ///
-/// The pair is deliberate: the duplicate exercises migration 4's copy (`CAST(rel AS BLOB)` per row) while
-/// `fresh.md` exercises the one writer that can invent a keyless note, [`np_core::db::insert_note`].
-fn seed_duplicate_notes_version_three(path: &Path, rel: &str, hash: &str, size: i64) {
-    let conn = rusqlite::Connection::open(path).expect("test setup: open the old file");
-    conn.execute_batch(VERSION_THREE)
-        .expect("test setup: version-three schema");
-    conn.execute(
-        "INSERT INTO files (rel, case_key, abs, hash, size, mtime, state, last_seen)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, 'ok', 90)",
+/// This used to be a version-three fixture. Migration 5 (F19) merges any pair it can see at open time, so the
+/// only way to meet a pair *as a pair* is to write one after the migrations ran — which is exactly the
+/// population `docs/design-f19-note-merge.md` §3 says the reader exists for: a database another tool wrote.
+///
+/// The values are the ones the old fixture used, so the assertions below read as they always did: ids 4 and 9
+/// (non-consecutive, because that is what a legacy file looks like) beside one `files` row whose `hash` matches
+/// the note on disk and whose `mtime` is an impossible `1`. That mtime makes the cheap size-and-mtime trigger
+/// fail so the digest is compared and `classify` calls the file unchanged: a note that is *not* rewritten is
+/// what keeps property (1) below a statement about the reader rather than about `store_note`.
+fn plant_duplicate_notes_after_migration(db: &Db, rel: &str, hash: &str, size: i64) {
+    // A hex literal, not a bind: `rel_bytes` is a BLOB under a `typeof(rel_bytes) = 'blob'` CHECK, and a TEXT
+    // bind is refused rather than quietly matching (F13 §4). `dup.md` is ASCII, so its case fold is itself.
+    let key = "X'6475702E6D64'";
+    db.0.execute(
+        &format!(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state,
+                                last_seen)
+             VALUES ({key}, {key}, ?1, ?2, ?3, ?4, ?5, 1, 'ok', 90)"
+        ),
         rusqlite::params![rel, rel.to_lowercase(), format!("/ws/{rel}"), hash, size],
     )
     .expect("test setup: seed the duplicated-note file row");
-    // `mtime` is an impossible `1` on purpose: the cheap size-and-mtime trigger has to fail so a scan
-    // compares the real digest above and reads this file as unchanged. The note is then not rewritten, which
-    // keeps property (1) below a statement about migration 4's copy rather than about `store_note`.
-    let mut statement = conn
-        .prepare(
-            "INSERT INTO notes (id, rel, title, title_source, encoding, word_count, body)
-             VALUES (?1, ?2, ?3, 'filename', 'utf-8', 1, ?4)",
-        )
-        .expect("test setup: prepare the note insert");
-    // Two rows, one path, non-consecutive ids — every shape `notes.rel`'s missing `UNIQUE` allowed.
     for (id, title, body) in [(4, "Dup first", "first"), (9, "Dup second", "second")] {
-        statement
-            .execute(rusqlite::params![id, rel, title, body])
-            .expect("test setup: two note rows for one path");
+        db.0.execute(
+            &format!(
+                "INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body)
+                 VALUES (?1, {key}, ?2, ?3, 'filename', 'utf-8', 1, ?4)"
+            ),
+            rusqlite::params![id, rel, title, body],
+        )
+        .expect("test setup: two note rows for one path");
     }
 }
 
 #[test]
 fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a_bare_query_row() {
-    // `notes.rel` was never UNIQUE at version 3, so a legacy database may carry two note rows for one file,
-    // and migration 4 copies both onto one `rel_bytes` — which has no UNIQUE there by design (F13 §7). This
-    // is the population every identity lookup now plans for: a bare `query_row` on such a key is **not a wrong
-    // answer but a scan error** (`ExecuteMultipleValues`), and `LIMIT 1` is a silent pick that rewrites one
-    // note's title, tags, items and links with the other file's. So [`np_core::db::note_ids`] reads every id
-    // and the scan acts on the count.
+    // `notes.rel` was never UNIQUE, so one path can hold two note rows and `rel_bytes` carries no UNIQUE to
+    // refuse it (F13 §7). This is the population every identity lookup now plans for: a bare `query_row` on
+    // such a key is **not a wrong answer but a scan error** (`ExecuteMultipleValues`), and `LIMIT 1` is a
+    // silent pick that rewrites one note's title, tags, items and links with the other file's. So
+    // [`np_core::db::note_ids`] reads every id and the scan acts on the count.
     //
-    // Round 2 amended the second half of this test (F13 §7): what used to be "indexed quietly" is now
-    // reported. Three things are pinned:
-    // (1) the legacy duplicate neither fails the scan nor gets a silent winner — the file is named in
-    //     `skipped` and **no note is rewritten**;
-    // (2) the migration neither collapses the pair into one row nor refuses it: both survive, on one key;
+    // F19 amended *how the pair gets here*, not what is pinned about reading it. It used to arrive through
+    // migration 4's mechanical key copy, and the test then pinned that no migration made an unannounced
+    // identity call. Migration 5 is a different act: it merges such a pair onto `MIN(id)`, re-points incoming
+    // edges instead of nulling them, and writes its receipt in the same transaction — an announced repair,
+    // not the silent pick F13 refused (`docs/design-f19-note-merge.md` §2 and §4; the F19 section below
+    // this test pins that merge). Three things stay pinned, and (1) and (3) are unchanged in substance:
+    // (1) a pair that exists when a scan runs neither fails the scan nor gets a silent winner — the file is
+    //     named in `skipped` and **no note is rewritten**;
+    // (2) migration 5 does not chase a pair that appears after it ran, and nothing else folds one either: both
+    //     rows survive on one key. That reachability is deliberate — §7 keeps `notes(rel_bytes)` free of a
+    //     UNIQUE index so this defensive arm stays a state the reader can be shown rather than dead code
+    //     maintained by hand;
     // (3) after a write pass no note row carries a NULL `rel_bytes`, so none can hide from the re-keyed join.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let root = tmp.path().join("ws");
@@ -2006,18 +2016,15 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
         ..Config::default()
     };
     let db_path = cfg.workspace_db(&root);
-    fs::create_dir_all(
-        db_path
-            .parent()
-            .expect("test setup: the workspace database sits in a directory"),
-    )
-    .expect("test setup: database directory");
+    // Migrated to completion *before* the pair exists, so what follows is a database another tool wrote into.
+    let db = Db::open(&db_path).expect("test setup: migrate the database, then plant beside it");
     let dup = root.join("dup.md");
     let hash = sha256_file(&dup).expect("test setup: hash the note the way a scan does");
     let size = fs::metadata(&dup)
         .expect("test setup: read the note's size")
         .len() as i64;
-    seed_duplicate_notes_version_three(&db_path, "dup.md", &hash, size);
+    plant_duplicate_notes_after_migration(&db, "dup.md", &hash, size);
+    drop(db);
     assert_eq!(
         rusqlite::Connection::open(&db_path)
             .expect("test: read the fixture's note rows")
@@ -2028,10 +2035,10 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
             )
             .expect("test: the fixture records its notes"),
         2,
-        "premise: version three really would hold two rows for one path"
+        "premise: the current schema really does accept two rows for one path"
     );
 
-    let report = scan(&root, &cfg).expect("a legacy duplicate must not fail the scan");
+    let report = scan(&root, &cfg).expect("a duplicate pair must not fail the scan");
     // (1) The duplicate is named, by the spelling a person can match against their workspace, and the scan
     // carried on to `fresh.md`. Nothing about `dup.md` was counted: it was refused, not indexed.
     assert_eq!(
@@ -2058,9 +2065,9 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
             "9:Dup second:second".to_string(),
             "10:Fresh:# Fresh\n".to_string(),
         ],
-        "no note was rewritten, and the untouched pair still reads as the legacy fixture wrote it"
+        "no note was rewritten, and the untouched pair still reads as it was planted"
     );
-    // (1) Both legacy rows, both ids, one key — and `fresh.md`'s brand-new note keyed the same way.
+    // (1) Both rows, both ids, one key — and `fresh.md`'s brand-new note keyed the same way.
     assert_eq!(
         names(
             &db,
@@ -2071,12 +2078,23 @@ fn two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a
             "dup.md:9:6475702E6D64",
             "fresh.md:10:66726573682E6D64",
         ],
-        "both legacy rows survive onto the one byte key, and the note this scan minted carries a key as well"
+        "both rows survive onto the one byte key, and the note this scan minted carries a key as well"
     );
     assert_eq!(
         scalar::<String>(&db, "SELECT hex(rel_bytes) FROM files WHERE rel = 'dup.md'"),
         "6475702E6D64",
         "the two notes hang off one `files` row's key, which is what makes the key non-unique by design"
+    );
+    // (2) The new half of the contract. Migration 5 ran on this file — and recorded that it merged nothing,
+    // because the pair did not exist yet. It does not run again, so a pair written afterwards is never folded
+    // quietly: it is named by every scan until whoever wrote it is dealt with (F19 §3).
+    assert_eq!(
+        scalar::<String>(
+            &db,
+            &format!("SELECT value FROM meta WHERE key = '{NOTE_MERGE_KEY}'")
+        ),
+        "merged=0;paths=".to_string(),
+        "the merge is recorded as done and empty while a pair still stands: no second pass, no silent winner"
     );
 
     // (3) §5's weaker, more important half: no keyless note after a write pass. A NULL key matches nothing

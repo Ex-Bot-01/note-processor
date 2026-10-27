@@ -99,6 +99,17 @@ fn print_summary(report: &ScanReport) {
             receipt
         );
     }
+    // What this run's own `Db::open` merged — F19's duplicate-note repair. One value, printed verbatim as
+    // `meta` holds it under `np_core::db::NOTE_MERGE_KEY`, so this line and the durable record cannot drift
+    // and no second count is computed here.
+    //
+    // Once per database rather than on every scan (`ScanReport::merged_notes` gives the reason), and dropped
+    // when stdout refuses writes like every other line here: the merge itself is committed, and its receipt
+    // is in `meta`. The same sentence can also appear on stderr from the migration
+    // (`np_core::db::report_merges`), which is the deliberate duplication `report_orphans` documents.
+    if let Some(receipt) = &report.merged_notes {
+        let _ = writeln!(out, "merge      {receipt}");
+    }
     let _ = writeln!(out, "notes      {}", report.notes);
     let _ = write!(out, "unresolved {}", report.unresolved_links);
     if report.unresolved_links > 0 {

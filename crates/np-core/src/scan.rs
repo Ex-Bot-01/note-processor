@@ -196,6 +196,16 @@ pub struct ScanReport {
     /// reader cannot tell "nothing was removed" apart from "this build stopped reporting it", and every
     /// reader grows a missing-key branch to answer a question `null` already answered.
     pub upgrade_orphans: Option<String>,
+    /// What **this process's own** `Db::open` merged, spelled exactly as the receipt it stored under
+    /// [`crate::db::NOTE_MERGE_KEY`] — and `None` for every other scan.
+    ///
+    /// The same two conditions as [`Self::upgrade_orphans`], for the same reasons: this open ran migration 5
+    /// ([`crate::db::Db::merged_notes`], not a later open of the same file), and that merge folded at least
+    /// one duplicate note row. A `merged=0` receipt stays in `meta` as the record that the check ran while
+    /// this field reports work done, so an ordinary workspace's report says `null`.
+    ///
+    /// **Null, not absent**, for the reason [`Self::upgrade_orphans`] gives: one JSON shape for every scan.
+    pub merged_notes: Option<String>,
     /// What this scan could not index, and what the registry duplicates — counted by kind, which is the
     /// diagnosis [`ScanReport::skipped`] cannot give because it merges every cause into one list of paths
     /// (F22 §1). `None` when every count is zero, so a workspace that lost nothing keeps a clean report.
@@ -372,6 +382,12 @@ pub fn scan_with_inject(
         .upgrade_orphans()
         .filter(|receipt| db::orphan_total(receipt) > 0)
         .map(str::to_owned);
+    // Decided the same way one line later: only the open that ran migration 5 can announce the merge, and a
+    // receipt of `merged=0` proves the check ran without reporting any work.
+    let merged_notes = db
+        .merged_notes()
+        .filter(|receipt| db::merge_total(receipt) > 0)
+        .map(str::to_owned);
     // Which rules wrote the rows on disk. Read before anything is written, so this one scan both does the
     // re-parse and records what it re-parsed with: `classify` compares bytes and knows nothing about the
     // rules that turn those bytes into headings, tags, items and links, so without this a note nobody has
@@ -464,6 +480,7 @@ pub fn scan_with_inject(
         unresolved_targets: targets,
         index_files: rendered.iter().map(|(name, _)| name.clone()).collect(),
         upgrade_orphans,
+        merged_notes,
         // `None` when nothing was lost, so the common report stays clean while its JSON still carries the
         // key as `null` — one shape for every scan, which is what [`ScanReport::upgrade_orphans`] argues.
         unindexable: (!losses.is_empty()).then_some(losses),
@@ -942,8 +959,13 @@ enum Indexed {
     /// display `rel` changed; and `upsert_file` has refreshed `hash`, `size`, `mtime` and `state`. The
     /// registry row is therefore current while the two notes keep an older title, body, headings, tags,
     /// items and prose edges — a deliberately mixed-age database, because every alternative either merges
-    /// two notes nobody asked to merge or stops the scan. Nothing heals this on its own: see
-    /// `docs/backlog-m2-followups.md` F19.
+    /// two notes nobody asked to merge or stops the scan.
+    ///
+    /// This state is now **transient for our own databases**: migration 5
+    /// (`crate::db::merge_duplicate_notes`, a code span: that step is private) folds such a pair onto its
+    /// `MIN(id)` the first time the file is opened, so no scan of a database this program wrote reaches this
+    /// arm twice. It stays permanent — and this reader stays load-bearing — only for a database another tool
+    /// wrote, which can still arrive with a pair.
     Duplicate,
 }
 
