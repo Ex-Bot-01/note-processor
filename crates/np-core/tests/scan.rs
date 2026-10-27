@@ -3478,6 +3478,161 @@ fn a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version() {
     );
 }
 
+/// **F23 §5.0: the second resolution route — discharge by *match*, with no re-key anywhere.** Design §2 says a
+/// row resolves either by claim (`Moved`, re-keyed from real bytes) or by **match** (its own display path listed
+/// this pass with a non-empty hash), and every fixture above takes the first route. This one takes the second,
+/// built from the class that takes it permanently rather than once: a directory whose name really does hold the
+/// bytes `EF BF BD`. An ordinary scan keys that path from the walk's own bytes, and those bytes **are** its
+/// display text, so [`np_core::scan`]'s `key_is_display_derived` is true with no migration 4 rewrite in the
+/// file's history — which is also every lossily-named row on Windows, universally. Block a sibling `caf\xE9`
+/// (another directory, same display spelling `caf\u{FFFD}`, different bytes) and the row is ambiguous; its own
+/// path was nevertheless listed readable, so §2's match route discharges it.
+///
+/// Four things are pinned, in design §5.0's order: no `Added` and no duplicate row; `PARSE_VERSION` recorded with
+/// **no `Moved` in the report at all** (a definition of "resolved" that required `Moved` would charge this class
+/// every scan forever — §3's own forbidden outcome, and what mutation (5) attacks); the note keeps its id *and*
+/// its key, because this route never re-keys; and neither charge source fired, so the sum stayed zero. The last
+/// one is read from the version, which is the only integration-side observable of §3's sum: a charge from the
+/// byte-keyed arm would withhold it exactly as an unresolved mark does, so recording it proves both arms were
+/// empty over a refresh that demonstrably ran.
+#[cfg(unix)]
+#[test]
+fn a_row_keyed_from_its_own_lossy_bytes_discharges_by_match_without_a_move() {
+    assert_twin_dirs();
+    /// `c a f EF BF BD`: a directory name whose OS bytes are the encoded replacement character, so it spells
+    /// itself exactly as the lossy twin `caf\xE9` does while being a different directory.
+    const LOSSY_DIR: &[u8] = b"caf\xEF\xBF\xBD";
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    // The premise that makes this a twin pair at all, asserted rather than assumed: byte-distinct directories,
+    // one display spelling. Without it the blocked sibling would not be ambiguous with this row.
+    assert_ne!(LOSSY_DIR, TWIN_DIR_NINE);
+    assert_eq!(
+        String::from_utf8_lossy(LOSSY_DIR).into_owned(),
+        String::from_utf8_lossy(TWIN_DIR_NINE).into_owned(),
+        "the fixture has to produce one display spelling for two directories"
+    );
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_note_dir(&ws.root, LOSSY_DIR, "# Twin Heading\n") {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {LOSSY_DIR:?}, so no row here is \
+             keyed from its own display bytes and the match route would go untested"
+        );
+        return;
+    }
+    let first = scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+    assert_eq!((first.added, first.notes), (2, 2), "{first:?}");
+
+    // Premise on the row itself, not on a helper's name: this key came off the disk — no
+    // `rekey_row_like_migration_four` was called anywhere in this fixture — and it still equals the bytes of its
+    // own display text, which is precisely what makes the row ambiguous once a twin is blocked.
+    let db = ws.db();
+    assert_eq!(
+        key_hex(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE rel = 'caf\u{fffd}/note.md' ORDER BY rel_bytes"
+        ),
+        LOSSY_KEY,
+        "test setup: an ordinary scan keyed this row from bytes that are its own display text"
+    );
+    let note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(
+        note_id > 0,
+        "test setup: the lossy-keyed path has a note to keep"
+    );
+    // Visible refresh work on a path this scan can always read, so "the version was recorded" below means the
+    // charge cleared — not that no refresh was owed.
+    forget_headings(&db, "top.md");
+    record_parse_version(&db, outdated_parse_version());
+    drop(db);
+
+    // The sibling, planted only now and blocked at once: a genuinely different directory with the same display
+    // spelling, holding its own file. Its body is irrelevant to the scan — it cannot read past the directory name
+    // — but it matters to the fixture: this is a second physical note, so the row really is ambiguous rather than
+    // merely oddly keyed.
+    assert!(
+        plant_note_dir(&ws.root, TWIN_DIR_NINE, "# Quite Another Heading\n"),
+        "test setup: plant the sibling directory"
+    );
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the sibling on this runner (a privileged user?), so no \
+             row was ambiguous this pass and there was nothing to discharge"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("an unreadable sibling must not fail the scan");
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the blocked sibling is named, and it is the only thing the scan has to say: {report:?}"
+    );
+    // Assertion 1, and the second half of assertion 2: the listed path minted no second row (**no `Added`**), and
+    // nothing travelled either — **no `Moved` anywhere in this report**, which is what separates discharge by
+    // match from discharge by claim.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 0, 0),
+        "the row paired with its own path by identity: no duplicate row, and no re-keying move to create one: {report:?}"
+    );
+
+    let db = ws.db();
+    // Assertion 1's other half and assertion 3: one live row, still under the key it started on — this route
+    // never re-keys — holding the same note id it always had.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "one live row for one physical file"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        2,
+        "and no second row anywhere: the duplicate rows F23 exists to stop are absent"
+    );
+    assert_eq!(
+        texts(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE rel = 'caf\u{fffd}/note.md' ORDER BY rel_bytes"
+        ),
+        [LOSSY_KEY],
+        "the row kept its key: discharge by match leaves the stored bytes alone"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        note_id,
+        "and its id, so headings, tags, items and links stayed attached"
+    );
+
+    // Assertion 4: §3's sum is zero this pass — neither the byte-keyed arm nor an unresolved mark charged it.
+    // The version is the only observable of that sum from outside the crate, and it reads zero only when both
+    // arms do; a precedence rule that let one row charge twice would leave this line withheld. The heading read
+    // first proves the refresh actually ran, so a recorded version means coverage rather than an empty scan.
+    assert_eq!(
+        heading_texts(&db, "top.md"),
+        vec!["Top Heading".to_string()],
+        "the note this scan could read was refreshed: {report:?}"
+    );
+    assert_eq!(
+        recorded_parse_version(&db),
+        Some(PARSE_VERSION),
+        "a marked row that resolved by match charges nothing, in either source — §3's sum is what gates this write"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // F22 — a scan's losses get a durable record, not just a line.
 //
