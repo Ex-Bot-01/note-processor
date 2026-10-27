@@ -2206,7 +2206,9 @@ fn seed_duplicate_notes_at_version_three(path: &Path) {
             (9, 'dup.md', 'Dup second', 'filename', 'utf-8', 1, 'second'),
             (12, 'third.md', 'Third',   'filename', 'utf-8', 1, 'third');
          -- Derived rows on both halves of the pair, so 'the winner kept its corpus' is an assertion rather
-         -- than a hope, and one edge into each of them from the third note.
+         -- than a hope: one edge into each of them from the third note, and one edge **out of the loser** (9 ->
+         -- 12), which mirrors the version-four fixture and is what makes the merge's outgoing-edge delete visible
+         -- here too. Without that row the loop asking `links WHERE src_note_id = 9` can never fail.
          INSERT INTO headings (note_id, level, text, line) VALUES
             (4, 1, 'First heading', 1), (9, 2, 'Second heading', 3), (12, 1, 'Third heading', 1);
          INSERT INTO tags (note_id, tag) VALUES (4, 'first-tag'), (9, 'second-tag');
@@ -2214,7 +2216,8 @@ fn seed_duplicate_notes_at_version_three(path: &Path) {
             (4, 'first task', 2, 'open', '- [ ]'), (9, 'second task', 4, 'done', '- [x]');
          INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin) VALUES
             (12, 4, 'wiki', 'Dup first', 2, 'prose'),
-            (12, 9, 'wiki', 'Dup second', 3, 'prose');",
+            (12, 9, 'wiki', 'Dup second', 3, 'prose'),
+            (9, 12, 'wiki', 'Third', 5, 'prose');",
     )
     .expect("test setup: plant a version-three pair on one path");
     assert_eq!(
