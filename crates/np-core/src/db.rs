@@ -1205,9 +1205,15 @@ struct DuplicateNotes {
 /// Every `rel_bytes` holding more than one note row, with its winner and losers.
 ///
 /// Ordered by the **byte key**, which is what makes one database produce one receipt; display spellings can
-/// tie where bytes do not (F20 §1), the key cannot. Rows whose key is NULL are left alone: `GROUP BY` would
-/// gather all of them into one group, and two keyless notes are not duplicates of each other — merging them
-/// would fold two unrelated files into one row.
+/// tie where bytes do not (F20 §1), the key cannot.
+///
+/// Rows whose key is NULL are left alone — and today none can exist. `notes.rel_bytes` carries
+/// `CHECK (typeof(rel_bytes) = 'blob')` from migration 4 onward and `typeof(NULL)` is `'null'`, so a keyless row
+/// is unwritable by this program or by anything speaking plain SQL to the file; **that constraint, not this
+/// clause, is what protects those rows, which is why no test pins the clause and none can be written.** It stays
+/// as defence in depth for whoever changes that: `GROUP BY` gathers **every** NULL into one group, two keyless
+/// notes are two unrelated files, and folding them deletes one of their note rows outright. The same reasoning
+/// is in `docs/design-f19-note-merge.md` §3 step 1.
 fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateNotes>, DbError> {
     let keys: Vec<Vec<u8>> = {
         let mut statement = conn.prepare(
@@ -1247,7 +1253,9 @@ fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateNotes>, DbError> {
 /// The spelling one merged path is named by in the receipt.
 ///
 /// `notes.rel` is a display column and nullable (F13 §4), so a hand-made row can lack it; the byte key's own
-/// lossy spelling is the fallback, because the receipt points at a path rather than identifying one.
+/// lossy spelling is the fallback, because the receipt points at a path rather than identifying one. Without it
+/// such a merge would record `merged=1;paths=` — a fold whose path cannot be named. Pinned by
+/// `a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key` in `crates/np-core/tests/db.rs`.
 fn survivor_display(conn: &Connection, winner: i64, rel_bytes: &[u8]) -> Result<String, DbError> {
     let stored: Option<Option<String>> = conn
         .query_row(

@@ -2122,6 +2122,13 @@ const THIRD_BYTES: &str = "X'74686972642E6D64'";
 const A_MD_BYTES: &str = "X'612E6D64'";
 /// The byte key of `b.md` — later as a key, earlier everywhere else.
 const B_MD_BYTES: &str = "X'622E6D64'";
+/// A byte key with no exact display spelling: `a\xE4b.md`, where `\xE4` is not valid UTF-8 on its own. Its
+/// lossy spelling — the one this program stores in a display column for such a name — is `a\u{FFFD}b.md`, and
+/// that is the string [`seed_keyless_display_pair_at_version_four`]'s receipt has to produce.
+const LOSSY_BYTES: &str = "X'61E4622E6D64'";
+/// The lossy spelling of [`LOSSY_BYTES`], spelled by hand rather than computed, so the assertion that reads it
+/// is an expectation and not a second call to the code under test.
+const LOSSY_DISPLAY: &str = "a\u{FFFD}b.md";
 
 /// Plant F19 §5's shape and leave the file claiming version four, so the next open runs migration 5:
 /// one `rel_bytes` holding two note rows (ids 4 and 9 — the winner is 4 by `MIN(id)`, and the ids are
@@ -2245,6 +2252,36 @@ fn seed_two_duplicate_groups_at_version_four(path: &Path) {
         ),
     )
     .expect("test setup: plant two duplicate groups, one of them a triple");
+    db.0.execute_batch(&format!(
+        "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
+         DELETE FROM schema_version WHERE version = 5;"
+    ))
+    .expect("test setup: rewind the file to version four");
+}
+
+/// Plant a duplicate pair whose survivor carries **no display text at all** and leave the file claiming
+/// version four: two note rows on one byte key that is not valid UTF-8, both with `rel` NULL.
+///
+/// `notes.rel` is nullable (F13 §4), so this half of F19's receipt shape *is* plantable — unlike a row with a
+/// NULL `rel_bytes`, which migration 4 forbids: the rebuilt column carries
+/// `CHECK (typeof(rel_bytes) = 'blob')` and `typeof(NULL)` is `'null'`, so no writer — this program or a tool
+/// holding nothing but SQL — can leave a note row keyless. The pair here is the reachable case: the key names
+/// the path, only the human-readable spelling is missing.
+fn seed_keyless_display_pair_at_version_four(path: &Path) {
+    let db = Db::open(path).expect("test setup: create the current schema");
+    db.0.execute_batch(
+        &format!(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+             VALUES ({LOSSY_BYTES}, {LOSSY_BYTES}, '{LOSSY_DISPLAY}', '{LOSSY_DISPLAY}',
+                     '/ws/{LOSSY_DISPLAY}', 'h1', 5, 1, 'ok', 9);
+             -- Both rows lack `rel`, so the fallback is reached whichever of them survives; ids are 6 and 8
+             -- because which row is the winner must not decide whether the receipt can name the path at all.
+             INSERT INTO notes (id, rel_bytes, rel, title, title_source, encoding, word_count, body) VALUES
+                (6, {LOSSY_BYTES}, NULL, 'first',  'filename', 'utf-8', 1, 'one'),
+                (8, {LOSSY_BYTES}, NULL, 'second', 'filename', 'utf-8', 1, 'two');"
+        ),
+    )
+    .expect("test setup: plant a keyless-display pair on one byte key");
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version = 5;"
@@ -2400,6 +2437,47 @@ fn the_receipt_counts_folded_rows_across_groups_and_names_paths_in_key_order() {
         scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"),
         2,
         "five rows in, two out: `merged=3` is the difference, not a path count"
+    );
+}
+
+#[test]
+fn a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key() {
+    // `survivor_display`'s fallback, the half of F19's receipt that is reachable: `notes.rel` is nullable, so a
+    // merged path can arrive with no display text of its own. An empty name here is a merge that folded rows
+    // nobody can point at — `merged=1;paths=` reads as one unnamed path, and the count would be the only fact
+    // left. The expected spelling is written out (`LOSSY_DISPLAY`), not derived from the key.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_keyless_display_pair_at_version_four(&path);
+
+    let db = Db::open(&path).expect("the open runs migration 5");
+
+    // The precondition, so the fallback below cannot be credited to a stored `rel` that was there all along.
+    assert_eq!(
+        scalar::<String>(
+            &db,
+            "SELECT COALESCE(rel, '<none>') FROM notes WHERE id = 6"
+        ),
+        "<none>",
+        "test setup: the survivor has no display text of its own"
+    );
+
+    assert_eq!(
+        merge_receipt_of(&db),
+        format!("merged=1;paths={LOSSY_DISPLAY}"),
+        "the byte key's lossy spelling names the path when the row cannot"
+    );
+
+    // And the fallback changes only the name: the fold itself still keeps `MIN(id)` and drops the other row.
+    assert_eq!(
+        names(
+            &db,
+            &format!(
+                "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {LOSSY_BYTES} ORDER BY id"
+            )
+        ),
+        ["6".to_string()],
+        "the unnamed survivor is still the oldest row on the key"
     );
 }
 

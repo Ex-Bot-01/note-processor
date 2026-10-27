@@ -301,6 +301,12 @@ What these numbers can and cannot carry:
   `Indexed::Duplicate` survives because a pair another tool writes *after* migration 5 has run is still permanent:
   there is no second pass and no `UNIQUE` index on `notes(rel_bytes)` (design §7 keeps that choice deliberately
   open so F13 §7's reader stays testable), so the reader still names such a pair instead of picking a winner.
+  **One pin this entry cannot have yet:** migration 5's `WHERE rel_bytes IS NOT NULL` arm has no fixture, and a run
+  that went looking for one established why — `notes.rel_bytes` carries `CHECK (typeof(rel_bytes) = 'blob')`, and
+  `typeof(NULL)` is `'null'`, so no writer can leave a note row keyless in any file migration 4 touched. That CHECK
+  is the protection; the clause is defence in depth, and **F-5's keyless-row pin becomes possible only when some
+  future migration admits keyless note rows.** What is pinned instead is the reachable half of the same shape: a
+  merged survivor with no `rel` at all (`a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key`).
 
 ## F20 — two report-side filters still compare display text
 

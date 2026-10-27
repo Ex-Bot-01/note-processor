@@ -54,10 +54,15 @@ Migration 5, `merge_duplicate_notes`, inside its own transaction like every othe
 1. Select groups: `SELECT rel_bytes FROM notes WHERE rel_bytes IS NOT NULL GROUP BY rel_bytes HAVING
    COUNT(*) > 1`, ordered by `rel_bytes` so one database produces one receipt.
 
-   The `WHERE` clause is not an optimisation and must not be "simplified" away: `notes.rel_bytes` is nullable
-   (F13 §4 — a hand-written row can lack it), and `GROUP BY` gathers **every** NULL into one group. Two keyless
-   notes are two unrelated files, so folding them would delete one of them outright; the code excludes them and
-   the query here has to say so, or the next reader treats the clause as noise.
+   The `WHERE` clause is not an optimisation, but say plainly what it defends today: **nothing can reach it.**
+   Migration 4 rebuilt `notes.rel_bytes` with `CHECK (typeof(rel_bytes) = 'blob')`, and `typeof(NULL)` is
+   `'null'`, so a keyless note row is unwritable in any file migration 4 has touched — by this program or by
+   anything speaking plain SQL to it. Even the one in-program route fails: a version-three row with `rel IS NULL`
+   would copy through `CAST(rel AS BLOB)` as NULL, and that CHECK refuses migration 4 itself. **That constraint is
+   what protects keyless rows; this clause has no test because none can be written.** It stays for whoever changes
+   that: if a later migration ever admits keyless rows, `GROUP BY` gathers **every** NULL into one group, two
+   keyless notes are two unrelated files, and folding them deletes one of their note rows outright — so the clause
+   must not be "simplified" away then, and the query here has to keep saying why.
 2. For each group: re-point incoming edges from every other id to the winner; delete the loser's derived rows and
    outgoing edges, then its note row — by hand, per §2. Then `PRAGMA foreign_key_check` over the whole file, inside the
    same transaction, refusing the step through `DbError::ForeignKeys` exactly as migrations 3 and 4 do.
@@ -113,6 +118,13 @@ Then:
 - F13 §7's existing duplicate-reader tests must keep passing **unchanged** — they pin the reader that names a pair this
   migration no longer allows in our own databases, and if one of them has to change, that is a signal the design is wrong:
   stop and report.
+
+**A second thing was settled on the controller's decision rather than assumed:** §3 step 1 used to justify its
+NULL clause as load-bearing ("a hand-written row can lack it"). A run tried to build the fixture that would prove
+it and could not — the CHECK above rejects a NULL key, with `PRAGMA foreign_keys = OFF` or without it. The claim is
+corrected here rather than quietly dropped, and the reachable half of the same shape is pinned instead: a merged
+pair whose survivor has no `rel` is named by its key's lossy spelling
+(`a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key`).
 
 **One bullet of §5 was overridden, on the controller's decision, and it is recorded here rather than hidden.**
 `two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a_bare_query_row` did change. What moved was
