@@ -21,6 +21,7 @@ mod common;
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
     config_file_path, CatalogConfig, Config, ConfigError, MarkerConfig, WorkspaceRegistry,
+    MAX_CONTINUATION_INDENT,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -582,4 +583,76 @@ fn workspace_db_separates_a_non_utf8_path_from_its_lossy_spelling() {
         cfg.workspace_db(&lossy_twin),
         "the database key is the raw OS path, not its lossy text"
     );
+}
+
+/// Write `body` as a config file in `dir` that also names its own `data_dir`, and return the path.
+///
+/// The `data_dir` half is not decoration: `Config::load` refuses an unresolvable data dir **before** it looks at
+/// anything else, so a fixture holding only `[catalog]` keys fails with `missing config value: data_dir` and every
+/// message assertion about the catalog key goes red for an unrelated reason.
+fn write_config_with_data_dir(dir: &Path, body: &str) -> PathBuf {
+    let full = format!(
+        "data_dir = {}\n{}",
+        toml_str(&dir.display().to_string()),
+        body
+    );
+    write_config(dir, &full)
+}
+
+#[test]
+fn an_oversized_continuation_indent_is_refused_naming_key_value_and_ceiling() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\ncontinuation_indent = 17\n");
+
+    let err = match Config::load(Some(&path)) {
+        Ok(cfg) => panic!(
+            "an indent of 17 must be refused, got continuation_indent = {}",
+            cfg.catalog.continuation_indent
+        ),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    // The backlog's done-when is that a person can tell *which key* broke, so the text is the assertion — an
+    // `is_err()` check would still pass if the refusal were reworded into "config io: InvalidData".
+    assert!(
+        message.contains("catalog.continuation_indent"),
+        "the refusal must name the key: {message}"
+    );
+    assert!(message.contains("17"), "and the offending value: {message}");
+    assert!(
+        message.contains("max 16"),
+        "and the ceiling to aim at, upper bound only — a negative literal never reaches this check, serde refuses it as          a parse error: {message}"
+    );
+    // The refusal is data being rejected, not a file that could not be read: callers who care match the kind rather
+    // than parsing prose.
+    let ConfigError::Io(io_err) = &err else {
+        panic!("an out-of-range value must travel as Io(InvalidData), got {err:?}");
+    };
+    assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn the_ceiling_itself_is_accepted_and_zero_means_no_indent() {
+    // The boundary, because a check that refuses 17 but also refuses 16 has off-by-one-drifted into breaking the
+    // documented range; and 0, which is a legal layout choice (flush continuation lines) rather than an absurdity.
+    for indent in [0usize, MAX_CONTINUATION_INDENT] {
+        let tmp = TempDir::new().expect("test setup: tempdir");
+        let path = write_config_with_data_dir(
+            tmp.path(),
+            &format!("[catalog]\ncontinuation_indent = {indent}\n"),
+        );
+        let cfg = Config::load(Some(&path))
+            .unwrap_or_else(|err| panic!("indent {indent} is inside the documented range: {err}"));
+        assert_eq!(cfg.catalog.continuation_indent, indent);
+    }
+}
+
+#[test]
+fn refusing_an_oversized_indent_leaves_the_default_alone() {
+    // The default path is what every golden byte was rendered with, so this item must not nudge it. Absent key ⇒ 2,
+    // exactly as before the check existed.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 400\n");
+    let cfg = Config::load(Some(&path)).expect("a file naming no indent keeps the default");
+    assert_eq!(cfg.catalog.continuation_indent, 2);
 }
