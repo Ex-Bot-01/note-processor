@@ -4110,3 +4110,56 @@ fn an_unmerged_duplicate_pair_still_charges_the_refresh_and_withholds_the_versio
         "the planted row keeps what it was written with"
     );
 }
+
+/// COMMIT-0 PROBE, temporary: §2's scoping clause was found by reading, not by running. This is the
+/// empirical baseline — M's blocked directory holding the display-keyed note, plus an **unrelated**
+/// readable path `notes/lookalike.md` whose bytes are identical to the hidden note.
+#[cfg(unix)]
+#[test]
+fn probe_f23_unrelated_look_alike_baseline() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    const LOOKALIKE_KEY: &str = "6E6F7465732F6C6F6F6B616C696B652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!("NOT COVERAGE: probe could not create a directory named {TWIN_DIR_NINE:?}");
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    drop(db);
+
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!("NOT COVERAGE: 0o000 did not deny access to the hidden note's directory");
+        return;
+    }
+    fs::create_dir_all(ws.root.join("notes")).expect("test setup: notes/");
+    fs::write(ws.root.join("notes/lookalike.md"), "# Twin Heading\n")
+        .expect("test setup: the look-alike, byte-identical to the hidden note");
+
+    let report = scan(&ws.root, &ws.cfg).expect("the look-alike must not fail the scan");
+    let db = ws.db();
+    eprintln!(
+        "PROBE added={} moved={} removed={} notes={} display_rows={} lookalike_rows={} live_total={} version={:?} record={}",
+        report.added,
+        report.moved,
+        report.removed,
+        report.notes,
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOOKALIKE_KEY}' AND state = 'ok'")
+        ),
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        recorded_parse_version(&db),
+        recorded_losses(&db),
+    );
+}
