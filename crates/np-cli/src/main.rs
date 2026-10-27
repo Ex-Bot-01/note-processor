@@ -117,6 +117,19 @@ fn print_summary(report: &ScanReport) {
     for path in &report.skipped {
         let _ = writeln!(out, "  {path}");
     }
+    // What that list actually **was**, counted by kind instead of merged (F22 §3): `skipped 2` hides that one
+    // path is a permission problem nobody fixes by renaming and the other a name this build can never key.
+    // Printed only when something was lost, and printed as the same string `meta` records under
+    // `np_core::scan::UNINDEXABLE_KEY` — one value, two channels, so the line a person read yesterday can be
+    // compared with the record they open today.
+    //
+    // One column wider than the labels above: `unindexable` is eleven letters, those are ten, and re-spacing
+    // them to fit a new word would break the `grep` of anyone reading their own old logs. Dropped when stdout
+    // refuses writes (descriptor 1) like every other line here — the durable copy is in `meta`, so this line
+    // is the copy a person reads rather than the only place the fact lives.
+    if let Some(losses) = &report.unindexable {
+        let _ = writeln!(out, "unindexable {}", losses.value());
+    }
     let _ = writeln!(out, "index      {}", report.index_files.join(", "));
     let _ = writeln!(out, "elapsed    {} ms", report.elapsed_ms);
 }

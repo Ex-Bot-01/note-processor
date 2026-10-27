@@ -72,8 +72,30 @@ const INDEX_FILES_KEY: &str = "index_files";
 /// were written with. Absent means "written before this mechanism existed", which is not a version to
 /// compare against and therefore refreshes; see the comparison in `refresh_needed`.
 pub const PARSE_VERSION_KEY: &str = "parse_version";
+/// `meta` key holding what the **last scan** of this workspace could not index, beside what its registry
+/// currently duplicates.
+///
+/// Beside [`crate::db::FK_ORPHANS_KEY`] and [`crate::db::PATHS_LOSSY_KEY`] for the same reason (F22 §1): a
+/// refusal is a fact with no afterlife otherwise — one line on stdout or stderr at the moment it happened,
+/// gone as soon as the terminal closes, while the note stays missing from the catalog until somebody
+/// renames the file. There is no logger to write to and the catalog's bytes may not move, so `meta` is where
+/// a person reading the workspace later has to be able to ask what was lost.
+///
+/// The value is `unreadable=N;unkeyable=N;duplicates=N;names=a,b`, written **even when every count is
+/// zero**: this record describes the *last scan* rather than the history of the file, so a fixed workspace
+/// has to overwrite an old complaint instead of leaving it standing there forever (F22 §2). `names` holds
+/// up to eight display spellings joined by `,` — see [`Unindexable::names`] for their order — and a path
+/// holding a comma reads as two entries, because this is a diagnosis for a human at an `sqlite3` prompt and
+/// not a format to parse. Nothing decides anything with it: no deletion rule reads this key (F22 §4.2).
+pub const UNINDEXABLE_KEY: &str = "unindexable";
 /// Suffix of the temporary file every catalog write goes through before its `rename`.
 const TEMP_SUFFIX: &str = ".tmp";
+/// How many display spellings one record names, most actionable first (see [`Unindexable::names`]).
+///
+/// Bounded because the value is written on **every** scan: a workspace with an unreadable subtree under a
+/// `chmod -R 000` would otherwise grow one `meta` row's text without limit, and a person reading it can act
+/// on eight paths no better than on eight hundred.
+const NAME_CAP: usize = 8;
 
 /// A note re-parsed by one scan: its path and the links its text holds, which is everything
 /// [`store_note_links`] needs once the whole corpus is up to date. The path travels in both spellings so the
@@ -174,9 +196,115 @@ pub struct ScanReport {
     /// reader cannot tell "nothing was removed" apart from "this build stopped reporting it", and every
     /// reader grows a missing-key branch to answer a question `null` already answered.
     pub upgrade_orphans: Option<String>,
+    /// What this scan could not index, and what the registry duplicates — counted by kind, which is the
+    /// diagnosis [`ScanReport::skipped`] cannot give because it merges every cause into one list of paths
+    /// (F22 §1). `None` when every count is zero, so a workspace that lost nothing keeps a clean report.
+    ///
+    /// **Null, not absent**, exactly like [`Self::upgrade_orphans`]: the JSON key is there on every scan
+    /// whatever the outcome, because a reader must be able to tell "nothing was lost" apart from "this build
+    /// stopped reporting it", and every reader would otherwise grow a missing-key branch to answer a question
+    /// `null` already answered.
+    ///
+    /// The durable copy is `meta`'s [`UNINDEXABLE_KEY`] value, written after this scan's commit and overwritten
+    /// by the next one. This field is not read back from it, and nothing that *decides* anything reads either:
+    /// unknown-is-not-absent stays settled by the walk's own lists (F22 §4.2), so a refused record write
+    /// degrades the diagnosis and never changes what is indexed.
+    pub unindexable: Option<Unindexable>,
     /// Wall-clock milliseconds for the whole scan. Informational only — never in a generated file,
     /// where it would make every regeneration differ (spec §10).
     pub elapsed_ms: u128,
+}
+
+/// What one scan could not index, and what its registry duplicates — F22's diagnosis, counted by kind.
+///
+/// This exists because [`ScanReport::skipped`] cannot carry it: one merged list names an unreadable
+/// directory and a name the byte spelling refuses identically, so even the live line cannot tell a
+/// permission problem from an unkeyable name (F22 §1). The list itself keeps its entries **verbatim** —
+/// causes arrive here, as separate counts, rather than by rewording strings a person's `grep` already
+/// depends on.
+///
+/// Its durable copy is the [`UNINDEXABLE_KEY`] value this scan writes after its commit; [`Self::value`] is
+/// that one spelling, so `meta`, `np scan`'s summary line and this struct's own fields describe one fact
+/// rather than three recomputations of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unindexable {
+    /// Directories whose contents this walk did not read: permission denied, or a directory that vanished
+    /// mid-walk. Somebody's `chmod`, not anybody's filename.
+    pub unreadable: usize,
+    /// Names the byte spelling cannot hold (F18) — the count [`Self::unreadable`] refuses to be confused
+    /// with, because this one is fixed by renaming a file. Windows-only in practice: `os_bytes` is exact on
+    /// Unix, so no scan run there ever raises this above zero (see [`crate::walk::Walked::unrepresentable`]).
+    pub unkeyable: usize,
+    /// Display paths the registry holds **more than one live (`state = 'ok'`) row** for.
+    ///
+    /// **This is a question, not an accusation.** Two genuinely different files can share a display spelling —
+    /// latin-1 `caf\xE9/note.md` beside `caf\xE8/note.md`, both readable, both correctly indexed — and they land
+    /// here exactly as F23's one-file-two-rows does. It also counts attachments, which have no catalog entry at
+    /// all. So read it as "look at these paths" and confirm with `sqlite3` before deleting anything: the count is
+    /// deliberately **unexplained**, because why a path holds two rows is F23's ambiguity and a count naming a
+    /// cause would be re-deciding it here (F22 §4.5).
+    pub duplicates: usize,
+    /// Up to eight display spellings, most actionable first: [`Self::unkeyable`] paths, then
+    /// [`Self::duplicates`] ones, then [`Self::unreadable`] directories. A refused name and a duplicated path have
+    /// no other channel — the duplicate count is the *only* place F23's "this note appears twice" surfaces — while
+    /// an unreadable directory is also named in [`ScanReport::skipped`], so it can afford to lose cap room.
+    ///
+    /// Names are display text, so **a name here identifies no path**: two byte-distinct paths can share one
+    /// lossy spelling (F20 §1) and then two entries look alike, exactly as two `skipped` lines do. It says
+    /// where to look, not which twin.
+    pub names: Vec<String>,
+}
+
+impl Unindexable {
+    /// The stored spelling under [`UNINDEXABLE_KEY`] — the string `meta` holds and `np scan` prints beside
+    /// the label, so a person comparing the line they just read with the record a later run finds is
+    /// comparing one format. Public for the reason [`crate::db::orphan_total`] is public: the CLI renders
+    /// this record and must not invent a second spelling of it.
+    pub fn value(&self) -> String {
+        format!(
+            "unreadable={};unkeyable={};duplicates={};names={}",
+            self.unreadable,
+            self.unkeyable,
+            self.duplicates,
+            self.names.join(","),
+        )
+    }
+
+    /// Whether this scan lost nothing at all, which is the case [`ScanReport::unindexable`] reports as
+    /// `None` while `meta` still records it as zeros — "looked and found none" staying distinguishable from
+    /// "this workspace was never scanned by a build that looks" (F22 §2).
+    fn is_empty(&self) -> bool {
+        self.unreadable == 0 && self.unkeyable == 0 && self.duplicates == 0
+    }
+}
+
+/// The record one scan loses, from the two lists [`crate::walk`] reported and the registry's duplicated
+/// display paths.
+///
+/// Takes the pieces rather than the database or the walk because all three are already in hand once the
+/// write pass ends (F22 §3), and because a hand-built list is the only way to exercise the refusal arm on a
+/// platform that refuses no name — see `scan::tests` for the case that does.
+fn unindexable_record(
+    unreadable: &[UnknownPath],
+    unkeyable: &[UnknownPath],
+    duplicates: &[String],
+) -> Unindexable {
+    // Ordered by kind rather than merged, and capped in that order: refused names and duplicated paths have no
+    // other channel at all, while an unreadable directory is also named in `ScanReport::skipped`, so it gives up
+    // cap room first.
+    let names = unkeyable
+        .iter()
+        .map(|path| path.display.clone())
+        .chain(duplicates.iter().cloned())
+        .chain(unreadable.iter().map(|path| path.display.clone()))
+        .take(NAME_CAP)
+        .collect();
+    Unindexable {
+        unreadable: unreadable.len(),
+        unkeyable: unkeyable.len(),
+        duplicates: duplicates.len(),
+        names,
+    }
 }
 
 /// Index `root` into its workspace database and regenerate its catalog.
@@ -283,6 +411,9 @@ pub fn scan_with_inject(
     // so a kill between this commit and the writes below still leaves every stranded shard named.
     let rendered = catalog::render(&entries, &cfg.catalog);
     set_index_list(&db, &rendered)?;
+    // Read here, inside the transaction and after every write of this scan, so the duplicate count answers
+    // what this scan leaves behind rather than what it found (F23's duplicate is *created* by a write pass).
+    let duplicates = duplicated_rels(&db)?;
     if record_version {
         // Recorded in the same transaction as the rows it describes: a scan that dies halfway has to
         // refresh again rather than leave half the corpus labelled as current. An up-to-date database
@@ -299,6 +430,14 @@ pub fn scan_with_inject(
         // every scan in silence, which looks exactly like the version never being written by accident.
         report_refresh_gap(&mut io::stderr(), written.uncovered + hidden_by_unknown);
     }
+
+    // The durable record of what this scan could not index, written **after** the commit it describes — the
+    // position F21's receipt echo established, and for the same reason: a scan that rolled itself back has
+    // nothing to announce. Written on every scan, including one that lost nothing, because the record is
+    // current state and an old value left standing is a false accusation (F22 §2).
+    let losses = unindexable_record(&walked.unreadable, &walked.unrepresentable, &duplicates);
+    let record = losses.value();
+    record_unindexable(&db, &record);
 
     // A root entry that wears one of our names but is not ours stays on disk and reaches the report, so
     // the user hears about the collision instead of losing the file.
@@ -325,6 +464,9 @@ pub fn scan_with_inject(
         unresolved_targets: targets,
         index_files: rendered.iter().map(|(name, _)| name.clone()).collect(),
         upgrade_orphans,
+        // `None` when nothing was lost, so the common report stays clean while its JSON still carries the
+        // key as `null` — one shape for every scan, which is what [`ScanReport::upgrade_orphans`] argues.
+        unindexable: (!losses.is_empty()).then_some(losses),
         elapsed_ms: started.elapsed().as_millis(),
     })
 }
@@ -1336,6 +1478,48 @@ fn set_meta(db: &Db, key: &str, value: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// The display paths the registry holds **more than one live row** for — counted, never explained (F22 §4.5).
+///
+/// Grouped by `rel`, the display text, because that is what a person notices: two byte-distinct paths sharing one
+/// lossy spelling produce two alike-looking lines in `INDEX.md`. **That is also why the count cannot name a cause.**
+/// Two different files whose names collide under lossy decoding are legitimate, correctly indexed, and
+/// indistinguishable here from F23's duplicated note — and an attachment sharing a display spelling with a note
+/// counts too, though it has no catalog entry at all. Narrowing this with `key_is_display_derived` would not help:
+/// it flags both of F23's configurations identically (nothing separates them) while staying silent on Windows,
+/// where every lossy key qualifies.
+///
+/// `state = 'ok'` keeps stale rows out; a note whose file went away is not a path that appears twice. Sorted by the
+/// same text, so one workspace produces one record.
+///
+/// Collected in full before returning, like every other read here, so no statement is left mid-iteration
+/// across a write.
+fn duplicated_rels(db: &Db) -> Result<Vec<String>, DbError> {
+    let mut statement = db.0.prepare(
+        "SELECT rel FROM files WHERE state = 'ok' GROUP BY rel HAVING COUNT(*) > 1 ORDER BY rel",
+    )?;
+    let rels = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rels)
+}
+
+/// Record what this scan lost, **after the transaction commit and best-effort** (F22 §3).
+///
+/// "After the commit" is not "after the scan finished": publishing the index files and recording the workspace
+/// row come later and can still fail the run. The record is therefore accurate about the *committed rows* it
+/// describes, and a scan that dies after this point leaves a record of work that really did land — which is the
+/// lesser error, since the alternative is describing nothing at all.
+///
+/// The result is dropped for the reason [`crate::db::report_orphans`] gives for its own writes: by the time
+/// this runs the scan's rows and catalog are committed, so a `meta` write that refuses — a full disk, a lock another
+/// process holds past the timeout, a trigger — costs this workspace its record and nothing else. Returning
+/// `Err` would report a failed scan whose rows and catalog are already durable, and `.expect` would do worse
+/// (F21 §2: that panic is exactly what F21 removed). The loss still reaches this run's report field and its
+/// stdout line; only its afterlife is degraded.
+fn record_unindexable(db: &Db, value: &str) {
+    let _ = set_meta(db, UNINDEXABLE_KEY, value);
+}
+
 /// Record the index files this scan publishes, so a later scan knows which shards to delete.
 ///
 /// Written inside the scan's transaction, before the files exist: `meta` describes the catalog this
@@ -1830,7 +2014,7 @@ mod tests {
     use super::{
         apply_changes, folded_row, is_unknown_path, known_rows, np_published, refresh_covered,
         remove_corpses, remove_file, report_refresh, report_refresh_gap, skipped_lines,
-        under_unreadable, Found, UnknownPath, Written, PARSE_VERSION,
+        under_unreadable, unindexable_record, Found, UnknownPath, Written, NAME_CAP, PARSE_VERSION,
     };
     use crate::catalog::{HEADER, HEADER_CRLF};
     use crate::config::MarkerConfig;
@@ -2311,6 +2495,106 @@ mod tests {
             [shared],
             "one path named twice is one line"
         );
+    }
+
+    /// F22 §3's arithmetic, over **hand-built** walk lists.
+    ///
+    /// A Linux filesystem refuses no name — `os_bytes` is exact — so the refusal arm has no end-to-end
+    /// fixture and is counted here instead, exactly as the matcher cases above and in `walk::tests` build
+    /// their refused entries. What this does **not** claim is that any real scan produces a non-zero
+    /// `unkeyable`: only Windows refuses a name, and that arm stays unexecuted (F18's honest terms). The last
+    /// block pins the consequence for every run on this platform: `unkeyable` is zero, always.
+    #[test]
+    fn the_record_counts_each_loss_by_kind_and_caps_its_names() {
+        // Two refused names and one unreadable directory, all with distinct display text. The counts have to
+        // stay apart, because "3 paths skipped" — the sentence `skipped` prints — is precisely what F22
+        // exists to replace with a diagnosis.
+        let refused = [
+            display_keyed_unknown("caf\u{fffd}.md"),
+            display_keyed_unknown("zebra.md"),
+        ];
+        let blocked = [raw(b"caf\xE9")];
+        let duplicates = ["dup/a.md".to_string(), "dup/b.md".to_string()];
+        let record = unindexable_record(&blocked, &refused, &duplicates);
+
+        assert_eq!(
+            (record.unreadable, record.unkeyable, record.duplicates),
+            (1, 2, 2),
+            "three kinds of loss, three counts — merged they would say only \"5\""
+        );
+        assert_eq!(
+            record.names,
+            [
+                "caf\u{fffd}.md",
+                "zebra.md",
+                "dup/a.md",
+                "dup/b.md",
+                "caf\u{fffd}",
+            ],
+            // A refused name and a duplicated path have no other channel; an unreadable directory is also
+            // named in `ScanReport::skipped`, so it gives up the last cap slot.
+            "unkeyable first, then duplicated paths, then unreadable directories"
+        );
+        // The stored spelling, pinned whole — `meta`, `np scan`'s line and this struct read one format, so a
+        // person comparing yesterday's terminal against today's record is comparing one string.
+        assert_eq!(
+            record.value(),
+            "unreadable=1;unkeyable=2;duplicates=2;names=caf\u{fffd}.md,zebra.md,dup/a.md,dup/b.md,caf\u{fffd}",
+        );
+
+        // The cap: five refused, four unreadable, three duplicated is twelve losses and eight names. What falls
+        // off is the directories: a refused name and a duplicated path reach the person only through this list,
+        // while an unreadable directory is named in `ScanReport::skipped` as well (F22 §3).
+        let spelled = |prefix: &str, count: usize| -> Vec<UnknownPath> {
+            (0..count)
+                .map(|index| display_keyed_unknown(&format!("{prefix}{index}.md")))
+                .collect()
+        };
+        let many_duplicates: Vec<String> = (0..3).map(|index| format!("dup{index}.md")).collect();
+        let capped = unindexable_record(&spelled("dir", 4), &spelled("no", 5), &many_duplicates);
+        assert_eq!(
+            (capped.unreadable, capped.unkeyable, capped.duplicates),
+            (4, 5, 3),
+            "the counts still say twelve while the names say eight"
+        );
+        assert_eq!(
+            capped.names.len(),
+            NAME_CAP,
+            "the value is bounded: it is rewritten on every scan, so an unbounded list would grow one \
+             `meta` row without limit"
+        );
+        assert_eq!(
+            &capped.names[..5],
+            ["no0.md", "no1.md", "no2.md", "no3.md", "no4.md"],
+            "every refused name survives before any directory's"
+        );
+        assert_eq!(
+            &capped.names[5..],
+            ["dup0.md", "dup1.md", "dup2.md"],
+            "then every duplicated path, and the four directories are what the cap cost — they are in              `skipped` too"
+        );
+
+        // Nothing lost: `is_empty` is what makes the report field `None`, while the value is still the full
+        // all-zero spelling — a fixed workspace has to overwrite an older complaint rather than leave it
+        // standing there accusing somebody (F22 §2).
+        let clean = unindexable_record(&[], &[], &[]);
+        assert!(clean.is_empty(), "nothing lost is nothing reported");
+        assert_eq!(
+            clean.value(),
+            "unreadable=0;unkeyable=0;duplicates=0;names="
+        );
+        assert!(clean.names.is_empty());
+
+        // And the shape every scan on this platform can actually reach: an unreadable directory, no refusal
+        // of any kind. `walk::Walked::unrepresentable` is empty on Unix by construction, so a real run's
+        // record reads `unkeyable=0` here for the same reason — the non-zero arm above is Windows-only and
+        // unexecuted.
+        let unix = unindexable_record(&blocked, &[], &[]);
+        assert_eq!(
+            unix.unkeyable, 0,
+            "Unix refuses no name, so no scan run here can raise this count"
+        );
+        assert!(!unix.is_empty(), "one unreadable directory is still a loss");
     }
 
     /// §4.4's answer, **counted** rather than assumed: one note behind one unknown path is charged in exactly

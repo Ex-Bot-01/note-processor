@@ -945,3 +945,118 @@ fn only_the_scan_that_removed_the_orphans_announces_them() {
     assert_only_the_orphans_went(&db);
     assert_eq!(receipt(&db), ORPHAN_RECEIPT);
 }
+
+/// The record line as `np`'s summary writes it: the label, then the value `meta` holds verbatim — one string
+/// rendered by two channels, not a second spelling of the four fields.
+#[cfg(unix)]
+fn record_line(record: &str) -> String {
+    format!("unindexable {record}")
+}
+
+/// F22 §5's stdout half: an unreadable directory prints **one** line naming the loss by kind, and `--json`
+/// carries the same counts as an object.
+///
+/// This is the channel a person actually reads, so it is asserted here rather than in `np-core`: no
+/// in-process test reaches the child's stdout. The line is pinned whole, not as "contains something about
+/// losses", because the counts by kind are the entire product — `skipped 1` was already printed before F22
+/// and said nothing a permission problem could act on.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_prints_one_record_line() {
+    let ws = workspace();
+    // A directory, not a bare note: `unreadable` counts subtrees the walk did not enter, which is the shape
+    // whose report line could not say whether it was a permission problem or an unkeyable name.
+    let blocked = ws.root.join("lost");
+    fs::create_dir_all(&blocked).expect("test setup: create the directory to block");
+    fs::write(blocked.join("note.md"), "# Blocked Heading\n").expect("test setup: write the note");
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let _restore = deny_read(&blocked);
+    // Premise off the disk, not off the report: a privileged runner reads a 0o000 directory anyway, and then
+    // nothing was lost and every assertion below would be about a clean workspace.
+    if fs::read_dir(&blocked).is_ok() {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to {} on this runner (a privileged user?), so this \
+             scan lost nothing and had no line to print",
+            blocked.display()
+        );
+        return;
+    }
+
+    let losing = run(&mut ws.command(&["scan"]));
+    losing.assert_success();
+    let expected = "unreadable=1;unkeyable=0;duplicates=0;names=lost";
+    assert!(
+        losing.stdout().contains(&record_line(expected)),
+        "`{}` missing from:\n{}",
+        record_line(expected),
+        losing.stdout()
+    );
+    // Once. A second copy would mean the summary grew a duplicate of its own line, and F21's lesson is that a
+    // repeated warning is a warning the reader stops seeing.
+    let lines = losing
+        .stdout()
+        .lines()
+        .filter(|line| line.starts_with("unindexable"))
+        .count();
+    assert_eq!(lines, 1, "one record line per run:\n{}", losing.stdout());
+
+    // The same counts on the machine-readable channel, as an object of four fields — including `names`, so a
+    // reader gets the path and not only the number.
+    let json = run(&mut ws.command(&["scan", "--json"]));
+    json.assert_success();
+    let report: serde_json::Value =
+        serde_json::from_str(&json.stdout()).expect("`--json` must print one JSON object");
+    assert_eq!(report["unindexable"]["unreadable"], 1, "{report}");
+    assert_eq!(report["unindexable"]["unkeyable"], 0, "{report}");
+    assert_eq!(report["unindexable"]["duplicates"], 0, "{report}");
+    assert_eq!(
+        report["unindexable"]["names"].as_array().map(Vec::len),
+        Some(1),
+        "the name has to survive into JSON: {report}"
+    );
+    assert_eq!(report["unindexable"]["names"][0], "lost", "{report}");
+
+    // And the durable copy agrees with what was printed, which is the point of writing it at all.
+    let db = Db::open(&ws.db_path()).expect("test setup: open the workspace database");
+    let stored: String = scalar(
+        &db,
+        &format!(
+            "SELECT value FROM meta WHERE key = '{}'",
+            np_core::scan::UNINDEXABLE_KEY
+        ),
+    );
+    assert_eq!(stored, expected, "one value, two channels");
+}
+
+/// The other half of one JSON shape: a scan that lost nothing prints `"unindexable": null` — the **key
+/// present**, exactly like `upgrade_orphans` — and its summary prints no line.
+///
+/// Suppressing the key at zero would cost every reader a missing-key branch to answer a question `null`
+/// already answers, and would make "nothing was lost" unreadable apart from "this build stopped reporting
+/// it". The record-side half of this promise — the all-zero value overwriting an older one — is pinned in
+/// `crates/np-core/tests/scan.rs`, where a test can reach `meta` directly.
+#[test]
+fn a_scan_that_loses_nothing_reports_the_key_as_null() {
+    let ws = workspace();
+
+    let report: serde_json::Value =
+        serde_json::from_str(&run(&mut ws.command(&["scan", "--json"])).stdout())
+            .expect("`--json` must print one JSON object");
+    assert!(
+        report.get("unindexable").is_some(),
+        "the key is there on every scan whatever the outcome: {report}"
+    );
+    assert!(
+        report["unindexable"].is_null(),
+        "a workspace that lost nothing has nothing to name: {report}"
+    );
+
+    let plain = run(&mut ws.command(&["scan"]));
+    plain.assert_success();
+    assert!(
+        !plain.stdout().contains("unindexable"),
+        "a zero record would state a loss this scan did not have:\n{}",
+        plain.stdout()
+    );
+}
