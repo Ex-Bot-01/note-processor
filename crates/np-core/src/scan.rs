@@ -2934,6 +2934,49 @@ mod tests {
         assert!(!unix.is_empty(), "one unreadable directory is still a loss");
     }
 
+    /// §3's exclusion, pinned on the class it exists for. A row whose key already equals its OS bytes — a name
+    /// genuinely holding `U+FFFD`, which is every lossy name on Windows — can be marked *and* listed unread: the walk
+    /// saw the path, the read failed, and `written.uncovered` charges that. Source 2 must stand down for it, or one note
+    /// pays twice and the gap line over-counts the way F20 §1 says it used to.
+    #[test]
+    fn a_marked_row_listed_but_unread_charges_exactly_one_counter() {
+        assert_twin_bytes(b"caf\xE9/note.md", b"caf\xE8/note.md");
+
+        let db = Db::in_memory().expect("in-memory database");
+        // A note whose real directory name is the three bytes `EF BF BD`: its key is its own display text, so it is
+        // a member of the permanent class, and no migration had to make it one.
+        plant_note(&db, "caf\u{fffd}/note.md");
+        let blocked = raw(b"caf\xE9");
+        let known =
+            known_rows(&db, std::slice::from_ref(&blocked), &[], &[]).expect("the rows read back");
+
+        assert_eq!(
+            known.hidden, 0,
+            "the byte arm cannot see this row: its key is `EF BF BD`, the refusal is a raw `E9`"
+        );
+        assert_eq!(
+            known.marked.iter().map(|row| &row.rel).collect::<Vec<_>>(),
+            ["caf\u{fffd}/note.md"],
+            "the look-alike prefix marks it, which is §2's width unchanged"
+        );
+
+        // The same path listed by this walk with an empty hash: it exists, and the read failed.
+        let mut listed = twin_row(b"caf\xEF\xBF\xBD", "note.md").1;
+        listed.hash.clear();
+        assert_eq!(
+            unresolved_ambiguity(&known.marked, &[], &[listed]),
+            Vec::<String>::new(),
+            "source 2 stands down — the read failure already charges this note in `written.uncovered`"
+        );
+
+        // With nothing listed at all, that same row is exactly source 2's population: charged once, not zero times.
+        assert_eq!(
+            unresolved_ambiguity(&known.marked, &[], &[]),
+            ["caf\u{fffd}/note.md".to_string()],
+            "hidden work charges in the counter that describes it"
+        );
+    }
+
     /// §4.4's answer, **counted** rather than assumed: one note behind one unknown path is charged in exactly
     /// one of the two counters the gap line adds together.
     ///
@@ -2944,10 +2987,13 @@ mod tests {
     /// cannot be both: [`under_unreadable`]'s byte prefix only ever names a directory that was never entered, and
     /// [`is_unknown_path`]'s refused arm only ever names a name the walk would not key — neither is a listed path.
     ///
-    /// The [`key_is_display_derived`] fallback sits outside that construction: it hides a row on **display** text,
-    /// so a row it drops may be one whose own path was listed and could not be read, which is
-    /// `written.uncovered`'s shape as well. Nothing below proves those two charges cannot meet — F23 in
-    /// `docs/backlog-m2-followups.md` owns what that fallback costs.
+    /// The [`key_is_display_derived`] fallback used to sit outside that construction: it hid a row on **display** text,
+    /// so a row it dropped could also be one whose own path was listed and could not be read — `written.uncovered`'s
+    /// shape as well. F23 settled that in two places rather than leaving it to luck: `known_rows` asks the byte arm
+    /// **first** and marks nothing it already hid (§3's precedence, which on Windows is the difference between one charge
+    /// and a universal double charge), and [`unresolved_ambiguity`] skips any marked row whose key appears in the
+    /// found-side unreadable set. [`a_marked_row_listed_but_unread_charges_exactly_one_counter`] pins that exclusion on
+    /// the class it exists for; what remains here is the byte-keyed disjointness F20 established.
     ///
     /// Before F20 the two sets overlapped for byte-keyed rows too: a note in the readable twin was hidden by its
     /// unreadable twin's display spelling **and** charged as an unread write, so one note cost two charges and the
