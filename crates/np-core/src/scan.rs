@@ -35,7 +35,7 @@
 //!   fingerprint deciding which of them are ours to replace. Every write goes through a temporary file
 //!   plus `rename`, and no note body is ever opened for writing.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
@@ -395,8 +395,18 @@ pub fn scan_with_inject(
     let stored = parse_version(&db)?;
     let refresh = refresh_needed(stored);
     let now = now_secs();
-    let (known, hidden_by_unknown) = known_rows(&db, &walked.unreadable, &walked.unrepresentable)?;
-    let changes = classify(&known, &snapshots, !cfg!(windows));
+    let known = known_rows(&db, &walked.unreadable, &walked.unrepresentable, &snapshots)?;
+    let changes = classify(&known.rows, &snapshots, !cfg!(windows));
+    // An ambiguous row is marked rather than deleted (F23 §2), which puts two decisions between
+    // classification and the write pass: a `Removed` naming an admitted marked key is dropped (§4 — this is
+    // the arm that used to live inside `known_rows` as a deletion, and F20's safety property says it must
+    // never stale a note nobody re-read), and what is left unresolved becomes the second source of the
+    // charge §3 sums.
+    let changes = strip_marked_removals(changes, &known.marked);
+    let ambiguous = unresolved_ambiguity(&known.marked, &changes, &snapshots);
+    // The two sources are **added**, never one replacing the other: rows hidden by the byte-keyed arm
+    // resolve nothing, and an unresolved marked row is a note this refresh did not reach either.
+    let hidden = known.hidden + ambiguous.len();
 
     let tx = db.0.unchecked_transaction().map_err(DbError::from)?;
     let written = apply_changes(
@@ -409,7 +419,7 @@ pub fn scan_with_inject(
         &cfg.markers,
     )?;
     // Decided here, before anything else writes, from what the write pass actually delivered.
-    let record_version = refresh && refresh_covered(&written, hidden_by_unknown);
+    let record_version = refresh && refresh_covered(&written, hidden);
     // Resolution waits for that pass so a link can land on a file that only appeared in this scan, and
     // comes after the stale-marking so nothing resolves onto a note that just left the live set.
     store_note_links(&db, &written.parsed)?;
@@ -444,7 +454,7 @@ pub fn scan_with_inject(
     if refresh && !record_version {
         // Without this line a workspace with one unreadable directory would re-parse its whole corpus on
         // every scan in silence, which looks exactly like the version never being written by accident.
-        report_refresh_gap(&mut io::stderr(), written.uncovered + hidden_by_unknown);
+        report_refresh_gap(&mut io::stderr(), written.uncovered + hidden);
     }
 
     // The durable record of what this scan could not index, written **after** the commit it describes — the
@@ -655,8 +665,10 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// [`is_unknown_path`], and it judges a row by its `rel_bytes`: a row whose *display* text happens to match an
 /// unknown path while its bytes do not belongs to a subtree this scan did read, and hiding it is F20. The one
 /// exception is a row whose stored key was itself derived from display text ([`key_is_display_derived`]): such a
-/// row has no byte spelling left to be judged by, so it is compared text against text — over-hiding rather than
-/// falsely reporting a live note `Removed` (F20 §4.2, "unknown is not absent").
+/// row has no byte spelling left to be judged by, so it is compared text against text (F20 §4.2, "unknown is not
+/// absent") — but since F23 that comparison **marks** the row instead of deleting it. An ambiguous row stays in
+/// `known` when a listed readable path spells it exactly and matches its stored hash ([`admits`], §2's scoping),
+/// and whether it resolves is decided afterwards from what `classify` did, not here.
 ///
 /// Stale rows stay out because their absence was already reported; leaving them in would count one
 /// deleted file as `removed` on every later scan. Dropping them is also what lets such a file come back
@@ -675,16 +687,47 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// answer for both, and that boolean feeds the refresh-coverage decision, which decides whether
 /// [`PARSE_VERSION_KEY`] gets recorded (F13 §3).
 ///
-/// The count alongside the rows is how many live **note** rows that unknown-path filter dropped — nothing else
+/// The count alongside the rows is how many live **note** rows that byte-keyed filter dropped — nothing else
 /// reports them, since they appear nowhere in `found` — which is how [`scan_with_inject`] knows a
 /// parse-rule refresh never reached part of the corpus. Any row with no note behind it is excluded by the
 /// `EXISTS` — attachments and never-yet-parsed paths alike: no parse rule can stale rows that do not exist,
-/// so counting one would pin the version forever over work that is not owed.
+/// so counting one would pin the version forever over work that is not owed. F23's marked rows charge
+/// **separately** ([`unresolved_ambiguity`], §3's source 2), and a row never charges both ([`known_rows`]'s
+/// precedence: the byte arm answers first and marks nothing).
+struct KnownRows {
+    /// The rows `classify` may judge.
+    rows: Vec<Snapshot>,
+    /// Source 1 (§3): live note rows the **byte-keyed** arm hid, unchanged by F23.
+    hidden: usize,
+    /// Every ambiguous row this pass marked, admitted or refused, in byte-key ascending order — the
+    /// population [`unresolved_ambiguity`] reads and §6's record field renders.
+    marked: Vec<Marked>,
+}
+
+/// One row F23 **marked**: its key is display text ([`key_is_display_derived`]) and an unreadable path spells
+/// that text, so `known_rows` cannot tell whether the file it describes is the readable look-alike or a file
+/// behind the obstruction. It may never be removed, and it may be claimed — by content or by its own listed
+/// path (§2).
+struct Marked {
+    /// The row's stored key: what a claim names (`Change::Moved { from }`) and what [`strip_marked_removals`]
+    /// matches a `Removed` against.
+    key: Vec<u8>,
+    /// Display spelling, for the capped name list in F22's record (§6).
+    rel: String,
+    /// Whether [`admits`] let it reach `known`. A refused row is pre-dropped — today's behaviour — and so
+    /// resolves nothing this pass.
+    admitted: bool,
+    /// Whether a note row hangs off it, for the reason [`known_rows`] gives: only a note can hold
+    /// [`PARSE_VERSION_KEY`] back.
+    is_note: bool,
+}
+
 fn known_rows(
     db: &Db,
     unreadable: &[UnknownPath],
     unrepresentable: &[UnknownPath],
-) -> Result<(Vec<Snapshot>, usize), DbError> {
+    listed: &[Snapshot],
+) -> Result<KnownRows, DbError> {
     // Both key columns come back, because this is the database side of a byte-keyed comparison: hand out
     // display text here and every non-UTF-8 row reads as removed-and-re-added on every scan forever, which is
     // §1's never-converges symptom manufactured by the fix (F13 §4.1).
@@ -714,22 +757,164 @@ fn known_rows(
     let unreadable_display = display_spelled(unreadable);
     // Read out fully here, so the write pass never runs with a read open across it.
     let mut known = Vec::new();
+    let mut marked = Vec::new();
     let mut hidden = 0_usize;
     for row in rows {
         let (snapshot, is_note) = row?;
-        // Bytes first: that is the identity, and for any row the walk keyed it this is the whole answer.
-        let unknown = is_unknown_path(&snapshot.rel_bytes, unreadable, unrepresentable)
-            || (key_is_display_derived(&snapshot.rel, &snapshot.rel_bytes)
-                && under_unreadable(snapshot.rel.as_bytes(), &unreadable_display));
-        if unknown {
+        // Bytes first: that is the identity, and for any row the walk keyed it this is the whole answer. First
+        // for a second reason too — §3's **precedence**. The permanent class satisfies both arms at once (a row
+        // whose key equals its OS bytes, sitting under a genuinely unreadable prefix), so marking before hiding
+        // would charge it in source 1 *and* source 2; on Windows, where refusal bytes are already lossy, that
+        // double charge would be universal. Today's single `||` could not double count, and neither may this.
+        if is_unknown_path(&snapshot.rel_bytes, unreadable, unrepresentable) {
             if is_note {
                 hidden += 1;
             }
-        } else {
+            continue;
+        }
+        let ambiguous = key_is_display_derived(&snapshot.rel, &snapshot.rel_bytes)
+            && under_unreadable(snapshot.rel.as_bytes(), &unreadable_display);
+        if !ambiguous {
             known.push(snapshot);
+            continue;
+        }
+        // Marked. Admission is decided here because it is a **pre**-drop (§4): what no listed readable path
+        // spells exactly, with its stored hash, never enters `known` — today's behaviour for the refused set,
+        // unchanged — and charges source 2.
+        let admitted = admits(db, &snapshot, listed)?;
+        if admitted {
+            known.push(snapshot.clone());
+        }
+        marked.push(Marked {
+            key: snapshot.rel_bytes,
+            rel: snapshot.rel,
+            admitted,
+            is_note,
+        });
+    }
+    Ok(KnownRows {
+        rows: known,
+        hidden,
+        marked,
+    })
+}
+
+/// Whether an ambiguous row is **admitted** to `known` — §2's scoping clause, and the one assertion standing
+/// between F23 and a note re-homed onto a stranger's file.
+///
+/// `classify` matches a claim on **hash alone** (`claimants.get(added.hash)` over every unmatched known row),
+/// and its `present_hashes` guard cannot help here: that set is seeded from known rows whose *key* matches an
+/// unreadable listing, and a display-derived key never equals a real-bytes listing key. Left unscoped, any
+/// unrelated readable path with byte-identical content — a `# Title` stub, a blank template, a re-exported note
+/// — would claim the hidden row and re-home its id. So the scoping happens before classification: some listed
+/// path must spell the row exactly (same display text), carry its stored hash, and be readable (an empty hash is
+/// [`crate::change`]'s unknown marker).
+///
+/// The third test is §4's stale-row rule: a claim onto a key another row already holds hits the `UNIQUE` in
+/// [`crate::db::apply_move`], comes back `Indexed::Taken`, returns early, and leaves the path in `skipped` while
+/// `owes_a_reparse` charges `written.uncovered` on every refresh — a stuck state nothing clears. Rows of **any**
+/// state count, because [`crate::db::upsert_file`] resolves by `rel_bytes` with no state filter and that is how a
+/// returning file rejoins its note.
+///
+/// Testing "some candidate" rather than "the one `classify` will pick" is sound: a claim needs exactly one added
+/// path carrying the hash (`added_count == Some(&1)`), so wherever two twins both qualify there is no claim to
+/// refuse. With display scoping plus `files.rel_bytes UNIQUE` there is at most **one claimant per listed path**,
+/// which is why no multiplicity rule, tally or tie-break exists to write (§2's corollary).
+fn admits(db: &Db, row: &Snapshot, listed: &[Snapshot]) -> Result<bool, DbError> {
+    for path in listed {
+        if path.rel != row.rel || path.hash.is_empty() || path.hash != row.hash {
+            continue;
+        }
+        if key_taken(db, &path.rel_bytes, &row.rel_bytes)? {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Whether some row of **any** state — live or stale — besides the one keyed `except` already holds `key`.
+fn key_taken(db: &Db, key: &[u8], except: &[u8]) -> Result<bool, DbError> {
+    let taken =
+        db.0.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM files WHERE rel_bytes = ?1 AND rel_bytes <> ?2)",
+        )?
+        .query_row(params![key, except], |row| row.get::<_, bool>(0))?;
+    Ok(taken)
+}
+
+/// §4's post-strip: drop every `Removed` naming an admitted marked key, after classification and before
+/// anything consumes the list — `changes` has exactly one consumer ([`apply_changes`]), read twice inside it.
+///
+/// **`Change::Removed` only.** The identity-matched route legitimately emits `Modified` keyed on the listed
+/// path, whose `rel_bytes` equal the row's stored key; a strip written as "drop any change carrying a marked
+/// key" would delete that legitimate re-parse and leave stale derived rows behind charging nothing. Traced
+/// against [`classify`]: in M and in N′-changed the row is unmatched by identity, its hash matches no added path,
+/// and the final loop pushes exactly one `Removed` whose bytes are the stored key — so `(Removed, key)` covers
+/// both.
+fn strip_marked_removals(
+    changes: Vec<(RelPath, Change)>,
+    marked: &[Marked],
+) -> Vec<(RelPath, Change)> {
+    changes
+        .into_iter()
+        .filter(|(path, change)| {
+            !(matches!(change, Change::Removed)
+                && marked
+                    .iter()
+                    .any(|row| row.admitted && row.key == path.rel_bytes))
+        })
+        .collect()
+}
+
+/// §3's source 2: the marked rows this pass **did not resolve**, as their display spellings in byte-key order.
+///
+/// Resolution is §2's two routes, read from what classification actually delivered rather than tallied in a
+/// pre-pass — which is what lets healed N′ stop paying once it has healed (a charge that never clears is F19's
+/// bug wearing this milestone's clothes):
+///
+/// - **claimed** — it produced `Moved { from } = its own key`, so [`crate::db::apply_move`] re-keys `rel_bytes`
+///   from real bytes; or
+/// - **matched** — its own path was listed with a non-empty hash. Matched on the **key**, because that is what
+///   `classify` pairs identity on: a listing that merely *spells* the row the same is M's look-alike, whose rows
+///   are still unpaired. Without this route the permanent class — a name genuinely holding `U+FFFD`, and every
+///   lossy Windows name — would charge every scan forever.
+///
+/// Then §3's exclusion: a marked row whose own key was listed **unreadable** is charged by `written.uncovered`
+/// instead, which resolves by byte key. Deriving the count from "did we strip a `Removed`" instead would charge
+/// zero times for a marked row `classify` filtered out before emitting anything — an uncharged stale row is
+/// exactly the F15 class this project keeps paying to avoid.
+fn unresolved_ambiguity(
+    marked: &[Marked],
+    changes: &[(RelPath, Change)],
+    listed: &[Snapshot],
+) -> Vec<String> {
+    let claimed: HashSet<&[u8]> = changes
+        .iter()
+        .filter_map(|(_, change)| match change {
+            Change::Moved { from } => Some(from.rel_bytes.as_slice()),
+            _ => None,
+        })
+        .collect();
+    let mut matched: HashSet<&[u8]> = HashSet::new();
+    let mut unreadable: HashSet<&[u8]> = HashSet::new();
+    for path in listed {
+        if path.hash.is_empty() {
+            unreadable.insert(path.rel_bytes.as_slice());
+        } else {
+            matched.insert(path.rel_bytes.as_slice());
         }
     }
-    Ok((known, hidden))
+    marked
+        .iter()
+        // Only a row with a note behind it can hold `PARSE_VERSION` back ([`known_rows`]'s reason).
+        .filter(|row| row.is_note)
+        .filter(|row| !unreadable.contains(row.key.as_slice()))
+        .filter(|row| {
+            !claimed.contains(row.key.as_slice()) && !matched.contains(row.key.as_slice())
+        })
+        .map(|row| row.rel.clone())
+        .collect()
 }
 
 /// Whether `rel_bytes` sits inside a directory whose contents this walk never saw, which makes its absence from
@@ -2052,9 +2237,11 @@ mod tests {
     use super::{
         apply_changes, folded_row, is_unknown_path, known_rows, np_published, refresh_covered,
         remove_corpses, remove_file, report_refresh, report_refresh_gap, skipped_lines,
-        under_unreadable, unindexable_record, Found, UnknownPath, Written, NAME_CAP, PARSE_VERSION,
+        strip_marked_removals, under_unreadable, unindexable_record, unresolved_ambiguity, Found,
+        UnknownPath, Written, NAME_CAP, PARSE_VERSION,
     };
     use crate::catalog::{HEADER, HEADER_CRLF};
+    use crate::change::{classify, Change};
     use crate::config::MarkerConfig;
     use crate::db::{self, upsert_file, Db};
     use crate::hash::Snapshot;
@@ -2246,8 +2433,14 @@ mod tests {
     }
 
     /// The charge behind the suppression: a hidden note is one the refresh never re-parsed, so recording the
-    /// new rules over it would label rows an older build wrote as current (F15). `known_rows` drops the row so
-    /// `classify` cannot call it `Removed` **and** counts it here — one comparison, both halves of the promise.
+    /// new rules over it would label rows an older build wrote as current (F15). `known_rows` keeps the row out
+    /// of `classify`'s reach **and** counts it here — one comparison, both halves of the promise.
+    ///
+    /// F23 §5.2 named this case as one whose contract was being replaced, on the reading that its rows are
+    /// ambiguous (`snap` keys from display text, so they are). Running it showed the other half of §3: the entry
+    /// [`crate::walk`] would record for this refusal is built by [`display_keyed_unknown`], whose **bytes** equal
+    /// those rows' keys, so the byte-keyed arm answers first and precedence keeps them charged in source 1 and
+    /// unmarked. That is pinned below rather than assumed: listing their own paths readable does not move them.
     #[test]
     fn a_note_behind_a_refused_path_is_charged_to_the_refresh_that_missed_it() {
         let db = Db::in_memory().expect("in-memory database");
@@ -2267,28 +2460,60 @@ mod tests {
 
         // A refused directory, recorded as [`crate::walk`] records it.
         let dirs = [display_keyed_unknown("notes/caf\u{fffd}")];
-        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
+        let refused = known_rows(&db, &dirs, &[], &[]).expect("the rows read back");
 
         assert_eq!(
-            known.iter().map(|row| row.rel.as_str()).collect::<Vec<_>>(),
+            refused
+                .rows
+                .iter()
+                .map(|row| row.rel.as_str())
+                .collect::<Vec<_>>(),
             ["elsewhere/c.md", "notes/peer.md"],
             "the refused subtree reaches neither `Removed` nor a move, and its neighbours still do"
         );
         assert_eq!(
-            hidden, 2,
+            refused.hidden, 2,
             "one charge per hidden note — the attachment behind the same refusal owes nothing"
         );
 
-        // The other arm, fed a refused *file*: exactly its own row disappears and is charged.
-        let (known, hidden) = known_rows(&db, &[], &[display_keyed_unknown("notes/peer.md")])
-            .expect("the rows read back again");
-        assert_eq!(hidden, 1, "one refused note, one charge");
+        // §3's precedence, on the arm pair that overlaps for the permanent class. These rows are ambiguous by
+        // predicate, and their own paths can be listed readable with a matching hash, yet the byte-keyed arm has
+        // already answered: they stay charged **once**, in source 1, and are never marked. Mark-first would charge
+        // each of them twice — universally on Windows, where refusal bytes are already lossy.
+        let listed = [
+            snap("notes/caf\u{fffd}/a.md"),
+            snap("notes/caf\u{fffd}/deep/b.md"),
+        ];
+        let both_arms =
+            known_rows(&db, &dirs, &[], &listed).expect("the same rows, with their paths listed");
+        assert_eq!(
+            both_arms.hidden,
+            2,
+            "source 1 still owns the charge: {:?}",
+            both_arms
+                .marked
+                .iter()
+                .map(|row| &row.rel)
+                .collect::<Vec<_>>()
+        );
         assert!(
-            !known.iter().any(|row| row.rel == "notes/peer.md"),
+            both_arms.marked.is_empty(),
+            "a row the byte arm hid is not marked, so it cannot charge twice"
+        );
+
+        // The other arm, fed a refused *file*: exactly its own row disappears and is charged.
+        let peer = known_rows(&db, &[], &[display_keyed_unknown("notes/peer.md")], &[])
+            .expect("the rows read back again");
+        assert_eq!(peer.hidden, 1, "one refused note, one charge");
+        assert!(
+            !peer.rows.iter().any(|row| row.rel == "notes/peer.md"),
             "the refused path is out of the comparison"
         );
         assert_eq!(
-            known.iter().map(|row| row.rel.as_str()).collect::<Vec<_>>(),
+            peer.rows
+                .iter()
+                .map(|row| row.rel.as_str())
+                .collect::<Vec<_>>(),
             [
                 "elsewhere/c.md",
                 "notes/caf\u{fffd}/a.md",
@@ -2301,7 +2526,7 @@ mod tests {
         // And the charge is what withholds the version. Both halves of `refresh_covered` are pinned because
         // the notice the user sees prints their sum (`written.uncovered + hidden_by_unknown`).
         assert!(
-            !refresh_covered(&Written::default(), hidden),
+            !refresh_covered(&Written::default(), peer.hidden),
             "a refresh that never reached a note may not label its rules current"
         );
         assert!(
@@ -2320,9 +2545,16 @@ mod tests {
 
     /// The one exception to byte matching, and its bound, in one comparison. A row whose key migration 4 derived
     /// from display text ([`key_is_display_derived`]) has no byte spelling to be judged by, so an unreadable
-    /// directory whose bytes it cannot tell apart hides it — over-hidden, charged, reported nothing. The same
-    /// display spelling keyed from **real** bytes is a row the walk re-keyed, and stays in `known` on its bytes:
-    /// that is F20's twin fix surviving the fallback, asserted rather than promised.
+    /// directory whose bytes it cannot tell apart is **marked** — since F23 that is what the fallback does with
+    /// it, instead of deleting it from the scan's view. With nothing listed the mark refuses admission (today's
+    /// pre-drop) and charges source 2; with a listed readable path spelling the row exactly and carrying its
+    /// stored hash the row is **in `known`, marked, and unremovable** — `classify` still calls it `Removed`, and
+    /// [`strip_marked_removals`] is what stops that stale-ing a live note.
+    ///
+    /// The same display spelling keyed from **real** bytes is a row the walk re-keyed, and stays in `known` on
+    /// its bytes: that is F20's twin fix surviving the fallback, asserted rather than promised. F23 §5.2 names
+    /// this case as a contract update rather than a fence, and it is one: the assertions below used to read
+    /// `hidden == 1`, which was the deletion being counted.
     #[test]
     fn a_display_keyed_row_falls_back_to_text_and_a_byte_keyed_row_does_not() {
         assert_twin_bytes(b"caf\xE9/note.md", b"caf\xE8/note.md");
@@ -2360,10 +2592,11 @@ mod tests {
 
         // The blocked directory is the **twin** (`caf\xE8`); `caf\xE9` was read in full by this walk.
         let dirs = [raw(b"caf\xE8")];
-        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
+        let refused = known_rows(&db, &dirs, &[], &[]).expect("the rows read back");
 
         assert_eq!(
-            known
+            refused
+                .rows
                 .iter()
                 .map(|row| row.rel_bytes.as_slice())
                 .collect::<Vec<_>>(),
@@ -2371,8 +2604,74 @@ mod tests {
             "the byte-keyed row and the plain row stay in the comparison; only the text-keyed row drops out"
         );
         assert_eq!(
-            hidden, 1,
-            "the legacy note is charged to a refresh that could not reach it, and no other note is"
+            refused.hidden, 0,
+            "the byte arm saw this row and answered `known`: source 1 charges nothing here"
+        );
+        let marks = refused
+            .marked
+            .iter()
+            .map(|row| &row.rel)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marks,
+            ["caf\u{fffd}/note.md"],
+            "and the fallback marked exactly one row"
+        );
+        assert!(
+            !refused.marked[0].admitted,
+            "no listed path spells it, so §2's scoping refuses admission and it never reaches `classify`"
+        );
+        assert_eq!(
+            unresolved_ambiguity(&refused.marked, &[], &[]),
+            ["caf\u{fffd}/note.md".to_string()],
+            "the legacy note is still charged to a refresh that could not reach it — as source 2 now"
+        );
+
+        // The contract F23 replaces: a listed readable path that spells the row exactly **and** carries its
+        // stored hash admits it. It pairs with nothing by identity — its key is display text, the listing's are
+        // the walk's bytes — so `classify` still reaches for a `Removed`, and being marked is what makes that
+        // change unremovable.
+        let (_, lookalike) = twin_row(b"caf\xE8", "note.md");
+        let listed = [lookalike];
+        let admitted = known_rows(&db, &dirs, &[], &listed).expect("the rows read back once more");
+        assert!(
+            admitted
+                .rows
+                .iter()
+                .any(|row| row.rel_bytes == b"caf\xEF\xBF\xBD/note.md".to_vec()),
+            "an admitted ambiguous row is in `known`: {:?}",
+            admitted.rows.iter().map(|row| &row.rel).collect::<Vec<_>>()
+        );
+        assert!(
+            admitted.marked[0].admitted,
+            "marked **and** admitted, which is the state §4's post-strip exists for"
+        );
+
+        let changes = classify(&admitted.rows, &listed, true);
+        assert!(
+            changes.iter().any(|(path, change)| {
+                matches!(change, Change::Removed) && path.rel_bytes == b"caf\xEF\xBF\xBD/note.md"
+            }),
+            "premise: `classify` would stale it — {:?}",
+            changes
+                .iter()
+                .map(|(path, change)| (path.rel.clone(), format!("{change:?}")))
+                .collect::<Vec<_>>()
+        );
+        let kept = strip_marked_removals(changes, &admitted.marked);
+        assert!(
+            !kept.iter().any(|(path, change)| {
+                matches!(change, Change::Removed) && path.rel_bytes == b"caf\xEF\xBF\xBD/note.md"
+            }),
+            "and the strip is what makes it unremovable: {:?}",
+            kept.iter()
+                .map(|(path, change)| (path.rel.clone(), format!("{change:?}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            unresolved_ambiguity(&admitted.marked, &kept, &listed),
+            ["caf\u{fffd}/note.md".to_string()],
+            "strip or no strip, its rows are still unpaired while a look-alike holds the content: it charges"
         );
     }
 
@@ -2666,10 +2965,17 @@ mod tests {
         let dirs = [raw(b"caf\xE9")];
 
         // Case 1 — the fixture in `tests/scan.rs`: one directory the walk could not enter, its note behind it.
-        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back");
-        assert_eq!(hidden, 1, "one note behind the unreadable twin: one charge");
+        let first = known_rows(&db, &dirs, &[], &[]).expect("the rows read back");
         assert_eq!(
-            known.iter().map(|row| row.rel.as_str()).collect::<Vec<_>>(),
+            first.hidden, 1,
+            "one note behind the unreadable twin: one charge"
+        );
+        assert_eq!(
+            first
+                .rows
+                .iter()
+                .map(|row| row.rel.as_str())
+                .collect::<Vec<_>>(),
             ["caf\u{fffd}/low.md"],
             "and the only row left in the comparison is the **readable** twin's"
         );
@@ -2688,7 +2994,7 @@ mod tests {
             "a note this scan read is not charged as an uncovered write"
         );
         assert_eq!(
-            hidden + written.uncovered,
+            first.hidden + written.uncovered,
             1,
             "one note the refresh missed, one charge on the gap line"
         );
@@ -2697,13 +3003,14 @@ mod tests {
         // changed, between walk and read), so it reaches `found` as an unknown marker while its unreadable twin
         // sits in the list. Matched on display text it would be charged **twice**: hidden by a refusal this
         // scan never made, and missed by the write pass.
-        let (known, hidden) = known_rows(&db, &dirs, &[]).expect("the rows read back again");
+        let second = known_rows(&db, &dirs, &[], &[]).expect("the rows read back again");
         assert_eq!(
-            hidden, 1,
+            second.hidden, 1,
             "only the genuinely hidden note is charged: the readable twin's row is still in `known`"
         );
         assert!(
-            known
+            second
+                .rows
                 .iter()
                 .any(|row| row.rel_bytes == b"caf\xE8/low.md".to_vec()),
             "the readable twin survives the comparison on bytes"
@@ -2723,7 +3030,7 @@ mod tests {
             "the note this scan could not read is charged once"
         );
         assert_eq!(
-            hidden + written.uncovered,
+            second.hidden + written.uncovered,
             2,
             "two notes the refresh missed, two charges — display-text matching made this three (F20 §1)"
         );
