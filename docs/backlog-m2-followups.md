@@ -273,16 +273,34 @@ What these numbers can and cannot carry:
 
 - **Where:** `crates/np-core/src/scan.rs`'s `Indexed::Duplicate` arm charging `written.uncovered` on every
   scan, and `refresh_covered`, which therefore never returns true for such a workspace.
-- **Risk:** deliberate at the level of F15 (recording the parse version beside a note that was not re-parsed is
-  exactly F15's bug), but nothing heals it: no code merges two `notes` rows for one path, so every scan
-  re-parses every note and prints the refresh-gap line. On a large corpus that is a permanent several-hundred-ms
-  cost plus a warning nobody can act on, and the registry row keeps moving ahead of derived rows that never
-  change (mixed-age database, `Indexed::Duplicate`'s doc).
-- **Fix:** a migration or repair command that merges duplicate note rows for one `rel_bytes` — keeping the older
-  `notes.id` so derived rows stay attached, re-pointing edges that named the loser, and reporting what it merged
-  rather than choosing silently — after which the version records normally. Until then the cost is named in
-  `refresh_covered`'s doc, not discovered. **Do when:** a workspace holding a legacy duplicate converges to
-  `uncovered = 0` on the scan after the repair, and the repair names every pair it merged.
+- **Risk (as filed, against a build that had no exit):** deliberate at the level of F15 (recording the parse
+  version beside a note that was not re-parsed is exactly F15's bug), but nothing healed it: no code merged two
+  `notes` rows for one path, so every scan re-parsed every note and printed the refresh-gap line. On a large
+  corpus that was a permanent several-hundred-ms cost plus a warning nobody can act on, and the registry row
+  kept moving ahead of derived rows that never changed (mixed-age database, `Indexed::Duplicate`'s doc).
+- **Fix:** a migration that merges duplicate note rows for one `rel_bytes` — keeping the older `notes.id` so
+  derived rows stay attached, re-pointing edges that named the loser, and reporting what it merged rather than
+  choosing silently — after which the version records normally. **A `np repair` command was considered and ruled
+  out** (design §7): this program's only command is `np scan`, whose open already runs every schema fact, and a
+  user-facing second path through the same logic is a second thing to keep in agreement with the first. So do not
+  build one on the strength of this entry — the entry is closed, and migration 5 at open is the merge path.
+  **Do when:** a workspace holding a legacy duplicate converges to `uncovered = 0` on the scan after the repair,
+  and the repair names every pair it merged. **Met** by `a_merged_duplicate_pair_clears_the_charge_and_records_
+  the_parse_version` and `the_scan_that_merges_reports_the_string_it_stored`.
+- **Shipped (`9821dbb`, `4f0f5b3`, `e4495c3`, `7212e56`, `docs/design-f19-note-merge.md`): migration 5 folds the
+  pair at open, and announces it in the transaction that deletes.** Migration 5 (`merge_duplicate_notes`) groups
+  by `rel_bytes` — never by display text, so it cannot reach across F23's display twins — keeps `MIN(id)` because
+  that is the row derived rows already hang off, re-points `links.dst_note_id` onto the winner instead of nulling
+  it (other notes' prose is not re-parsed, so a NULL target is a resolved link lost permanently), and deletes the
+  loser's `headings`, `tags`, `items` and outgoing edges **by hand**: enforcement is off inside a code step, so no
+  `ON DELETE CASCADE` fires behind it, and `PRAGMA foreign_key_check` in the same transaction is what turns a
+  softened delete into a refused open. The receipt lands in `meta` under `note_merges` — `merged=N;paths=…`, names
+  capped at eight and ordered by byte key — written even at zero, because `merged=0` is the record that the check
+  ran; only the open that merged echoes it, on stderr and as `ScanReport::merged_notes`, so stdout, `--json` and
+  the durable record are one string (F21 §3's rule again). Convergence is asserted rather than hoped for, and
+  `Indexed::Duplicate` survives because a pair another tool writes *after* migration 5 has run is still permanent:
+  there is no second pass and no `UNIQUE` index on `notes(rel_bytes)` (design §7 keeps that choice deliberately
+  open so F13 §7's reader stays testable), so the reader still names such a pair instead of picking a winner.
 
 ## F20 — two report-side filters still compare display text
 
