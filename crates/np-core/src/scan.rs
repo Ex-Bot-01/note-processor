@@ -1599,15 +1599,23 @@ fn refresh_needed(stored: Option<u32>) -> bool {
 /// stays unrepresentable no scan can index it — a refused *file* leaves its own rows owing, a refused
 /// *directory* leaves everything below it owing — so they keep whatever an older build wrote and only renaming
 /// the path clears the debt), a move refused by an identity conflict — judged by the path it came from, since
-/// `classify` suppressed that path's `Removed` and its rows are still in the catalog — and **a legacy
-/// duplicate note pair** (`Indexed::Duplicate`). The unreadable ones clear when the obstruction does.
-/// A refused name and a duplicate never do on their own: no code renames a file and no code merges two note
-/// rows, so such a workspace re-parses its whole corpus on every scan and prints the gap line each time. That
-/// is chosen over recording the version beside a note that was not re-parsed, which is F15's bug wearing a
-/// clean hat; the cost is named here rather than discovered, and `docs/backlog-m2-followups.md` F19 owns the
-/// migration that would heal the duplicate. That loop
-/// is worth paying for: those rows stay wrong until the obstruction clears, and the notice below names the
-/// count so this is never silent.
+/// `classify` suppressed that path's `Removed` and its rows are still in the catalog — and **a duplicate note
+/// pair** (`Indexed::Duplicate`). The unreadable ones clear when the obstruction does.
+///
+/// Of those, a refused name is the one that never clears on its own: no code renames a file, so such a
+/// workspace re-parses its whole corpus on every scan and prints the gap line each time. That is chosen over
+/// recording the version beside a note that was not re-parsed, which is F15's bug wearing a clean hat; the cost
+/// is named here rather than discovered.
+///
+/// A duplicate pair no longer belongs to that class in a database this program wrote: **the next open heals
+/// it.** Migration 5 (`crate::db::merge_duplicate_notes`) folds the pair onto its oldest row before the write
+/// pass runs, so the charge is paid at most once more and then disappears with the reason it was withheld —
+/// `a_merged_duplicate_pair_clears_the_charge_and_records_the_parse_version` in `crates/np-core/tests/scan.rs`
+/// pins the clearing, and `an_unmerged_duplicate_pair_still_charges_the_refresh_and_withholds_the_version`
+/// beside it pins what stays: a pair that arrives after that step has run — one another tool wrote into a
+/// migrated file — is permanent again, because migration 5 does not take a second pass and this reader still
+/// refuses to pick a winner. That loop is worth paying for: those rows stay wrong until the obstruction clears,
+/// and the notice below names the count so this is never silent.
 fn refresh_covered(written: &Written, hidden_by_unknown: usize) -> bool {
     written.uncovered == 0 && hidden_by_unknown == 0
 }
