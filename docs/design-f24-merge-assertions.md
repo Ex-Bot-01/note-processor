@@ -67,6 +67,13 @@ assert_planted_pair(&conn);   // two rows on `dup.md` (4 live-shape, 9), one edg
                               // one edge from 12 into 9, winner's heading+tag+item present
 ```
 
+**Both halves of the pair are asserted, per shape.** The first draft checked the winner's corpus as a summed three and said
+nothing about the loser's own derived rows — which left three of the four residue zeros both fixtures assert satisfiable by a
+pair that was never planted. That is the same class of hole as §2, one row away, and it arrived from me rather than from the
+data. So the helper compares two vectors of `(query, count)`: the winner's heading/tag/item at one each, and the loser's
+heading/tag/item at one each. Winner queries come in two spellings on purpose — `SELECT text …` for the verdict, which asks
+*which* heading survived, and `SELECT COUNT(*) …` for the premise, which asks only whether one was planted.
+
 `assert_planted_pair` takes a `&rusqlite::Connection`, which both seeders already hold (`db.0` in the v4 case, its own
 connection in the v3 case), so no fixture has to open the file twice or reorder migrations. **It queries `rel = 'dup.md'`,
 never `rel_bytes`:** version three's `notes` has no key column at all (`db.rs:898-907`), so a shared premise check must stay

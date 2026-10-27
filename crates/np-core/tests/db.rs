@@ -2379,6 +2379,22 @@ const LOSER_SHAPES: [&str; 4] = [
     LOSER_OUTGOING_LINKS,
 ];
 
+/// The three shapes the **winner** owns, named for the same reason and shared with [`assert_planted_pair`] so the
+/// premise and the verdict cannot drift apart by editing one literal and not the other.
+const WINNER_HEADINGS: &str = "SELECT text FROM headings WHERE note_id = 4";
+const WINNER_TAGS: &str = "SELECT tag FROM tags WHERE note_id = 4";
+const WINNER_ITEMS: &str = "SELECT COUNT(*) FROM items WHERE note_id = 4";
+
+/// The same two shapes **counted** rather than read, for [`assert_planted_pair`]: a premise asks "did the fixture plant
+/// one", a verdict asks "which text survived". One query cannot serve both — a `COUNT(*)` does not belong in the
+/// fixture's expected heading list.
+const WINNER_HEADING_ROWS: &str = "SELECT COUNT(*) FROM headings WHERE note_id = 4";
+const WINNER_TAG_ROWS: &str = "SELECT COUNT(*) FROM tags WHERE note_id = 4";
+
+/// [`LOSER_SHAPES`] without the outgoing-edge query: the derived rows a planted loser has to own for the merge's
+/// residue zeros to mean anything.
+const LOSER_DERIVED: [&str; 3] = [LOSER_HEADINGS, LOSER_TAGS, LOSER_ITEMS];
+
 /// What a merged pair leaves on disk, **measured once** so the two fixtures that plant this shape ask the same
 /// questions the same way (F24 §3). The struct holds no verdicts: every field is a reading, and each fixture compares it
 /// with its own message, because "the survivor is `MIN(id)`, not a silent pick" and "the merge ran on the pair migration 4
@@ -2404,9 +2420,9 @@ fn merged_pair_facts(db: &Db) -> MergedPairFacts {
                 "SELECT CAST(id AS TEXT) FROM notes WHERE rel_bytes = {DUP_BYTES} ORDER BY id"
             ),
         ),
-        winner_headings: names(db, "SELECT text FROM headings WHERE note_id = 4"),
-        winner_tags: names(db, "SELECT tag FROM tags WHERE note_id = 4"),
-        winner_items: scalar(db, "SELECT COUNT(*) FROM items WHERE note_id = 4"),
+        winner_headings: names(db, WINNER_HEADINGS),
+        winner_tags: names(db, WINNER_TAGS),
+        winner_items: scalar(db, WINNER_ITEMS),
         loser_residue: LOSER_SHAPES
             .iter()
             .map(|sql| (*sql, scalar::<i64>(db, sql)))
@@ -2449,7 +2465,7 @@ fn assert_planted_pair(conn: &rusqlite::Connection) {
         "test setup: winner 4 and loser 9, so `MIN(id)` has a rule to follow rather than a coincidence to match"
     );
     assert_eq!(
-        count("SELECT COUNT(*) FROM links WHERE src_note_id = 9"),
+        count(LOSER_OUTGOING_LINKS),
         1,
         "test setup: the loser owns an outgoing edge — without this row the merge's outgoing-edge delete is \
          unobservable and every assertion about it is a tautology"
@@ -2459,12 +2475,35 @@ fn assert_planted_pair(conn: &rusqlite::Connection) {
         1,
         "test setup: another note points **at** the loser, which is what makes re-pointing rather than nulling a claim"
     );
+    // Both halves of the pair have to own derived rows, asserted **per shape**. A summed total would let one
+    // fixture lose its winner heading and gain a loser item and still read as three; and skipping the loser's
+    // side entirely — which is what this used to do — leaves three of the four residue zeros that both fixtures
+    // assert satisfiable by a pair that was never planted. Same class as the hole in §2, one row away.
+    let winner_corpus: Vec<(&str, i64)> = [WINNER_HEADING_ROWS, WINNER_TAG_ROWS, WINNER_ITEMS]
+        .iter()
+        .map(|sql| (*sql, count(sql)))
+        .collect();
     assert_eq!(
-        count("SELECT COUNT(*) FROM headings WHERE note_id = 4")
-            + count("SELECT COUNT(*) FROM tags WHERE note_id = 4")
-            + count("SELECT COUNT(*) FROM items WHERE note_id = 4"),
-        3,
-        "test setup: the winner owns a heading, a tag and an item, so 'the survivor kept its corpus' is a comparison"
+        winner_corpus,
+        [
+            (WINNER_HEADING_ROWS, 1),
+            (WINNER_TAG_ROWS, 1),
+            (WINNER_ITEMS, 1),
+        ],
+        "test setup: the winner owns one heading, one tag and one item, so 'the survivor kept its corpus' is a \
+         comparison and not a hope"
+    );
+    let loser_corpus: Vec<(&str, i64)> =
+        LOSER_DERIVED.iter().map(|sql| (*sql, count(sql))).collect();
+    assert_eq!(
+        loser_corpus,
+        [
+            (LOSER_HEADINGS, 1),
+            (LOSER_TAGS, 1),
+            (LOSER_ITEMS, 1),
+        ],
+        "test setup: the loser owns derived rows of its own — plant none and the merge's four residue zeros become \
+         a description of an empty fixture"
     );
 }
 
