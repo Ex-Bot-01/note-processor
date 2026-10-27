@@ -51,10 +51,24 @@ Choosing the survivor is the whole risk, so it is stated rather than left to cha
 
 Migration 5, `merge_duplicate_notes`, inside its own transaction like every other step:
 
-1. Select groups: `SELECT rel_bytes, MIN(id) FROM notes GROUP BY rel_bytes HAVING COUNT(*) > 1`.
+1. Select groups: `SELECT rel_bytes FROM notes WHERE rel_bytes IS NOT NULL GROUP BY rel_bytes HAVING
+   COUNT(*) > 1`, ordered by `rel_bytes` so one database produces one receipt.
+
+   The `WHERE` clause is not an optimisation and must not be "simplified" away: `notes.rel_bytes` is nullable
+   (F13 §4 — a hand-written row can lack it), and `GROUP BY` gathers **every** NULL into one group. Two keyless
+   notes are two unrelated files, so folding them would delete one of them outright; the code excludes them and
+   the query here has to say so, or the next reader treats the clause as noise.
 2. For each group: re-point incoming edges from every other id to the winner; delete the loser's derived rows and
    outgoing edges, then its note row — by hand, per §2. Then `PRAGMA foreign_key_check` over the whole file, inside the
    same transaction, refusing the step through `DbError::ForeignKeys` exactly as migrations 3 and 4 do.
+
+   Note what that costs, because §2 justifies the check only through softened deletes and this is wider: the pragma
+   answers about the **whole file** and the step runs it whether or not it merged anything, so a workspace damaged by
+   something with no bearing on a duplicate pair — a `headings` row whose `note_id` names nothing — now refuses to open
+   at the four-to-five step where version four opened it happily. That is intended (the damage is real, an orphan id is
+   re-adopted by the next `INSERT`, and no later scan re-checks those keys), and it is pinned by
+   `the_merge_gate_refuses_a_child_row_whose_note_is_gone`. It also has no in-program exit: §7 rules out the repair
+   command that would be one, so the refusal text — table, rowid, parent — is itself the diagnosis.
 3. Write a receipt into `meta` under `NOTE_MERGE_KEY = "note_merges"` **in the same transaction**, in the compact style
    of `FK_ORPHANS_KEY`: `merged=N;paths=a.md,b.md` with at most eight display spellings, ordered by path so one database
    produces one receipt. Zero merges still writes `merged=0`, because the receipt proves the check ran (F21 §2's lesson).
@@ -100,6 +114,24 @@ Then:
   migration no longer allows in our own databases, and if one of them has to change, that is a signal the design is wrong:
   stop and report.
 
+**One bullet of §5 was overridden, on the controller's decision, and it is recorded here rather than hidden.**
+`two_note_rows_on_one_path_share_one_rel_bytes_so_a_note_id_lookup_cannot_be_a_bare_query_row` did change. What moved was
+the half that made the pair reachable at all: it seeded a version-three database holding the pair and let migration 4 carry
+it in, so once migration 5 existed the fixture no longer described what its name says — the merge folded the pair before any
+scan read it. The seed now opens the file to completion first and plants the pair beside it, which is the population that
+test is actually about: a database another tool wrote into, after this program's one pass. Its assertions were re-pinned in
+place (same names, same three properties, plus a new one: the stored receipt reads `merged=0` while the pair still stands,
+which is the proof no second pass ran), and `seed_duplicate_notes_version_three` was deleted with it because nothing else
+used it.
+
+The durable half of F13 §7 — the half the stop condition was protecting — is untouched and still pinned twice over:
+**a read must never pick a winner silently.** Migration 5 is not such a pick. It runs once, at open, on a rule stated in
+advance (`MIN(id)`), it re-points the edges that named the loser rather than dropping them, and it writes its receipt in the
+same transaction so the deletion cannot commit unannounced — an announced repair, of exactly the shape migration 3 set with
+its orphan cleanup. What F13 refused was a `LIMIT 1` in the reader: a silent, per-query, unrecorded choice that rewrites one
+note with another file's contents. The reader still refuses; `an_unmerged_duplicate_pair_still_charges_the_refresh_and_
+withholds_the_version` pins that it does.
+
 ## 6. Gates
 
 The standing list, no subsetting: `cargo fmt --check`; `cargo clippy --all-targets -- -D warnings`;
@@ -114,6 +146,10 @@ against the merge base and report raw numbers — no percentage from a single sa
 - **A `UNIQUE` index on `notes(rel_bytes)`.** It would make the state unrepresentable, which is tempting, but it also
   makes F13 §7's reader untestable through any API and turns a defensive arm into dead code maintained by hand. The
   backlog keeps this as a possible later schema step, with the legacy fixtures moved to raw-SQL construction first.
-- **A user-facing repair command** (invariant 4).
+- **A user-facing repair command** (invariant 4). One cost of that ruling deserves a line here rather than living only in
+  the code comment: migration 5's whole-file `PRAGMA foreign_key_check` refuses damage it did not cause (see §3 step 2),
+  and such a file therefore has no way back inside this program — the message names the offending table, rowid and parent,
+  and fixing it means `sqlite3`. A repair command would have been the exit; two paths through the merge were judged worse
+  than no exit at all, and that trade is being made knowingly.
 - **Merging across display twins** — two byte-distinct paths that share a lossy spelling are not duplicates of each
   other; that is F23's ambiguity, and this migration groups by `rel_bytes` precisely so it cannot reach into it.
