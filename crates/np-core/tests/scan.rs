@@ -3379,24 +3379,30 @@ fn a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin
     );
 }
 
-/// **F23's harm, pinned as a defect rather than as desired behaviour.** The same display-keyed row, with the
-/// unreadable directory now on the *other* twin: this scan reads the row's own path, yet the fallback still hides it,
-/// because a display spelling has many byte twins and the row records none of them. With nothing to pair against,
-/// the listed file indexes as `Added`, so one physical file ends up with two live `files` rows and two `notes` rows —
-/// two catalog entries, links and headings free to diverge between the ids — and `hidden_by_unknown` holds
-/// `PARSE_VERSION` back until somebody renames or removes the twin. **No scan clears either half.**
+/// **F23's harm, healed.** The same display-keyed row with the unreadable directory now on the *other* twin: this
+/// scan reads the row's own path. The ambiguous row is no longer deleted from the scan's view — it is marked, admitted
+/// to classification because a listed readable path spells itself exactly as the row does and matches its stored hash,
+/// and content settles what hiding could not. The listed file pairs with its own row as a `Moved`, `apply_move` re-keys
+/// it from real bytes, and the workspace ends with **one** live registry row, one note row at the id it already had,
+/// and the parse version recorded because the reason it was withheld is gone.
 ///
-/// Removing the fallback does "fix" this case — with it gone the scan pairs by hash and reports a clean `Moved: 1`,
-/// one live row, which is exactly why the narrow rule looked like a cure. It is not: the same change turns the
-/// configuration in
-/// [`a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`] into `added: 1, removed: 1`,
-/// destroying a live note. Delete this test in the same commit that fixes F23; do not let it harden into a guard on
-/// the bug.
+/// This replaced a fixture that pinned the opposite — two live rows, the version withheld until somebody renamed the
+/// twin — which F23's backlog entry instructed whoever fixed it to delete rather than let harden into a guard on the
+/// bug. What does **not** heal here is the residue: a row whose content changed while it was unindexable has no hash
+/// agreement, nothing claims it, and the duplicate pair reappears. That half is still open in F23, and this test's
+/// silence about it is not a claim that it is fixed.
+///
+/// The fence beside this —
+/// [`a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin`] — is what keeps the healing honest:
+/// there the readable twin carries *different* content, so nothing may claim it, and a live note survives with its
+/// version withheld. Those two tests together are the reason "hide less" had to become "mark instead of delete".
 #[cfg(unix)]
 #[test]
-fn known_defect_a_readable_display_keyed_path_duplicates_its_own_row() {
+fn a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version() {
     assert_twin_dirs();
     const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    /// `c a f E9 / n o t e . m d` — the path's real bytes, which the row carries once the move re-keys it.
+    const REAL_KEY: &str = "636166E92F6E6F74652E6D64";
 
     let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
     if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
@@ -3412,6 +3418,14 @@ fn known_defect_a_readable_display_keyed_path_duplicates_its_own_row() {
     rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
     forget_headings(&db, "top.md");
     record_parse_version(&db, outdated_parse_version());
+    let legacy_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(
+        legacy_note_id > 0,
+        "test setup: there is a note row for this path to keep"
+    );
     drop(db);
 
     // The blocked directory is the twin; the display-keyed row's own path is perfectly readable this scan.
@@ -3425,34 +3439,42 @@ fn known_defect_a_readable_display_keyed_path_duplicates_its_own_row() {
         return;
     }
 
-    let report = scan(&ws.root, &ws.cfg).expect("the defect must not fail the scan");
+    let report = scan(&ws.root, &ws.cfg).expect("a blocked directory must not fail the scan");
     assert_eq!(
         (report.added, report.moved, report.removed),
-        (1, 0, 0),
-        "the readable path is re-indexed as new work instead of pairing with its own row: {report:?}"
+        (0, 1, 0),
+        "the readable path pairs with its own row instead of minting a second one: {report:?}"
     );
 
     let db = ws.db();
     assert_eq!(
         scalar(
             &db,
-            "SELECT COUNT(*) FROM files WHERE rel = 'caf\u{fffd}/note.md' AND state = 'ok'"
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{REAL_KEY}' AND state = 'ok'")
         ),
-        2,
-        "one physical file, two live registry rows — F23's duplicate"
+        1,
+        "one live registry row for one physical file, keyed by the path's real bytes"
     );
     assert_eq!(
         scalar(
             &db,
-            "SELECT COUNT(*) FROM notes WHERE rel = 'caf\u{fffd}/note.md'"
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}'")
         ),
-        2,
-        "and two live notes rows for it: one under the lossy key {LOSSY_KEY}, one the re-indexed path created"
+        0,
+        "and nothing left behind under the display-derived key: it was a lie about bytes, and it is gone"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{REAL_KEY}'")
+        ),
+        legacy_note_id,
+        "the note keeps its id, so headings, tags, items and links stayed attached to it"
     );
     assert_eq!(
         recorded_parse_version(&db),
-        Some(outdated_parse_version()),
-        "the hidden row also holds the parse version back, every scan, until the twin is renamed"
+        Some(PARSE_VERSION),
+        "the charge clears with the reason it was withheld — this is what separates a repair from a warning"
     );
 }
 
@@ -3876,13 +3898,19 @@ fn names_order_a_duplicated_path_before_an_unreadable_directory() {
     );
 }
 
-/// The **harmful** duplicate, not the innocent one: F23's one physical file holding two live rows, built the way
-/// F23 builds it — a row re-keyed to its own lossy display text, then re-indexed from real bytes while a twin
-/// directory is blocked. The record has to see this shape too, or `duplicates` would count only the innocent case
-/// and the defect would stay invisible behind a look-alike count.
+/// F23's shape, as the record sees it **after** the heal: a row re-keyed to its own lossy display text, then paired
+/// with its real bytes while a twin directory is blocked. It used to assert `duplicates=1` here, which was the defect
+/// reaching the record; now the pair folds on the way through, so the honest assertion is that the duplicate count
+/// falls to zero **and** the blocked directory keeps its name — quieter by exactly what was fixed, not quiet.
+///
+/// **Coverage this leaves open, stated rather than hidden:** no fixture now shows an F23-shaped row *arriving* at
+/// `duplicates=1`, because the shape that used to produce it heals. The residue — content changed while unindexable,
+/// so nothing claims the row and the pair survives — is the configuration that would, and it is owed by
+/// `docs/design-f23-ambiguous-rows.md` §5.4/§5.6. Until one of those lands, the duplicate counter's F23 population is
+/// pinned only by the innocent-twin fixtures above.
 #[cfg(unix)]
 #[test]
-fn a_duplicated_note_from_f23_reaches_the_record() {
+fn a_healed_pair_leaves_no_duplicate_in_the_record_but_still_names_the_loss() {
     let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
     if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
         eprintln!("NOT COVERAGE: this filesystem refused to create {TWIN_DIR_NINE:?}, so F23 cannot be built");
@@ -3906,26 +3934,31 @@ fn a_duplicated_note_from_f23_reaches_the_record() {
 
     let report = scan(&ws.root, &ws.cfg).expect("F23's shape must not fail the scan");
     let db = ws.db();
+    // F19's branch changed this fixture's expectation from two live rows to one, and the reason is the whole point of
+    // the record: it answers what **this scan leaves behind**, because `duplicated_rels` runs inside the write
+    // transaction after the changes land. A pair that healed on the way through is not a loss this scan made, so the
+    // duplicate count goes to zero and the unreadable directory keeps its name in the record either way — the
+    // workspace does not go quiet, it gets quieter by exactly what was fixed.
     assert_eq!(
         scalar(
             &db,
             "SELECT COUNT(*) FROM files WHERE rel = 'caf\u{fffd}/note.md' AND state = 'ok'"
         ),
-        2,
-        "one physical file, two live rows — the state F23 leaves behind"
+        1,
+        "the pair folded onto one row this scan, so the record has no duplicate to report"
     );
     let losses = recorded_losses(&db);
     assert!(
-        losses.starts_with("unreadable=1;unkeyable=0;duplicates=1;"),
-        "the duplicate reaches the record: {losses}"
+        losses.starts_with("unreadable=1;unkeyable=0;duplicates=0;"),
+        "the loss that remains is the blocked directory, not a pair that no longer exists: {losses}"
     );
     assert!(
-        losses.contains("caf\u{fffd}/note.md"),
-        "and names the path it happened to: {losses}"
+        losses.contains("caf\u{fffd}"),
+        "and it is still named, so the record does not go quiet just because one count fell to zero: {losses}"
     );
     assert_eq!(
         report.unindexable.as_ref().expect("some").duplicates,
-        1,
+        0,
         "the same count on both channels: {report:?}"
     );
 }
