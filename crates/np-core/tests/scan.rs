@@ -3633,6 +3633,175 @@ fn a_row_keyed_from_its_own_lossy_bytes_discharges_by_match_without_a_move() {
     );
 }
 
+/// **F23 §5.4: the byte-identical twin, priced in the same breath as it is bought.** The fence fixture and this
+/// one differ in exactly one respect: the readable look-alike carries the **same bytes** as the note behind the
+/// obstruction. `known_rows` is handed configurations that are identical by construction — one display-derived key,
+/// one unreadable sibling spelling it, one listed readable path with that display text and that hash — so no
+/// predicate here can prefer one over the other, and §2's rule lets this row claim the twin.
+///
+/// What that buys is the reason the rule is worth it: **no duplicate rows** and **one catalog entry** while the
+/// directory stays blocked, instead of two live `files` rows and two `notes` rows for what a reader sees as one
+/// note. What it costs is asserted here rather than left to inference, because §8's first review round found the
+/// original design understating exactly this cell:
+///
+/// - `moved: 1` where **nothing moved** — two physical files are on disk after the scan and two were on disk
+///   before it; what travelled is the row, not the note; and
+/// - the row has left its own key, so nothing tracks the file still sitting inside the obstruction. A deletion
+///   there is then **unreported** — F20 §1's harm class, accepted under design §2's table, and built below as a
+///   second scan rather than described in prose.
+#[cfg(unix)]
+#[test]
+fn a_byte_identical_twin_is_claimed_and_the_file_it_leaves_behind_goes_unreported() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    /// One body, written twice. [`plant_note_dir`]'s own reason for taking a body is that distinct bodies keep
+    /// `classify` from pairing twins; this fixture asks for that pairing on purpose.
+    const SHARED_BODY: &str = "# Twin Heading\n";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_note_dir(&ws.root, TWIN_DIR_NINE, SHARED_BODY) {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_NINE:?}, so there is no \
+             hidden note for a look-alike to be byte-identical to"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    // Migration 4's shape, as in the fence fixture: the row for real bytes `63 61 66 E9 …` keyed from its own
+    // lossy display text.
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    let note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(
+        note_id > 0,
+        "test setup: the hidden note exists to be re-homed"
+    );
+    drop(db);
+
+    // The readable twin, planted now with **the hidden note's own bytes**, then the obstruction closed. Identical
+    // content is the whole difference from the fence fixture, and it is not a choice: §2's table has no row for
+    // "and also make the bodies differ", because `known_rows` cannot ask.
+    assert!(
+        plant_note_dir(&ws.root, TWIN_DIR_EIGHT, SHARED_BODY),
+        "test setup: plant the byte-identical twin"
+    );
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the hidden note's directory on this runner (a privileged \
+             user?), so the row was never ambiguous and nothing could claim it"
+        );
+        return;
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("a blocked directory must not fail the scan");
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the obstruction is named, and only it: {report:?}"
+    );
+    // The cost, stated first: `moved: 1` where nothing moved. Nothing was renamed between these two scans — the
+    // twin arrived new and the hidden note never left its directory.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 1, 0),
+        "the row claims a look-alike it has never been on: a move reported over a file that did not travel: {report:?}"
+    );
+
+    let db = ws.db();
+    // What the claim buys: one live row for one display path and one catalog entry, where hiding the row used to
+    // leave two of each. This is §2's whole argument for claiming, so it is pinned on the same scan as its price.
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM files WHERE rel = 'caf\u{fffd}/note.md' AND state = 'ok'"
+        ),
+        1,
+        "no duplicate rows for one display path, which is what the claim was bought for"
+    );
+    assert_eq!(report.notes, 2, "{report:?}");
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes"),
+        2,
+        "one catalog entry while blocked: the note is neither swallowed nor doubled"
+    );
+    assert_eq!(
+        entry_lines(&index_text(&ws.root)).len(),
+        2,
+        "and the published catalog agrees with the row count"
+    );
+
+    // The rest of the price, on the same rows: the id is homed on a **different physical file**, and it has left
+    // the key that named the file inside the obstruction. Other notes' links now resolve to the twin.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        0,
+        "the row left its own key — the premise for the silence asserted below, not an incidental detail"
+    );
+    assert_eq!(
+        texts(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE rel = 'caf\u{fffd}/note.md' ORDER BY rel_bytes"
+        ),
+        [TWIN_EIGHT_KEY],
+        "it sits on the twin's bytes now: `63 61 66 E8 …`, a different file from the one it describes no more"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{TWIN_EIGHT_KEY}'")
+        ),
+        note_id,
+        "the same id, re-homed: every link that named this note now names the twin's rendering of it"
+    );
+    drop(db);
+
+    // The harm, **built** rather than inferred. Open the obstruction, delete the file still inside it, close it
+    // again — the state a user reaches by unblocking a directory for one moment and losing something in it.
+    drop(_blocked);
+    fs::remove_file(byte_name(&ws.root, TWIN_DIR_NINE).join("note.md"))
+        .expect("test setup: delete the note still inside the obstruction");
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 would not deny the obstruction a second time on this runner"
+        );
+        return;
+    }
+
+    let report =
+        scan(&ws.root, &ws.cfg).expect("a deletion behind the obstruction must not fail the scan");
+    // This silence is **F20 §1's harm class — a gone file nobody reports — accepted under design §2's table.** It
+    // is asserted as an outcome because reading `moved: 1` above as "the note travelled" is the one wrong answer
+    // this configuration can produce: a file was lost two scans in a row and the report says nothing about either.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 0, 0),
+        "nothing tracks the file inside the obstruction once its row has claimed a look-alike, so its deletion is \
+         unreported: F20 §1's harm class, taken on knowingly by §2's table — {report:?}"
+    );
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the directory is still named, and that is the whole trace a lost file leaves here: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes"),
+        2,
+        "the catalog still shows the note, backed by one file where it used to be two — quiet, not wrong, and \
+         quiet about a loss"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // F22 — a scan's losses get a durable record, not just a line.
 //
