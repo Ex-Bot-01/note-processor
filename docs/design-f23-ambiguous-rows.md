@@ -1,7 +1,8 @@
 # F23 — stop deleting the ambiguous row, and let content decide what it can
 
-Status: design for `m6/ambiguous-rows`, **revised after the pre-implementation review** (`05cffe24`, verdict BLOCK on five
-P1s; every one is incorporated below, and §8 records what each one changed). Backlog:
+Status: design for `m6/ambiguous-rows`, **revised twice at the pre-implementation gate** — round one (`05cffe24`) blocked on
+five P1s, round two (`d1a4cbd7`) said "correct three things first" and found a note-losing hole in the claim rule. Every
+finding is incorporated below; §8 records what each changed. Backlog:
 `docs/backlog-m2-followups.md` F23 (open by decision since M3). Prior art: F20 §4 (the fallback that hides these rows),
 F13 §4.1/§7 (bytes are identity; name a conflict, never pick — the rule as phrased here is restated in
 `docs/design-f19-note-merge.md` and enforced by `db.rs`'s note identity-conflict rule), F22 (the bounded durable record),
@@ -41,11 +42,19 @@ be removed, and it may be claimed — by content or by its own listed path.**
     name genuinely contains `U+FFFD` (permanent class member, and universal on Windows): its key already equals its OS
     bytes, it pairs by identity, and no move ever happens. A definition of "resolved" that required `Moved` would leave
     those rows charged every scan forever — §3's own forbidden outcome.
-- **Refuse to pick when there is more than one candidate.** Multiplicity here is not two rows sharing a display spelling —
-  `files.rel_bytes` is `NOT NULL UNIQUE`, and the key is a function of the display text, so that state cannot exist. The
-  reachable state is **N ambiguous rows with equal content claiming one listed path** (two notes under one blocked
-  directory whose bytes match a planted twin). There, `classify` would pick via `closest_to`; this design refuses:
-  **resolve none of them.** Enforcement point is §4.
+- **A claim must be scoped to the look-alike, not to the content.** `classify` matches a claim on **hash alone**
+  (`claimants.get(added.hash)` over every unmatched known row), and the `present_hashes` guard cannot help: it is seeded
+  from known rows whose *key* matches an unreadable listing, and a display-derived key never equals a real-bytes listing
+  key. Left unscoped, a new unrelated path anywhere in the corpus with byte-identical content — a `# Title` stub, a blank
+  template, a re-exported note, all common in a notes corpus — would claim the hidden row: `moved: 1`, the id re-homed onto
+  somebody else's file, and nothing left tracking the file inside the obstruction. That is a worse wrong answer than today's.
+  So: **an ambiguous row is admitted to `known` only when some listed, readable path spells itself exactly as the row does
+  (same display text) and matches its stored hash; otherwise it is refused.** This is still a pre-drop and still leaves
+  `classify` untouched.
+  - **Corollary, and it removes machinery:** with display scoping plus `files.rel_bytes NOT NULL UNIQUE`, there is **at most
+    one claimant per listed path**. So there is no multiplicity rule to write, no tally to keep and no tie-break to refuse —
+    uniqueness is enforced by display equality plus the schema. (Two ambiguous rows cannot share a display spelling either,
+    since the key is a function of the text.) An implementation that finds itself counting claimants has mis-scoped.
 
 Read against the cases (row hash `H_r`, listed twin hash `H_t`):
 
@@ -54,6 +63,7 @@ Read against the cases (row hash `H_r`, listed twin hash `H_t`):
 | N′, content unchanged (`H_t == H_r`) | duplicate rows forever, version withheld | **resolves** by claim: `Moved`, re-keyed to real bytes, one live row at the original id, charge clears with the reason it was withheld |
 | ambiguous row whose own path is listed and readable (real `U+FFFD` name) | charged every scan if a look-alike is blocked | **resolves** by match: identity pairing, no move, charge clears |
 | M, twin differs (`H_t != H_r`) | `added: 1`, note survives, withheld | **unchanged.** No claim, no removal, still charged. The existing fence passes with its assertions untouched — that is invariant 2 and this design's over-reach test |
+| unrelated readable path, byte-identical to the hidden note | `added: 1`, two rows for two files — correct | **unchanged**, because §2's scoping refuses admission: no display match, no claim. Without that clause this cell becomes `moved: 1` and a note is re-homed onto a stranger's file |
 | N′, content changed while hidden | duplicate rows forever | unchanged (still duplicates) — the residue, §6 |
 | M, twin byte-identical (`H_t == H_r`) | `added: 1`, note survives — **already correct: two files, two rows** | row claims the twin: `moved: 1` where nothing moved, one fewer catalog entry while blocked, and the id is re-homed onto a different physical file. Costs named in §5.4 |
 | obstruction gone, no look-alike | row not ambiguous at all | unchanged: matched or removed on bytes like any other row |
@@ -67,7 +77,18 @@ the bug. The count stays **two sources added together**:
 2. ambiguous rows this pass **did not resolve** — resolved meaning claimed *or* matched, §2.
 
 Deriving source 2 from classification rather than from a pre-pass tally is what makes N′ stop paying once it has healed; a
-charge that never clears is F19's bug wearing this milestone's clothes.
+charge that never clears is F19's bug wearing this milestone's clothes. Two precision rules, because the two sets are not
+naturally disjoint:
+
+- **Precedence.** A row is marked **only if the byte-keyed arm did not already hide it**. The permanent class can satisfy
+  both arms at once — a row whose key equals its OS bytes sitting under a genuinely unreadable prefix hits `is_unknown_path`
+  *and* the fallback. Today's single `||` and single counter cannot double count; two passes over two sets can, and on
+  Windows (where refusals are already lossy bytes) they would double charge universally.
+- **Source 2 is defined positively over the marked set, not over stripped changes:** marked rows that produced neither
+  `Moved { from } = its key` nor a listing of their own path with a non-empty hash, **minus** those whose own key appears in
+  the found-side unreadable set — those are already charged by `written.uncovered`, which resolves by byte key. Deriving it
+  from "did we strip a `Removed`" would charge zero times for a marked row that `classify` filtered out before ever emitting
+  one, and an uncharged stale row is exactly the F15 class this project keeps paying to avoid.
 
 ## 4. Where the mark lives (enforcement point)
 
@@ -75,11 +96,17 @@ charge that never clears is F19's bug wearing this milestone's clothes.
 new kind of row would move F23's ambiguity into the matching primitive every other caller inherits. So the mark is
 **scan-side**, around an unmodified `classify`:
 
-1. **Pre-drop the refused ones.** Ambiguous rows caught by the multiplicity rule are removed from `known` before
-   `classify`, exactly as today, and they charge source 2. This is what makes "resolve none" true rather than aspirational:
-   left in, `closest_to` would pick a winner among equal hashes and the uniqueness rule would be silently unenforced.
-2. **Post-strip the unclaimed ones.** Ambiguous rows that were admitted and end with a `Removed` for their key have that
-   change dropped after classification, before anything consumes it, and they charge source 2.
+1. **Pre-drop the unadmitted ones.** Ambiguous rows with no listed readable path that spells them exactly and matches their
+   stored hash never enter `known` — today's behaviour, unchanged — and they charge source 2.
+2. **Post-strip the admitted-but-unclaimed ones.** If such a row ends with a `Removed` for its key, that change is dropped
+   after classification and before anything consumes it (`changes` has exactly one consumer, read twice inside
+   `apply_changes`, so this is one filter between those reads), and the row charges source 2.
+
+**The strip matches `Change::Removed` only.** The identity-matched route legitimately emits `Modified` keyed on the listed
+path, whose `rel_bytes` equals the row's stored key; a strip written as "drop any change carrying a marked key" would delete
+a legitimate re-parse and leave stale derived rows behind charging nothing. Traced against `classify`: in M and in
+N′-changed the row is unmatched by identity, its hash matches no added path, and the final loop pushes exactly one `Removed`
+whose bytes are the stored key — so `(Removed, key)` covers both.
 
 The two orders are observably different, which is why they are named: pre-dropping keeps today's behaviour for the refused
 set; post-stripping is what the admitted set needs to survive. A `Snapshot` field is not required — the scan already knows
@@ -118,34 +145,53 @@ from display text, so they are ambiguous). Both must be updated to "in `known`, 
 assertions **unedited**, or the design is wrong and the round stops and reports. Its twin deliberately carries a different
 body; identical content would let hash pairing pair them and prove nothing.
 
-**5.4 New: the byte-identical twin, with its cost named.** Two notes under one blocked directory, bytes matching a planted
-twin → the row claims it. Assert what it buys (one catalog entry while blocked, no duplicate rows) **and what it costs**:
+**5.0 New first: the identity-matched row (no re-key at all).** Build it with existing helpers and **no rekey**: a directory
+literally named `caf\xEF\xBF\xBD` holding a note, scanned (its key is naturally its own display bytes and `rel` contains
+`U+FFFD`, so `key_is_display_derived` is true), then a sibling `caf\xe9` blocked — same display spelling, different bytes →
+marked. Assert four things: no `Added` and no duplicate row; `PARSE_VERSION` recorded with **no `Moved` anywhere in the
+report** (discharge by match); the note keeps its id *and* its key; and, once §3's precedence rule lands, that source 1 did
+not also charge it this pass. This is the only fixture for §2's second resolution route, it is the class Windows lands in
+universally, and it is where the precedence question bites — so it is built first.
+
+**5.4 New: the byte-identical twin, with its cost named.** **One** note under the blocked directory (the fence fixture's
+shape with an identical body) and a readable twin carrying the same bytes → one claimant, one added path, claim allowed. Assert what it buys (one catalog entry while blocked, no duplicate rows) **and what it costs**:
 `moved: 1` where nothing moved, and because the row has left its own key, nothing tracks the file inside the obstruction —
 a later deletion there is never reported, which is F20 §1's harm class, and other notes' links now resolve to the twin's
 id. This configuration cannot be avoided (the two cases are identical to `known_rows` by construction), so it is documented
 rather than described as free.
 
-**5.5 New: multiplicity and collisions.**
-- Two ambiguous rows with equal content, one claimant → **neither resolves**, both stay live, both charge source 2.
+**5.5 New: strangers and collisions.**
+- **The unrelated look-alike.** The hidden note's bytes reappear at an unconnected readable path (`notes/lookalike.md`).
+  Assert `added: 1, moved: 0`, the row still live on its own key, and no catalog entry lost. This is the regression test for
+  §2's scoping clause — the one assertion standing between this design and a note re-homed onto a stranger's file.
 - A claim whose target key is held by a **stale** row → refused; the path is handled by the ordinary `upsert_file`
   reactivation route rather than ending in `skipped` with a permanent charge.
 
 **5.6 Charge arithmetic.** One test where M still withholds `PARSE_VERSION`, one where healed N′ records it, plus one that
-keeps source 1 charging (a byte-keyed row behind an unreadable prefix) so the sum cannot be read as a replacement. And the
-debt `one_note_behind_an_unknown_path_is_charged_in_exactly_one_counter` explicitly leaves to F23: a disjointness unit beside
-it, with its premise paragraph updated — the overlap was real today because `Indexed::Taken` charges
-`written.uncovered` over an existing note row.
+keeps source 1 charging (a byte-keyed row behind an unreadable prefix) so the sum cannot be read as a replacement. The debt
+`one_note_behind_an_unknown_path_is_charged_in_exactly_one_counter` explicitly leaves to F23 gets a disjointness unit beside
+it, with its premise paragraph updated — and it pins **per-configuration numbers** (`hidden = 1, uncovered = 0`; then
+`hidden = 0, uncovered = 1`) rather than a blanket theorem: on Unix the two sources are disjoint for both classes, while on
+Windows they overlap unless §3's precedence rule is in place. That asymmetry is the finding worth writing down.
 
 **5.7 Fixture honesty.** These depend on `chmod 000` and latin-1 directory names: re-check denial off disk, print
-`NOT COVERAGE` rather than pass silently. **Baseline recorded on this runner:** scan suite 58 passed / 0 failed with
-**zero** `NOT COVERAGE` lines, so every permission-dependent fixture executed here; the PR must name the validation runner
-as F23's caveat requires.
+`NOT COVERAGE` rather than pass silently. **Baseline measured here:** scan suite 58 passed / 0 failed with **zero**
+`NOT COVERAGE` lines, so every permission-dependent fixture executed. "This runner" is not an identification — F23's caveat
+exists because `chmod 000` does not deny a privileged user — so the PR body records **command, head SHA, host and euid**.
+
+**5.8 Expected edits from the record field (§6), inventoried so no one meets them as breakage.** Adding a field to F22's
+value rewrites it whole in nine places — `scan.rs:2580`, `scan.rs:2622`, `tests/scan.rs:3552, 3589, 3608, 3624, 3731, 3869`
+and the `starts_with` at `tests/scan.rs:3919` — plus two in np-cli (`cli.rs:1215` whole string, `cli.rs:1237-1245` JSON
+keys), with the stdout line assembled from it at `np-cli/src/main.rs:142`. Each is a value update, not a weakened assertion:
+the strings get longer, none gets vaguer.
 
 **Mutations, each with a named assertion that must fail:** (1) let an ambiguous row produce `Removed` → the M fence fails;
-(2) drop the claim route, keep the mark → healed N′ never converges; (3) resolve when two rows share one claimant → the
-multiplicity fixture fails; (4) count ambiguity before classification instead of after → the charge test fails on the
-resolved case; (5) require `Moved` for discharge → the identity-matched (`U+FFFD` name) fixture keeps charging forever;
-(6) ignore stale rows in the claim check → the collision fixture ends in a permanent charge. Restore from `/tmp` copies,
+(2) drop the claim route, keep the mark → healed N′ never converges; **(3) remove §2's display scoping and let content alone
+admit a row → the unrelated look-alike fixture must fail with `moved: 1`** — this is the mutation that guards the only
+note-losing hole in the design; (4) count ambiguity before classification instead of after → the charge test fails on the
+resolved case; (5) require `Moved` for discharge → §5.0's identity-matched fixture keeps charging forever; (6) ignore stale
+rows in the claim check → the collision fixture ends in a permanent charge; (7) drop §3's precedence rule → §5.0's fixture
+charges twice. Restore from `/tmp` copies,
 never `git checkout --`.
 
 ## 6. Deliberately not in this round
@@ -162,19 +208,33 @@ never `git checkout --`.
 - **Cleaning up duplicates F23 already made.** F19's merge folds rows sharing one `rel_bytes`; these twins sit on different
   keys, so folding them means deciding which key is a lie. Deferred with the residue.
 
-**Refused ambiguity must be visible.** §2 borrows "name the conflict" as a decision rule, and today the only observables
-are a withheld version plus the gap line. So the refused set gets **one more field in F22's existing bounded `meta`
-record** (`ambiguous=N;names=…`, same cap and ordering discipline) rather than a third mechanism — the same reasoning that
-kept F22's duplicate count inside one key instead of inventing a channel.
+**Unresolved ambiguity must be visible.** Today the only observables are a withheld version plus the gap line, so this gets
+**one more field in F22's existing bounded `meta` record** rather than a third mechanism — F22's own reasoning for keeping
+the duplicate count inside one key. Rules it must obey, all of them F22's:
+
+- **`N` is exactly source 2** — unresolved ambiguity, the same population that holds `PARSE_VERSION` back — never "the
+  refused set", or the record and the withheld version can disagree, which is F21's "ask a day later and there is nothing to
+  say". Rendered *from* that population, never read back into deletion or version decisions.
+- **One capped `names` list, not a second one** (`NAME_CAP = 8`), ordered duplicates → ambiguous → unreadable: duplicates
+  have no other channel, ambiguity has this one, and an unreadable directory already appears in `skipped`. A second cap
+  invites an unbounded value.
+- **`is_empty()` stays as it is**, and the reason is recorded: ambiguity requires `under_unreadable`, so
+  `ambiguous > 0 ⟹ unreadable ≥ 1 ⟹ is_empty() == false`; the field can never be the sole reason a record exists.
+- **It steps on a stated contract, which §7 must amend:** `Unindexable::duplicates` promises to be "deliberately
+  **unexplained**, because why a path holds two rows is F23's ambiguity and a count naming a cause would be re-deciding it
+  here". A sibling `ambiguous` count *does* name a cause, so that docstring joins the falsified list.
 
 ## 7. Documentation step
 
 Precedent is explicit (F18's entry was reworded to what shipped rather than closed as if solved). This round updates:
-`docs/backlog-m2-followups.md` F23 — the half that now heals, the residue, candidate iv as the next step; and three
-docstrings this change falsifies — `known_rows` and `display_spelled` ("**No scan clears that**"), and
-`key_is_display_derived` ("Nothing else does").
+`docs/backlog-m2-followups.md` F23 — the half that now heals, the residue, candidate iv as the next step; and four
+docstrings this change falsifies — `known_rows` and `display_spelled` ("**No scan clears that**"),
+`key_is_display_derived` ("Nothing else does"), and `Unindexable::duplicates` (§6's new sibling names the cause it promised
+not to).
 
-## 8. What the design review changed
+## 8. What the two design reviews changed
+
+Round one (`05cffe24`, BLOCK):
 
 | finding | change |
 | --- | --- |
@@ -188,6 +248,20 @@ docstrings this change falsifies — `known_rows` and `display_spelled` ("**No s
 | P2 the charge could be read as replaced | §3 writes it as a sum; §5.6 keeps source 1 pinned |
 | P2 refused ambiguity invisible | §6: one more field in F22's bounded record |
 | P2 no documentation step; citation nit | §7 added; F13 §7 citation pointed at the restatement that carries the rule |
+
+**Second review round** (`d1a4cbd7`, verdict "correct three things first, then build"):
+
+| finding | change |
+| --- | --- |
+| P1-new the claim is scoped to content, not to the look-alike: `classify` matches on hash alone and `present_hashes` cannot fire for a display-derived key, so any unrelated byte-identical path re-homes the note | §2's scoping clause (admit only a listed readable path that spells the row exactly **and** matches its hash); new table row; mutation (3) rewritten to attack it; §5.5's look-alike fixture is the regression test |
+| corollary: with scoping + `rel_bytes UNIQUE` there is at most one claimant, so the multiplicity machinery was unreachable code | §2/§4 multiplicity deleted; §5.5's first bullet replaced by the look-alike case |
+| source 2 could double count (permanent class hits both arms; universal on Windows) or charge zero (`classify` filters rows out before emitting anything) | §3 adds precedence and a positive definition over the marked set, minus keys already charged by `written.uncovered` |
+| the strip could swallow a legitimate `Modified` whose key equals the row's | §4: matches `Change::Removed` only, with the trace that shows `(Removed, key)` covers M and N′-changed |
+| §5.4 built the state §4 refuses (two notes = multiplicity) | one note under the obstruction |
+| mutation (5) named a fixture nobody owed | §5.0 adds the identity-matched `U+FFFD` fixture, first to build, four assertions |
+| §6's field population, cap and `is_empty()` questions | §6: `N` = source 2 exactly; one capped list ordered duplicates → ambiguous → unreadable; `is_empty()` untouched with proof it cannot matter |
+| the record field breaks nine pinned strings and a JSON shape | §5.8 inventories every site, and says why each is a lengthening rather than a weakening |
+| "this runner" is not an identification | §5.7: PR body records command, head SHA, host and euid |
 
 ## 9. Gates
 
