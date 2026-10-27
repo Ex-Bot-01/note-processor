@@ -1341,6 +1341,15 @@ fn an_indent_at_the_ceiling_still_renders_the_catalog() {
     // shape has to scan cleanly. Without this pair the refusal test would pass under a check that refused everything.
     let ws = workspace();
     ws.write_user_config("[catalog]\ncontinuation_indent = 16\n");
+    // An entry long enough to wrap. The corpus alone does not give one: scanned at indent 2 and at indent 16, this
+    // workspace's `INDEX.md` holds **no** continuation line at all (the whole golden corpus contains exactly one, in a
+    // shard), so an assertion about indented lines would be asserting over an empty set. Planting the note is what makes
+    // the claim below able to fail.
+    fs::write(
+        ws.root.join("long-note-for-wrapping.md"),
+        "# A note title long enough to push the rendered entry line past the hundred-column budget the catalog promises\n",
+    )
+    .expect("test setup: plant a note whose entry wraps");
 
     let mut cmd = ws.command(&["scan"]);
     let ok = run(&mut cmd);
@@ -1352,12 +1361,12 @@ fn an_indent_at_the_ceiling_still_renders_the_catalog() {
         ok.stderr()
     );
     let index = fs::read_to_string(ws.index()).expect("the catalog renders at the ceiling");
+    // Some line has to start with sixteen spaces. The first draft asked whether every indented line was longer than
+    // its trimmed self — true of any line beginning with a space, so it held even with nothing wrapped; the review
+    // caught that, and this is the assertion it should have been. With the long note planted above it fails when `wrap`
+    // stops indenting (verified by mutation) and passes at the ceiling.
     assert!(
-        index
-            .lines()
-            .skip(2)
-            .filter(|line| line.starts_with(' '))
-            .all(|line| line.len() > line.trim_start().len()),
-        "continuation lines at indent 16 really are indented:\n{index}"
+        index.lines().any(|line| line.starts_with(&" ".repeat(16))),
+        "indent 16 has to reach the rendered bytes, not merely exit 0:\n{index}"
     );
 }

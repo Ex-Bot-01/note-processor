@@ -95,6 +95,15 @@ golden byte: every fixture that renders uses the default or an explicit in-proce
    invisible to the process, and the test would exit 0 having tested nothing. So a helper creates the `note-processor/`
    subdirectory; on Windows the same file belongs under `%APPDATA%\note-processor\`, which `cli.rs:55` already redirects at
    the temp dir.
+   **The ceiling test has to plant something that wraps.** The first version of this case asserted over the corpus and
+   passed; the review then caught that its assertion was a tautology (`line.len() > line.trim_start().len()` holds for any
+   line starting with a space, and `all` is true over an empty set). Tightening it to "some line starts with sixteen spaces"
+   made it **fail**, because this workspace's `INDEX.md` contains no continuation line at either indent — measured, not
+   argued: scanning the fixture corpus at 2 and at 16 yields 19 lines and zero indented ones, and the entire golden corpus
+   holds exactly one wrapped line, in a shard rather than in `INDEX.md`. So the fixture writes one note with a long title.
+   Worth recording because the wrong fix came from a reviewer reading a golden file: an assertion over a set nobody checked
+   is non-empty is as empty as the one it replaced.
+
 4. **No allocation on the refusal path**: implied by (1) — the process never reaches `wrap` — but worth one comment saying so,
    because it is the reason the check is not in `catalog.rs`.
 

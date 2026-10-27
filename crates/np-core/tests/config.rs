@@ -621,7 +621,8 @@ fn an_oversized_continuation_indent_is_refused_naming_key_value_and_ceiling() {
     assert!(message.contains("17"), "and the offending value: {message}");
     assert!(
         message.contains("max 16"),
-        "and the ceiling to aim at, upper bound only — a negative literal never reaches this check, serde refuses it as          a parse error: {message}"
+        "and the ceiling to aim at, upper bound only — a negative literal is refused by serde before this check runs: \
+         {message}"
     );
     // The refusal is data being rejected, not a file that could not be read: callers who care match the kind rather
     // than parsing prose.
