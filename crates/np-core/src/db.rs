@@ -1124,6 +1124,10 @@ const MERGE_NAME_CAP: usize = 8;
 /// migration 3's shapes, spelled out: the loser's own derived rows and outgoing edges go with it, its inbound
 /// edges move to the winner.
 ///
+/// Because those deletes are the only thing between a loser row and its children, the step closes with
+/// `PRAGMA foreign_key_check` like migrations 3 and 4 — see the check's own comment for why it matters more here
+/// than it does anywhere else in this file.
+///
 /// The receipt goes into `meta` **inside this transaction** (F19 §4.1): a merge that cannot announce itself
 /// does not happen. [`apply_migrations`] echoes it after the commit, never from here.
 fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
@@ -1146,6 +1150,27 @@ fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
             conn.execute("DELETE FROM links WHERE src_note_id = ?1", params![loser])?;
             conn.execute("DELETE FROM notes WHERE id = ?1", params![loser])?;
         }
+    }
+
+    if let Some((table, rowid, parent)) = first_violation(conn)? {
+        // Migrations 3 and 4 run this check because a *rebuild* could misplace a row. Here it is the only
+        // defence against the deletes above being softened: a code step runs with enforcement off, so no
+        // `ON DELETE CASCADE` fires behind them and a skipped or narrowed delete leaves a `note_id` pointing at
+        // a row that is gone — into a file whose enforcement is back ON the moment this transaction commits,
+        // where an id can be re-adopted by the next `INSERT`. No later scan re-checks those keys, so this is
+        // the one place anything would notice. Returning rolls the merge and its receipt back together, which
+        // leaves the file at version four to try again rather than committing a half-merged corpus.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check()",
+            [],
+            |row| row.get(0),
+        )?;
+        return Err(DbError::ForeignKeys {
+            count,
+            table,
+            rowid,
+            parent,
+        });
     }
 
     let paths: Vec<String> = groups.iter().map(|group| group.display.clone()).collect();

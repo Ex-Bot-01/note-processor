@@ -33,17 +33,28 @@ Choosing the survivor is the whole risk, so it is stated rather than left to cha
   Other notes' prose was not re-parsed and will not be, so nulling a target would lose a resolved link permanently — the
   distinction migration 3 already drew between `ON DELETE CASCADE` (an edge from a note that is gone) and
   `SET NULL` (a target that is gone). Here neither applies: the target still exists under another id.
-- **Loser-derived rows are deleted by the cascade**, not by hand: dropping the loser's row takes its headings, tags,
-  items and outgoing edges with it, and the following refresh rebuilds them for the winner. No table carries a unique
-  constraint (`headings`, `tags`, `items`, `links` are plain), so re-pointing cannot collide — say so in the code comment
-  so nobody adds defensive dedup that can never fire.
+- **Loser-derived rows are deleted by hand, not by the cascade.** The schema does declare `ON DELETE CASCADE` on every
+  one of them and dropping the loser takes its headings, tags, items and outgoing edges with it — but that is the
+  *outcome*, and it cannot be the mechanism. A `Migration::Code` step runs with `foreign_keys` enforcement switched off
+  (`migrate` switches it outside the transaction, because a table rebuild needs it that way, and the pragma cannot be
+  changed inside a transaction), and SQLite performs no `ON DELETE CASCADE` while enforcement is off. So deleting the
+  loser's row would commit its headings, tags, items and outgoing edges as orphans into a file whose enforcement is back
+  ON the moment the step commits — the silent re-adoption migration 3 exists to end. `merge_duplicate_notes` therefore
+  deletes `headings`, `tags`, `items` and the loser's outgoing `links` explicitly, then the note row itself, in
+  migration 3's shapes; the following refresh rebuilds them for the winner. Because nothing cascades behind those
+  statements, the step ends with `PRAGMA foreign_key_check` (migrations 3 and 4 already run it): an explicit delete that
+  is ever softened must fail the open, not leave a dangling `note_id` that no later scan re-checks. No table carries a
+  unique constraint (`headings`, `tags`, `items`, `links` are plain), so re-pointing cannot collide — say so in the code
+  comment so nobody adds defensive dedup that can never fire.
 
 ## 3. Shape
 
 Migration 5, `merge_duplicate_notes`, inside its own transaction like every other step:
 
 1. Select groups: `SELECT rel_bytes, MIN(id) FROM notes GROUP BY rel_bytes HAVING COUNT(*) > 1`.
-2. For each group: re-point incoming edges from every other id to the winner; delete the loser rows.
+2. For each group: re-point incoming edges from every other id to the winner; delete the loser's derived rows and
+   outgoing edges, then its note row — by hand, per §2. Then `PRAGMA foreign_key_check` over the whole file, inside the
+   same transaction, refusing the step through `DbError::ForeignKeys` exactly as migrations 3 and 4 do.
 3. Write a receipt into `meta` under `NOTE_MERGE_KEY = "note_merges"` **in the same transaction**, in the compact style
    of `FK_ORPHANS_KEY`: `merged=N;paths=a.md,b.md` with at most eight display spellings, ordered by path so one database
    produces one receipt. Zero merges still writes `merged=0`, because the receipt proves the check ran (F21 §2's lesson).
