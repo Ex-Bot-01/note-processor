@@ -3802,6 +3802,131 @@ fn a_byte_identical_twin_is_claimed_and_the_file_it_leaves_behind_goes_unreporte
     );
 }
 
+/// **F23 §5.5: the unrelated look-alike. This is the regression test for §2's display scoping** — the only
+/// assertion standing between this design and a note re-homed onto a stranger's file.
+///
+/// `classify` matches a claim on **hash alone** (`claimants.get(added.hash)` over every unmatched known row) and its
+/// `present_hashes` guard cannot fire here: that set is seeded from known rows whose *key* matches an unreadable
+/// listing, and a display-derived key never equals a real-bytes listing key. So without §2's scoping clause, any
+/// readable path anywhere in the corpus with byte-identical content — a `# Title` stub, a blank template, a
+/// re-exported note, all common in a notes corpus — would claim the hidden row: `moved: 1`, the id homed on somebody
+/// else's file, and nothing left tracking what sits inside the obstruction. The second design review called that a
+/// worse wrong answer than the one F23 set out to fix, and named this configuration as the hole; it is promoted from
+/// the temporary `COMMIT-0 PROBE` (which only printed the baseline) to a permanent fixture for exactly that reason.
+///
+/// Pinned: `added: 1` with **`moved: 0`** — the stranger's bytes are indexed as the new file they are; the hidden row
+/// is still live on its own display-derived key, same id; and no catalog entry is lost, because refusing admission is
+/// today's pre-drop, not a deletion. Mutation (3) deletes the scoping clause and must turn the first assertion below
+/// red with `moved: 1`.
+#[cfg(unix)]
+#[test]
+fn an_unrelated_look_alike_carrying_the_hidden_bytes_is_added_and_never_claims_them() {
+    assert_twin_dirs();
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+    /// `n o t e s / l o o k a l i k e . m d` — an unconnected path: different directory, different name, nothing
+    /// about it resembles the hidden note except its bytes.
+    const LOOKALIKE_KEY: &str = "6E6F7465732F6C6F6F6B616C696B652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_NINE:?}, so there is no \
+             hidden row for a stranger to try to claim"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
+    let hidden_note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    assert!(
+        hidden_note_id > 0,
+        "test setup: the hidden note exists to be protected"
+    );
+    drop(db);
+
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the hidden note's directory on this runner (a privileged \
+             user?), so its row was never ambiguous and no claim could have been attempted"
+        );
+        return;
+    }
+    // The stranger: byte-identical to the hidden note, spelled `notes/lookalike.md`. Same hash `classify` would
+    // pair on, none of the display text §2 requires.
+    fs::create_dir_all(ws.root.join("notes")).expect("test setup: notes/");
+    fs::write(ws.root.join("notes/lookalike.md"), "# Twin Heading\n")
+        .expect("test setup: the look-alike, byte-identical to the hidden note");
+
+    let report = scan(&ws.root, &ws.cfg).expect("the look-alike must not fail the scan");
+    assert_eq!(
+        report.skipped,
+        vec![TWIN_DIR_DISPLAY.to_string()],
+        "the obstruction is named, so the row really was ambiguous this pass: {report:?}"
+    );
+    // The assertion mutation (3) must break. Identical content alone does not admit a claim; the look-alike is
+    // indexed as the new file it is.
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (1, 0, 0, 0),
+        "the stranger's bytes are `Added` on their own account: §2's scoping refuses the claim, and `moved: 1` here \
+         would mean a live note was re-homed onto somebody else's file — {report:?}"
+    );
+
+    let db = ws.db();
+    // The hidden row survives on the key it holds — refused admission is today's pre-drop, and §4 keeps its
+    // `Removed` stripped, so this is neither a stale-ing nor a re-add.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "the hidden row is still live on its own key"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'")
+        ),
+        hidden_note_id,
+        "and it is the same note, not a fresh id behind a re-added path"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOOKALIKE_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "two physical files, two rows: the outcome §2 must not trade away while it heals N′"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        3,
+        "and no third row appeared for the path behind the obstruction"
+    );
+    // No catalog entry lost: the hidden note, the look-alike and `top.md` are all still rendered.
+    assert_eq!(report.notes, 3, "{report:?}");
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM notes"),
+        3,
+        "no catalog entry lost: the hidden note is charged, not dropped"
+    );
+    assert!(
+        entry_line(&ws.root, "notes/lookalike.md").is_some(),
+        "the new path is in the catalog on its own title"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // F22 — a scan's losses get a durable record, not just a line.
 //
@@ -4465,58 +4590,5 @@ fn an_unmerged_duplicate_pair_still_charges_the_refresh_and_withholds_the_versio
         ),
         ["Legacy second".to_string()],
         "the planted row keeps what it was written with"
-    );
-}
-
-/// COMMIT-0 PROBE, temporary: §2's scoping clause was found by reading, not by running. This is the
-/// empirical baseline — M's blocked directory holding the display-keyed note, plus an **unrelated**
-/// readable path `notes/lookalike.md` whose bytes are identical to the hidden note.
-#[cfg(unix)]
-#[test]
-fn probe_f23_unrelated_look_alike_baseline() {
-    assert_twin_dirs();
-    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
-    const LOOKALIKE_KEY: &str = "6E6F7465732F6C6F6F6B616C696B652E6D64";
-
-    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
-    if !plant_twin_dir(&ws.root, TWIN_DIR_NINE) {
-        eprintln!("NOT COVERAGE: probe could not create a directory named {TWIN_DIR_NINE:?}");
-        return;
-    }
-    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
-    let db = ws.db();
-    rekey_row_like_migration_four(&db, b"caf\xE9/note.md", "caf\u{fffd}/note.md");
-    drop(db);
-
-    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
-    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
-        eprintln!("NOT COVERAGE: 0o000 did not deny access to the hidden note's directory");
-        return;
-    }
-    fs::create_dir_all(ws.root.join("notes")).expect("test setup: notes/");
-    fs::write(ws.root.join("notes/lookalike.md"), "# Twin Heading\n")
-        .expect("test setup: the look-alike, byte-identical to the hidden note");
-
-    let report = scan(&ws.root, &ws.cfg).expect("the look-alike must not fail the scan");
-    let db = ws.db();
-    eprintln!(
-        "PROBE added={} moved={} removed={} notes={} display_rows={} lookalike_rows={} live_total={} version={:?} record={}",
-        report.added,
-        report.moved,
-        report.removed,
-        report.notes,
-        scalar(
-            &db,
-            &format!(
-                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
-            )
-        ),
-        scalar(
-            &db,
-            &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOOKALIKE_KEY}' AND state = 'ok'")
-        ),
-        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
-        recorded_parse_version(&db),
-        recorded_losses(&db),
     );
 }
