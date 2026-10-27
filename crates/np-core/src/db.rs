@@ -1120,7 +1120,7 @@ const MERGE_NAME_CAP: usize = 8;
 /// no `ON DELETE CASCADE` while it is off (verified: deleting a parent with the pragma off leaves its
 /// cascading children standing). Deleting the loser without its children would commit orphan `headings`,
 /// `tags`, `items` and `links.src_note_id` rows into a file whose enforcement is back ON the moment this step
-/// commits — the silent re-adoption [`add_note_foreign_keys`] exists to end. So the five statements below are
+/// commits — the silent re-adoption [`add_note_foreign_keys`] exists to end. So the six statements below are
 /// migration 3's shapes, spelled out: the loser's own derived rows and outgoing edges go with it, its inbound
 /// edges move to the winner.
 ///
@@ -1160,6 +1160,14 @@ fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
         // where an id can be re-adopted by the next `INSERT`. No later scan re-checks those keys, so this is
         // the one place anything would notice. Returning rolls the merge and its receipt back together, which
         // leaves the file at version four to try again rather than committing a half-merged corpus.
+        //
+        //
+        // One consequence worth naming: the pragma answers about the **whole file** and this step runs it
+        // unconditionally, so a workspace damaged by anything else — a child row whose note is simply gone —
+        // now refuses to open at the four-to-five step where version four opened it, which is deliberate,
+        // pinned by `the_merge_gate_refuses_a_child_row_whose_note_is_gone`, and its only exit is the message
+        // itself (table, rowid, parent) because §7 of `docs/design-f19-note-merge.md` rules out a repair
+        // command. The check is not scoped to rows this merge touched.
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_foreign_key_check()",
             [],
