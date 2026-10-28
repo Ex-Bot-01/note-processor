@@ -47,7 +47,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::catalog::{self, CatalogEntry};
-use crate::change::{classify, Change};
+use crate::change::{classify_with_identities, Change, FileIdentities};
 use crate::config::{abs_path, Config, ConfigError, MarkerConfig, WorkspaceRegistry};
 use crate::db::{self, Db, DbError, LIVE_EDGE, PROSE_ORIGIN};
 use crate::hash::{sha256_bytes, sha256_file, Snapshot};
@@ -416,7 +416,8 @@ pub fn scan_with_inject(
     let refresh = refresh_needed(stored);
     let now = now_secs();
     let known = known_rows(&db, &walked.unreadable, &walked.unrepresentable, &snapshots)?;
-    let changes = classify(&known.rows, &snapshots, !cfg!(windows));
+    let changes =
+        classify_with_identities(&known.rows, &snapshots, !cfg!(windows), &known.identity);
     // An ambiguous row is marked rather than deleted (F23 §2), which puts two decisions between
     // classification and the write pass: a `Removed` naming an admitted marked key is dropped (§4 — this is
     // the arm that used to live inside `known_rows` as a deletion, and F20's safety property says it must
@@ -727,6 +728,9 @@ struct KnownRows {
     /// Every ambiguous row this pass marked, admitted or refused, in byte-key ascending order — the
     /// population [`unresolved_ambiguity`] reads and §6's record field renders.
     marked: Vec<Marked>,
+    /// The one identity tally computed from these rows and the listed paths, shared with
+    /// [`crate::change::classify_with_identities`] so admission and pairing cannot disagree (design-a4 §3).
+    identity: FileIdentities,
 }
 
 /// One row F23 **marked**: its key is display text ([`key_is_display_derived`]) and an unreadable path spells
@@ -785,9 +789,19 @@ fn known_rows(
     // the refused-name arm needs no text side.
     let unreadable_display = display_spelled(unreadable);
     // Read out fully here, so the write pass never runs with a read open across it.
-    let mut known = Vec::new();
-    let mut marked = Vec::new();
     let mut hidden = 0_usize;
+    // Every row that survived the byte-keyed hiding, in the byte-key order the query returned them, plus the
+    // index of each **marked** one. Two passes are the point rather than a flourish: identity eligibility is a
+    // fact about the whole population — "exactly one row and exactly one listed path carry this id" cannot be
+    // answered row by row — so it is computed once from everything loaded, then consulted by admission here and
+    // by pairing in `classify`. One tally, two readers, which is what keeps them from disagreeing about who is
+    // eligible (design-a4 §3): a row admitted without a partner would have its `Removed` stripped and gain no
+    // `Moved`, the permanent-duplicate stuck state this function's own comment warns about.
+    let mut loaded: Vec<Snapshot> = Vec::new();
+    // `(index, is_note)` for each marked row, in the query's byte-key order — which is the order `marked` must
+    // come out in, because §5.7's determinism rule reads that vector when it renders the record.
+    let mut candidates: Vec<(usize, bool)> = Vec::new();
+    let mut is_marked: Vec<bool> = Vec::new();
     for row in rows {
         let (snapshot, is_note) = row?;
         // Bytes first: that is the identity, and for any row the walk keyed it this is the whole answer. First
@@ -803,28 +817,60 @@ fn known_rows(
         }
         let ambiguous = key_is_display_derived(&snapshot.rel, &snapshot.rel_bytes)
             && under_unreadable(snapshot.rel.as_bytes(), &unreadable_display);
-        if !ambiguous {
-            known.push(snapshot);
-            continue;
+        if ambiguous {
+            candidates.push((loaded.len(), is_note));
         }
-        // Marked. Admission is decided here because it is a **pre**-drop (§4): what no listed readable path
-        // spells exactly, with its stored hash, never enters `known` — today's behaviour for the refused set,
-        // unchanged — and charges source 2.
-        let admitted = admits(db, &snapshot, listed)?;
-        if admitted {
-            known.push(snapshot.clone());
-        }
+        is_marked.push(ambiguous);
+        loaded.push(snapshot);
+    }
+
+    // The scope lives here, at the one call site, rather than as a wider public API: every marked row is
+    // display-derived by construction, so this is exactly F23's population and an ordinary rename's stored row is
+    // never offered to identity pairing at all (design-a4 §3).
+    let identity = FileIdentities::build(&loaded, listed, |row| {
+        key_is_display_derived(&row.rel, &row.rel_bytes)
+    });
+
+    // Admission is decided before anything is dropped (§4): what no route can account for never enters `known`
+    // — today's behaviour for the refused set, unchanged — and charges source 2.
+    let mut admitted_row = vec![false; loaded.len()];
+    let mut marked = Vec::with_capacity(candidates.len());
+    for &(index, is_note) in &candidates {
+        let snapshot = &loaded[index];
+        // Content first, identity second, and the order is F23 §3's precedence carried forward rather than
+        // taste: the byte arm of `key_is_display_derived` already decides what a row is, and a route that could
+        // disagree with it would make which fact wins depend on which question got asked first.
+        let admitted = admits(db, snapshot, listed)?
+            || match identity.listed_for(snapshot) {
+                // The key this pairing will **write** is the listed path's, not the row's — so that is the key
+                // the stale-row rule tests, excluding this row itself. Without the guard a marked row could be
+                // admitted while another row already holds the listed path's key: `classify` would pair it with
+                // nothing (that path matched its own row and is no leftover), its `Removed` would still be
+                // stripped as admitted, and it would sit in the table forever charging `unresolved_ambiguity`.
+                Some(listed_key) => !key_taken(db, listed_key, &snapshot.rel_bytes)?,
+                None => false,
+            };
+        admitted_row[index] = admitted;
         marked.push(Marked {
-            key: snapshot.rel_bytes,
-            rel: snapshot.rel,
+            key: snapshot.rel_bytes.clone(),
+            rel: snapshot.rel.clone(),
             admitted,
             is_note,
         });
     }
+
+    // Unmarked rows enter `known` as they always did; a marked one enters only if some route accounts for it.
+    let known = loaded
+        .into_iter()
+        .zip(is_marked.iter().copied().zip(admitted_row))
+        .filter(|(_row, (marked, admitted))| !*marked || *admitted)
+        .map(|(row, _)| row)
+        .collect();
     Ok(KnownRows {
         rows: known,
         hidden,
         marked,
+        identity,
     })
 }
 

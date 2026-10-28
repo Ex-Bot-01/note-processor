@@ -3681,8 +3681,10 @@ fn a_permanent_class_row_whose_content_changed_while_a_twin_is_blocked_rejoins_i
         return;
     }
 
-    // The edit that breaks hash agreement. Admission is now refused (§2), and only the listing of its own path can
-    // settle the row.
+    // The edit that breaks hash agreement. Before A4 this refused admission outright and left the row to the
+    // listing alone; now the row's stored identity matches this file's uniquely, so a route exists and admission
+    // succeeds on its account (docs/design-a4-file-identity.md §3). The `file_id = NULL` variant below keeps the
+    // pre-A4 state asserted for the rows where identity is genuinely unknown.
     fs::write(
         byte_name(&ws.root, LOSSY_DIR).join("note.md"),
         "# Edited While Blocked\n\nThe body no longer matches what the row stores.\n",
@@ -3691,13 +3693,35 @@ fn a_permanent_class_row_whose_content_changed_while_a_twin_is_blocked_rejoins_i
 
     let report =
         scan(&ws.root, &ws.cfg).expect("an edited lossy-named note must not fail the scan");
-    // Measured, not assumed: classification calls the path `Added` — the row was pre-dropped, so nothing was there
-    // to pair with — and that is also what makes this safe rather than duplicating.
+    // `Modified`, and the change is load-bearing. Pre-A4 this read `(1, 0, 0, 0)`: the row was pre-dropped, so the
+    // path arrived as new work on its own account while the old row sat discharged. Now identity pairs them, so the
+    // same note is re-keyed and **re-parsed** — which is what design-a4 §6 test 1 demands be asserted as parsed text
+    // rather than as a count, because every stale-row failure found here so far was one where the row got touched
+    // but never read. The derived rows hang off the id checked below.
     assert_eq!(
         (report.added, report.modified, report.moved, report.removed),
-        (1, 0, 0, 0),
-        "the edited path is new work on its own account; nothing was moved and nothing was removed: {report:?}"
+        (0, 1, 0, 0),
+        "identity settled the row, so its content change is a modification of the note it already was: {report:?}"
     );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar_text(
+            &db,
+            &format!("SELECT text FROM headings WHERE note_id = {note_id} ORDER BY line LIMIT 1")
+        ),
+        "Edited While Blocked",
+        "the paired row was **re-parsed**, not merely re-keyed: its heading is the edited file's"
+    );
+    assert_eq!(
+        scalar_text(
+            &db,
+            &format!("SELECT title FROM notes WHERE id = {note_id}")
+        ),
+        "Edited While Blocked",
+        "and its title came from the same read — a row that kept its old body would fail here too"
+    );
+    drop(db);
 
     let db = ws.db();
     assert_eq!(
@@ -3738,6 +3762,158 @@ fn a_permanent_class_row_whose_content_changed_while_a_twin_is_blocked_rejoins_i
     assert!(
         losses.contains("ambiguous=0"),
         "and the durable record agrees with the charge rather than inventing a worry: {losses}"
+    );
+}
+/// One text value from the workspace database, for the assertions that have to read **parsed content** rather
+/// than a count: design-a4 §6 test 1's whole point is that a re-keyed row which was never re-read still looks
+/// correct to every counting assertion.
+fn scalar_text(open: &Db, sql: &str) -> String {
+    open.0
+        .query_row(sql, [], |row| row.get::<_, String>(0))
+        .expect("test: text query")
+}
+
+/// The same workspace with the identity **removed**: what every row written before migration 6 holds, and what
+/// every platform without the concept holds forever. The point is not nostalgia for the pre-A4 counts — it is that
+/// F23 §3-vs-§4's reconciliation (admission refused, discharge granted independently) stays asserted on a host where
+/// identity *can* answer. The only way to know A4 changed this state rather than broke it is to watch the old state
+/// still arrive when the id is missing.
+#[test]
+fn an_unknown_identity_leaves_that_row_refused_and_discharged_exactly_as_before() {
+    assert_twin_dirs();
+    const LOSSY_DIR: &[u8] = b"caf\xEF\xBF\xBD";
+    const LOSSY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_note_dir(&ws.root, LOSSY_DIR, "# Twin Heading\n") {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {LOSSY_DIR:?}"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    let db = ws.db();
+    let note_id = scalar(
+        &db,
+        &format!("SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}'"),
+    );
+    // The row a pre-migration build would have written: same key, same hash, no opinion about which file it is.
+    db.0.execute("UPDATE files SET file_id = NULL", [])
+        .expect("test setup: forget the identity");
+    drop(db);
+
+    assert!(
+        plant_note_dir(&ws.root, TWIN_DIR_NINE, "# Quite Another Heading\n"),
+        "test setup: plant the sibling directory"
+    );
+    let _blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!("NOT COVERAGE: 0o000 did not deny access to the sibling on this runner");
+        return;
+    }
+    fs::write(
+        byte_name(&ws.root, LOSSY_DIR).join("note.md"),
+        "# Edited While Blocked\n",
+    )
+    .expect("test setup: edit the note");
+
+    let report = scan(&ws.root, &ws.cfg).expect("the scan must still succeed");
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (1, 0, 0, 0),
+        "with no identity there is no route: the path is new work and the old row is discharged, as before A4: {report:?}"
+    );
+    let db = ws.db();
+    // One live row on that key, exactly as before A4 — and for the same reason. This is the **permanent** class:
+    // the row's key already equals its OS bytes, so the incoming listing carries that very key and `upsert_file`
+    // updates the row in place instead of minting a second one. What differs from the identity route above is how
+    // it got there — that one arrived as `Modified` through a pairing, this one as `Added` with the old row
+    // discharged — and both land on a re-read note rather than a stale one.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{LOSSY_KEY}' AND state = 'ok'"
+            )
+        ),
+        1,
+        "one live row on the key, not a duplicate and nothing parked at error"
+    );
+    assert_eq!(
+        scalar_text(
+            &db,
+            &format!(
+                "SELECT text FROM headings WHERE note_id = \
+                 (SELECT id FROM notes WHERE rel_bytes = X'{LOSSY_KEY}') ORDER BY line LIMIT 1"
+            )
+        ),
+        "Edited While Blocked",
+        "the note behind that key holds the edited content either way"
+    );
+    let _ = note_id;
+}
+
+/// A note that arrives at a new path under a **different** identity with its bytes unchanged — what a copy, a
+/// restore, an rsync without `--inplace`, a container image build and a cloud-sync client all produce. The stored id
+/// then matches nothing on disk, and that has to cost nothing: the content claim still moves the note and the row
+/// keeps its id. A route allowed to veto on disagreement would turn "this filesystem recycles inode numbers" into
+/// mass deletion (design-a4 §3).
+#[test]
+fn an_identity_that_no_longer_matches_never_vetoes_the_move_content_already_earned() {
+    let ws = scratch(&[("a.md", "# First\n")], 700);
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+
+    // A **copy** and a delete, not `fs::rename`: renaming keeps the inode, so the identity would stay in agreement
+    // and the fixture would prove nothing about disagreement. Bytes identical, id new — exactly the state a route
+    // that trusted identity over content would misread as "the old note is gone and here is a new one".
+    let stored_id = {
+        let db = ws.db();
+        let id: i64 =
+            db.0.query_row("SELECT id FROM files WHERE rel = 'a.md'", [], |row| {
+                row.get(0)
+            })
+            .expect("test setup: the row's identity before the copy");
+        drop(db);
+        id
+    };
+    fs::copy(ws.root.join("a.md"), ws.root.join("b.md")).expect("test setup: copy the note");
+    fs::remove_file(ws.root.join("a.md")).expect("test setup: remove the original");
+
+    let report = scan(&ws.root, &ws.cfg).expect("the second scan");
+    assert_eq!(
+        (report.added, report.modified, report.moved, report.removed),
+        (0, 0, 1, 0),
+        "a copied note is one move, whatever the ids say: {report:?}"
+    );
+
+    let db = ws.db();
+    assert_eq!(
+        scalar_text(
+            &db,
+            "SELECT hex(rel_bytes) FROM files WHERE state = 'ok' AND rel = 'b.md'"
+        ),
+        "622E6D64",
+        "the row followed the note to the new key"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        1,
+        "and no second row was minted for the path the id disagreed about"
+    );
+
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE id = {stored_id} AND file_id IS NOT NULL")
+        ),
+        1,
+        "the surviving row kept its id and had the **new** identity written back, rather than holding the stale one"
+    );
+    assert_eq!(
+        scalar_text(&db, "SELECT title FROM notes WHERE rel_bytes = X'622E6D64'"),
+        "First",
+        "the note is the one that was there before"
     );
 }
 
