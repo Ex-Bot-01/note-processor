@@ -62,7 +62,7 @@ pub const CHUNKER_VERSION: i64 = 1;
 
 /// The hard byte bound every chunk obeys, and the number [`chunk`] measures its tolerance against.
 ///
-/// **Why 1800.** Spec §Pipeline puts the target at "~350 tokens ±overlap", and tokens need a tokenizer
+/// **Why 1800.** The spec (`spec:223`) puts the target at "~350 tokens ±overlap", and tokens need a tokenizer
 /// this milestone does not have (§4), so the bound is stated in bytes and picked to put the corpus's
 /// common case near that target: prose here is mostly German and English running ~4 ASCII bytes per
 /// subword token, which places 350 tokens at ~1400 bytes, and 1800 is the next round step up. The

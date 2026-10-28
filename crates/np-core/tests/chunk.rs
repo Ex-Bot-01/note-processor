@@ -10,7 +10,7 @@
 
 use np_core::chunk::{chunk, Chunk, MAX_CHUNK_BYTES};
 
-/// One paragraph of German prose with a distinct topic sentence: ~850 bytes, ten lines, no blank line
+/// One paragraph of German prose with a distinct topic sentence: ~785 bytes, eleven lines, no blank line
 /// inside it, so it is exactly one block.
 fn paragraph(topic: &str) -> String {
     let sentences = [
@@ -31,7 +31,7 @@ fn paragraph(topic: &str) -> String {
     out
 }
 
-/// A six-paragraph note, blank line between each pair, terminated by a newline: ~5.1 kB, so several
+/// A six-paragraph note, blank line between each pair, terminated by a newline: ~4.7 kB, so several
 /// chunks deep and therefore usable for the mutation check below.
 fn six_paragraph_note() -> String {
     let topics = [
@@ -54,7 +54,7 @@ fn six_paragraph_note() -> String {
 }
 
 /// A note mixing the character widths that matter: 2-byte umlauts, a 4-byte emoji and a flag, 3-byte
-/// CJK and Hangul. Four short blocks, so it is also the merge case.
+/// CJK and Hangul. Five short blocks, so it is also the merge case.
 fn wide_text() -> String {
     "# Größen und Wörter\n\n\
      Die Größe für Müller steht im Gespräch über Ökologie und Straße.\n\n\
@@ -142,7 +142,7 @@ fn the_same_note_twice_yields_the_same_chunks() {
 #[test]
 fn every_chunk_reads_back_as_the_slice_it_names() {
     // The slice contract on the corpus's hazard mix (umlauts, emoji, CJK, Hangul) plus the merge rule
-    // §4 asks for: four short blocks are one chunk, not four. Mutation this pins: counting chunk length
+    // §4 asks for: five short blocks are one chunk, not five. Mutation this pins: counting chunk length
     // in *characters* while storing byte offsets, or trimming a `\r` from the text but not from the
     // offsets — either makes the slicing below panic, or worse, succeed with text off by one.
     let text = wide_text();
@@ -257,6 +257,38 @@ fn a_huge_block_without_a_seam_is_cut_at_a_char_boundary() {
     // Still tiling, so nothing was dropped between pieces.
     let rejoined: String = chunks.iter().map(|c| c.text.as_str()).collect();
     assert_eq!(rejoined, text);
+
+    // How *far* that walk goes. One ASCII byte in front puts every later boundary at `1 mod 4`, so the
+    // limit lands 3 bytes inside a 4-byte emoji and the loop has to take three steps back rather than one:
+    // a fixture that only ever needs a single step passes with a mutant that walks back exactly once.
+    //
+    // Mutation this pins: deleting the `while !text.is_char_boundary(cut)` walk-back in `split_block`.
+    // Cutting at the raw limit then slices through an emoji, which panics in `str`'s own char-boundary
+    // check when `chunk` slices it — and for a mutant that re-spells the text instead of slicing it, the
+    // exact length below is what fails, because a cut at 1800 or at 1796 is a chunk whose bytes are not
+    // the note's.
+    let emoji = format!("a{}", "🎉".repeat(2000));
+    assert_eq!(
+        MAX_CHUNK_BYTES % 4,
+        0,
+        "test setup: the limit only lands inside a 4-byte character while it is a multiple of 4"
+    );
+    assert!(
+        !emoji.is_char_boundary(MAX_CHUNK_BYTES),
+        "this fixture exists to make the limit land three bytes into a four-byte character"
+    );
+
+    let emoji_chunks = chunk(&emoji);
+    assert_contract(&emoji, &emoji_chunks);
+    let first = emoji_chunks.first().expect("test setup: chunks");
+    assert_eq!(
+        first.byte_end - first.byte_start,
+        MAX_CHUNK_BYTES - 3,
+        "the walk-back has to stop on the first boundary before the limit, not one step further"
+    );
+    // Still tiling, so a deeper walk did not drop bytes between pieces.
+    let rejoined: String = emoji_chunks.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(rejoined, emoji);
 }
 
 #[test]
@@ -286,9 +318,15 @@ fn nothing_exceeds_the_bound_by_even_one_byte() {
     // The bound is hard, so the tolerance a caller carries is **zero** — that is the claim under test,
     // over inputs chosen to defeat an overshooting chunker: one long unbroken line, CJK with no spaces at
     // all, and blocks sitting just below and just above the limit.
-    // Mutations this pins: `<=` becoming `<` when deciding a merge, or splitting forward to the next seam
-    // after the limit instead of back to the previous one.
+    // Mutations this pins: `<=` becoming `<` when deciding a merge — pinned at equality by the exact-bound
+    // note below, not merely approached by `just_under` — or splitting forward to the next seam after the
+    // limit instead of back to the previous one.
     let just_under = "x".repeat(MAX_CHUNK_BYTES - 2);
+    // Equality on the merge guard rather than a near miss: 899 + 2 + 899 = 1800 bytes, so the span from the
+    // first block's first byte to the second block's last byte is exactly `MAX_CHUNK_BYTES` and the guard has
+    // to answer "fits". Flipping `<=` to `<` splits this note into two chunks — that is the mutation this
+    // case exists to catch.
+    let exact_bound = format!("{}\n\n{}", "x".repeat(899), "y".repeat(899));
     let cases = [
         six_paragraph_note(),
         wide_text(),
@@ -298,6 +336,8 @@ fn nothing_exceeds_the_bound_by_even_one_byte() {
         format!("{just_under}\n\n{just_under}\n\n{just_under}"),
         // A block whose only seam is past the limit: nothing to break at but a char boundary.
         format!("{}{}", "长".repeat(700), "x".repeat(40)),
+        // Cloned because the count below is asserted on the same note the loop covers.
+        exact_bound.clone(),
     ];
     for text in cases {
         let chunks = chunk(&text);
@@ -310,6 +350,27 @@ fn nothing_exceeds_the_bound_by_even_one_byte() {
             );
         }
     }
+
+    // The bound is inclusive, so a span sitting exactly on it is still one chunk. Asserted as a count, on
+    // top of the bound check above: two chunks here means the merge guard stopped accepting equality.
+    assert_eq!(
+        exact_bound.len(),
+        MAX_CHUNK_BYTES,
+        "test setup: 899 + blank line + 899 has to land exactly on the bound"
+    );
+    let at_bound = chunk(&exact_bound);
+    assert_contract(&exact_bound, &at_bound);
+    assert_eq!(
+        at_bound.len(),
+        1,
+        "a span of exactly {MAX_CHUNK_BYTES} bytes merges into one chunk, got {:?}",
+        spans(&at_bound)
+    );
+    assert_eq!(
+        at_bound[0].byte_end - at_bound[0].byte_start,
+        MAX_CHUNK_BYTES,
+        "the single chunk carries the whole span, separator included"
+    );
 }
 
 #[test]

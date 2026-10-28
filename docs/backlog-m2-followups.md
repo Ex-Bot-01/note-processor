@@ -534,6 +534,20 @@ What these numbers can and cannot carry:
   no current golden exercises this shape, so only the new fixture and unit cases move) or amend R2 and add a golden that pins
   the accepted shape deliberately.
 
+## Carried out of the M2a chunker review (2026-10-28)
+
+Two behaviours `crates/np-core/src/chunk.rs` defers in its own comments, recorded here rather than left in a docstring —
+the same treatment design-m2-embeddings §3 gave "No FTS5 yet". Both change where chunks start and end, so both belong to
+one `CHUNKER_VERSION` bump rather than to a quiet patch.
+
+- **No overlap between chunks yet.** `chunk` cuts at blank lines and its chunks are disjoint — `tests/chunk.rs` asserts
+  `byte_start >= predecessor.byte_end` — so the spec's "~350 tokens ±overlap" is not implemented, and a seam that cuts a
+  sentence in half stays cut. **Do when:** the tokenizer-aware cut ships overlap and every row says which chunker wrote
+  it (`docs/design-m2-embeddings.md` §4).
+- **The chunker is fence-blind.** A "block" here is a maximal run of non-blank lines, not `crate::parse`'s notion of one,
+  so a fenced code block holding a blank line can be split in half — the shape §4 says embeds garbage. **Do when:** a
+  note with a blank line inside a fence keeps that fence inside one chunk.
+
 ## Explicitly not in this backlog
 
 Embeddings and clustering, compression into `processed/`, item timelines and tick extraction, the daemon, API,

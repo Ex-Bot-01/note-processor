@@ -66,7 +66,8 @@ CREATE TABLE chunks (
     note_id       INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
     ordinal       INTEGER NOT NULL,          -- 0-based within the note
     chunker       INTEGER NOT NULL,          -- which chunking code cut this row (§4)
-    text          BLOB    NOT NULL,          -- raw UTF-8 bytes: never assume it round-trips as String
+    -- typeof, not just affinity: a Rust `String` bind arrives as TEXT and length() counts characters (F13 §4).
+    text          BLOB    NOT NULL CHECK (typeof(text) = 'blob'),  -- raw UTF-8 bytes: no round trip as String
     byte_start    INTEGER NOT NULL,
     byte_end      INTEGER NOT NULL,
     source_hash   TEXT    NOT NULL,          -- sha256 of the note bytes this was cut from
@@ -77,7 +78,9 @@ CREATE TABLE embeddings (
     chunk_id      INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
     model         TEXT    NOT NULL REFERENCES models(id) ON DELETE CASCADE,  -- id + version, verbatim
     dim           INTEGER NOT NULL,
-    vector        BLOB    NOT NULL CHECK (length(vector) = 4 * dim),  -- little-endian f32, exactly dim
+    -- The same trap one arm over: a TEXT bind of 4·dim characters passes `length(vector) = 4 * dim`, because
+        -- length() counts characters on TEXT (F13 §4's type-split bug).
+    vector        BLOB    NOT NULL CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim),  -- little-endian f32
     source_hash   TEXT    NOT NULL,          -- the chunk's, at embed time
     embedded_at   INTEGER NOT NULL,
     PRIMARY KEY (chunk_id, model)
@@ -91,12 +94,13 @@ Notes on the shape, each of which is a decision and not an accident:
   is stored as raw little-endian f32 rather than serialised JSON: 512 dimensions is 2 KiB, and hex or JSON would triple
   it for no benefit — **a deliberate deviation from the spec's "q8 ≈ 19 MB"** (`spec:85`, `spec:227`), accepted here
   because quantisation is a quality decision that belongs with the model benchmark and not smuggled in as storage
-  trivia. `CHECK (length(vector) = 4 * dim)` makes that deviation machine-enforced **now**, while the table is empty, so
+  trivia. `CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim)` makes that deviation machine-enforced **now**, while the table is empty, so
   a later switch to q8 fails at write time instead of becoming subtly wrong cosines no test would notice. `dim` is stored
   so a mismatch is detectable at read time rather than producing garbage.
 - **`(chunk_id, model)` is the key.** Re-embedding with a second model must not destroy the first: switching providers
   then costs a re-embed and nothing else, which is what makes §2's "one config key" promise true. It also means every
-  read must filter by model, so `vector_for(model)` takes it explicitly rather than defaulting to "whatever is there".
+  read must filter by model, so the read helper this design calls `vector_for(model)` — **not written yet**, like every
+  other provider-side name below — takes it explicitly rather than defaulting to "whatever is there".
 - **`source_hash` on both tables.** `chunks.source_hash` says which note bytes the chunk was cut from;
   `embeddings.source_hash` says which chunk text the vector was computed from. Two levels because a chunk can be
   unchanged while its note changed (a heading edit in paragraph 9 leaves chunk 2's text alone), and re-embedding only
@@ -135,12 +139,20 @@ Notes on the shape, each of which is a decision and not an accident:
   AND source_hash matches`) rather than a global verdict; `models.id` carries model identity only — one fact, one place.
   Without the stamp, §4's promise of "no half-embedded corpus under two definitions of chunk" is unenforceable: the only
   honest action after a bump would be re-chunk-everything, which is the very thing the mitigation was for.
-- **Boundaries at block ends where possible.** Markdown blocks (headings, list items, fenced code) are the natural
-  seams and the parser already finds them; a chunk that splits a fenced code block in half embeds garbage.
-- **~350 tokens with overlap** is the spec's number, but token counts belong to a tokenizer M2a does not have. The
-  first implementation bounds chunks by **bytes** with a documented constant; the tokenizer-aware cut lands with the
-  chosen model as a `CHUNKER_VERSION` bump recorded per row, so old rows are *identifiable* rather than merely presumed
-  stale.
+- **Boundaries at blank-line seams where possible — and fence-blind.** What M2a actually does is cut at **blank lines**:
+  a block is a maximal run of non-blank lines, whole blocks are merged while their span fits `MAX_CHUNK_BYTES`, and a
+  block larger than the bound is cut back to the last whitespace seam before it. That is deliberately not `parse`'s
+  notion of a block, so **a fenced code block containing a blank line can still be split in half** — and a chunk that
+  splits a fenced block in half embeds garbage. Fence awareness belongs with the tokenizer-aware `CHUNKER_VERSION` bump
+  below, because either one moves seams and therefore every row; recorded as an open item rather than silently dropped
+  (`docs/backlog-m2-followups.md`).
+- **~350 tokens with overlap** is the spec's number and M2a implements neither half of it. Token counts belong to a
+  tokenizer this milestone does not have, so the first implementation bounds chunks by **bytes** with a documented
+  constant (`MAX_CHUNK_BYTES`). And there is **no overlap yet**: v1's chunks are disjoint — `tests/chunk.rs` asserts
+  `byte_start >= predecessor.byte_end` — so nothing is re-embedded twice and a seam that cuts a sentence in half stays
+  cut. The tokenizer-aware cut lands with the chosen model as a `CHUNKER_VERSION` bump recorded per row, so old rows are
+  *identifiable* rather than merely presumed stale; overlap is recorded beside the fence gap
+  (`docs/backlog-m2-followups.md`) because adding it changes every offset.
 - **CRLF is a re-embed amplifier, accepted knowingly.** Chunk text comes from stored note bytes, so a CRLF↔LF rewrite by
   an editor or sync client moves every offset and re-embeds the whole note — worst case all ~18k chunks of one language,
   against spec §"Linux **and** Windows: … line endings … differ". Normalising is *not* the fix: it would break the slice
@@ -160,9 +172,10 @@ makes it safe: recording the version only when every owed note was actually re-p
 - **Two facts, split apart — this paragraph is the review's P0 and the one correction here that would have cost a
   week.** F15's `refresh_covered` (`scan.rs:1907-1909`) counts exactly two sources of unfinished work — a path that
   changed or went unread between walk and read, and a live row behind an unenterable directory or refused name — and the
-  code refuses to charge anything else, because "Charging either would re-parse the whole corpus on every scan forever
-  and repair nothing" (`scan.rs:1873-1876`). Re-parsing never fails for an *external* reason. Embedding does: no model
-  installed, endpoint down, out of memory. Gate `EMBED_VERSION` on that and the **default** configuration
+  code refuses to charge anything else, because "Charging any of them would re-parse the whole corpus on every scan
+  forever and repair nothing" (`scan.rs:1872-1873`). Re-parsing never fails for an *external* reason. Embedding does:
+  no model installed, endpoint down, out of memory. Gate `EMBED_VERSION` — a name this design introduces, not code: it
+  exists nowhere in the tree yet — on that and the **default** configuration
   (`embeddings.provider = "none"`, §2) withholds it on every scan forever — a full re-chunk of ~18k chunks each time,
   plus a gap line nobody can clear. So:
   - `EMBED_VERSION` covers **chunker-definition coverage only**, reusing `refresh_covered`'s two sources unchanged, and
@@ -178,7 +191,7 @@ makes it safe: recording the version only when every owed note was actually re-p
   of `apply_changes`, the whole scan's indexing work rolls back with it. Provider failure must not be data loss; neither
   may our own conflict handling be.
 - **Embedding does not hold the scan's transaction open.** The write pass runs inside `unchecked_transaction()` and
-  commits once (`scan.rs:432`, `:469`); unbounded model work inside it would leave a concurrent `np` waiting out
+  commits once (`scan.rs:432`, `:470`); unbounded model work inside it would leave a concurrent `np` waiting out
   `busy_timeout` to report `database is locked`. Chunk writes stay in the transaction — they are cheap and must be atomic
   with the note rows; vectors commit separately per batch, which is safe precisely because the bullet above no longer
   claims "recorded ⇒ embedded".
@@ -192,7 +205,7 @@ The spec's gate is throughput, so the deliverable is a measurement and an honest
 
 - **A real corpus, not a synthetic one.** The spec's own gate wording is "on my own notes … retrieval spot-checks in
   German and English" (`spec:316`), and throughput is tokenizer- and language-dependent on the mixed de/en corpus
-  (`spec:81`). A synthetic corpus cannot support even this section's modest claim. So: a fixed de/en-mixed slice derived
+  (`spec:82`). A synthetic corpus cannot support even this section's modest claim. So: a fixed de/en-mixed slice derived
   from the real vault (~2k notes at the real size distribution), committed as a fixture or generated from a recorded
   seed — reported per language as well as blended, because one blended figure hides whichever language costs triple.
 - Reported per candidate: chunks/hour, seconds to first useful result, peak RSS, weight bytes, and warm-scan cost when
@@ -233,7 +246,8 @@ answer to compare against.
   three hand-written child lists (`merge_duplicate_notes`'s deletes, `scan.rs:1368-1372`, `scan.rs:1497-1501`).
   Plus: two models
   coexisting on one chunk; a length/`dim` mismatch refused at write by the `CHECK`; an `embeddings` row naming an unknown
-  model refused by the foreign key.
+  model refused by the foreign key; and a Rust `String` bind into `chunks.text` refused by its `typeof` arm
+  (`a_string_bind_is_refused_from_chunks_text`, on `refuses_string_bind`) — BLOB is an affinity, not a constraint.
 - **Staleness:** unchanged note → no re-embed (asserted as "the provider was called zero times", through a test provider
   that counts calls, not as a timing claim); edited note with an untouched paragraph → only the covering chunks
   re-embedded; provider failure → `EMBED_VERSION` not recorded and the count reported.
@@ -249,13 +263,14 @@ answer to compare against.
   mutating environment inside a test races cargo's parallel harness.
 - **Anything needing the real model or endpoint is gated on an explicit runtime env var with a clean early return — never
   on `#[ignore]`.** CI runs `cargo test --locked --release -- --ignored` (`ci.yml:41`), which F16 already learned burns a
-  green run; the spec's "opt-in, skipped by default, not in CI" bench and integration test (`spec:310-312`) are only
+  green run; the spec's "opt-in, skipped by default, not in CI" bench and integration test (`spec:308-310`) are only
   opt-in if they check a variable at runtime.
 - **Config refuses to be misspelled.** Every existing config struct is `#[serde(default)]` with no unknown-key refusal,
   and `MissingField` "cannot fire from `Config::load` today" (`config.rs:30-32`, `:56-57`) — so a hand-typed
   `provide = "openai-compatible"` would load as `"none"` in silence. In a project whose F-series is about not lying about
-  status: `provider` is an **enum**, the new `[embeddings]` struct carries `#[serde(deny_unknown_fields)]`, and one test
-  asserts an unknown key there is refused naming key and file.
+  status: `provider` is to be an **enum**, and the `[embeddings]` struct this design adds — **not written yet, like the
+  provider itself; `Config` today holds `data_dir`, `catalog` and `markers` only** — is to carry
+  `#[serde(deny_unknown_fields)]`, with one test asserting an unknown key there is refused naming key and file.
 - Migration 7 updates `the_schema_is_what_the_plan_mandates`, which pins the table list by exact array and whose index
   assertion filters `sql IS NOT NULL`, so PK/UNIQUE autoindexes stay out of the expected list. Named rather than
   numbered: migration 7 moved every line below it in `tests/db.rs`, which is how the old numbers went stale.
@@ -266,7 +281,7 @@ answer to compare against.
 
 1. **candle on Windows — stated in both halves.** M2a's own chunker, storage and staleness tests run on Windows from
    day one: CI already builds and tests the workspace on `windows-latest` (`ci.yml:20`, `:29-41`) and byte-exactness is
-   engineered for (`.gitattributes:4`, fixtures exempted at `:6-8`). What CI does *not* cover is an optional heavy
+   engineered for (`.gitattributes:3`, fixtures exempted at `:5-7`). What CI does *not* cover is an optional heavy
    provider: a feature-gated `candle`/`ggml` dependency is invisible to `--all-targets` unless asked for, and the GGUF
    fallback additionally needs a C++ toolchain. §6's per-OS `cargo check --features local-model` is the measurement; until
    it runs, no claim about Windows model support is made here (F18's rule).
