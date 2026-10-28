@@ -58,7 +58,7 @@ pub(crate) const BUSY_TIMEOUT_MS: u32 = 1800;
 /// ahead of this list is refused rather than trusted — a newer file read by an older binary
 /// would otherwise be written to a schema this code does not know.
 ///
-/// Five entries rather than one, split along the lines that matter (`files` + `notes` are the
+/// Seven entries rather than one, split along the lines that matter (`files` + `notes` are the
 /// registry and the note's identity; everything after them is derived from a note's contents
 /// and can be rebuilt from the file; the third adds the keys between those two groups; the fourth
 /// re-keys the registry's own pair onto bytes; the fifth folds the duplicate note rows that key may
@@ -166,6 +166,73 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(
         r#"
     ALTER TABLE files ADD COLUMN file_id BLOB;
+    "#,
+    ),
+    // Chunk and vector storage (design-m2-embeddings §3): the first derived data that hangs off a note *id* rather
+    // than a path, which is the F13 lesson applied forward — a chunk storing `rel_bytes` would inherit every
+    // lossy-name, rename and merge defect six milestones spent removing.
+    //
+    // Four things about this shape are decisions rather than accidents:
+    //
+    // - **`models.sha256` is nullable by design.** Weights are never committed and `np models install` verifies the
+    //   digest it fetched, but a provider with no weights — the default `embeddings.provider = "none"`, and every
+    //   endpoint provider — has nothing to verify. NULL is therefore the common arm, so there is no
+    //   `CHECK (typeof(sha256) = 'text')`: that CHECK would refuse the shipping configuration.
+    // - **`embeddings.model` is a real foreign key**, and `models` is declared before its child so the key reads in
+    //   file order. Without the reference an embedding row could name a model that was never installed, or one
+    //   removed and reinstalled under the same id — exactly the orphan class migration 3 exists to end ("Migration 3
+    //   gave every one of these five statements a twin in the schema", `scan.rs:1338-1340`) — and
+    //   `PRAGMA foreign_key_check` reads *declared* constraints and ignores the pragma, which is what
+    //   `first_violation`'s own comment says; a key that was never declared is a key that check can never see.
+    //   Declaring it here costs nothing at write time and buys the one audit that reaches every row.
+    // - **`vector` carries a length CHECK.** Little-endian f32 instead of the spec's q8 (`spec:85`) is a deliberate
+    //   deviation — quantisation is a quality decision that belongs with the model benchmark, not smuggled in as
+    //   storage trivia — and the CHECK keeps that deviation machine-enforced *now*, while the table is empty, so a
+    //   later switch to q8 fails at write instead of becoming subtly wrong cosines no test would notice. `dim` is
+    //   stored beside it so a mismatch is detectable at read time rather than producing garbage.
+    // - **No index beyond the primary keys and `UNIQUE (note_id, ordinal)`**, because nothing looks a chunk up by
+    //   anything but that pair. An index here would be written on every embed and paid for by every scan, to speed
+    //   up a query no reader makes.
+    Migration::Sql(
+        r#"
+    CREATE TABLE models (
+        id            TEXT    PRIMARY KEY,
+        dim           INTEGER NOT NULL,
+        -- NULL is a provider with no weights, which is the common case rather than the broken one.
+        sha256        TEXT,
+        prefix_doc    TEXT    NOT NULL DEFAULT '',
+        prefix_query  TEXT    NOT NULL DEFAULT '',
+        installed_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE chunks (
+        id            INTEGER PRIMARY KEY,
+        note_id       INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        ordinal       INTEGER NOT NULL,
+        chunker       INTEGER NOT NULL,
+        -- Raw UTF-8 bytes: `TEXT` would be a promise that note bodies are valid UTF-8, which F13 refuses to make.
+        -- `typeof = 'blob'` too, not just the declared affinity: a Rust `String` bind arrives as TEXT and
+        -- `length()` would then count characters, letting eight of them satisfy a 4*dim rule for dim=2.
+        -- Migration 4 learned this the hard way with its key columns (F13 §4).
+        text          BLOB    NOT NULL CHECK (typeof(text) = 'blob'),
+        byte_start    INTEGER NOT NULL,
+        byte_end      INTEGER NOT NULL,
+        source_hash   TEXT    NOT NULL,
+        UNIQUE (note_id, ordinal)
+    );
+
+    CREATE TABLE embeddings (
+        chunk_id      INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+        model         TEXT    NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        dim           INTEGER NOT NULL,
+        -- Same trap one table over: without the typeof arm a TEXT bind of eight characters would satisfy
+        -- `length(vector) = 4 * dim` at dim=2, and the failure would surface later as garbage cosines.
+        vector        BLOB    NOT NULL CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim),
+        source_hash   TEXT    NOT NULL,
+        embedded_at   INTEGER NOT NULL,
+        -- Re-embedding under a second model must not destroy the first, so the pair is the key.
+        PRIMARY KEY (chunk_id, model)
+    );
     "#,
     ),
 ];

@@ -195,11 +195,14 @@ fn the_schema_is_what_the_plan_mandates() {
     assert_eq!(
         tables,
         [
+            "chunks",
+            "embeddings",
             "files",
             "headings",
             "items",
             "links",
             "meta",
+            "models",
             "notes",
             "schema_version",
             "tags"
@@ -241,6 +244,20 @@ fn the_schema_is_what_the_plan_mandates() {
         ("links", "src_note_id dst_note_id kind target line origin"),
         ("items", "note_id text line state marker"),
         ("meta", "key value"),
+        // Migration 7's three tables, pinned by the same argument as the rest: the chunker writes them and the
+        // provider reads them column by column, so a rename here has to break that code rather than merely differ.
+        (
+            "models",
+            "id dim sha256 prefix_doc prefix_query installed_at",
+        ),
+        (
+            "chunks",
+            "id note_id ordinal chunker text byte_start byte_end source_hash",
+        ),
+        (
+            "embeddings",
+            "chunk_id model dim vector source_hash embedded_at",
+        ),
     ] {
         assert_eq!(
             column_names(&db, table),
@@ -413,6 +430,257 @@ fn deleting_a_note_row_cascades_to_its_children_and_nulls_inbound_edges() {
     // The NULLed edge is still unresolved rather than forgotten: this is the count a scan reports.
     let counts = note_counts(&db).expect("counts");
     assert_eq!((counts.links, counts.unresolved_links), (1, 1));
+}
+
+/// A model row an embedding can name: identity, dimensionality, no weights (`sha256` NULL, which is the arm the
+/// default `embeddings.provider = "none"` ships on) and empty prefixes.
+fn insert_model(db: &Db, id: &str, dim: i64) {
+    db.0.execute(
+        "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+         VALUES (?1, ?2, NULL, '', '', 1)",
+        rusqlite::params![id, dim],
+    )
+    .expect("test setup: model row");
+}
+
+/// One chunk of `note`, cut by chunker 1 from bytes hashing to a fixed `source_hash`, returning its id.
+fn insert_chunk(db: &Db, note: i64, ordinal: i64) -> i64 {
+    db.0.execute(
+        "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+         VALUES (?1, ?2, 1, x'616263', 0, 3, 'chunk-source-hash')",
+        rusqlite::params![note, ordinal],
+    )
+    .expect("test setup: chunk row");
+    db.0.last_insert_rowid()
+}
+
+#[test]
+fn deleting_a_note_takes_its_chunks_and_their_vectors() {
+    // Migration 7's cascade is asserted at **runtime**, on a fresh database with enforcement on — not during the
+    // migration, which runs with `PRAGMA foreign_keys = OFF` and would therefore prove nothing about the ordinary
+    // write path (design-m2-embeddings §7). The pragma is read back first because the whole test rests on it: an
+    // enforcement-off connection makes every cascade below silently stop firing.
+    let db = Db::in_memory().expect("fresh database");
+    assert_eq!(scalar::<i64>(&db, "PRAGMA foreign_keys"), 1);
+
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row a");
+    upsert_file(&db, &snap("b.md", "hb"), Path::new("/ws/b.md"), 1)
+        .expect("test setup: registry row b");
+    let a = insert_note(&db, "a.md", "A");
+    let b = insert_note(&db, "b.md", "B");
+    insert_model(&db, "m@1", 2);
+    let chunk_a = insert_chunk(&db, a, 0);
+    let chunk_b = insert_chunk(&db, b, 0);
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'0000000000000000', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk_a],
+    )
+    .expect("test setup: vector for a's chunk");
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'00000000000000f0', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk_b],
+    )
+    .expect("test setup: vector for b's chunk");
+
+    // Only the note row goes away, which is what shows the schema does the rest on its own.
+    db.0.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![a])
+        .expect("delete the note row itself");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"),
+        1,
+        "the deleted note's chunk goes with it"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT note_id FROM chunks"),
+        b,
+        "the survivor is the other note's chunk: a delete sweeping the whole table satisfies the count above and fails here"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        1,
+        "the vector hangs off the chunk, so it goes too — one cascade, not two"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT chunk_id FROM embeddings"),
+        chunk_b,
+        "the surviving vector is the other note's"
+    );
+    // A model is workspace-wide, not a note's; deleting one note must not empty the registry that tells the next
+    // scan what is installed.
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM models"), 1);
+}
+
+#[test]
+fn deleting_a_model_takes_the_vectors_that_named_it() {
+    // The other direction of migration 7's second cascade: an uninstalled model must not leave vectors behind that
+    // name it. Without `ON DELETE CASCADE` on `embeddings.model` the delete below is *refused* by the foreign key,
+    // which fails this test rather than passing it quietly.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "gone@1", 2);
+    insert_model(&db, "kept@1", 2);
+    let chunk = insert_chunk(&db, a, 0);
+    for model in ["gone@1", "kept@1"] {
+        db.0.execute(
+            "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+             VALUES (?1, ?2, 2, x'0000000000000000', 'chunk-source-hash', 1)",
+            rusqlite::params![chunk, model],
+        )
+        .expect("test setup: vector under each model");
+    }
+
+    db.0.execute("DELETE FROM models WHERE id = 'gone@1'", [])
+        .expect("uninstall one model");
+
+    assert_eq!(
+        names(&db, "SELECT model FROM embeddings ORDER BY model"),
+        ["kept@1".to_string()],
+        "the vectors naming the removed model go with it, and only those"
+    );
+    // Chunks are cut from notes, not from models: dropping a model costs vectors and nothing else, which is what
+    // makes §3's "switching providers costs a re-embed and nothing else" true at the schema level.
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"), 1);
+}
+
+#[test]
+fn a_vector_that_is_not_four_times_dim_bytes_is_refused() {
+    // Storing little-endian f32 instead of the spec's q8 is a deliberate deviation, and the `CHECK` is what keeps it
+    // honest while the table is empty (design-m2-embeddings §3). Three wrong lengths and the exact fit are
+    // asserted: a `>=` mutant, or a `length(vector) = dim` mutant, passes a test that probes one short value only.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+    let chunk = insert_chunk(&db, a, 0);
+
+    for (bytes, shape) in [
+        ("00", "one byte, short of 2 * 4"),
+        ("000000", "three bytes, not a whole f32"),
+        ("000000000000000000", "nine bytes, one over 2 * 4"),
+    ] {
+        rejects(
+            &db,
+            &format!(
+                "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+                 VALUES ({chunk}, 'm@1', 2, x'{bytes}', 'chunk-source-hash', 1)"
+            ),
+            &format!("embeddings.vector ({shape})"),
+        );
+    }
+
+    // The exact fit goes in, which is the half of the assertion that says the CHECK is `= 4 * dim` and not merely
+    // "some length".
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'00000000000000f0', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk],
+    )
+    .expect("eight bytes for dim 2 is exactly right");
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"), 1);
+}
+
+#[test]
+fn an_embedding_that_names_no_installed_model_is_refused() {
+    // The orphan class migration 3 ended, one milestone later: an embedding naming a model that was never installed
+    // is invisible to `PRAGMA foreign_key_check` unless it is *declared* here, and it would be read back as a
+    // vector under a model nobody can name.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+    let chunk = insert_chunk(&db, a, 0);
+
+    // The chunk parent exists on purpose, so the only key this row can fail is `model` — the same discipline as
+    // [`rejects`], which names a parent that exists for every CHECK it probes.
+    refuses_orphan(
+        &db,
+        &format!(
+            "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+             VALUES ({chunk}, 'never-installed@1', 2, x'0000000000000000', 'chunk-source-hash', 1)"
+        ),
+    );
+
+    // The identical row naming the installed model goes in: what is refused is the missing parent, not the table.
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'0000000000000000', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk],
+    )
+    .expect("a vector under an installed model");
+}
+
+#[test]
+fn two_models_hold_vectors_for_one_chunk() {
+    // `PRIMARY KEY (chunk_id, model)` is what makes "switching providers costs a re-embed and nothing else" true.
+    // A key narrowed to `chunk_id` alone refuses the second INSERT; a key dropped altogether lets a third row in,
+    // so both directions are asserted.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "small@1", 2);
+    insert_model(&db, "large@1", 4);
+    let chunk = insert_chunk(&db, a, 0);
+
+    // Different dimensionalities on purpose: `dim` is the row's own, so the CHECK must read it per embedding rather
+    // than assume one model per database.
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'small@1', 2, x'0102030405060708', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk],
+    )
+    .expect("the first model's vector");
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'large@1', 4, x'0102030405060708090a0b0c0d0e0f10', 'chunk-source-hash', 2)",
+        rusqlite::params![chunk],
+    )
+    .expect("the second model's vector, same chunk");
+
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"), 2);
+    // Each one reads back intact rather than one having overwritten the other.
+    for (model, bytes) in [
+        ("small@1", vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+        (
+            "large@1",
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        ),
+    ] {
+        assert_eq!(
+            scalar::<Vec<u8>>(
+                &db,
+                &format!("SELECT vector FROM embeddings WHERE model = '{model}'")
+            ),
+            bytes,
+            "{model}'s vector is the bytes that were written"
+        );
+    }
+
+    // And the pair really is the key: a second row for it is refused by the primary key, not accepted as a new
+    // version of the same fact.
+    let err =
+        db.0.execute(
+            "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'small@1', 2, x'0000000000000000', 'other-hash', 3)",
+            rusqlite::params![chunk],
+        )
+        .expect_err("the same (chunk_id, model) pair cannot be written twice");
+    assert!(
+        matches!(
+            &err,
+            rusqlite::Error::SqliteFailure(fault, _)
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+        ),
+        "expected a primary-key violation from the repeated pair, got {err}"
+    );
 }
 
 /// The schema as of version 2 — the first two `MIGRATIONS` entries copied out verbatim, and
@@ -2167,13 +2435,22 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
     )
     .expect("test setup: plant two note rows on one key, their derived rows and the edges around them");
     // Rewind past migration 5 — and past the receipt its step wrote while this file was still empty. A
+    //
+    // The rewind deletes a version number, so it has to undo what every later entry **created** as well: the
+    // `file_id` column (migration 6) and migration 7's three tables. Leave those standing and the next open
+    // re-applies migration 7 onto a schema that already has them — `table models already exists`, and an upgrade
+    // path nobody tested. Child table first, which matters once rows exist (with empty tables either order works) — with rows present an implicit DELETE would be
+    // refused by `embeddings`' two foreign keys; here the tables are still empty, so it is defence, not necessity.
     // genuine version-four file has no `note_merges` row at all, and leaving a `merged=0` one behind would
     // let that step take its upsert's update arm instead of recording itself, which is the difference
     // between "never checked" and "checked and found none" (F21 §2).
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -2266,10 +2543,15 @@ fn seed_two_duplicate_groups_at_version_four(path: &Path) {
         ),
     )
     .expect("test setup: plant two duplicate groups, one of them a triple");
+    // Undo everything migrations 5+ wrote, migration 7's tables included — see
+    // [`seed_duplicate_pair_at_version_four`] for why the drops are child-first.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -2309,10 +2591,14 @@ fn seed_nine_duplicate_groups_at_version_four(path: &Path) {
          VALUES {note_rows};"
     ))
     .expect("test setup: plant nine duplicate groups");
+    // Migration 7's tables go too, child first: [`seed_duplicate_pair_at_version_four`] says why.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -2340,10 +2626,14 @@ fn seed_keyless_display_pair_at_version_four(path: &Path) {
         ),
     )
     .expect("test setup: plant a keyless-display pair on one byte key");
+    // Migration 7's tables go too, child first: [`seed_duplicate_pair_at_version_four`] says why.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -3009,10 +3299,14 @@ fn the_merge_gate_refuses_damage_that_no_merge_could_have_caused() {
             [],
         )
         .expect("test setup: a heading row whose note never existed");
+        // Migration 7's tables go too, child first: [`seed_duplicate_pair_at_version_four`] says why.
         db.0.execute_batch(&format!(
             "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
              DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
         ))
         .expect("test setup: rewind the file to version four");
 

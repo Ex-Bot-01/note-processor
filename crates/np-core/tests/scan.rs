@@ -4946,13 +4946,17 @@ fn plant_legacy_pair(open: &Db, rel: &str) -> i64 {
 
 /// Rewind the file past migration 5 so the **next** open runs it, and drop the receipt that step wrote when
 /// the file was still empty — a version-four database holds neither (see `seed_duplicate_pair_at_version_four`
-/// in `crates/np-core/tests/db.rs`).
+/// in `crates/np-core/tests/db.rs`). The three tables migration 7 creates are dropped too, child first: rewinding
+/// a version number does not rewind the schema by itself, and the next open re-applies every entry above four.
 fn rewind_past_the_merge(open: &Db) {
     open.0
         .execute_batch(&format!(
             "DELETE FROM meta WHERE key = '{}';
              DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;",
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;",
             db::NOTE_MERGE_KEY
         ))
         .expect("test setup: rewind past migration 5");

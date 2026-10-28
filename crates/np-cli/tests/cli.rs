@@ -1020,10 +1020,16 @@ fn seed_duplicate_pair_at_version_four(ws: &Workspace) {
         abs("third.md")
     ))
     .expect("test setup: plant two note rows on one key, their derived rows and the edges around them");
+    // Undo what every entry above 4 created, migration 7's three tables included — a version-four file has no
+    // chunk storage, and the next open re-applies those entries. Child table first, which matters once rows exist (with empty tables either order works) — with rows present an implicit DELETE
+    // would be refused by `embeddings`' two foreign keys; these tables are still empty, so it is defence, not necessity.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -1169,10 +1175,14 @@ fn the_upgrading_scan_prints_the_merged_pair_on_stdout() {
 /// cannot answer with a group whatever the corpus on disk looks like.
 fn rewind_to_version_four_without_a_pair(ws: &Workspace) {
     let db = Db::open(&ws.db_path()).expect("test setup: create the current schema");
+    // Migration 7's tables go with the version number, child first — see `seed_duplicate_pair_at_version_four`.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
