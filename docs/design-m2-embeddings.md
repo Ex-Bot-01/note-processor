@@ -96,7 +96,10 @@ Notes on the shape, each of which is a decision and not an accident:
   because quantisation is a quality decision that belongs with the model benchmark and not smuggled in as storage
   trivia. `CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim)` makes that deviation machine-enforced **now**, while the table is empty, so
   a later switch to q8 fails at write time instead of becoming subtly wrong cosines no test would notice. `dim` is stored
-  so a mismatch is detectable at read time rather than producing garbage.
+  so a mismatch is detectable at read time rather than producing garbage. The Rust twin of that `CHECK`, written in Round
+  3a, is `embed::Vector::from_bytes(bytes, dim)`: it refuses trailing bytes past the last whole component as
+  `EmbedError::Malformed { len }` and a wrong component count as `EmbedError::DimensionMismatch { expected, got }`, in that
+  order — see §7's provider-seam bullet for why the ragged case is not a dimension mismatch.
 - **`(chunk_id, model)` is the key.** Re-embedding with a second model must not destroy the first: switching providers
   then costs a re-embed and nothing else, which is what makes §2's "one config key" promise true. It also means every
   read must filter by model, so the read helper this design calls `vector_for(model)` — **not written yet**, like every
@@ -253,7 +256,13 @@ answer to compare against.
   re-embedded; provider failure → `EMBED_VERSION` not recorded and the count reported.
 - **Provider seam:** `"none"` embeds nothing and says so in the report; an unconfigured endpoint is refused **quietly**,
   not by panic — CI runs `cargo test --locked --release -- --ignored`, so a panicking authoring path poisons a green run
-  (F16's lesson).
+  (F16's lesson). `embed::EmbedError` states four things and no fifth: `Disabled`, `Unavailable(label)` whose payload is an
+  opaque label per §9, `DimensionMismatch { expected, got }` in components, and `Malformed { len }` in bytes for a buffer
+  that is not a whole number of 4-byte components. That fourth variant is a deliberate correction to this design's earlier
+  three-variant sketch: a ragged buffer has no honest component count to report — 10 bytes at `dim = 2` holds two whole
+  components plus two stray ones, so any derived `got` would print "expected 2, got 2" for a refusal, which reads like
+  nothing happened. `NoEmbeddingProvider` is a unit struct and `tests/embed.rs` pins `size_of::<NoEmbeddingProvider>() == 0`,
+  so the first client/URL/key field added to it fails a test instead of passing unnoticed.
 - **No network in the indexing path, fenced where a fence can actually see it.** The risk worth catching is not a test
   dialing out — it is someone wiring a default base URL into config, which env-stripping cannot notice. So: provider
   `"none"` **constructs no HTTP client at all**, asserted by the type (the none-provider holds no client field, so there
@@ -268,9 +277,13 @@ answer to compare against.
 - **Config refuses to be misspelled.** Every existing config struct is `#[serde(default)]` with no unknown-key refusal,
   and `MissingField` "cannot fire from `Config::load` today" (`config.rs:30-32`, `:56-57`) — so a hand-typed
   `provide = "openai-compatible"` would load as `"none"` in silence. In a project whose F-series is about not lying about
-  status: `provider` is to be an **enum**, and the `[embeddings]` struct this design adds — **not written yet, like the
-  provider itself; `Config` today holds `data_dir`, `catalog` and `markers` only** — is to carry
-  `#[serde(deny_unknown_fields)]`, with one test asserting an unknown key there is refused naming key and file.
+  status: `provider` is an **enum** (`EmbeddingProvider`, kebab-case spellings, default `None`) and the `[embeddings]`
+  struct (`EmbeddingsConfig`: `provider`, `model`, `dim`) carries `#[serde(deny_unknown_fields)]` — both written in Round
+  3a, with tests that an unknown key there is refused naming key and file, that a stray key beside a valid one is still
+  refused, that omitting the section yields `None`, and that unknown keys **outside** this section keep loading (the
+  strictness is scoped, and one half of that pair cannot be inferred from the other). The refusal travels as
+  `ConfigError::Parse { path, source }`: the variant gained a `path` field in the same round because `toml::de::Error`
+  knows its own line and column but never which file it read.
 - Migration 7 updates `the_schema_is_what_the_plan_mandates`, which pins the table list by exact array and whose index
   assertion filters `sql IS NOT NULL`, so PK/UNIQUE autoindexes stay out of the expected list. Named rather than
   numbered: migration 7 moved every line below it in `tests/db.rs`, which is how the old numbers went stale.

@@ -24,9 +24,25 @@ pub enum ConfigError {
     /// A config file or database could not be read or created; the message names the path.
     #[error("config io: {0}")]
     Io(#[from] io::Error),
-    /// The config file exists but is not valid TOML for [`Config`].
-    #[error("config parse error: {0}")]
-    Parse(#[from] toml::de::Error),
+    /// The config file exists but is not valid TOML for [`Config`] — including a key it does not
+    /// recognise under `[embeddings]`, which that section refuses (`EmbeddingsConfig`'s
+    /// `deny_unknown_fields`, `docs/design-m2-embeddings.md` §7).
+    ///
+    /// The path travels with the failure because a parse error that cannot say *which file* is broken
+    /// is not actionable: this program reads one user file and takes another from the command line,
+    /// and `toml::de::Error` knows its own line and column but never where it came from. The payload
+    /// stays the driver's error rather than a formatted string so serde's line/caret diagnostic
+    /// survives and callers can still match the kind — the same reason
+    /// `tests/config.rs`'s `explicit_missing_config_file_is_an_io_error` insists that a refusal name
+    /// its file.
+    #[error("config parse error in {}: {source}", path.display())]
+    Parse {
+        /// The file whose contents were rejected.
+        path: PathBuf,
+        /// serde's own failure, with its line and column intact.
+        #[source]
+        source: toml::de::Error,
+    },
     /// A value neither the config file nor the environment supplied. Every config
     /// struct is `#[serde(default)]`, so a partial file keeps defaults and this
     /// cannot fire from `Config::load` today; kept because the plan mandates it.
@@ -71,6 +87,75 @@ impl Default for CatalogConfig {
     }
 }
 
+/// Which embedding provider to ask for work from (`docs/design-m2-embeddings.md` §2).
+///
+/// An **enum**, not a `String`, and that choice is the whole of §7's argument. Every other config
+/// struct here is `#[serde(default)]` with no unknown-key refusal, so a free-text provider field would
+/// take a hand-typed `provide = "openai-compatible"` — the key misspelled, the value perfect — and
+/// load it as *no provider at all*, in silence, on a machine whose owner believes they configured
+/// embeddings. In a project whose F-series exists to stop exactly that shape of lie about status, the
+/// spelling has to be refused rather than defaulted, which is what [`EmbeddingsConfig`]'s
+/// `deny_unknown_fields` does and what `tests/config.rs` pins.
+///
+/// The accepted spellings are exactly the ones §2 writes — `"none"`, `"local-model"`,
+/// `"openai-compatible"` — via `rename_all` plus one hand-written exception noted on
+/// [`EmbeddingProvider::OpenAiCompatible`]. A config value with two accepted spellings would be two
+/// values, so nothing here aliases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddingProvider {
+    /// No provider: nothing is embedded, downloaded or contacted. **The default**, and the shipping
+    /// behaviour for anyone who has not chosen a model (§2) — not a stub awaiting a real one.
+    #[default]
+    None,
+    /// A model running inside this process (`local-model`). What that costs and how it is loaded is
+    /// §6's benchmark's question; nothing in this crate reads the variant yet.
+    LocalModel,
+    /// An OpenAI-compatible HTTP endpoint. Its base URL and key arrive at runtime as
+    /// `NP_EMBED_BASE_URL` / `NP_EMBED_API_KEY` and never enter a config file (§9), so this section
+    /// holds no endpoint field to leak.
+    ///
+    /// Renamed by hand because `rename_all` cannot know it: serde kebab-cases `OpenAiCompatible` into
+    /// `open-ai-compatible`, while §2 and the roadmap spell the config value `openai-compatible`. The
+    /// explicit attribute is what keeps the documented spelling the only accepted one — and
+    /// `tests/config.rs` parses every variant from a file precisely so this cannot drift.
+    #[serde(rename = "openai-compatible")]
+    OpenAiCompatible,
+}
+
+/// The `[embeddings]` section: which provider to ask, and the two identity fields that provider will
+/// need (`docs/design-m2-embeddings.md` §2, §7).
+///
+/// **`deny_unknown_fields`, unlike every other struct in this file.** That is a deliberate break with
+/// the lenient posture of [`CatalogConfig`] and [`MarkerConfig`], and §7 says why: those structs guard
+/// rendering choices, where an unrecognised key costs one wrong-looking line, while this one guards a
+/// *status claim* — whether the corpus is embedded at all. A misspelled key there must not become
+/// `provider = "none"` by omission, so the file is refused instead. The strictness stops at this
+/// section's boundary: unknown keys elsewhere keep loading as they always have (`tests/config.rs`
+/// asserts both halves, because a reader of one half cannot tell a scoped rule from a global one).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingsConfig {
+    /// Which provider to ask. Absent means [`EmbeddingProvider::None`].
+    pub provider: EmbeddingProvider,
+    /// Model identity as the provider will name it (`embeddinggemma-2-text@1`-shaped), i.e. what
+    /// `models.id` and `embeddings.model` will hold (§3).
+    ///
+    /// **Nothing reads this yet, and that is the state of Round 3a rather than an oversight:** the
+    /// provider that would put a value here into a database row arrives with the scan wiring. It lives
+    /// in config now so §2's "one config key apart" promise describes the whole surface a user touches,
+    /// and so a chosen model is already expressible while §6's benchmark is still running.
+    pub model: Option<String>,
+    /// Vector width the provider must produce, in `f32` components — the number
+    /// `embeddings.dim`/[`crate::embed::Vector::dim`] speaks.
+    ///
+    /// Also unread so far, for the same reason as [`EmbeddingsConfig::model`]. `u16` rather than
+    /// `usize` because it is a *declared* width and the schema's `CHECK (length(vector) = 4 * dim)`
+    /// has to hold: 65 535 components is 256 KiB per row, already past any model this project would
+    /// run, so the type refuses an absurdity before a provider has to.
+    pub dim: Option<u16>,
+}
+
 /// Status markers (spec §8.7). Stored exactly as written here; later tasks match
 /// them case-insensitively against the lowercased line.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -110,7 +195,7 @@ fn marker_list(markers: &[&str]) -> Vec<String> {
     markers.iter().map(|marker| (*marker).to_string()).collect()
 }
 
-/// Loaded configuration: where data lives, catalog layout, status markers.
+/// Loaded configuration: where data lives, catalog layout, status markers, embedding provider.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -121,6 +206,9 @@ pub struct Config {
     pub catalog: CatalogConfig,
     /// Status markers.
     pub markers: MarkerConfig,
+    /// Embedding provider choice. An absent `[embeddings]` section is `provider = "none"`, which is
+    /// the default and not a degraded state (§2).
+    pub embeddings: EmbeddingsConfig,
 }
 
 impl Default for Config {
@@ -129,6 +217,7 @@ impl Default for Config {
             data_dir: default_data_dir().unwrap_or_default(),
             catalog: CatalogConfig::default(),
             markers: MarkerConfig::default(),
+            embeddings: EmbeddingsConfig::default(),
         }
     }
 }
@@ -141,7 +230,10 @@ impl Config {
     /// [`config_file_path`] is used and a missing file means all defaults. A file
     /// that is present keeps every default its structs provide, so a partial file
     /// only changes the keys it spells out; unparsable content is
-    /// [`ConfigError::Parse`]. Unknown keys are allowed.
+    /// [`ConfigError::Parse`], which names the file it refused.
+    ///
+    /// Unknown keys are allowed everywhere except `[embeddings]`, which refuses them
+    /// ([`EmbeddingsConfig`], §7 of the M2a design).
     /// A `data_dir` neither the file nor the environment supplied is a failure, not a default:
     /// every path this program derives from it would go relative — a `workspaces/` directory next
     /// to whatever directory the command happened to run in. The CLI reports it and exits 1.
@@ -216,7 +308,13 @@ fn read_config(path: &Path) -> Result<Config, ConfigError> {
             format!("{err}: {}", path.display()),
         ))
     })?;
-    Ok(toml::from_str(&text)?)
+    // `Parse` carries the path because `toml::de::Error` cannot know it: `from_str` has no file to
+    // name, and this function is the only place that does. The driver error goes with it unchanged so
+    // its line/column caret survives.
+    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Absolute spelling of `path`: the current directory is prepended when it is

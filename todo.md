@@ -54,12 +54,15 @@ will change every golden at once, by design, in one reviewed milestone).
 
 Done on the branch: migration 7 (`models`, `chunks`, `embeddings`; FKs, `typeof='blob'` and length CHECKs pinned
 by tests) · `chunk.rs` (pure over decoded text, `MAX_CHUNK_BYTES = 1800`, block seams, char-boundary safe, its
-contract tested including a one-byte mutation case) · the review's P2 batch.
+contract tested including a one-byte mutation case) · the review's P2 batch · **Round 3a**: `embed.rs` — `Vector`
+(little-endian `f32`, refuses ragged and wrong-dim buffers), `Embedder`, `NoEmbeddingProvider` holding no client, URL or
+key (pinned by `size_of == 0`) — and the `[embeddings]` config section (`provider` as an enum defaulting to `none`,
+`deny_unknown_fields` on that one section).
 
-Remaining for M2a: **Round 3** — provider seam where `provider = "none"` holds no HTTP client at all, chunk
-writes by per-row diff (never delete-and-reinsert, which would cascade away vectors), vectors written with
-`ON CONFLICT (chunk_id, model) DO UPDATE`, and `EMBED_VERSION` covering **chunker coverage only** (provider
-availability is a reported count, never version debt — see design §5's P0). Then the EmbeddingGemma benchmark.
+Remaining for M2a: **Round 3b** — chunk writes by per-row diff (never delete-and-reinsert, which would cascade away
+vectors), vectors written with `ON CONFLICT (chunk_id, model) DO UPDATE`, and `EMBED_VERSION` covering **chunker
+coverage only** (provider availability is a reported count, never version debt — see design §5's P0). Nothing reads
+`embeddings.model` / `embeddings.dim` yet; the scan wiring is where they get read. Then the EmbeddingGemma benchmark.
 
 ## Locked decisions — do not revisit
 

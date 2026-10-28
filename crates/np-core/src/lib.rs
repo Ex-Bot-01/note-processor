@@ -5,6 +5,7 @@ pub mod change;
 pub mod chunk;
 pub mod config;
 pub mod db;
+pub mod embed;
 pub mod hash;
 pub mod index_names;
 pub mod items;
