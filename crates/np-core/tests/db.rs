@@ -933,6 +933,69 @@ fn rewriting_the_same_chunks_writes_nothing_and_keeps_every_row_id() {
 }
 
 #[test]
+fn an_emptied_note_loses_its_chunks_and_the_vectors_hanging_off_them() {
+    // The cheap path's counterexample, made a fixture. A note whose body is cleared to blank lines yields no
+    // chunks at all (see `tests/chunk.rs`), so the wanted count is zero while three stamped-from-yesterday rows
+    // sit on the table: judged against the stamp alone, `0 == 0`, and the early return leaves the note holding
+    // chunks it does not have — with their vectors — on every scan from here to forever. Killed by: dropping
+    // the second count from the predicate (this test then reports ChunkWrite::default() and three live rows).
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "model-a", 1);
+
+    let original = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "beta"),
+        chunk_at(2, 13, "gamma"),
+    ];
+    write_chunks_for_note(&db, a, &original, "d1").expect("test setup: three chunks");
+    let need =
+        db.0.query_row(
+            &format!("SELECT id FROM chunks WHERE note_id = {a} AND ordinal = 0"),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("test setup: ordinal 0 has an id");
+    upsert_vector(&db, need, "model-a", 1, &0.5f32.to_le_bytes(), "c0", 5)
+        .expect("test setup: a vector hanging off ordinal 0");
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"), 1);
+
+    let emptied = write_chunks_for_note(&db, a, &[], "d2").expect("the note was cleared");
+    assert_eq!(
+        emptied,
+        ChunkWrite {
+            inserted: 0,
+            updated: 0,
+            deleted: 3
+        },
+        "clearing a note deletes its chunks; it does not report having done nothing"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM chunks WHERE note_id = {a}")
+        ),
+        0,
+        "no chunk row survives an emptied note"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        0,
+        "and the vector went with its chunk by cascade rather than being orphaned"
+    );
+
+    // The arm is idempotent afterwards: with nothing wanted and nothing stored, the cheap path may return
+    // zeros — that one is honest.
+    assert_eq!(
+        write_chunks_for_note(&db, a, &[], "d3").expect("still empty"),
+        ChunkWrite::default(),
+        "a genuinely empty note writes nothing on the second pass too"
+    );
+}
+
+#[test]
 fn editing_a_chunk_updates_that_row_and_a_shorter_list_deletes_the_tail() {
     // §5's per-row diff: an edited note rewrites the rows that moved and deletes the ordinals the note no
     // longer has — it does not replace the set.

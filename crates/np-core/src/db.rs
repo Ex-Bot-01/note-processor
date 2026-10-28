@@ -1825,12 +1825,16 @@ pub struct ChunkWrite {
 ///
 /// ## The cheap path
 ///
-/// When the note holds exactly `chunks.len()` rows stamped with this digest *and* this chunker, the stored
-/// set **is** what this call would write: nothing else writes `chunks`, [`crate::chunk::chunk`] is
-/// deterministic, and a row's stamp means it was cut from bytes hashing to that digest by this chunker. One
-/// indexed `COUNT` then answers the whole question and nothing is written. The empty-note case rides the
-/// same arm — zero rows and zero chunks agree, and there is nothing to insert — while a note with no rows
-/// and non-empty `chunks` cannot match (`0 != n`), so a first write always inserts.
+/// When the note holds exactly `chunks.len()` rows stamped with this digest *and* this chunker, **and no other
+/// rows at all**, the stored set is what this call would write: nothing else writes `chunks`,
+/// [`crate::chunk::chunk`] is deterministic, and a row's stamp means it was cut from bytes hashing to that
+/// digest by this chunker. Two counts answer that in one indexed pass and nothing is written.
+///
+/// The second count is not paranoia. An **emptied** note — body cleared to blank lines, which [`crate::chunk::chunk`]
+/// returns no chunks for — wants zero rows and can hold three stamped with an older digest; against the stamp
+/// alone both sides read `0 == 0`, so a single-count predicate returns early and leaves those rows **and their
+/// vectors** on the table permanently, every later scan re-deriving the same empty list and taking the same arm.
+/// That is a report claiming work it did not do, which is the F21 §3 lie this module's own doc refuses.
 ///
 /// ## Transaction
 ///
@@ -1847,15 +1851,23 @@ pub fn write_chunks_for_note(
     // The row count as SQLite's INTEGER. Nothing here is near `i64::MAX` chunks, but a bare `as` would wrap
     // such a length into a negative number that matches nothing (the same reasoning as [`upsert_file`]'s size).
     let wanted = i64::try_from(chunks.len()).unwrap_or(i64::MAX);
-    let current: i64 =
-        db.0.prepare_cached(
-            "SELECT COUNT(*) FROM chunks
-          WHERE note_id = ?1 AND source_hash = ?2 AND chunker = ?3",
+    // Two counts, not one. `stamped` alone answers "does every row I would keep carry this stamp?" but says
+    // nothing about rows that should be **gone**: an emptied note wants zero chunks and holds three, both
+    // numbers read 0 == 0 against today's stamp, and a single-count predicate would return early with those
+    // three rows — and their vectors — still on the table, forever, because every later scan derives the same
+    // empty list and takes the same arm. `total` is what makes the cheap path a proof rather than a hope: skip
+    // only when the stamped rows are as many as we want AND there are no others.
+    let (stamped, total): (i64, i64) = db
+        .0
+        .prepare_cached(
+            "SELECT COALESCE(SUM(CASE WHEN source_hash = ?2 AND chunker = ?3 THEN 1 ELSE 0 END), 0),
+                    COUNT(*)
+               FROM chunks WHERE note_id = ?1",
         )?
         .query_row(params![note_id, note_digest, CHUNKER_VERSION], |row| {
-            row.get(0)
+            Ok((row.get(0)?, row.get(1)?))
         })?;
-    if current == wanted {
+    if stamped == wanted && total == wanted {
         return Ok(ChunkWrite::default());
     }
 
@@ -2005,6 +2017,9 @@ fn stored_chunks(db: &Db, note_id: i64) -> Result<Vec<StoredChunk>, DbError> {
 // `Vec<(u32, Vec<u8>)>` would name one fact twice without saying anything the signature does not already.
 // clippy's heuristic counts nesting rather than meaning.
 #[allow(clippy::type_complexity)]
+/// No production caller yet: the scan round (design §5) is what will read this back. Stated because a helper
+/// whose semantics no test exercises through real use can drift quietly, and its `None` arm in particular means
+/// "no single digest describes these rows", which a caller must not read as "no chunks".
 pub fn chunk_state(
     db: &Db,
     note_id: i64,
