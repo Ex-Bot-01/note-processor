@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod change;
+pub mod chunk;
 pub mod config;
 pub mod db;
 pub mod hash;
