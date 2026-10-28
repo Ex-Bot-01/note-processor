@@ -46,7 +46,21 @@ Three tables, all keyed to `notes.id` and never to a path. That is deliberate an
 a chunk that stored `rel_bytes` would inherit every lossy-name, rename and merge defect this project has spent six
 milestones removing, and F19's merge already moves derived rows to the surviving id — which is exactly what chunks need.
 
+Listed in the order migration 7 declares them — `models`, then `chunks`, then `embeddings` — because that order is
+itself a decision: a child's foreign key has to read in file order. Only **`models` before `embeddings`** is binding;
+`chunks` could sit on either side of `models` without changing one constraint.
+
 ```sql
+-- Declared before its child, so `embeddings.model`'s foreign key reads in file order.
+CREATE TABLE models (
+    id            TEXT    PRIMARY KEY,       -- e.g. embeddinggemma-2-text@1 — model identity ONLY (§4)
+    dim           INTEGER NOT NULL,
+    sha256        TEXT,                      -- NULL for a provider with no weights
+    prefix_doc    TEXT    NOT NULL DEFAULT '',
+    prefix_query  TEXT    NOT NULL DEFAULT '',
+    installed_at  INTEGER NOT NULL
+);
+
 CREATE TABLE chunks (
     id            INTEGER PRIMARY KEY,
     note_id       INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
@@ -57,16 +71,6 @@ CREATE TABLE chunks (
     byte_end      INTEGER NOT NULL,
     source_hash   TEXT    NOT NULL,          -- sha256 of the note bytes this was cut from
     UNIQUE (note_id, ordinal)
-);
-
--- `models` is declared first so its child's foreign key reads in file order.
-CREATE TABLE models (
-    id            TEXT    PRIMARY KEY,       -- e.g. embeddinggemma-2-text@1 — model identity ONLY (§4)
-    dim           INTEGER NOT NULL,
-    sha256        TEXT,                      -- NULL for a provider with no weights
-    prefix_doc    TEXT    NOT NULL DEFAULT '',
-    prefix_query  TEXT    NOT NULL DEFAULT '',
-    installed_at  INTEGER NOT NULL
 );
 
 CREATE TABLE embeddings (
@@ -100,8 +104,8 @@ Notes on the shape, each of which is a decision and not an accident:
 - **`embeddings.model` is a real foreign key, and `models` is written before any vector naming it.** Without the
   reference an embedding row can name a model that was never installed, or one removed and reinstalled under the same
   id — exactly the orphan class migration 3 exists to end ("Migration 3 gave every one of these five statements a twin in
-  the schema", `scan.rs:1338-1340`) — and `PRAGMA foreign_key_check` reads *declared* constraints (`db.rs:805-811`), so
-  it could never see the damage.
+  the schema", `scan.rs:1338-1340`) — and `PRAGMA foreign_key_check` reads *declared* constraints (`first_violation`
+  says as much in its own comment), so it could never see the damage.
 - **Stored vectors are always document-prefixed.** The spec makes prefixes part of correctness: retrieval is asymmetric
   (query prefix on questions, document prefix on stored text), clustering symmetric. Both hold if what is *stored* is
   document-prefixed and only queries ever take `prefix_query`. That is a convention unless it is written down, so it is
@@ -220,12 +224,14 @@ answer to compare against.
   rule — a premise asserted for one side of a pair is half an assertion).
 - **Storage:** a runtime note delete cascades chunks and vectors with enforcement ON, asserted on a fresh database.
   **Not** "F19's merge moves them to the survivor" — that claim was wrong in three ways at once: `migrate` runs every
-  step under `PRAGMA foreign_keys = OFF` (`db.rs:403`, restored at `:405`), migration 5 therefore deletes its children
-  *by hand* precisely because "SQLite performs no `ON DELETE CASCADE` while it is off (verified)" (`db.rs:1126-1135`,
-  statements at `:1155-1160`), and migration 5 runs **once** with no second pass (`scan.rs:1893-1896`) while runtime
+  step under `PRAGMA foreign_keys = OFF` (`migrate`, `db.rs:470`, restored at `:472`), migration 5 therefore deletes
+  its children *by hand* precisely because "SQLite performs no `ON DELETE CASCADE` while it is off (verified)" — that
+  sentence is `merge_duplicate_notes`'s own comment and the statements are its deletes at `db.rs:1222-1228`, and
+  migration 5 runs **once** with no second pass (`scan.rs:1893-1896`) while runtime
   duplicates are refused rather than merged (`scan.rs:1357-1360`). Cascade also *deletes*; it never re-points. The honest
   statement is in §3: any future duplicate-healing must be taught `chunks`/`embeddings` explicitly, in step with the
-  three hand-written child lists (`db.rs:1155-1160`, `scan.rs:1368-1372`, `scan.rs:1497-1501`). Plus: two models
+  three hand-written child lists (`merge_duplicate_notes`'s deletes, `scan.rs:1368-1372`, `scan.rs:1497-1501`).
+  Plus: two models
   coexisting on one chunk; a length/`dim` mismatch refused at write by the `CHECK`; an `embeddings` row naming an unknown
   model refused by the foreign key.
 - **Staleness:** unchanged note → no re-embed (asserted as "the provider was called zero times", through a test provider
@@ -250,9 +256,9 @@ answer to compare against.
   `provide = "openai-compatible"` would load as `"none"` in silence. In a project whose F-series is about not lying about
   status: `provider` is an **enum**, the new `[embeddings]` struct carries `#[serde(deny_unknown_fields)]`, and one test
   asserts an unknown key there is refused naming key and file.
-- Migration 7 updates `the_schema_is_what_the_plan_mandates`, which pins the table list by exact array
-  (`tests/db.rs:196-207`); its index assertion filters `sql IS NOT NULL` (`:210`), so PK/UNIQUE autoindexes stay out of
-  the expected list.
+- Migration 7 updates `the_schema_is_what_the_plan_mandates`, which pins the table list by exact array and whose index
+  assertion filters `sql IS NOT NULL`, so PK/UNIQUE autoindexes stay out of the expected list. Named rather than
+  numbered: migration 7 moved every line below it in `tests/db.rs`, which is how the old numbers went stale.
 - **Goldens:** M2a must move zero bytes in `tests/golden` and `tests/golden-wide`. No catalog field reads chunks yet, so
   an empty result there is not luck — it is the fence that says §1's "byte-for-byte identical" held.
 

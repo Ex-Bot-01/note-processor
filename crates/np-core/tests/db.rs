@@ -332,6 +332,26 @@ fn refuses_orphan(db: &Db, sql: &str) {
     );
 }
 
+/// Whether one statement is refused as a duplicate of a unique key that already exists.
+///
+/// The extended code once more, and `chunks` is the reason it matters: that table carries both an
+/// `INTEGER PRIMARY KEY` and a `UNIQUE (note_id, ordinal)`, and the two classes share the primary code.
+/// A test that matched only `ConstraintViolation` would pass on an id collision while the unique pair went
+/// unenforced — which is [`one_note_cannot_hold_two_chunks_at_the_same_ordinal`]'s whole subject.
+fn refuses_duplicate(db: &Db, sql: &str) {
+    let err =
+        db.0.execute(sql, [])
+            .expect_err("a row duplicating a unique key has to be refused");
+    assert!(
+        matches!(
+            &err,
+            rusqlite::Error::SqliteFailure(fault, _)
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        ),
+        "expected a unique-constraint violation from `{sql}`, got {err}"
+    );
+}
+
 #[test]
 fn a_child_row_that_names_no_note_is_refused() {
     // The invariant "one note row per file, and its children belong to that note" used to be held by
@@ -680,6 +700,92 @@ fn two_models_hold_vectors_for_one_chunk() {
                 if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
         ),
         "expected a primary-key violation from the repeated pair, got {err}"
+    );
+}
+
+#[test]
+fn one_note_cannot_hold_two_chunks_at_the_same_ordinal() {
+    // `UNIQUE (note_id, ordinal)` is what makes a chunk's ordinal addressable: §5's per-row staleness and
+    // the diff that replaces only the moved chunks both look rows up by that pair, so a second row on one
+    // pair means the note holds two different texts under one ordinal and every "did this chunk move" answer
+    // after it is a coin flip. Migration 7 declared the constraint while nothing wrote to `chunks` often enough
+    // to notice if it were missing — this is the probe that says it fires.
+    //
+    // Killed by: dropping `UNIQUE (note_id, ordinal)` from migration 7's `chunks` declaration (the second
+    // `(a, 0)` insert then succeeds and `refuses_duplicate` fails). Narrowing it to `UNIQUE (ordinal)` or
+    // `UNIQUE (note_id)` alone is killed by the three accepted inserts below rather than by the refusal.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row a");
+    upsert_file(&db, &snap("b.md", "hb"), Path::new("/ws/b.md"), 1)
+        .expect("test setup: registry row b");
+    let a = insert_note(&db, "a.md", "A");
+    let b = insert_note(&db, "b.md", "B");
+
+    // The positive controls first, so what refuses the last statement is the pair and not one column of it:
+    // one note holds several ordinals, and two notes reuse ordinal 0 freely — chunks are per-note.
+    insert_chunk(&db, a, 0);
+    insert_chunk(&db, a, 1);
+    insert_chunk(&db, b, 0);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"), 3);
+
+    // The same pair again, with different text: an append, not a new fact about the note.
+    refuses_duplicate(
+        &db,
+        &format!(
+            "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+             VALUES ({a}, 0, 1, x'646566', 0, 3, 'other-source-hash')"
+        ),
+    );
+
+    // Refused means not written: the table still holds exactly the three rows above, and neither of them was
+    // replaced by the statement that was turned away.
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"), 3);
+    assert_eq!(
+        scalar::<Vec<u8>>(
+            &db,
+            &format!("SELECT text FROM chunks WHERE note_id = {a} AND ordinal = 0")
+        ),
+        b"abc",
+        "the rejected insert left the chunk it collided with alone"
+    );
+}
+
+#[test]
+fn a_string_bind_is_refused_from_chunks_text() {
+    // `chunks.text` is BLOB because note bodies are arbitrary bytes (§3), and BLOB is an *affinity* rather
+    // than a constraint: without migration 7's `CHECK (typeof(text) = 'blob')` a Rust `String` bind lands as
+    // TEXT, conflicts with nothing, and violates nothing beside its own typeof check. The table would then
+    // hold one identity in two types that never compare equal — F13 §4's original bug, moved from paths to
+    // chunk text, where it reads back as a chunk whose bytes are not the note's.
+    //
+    // Killed by: deleting `CHECK (typeof(text) = 'blob')` from the `text` column in migration 7. The TEXT
+    // bind below is then stored happily and this probe's `expect_err` fails. It is also why the blob arm here
+    // has to stay: a mutant that refuses *every* bind into the column fails the accepted row instead.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    // The blob arm goes in: what is refused below is the type, not the table or the parent.
+    insert_chunk(&db, a, 0);
+
+    // `refuses_string_bind` binds the TEXT `'a.md'` into `?1`. The note parent exists and the ordinal is one the
+    // accepted row does not use, so neither the foreign key nor the unique pair can be what stops this
+    // statement — only the typeof CHECK can.
+    refuses_string_bind(
+        &db,
+        &format!(
+            "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+             VALUES ({a}, 5, 1, ?1, 0, 4, 'chunk-source-hash')"
+        ),
+        "chunks.text",
+    );
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"),
+        1,
+        "a refused text bind wrote no row at all"
     );
 }
 
