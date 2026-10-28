@@ -51,6 +51,7 @@ CREATE TABLE chunks (
     id            INTEGER PRIMARY KEY,
     note_id       INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
     ordinal       INTEGER NOT NULL,          -- 0-based within the note
+    chunker       INTEGER NOT NULL,          -- which chunking code cut this row (§4)
     text          BLOB    NOT NULL,          -- raw UTF-8 bytes: never assume it round-trips as String
     byte_start    INTEGER NOT NULL,
     byte_end      INTEGER NOT NULL,
@@ -58,31 +59,37 @@ CREATE TABLE chunks (
     UNIQUE (note_id, ordinal)
 );
 
-CREATE TABLE embeddings (
-    chunk_id      INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
-    model         TEXT    NOT NULL,          -- model id + version, verbatim from config/manifest
-    dim           INTEGER NOT NULL,
-    vector        BLOB    NOT NULL,          -- little-endian f32, exactly dim of them
-    source_hash   TEXT    NOT NULL,          -- the chunk's, at embed time
-    embedded_at   INTEGER NOT NULL,
-    PRIMARY KEY (chunk_id, model)
-);
-
+-- `models` is declared first so its child's foreign key reads in file order.
 CREATE TABLE models (
-    id            TEXT    PRIMARY KEY,       -- e.g. embeddinggemma-2-text@1, or lexical-v1
+    id            TEXT    PRIMARY KEY,       -- e.g. embeddinggemma-2-text@1 — model identity ONLY (§4)
     dim           INTEGER NOT NULL,
     sha256        TEXT,                      -- NULL for a provider with no weights
     prefix_doc    TEXT    NOT NULL DEFAULT '',
     prefix_query  TEXT    NOT NULL DEFAULT '',
     installed_at  INTEGER NOT NULL
 );
+
+CREATE TABLE embeddings (
+    chunk_id      INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    model         TEXT    NOT NULL REFERENCES models(id) ON DELETE CASCADE,  -- id + version, verbatim
+    dim           INTEGER NOT NULL,
+    vector        BLOB    NOT NULL CHECK (length(vector) = 4 * dim),  -- little-endian f32, exactly dim
+    source_hash   TEXT    NOT NULL,          -- the chunk's, at embed time
+    embedded_at   INTEGER NOT NULL,
+    PRIMARY KEY (chunk_id, model)
+);
+
 ```
 
 Notes on the shape, each of which is a decision and not an accident:
 
 - **`text BLOB`, `vector BLOB`.** Notes are arbitrary bytes; `TEXT` would be a promise that they are UTF-8. The vector
   is stored as raw little-endian f32 rather than serialised JSON: 512 dimensions is 2 KiB, and hex or JSON would triple
-  it for no benefit. `dim` is stored so a mismatch is detectable at read time instead of producing garbage cosines.
+  it for no benefit — **a deliberate deviation from the spec's "q8 ≈ 19 MB"** (`spec:85`, `spec:227`), accepted here
+  because quantisation is a quality decision that belongs with the model benchmark and not smuggled in as storage
+  trivia. `CHECK (length(vector) = 4 * dim)` makes that deviation machine-enforced **now**, while the table is empty, so
+  a later switch to q8 fails at write time instead of becoming subtly wrong cosines no test would notice. `dim` is stored
+  so a mismatch is detectable at read time rather than producing garbage.
 - **`(chunk_id, model)` is the key.** Re-embedding with a second model must not destroy the first: switching providers
   then costs a re-embed and nothing else, which is what makes §2's "one config key" promise true. It also means every
   read must filter by model, so `vector_for(model)` takes it explicitly rather than defaulting to "whatever is there".
@@ -90,6 +97,15 @@ Notes on the shape, each of which is a decision and not an accident:
   `embeddings.source_hash` says which chunk text the vector was computed from. Two levels because a chunk can be
   unchanged while its note changed (a heading edit in paragraph 9 leaves chunk 2's text alone), and re-embedding only
   what actually moved is the whole difference between a usable and an unusable incremental scan.
+- **`embeddings.model` is a real foreign key, and `models` is written before any vector naming it.** Without the
+  reference an embedding row can name a model that was never installed, or one removed and reinstalled under the same
+  id — exactly the orphan class migration 3 exists to end ("Migration 3 gave every one of these five statements a twin in
+  the schema", `scan.rs:1338-1340`) — and `PRAGMA foreign_key_check` reads *declared* constraints (`db.rs:805-811`), so
+  it could never see the damage.
+- **Stored vectors are always document-prefixed.** The spec makes prefixes part of correctness: retrieval is asymmetric
+  (query prefix on questions, document prefix on stored text), clustering symmetric. Both hold if what is *stored* is
+  document-prefixed and only queries ever take `prefix_query`. That is a convention unless it is written down, so it is
+  written down: `prefix_doc` describes every row of `embeddings`, and a provider that ignores prefixes is a bug.
 - **`models.sha256` nullable.** Weights are never committed and `np models install` verifies the digest it fetched;
   a provider with no weights has nothing to verify. No `CHECK (typeof(sha256)='text')`: the NULL arm is the common one.
 - **No FTS5 yet.** The spec wants it over note and summary text; summaries do not exist, and adding FTS now would put a
@@ -101,17 +117,31 @@ Notes on the shape, each of which is a decision and not an accident:
 `chunk(note_text) -> Vec<Chunk>` is a pure function over bytes, and its contract is asserted before any model exists:
 
 - **Deterministic and total.** Same bytes, same chunks, on every platform and every run: no HashMap, no time, no locale.
-  Chunk boundaries are byte offsets into the note, and `byte_start`/`byte_end` must satisfy
-  `text == &note_bytes[byte_start..byte_end]` — asserted per chunk, because an off-by-one here silently misaligns every
-  citation to come, and a slice across a multi-byte character would panic on German umlauts, which is the corpus (§
-  Constraints: mixed German and English).
+  Chunk boundaries are byte offsets with `text == &domain[byte_start..byte_end]`, asserted per chunk: an off-by-one
+  silently misaligns every citation to come, and a slice through a multi-byte character would panic on the German umlauts
+  this corpus is full of.
+- **The domain is the decoded text, not the file.** `scan.rs:681-687` strips a leading BOM and replaces invalid UTF-8
+  before anything is parsed, while `files.hash` digests the raw bytes on disk — "BOM included", in that file's own words.
+  Offsets into the *file* would therefore mean something else for precisely the corpus F13/F18/F20/F23 refuse to key by:
+  every BOM'd Windows export and every non-UTF-8 note. So offsets and `chunks.source_hash` are over the **decoded text
+  that is actually embedded** — the same spelling as `notes.body`. The consequence is stated rather than buried: for a
+  note whose `notes.encoding = 'lossy'` (already stored, no new column), byte offsets are *approximate* citations into
+  the file, and M2b's evidence links must say so instead of pointing one character off.
+- **`chunks.chunker` stamps which chunking code produced the row**, and staleness is per row (`chunker = CHUNKER_VERSION
+  AND source_hash matches`) rather than a global verdict; `models.id` carries model identity only — one fact, one place.
+  Without the stamp, §4's promise of "no half-embedded corpus under two definitions of chunk" is unenforceable: the only
+  honest action after a bump would be re-chunk-everything, which is the very thing the mitigation was for.
 - **Boundaries at block ends where possible.** Markdown blocks (headings, list items, fenced code) are the natural
   seams and the parser already finds them; a chunk that splits a fenced code block in half embeds garbage.
-- **~350 tokens with overlap** is the spec's number, but token counts belong to a tokenizer M2a does not have. So the
-  first implementation bounds chunks by **bytes** with a documented constant, and the tokenizer-aware cut lands with the
-  chosen model as a **chunker version bump**, not a silent change: `models.id` carries the chunker in its version
-  suffix so re-chunking invalidates vectors honestly. Getting this wrong is how you end up with half a corpus embedded
-  under two different definitions of "chunk" and no way to tell which rows are comparable.
+- **~350 tokens with overlap** is the spec's number, but token counts belong to a tokenizer M2a does not have. The
+  first implementation bounds chunks by **bytes** with a documented constant; the tokenizer-aware cut lands with the
+  chosen model as a `CHUNKER_VERSION` bump recorded per row, so old rows are *identifiable* rather than merely presumed
+  stale.
+- **CRLF is a re-embed amplifier, accepted knowingly.** Chunk text comes from stored note bytes, so a CRLF↔LF rewrite by
+  an editor or sync client moves every offset and re-embeds the whole note — worst case all ~18k chunks of one language,
+  against spec §"Linux **and** Windows: … line endings … differ". Normalising is *not* the fix: it would break the slice
+  contract above and make citations point at text the file does not contain. The cost is written here so a Windows user's
+  second scan is not filed as a bug.
 
 ## 5. Staleness: reuse the F15 machinery, do not invent a second one
 
@@ -123,22 +153,56 @@ makes it safe: recording the version only when every owed note was actually re-p
   `files.hash` already tells us whether a note changed at all, so an unchanged note costs one indexed lookup per scan —
   the warm-pass property that F13 §4.1 and A4's benchmark both protect.
 - A new note or an edited note re-chunks, and only chunks whose own text moved get re-embedded.
-- `EMBED_VERSION` (a `meta` key, same code path as `PARSE_VERSION`) covers chunker and prefix changes: bump it and the
-  next scan re-chunks everything, with the same "don't record it if you could not finish it" rule.
-- **A provider failure must not be a data-loss event.** If embedding is unavailable — no model installed, endpoint
-  down, out of memory — the scan indexes the note, leaves its chunks unembedded, reports a bounded count, and does not
-  record `EMBED_VERSION`. This is F21's durable-first rule and the `/dev/full` lesson: refusing work is fine, pretending
-  it happened is not. The catalog still renders, because §2's whole point is that catalog quality does not depend on
-  embeddings.
+- **Two facts, split apart — this paragraph is the review's P0 and the one correction here that would have cost a
+  week.** F15's `refresh_covered` (`scan.rs:1907-1909`) counts exactly two sources of unfinished work — a path that
+  changed or went unread between walk and read, and a live row behind an unenterable directory or refused name — and the
+  code refuses to charge anything else, because "Charging either would re-parse the whole corpus on every scan forever
+  and repair nothing" (`scan.rs:1873-1876`). Re-parsing never fails for an *external* reason. Embedding does: no model
+  installed, endpoint down, out of memory. Gate `EMBED_VERSION` on that and the **default** configuration
+  (`embeddings.provider = "none"`, §2) withholds it on every scan forever — a full re-chunk of ~18k chunks each time,
+  plus a gap line nobody can clear. So:
+  - `EMBED_VERSION` covers **chunker-definition coverage only**, reusing `refresh_covered`'s two sources unchanged, and
+    is recorded whenever chunking reached every note it owed;
+  - **provider availability is not version debt.** "Owed but unembedded" is already self-describing per row through
+    `chunks.source_hash`, so it is reported as a bounded count in F21/F22's durable-record shape and never inferred from
+    a missing meta key.
+- **Vectors are written `INSERT … ON CONFLICT (chunk_id, model) DO UPDATE`, and chunk replacement is a per-row diff.**
+  F15 *expects* its retry to happen, and the derived-row pattern elsewhere is delete-then-insert (`scan.rs:1497-1503`);
+  reusing that for chunks would cascade away every vector of an edited note, destroying exactly the "re-embed only what
+  moved" property §3 calls the whole difference between a usable and an unusable incremental scan. A plain `INSERT` into
+  `PRIMARY KEY (chunk_id, model)` makes the expected retry fail on a constraint error — and since one `?` propagates out
+  of `apply_changes`, the whole scan's indexing work rolls back with it. Provider failure must not be data loss; neither
+  may our own conflict handling be.
+- **Embedding does not hold the scan's transaction open.** The write pass runs inside `unchecked_transaction()` and
+  commits once (`scan.rs:432`, `:469`); unbounded model work inside it would leave a concurrent `np` waiting out
+  `busy_timeout` to report `database is locked`. Chunk writes stay in the transaction — they are cheap and must be atomic
+  with the note rows; vectors commit separately per batch, which is safe precisely because the bullet above no longer
+  claims "recorded ⇒ embedded".
+- **A provider failure must not be a data-loss event.** The scan indexes the note, leaves its chunks unembedded, reports
+  the count, and the catalog still renders: refusing work is fine, pretending it happened is not (F21, and the
+  `/dev/full` lesson).
 
 ## 6. The benchmark, with its limits stated up front
 
 The spec's gate is throughput, so the deliverable is a measurement and an honest statement of what it cannot tell us:
 
-- A/B/A over a fixed synthetic corpus (~2k notes, ~18k chunks at the real size distribution), warm pass after cold, on
-  this host (`pi`, euid 1000), recorded with CPU model, thread count and whether other work was running.
-- Reported per candidate: seconds to embed the corpus, peak RSS, bytes downloaded, and the warm-scan cost when nothing
-  changed (which must stay ~zero — that is the property users actually feel).
+- **A real corpus, not a synthetic one.** The spec's own gate wording is "on my own notes … retrieval spot-checks in
+  German and English" (`spec:316`), and throughput is tokenizer- and language-dependent on the mixed de/en corpus
+  (`spec:81`). A synthetic corpus cannot support even this section's modest claim. So: a fixed de/en-mixed slice derived
+  from the real vault (~2k notes at the real size distribution), committed as a fixture or generated from a recorded
+  seed — reported per language as well as blended, because one blended figure hides whichever language costs triple.
+- Reported per candidate: chunks/hour, seconds to first useful result, peak RSS, weight bytes, and warm-scan cost when
+  nothing changed (must stay ~zero — the property users actually feel). **≥2 runs with spread reported**: one
+  unreplicated observation on a shared host is an anecdote. Endpoint candidates get their own table — "bytes downloaded"
+  for `openai-compatible` measures your server rather than this CPU, and putting it in the same A/B/A column invites
+  comparing incomparable things.
+- **The decision rule is applied, not implied.** Spec `:317-318`: keep EmbeddingGemma 2 "if a full first pass fits in one
+  evening, otherwise fall back per §9 and record the choice". The report therefore states the arithmetic — real corpus
+  size × measured chunks/hour against an evening's hours — and shows each candidate passing or failing it. Numbers
+  without the threshold they were judged against are how a benchmark becomes a poster.
+- **Buildability is measured, not assumed.** One CI step per OS row runs `cargo check --locked -p np-core --features
+  local-model`, because `cargo clippy --all-targets` never compiles a feature-gated heavy dependency. That answers the
+  Windows question §8 asks with a build instead of hope.
 - **Stated limit:** this host is not your laptop, and a single machine's tokens/sec does not prove the model will feel
   fast on a fanless one. The claim it can support is "X is N× the cost of Y at the same quality question", which is
   what §2's decision needs.
@@ -154,24 +218,52 @@ answer to compare against.
   emoji, an empty note, a note that is one huge block, a note whose last line has no newline, and a mutation check:
   change one byte in paragraph 3 and assert exactly the chunks covering it changed (`docs/design-f24-merge-assertions.md`'
   rule — a premise asserted for one side of a pair is half an assertion).
-- **Storage:** cascade when a note goes (F19's merge must move chunks and vectors to the survivor, which is the reason
-  they hang off `notes.id` at all); two models coexisting on one chunk; `dim` mismatch refused at read.
+- **Storage:** a runtime note delete cascades chunks and vectors with enforcement ON, asserted on a fresh database.
+  **Not** "F19's merge moves them to the survivor" — that claim was wrong in three ways at once: `migrate` runs every
+  step under `PRAGMA foreign_keys = OFF` (`db.rs:403`, restored at `:405`), migration 5 therefore deletes its children
+  *by hand* precisely because "SQLite performs no `ON DELETE CASCADE` while it is off (verified)" (`db.rs:1126-1135`,
+  statements at `:1155-1160`), and migration 5 runs **once** with no second pass (`scan.rs:1893-1896`) while runtime
+  duplicates are refused rather than merged (`scan.rs:1357-1360`). Cascade also *deletes*; it never re-points. The honest
+  statement is in §3: any future duplicate-healing must be taught `chunks`/`embeddings` explicitly, in step with the
+  three hand-written child lists (`db.rs:1155-1160`, `scan.rs:1368-1372`, `scan.rs:1497-1501`). Plus: two models
+  coexisting on one chunk; a length/`dim` mismatch refused at write by the `CHECK`; an `embeddings` row naming an unknown
+  model refused by the foreign key.
 - **Staleness:** unchanged note → no re-embed (asserted as "the provider was called zero times", through a test provider
   that counts calls, not as a timing claim); edited note with an untouched paragraph → only the covering chunks
   re-embedded; provider failure → `EMBED_VERSION` not recorded and the count reported.
 - **Provider seam:** `"none"` embeds nothing and says so in the report; an unconfigured endpoint is refused **quietly**,
   not by panic — CI runs `cargo test --locked --release -- --ignored`, so a panicking authoring path poisons a green run
   (F16's lesson).
-- **No network in tests.** The suite runs with proxy and `*_API_KEY` variables unset, and the endpoint provider's tests
-  point at an unroutable address on `127.0.0.0/8` that is refused immediately. "No network in the indexing path" is a
-  spec constraint, so it gets a mechanism rather than a comment.
+- **No network in the indexing path, fenced where a fence can actually see it.** The risk worth catching is not a test
+  dialing out — it is someone wiring a default base URL into config, which env-stripping cannot notice. So: provider
+  `"none"` **constructs no HTTP client at all**, asserted by the type (the none-provider holds no client field, so there
+  is nothing to call), and endpoint tests point at a `TcpListener` bound on `127.0.0.1:0`, port read then dropped —
+  refused deterministically on both OSes, where `127.0.0.0/8` is platform-shaped and CI runs Windows (`ci.yml:20`).
+  Hermetic env isolation belongs in the CI job (F14's open defect, `backlog-m2-followups.md:191-200`), not in-process:
+  mutating environment inside a test races cargo's parallel harness.
+- **Anything needing the real model or endpoint is gated on an explicit runtime env var with a clean early return — never
+  on `#[ignore]`.** CI runs `cargo test --locked --release -- --ignored` (`ci.yml:41`), which F16 already learned burns a
+  green run; the spec's "opt-in, skipped by default, not in CI" bench and integration test (`spec:310-312`) are only
+  opt-in if they check a variable at runtime.
+- **Config refuses to be misspelled.** Every existing config struct is `#[serde(default)]` with no unknown-key refusal,
+  and `MissingField` "cannot fire from `Config::load` today" (`config.rs:30-32`, `:56-57`) — so a hand-typed
+  `provide = "openai-compatible"` would load as `"none"` in silence. In a project whose F-series is about not lying about
+  status: `provider` is an **enum**, the new `[embeddings]` struct carries `#[serde(deny_unknown_fields)]`, and one test
+  asserts an unknown key there is refused naming key and file.
+- Migration 7 updates `the_schema_is_what_the_plan_mandates`, which pins the table list by exact array
+  (`tests/db.rs:196-207`); its index assertion filters `sql IS NOT NULL` (`:210`), so PK/UNIQUE autoindexes stay out of
+  the expected list.
 - **Goldens:** M2a must move zero bytes in `tests/golden` and `tests/golden-wide`. No catalog field reads chunks yet, so
   an empty result there is not luck — it is the fence that says §1's "byte-for-byte identical" held.
 
 ## 8. Risks I can see now
 
-1. **candle on Windows.** A Rust-only build probably works; the GGUF fallback needs C++. Nothing here claims either
-   until one runs there (F18's rule), which is why §6 records buildability as a per-platform fact, not an assumption.
+1. **candle on Windows — stated in both halves.** M2a's own chunker, storage and staleness tests run on Windows from
+   day one: CI already builds and tests the workspace on `windows-latest` (`ci.yml:20`, `:29-41`) and byte-exactness is
+   engineered for (`.gitattributes:4`, fixtures exempted at `:6-8`). What CI does *not* cover is an optional heavy
+   provider: a feature-gated `candle`/`ggml` dependency is invisible to `--all-targets` unless asked for, and the GGUF
+   fallback additionally needs a C++ toolchain. §6's per-OS `cargo check --features local-model` is the measurement; until
+   it runs, no claim about Windows model support is made here (F18's rule).
 2. **Memory ceiling.** 18k × 512-d f32 ≈ 37 MB in RAM is fine; the danger is loading 540 MB of weights inside a scan on
    a small machine. The provider gets an explicit load/release boundary and the scan embeds in bounded batches.
 3. **Chunker churn.** §4's byte-bounded first cut will be replaced by a tokenizer-aware one, and if that lands without a
