@@ -62,6 +62,18 @@ impl Workspace {
         self._tmp.path().join("config")
     }
 
+    /// A user-level `config.toml`, written where the binary actually looks.
+    ///
+    /// `config_file_path` joins `note-processor/config.toml` under the OS config dir, and `Workspace::command`
+    /// redirects that dir at this tempdir through `XDG_CONFIG_HOME` on Unix and `%APPDATA%` on Windows. Writing a file
+    /// straight into `config_dir()` would leave it invisible to the process — the scan would succeed and the test would
+    /// pass without having configured anything, which is the failure mode worth naming here.
+    fn write_user_config(&self, body: &str) {
+        let dir = self.config_dir().join("note-processor");
+        fs::create_dir_all(&dir).expect("test setup: config package dir");
+        fs::write(dir.join("config.toml"), body).expect("test setup: write user config");
+    }
+
     fn data_dir(&self) -> PathBuf {
         self._tmp.path().join("data")
     }
@@ -1287,5 +1299,74 @@ fn a_scan_that_loses_nothing_reports_the_key_as_null() {
         !plain.stdout().contains("unindexable"),
         "a zero record would state a loss this scan did not have:\n{}",
         plain.stdout()
+    );
+}
+
+/// F17's "done when": an absurd `continuation_indent` fails the command with a message naming the key, instead of
+/// re-rendering the catalog one token per line — or, past a point, trying to allocate the indent. The library case in
+/// `crates/np-core/tests/config.rs` proves the refusal exists; this one proves the channel a person reads carries it, which
+/// is F21's rule for anything whose whole purpose is to be noticed.
+#[test]
+fn an_oversized_continuation_indent_fails_the_scan_and_names_the_key() {
+    let ws = workspace();
+    ws.write_user_config("[catalog]\ncontinuation_indent = 999\n");
+
+    let mut cmd = ws.command(&["scan"]);
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "a config the renderer cannot honour must exit 1, got:\n{}",
+        failed.stdout()
+    );
+    let message = format!("{} {}", failed.stdout(), failed.stderr());
+    assert!(
+        message.contains("catalog.continuation_indent") && message.contains("999"),
+        "the refusal has to name the key and the value that broke it: {message}"
+    );
+    assert!(
+        !message.contains("panicked"),
+        "a config refusal is a message, not the arithmetic overflow an unclamped indent can reach: {message}"
+    );
+    assert!(
+        !ws.index().exists(),
+        "and nothing is written: a refused scan does not get to reflow the catalog first"
+    );
+}
+
+#[test]
+fn an_indent_at_the_ceiling_still_renders_the_catalog() {
+    // The other side of the boundary at the process level: 16 is inside the documented range, so the same fixture
+    // shape has to scan cleanly. Without this pair the refusal test would pass under a check that refused everything.
+    let ws = workspace();
+    ws.write_user_config("[catalog]\ncontinuation_indent = 16\n");
+    // An entry long enough to wrap. The corpus alone does not give one: scanned at indent 2 and at indent 16, this
+    // workspace's `INDEX.md` holds **no** continuation line at all (the whole golden corpus contains exactly one, in a
+    // shard), so an assertion about indented lines would be asserting over an empty set. Planting the note is what makes
+    // the claim below able to fail.
+    fs::write(
+        ws.root.join("long-note-for-wrapping.md"),
+        "# A note title long enough to push the rendered entry line past the hundred-column budget the catalog promises\n",
+    )
+    .expect("test setup: plant a note whose entry wraps");
+
+    let mut cmd = ws.command(&["scan"]);
+    let ok = run(&mut cmd);
+
+    assert_eq!(
+        ok.code(),
+        0,
+        "indent 16 is legal; refusing it would refuse the documented range:\n{}",
+        ok.stderr()
+    );
+    let index = fs::read_to_string(ws.index()).expect("the catalog renders at the ceiling");
+    // Some line has to start with sixteen spaces. The first draft asked whether every indented line was longer than
+    // its trimmed self — true of any line beginning with a space, so it held even with nothing wrapped; the review
+    // caught that, and this is the assertion it should have been. With the long note planted above it fails when `wrap`
+    // stops indenting (verified by mutation) and passes at the ceiling.
+    assert!(
+        index.lines().any(|line| line.starts_with(&" ".repeat(16))),
+        "indent 16 has to reach the rendered bytes, not merely exit 0:\n{index}"
     );
 }

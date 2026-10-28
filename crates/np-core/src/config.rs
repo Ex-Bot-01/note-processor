@@ -42,6 +42,16 @@ impl From<rusqlite::Error> for ConfigError {
     }
 }
 
+/// Largest `continuation_indent` a config file may ask for.
+///
+/// A product bound, not one derived from [`crate::catalog`]'s column budget: the catalog wraps at 100 columns and any indent
+/// below that still *renders*, so nothing here computes 16 out of 100. What is not a judgement is the need for **some** finite
+/// ceiling — `wrap` adds the indent into its width budget (`catalog.rs`) and then builds `" ".repeat(indent)`, so an enormous
+/// value either overflows that addition (a panic in a debug build, exit 101) or asks for gigabytes of spaces per entry. A
+/// typo in a text file must not reach either, which is why the ceiling is enforced at load and not in the renderer
+/// (`docs/design-f17-indent-clamp.md` §4).
+pub const MAX_CONTINUATION_INDENT: usize = 16;
+
 /// How the catalog (`INDEX.md` and its shards) is laid out.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -153,6 +163,20 @@ impl Config {
             // `Config::default()` already resolved; reaching here empty means the environment
             // named nothing either.
             cfg.data_dir = default_data_dir().ok_or(ConfigError::MissingField("data_dir"))?;
+        }
+        // Refuse an indent the renderer cannot be asked to draw, from whatever source it arrived — this runs after the
+        // file and environment merge, so a future override is covered too. It travels as `Io(InvalidData)` rather than a
+        // fourth variant because the plan fixes `ConfigError` at three (`docs/.../2026-10-23-note-processor-m1-core-catalog.md`
+        // step 3), following the precedent of the `From<rusqlite::Error>` impl above; `Parse` would have accused valid TOML
+        // of being broken. Rejecting rather than clamping keeps published bytes honest with the config that produced them.
+        if cfg.catalog.continuation_indent > MAX_CONTINUATION_INDENT {
+            return Err(ConfigError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid catalog.continuation_indent = {} (max {MAX_CONTINUATION_INDENT})",
+                    cfg.catalog.continuation_indent
+                ),
+            )));
         }
         Ok(cfg)
     }

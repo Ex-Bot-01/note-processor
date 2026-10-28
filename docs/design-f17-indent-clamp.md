@@ -1,0 +1,114 @@
+# F17 — refuse an impossible `continuation_indent` at config load
+
+Design note, 2026-10-27. Backlog: `docs/backlog-m2-followups.md` §F17. Roadmap: Track A item **A2**. Branch:
+`m8/indent-clamp`. Spec anchor: the catalog's 100-column budget (`catalog::COLUMN_LIMIT`) and spec §14's rule that a path is
+never broken.
+
+## 1. What is accepted today, and what it costs
+
+`CatalogConfig::continuation_indent` is a plain `usize` with `#[serde(default)]` (`config.rs:52`, default 2) and **no
+validation anywhere on the load path**. Two consequences, in ascending order of badness:
+
+1. **Layout collapse.** `wrap(line, indent)` charges `indent` columns to every continuation line before its first token
+   (`catalog.rs:214`). At `indent = 95` a continuation line has four columns of budget, so the catalog renders one token per
+   line — legal bytes, absurd output, and no warning. At `indent ≥ COLUMN_LIMIT` the budget is negative-in-effect and *every*
+   continuation line is a single token by the wide-token exemption.
+2. **Memory or arithmetic, depending on how far the typo goes.** The indent is added into the width budget
+   (`current.width() + prefix + 1 + token.width()`, `catalog.rs:219`) and then becomes `" ".repeat(indent)`
+   (`catalog.rs:230`). So there are two failure modes and neither is "odd output": a value near `usize::MAX` overflows that
+   addition, which **panics** a debug build (exit 101) before any writing happens, while a merely enormous one —
+   `4000000000`, say — survives the arithmetic and asks for four gigabytes of spaces per wrapped entry. Which one you get
+   depends on the value and the profile, and that is precisely why the check belongs at load time rather than in `wrap`: past
+   the loader the failure modes do not look alike, so a bug report would not point back at the config key.
+
+The sibling field already defends itself — `max_entries_per_file` is used as `.max(1)` (`catalog.rs:94`) — so this asymmetry
+is the only unvalidated numeric knob left in `CatalogConfig`, and it is the one whose bad value costs memory.
+
+## 2. Decision D1 — reject, do not clamp
+
+Clamping would render bytes the user did not ask for. The catalog is published output whose bytes are pinned by goldens and
+compared by a fingerprint (`np_published`); silently substituting 16 for the reader's 4000 means the file on disk disagrees
+with the config that produced it, which is the same class of surprise F21 refused to introduce for upgrade notices. **Reject
+at load**, the way a `data_dir` that resolves to nothing is refused rather than defaulted (`config.rs:151-158`).
+
+## 3. Decision D2 — where the error type goes, without touching the mandated enum
+
+The plan fixes the error shape: `ConfigError { Io, Parse, MissingField(&'static str) }`
+(`docs/superpowers/plans/2026-10-23-note-processor-m1-core-catalog.md:88`). Options weighed:
+
+- **New variant** `InvalidValue { .. }` — cleanest API, and rejected: it amends a mandated shape for a message. If the human
+  wants it, it is one variant plus a plan edit, and nothing here would have to change but the constructor.
+- **`ConfigError::Parse`** via `toml::de::Error::custom` — displays as *"config parse error: …"*, which accuses the reader's
+  TOML syntax of being broken when it parsed perfectly. Rejected as misleading.
+- **Chosen: `ConfigError::Io` with `ErrorKind::InvalidData`.** There is exact precedent two screens away: SQLite failures
+  travel through `Io` because "the mandated enum has no dedicated variant, so the driver message is preserved as the payload"
+  (`config.rs:36-38`). The kind is the honest one — the file was read and its **data** was rejected — and a caller that cares
+  can match `InvalidData` instead of parsing prose.
+
+The composed CLI line then reads:
+
+```text
+np: configuration error: config io: invalid catalog.continuation_indent = 999 (max 16)
+```
+
+with exit code 1 — `main.rs:44` writes every failure as `np: {err}`, so a test asserts that stderr **contains** the key, never
+the whole line. Naming only the **upper** bound is deliberate: `0..=16` would advertise a lower bound no config can reach,
+because a negative literal fails in serde as `Parse` long before this check runs. The `config io:` prefix is the price of D2
+and is stated here rather than discovered in review.
+
+## 4. The bound
+
+`pub const MAX_CONTINUATION_INDENT: usize = 16;` — **inclusive**, `0..=MAX`, so `0` (no indent) stays legal.
+
+Where the number comes from, said plainly because it is not derivable from `COLUMN_LIMIT`: any indent below 100 still
+*renders*, and any indent above a few columns already costs a sixth of the line to whitespace. 16 is a product bound — wider
+than anything this catalog has ever been laid out with, comfortably inside the budget — chosen so that a typo (`2` fat-fingered
+to `20`, or a stray `9`) fails loudly instead of quietly reflowing published bytes. It is **not** a mathematical limit and the
+doc comment must not imply one; the mathematical hazard (allocation) is removed by any finite bound whatsoever, which is why
+the specific value is a judgement call rather than a proof.
+
+**The constant lives in `config.rs`, not `catalog.rs`.** `catalog::COLUMN_LIMIT` is private (`catalog.rs:30`) and §4 refuses to
+derive the bound from it, so placing `MAX_CONTINUATION_INDENT` beside it would imply a derivation that does not exist; the
+value belongs with the code that enforces it.
+
+Validation runs at the end of `Config::load`, after file and environment merge, so it covers every source a value can arrive
+from, including a future env override. It does **not** run on a `Config` built in-process: catalog tests construct
+`CatalogConfig { continuation_indent: 5 }` directly and `wrap` keeps accepting any in-range-or-not value it is handed — the
+renderer's job is layout, the loader's job is refusal. That split is also what keeps this change from touching a single
+golden byte: every fixture that renders uses the default or an explicit in-process value.
+
+## 5. Tests
+
+1. **Load refusal** (`crates/np-core/tests/config.rs`): a file with `[catalog] continuation_indent = 17` fails `load`, and
+   the message names the key, the offending value and `max 16`. Assert on the *message*, not only on `is_err()`: the backlog's
+   done-when is that a person can tell which key broke. **The fixture must name a `data_dir`** — the new check runs after the
+   one at `config.rs:151-158`, so a file holding only `[catalog]` fails first with `missing config value: data_dir` and the
+   message assertion goes red for a reason that has nothing to do with F17. `config_with_data_dir` (`tests/config.rs:42-46`)
+   is the shape to copy.
+2. **Boundaries**: `16` loads (and round-trips into `cfg.catalog.continuation_indent`), `0` loads, and the default is still 2
+   when the key is absent — the last one is what proves this did not quietly change defaults.
+3. **CLI channel** (`crates/np-cli/tests/cli.rs`): `np scan` against a workspace whose config names an oversized indent exits
+   1 with stderr naming `continuation_indent`. The library test cannot show the exit code, and F21's rule applies: the channel
+   a person actually reads needs its own test. **The file has to land where the binary looks.** `config_file_path` joins
+   `note-processor/config.toml` under the OS config dir (`config.rs:183-186`) while `Workspace::config_dir()` is only
+   `<tmp>/config`, and `workspace()` creates just that (`cli.rs:61-65`, `:88`) — writing `config.toml` straight into it is
+   invisible to the process, and the test would exit 0 having tested nothing. So a helper creates the `note-processor/`
+   subdirectory; on Windows the same file belongs under `%APPDATA%\note-processor\`, which `cli.rs:55` already redirects at
+   the temp dir.
+   **The ceiling test has to plant something that wraps.** The first version of this case asserted over the corpus and
+   passed; the review then caught that its assertion was a tautology (`line.len() > line.trim_start().len()` holds for any
+   line starting with a space, and `all` is true over an empty set). Tightening it to "some line starts with sixteen spaces"
+   made it **fail**, because this workspace's `INDEX.md` contains no continuation line at either indent — measured, not
+   argued: scanning the fixture corpus at 2 and at 16 yields 19 lines and zero indented ones, and the entire golden corpus
+   holds exactly one wrapped line, in a shard rather than in `INDEX.md`. So the fixture writes one note with a long title.
+   Worth recording because the wrong fix came from a reviewer reading a golden file: an assertion over a set nobody checked
+   is non-empty is as empty as the one it replaced.
+
+4. **No allocation on the refusal path**: implied by (1) — the process never reaches `wrap` — but worth one comment saying so,
+   because it is the reason the check is not in `catalog.rs`.
+
+## 6. Out of scope
+
+`max_entries_per_file` (already defended at use), any change to `wrap`'s algorithm or its wide-token exemption, and any new
+config key. No migration: config values are not stored, so a workspace that scanned under an old bad value simply scans again
+after the file is fixed — nothing on disk has to be reconciled, and no goldens move.

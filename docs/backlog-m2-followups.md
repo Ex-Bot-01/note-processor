@@ -222,15 +222,29 @@ What these numbers can and cannot carry:
   confirm the independent verifier still reports `GOLDEN CHECK: pass` against the new bytes. **Done when:** the golden
   corpus contains at least one two-column title and CI is green on both runners.
 
-## F17 — `continuation_indent` is accepted unclamped
+## F17 — `continuation_indent` is accepted unclamped — **shipped**
 
-- **Where:** `crates/np-core/src/config.rs:52` takes any `usize`, and `wrap` charges it as the prefix of every
+- **Where:** `crates/np-core/src/config.rs:52` took any `usize`, and `wrap` charged it as the prefix of every
   continuation line.
 - **Risk:** pre-existing, not introduced by F12. An indent near or above `COLUMN_LIMIT` defeats the column budget on
   its own — every continuation line is over the limit before its first token — so a typo in `config.toml` silently
-  produces one-token-per-line output with no warning.
-- **Fix:** reject or clamp past a documented maximum (say 16) at config load, and say which in the error. **Done
-  when:** an oversized indent fails `np scan` with a message naming the key instead of rendering oddly.
+  produced one-token-per-line output with no warning. **Worse than the original report:** the value also reaches
+  `" ".repeat(indent)` (`catalog.rs:230`) and an addition into the width budget (`catalog.rs:219`), so a merely
+  enormous value attempts gigabytes of spaces per entry and one near `usize::MAX` overflows the addition and panics a
+  debug build. Two failure modes, neither of them "odd output" — which is why the check sits at load.
+- **Shipped (`m8/indent-clamp`, `docs/design-f17-indent-clamp.md`):** `MAX_CONTINUATION_INDENT = 16`, enforced at the end
+  of `Config::load` so every source a value can arrive from is covered, including a future env override. **Rejected rather
+  than clamped**, because substituting 16 for the reader's 4000 would render bytes that disagree with the config that
+  produced them — the catalog is published output compared by fingerprint. The refusal travels as
+  `Io(ErrorKind::InvalidData)` to keep the plan's mandated three-variant `ConfigError` intact; a new variant would amend a
+  mandated shape for a message, and `Parse` would accuse valid TOML of being broken. Bound is inclusive, so 0 (flush
+  continuation lines) stays legal; it is a product judgement and documented as one, since any finite ceiling removes the
+  hazard and nothing derives 16 from `COLUMN_LIMIT`.
+- **Pinned:** refusal names key, value and `max 16`, on both channels — `an_oversized_continuation_indent_is_refused_naming_key_value_and_ceiling`
+  in `crates/np-core/tests/config.rs` and `an_oversized_continuation_indent_fails_the_scan_and_names_the_key` in
+  `crates/np-cli/tests/cli.rs`, the last writing its fixture where the binary actually looks
+  (`<config>/note-processor/config.toml`). Boundary pair beside each: 16 renders, 0 renders, absent key still defaults to
+  2. Mutations confirm both directions — deleting the check fails the refusal tests, and `>` → `>=` fails the ceiling tests.
 
 ## F18 — Windows has no byte identity at all, and its suite cannot show it
 
