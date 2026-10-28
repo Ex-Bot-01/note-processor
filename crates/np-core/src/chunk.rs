@@ -77,10 +77,10 @@ pub const CHUNKER_VERSION: i64 = 1;
 ///   because **a byte bound cannot be a token bound** — which is exactly why this constant gets replaced by the
 ///   tokenizer-aware cut as a [`CHUNKER_VERSION`] bump instead of tuned into correctness.
 ///
-/// It must also be at least 4 so one window always holds a whole UTF-8 sequence (see [`split_block`]).
+/// It must also be at least 4 so one window always holds a whole UTF-8 sequence (see `split_block` (private to this module, so not a doc link)).
 pub const MAX_CHUNK_BYTES: usize = 1800;
 
-// Stated where the constant is, and at compile time: [`split_block`] walks back from the limit to a char
+// Stated where the constant is, and at compile time: `split_block` (private to this module, so not a doc link) walks back from the limit to a char
 // boundary, which needs one to be within reach of any start position.
 const _: () = assert!(
     MAX_CHUNK_BYTES >= 4,
@@ -116,7 +116,7 @@ pub struct Chunk {
 /// 2. **Merge adjacent blocks** greedily while the whole span fits [`MAX_CHUNK_BYTES`]. The span is
 ///    measured start-to-end, which counts the blank lines between the blocks: they are part of the text
 ///    and therefore part of the cost.
-/// 3. A block that alone exceeds the bound is cut by [`split_block`] and stands alone — its last piece
+/// 3. A block that alone exceeds the bound is cut by `split_block` (private to this module, so not a doc link) and stands alone — its last piece
 ///    never absorbs the following block, so where a chunk ends depends on local structure only and an
 ///    edit far away cannot move it.
 ///

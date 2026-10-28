@@ -242,3 +242,19 @@ fn the_counting_provider_records_every_call_it_is_given() {
     // Mutation this catches: a counter that is never incremented (or a text list that is overwritten
     // instead of extended) — the helper would then certify "zero calls" for a provider that was called.
 }
+
+/// The other side of the pair. `from_bytes` compares with `!=`, and a test that only ever hands it a short
+/// buffer cannot tell that from `<`: flip the comparison and every too-long vector is accepted, its extra
+/// components read into a row whose stored `dim` now understates them — which is the same silent truncation
+/// `Malformed` exists to prevent, arriving one line later. So the long case is asserted with both numbers in
+/// the payload, not merely "it errored".
+#[test]
+fn a_buffer_longer_than_the_declared_dim_is_refused_by_name() {
+    let bytes = Vector::new(vec![1.0, 2.0, 3.0]).to_bytes();
+    match Vector::from_bytes(&bytes, 2) {
+        Err(EmbedError::DimensionMismatch { expected: 2, got: 3 }) => {}
+        other => panic!(
+            "three components against a declared dim of 2 must refuse naming both numbers, got {other:?}"
+        ),
+    }
+}
