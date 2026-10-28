@@ -272,3 +272,26 @@ answer to compare against.
 4. **The `cluster` column reservation.** The catalog entry line already reserves it. M2a leaves it empty, which keeps
    goldens intact — but the moment M2b fills it, every golden changes at once. Better to face that in one reviewed
    milestone than to let it leak in per-note; recorded here so nobody "helpfully" starts filling it early.
+
+## 9. Decisions from the human (2026-10-28), and how the endpoint stays out of the tree
+
+**Benchmark order: `embeddinggemma-2` text tower first**, then the OpenAI-compatible endpoint candidate, then MiniLM
+only if both stall. §6's one-evening arithmetic decides, not preference.
+
+**Endpoint candidate:** the same self-hosted OpenAI-compatible server this project is developed against, serving the
+Qwen3.8-Flash-Next model. Whether it exposes `/v1/embeddings` at all is a **measured question**, asked first: if it
+serves only completions, that candidate is reported as unavailable rather than approximated by embedding through a chat
+endpoint, which would silently produce vectors whose meaning nobody verified.
+
+**Secret handling — a hard rule, not a preference.** The base URL and key never enter the repository in any form: not in
+`config.toml` examples, not in fixtures, not in a benchmark report, not in a test failure message, not in a commit
+message. They arrive at runtime as `NP_EMBED_BASE_URL` / `NP_EMBED_API_KEY` and are read only by the endpoint provider.
+Consequences that are part of the design rather than tidiness:
+
+- The benchmark writes **redacted** provenance — provider kind, model id, host category ("self-hosted loopback/LAN"),
+  latency and throughput — never a URL, host, port or Authorization value. If a run cannot describe itself without the
+  URL, it prints `<redacted>` and says what was withheld.
+- Test failure output must not echo request lines: an error path that formats the full URL into a panic would leak into
+  CI logs on the first flake, so the provider's error type carries the endpoint only as an opaque label.
+- Nothing in CI authenticates to it. Per §7, real-endpoint work is gated on the runtime variable being present, which CI
+  never sets — so a leaked key cannot be exercised by a public-facing job either.
