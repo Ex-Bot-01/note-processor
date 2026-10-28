@@ -1,0 +1,103 @@
+---
+name: Release
+# Builds a downloadable `np` for Windows, Linux and macOS and publishes them on a GitHub Release.
+# Tag-triggered so a release is a deliberate act (`git tag v0.1.0 && git push --tags`), and dispatchable
+# without publishing anything so the packaging path can be tested on a branch.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create a GitHub Release, not just workflow artifacts"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: np.exe
+            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: np
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: np
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runners ship a stable Rust toolchain; nothing is installed so a release cannot silently
+      # start depending on network-installed tooling that CI does not exercise.
+      - name: Build the release binary
+        run: cargo build --release --locked -p np-cli --target ${{ matrix.target }}
+
+      # The archive carries the target in its name, because a Windows user choosing between three
+      # files named `np.zip` is a support ticket waiting to happen.
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Get-Content Cargo.toml | Select-String '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          $name = "np-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
+            -DestinationPath "dist/$name.zip"
+          "ASSET=$name.zip" | Tee-Object -FilePath $env:GITHUB_ENV -Append
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          name="np-$version-${{ matrix.target }}"
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/$name.tar.gz" "${{ matrix.binary }}"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Refuse an empty archive
+        run: test -s "dist/$ASSET"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: dist/${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      # `--generate-notes` rather than a hand-written body: the notes are the commit list, which is
+      # the only description this repository keeps up to date.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "$tag" = "main" ]; then tag=$(git describe --tags --always); fi
+          gh release create "$tag" \
+            --draft=false \
+            --latest \
+            --generate-notes \
+            assets/*
