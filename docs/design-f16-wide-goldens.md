@@ -76,6 +76,19 @@ before anything is committed:
   own regression is not coverage; if that mutation comes back green, this design's premise is wrong and the item stops here
   rather than shipping a decorative file.
 
+**What actually happened when §4 was run against the first fixture: it came back green for the golden.** The mutation failed
+four unit cases that call `wrap` directly and left both golden tests untouched — none of the five entries then in the fixture
+had a line where the two measurements disagree about fitting. So the stop condition fired, and the fixture rather than the
+conclusion changed: entry 5 is now five `笔记 目录` pairs, whose logical line is **86 characters and 106 columns**, chosen by
+simulating both measurements until one differed while every token stayed inside the budget. Re-run: the wide golden test fails,
+the M1 golden test stays green, four unit cases fail as before. Recorded at length because the honest sequence is "the premise
+was false about my first fixture", not "the design predicted this".
+
+Two entries that did **not** survive the same scrutiny: a space-free CJK title long enough to exceed the budget rendered a
+physical line containing nothing but the bullet `-` (filed as F25, with its bytes, rather than pinned here — pinning it would
+have meant loosening R2 to accept a shape nobody had adjudicated), and a spaced-but-short CJK title, which measures the same
+path as entry 1 in a different alphabet.
+
 ## 5. Verifier hardening (tooling, not product code)
 
 `verify_catalog_goldens.py` gains three things, and the first is not optional:
