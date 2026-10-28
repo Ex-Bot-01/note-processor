@@ -44,8 +44,11 @@ so a row carries `NULL` until the next scan that sees its path, and every route 
 `Snapshot` gains the same field, so `classify` can see it without touching its signature more than the type requires.
 
 **And `upsert_file` reports whether the stored hash changed.** That is not part of identity; it is a latent hole identity walks
-straight into (see §4a). The insert and update arms both already hold old and new hash in one statement, so returning that bit
-costs no extra query and cannot race with another writer.
+straight into (see §4a). Mechanically: `upsert_file` (`db.rs`) currently opens with `SELECT id FROM files WHERE rel_bytes = ?1`
+and then takes an update or insert arm — **neither arm reads the old hash today**, and the insert arm has no prior row at all. So
+the existing `SELECT` extends to return `hash` as well, the comparison happens in Rust against the snapshot about to be written,
+and **the insert arm reports `false`**: a brand-new row is an `Added`, which already re-parses, so claiming a change there would
+be a lie that costs a second parse. One extra column on a statement that already runs per file; no new query, no race.
 
 ## 4. The rule: identity may add a match and may never remove one
 
@@ -69,7 +72,7 @@ This is the load-bearing sentence of the design, and everything else follows fro
 1. **`scan.rs::admits`** — a marked row is admitted when a listed readable path carries its stored id uniquely. Today admission
    needs display equality plus hash agreement; identity is an alternative route to the same yes/no, not a replacement, so a row
    whose file was copied (new id, same bytes) still admits by content exactly as F23 shipped. **The `key_taken` guard stays on
-   this route too** (`scan.rs:856`): admitting onto a key another row of any state holds hits the `UNIQUE` in `apply_move`, comes
+   this route too** (`scan.rs:862`): admitting onto a key another row of any state holds hits the `UNIQUE` in `apply_move`, comes
    back `Indexed::Taken`, leaves the path in `skipped`, and charges `written.uncovered` on every refresh — the stuck state F23
    §5.5 pinned for the content route. An identity claim is no less a claim.
 2. **`classify`** — after the existing routes, pair remaining unmatched known rows with unmatched found paths on unique equal
@@ -78,18 +81,29 @@ This is the load-bearing sentence of the design, and everything else follows fro
    one deleting it — which is the exact failure this codebase was built to prevent. The consequence that matters: a `Moved`
    carries the row's id, so headings, tags, items and links stay attached instead of being rebuilt from scratch.
 
+   **One eligibility, computed once, used by both plug-in points.** `admits` and the pairing share a single tally — *this id is
+   carried by exactly one known row and exactly one listed path, and by no other listed path* — evaluated before either runs. If
+   admission were looser than pairing, an admitted marked row would have its `Removed` stripped by `strip_marked_removals`
+   without ever gaining a `Moved`: permanent duplicate plus permanent `unresolved_ambiguity`, which is exactly the stuck state
+   `admits`' own doc comment warns about. Two definitions of "eligible" is how that happens.
+
    **Scoped to F23's population.** Identity pairing runs only over known rows that are display-derived (`key_is_display_derived`)
    or marked — every case in §1 is one — rather than over any unmatched row. A global route would be a second way for *any*
    rename to become a `Moved`, and renames reach the report, the catalog ordering and therefore the goldens; "it only fires on
    ambiguous rows" is the sentence that keeps this item's diff inside the residue it was written for. If a later phase wants it
-   global, that is a separate decision with its own golden review, not an extension of this one.
+   global, that is a separate decision with its own golden review, not an extension of this one. Two consequences of that scope,
+   stated so nobody implements the wrong thing: **"or marked" adds no population** — every marked row is display-derived by
+   construction, because `known_rows` marks only rows whose key came off lossy text — and the predicate lives in `scan.rs`, not
+   in `change.rs`. So the filter is applied where the snapshots are built (the scan hands `classify` an already-filtered set)
+   rather than by moving a private predicate into a public module.
 
 ### 4a. The write pass has to re-parse, or this feature ships silent staleness (P0)
 
 `index_file` decides whether to re-parse from the change kind: `rewritten = refresh || matches!(change, Some(Added | Modified))`
-(`scan.rs:1237`, and the comment above it at `:1231-1234`). **A `Moved` is deliberately not in that list**, because today a `Moved` implies equal bytes by construction —
-the claim route demands hash agreement, and the comment at `scan.rs:1231-1234` explains the one case it does handle (an extension
-change that keeps its bytes) through "no row exists yet".
+(`scan.rs:1237`, and the comment above it at `:1231-1233`, whose own text is "Missing rows are rebuilt whatever
+`classify` said"). **A `Moved` is deliberately not in that list**, because today a `Moved` implies equal bytes by construction —
+the claim route demands hash agreement, and the comment at `scan.rs:1231-1233` explains the one case it does handle (an extension
+change that keeps its bytes): missing rows are rebuilt, because there is no stored note to be stale.
 
 Identity introduces a move whose bytes **differ** — that is the whole residue case. Under the current rule the row would be
 re-keyed onto the real path, get a fresh `hash`/`size`/`mtime`, keep its stale body, headings, tags and links, be excluded from
