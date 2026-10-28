@@ -3767,6 +3767,7 @@ fn a_permanent_class_row_whose_content_changed_while_a_twin_is_blocked_rejoins_i
 /// One text value from the workspace database, for the assertions that have to read **parsed content** rather
 /// than a count: design-a4 §6 test 1's whole point is that a re-keyed row which was never re-read still looks
 /// correct to every counting assertion.
+#[cfg(unix)]
 fn scalar_text(open: &Db, sql: &str) -> String {
     open.0
         .query_row(sql, [], |row| row.get::<_, String>(0))
@@ -3778,6 +3779,9 @@ fn scalar_text(open: &Db, sql: &str) -> String {
 /// F23 §3-vs-§4's reconciliation (admission refused, discharge granted independently) stays asserted on a host where
 /// identity *can* answer. The only way to know A4 changed this state rather than broke it is to watch the old state
 /// still arrive when the id is missing.
+// The fixtures below build their case with `chmod 000` and raw-byte directory names, so they exist only
+// where that is possible -- the same gate their helpers carry.
+#[cfg(unix)]
 #[test]
 fn an_unknown_identity_leaves_that_row_refused_and_discharged_exactly_as_before() {
     assert_twin_dirs();
@@ -3859,6 +3863,9 @@ fn an_unknown_identity_leaves_that_row_refused_and_discharged_exactly_as_before(
 /// then matches nothing on disk, and that has to cost nothing: the content claim still moves the note and the row
 /// keeps its id. A route allowed to veto on disagreement would turn "this filesystem recycles inode numbers" into
 /// mass deletion (design-a4 §3).
+// The fixtures below build their case with `chmod 000` and raw-byte directory names, so they exist only
+// where that is possible -- the same gate their helpers carry.
+#[cfg(unix)]
 #[test]
 fn an_identity_that_no_longer_matches_never_vetoes_the_move_content_already_earned() {
     let ws = scratch(&[("a.md", "# First\n")], 700);
