@@ -355,6 +355,38 @@ fn one_changed_byte_moves_only_the_chunks_that_cover_it() {
         .map(|(index, _)| index)
         .collect();
 
+    // The same-length edit above cannot see a merge decision that depends on length rather than content, and it
+    // cannot see the seam rule at all -- so the two claims §4 actually makes are pinned here, one by a
+    // length-changing edit and once on the untouched note.
+    let mut grown = before.clone();
+    grown.insert_str(at, "bb");
+    for c in chunk(&grown) {
+        if c.byte_end <= at {
+            let same = chunks_before
+                .iter()
+                .find(|b| b.byte_start == c.byte_start && b.byte_end == c.byte_end);
+            assert!(
+                same.is_some_and(|b| b.text == c.text),
+                "a byte inserted at {at} must not disturb the chunk ending at {}: {:?}",
+                c.byte_end,
+                c.text
+            );
+        }
+    }
+    // Seam rule, asserted where §4 actually promises it: prose made of blocks under the bound. A note with an
+    // oversized block legitimately ends chunks mid-block -- that is `split_block`'s contract, not a violation --
+    // so asserting this over the mutation fixture would be asserting something the design never claims.
+    let prose = "Erste Abschnitt mit genug Text zum Zählen.
+
+"
+    .repeat(200);
+    assert!(
+        chunk(&prose)
+            .iter()
+            .all(|c| prose[c.byte_end..].starts_with("\n\n") || c.byte_end == prose.len()),
+        "in prose a chunk boundary is a block seam or the end of the note, never a cut through a paragraph"
+    );
+
     assert!(
         !covering.is_empty() && covering.len() < chunks_before.len(),
         "the edited byte must sit inside some chunks and outside others: {covering:?} of {}",

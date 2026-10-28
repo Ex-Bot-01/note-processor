@@ -69,10 +69,13 @@ pub const CHUNKER_VERSION: i64 = 1;
 /// headroom over 1400 is not slack about the target, it is seam quality — a bound sitting just below a
 /// typical paragraph makes nearly every chunk end mid-sentence, and a chunk ending mid-sentence embeds
 /// worse than one ending short. Two consequences belong to the number rather than to the implementation:
-/// ASCII-heavy chunks stay at or under the spec's target, while a CJK- or emoji-dense note (3 bytes per
-/// character, ~1 token per character) can reach well past 350 tokens, because **a byte bound cannot be a
-/// token bound** — which is exactly why this constant gets replaced by the tokenizer-aware cut as a
-/// [`CHUNKER_VERSION`] bump instead of tuned into correctness.
+/// - chunks near the bound sit roughly **25-30% above** the token target — deliberate seam headroom, and the reason
+///   this constant will be replaced by a tokenizer rather than tuned toward correctness. The "~4 ASCII bytes per
+///   subword token" figure above is an **unmeasured estimate**, pending §6's real corpus; treat 1400 as arithmetic
+///   on that estimate, not as a measurement of this vault; and
+/// - a CJK- or emoji-dense note (3 bytes per character, ~1 token per character) can reach well past 350 tokens,
+///   because **a byte bound cannot be a token bound** — which is exactly why this constant gets replaced by the
+///   tokenizer-aware cut as a [`CHUNKER_VERSION`] bump instead of tuned into correctness.
 ///
 /// It must also be at least 4 so one window always holds a whole UTF-8 sequence (see [`split_block`]).
 pub const MAX_CHUNK_BYTES: usize = 1800;
