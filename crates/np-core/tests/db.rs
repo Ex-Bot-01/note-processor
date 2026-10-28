@@ -36,6 +36,7 @@ fn snap(rel: &str, hash: &str) -> Snapshot {
         hash: hash.to_string(),
         size: 12,
         mtime: 1_000,
+        file_id: None,
     }
 }
 
@@ -229,7 +230,7 @@ fn the_schema_is_what_the_plan_mandates() {
     for (table, declared) in [
         (
             "files",
-            "id rel_bytes case_bytes rel case_key abs hash size mtime state last_seen",
+            "id rel_bytes case_bytes rel case_key abs hash size mtime state last_seen file_id",
         ),
         (
             "notes",
@@ -2171,7 +2172,8 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
     // between "never checked" and "checked and found none" (F21 §2).
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
-         DELETE FROM schema_version WHERE version = 5;"
+         DELETE FROM schema_version WHERE version > 4;
+         ALTER TABLE files DROP COLUMN file_id;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -2266,7 +2268,8 @@ fn seed_two_duplicate_groups_at_version_four(path: &Path) {
     .expect("test setup: plant two duplicate groups, one of them a triple");
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
-         DELETE FROM schema_version WHERE version = 5;"
+         DELETE FROM schema_version WHERE version > 4;
+         ALTER TABLE files DROP COLUMN file_id;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -2308,7 +2311,8 @@ fn seed_nine_duplicate_groups_at_version_four(path: &Path) {
     .expect("test setup: plant nine duplicate groups");
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
-         DELETE FROM schema_version WHERE version = 5;"
+         DELETE FROM schema_version WHERE version > 4;
+         ALTER TABLE files DROP COLUMN file_id;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -2338,7 +2342,8 @@ fn seed_keyless_display_pair_at_version_four(path: &Path) {
     .expect("test setup: plant a keyless-display pair on one byte key");
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
-         DELETE FROM schema_version WHERE version = 5;"
+         DELETE FROM schema_version WHERE version > 4;
+         ALTER TABLE files DROP COLUMN file_id;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -2714,10 +2719,14 @@ fn a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges() {
     let db = Db::open(&path).expect("one open runs migration 4 and then migration 5");
 
     // Both steps landed: the file is current, and the pair sits on one byte key — which is migration 4's doing
-    // (`CAST(rel AS BLOB)` per row), and the precondition migration 5 merges on.
+    // (`CAST(rel AS BLOB)` per row), and the precondition migration 5 merges on. Current means **the whole
+    // list**, so this reads `MIGRATIONS` rather than a literal: when step 6 arrived, the assertion that used to
+    // say `5` here was the fixture quietly going stale on the day a column was added — the point of an upgrade
+    // test is that the open runs *everything*, whatever "everything" is this release.
     assert_eq!(
         scalar::<i64>(&db, "SELECT MAX(version) FROM schema_version"),
-        5
+        crate::MIGRATIONS.len() as i64,
+        "one open ran every step, not just the two this fixture was written for"
     );
     assert_eq!(
         scalar::<String>(&db, "SELECT hex(rel_bytes) FROM files WHERE rel = 'dup.md'"),
@@ -3002,7 +3011,8 @@ fn the_merge_gate_refuses_damage_that_no_merge_could_have_caused() {
         .expect("test setup: a heading row whose note never existed");
         db.0.execute_batch(&format!(
             "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
-             DELETE FROM schema_version WHERE version = 5;"
+             DELETE FROM schema_version WHERE version > 4;
+         ALTER TABLE files DROP COLUMN file_id;"
         ))
         .expect("test setup: rewind the file to version four");
 

@@ -69,6 +69,18 @@ pub fn classify(
     found: &[Snapshot],
     case_sensitive: bool,
 ) -> Vec<(RelPath, Change)> {
+    classify_with_identities(known, found, case_sensitive, &FileIdentities::none())
+}
+
+/// [`classify`] with the OS's own opinion about which leftovers are one and the same file.
+///
+/// Identity **adds** matches and never removes one; see [`FileIdentities`].
+pub fn classify_with_identities(
+    known: &[Snapshot],
+    found: &[Snapshot],
+    case_sensitive: bool,
+    identity: &FileIdentities,
+) -> Vec<(RelPath, Change)> {
     // Read failures first: their paths must not appear in the output in any direction.
     let unreadable: HashSet<&[u8]> = found
         .iter()
@@ -121,6 +133,46 @@ pub fn classify(
         if !known_index.contains_key(*identity) {
             unmatched_found.extend(founds.iter().copied());
         }
+    }
+
+    // Identity pairing (design-a4 §3), and it runs **here, over the leftovers only**, not as a first route.
+    // A row whose own path was listed matched that path positionally above and is not eligible for anything; a
+    // listed file already consumed by such a match must not be paired again, however uniquely its id reads —
+    // pairing it would put two known rows on one file, which is the duplicate this whole item exists to remove.
+    // So both sides have to still be unclaimed, and each pair consumes itself before any content claim is
+    // counted: a paired-away row must not also lend its hash to some third path's `Moved`.
+    let leftover_found: HashMap<&[u8], &Snapshot> = unmatched_found
+        .iter()
+        .map(|s| (s.rel_bytes.as_slice(), *s))
+        .collect();
+    // Byte-key order, so the outcome never follows hash-map iteration order.
+    let mut pairing: Vec<&Snapshot> = unmatched_known
+        .iter()
+        .copied()
+        .filter(|before| identity.eligible(before))
+        .collect();
+    pairing.sort_by_key(|s| s.rel_bytes.as_slice());
+    let mut paired_known: Vec<&[u8]> = Vec::new();
+    let mut paired_found: Vec<&[u8]> = Vec::new();
+    for before in pairing {
+        let Some(listed_key) = identity.listed_for(before) else {
+            continue;
+        };
+        let Some(after) = leftover_found.get(listed_key).copied() else {
+            continue; // consumed by an identity match, or never a leftover: nothing to pair with
+        };
+        changes.push((
+            path_of(after),
+            Change::Moved {
+                from: path_of(before),
+            },
+        ));
+        paired_known.push(before.rel_bytes.as_slice());
+        paired_found.push(listed_key);
+    }
+    if !paired_known.is_empty() {
+        unmatched_known.retain(|s| !paired_known.contains(&s.rel_bytes.as_slice()));
+        unmatched_found.retain(|s| !paired_found.contains(&s.rel_bytes.as_slice()));
     }
 
     let claimants = group_by_hash(&unmatched_known);
@@ -241,6 +293,102 @@ fn closest_to<'a>(candidates: &[&'a Snapshot], added: &Snapshot) -> Option<&'a S
         }
     }
     best
+}
+
+/// Which leftovers the OS says are one and the same file — computed **once** per scan, from every row and every
+/// listed path, and shared by both places that consult it (design-a4 §3, §4).
+///
+/// An identity is *eligible* when exactly one known row carries it and exactly one listed path carries it, and no
+/// other listed path does. Anything else abstains: two rows on one id means a hard link or a corrupted registry,
+/// and pairing either would duplicate a note; two paths on one id is the same hard link seen from the walk. A row
+/// outside the caller's scope never enters it, which is what keeps an ordinary rename out of this feature's reach —
+/// its old path still goes `Removed` + `Added`, with the catalog bytes unchanged.
+///
+/// **It only ever adds a match.** Disagreement — a row whose id matches nothing, or whose file now reports a
+/// different id — is not evidence of absence: ids legitimately change across copies, restores, rsync and containers,
+/// and a route that could veto would turn "this filesystem recycles inode numbers" into mass deletion. Unknown
+/// (`None`) is likewise no opinion, which is what every non-Unix platform and every pre-migration row reports.
+#[derive(Debug, Default)]
+pub struct FileIdentities {
+    /// Ids eligible for pairing: in scope on the row side and unique on both.
+    eligible: HashSet<Vec<u8>>,
+    /// The one listed path per eligible id, as its `rel_bytes`.
+    listed: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl FileIdentities {
+    /// The empty opinion — what [`classify`] passes, meaning "no identity information anywhere". Every route
+    /// then behaves exactly as it did before this feature existed, which is what lets that entry point stay a
+    /// one-line delegate and keeps every existing caller's semantics asserted rather than restated.
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// Compute the tally once.
+    ///
+    /// `all_known` and `all_listed` are **every** row and every listed path, because uniqueness is a fact about
+    /// the whole workspace — an id carried by a second row has to disqualify the pairing even when that row is out
+    /// of scope. `in_scope` decides which rows may be paired at all, and belongs to the caller: the population this
+    /// feature is scoped to (display-derived keys) is derived from a predicate in `scan.rs`, and moving it here
+    /// would widen a public API to serve one call site (design-a4 §3).
+    pub fn build(
+        all_known: &[Snapshot],
+        all_listed: &[Snapshot],
+        in_scope: impl Fn(&Snapshot) -> bool,
+    ) -> Self {
+        let mut known_count: HashMap<&[u8], usize> = HashMap::new();
+        for row in all_known {
+            if let Some(id) = &row.file_id {
+                *known_count.entry(id.as_slice()).or_default() += 1;
+            }
+        }
+        let mut listed_count: HashMap<&[u8], usize> = HashMap::new();
+        let mut listed_one: HashMap<&[u8], &[u8]> = HashMap::new();
+        for file in all_listed {
+            if let Some(id) = &file.file_id {
+                *listed_count.entry(id.as_slice()).or_default() += 1;
+                listed_one.insert(id.as_slice(), file.rel_bytes.as_slice());
+            }
+        }
+        let mut out = FileIdentities::default();
+        for row in all_known {
+            let Some(id) = &row.file_id else { continue };
+            if !in_scope(row) {
+                continue;
+            }
+            // Two-sided uniqueness, checked once here so that admission and pairing cannot disagree about who is
+            // eligible — the coupling design-a4 §3 names. A row admitted without a partner would have its
+            // `Removed` stripped and gain no `Moved`: permanent duplicate plus permanent charge forever.
+            if known_count.get(id.as_slice()) != Some(&1) {
+                continue;
+            }
+            if listed_count.get(id.as_slice()) != Some(&1) {
+                continue;
+            }
+            let Some(listed) = listed_one.get(id.as_slice()) else {
+                continue;
+            };
+            out.eligible.insert(id.clone());
+            out.listed.insert(id.clone(), listed.to_vec());
+        }
+        out
+    }
+
+    /// Whether this row's identity is eligible: in scope, one row, one path. This is the **one** question both
+    /// plug-in points ask.
+    pub fn eligible(&self, row: &Snapshot) -> bool {
+        row.file_id
+            .as_deref()
+            .is_some_and(|id| self.eligible.contains(id))
+    }
+
+    /// The listed path this row pairs with, when it pairs with one.
+    pub fn listed_for(&self, row: &Snapshot) -> Option<&[u8]> {
+        if !self.eligible(row) {
+            return None;
+        }
+        self.listed.get(row.file_id.as_deref()?).map(Vec::as_slice)
+    }
 }
 
 /// How many leading directories two `/`-separated byte paths share. The file name never counts,

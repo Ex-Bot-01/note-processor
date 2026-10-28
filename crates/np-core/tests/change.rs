@@ -3,7 +3,7 @@
 //! Pure by design — every `Snapshot` is built by hand, so no test touches the
 //! filesystem. `case_key` is always the lowercased `rel`, which is how `walk` fills it.
 
-use np_core::change::{classify, Change};
+use np_core::change::{classify, classify_with_identities, Change, FileIdentities};
 use np_core::hash::Snapshot;
 use np_core::path_keys::{self, RelPath};
 
@@ -25,6 +25,10 @@ fn snap(rel: &str, hash: &str, size: u64, mtime: i64) -> Snapshot {
         hash: hash.to_string(),
         size,
         mtime,
+        // Identity is a separate axis from everything this file pins, so the helper leaves it unknown rather
+        // than inventing one: `None` means "no opinion", which is what every route here must keep assuming
+        // until a fixture says otherwise (design-a4 §3).
+        file_id: None,
     }
 }
 
@@ -433,10 +437,82 @@ fn twin(rel_bytes: &[u8], hash: &str, size: u64, mtime: i64) -> Snapshot {
         size,
         mtime,
         rel,
+        file_id: None,
     }
 }
 
 /// The pair for a raw-byte path, as [`classify`] names it.
 fn id_bytes(rel_bytes: &[u8], display: &str) -> RelPath {
     RelPath::new(rel_bytes.to_vec(), display.to_string())
+}
+
+/// The three ways an identity must abstain, checked where the tally is computed rather than through a filesystem:
+/// two rows on one id (a hard link, or a registry that lost its uniqueness), two listed paths on one id (the same
+/// hard link from the walk's side), and `None` everywhere (every non-Unix platform, every row written before
+/// migration 6). In none of these may identity create a move: an ambiguous match is worse than no match, because a
+/// wrong pairing **duplicates** a note while no pairing only leaves it unclaimed (design-a4 §3).
+#[test]
+fn an_identity_carried_twice_pairs_nothing_and_an_unknown_one_says_nothing() {
+    let known = vec![
+        with_id("old/a.md", "h", Some(b"id-one")),
+        // A second row on the same inode — a hard link, or damage. Pairing either would duplicate a note.
+        with_id("other/a.md", "h2", Some(b"id-one")),
+        // The shape every Windows row and every pre-migration row has.
+        with_id("plain/a.md", "h3", None),
+    ];
+    let listed = vec![with_id("new/a.md", "hx", Some(b"id-two"))];
+
+    // Eligibility starts closed: only the caller's scope opens it, so an ordinary row is never paired by accident.
+    let out_of_scope = FileIdentities::build(&known, &listed, |_| false);
+    assert!(
+        !out_of_scope.eligible(&known[0]),
+        "a row outside the caller's scope is never eligible"
+    );
+
+    // Everyone in scope changes nothing while uniqueness fails on either side.
+    let all_in = FileIdentities::build(&known, &listed, |_| true);
+    assert!(
+        !all_in.eligible(&known[0]),
+        "two known rows carry `id-one`, so neither may be paired"
+    );
+    assert!(
+        !all_in.eligible(&known[2]),
+        "an unknown identity is no opinion — not a match, and just as certainly not a refusal"
+    );
+
+    let linked = vec![
+        with_id("new/a.md", "hx", Some(b"id-two")),
+        with_id("alias/a.md", "hx", Some(b"id-two")),
+    ];
+    let lone = vec![with_id("old/a.md", "h", Some(b"id-two"))];
+    let hard_link = FileIdentities::build(&lone, &linked, |_| true);
+    assert!(
+        !hard_link.eligible(&lone[0]),
+        "two listed paths carry `id-two`, so the row may be paired with neither"
+    );
+
+    // And abstention reaches classification: with nothing eligible these leftovers classify exactly as they did
+    // before identity existed.
+    let changes = classify_with_identities(&known, &listed, true, &FileIdentities::default());
+    assert!(
+        !changes
+            .iter()
+            .any(|(_, change)| matches!(change, Change::Moved { .. })),
+        "an abstaining tally must add no move: {changes:?}"
+    );
+}
+
+/// A snapshot with an identity attached. `snap` leaves `file_id` unknown on purpose, which is what makes this the
+/// only way for a fixture here to say \"the OS told us\".
+fn with_id(rel: &str, hash: &str, file_id: Option<&[u8]>) -> Snapshot {
+    Snapshot {
+        rel_bytes: path_keys::rel_bytes_of_display(rel),
+        case_bytes: path_keys::case_fold(rel.as_bytes()),
+        rel: rel.to_string(),
+        case_key: rel.to_lowercase(),
+        hash: hash.to_string(),
+        size: 4,
+        mtime: 10,
+        file_id: file_id.map(<[u8]>::to_vec),
+    }
 }

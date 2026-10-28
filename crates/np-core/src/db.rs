@@ -158,6 +158,16 @@ pub const MIGRATIONS: &[Migration] = &[
     // and its incoming edges are re-pointed rather than dropped, which is a loop with a receipt, not a
     // statement.
     Migration::Code(merge_duplicate_notes),
+    // Durable file identity (design-a4 §3): the OS's own answer to "is this the same file", so a note whose
+    // bytes changed while its path was unreadable can still be rejoined to its row. Nullable and **not
+    // backfilled**: identity is only readable by walking, so a row carries NULL until its path is next seen,
+    // and every reader must treat that as unknown rather than as a mismatch. No CHECK (the bytes are opaque and
+    // platform-shaped) and no index (nothing looks a row up by it; the scan reads the table in bulk).
+    Migration::Sql(
+        r#"
+    ALTER TABLE files ADD COLUMN file_id BLOB;
+    "#,
+    ),
 ];
 
 /// One step of the schema, as one entry of [`MIGRATIONS`].
@@ -1354,10 +1364,15 @@ fn report_merges(out: &mut dyn io::Write, receipt: &str) {
 /// this function, since nothing moved and nothing went away, so exactly one prepare is saved per
 /// file. Caching changes how a statement is obtained, not what it does: every error — the
 /// identity collisions below included — reaches the caller exactly as it did before.
-pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), DbError> {
-    let existing: Option<i64> =
-        db.0.prepare_cached("SELECT id FROM files WHERE rel_bytes = ?1")?
-            .query_row(params![&s.rel_bytes], |row| row.get(0))
+pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<bool, DbError> {
+    // The row's **previous digest travels out of this function** (design-a4 §3 and §4a). The caller decides
+    // whether a note has to be re-parsed, and an identity-resolved move — same file, new key, different bytes —
+    // is a case no `Change` variant names. Reading it here costs nothing, because this statement already runs
+    // once per file, and the compare sits in the same transaction as the write, so no other writer can slip a
+    // digest in between the two.
+    let existing: Option<(i64, String)> =
+        db.0.prepare_cached("SELECT id, hash FROM files WHERE rel_bytes = ?1")?
+            .query_row(params![&s.rel_bytes], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
 
     // `abs` is stored as TEXT, so a path that is not valid UTF-8 arrives here lossy.
@@ -1366,12 +1381,14 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
     // and a bare `as` cast would wrap such a size into a negative one.
     let size = i64::try_from(s.size).unwrap_or(i64::MAX);
 
-    match existing {
-        Some(id) => {
+    // Written on both arms: identity is only as current as the last walk, and a file restored or recreated
+    // under the same name deserves its new one rather than the stale id stored since before the restore.
+    let hash_changed = match existing {
+        Some((id, ref old_hash)) => {
             db.0.prepare_cached(
                 "UPDATE files
                     SET rel_bytes = ?2, case_bytes = ?3, case_key = ?4, abs = ?5, hash = ?6, size = ?7,
-                        mtime = ?8, state = 'ok', last_seen = ?9
+                        mtime = ?8, state = 'ok', last_seen = ?9, file_id = ?10
                   WHERE id = ?1",
             )?
             .execute(params![
@@ -1383,14 +1400,16 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
                 s.hash,
                 size,
                 s.mtime,
-                now
+                now,
+                &s.file_id
             ])?;
+            *old_hash != s.hash
         }
         None => {
             db.0.prepare_cached(
                 "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state,
-                                    last_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ok', ?9)",
+                                    last_seen, file_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ok', ?9, ?10)",
             )?
             .execute(params![
                 &s.rel_bytes,
@@ -1401,11 +1420,16 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<(), Db
                 s.hash,
                 size,
                 s.mtime,
-                now
+                now,
+                &s.file_id
             ])?;
+            // A brand-new row reports **no change**. There is no previous digest to have changed, and the
+            // caller's `Change::Added` already re-parses it — reporting true here would buy a second parse and
+            // a lie about what was compared.
+            false
         }
-    }
-    Ok(())
+    };
+    Ok(hash_changed)
 }
 
 /// Insert the note row for a file that has none yet, returning its freshly minted id.
