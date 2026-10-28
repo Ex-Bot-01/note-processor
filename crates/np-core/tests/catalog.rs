@@ -241,6 +241,11 @@ fn wide_golden_render_matches_committed_bytes() {
 /// Write `tests/golden-wide/` from the renderer. **Not part of any run by default**: `#[ignore]`d *and* gated on an
 /// environment variable, because a golden you can regenerate by accident is not a check.
 ///
+/// Without the variable it **returns quietly rather than panicking**, and that is load-bearing: CI has a
+/// `cargo test --locked --release -- --ignored` step for the huge-input release cases, so an authoring path that refuses by
+/// *failing* turns the pipeline red over a test that was asked to run and did the right thing by doing nothing. The first
+/// version panicked, and CI said so on both runners within five minutes.
+///
 /// Running it after the fact needs a reason in the commit: which rule the old bytes broke, and why the new ones are right.
 /// The honest order for anything new here is render once → review the bytes against the spec rules (the independent verifier
 /// checks them column-wise) → commit — never edit goldens until a test goes quiet.
@@ -248,9 +253,11 @@ fn wide_golden_render_matches_committed_bytes() {
 #[ignore = "authoring tool: NP_AUTHOR_WIDE_GOLDENS=1 cargo test -p np-core --test catalog -- author_wide_goldens --ignored"]
 fn author_wide_goldens() {
     if std::env::var_os("NP_AUTHOR_WIDE_GOLDENS").is_none() {
-        panic!(
-            "refusing to write goldens without NP_AUTHOR_WIDE_GOLDENS=1: goldens are committed evidence,              and this path exists so a new fixture's bytes can come from the renderer exactly once"
+        eprintln!(
+            "goldens are committed evidence: nothing written. Author deliberately with NP_AUTHOR_WIDE_GOLDENS=1, \
+             then explain in the commit which rule the old bytes broke."
         );
+        return;
     }
     let dir = wide_golden_dir();
     fs::create_dir_all(&dir).expect("authoring: create the golden directory");
