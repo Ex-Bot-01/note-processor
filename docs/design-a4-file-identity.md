@@ -18,7 +18,12 @@ the file the row was written for.
 
 | Platform | Source | Stored as |
 | --- | --- | --- |
-| Unix | `st_dev` and `st_ino` from the metadata the walk **already reads** (`walk.rs:433` calls `entry.metadata()` for size and mtime today) | 16 bytes, `dev` then `ino`, little-endian |
+| Unix | `st_dev` and `st_ino` from the metadata the walk **already reads** (`walk.rs:433` calls `entry.metadata()` for size and mtime today) | fixed-width pair: both widened to 64 bits, `dev` then `ino`, little-endian |
+
+Widening is not cosmetic. `st_dev` is `u64` on Linux and a 32-bit type on Apple platforms, so a layout written as "native bytes"
+makes the same file encode differently on two hosts — and a workspace directory that travels between them (an external disk, a
+VM mount) would then look like every file had been replaced. Fixed-width encoding makes the comparison mean what it says; the
+bytes are still **opaque and per-host**, never interpreted, never rendered.
 | Windows | *nothing, in this phase* | `NULL` |
 
 **Windows stays inert, deliberately, and F18's rule is why.** NTFS has an equivalent (`VolumeSerialNumber` + `FileId` from
@@ -37,6 +42,10 @@ so a row carries `NULL` until the next scan that sees its path, and every route 
 "different". That is what makes the migration safe on a workspace that is not scanned for a week.
 
 `Snapshot` gains the same field, so `classify` can see it without touching its signature more than the type requires.
+
+**And `upsert_file` reports whether the stored hash changed.** That is not part of identity; it is a latent hole identity walks
+straight into (see §4a). The insert and update arms both already hold old and new hash in one statement, so returning that bit
+costs no extra query and cannot race with another writer.
 
 ## 4. The rule: identity may add a match and may never remove one
 
@@ -59,11 +68,43 @@ This is the load-bearing sentence of the design, and everything else follows fro
 
 1. **`scan.rs::admits`** — a marked row is admitted when a listed readable path carries its stored id uniquely. Today admission
    needs display equality plus hash agreement; identity is an alternative route to the same yes/no, not a replacement, so a row
-   whose file was copied (new id, same bytes) still admits by content exactly as F23 shipped.
+   whose file was copied (new id, same bytes) still admits by content exactly as F23 shipped. **The `key_taken` guard stays on
+   this route too** (`scan.rs:856`): admitting onto a key another row of any state holds hits the `UNIQUE` in `apply_move`, comes
+   back `Indexed::Taken`, leaves the path in `skipped`, and charges `written.uncovered` on every refresh — the stuck state F23
+   §5.5 pinned for the content route. An identity claim is no less a claim.
 2. **`classify`** — after the existing routes, pair remaining unmatched known rows with unmatched found paths on unique equal
-   ids and emit `Moved { from }`. The consequence matters more than the mechanism: a `Moved` carries the row's id, so headings,
-   tags, items and links stay attached instead of being rebuilt from scratch — which is precisely what the residue case is
-   costing today.
+   ids, **inside the existing claim pass**, so the source path enters `moved_from` and never also appears as a `Removed`.
+   Emitting a `Moved` from a separate loop would report the same file twice in opposite directions — one entry re-homing it and
+   one deleting it — which is the exact failure this codebase was built to prevent. The consequence that matters: a `Moved`
+   carries the row's id, so headings, tags, items and links stay attached instead of being rebuilt from scratch.
+
+   **Scoped to F23's population.** Identity pairing runs only over known rows that are display-derived (`key_is_display_derived`)
+   or marked — every case in §1 is one — rather than over any unmatched row. A global route would be a second way for *any*
+   rename to become a `Moved`, and renames reach the report, the catalog ordering and therefore the goldens; "it only fires on
+   ambiguous rows" is the sentence that keeps this item's diff inside the residue it was written for. If a later phase wants it
+   global, that is a separate decision with its own golden review, not an extension of this one.
+
+### 4a. The write pass has to re-parse, or this feature ships silent staleness (P0)
+
+`index_file` decides whether to re-parse from the change kind: `rewritten = refresh || matches!(change, Some(Added | Modified))`
+(`scan.rs:1237`, and the comment above it at `:1231-1234`). **A `Moved` is deliberately not in that list**, because today a `Moved` implies equal bytes by construction —
+the claim route demands hash agreement, and the comment at `scan.rs:1231-1234` explains the one case it does handle (an extension
+change that keeps its bytes) through "no row exists yet".
+
+Identity introduces a move whose bytes **differ** — that is the whole residue case. Under the current rule the row would be
+re-keyed onto the real path, get a fresh `hash`/`size`/`mtime`, keep its stale body, headings, tags and links, be excluded from
+`unresolved_ambiguity` by `claimed`, and record `PARSE_VERSION` as though it had been read. The next scan then short-circuits on
+equal size and mtime before comparing hashes, so nothing ever notices: permanently stale derived rows behind a recorded version —
+the F15 class this project paid M3 to close.
+
+The fix is the §3 change: **a move whose stored hash differed re-parses**, expressed as content rather than as a change kind
+(`rewritten = refresh || matches!(change, Some(Added | Modified)) || upsert.reported_hash_changed`). Content-based rather than
+kind-based because the defect is not specific to identity: any future route that pairs differing bytes would fall into the same
+hole, and a rule keyed on `Change` variants would have to be remembered at each one.
+
+**Symlinks are not a case, because they are never indexed.** The walk neither follows nor records one (`walk.rs:310-316`), so no
+row can carry the identity of a link target and no link can claim a row. That is worth stating rather than leaving to the reader:
+"identity of a symlink vs its target" is the kind of question that otherwise gets answered by an experiment six months from now.
 
 ## 5. Hazards, named rather than waved at
 
@@ -79,10 +120,12 @@ This is the load-bearing sentence of the design, and everything else follows fro
 
 ## 6. Tests
 
-1. **The residue becomes convergence.** F23's documented case — marked row, note edited while blocked, obstruction clears — ends
-   with one live row on the real bytes, `moved = 1`, the same `notes.id`, derived rows intact, and `PARSE_VERSION` recorded
-   instead of withheld. This is the fixture the whole item exists for; it goes into `crates/np-core/tests/scan.rs` next to
-   F23's fixtures and its doc comment names the residue it closes.
+1. **The residue becomes convergence — and "convergence" means re-parsed, not merely re-keyed.** F23's documented case (marked
+   row, note edited while blocked, obstruction clears) must end with one live row on the real bytes, `moved = 1`, the same
+   `notes.id`, **the post-edit body and headings in the database**, and `PARSE_VERSION` recorded. My first draft of this test
+   asserted "derived rows intact", which is precisely the bug: intact-but-stale is what §4a describes, and a test written that
+   way would have passed on the broken behaviour. The assertions read the heading text and body back out and compare them to the
+   *edited* content, and a companion assertion pins that no `Removed` accompanies the `Moved` (`removed = 0`).
 2. **The route needs two scans.** Identity is only learnable while walking, so the fixture plants the file, scans (id recorded),
    blocks + edits, unblocks, scans again. Asserting the intermediate state (`file_id` non-NULL after scan one) keeps the fixture
    honest about why it converges rather than appearing to.
@@ -94,8 +137,13 @@ This is the load-bearing sentence of the design, and everything else follows fro
    authoritative would silently delete notes on the next restore.
 5. **`NULL` means unknown.** A row with no stored id and a listed path with no id (the non-Unix case, forced by constructing the
    snapshots) resolve exactly as before — this is also what Windows CI is evidence for: green there means inert, not working.
-6. Existing F23 fixtures, including the M fence and `a_permanent_class_row_…`, stay green unedited. If one of them moves, this
-   design removed a match somewhere and must be re-read before code continues.
+6. **No second report surface.** Because §4's route is scoped to display-derived rows, an ordinary rename must still classify
+   exactly as it does today: a fixture pairs a plain ASCII rename with an identity change and asserts the same `Moved` from the
+   hash route, byte-identical output, no new field anywhere. Catalog goldens stay untouched by construction (§3), and the gate at
+   merge is `git diff main..HEAD -- tests/golden` empty.
+7. Existing F23 fixtures, including the M fence and `a_permanent_class_row_…`, stay green unedited; so do the scan, catalog and
+   CLI suites as a whole. If one of them moves, this design removed or added a match somewhere it should not have, and gets
+   re-read before code continues.
 
 ## 7. Cost, and what the benchmark cannot see
 
