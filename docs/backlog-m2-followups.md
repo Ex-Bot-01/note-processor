@@ -227,7 +227,8 @@ What these numbers can and cannot carry:
 
 - **Original report follows.**
 - **Where:** repo-root `tests/golden/`
-- **Where:** repo-root `tests/golden/` (the golden directory is resolved at `crates/np-core/tests/catalog.rs:948`) contains no **two-column**
+- **Where:** repo-root `tests/golden/` (the golden directory is resolved inside `golden_render_matches_committed_bytes`,
+  `crates/np-core/tests/catalog.rs`) contains no **two-column**
   title — em dash and umlaut are there and are single-width — so a width regression can only be caught by the unit
   tests in `tests/catalog.rs`, never by the byte-for-byte golden check. The shared corpus that would need the new note
   lives in `tests/fixtures/corpus`.

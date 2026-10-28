@@ -99,8 +99,9 @@ golden byte: every fixture that renders uses the default or an explicit in-proce
    passed; the review then caught that its assertion was a tautology (`line.len() > line.trim_start().len()` holds for any
    line starting with a space, and `all` is true over an empty set). Tightening it to "some line starts with sixteen spaces"
    made it **fail**, because this workspace's `INDEX.md` contains no continuation line at either indent — measured, not
-   argued: scanning the fixture corpus at 2 and at 16 yields 19 lines and zero indented ones, and the entire golden corpus
-   holds exactly one wrapped line, in a shard rather than in `INDEX.md`. So the fixture writes one note with a long title.
+   argued: scanning the fixture corpus at 2 and at 16 yields 19 lines and zero indented ones, and the M1 golden set
+   (`tests/golden/`) holds exactly one wrapped line, in a shard rather than in `INDEX.md` — F16 later added a second directory with its
+   own wrapped lines, which does not change what this fixture renders. So the fixture writes one note with a long title.
    Worth recording because the wrong fix came from a reviewer reading a golden file: an assertion over a set nobody checked
    is non-empty is as empty as the one it replaced.
 

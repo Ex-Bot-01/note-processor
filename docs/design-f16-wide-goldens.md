@@ -5,8 +5,8 @@ Design note, 2026-10-27. Backlog: `docs/backlog-m2-followups.md` §F16. Roadmap:
 
 ## 1. What the golden check actually renders today
 
-`golden_render_matches_committed_bytes` (`crates/np-core/tests/catalog.rs:943`) renders a **hand-written entry list**
-(`catalog()`, `catalog.rs:48`) with `config(4)` and compares the bytes to `tests/golden/`. The on-disk fixture corpus in
+`golden_render_matches_committed_bytes` (in `crates/np-core/tests/catalog.rs`; line numbers move with every fixture, so the
+function is the address) renders a **hand-written entry list** (`catalog()`) with `config(4)` and compares the bytes to `tests/golden/`. The on-disk fixture corpus in
 `tests/fixtures/corpus` is a separate thing used by the scan and CLI tests; the backlog's "the shared corpus that would need
 the new note" points at it, but the goldens do not come from it. That matters for scoping: this item is about the renderer's
 golden pair, not about the walk fixtures.
@@ -48,14 +48,14 @@ Five entries in `wide_catalog()` (`crates/np-core/tests/catalog.rs`), chosen for
 | --- | --- |
 | `笔记 目录` (CJK, all two-column) | the plain case: columns = 2 × chars, so a char-counting regression changes the break |
 | `🚧 Roadmap — in progress` | emoji (two columns) beside an em dash and hyphen (one each), so a table swap is visible |
-| `Café du Marché` built from `e` + U+0301, `o` + U+0301 | combining marks contribute **zero** columns: the opposite sign of the CJK case, and the one a naive "wide = 2" fix gets wrong |
+| `Café du Marché` built from **two** `e` + U+0301 | combining marks contribute **zero** columns: the opposite sign of the CJK case, and the one a naive "wide = 2" fix gets wrong |
 | one long ASCII entry | an unambiguous wrap point in the same file, so the wide lines are compared against a known-good neighbour |
-| one **space-free** long CJK title, over 100 columns in a single token | the realistic shape of CJK text, which carries no spaces: there is no break point, so it takes the pinned exemption and its own line reaches `COLUMN_LIMIT + indent`. Row 1 pins wrapping *between* two-column tokens; this pins what happens when there is none — an off-by-one in `COLUMN_LIMIT - indent` shows up here first. |
+| **five `笔记 目录` pairs**, whose logical line is 86 characters and 106 columns | the discriminating entry, and the only one whose bytes change if columns become code points: column-counting wraps it, code-point counting leaves it on one line. Row 1 pins the plain two-column case; this one pins the *disagreement*, which is what a golden has to be able to see. |
 
-Paths are ASCII except one (`notes/笔记.md`) so the rendered `rel` also carries two-column bytes into the golden. Worth naming
-why row 5 is space-free rather than a sentence of words: my first instinct was a spaced CJK title, which wraps between tokens
-and therefore measures the same code path as row 1 in a different alphabet. Real Japanese and Chinese titles run together, and
-that is the case where the budget has no legal break — so the fixture needs both shapes, not two spellings of one. Titles are
+Paths are ASCII except one (`notes/笔记.md`) so the rendered `rel` also carries two-column bytes into the golden. Why row 5 is a *spaced* run of pairs rather than one long unbroken token: the unbroken version was tried first, and it is the F25
+shape — an over-wide single token gets a line of its own after the bullet has been written, so the entry begins with a bare `-`.
+Pinning that would have meant loosening R2 to accept a rendering nobody has adjudicated, so the fixture stays inside the budget
+and F25 carries the finding instead. Titles are
 written with `\u{…}` escapes where a stray editor normalisation would change the measured width — NFC versus NFD is exactly the
 difference between zero columns and one for the combining case, and a fixture that silently re-normalises on someone's machine
 tests nothing.
@@ -88,6 +88,12 @@ Two entries that did **not** survive the same scrutiny: a space-free CJK title l
 physical line containing nothing but the bullet `-` (filed as F25, with its bytes, rather than pinned here — pinning it would
 have meant loosening R2 to accept a shape nobody had adjudicated), and a spaced-but-short CJK title, which measures the same
 path as entry 1 in a different alphabet.
+
+**Identification for §6.3, as this project's own rule demands.** Command: `cargo test -p np-core --test catalog` with
+`current.width()`/`token.width()` replaced by `.chars().count()` at the single width site in `wrap`; host `pi`, euid 1000;
+scored at head `588b8e3` (fixture) and confirmed green-after-fix at `11b3b3d`. Result: `wide_golden_render_matches_committed_bytes`
+plus four unit cases red, `golden_render_matches_committed_bytes` green. Against the first fixture the same mutation left both
+goldens green — recorded above.
 
 ## 5. Verifier hardening (tooling, not product code)
 
