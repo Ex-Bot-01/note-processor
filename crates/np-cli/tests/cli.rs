@@ -1342,8 +1342,8 @@ fn an_indent_at_the_ceiling_still_renders_the_catalog() {
     let ws = workspace();
     ws.write_user_config("[catalog]\ncontinuation_indent = 16\n");
     // An entry long enough to wrap. The corpus alone does not give one: scanned at indent 2 and at indent 16, this
-    // workspace's `INDEX.md` holds **no** continuation line at all (the whole golden corpus contains exactly one, in a
-    // shard), so an assertion about indented lines would be asserting over an empty set. Planting the note is what makes
+    // workspace's `INDEX.md` holds **no** continuation line at all (the M1 golden set `tests/golden/` contains exactly
+    // one, in a shard), so an assertion about indented lines would be asserting over an empty set. Planting the note is what makes
     // the claim below able to fail.
     fs::write(
         ws.root.join("long-note-for-wrapping.md"),

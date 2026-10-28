@@ -106,6 +106,166 @@ fn config(max_entries_per_file: usize) -> CatalogConfig {
     }
 }
 
+/// The wide-character fixture behind `tests/golden-wide/` — five entries chosen for what each can **fail**, not for volume.
+///
+/// [`catalog()`] holds an em dash and umlauts, which are one character *and* one column each: that is why F12's move from
+/// characters to display columns moved zero golden bytes, and why the byte-for-byte check could not see a width regression at
+/// all. Each entry here targets one way the measurement can be wrong:
+///
+/// - two-column CJK between spaces — the plain case, where columns are twice the characters and any break decision differs;
+/// - emoji beside an em dash and a hyphen — two columns next to one, so swapping width tables for code-point counting is
+///   visible in the same line rather than in one exotic entry;
+/// - **combining marks** (`e` + U+0301), which contribute *zero* columns: the opposite sign of the CJK case, and the one a
+///   naive "wide means two" fix gets wrong. Spelled with escapes on purpose — NFC versus NFD is exactly the difference between
+///   zero columns and one, and a fixture that silently re-normalises in someone's editor measures nothing;
+/// - a long ASCII entry, an unambiguous wrap point sitting next to the wide ones;
+/// - and one long CJK entry whose logical line is **86 characters but 106 columns**: the only entry here where counting code
+///   points instead of columns changes the bytes, which makes it the load-bearing one. The first version of this fixture had no
+///   such entry, and `wrap` measured in code points its goldens stayed green — the mutation §4 expected to fail came back green
+///   for the golden and red only for unit cases that call `wrap` directly.
+fn wide_catalog() -> Vec<CatalogEntry> {
+    vec![
+        entry(
+            "\u{7B14}\u{8A18} \u{76EE}\u{9304}",
+            "notes/\u{7B14}\u{8A18}.md",
+            "9 B",
+            &["idea"],
+            2,
+            1,
+        ),
+        entry(
+            "\u{1F6A7} Roadmap \u{2014} in progress",
+            "plans/roadmap.md",
+            "1.4 KB",
+            &["work"],
+            0,
+            3,
+        ),
+        // "Café du Marché", decomposed: the accents are their own code points.
+        entry(
+            "Cafe\u{301} du Marche\u{301}",
+            "notes/combining-cafe.md",
+            "512 B",
+            &[],
+            1,
+            0,
+        ),
+        entry(
+            "The remarkably long ASCII note title that guarantees a wrap point beside the wide entries",
+            "plans/ascii-long.md",
+            "2.1 MB",
+            &["work", "q3", "planning"],
+            4,
+            2,
+        ),
+        // The discriminating entry. Five `笔记 目录` pairs make this logical line **86 characters and 106 columns**, so the
+        // two measurements disagree about whether it fits: counted in columns it wraps to a second line, counted in code points
+        // it stays on one. That difference is the whole point of this directory — without an entry like it these bytes cannot
+        // detect the regression they were added for, and the first version of this fixture had none, so its goldens passed
+        // under the mutation (§4's stop condition, fired and recorded). No single token here exceeds the budget, so it does not
+        // reach `wrap`'s over-wide exemption: a space-free title long enough to hit that rendered a physical line holding
+        // nothing but the bullet `-`, which is filed as F25 rather than pinned here.
+        entry(
+            "\u{7B14}\u{8A18} \u{76EE}\u{9304} \u{7B14}\u{8A18} \u{76EE}\u{9304} \u{7B14}\u{8A18} \u{76EE}\u{9304} \u{7B14}\u{8A18} \u{76EE}\u{9304} \u{7B14}\u{8A18} \u{76EE}\u{9304}",
+            "plans/cjk-spaced.md",
+            "1.4 KB",
+            &["long", "cjk"],
+            2,
+            1,
+        ),
+    ]
+}
+
+/// Where the wide goldens live. A sibling directory rather than more files in `tests/golden/`, because those bytes are the
+/// evidence that F12 moved nothing and because `golden_render_matches_committed_bytes` compares its directory listing against
+/// what it produces — a new file there would be drift, not coverage.
+fn wide_golden_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden-wide")
+}
+
+#[test]
+fn wide_golden_render_matches_committed_bytes() {
+    let rendered = render(&wide_catalog(), &config(600));
+    // Unsharded on purpose: the default `max_entries_per_file` keeps one file, so this fixture pins entry bytes and
+    // wrapping, not shard names. Shard ranges stay covered by the M1 goldens, and that limit is stated in the design rather
+    // than left to be discovered.
+    assert_eq!(names(&rendered), ["INDEX.md"], "{:?}", names(&rendered));
+
+    let dir = wide_golden_dir();
+    for (name, contents) in &rendered {
+        let path = dir.join(name);
+        let committed = fs::read(&path)
+            .unwrap_or_else(|err| panic!("missing wide golden {}: {err}", path.display()));
+        assert_eq!(
+            committed.as_slice(),
+            contents.as_bytes(),
+            "wide golden drift in {name}"
+        );
+    }
+
+    let committed: Vec<String> = fs::read_dir(&dir)
+        .expect("unreadable wide golden directory")
+        .map(|entry| {
+            entry
+                .expect("unreadable entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        committed,
+        ["INDEX.md".to_string()],
+        "unexpected files in {dir:?}"
+    );
+
+    // The backlog's done-when, asserted rather than assumed: the corpus contains a **two-column** title. Reading it back out
+    // of the committed bytes is what makes this a property of the fixture and not of the entry list above.
+    let golden = fs::read_to_string(dir.join("INDEX.md")).expect("read the wide golden");
+    assert!(
+        golden
+            .chars()
+            .any(|c| unicode_width::UnicodeWidthChar::width(c) == Some(2)),
+        "the wide goldens must hold at least one two-column character:\n{golden}"
+    );
+    // And a line whose characters and columns disagree, which is the whole reason this directory exists: if they always
+    // agreed, a regression to code-point counting would leave these bytes untouched.
+    assert!(
+        golden
+            .lines()
+            .any(|line| line.chars().count() != line.width()),
+        "no rendered line distinguishes columns from characters — the fixture cannot detect the regression it was added for"
+    );
+}
+
+/// Write `tests/golden-wide/` from the renderer. **Not part of any run by default**: `#[ignore]`d *and* gated on an
+/// environment variable, because a golden you can regenerate by accident is not a check.
+///
+/// Without the variable it **returns quietly rather than panicking**, and that is load-bearing: CI has a
+/// `cargo test --locked --release -- --ignored` step for the huge-input release cases, so an authoring path that refuses by
+/// *failing* turns the pipeline red over a test that was asked to run and did the right thing by doing nothing. The first
+/// version panicked, and CI said so on both runners within five minutes.
+///
+/// Running it after the fact needs a reason in the commit: which rule the old bytes broke, and why the new ones are right.
+/// The honest order for anything new here is render once → review the bytes against the spec rules (the independent verifier
+/// checks them column-wise) → commit — never edit goldens until a test goes quiet.
+#[test]
+#[ignore = "authoring tool: NP_AUTHOR_WIDE_GOLDENS=1 cargo test -p np-core --test catalog -- author_wide_goldens --ignored"]
+fn author_wide_goldens() {
+    if std::env::var_os("NP_AUTHOR_WIDE_GOLDENS").is_none() {
+        eprintln!(
+            "goldens are committed evidence: nothing written. Author deliberately with NP_AUTHOR_WIDE_GOLDENS=1, \
+             then explain in the commit which rule the old bytes broke."
+        );
+        return;
+    }
+    let dir = wide_golden_dir();
+    fs::create_dir_all(&dir).expect("authoring: create the golden directory");
+    for (name, contents) in render(&wide_catalog(), &config(600)) {
+        fs::write(dir.join(name), contents).expect("authoring: write the golden");
+    }
+}
+
 /// `n` entries sharing one bucket key, to make a bucket larger than the threshold.
 fn many(prefix: char, count: usize) -> Vec<CatalogEntry> {
     (0..count)

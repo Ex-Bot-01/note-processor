@@ -209,9 +209,26 @@ What these numbers can and cannot carry:
   string derived; add a migration and a round-trip test using a latin-1 path name. **Done when:** two paths that
   differ only in invalid UTF-8 bytes get distinct rows and both resolve.
 
-## F16 — no wide-character fixture in the golden corpus
+## F16 — no wide-character fixture in the golden corpus — **shipped**
 
-- **Where:** repo-root `tests/golden/` (the golden directory is resolved at `crates/np-core/tests/catalog.rs:948`) contains no **two-column**
+- **Shipped (`m9/wide-goldens`, `docs/design-f16-wide-goldens.md`), and not the way this entry proposed.** The goldens do not
+  come from `tests/fixtures/corpus`: `golden_render_matches_committed_bytes` renders `catalog()`'s hand-written list, so the
+  regeneration this entry asked for would have renamed shard files (a CJK title sorts into `#`) and re-laid-out unrelated
+  entries in one diff — spending the artifact behind "F12 moved zero committed bytes". Instead: a sibling directory
+  `tests/golden-wide/`, one unsharded `INDEX.md`, five entries, and **no byte of `tests/golden/` touched**. The independent
+  verifier gained an unsharded mode (it previously required every `INDEX.md` body line to be a shard link, so the new directory
+  would have been read by no rule at all while printing `pass`) and a column-aware R4 with the product's own single-token
+  exemption.
+- **What made it coverage rather than decoration:** the first fixture did not detect the regression it was added for — measuring
+  in code points left its bytes untouched, and only unit cases failed. Entry 5 became five `笔记 目录` pairs: 86 characters,
+  106 columns, so the two measurements disagree about whether the line fits. With that, the mutation fails the wide golden test
+  and leaves the M1 one green. Finding an entry like that is the item; adding CJK text is not.
+- **Found on the way:** an over-wide token renders a physical line holding only the bullet — filed as F25 with its bytes.
+
+- **Original report follows.**
+- **Where:** repo-root `tests/golden/`
+- **Where:** repo-root `tests/golden/` (the golden directory is resolved inside `golden_render_matches_committed_bytes`,
+  `crates/np-core/tests/catalog.rs`) contains no **two-column**
   title — em dash and umlaut are there and are single-width — so a width regression can only be caught by the unit
   tests in `tests/catalog.rs`, never by the byte-for-byte golden check. The shared corpus that would need the new note
   lives in `tests/fixtures/corpus`.
@@ -491,6 +508,31 @@ What these numbers can and cannot carry:
   ("the edge crossed the rebuild and the merge together" is not the claim the version-four case makes) costs most
   of the saving, so the honest extraction is under twenty lines and would flatten those messages to buy it.
   **Do when:** the next change to migration 5's delete list — take it then, with both fixtures in front of you.
+
+## F25 — an over-wide token leaves a physical line holding nothing but the bullet
+
+- **Where:** `crates/np-core/src/catalog.rs`, `wrap`'s single-token exemption ("The one exemption", near `COLUMN_LIMIT`).
+  Found while building F16's wide goldens, not introduced by it: any entry whose second token is wider than the columns left
+  renders like this — the bytes below came off the renderer, with a 55-ideograph CJK title (110 columns in one token):
+
+  ```text
+  -
+    [[目目目目…目]](plans/cjk-unbroken.md)
+    · 3 B · #long · →0 ←0
+  ```
+
+  The bullet gets a line to itself, then the over-wide token, then the rest of the entry on a third line.
+- **Why it may be wrong:** R2's rule — and every human reading `INDEX.md` — expects an entry to *start* with `- [[title]]`. A
+  line containing only `-` is not an entry, and in a Markdown viewer it renders as an empty list item followed by two orphan
+  lines. The exemption itself is right (spec §14 forbids breaking inside a path, so a too-wide token must keep its own line);
+  what is questionable is that the bullet has already been emitted by then, so the break lands before it instead of after it.
+- **Fix (undecided):** either attach the bullet to the over-wide token (`- [[目…]](…)` on one line, whatever its width) or
+  document the current shape as intended and teach the golden verifier's R2 to accept a bare-bullet first physical line. The
+  second option is only honest after somebody adjudicates it — until then `verify_catalog_goldens.py` keeps rejecting the
+  shape, which is why F16's fixture uses a space-free CJK title that stays **inside** the budget rather than one that does not.
+- **Do when:** someone decides whether `- [[…]]` must begin every entry. Then either fix `wrap` (a golden-affecting change:
+  no current golden exercises this shape, so only the new fixture and unit cases move) or amend R2 and add a golden that pins
+  the accepted shape deliberately.
 
 ## Explicitly not in this backlog
 
