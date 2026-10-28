@@ -15,9 +15,11 @@ use std::time::Duration;
 mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
+use np_core::chunk::Chunk;
 use np_core::config::Config;
 use np_core::db::{
-    apply_move, mark_stale, note_counts, upsert_file, Db, DbError, Migration, NoteCounts,
+    apply_move, chunk_state, delete_vectors_for_chunk, mark_stale, note_counts, upsert_file,
+    upsert_vector, write_chunks_for_note, ChunkWrite, Db, DbError, Migration, NoteCounts,
     FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
 };
 use np_core::hash::{sha256_file, Snapshot};
@@ -787,6 +789,594 @@ fn a_string_bind_is_refused_from_chunks_text() {
         1,
         "a refused text bind wrote no row at all"
     );
+}
+
+/// One [`Chunk`] as [`np_core::chunk::chunk`] would hand it over: text plus the offsets it was sliced from.
+///
+/// Built by hand rather than cut, because what the four tests below measure is which **row** a write
+/// touches. `crates/np-core/tests/chunk.rs` owns the chunker's own contract.
+fn chunk_at(ordinal: u32, byte_start: usize, text: &str) -> Chunk {
+    Chunk {
+        ordinal,
+        byte_start,
+        byte_end: byte_start + text.len(),
+        text: text.to_string(),
+    }
+}
+
+/// One note's `chunks.id` values, ascending by ordinal.
+///
+/// Ids rather than a count: the promise around [`write_chunks_for_note`] is that row **identity** survives an
+/// edit, and `COUNT(*)` cannot see a delete-and-reinsert that replaced every row with a fresh one.
+fn chunk_ids(db: &Db, note: i64) -> Vec<i64> {
+    db.0.prepare("SELECT id FROM chunks WHERE note_id = ?1 ORDER BY ordinal")
+        .expect("chunks are readable")
+        .query_map(rusqlite::params![note], |row| row.get::<_, i64>(0))
+        .expect("chunk rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("chunk ids")
+}
+
+/// A `chunks` row written by hand, so a test can put the database into a shape no call to
+/// [`write_chunks_for_note`] would have produced — an ordinal out of order, another digest, another build's
+/// chunker. Returns its id.
+fn insert_chunk_stamped(
+    db: &Db,
+    note: i64,
+    ordinal: i64,
+    chunker: i64,
+    text: &[u8],
+    source_hash: &str,
+) -> i64 {
+    let byte_end = i64::try_from(text.len()).expect("a test chunk is shorter than i64::MAX");
+    db.0.execute(
+        "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+        rusqlite::params![note, ordinal, chunker, text, byte_end, source_hash],
+    )
+    .expect("test setup: stamped chunk row");
+    db.0.last_insert_rowid()
+}
+
+/// A second note holding one chunk row, created so that its `id` sits at the top of the `chunks` table.
+///
+/// This makes "the ids are unchanged" a falsifiable claim. An `INTEGER PRIMARY KEY` reuses the highest freed
+/// rowid, so when one note owns every row in the table, a blanket delete-and-reinsert hands back exactly the
+/// ids it just deleted and an id-survival assertion measures nothing. With another note's row holding the
+/// maximum, any re-insert mints ids above it.
+fn hold_the_high_water_mark(db: &Db, rel: &str) {
+    let abs = Path::new("/ws/").join(rel);
+    upsert_file(db, &snap(rel, "h"), &abs, 1).expect("test setup: registry row for the marker");
+    let note = insert_note(db, rel, "Marker");
+    insert_chunk(db, note, 0);
+}
+
+/// One note's `chunks` rows as `(ordinal, id)` pairs, ascending by ordinal.
+fn chunk_ordinals_and_ids(db: &Db, note: i64) -> Vec<(i64, i64)> {
+    db.0.prepare("SELECT ordinal, id FROM chunks WHERE note_id = ?1 ORDER BY ordinal")
+        .expect("chunks are readable")
+        .query_map(rusqlite::params![note], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("chunk rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("chunk pairs")
+}
+
+#[test]
+fn rewriting_the_same_chunks_writes_nothing_and_keeps_every_row_id() {
+    // The warm pass (§5's "an unchanged note costs one indexed lookup per scan"), and the half of it that a
+    // report has to be able to say out loud: nothing was touched, so nothing may be counted.
+    //
+    // Killed by: a blanket `DELETE FROM chunks WHERE note_id = ?1` followed by inserts. The marker note's row
+    // holds the top rowid, so those inserts come back with new ids and the comparison below fails — without
+    // that marker SQLite would hand back the same three rowids and the id assertion would be decoration.
+    // What this test does **not** claim to pin is the cheap path itself: removing it is not observable through
+    // counts, because a diff over identical rows also writes nothing. Its whole benefit is one indexed `COUNT`
+    // instead of reading the note's texts back, which no assertion here can see; what is pinned is that an
+    // unchanged rewrite reports no work and touched no row.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    let chunks = [
+        chunk_at(0, 0, "first paragraph"),
+        chunk_at(1, 17, "second paragraph"),
+        chunk_at(2, 35, "third"),
+    ];
+    assert_eq!(
+        write_chunks_for_note(&db, a, &chunks, "d1").expect("first write"),
+        ChunkWrite {
+            inserted: 3,
+            updated: 0,
+            deleted: 0
+        },
+        "a note with no rows yet inserts every chunk"
+    );
+    let before = chunk_ids(&db, a);
+    assert_eq!(before.len(), 3, "one row per chunk");
+    hold_the_high_water_mark(&db, "b.md");
+
+    // Same list, same digest: the cheap path, and nothing written.
+    assert_eq!(
+        write_chunks_for_note(&db, a, &chunks, "d1").expect("rewrite"),
+        ChunkWrite::default(),
+        "an unchanged note must report no work"
+    );
+    assert_eq!(
+        chunk_ids(&db, a),
+        before,
+        "the same three rows, not a set that happens to have the same size"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM chunks WHERE note_id = {a}")
+        ),
+        3,
+        "nothing was added either"
+    );
+
+    // And what was written is readable back through the helper the scan round will use: one digest, texts in
+    // ordinal order, bytes rather than a promise about UTF-8.
+    let (digest, texts) = chunk_state(&db, a).expect("state of a note that was just written");
+    assert_eq!(digest.as_deref(), Some("d1"));
+    assert_eq!(
+        texts,
+        [
+            (0, b"first paragraph".to_vec()),
+            (1, b"second paragraph".to_vec()),
+            (2, b"third".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn editing_a_chunk_updates_that_row_and_a_shorter_list_deletes_the_tail() {
+    // §5's per-row diff: an edited note rewrites the rows that moved and deletes the ordinals the note no
+    // longer has — it does not replace the set.
+    //
+    // Killed by: a `DELETE FROM chunks WHERE note_id = ?` blanket delete (the surviving ids change); an
+    // off-by-one in the tail predicate (`ordinal > wanted`, which keeps one row too many, or `>=` aimed at the
+    // front, which deletes the wrong end) — both are caught by asserting **which** ids remain, not how many.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    let original = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "beta"),
+        chunk_at(2, 13, "gamma"),
+    ];
+    write_chunks_for_note(&db, a, &original, "d1").expect("test setup: three chunks");
+    let before = chunk_ids(&db, a);
+    hold_the_high_water_mark(&db, "b.md");
+
+    // One chunk's text moves, and the note digest moves with it.
+    let edited = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "BETA EDITED"),
+        chunk_at(2, 20, "gamma"),
+    ];
+    assert_eq!(
+        write_chunks_for_note(&db, a, &edited, "d2").expect("edit"),
+        ChunkWrite {
+            inserted: 0,
+            updated: 3,
+            deleted: 0
+        },
+        "three rows were rewritten: one because its text moved, two because their stamp did"
+    );
+    // `updated` is 3 and not 1 on purpose. `chunks.source_hash` names the **note** bytes (§3), so every row of
+    // an edited note has a stale stamp even where its text sat still, and restamping them is what makes the
+    // next scan take the cheap path (§5's one indexed lookup). The rows below are asserted to hold their old
+    // text and offsets — the restamp is the only thing that changed, and it touches no vector.
+    let after = chunk_ids(&db, a);
+    assert_eq!(
+        after, before,
+        "no row was replaced by an edit — and with another note's row holding the top rowid, a re-insert could
+         not have handed these ids back"
+    );
+    for (ordinal, want) in [(0, "alpha"), (1, "BETA EDITED"), (2, "gamma")] {
+        assert_eq!(
+            scalar::<Vec<u8>>(
+                &db,
+                &format!("SELECT text FROM chunks WHERE note_id = {a} AND ordinal = {ordinal}")
+            ),
+            want.as_bytes(),
+            "ordinal {ordinal} holds the text the diff was given"
+        );
+    }
+
+    // The note loses its last chunk: the tail goes, the rows that stay keep their ids.
+    let shorter = [chunk_at(0, 0, "alpha"), chunk_at(1, 7, "BETA EDITED")];
+    assert_eq!(
+        write_chunks_for_note(&db, a, &shorter, "d3").expect("shrink"),
+        ChunkWrite {
+            inserted: 0,
+            updated: 2,
+            deleted: 1
+        },
+        "one trailing row deleted, the two survivors restamped"
+    );
+    assert_eq!(
+        chunk_ordinals_and_ids(&db, a),
+        [(0, before[0]), (1, before[1])],
+        "the tail went and nothing else did: which ids survive is the assertion, not how many"
+    );
+
+    // Growing again mints rows only for the new ordinals.
+    let grown = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "BETA EDITED"),
+        chunk_at(2, 20, "gamma re-added"),
+    ];
+    assert_eq!(
+        write_chunks_for_note(&db, a, &grown, "d4").expect("grow"),
+        ChunkWrite {
+            inserted: 1,
+            updated: 2,
+            deleted: 0
+        },
+        "ordinal 2 is new; the other two only needed their stamp"
+    );
+    let grown_rows = chunk_ordinals_and_ids(&db, a);
+    assert_eq!(
+        (&grown_rows[..2]),
+        [(0, before[0]), (1, before[1])],
+        "the two survivors are still the same rows"
+    );
+    assert_ne!(grown_rows[2].1, before[2], "ordinal 2 is a fresh row");
+}
+
+#[test]
+fn a_moved_chunk_keeps_its_id_and_the_other_chunks_keep_their_vectors() {
+    // The test §5 exists for. `embeddings.chunk_id` cascades off `chunks.id`, so the delete-then-insert
+    // pattern this module uses for headings, tags and items would take an edited note's vectors with it —
+    // silently, correctly, and at exactly the cost §3 calls "the whole difference between a usable and an
+    // unusable incremental scan".
+    //
+    // Killed by: replacing the diff with `DELETE FROM chunks WHERE note_id = ?1` plus inserts. Every chunk id
+    // changes, the cascade empties `embeddings`, and both assertions below go red — the ids and, with them,
+    // the vectors that were supposed to survive.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+
+    let original = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "beta"),
+        chunk_at(2, 13, "gamma"),
+    ];
+    write_chunks_for_note(&db, a, &original, "d1").expect("test setup: three chunks");
+    let before = chunk_ids(&db, a);
+    hold_the_high_water_mark(&db, "b.md");
+    // One vector per chunk, each payload naming the ordinal it was written for.
+    for (ordinal, id) in [(0u8, before[0]), (1, before[1]), (2, before[2])] {
+        let payload = vec![ordinal, ordinal + 10, 0, 0, 0, 0, 0, 0];
+        upsert_vector(&db, id, "m@1", 2, &payload, "chunk-text-digest", 1)
+            .expect("test setup: one vector per chunk");
+    }
+
+    // Middle chunk's text moves; the outer two are handed over byte-identical.
+    let edited = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "beta with an edit"),
+        chunk_at(2, 24, "gamma"),
+    ];
+    write_chunks_for_note(&db, a, &edited, "d2").expect("edit one chunk");
+
+    let after = chunk_ids(&db, a);
+    assert_eq!(after, before, "every ordinal kept its row");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        3,
+        "an edit that moved one chunk cascaded away nothing"
+    );
+    for (ordinal, id) in [(0u8, after[0]), (1, after[1]), (2, after[2])] {
+        assert_eq!(
+            scalar::<Vec<u8>>(
+                &db,
+                &format!("SELECT vector FROM embeddings WHERE chunk_id = {id}")
+            ),
+            vec![ordinal, ordinal + 10, 0, 0, 0, 0, 0, 0],
+            "chunk {ordinal}'s vector is still attached to the row it was written against"
+        );
+    }
+}
+
+#[test]
+fn upsert_vector_twice_for_one_chunk_keeps_the_second_write_and_one_row() {
+    // §5's third bullet: F15 *expects* its retry, so writing the same vector twice has to be an ordinary
+    // event. A plain `INSERT` answers it with `SQLITE_CONSTRAINT_PRIMARYKEY`, and one `?` out of the scan's
+    // write pass rolls the whole scan back — provider trouble turned into data loss.
+    //
+    // Killed by: dropping the `ON CONFLICT … DO UPDATE` arm (the second call errors here). Also killed by
+    // trimming the update arm to `vector` only — `dim`, `source_hash` and `embedded_at` are asserted below, so a
+    // row that keeps its old facts beside a new vector fails too.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+    let chunk = insert_chunk(&db, a, 0);
+
+    upsert_vector(
+        &db,
+        chunk,
+        "m@1",
+        2,
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        "digest-1",
+        10,
+    )
+    .expect("first attempt");
+    upsert_vector(
+        &db,
+        chunk,
+        "m@1",
+        2,
+        &[9, 10, 11, 12, 13, 14, 15, 16],
+        "digest-2",
+        20,
+    )
+    .expect("retry after a partial failure");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        1,
+        "a retry is one row rewritten, not a second version of the same fact"
+    );
+    assert_eq!(
+        scalar::<Vec<u8>>(&db, "SELECT vector FROM embeddings"),
+        vec![9, 10, 11, 12, 13, 14, 15, 16],
+        "the second write is what the row holds"
+    );
+    assert_eq!(
+        scalar::<String>(&db, "SELECT source_hash FROM embeddings"),
+        "digest-2",
+        "and it states which chunk text that vector came from"
+    );
+    assert_eq!(scalar::<i64>(&db, "SELECT embedded_at FROM embeddings"), 20);
+}
+
+#[test]
+fn upsert_vector_keeps_both_models_rows() {
+    // Round 1 pinned `PRIMARY KEY (chunk_id, model)` at the schema. This pins the **conflict target**: name
+    // anything else and either the statement stops matching a unique index (SQLite refuses it at prepare) or
+    // the second model's row becomes the thing a first model's retry overwrites — which would make §3's
+    // "switching providers costs a re-embed and nothing else" false in the writer while true in the schema.
+    //
+    // Killed by: `ON CONFLICT (chunk_id)` (prepare-time error, so the first upsert fails) or
+    // `ON CONFLICT (model)` (same). Both leave the pair as the only target that can compile and pass.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "small@1", 2);
+    insert_model(&db, "large@1", 4);
+    let chunk = insert_chunk(&db, a, 0);
+
+    upsert_vector(
+        &db,
+        chunk,
+        "small@1",
+        2,
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        "cd-1",
+        1,
+    )
+    .expect("the first model's vector");
+    upsert_vector(
+        &db,
+        chunk,
+        "large@1",
+        4,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        "cd-1",
+        2,
+    )
+    .expect("a second model on the same chunk");
+    // A retry under the first model, with a different answer.
+    upsert_vector(
+        &db,
+        chunk,
+        "small@1",
+        2,
+        &[99, 98, 97, 96, 95, 94, 93, 92],
+        "cd-2",
+        3,
+    )
+    .expect("retrying one model");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        2,
+        "two models on one chunk are two rows"
+    );
+    assert_eq!(
+        scalar::<Vec<u8>>(&db, "SELECT vector FROM embeddings WHERE model = 'small@1'"),
+        vec![99, 98, 97, 96, 95, 94, 93, 92],
+        "the retry landed on its own model's row"
+    );
+    assert_eq!(
+        scalar::<Vec<u8>>(&db, "SELECT vector FROM embeddings WHERE model = 'large@1'"),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        "and left the other model's vector alone"
+    );
+}
+
+#[test]
+fn a_string_bind_is_refused_from_embeddings_vector() {
+    // The P2 item the review named, carried from `todo.md`: `chunks.text` has had this probe since migration 7
+    // and `embeddings.vector` did not. BLOB is an affinity rather than a constraint, so without the `typeof`
+    // arm a TEXT vector would satisfy `length(vector) = 4 * dim` by character count — F13 §4's split-type bug,
+    // arriving as garbage cosines instead of an error.
+    //
+    // Written with `dim = 1` on purpose: the bound TEXT value `'a.md'` is four characters, so
+    // `length(vector) = 4 * dim` **passes** and only the typeof arm can refuse it. A probe at dim 2 with a
+    // four-character string would be refused by its length arm and prove nothing.
+    //
+    // Killed by: deleting `CHECK (typeof(vector) = 'blob' AND …)` down to the length half — the TEXT bind is
+    // then stored happily. The blob arm below is the other half: a mutant that refuses every bind fails it.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 1);
+
+    // The positive control, through the writer itself: `upsert_vector` takes `&[u8]`, which is why nothing in
+    // this crate can bind text here at all. Four bytes for a one-component model.
+    let chunk = insert_chunk(&db, a, 0);
+    upsert_vector(&db, chunk, "m@1", 1, &[0, 0, 128, 63], "chunk-digest", 1)
+        .expect("four bytes for dim 1 is exactly right");
+
+    // The probe goes through raw SQL on a **different chunk**, so neither the primary key nor the foreign keys
+    // can be what stops it — only the typeof CHECK, exactly as [`refuses_string_bind`]'s own doc asks.
+    let other = insert_chunk(&db, a, 1);
+    refuses_string_bind(
+        &db,
+        &format!(
+            "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+             VALUES ({other}, 'm@1', 1, ?1, 'chunk-digest', 1)"
+        ),
+        "embeddings.vector",
+    );
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        1,
+        "a refused vector bind wrote no row at all"
+    );
+}
+
+#[test]
+fn chunk_state_returns_the_shared_digest_and_texts_in_ordinal_order() {
+    // The read helper's ordering promise, pinned the only way that shows it: rows inserted **out of** ordinal
+    // order, so a statement without `ORDER BY ordinal` reads them back in rowid order.
+    //
+    // Killed by: dropping `ORDER BY ordinal` from `stored_chunks` — the vec comes back [(5,…),(0,…),(2,…)].
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    insert_chunk_stamped(&db, a, 5, 1, b"five", "d1");
+    insert_chunk_stamped(&db, a, 0, 1, b"zero", "d1");
+    insert_chunk_stamped(&db, a, 2, 1, b"two", "d1");
+
+    let (digest, texts) = chunk_state(&db, a).expect("state of a note with rows");
+    assert_eq!(
+        digest.as_deref(),
+        Some("d1"),
+        "rows that agree on their stamp state one note digest"
+    );
+    assert_eq!(
+        texts,
+        [
+            (0, b"zero".to_vec()),
+            (2, b"two".to_vec()),
+            (5, b"five".to_vec()),
+        ],
+        "ascending by ordinal, whatever order the rows went in"
+    );
+}
+
+#[test]
+fn chunk_state_has_no_single_answer_when_the_rows_disagree() {
+    // `Some(digest)` is a claim a caller acts on — "this note needs no chunk work" — so it is only allowed
+    // when every row supports it. Three shapes refuse that claim, each asserted on its own note so each kills
+    // its own mutant.
+    let db = Db::in_memory().expect("fresh database");
+    for rel in ["empty.md", "old-chunker.md", "mixed.md"] {
+        let abs = Path::new("/ws/").join(rel);
+        upsert_file(&db, &snap(rel, "h"), &abs, 1)
+            .unwrap_or_else(|_| panic!("test setup: registry row for {rel}"));
+    }
+    let empty = insert_note(&db, "empty.md", "Empty");
+    let old_chunker = insert_note(&db, "old-chunker.md", "Old");
+    let mixed = insert_note(&db, "mixed.md", "Mixed");
+
+    // Nothing has been cut from this note: no digest to be current for.
+    let (digest, texts) = chunk_state(&db, empty).expect("state of a note with no rows");
+    assert_eq!(digest, None, "no rows state no digest");
+    assert!(texts.is_empty());
+
+    // A row behind another build's chunker. §4 stamps per row precisely so a `CHUNKER_VERSION` bump makes old
+    // rows identifiable, so those rows must never read as current — and this signature has no third slot to
+    // say it with, which is why the digest arm carries the answer.
+    insert_chunk_stamped(&db, old_chunker, 0, 99, b"cut elsewhere", "d1");
+    let (digest, texts) = chunk_state(&db, old_chunker).expect("state of an old-chunker note");
+    assert_eq!(digest, None, "rows from another chunker are not current");
+    assert_eq!(texts, [(0, b"cut elsewhere".to_vec())], "and still listed");
+
+    // Two rows, two digests: there is no single note these chunks were cut from.
+    insert_chunk_stamped(&db, mixed, 0, 1, b"one", "d1");
+    insert_chunk_stamped(&db, mixed, 1, 1, b"two", "d2");
+    let (digest, texts) = chunk_state(&db, mixed).expect("state of a mixed note");
+    assert_eq!(digest, None, "disagreeing rows state nothing");
+    assert_eq!(texts.len(), 2, "both rows are still reported");
+}
+
+#[test]
+fn delete_vectors_for_chunk_takes_every_model_and_leaves_the_chunk() {
+    // The embeddings-side helper the scan round needs: dropping a chunk's vectors must not drop the chunk, and
+    // must not reach into another chunk's vectors — that would be the §5 data loss with the table renamed.
+    //
+    // Killed by: `DELETE FROM embeddings` (no predicate) or a predicate on `model` instead of `chunk_id` — both
+    // fail the surviving-pair list below. Repeating the call is asserted because "already gone" must not be an
+    // error for a retry.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "small@1", 2);
+    insert_model(&db, "large@1", 4);
+    let first = insert_chunk(&db, a, 0);
+    let second = insert_chunk(&db, a, 1);
+    // `dim` beside its payload so the length CHECK cannot be what refuses a row this test needs written.
+    for (chunk, model, dim, bytes) in [
+        (first, "small@1", 2, "0102030405060708"),
+        (first, "large@1", 4, "0102030405060708090a0b0c0d0e0f10"),
+        (second, "small@1", 2, "0102030405060708"),
+    ] {
+        db.0.execute(
+            &format!(
+                "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+                 VALUES ({chunk}, '{model}', {dim}, x'{bytes}', 'chunk-digest', 1)"
+            ),
+            [],
+        )
+        .expect("test setup: vector row");
+    }
+
+    delete_vectors_for_chunk(&db, first).expect("drop one chunk's vectors");
+
+    let left: Vec<(i64, String)> =
+        db.0.prepare("SELECT chunk_id, model FROM embeddings ORDER BY chunk_id, model")
+            .expect("embeddings are readable")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("embedding rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("embedding pairs");
+    assert_eq!(
+        left,
+        [(second, "small@1".to_string())],
+        "only the named chunk's vectors went, under both models"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"),
+        2,
+        "the chunk row itself stays, with its id and ordinal intact"
+    );
+
+    // A second call has nothing to do and says so by succeeding.
+    delete_vectors_for_chunk(&db, first).expect("deleting nothing is not an error");
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"), 1);
 }
 
 /// The schema as of version 2 — the first two `MIGRATIONS` entries copied out verbatim, and
