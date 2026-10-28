@@ -25,6 +25,10 @@ fn snap(rel: &str, hash: &str, size: u64, mtime: i64) -> Snapshot {
         hash: hash.to_string(),
         size,
         mtime,
+        // Identity is a separate axis from everything this file pins, so the helper leaves it unknown rather
+        // than inventing one: `None` means "no opinion", which is what every route here must keep assuming
+        // until a fixture says otherwise (design-a4 §3).
+        file_id: None,
     }
 }
 
@@ -433,6 +437,7 @@ fn twin(rel_bytes: &[u8], hash: &str, size: u64, mtime: i64) -> Snapshot {
         size,
         mtime,
         rel,
+        file_id: None,
     }
 }
 

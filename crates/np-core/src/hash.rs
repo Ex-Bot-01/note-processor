@@ -44,6 +44,14 @@ pub struct Snapshot {
     pub size: u64,
     /// Modification time in whole seconds since the Unix epoch.
     pub mtime: i64,
+    /// The OS's durable identity for this file: device and inode, widened to fixed width and encoded, on the
+    /// platforms that expose one (design-a4 §2).
+    ///
+    /// **`None` means unknown, never "different".** It is what every non-Unix platform reports, what a row
+    /// written before migration 6 carries until its path is next walked, and what a filesystem without the
+    /// concept reports forever. Every route that reads it treats unknown as "no opinion", because the one
+    /// failure this feature must never produce is a match refused.
+    pub file_id: Option<Vec<u8>>,
 }
 
 impl Snapshot {
@@ -64,6 +72,7 @@ impl Snapshot {
             hash,
             size: found.size,
             mtime: found.mtime,
+            file_id: found.file_id.clone(),
         }
     }
 }

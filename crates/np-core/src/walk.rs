@@ -67,6 +67,11 @@ pub struct DiscoveredFile {
     /// Modification time as whole seconds since the Unix epoch; `0` when the
     /// platform hides it or stores a time before the epoch.
     pub mtime: i64,
+    /// The OS's durable identity for this file — device and inode on Unix, `None` everywhere else — read from
+    /// the same metadata call that produced [`DiscoveredFile::size`] and [`DiscoveredFile::mtime`], so capturing
+    /// it costs no extra stat. Opaque bytes, never interpreted, never rendered; `None` means unknown rather
+    /// than different (`docs/design-a4-file-identity.md` §2).
+    pub file_id: Option<Vec<u8>>,
     /// Whether the name ends in `.md`, matched case-insensitively. Non-markdown
     /// files are still tracked: they get a registry row and can be link targets.
     pub is_markdown: bool,
@@ -447,6 +452,7 @@ fn record(entry: &DirEntry, root: &Path) -> Option<DiscoveredFile> {
         abs,
         size: meta.len(),
         mtime: epoch_secs(&meta),
+        file_id: file_identity(&meta),
         is_markdown,
     })
 }
@@ -470,6 +476,35 @@ fn sort_found(found: &mut [DiscoveredFile]) {
 /// Shared with [`crate::scan`], which re-states a file before reading it: comparing that second
 /// against the walk's is what catches a file rewritten mid-scan, so both readings have to round
 /// time the same way.
+/// The durable identity of one file, as opaque bytes.
+///
+/// Both numbers are widened to 64 bits **before** encoding. That is not tidiness: `st_dev` is a `u64` on Linux
+/// and a 32-bit type on Apple platforms, so an encoding of native widths would give the same file different
+/// bytes on two hosts — and a workspace directory that travels between them (an external disk, a VM mount)
+/// would then look as though every file in it had been replaced. Fixed width makes the comparison mean what it
+/// says while staying per-host and never decoded.
+// The `as u64` casts below are no-ops on this host and clippy says so on Linux, where `st_dev` and `st_ino`
+// are already 64-bit. They stay because the encoding must not depend on the platform's field widths: on Apple
+// platforms `st_dev` is 32-bit, so native-width bytes would make one file look like two hosts' files.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn file_identity(meta: &fs::Metadata) -> Option<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&(meta.dev() as u64).to_le_bytes());
+    bytes.extend_from_slice(&(meta.ino() as u64).to_le_bytes());
+    Some(bytes)
+}
+
+/// Windows and every other platform report **unknown**, deliberately and for now (design-a4 §2). NTFS has the
+/// equivalent in `VolumeSerialNumber` + `FileId`, but reaching it needs a syscall crate and — the part that
+/// actually decides — a fixture run on a Windows host with its evidence recorded, because a feature that reads
+/// `None` there passes every test either way. Green Windows CI is proof of *inert*, not of support.
+#[cfg(not(unix))]
+fn file_identity(_meta: &fs::Metadata) -> Option<Vec<u8>> {
+    None
+}
+
 pub(crate) fn epoch_secs(meta: &fs::Metadata) -> i64 {
     meta.modified()
         .ok()
@@ -805,6 +840,9 @@ mod tests {
             abs: Path::new(abs).to_path_buf(),
             size: 0,
             mtime: 0,
+            // The ordering tests read paths only; identity plays no part in them, and an invented one here
+            // would be a fact no fixture asserts.
+            file_id: None,
             is_markdown: true,
         }
     }

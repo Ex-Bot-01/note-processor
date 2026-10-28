@@ -133,6 +133,7 @@ fn add_file(db: &Db, rel: &str) {
             hash: "h".to_string(),
             size: 10,
             mtime: 1_000,
+            file_id: None,
         },
         &Path::new("/ws").join(rel),
         1,

@@ -4768,7 +4768,8 @@ fn rewind_past_the_merge(open: &Db) {
     open.0
         .execute_batch(&format!(
             "DELETE FROM meta WHERE key = '{}';
-             DELETE FROM schema_version WHERE version = 5;",
+             DELETE FROM schema_version WHERE version > 4;
+         ALTER TABLE files DROP COLUMN file_id;",
             db::NOTE_MERGE_KEY
         ))
         .expect("test setup: rewind past migration 5");

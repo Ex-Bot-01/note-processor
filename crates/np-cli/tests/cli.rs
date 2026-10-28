@@ -1022,7 +1022,8 @@ fn seed_duplicate_pair_at_version_four(ws: &Workspace) {
     .expect("test setup: plant two note rows on one key, their derived rows and the edges around them");
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
-         DELETE FROM schema_version WHERE version = 5;"
+         DELETE FROM schema_version WHERE version > 4;
+         ALTER TABLE files DROP COLUMN file_id;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -1170,7 +1171,8 @@ fn rewind_to_version_four_without_a_pair(ws: &Workspace) {
     let db = Db::open(&ws.db_path()).expect("test setup: create the current schema");
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
-         DELETE FROM schema_version WHERE version = 5;"
+         DELETE FROM schema_version WHERE version > 4;
+         ALTER TABLE files DROP COLUMN file_id;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(

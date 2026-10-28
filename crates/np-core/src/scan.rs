@@ -758,7 +758,8 @@ fn known_rows(
     // §1's never-converges symptom manufactured by the fix (F13 §4.1).
     let mut statement = db.0.prepare(
         "SELECT f.rel_bytes, f.case_bytes, f.rel, f.case_key, f.hash, f.size, f.mtime,
-                EXISTS (SELECT 1 FROM notes n WHERE n.rel_bytes = f.rel_bytes)
+                EXISTS (SELECT 1 FROM notes n WHERE n.rel_bytes = f.rel_bytes),
+                f.file_id
          FROM files f WHERE f.state = 'ok' ORDER BY f.rel_bytes",
     )?;
     let rows = statement.query_map([], |row| {
@@ -771,6 +772,9 @@ fn known_rows(
                 hash: row.get(4)?,
                 size: row.get::<_, i64>(5)?.max(0) as u64,
                 mtime: row.get(6)?,
+                // Nullable by design: a row written before migration 6, or any row on a platform that reports
+                // nothing, reads as unknown. The routes that use it treat unknown as no opinion (design-a4 §3).
+                file_id: row.get(8)?,
             },
             row.get::<_, bool>(7)?,
         ))
@@ -1224,9 +1228,12 @@ fn index_file(
         }
     }
 
-    if let Err(err) = db::upsert_file(db, snapshot, &readable.abs, now) {
-        return conflict_or_err(err, Indexed::Taken);
-    }
+    // Whether this write replaced a different digest. `index_file` needs it below: a change kind cannot express
+    // "same file, new path, new bytes", and that is exactly the case identity resolves (design-a4 §4a).
+    let hash_changed = match db::upsert_file(db, snapshot, &readable.abs, now) {
+        Ok(changed) => changed,
+        Err(err) => return conflict_or_err(err, Indexed::Taken),
+    };
 
     // A move alone leaves the derived rows untouched, because they hang off `notes.id` and not off the
     // path. Missing rows are rebuilt whatever `classify` said: a file that changed extension into `.md`
@@ -1234,7 +1241,16 @@ fn index_file(
     if let Some(text) = &readable.text {
         // `refresh` rewrites a note whose bytes did not change: the whole point of F15 is that its
         // derived rows were written by rules this build no longer has.
-        let rewritten = refresh || matches!(change, Some(Change::Added | Change::Modified));
+        // `hash_changed` is the content-based half of this test, and it is load-bearing rather than tidier.
+        // A `Moved` was never in the list above because every move today implies equal bytes by construction —
+        // but an identity-resolved move pairs a row with a file whose bytes **differ**. Without this term that
+        // row would be re-keyed, handed fresh size/mtime/hash, keep its stale body and derived rows, be excluded
+        // from the ambiguity charge, and let `PARSE_VERSION` be recorded as though it had been read; the next
+        // scan short-circuits on size and mtime before comparing hashes, so nothing would ever notice. Keyed on
+        // content rather than on a variant on purpose: any future route that pairs differing bytes lands in the
+        // same hole (design-a4 §4a).
+        let rewritten =
+            refresh || hash_changed || matches!(change, Some(Change::Added | Change::Modified));
         // One id lookup per note, resolved here — after any move above has been applied, which is
         // what lets [`db::apply_move`] have rewritten `notes.rel` onto the new path (migration 4 removed the
         // foreign key that used to do it). The same answer
@@ -2294,6 +2310,7 @@ mod tests {
             hash: "h".to_string(),
             size: 4,
             mtime: 10,
+            file_id: None,
         }
     }
 
@@ -2604,6 +2621,7 @@ mod tests {
             hash: "h".to_string(),
             size: 4,
             mtime: 10,
+            file_id: None,
         };
         upsert_file(&db, &walked, Path::new("/ws/caf\u{fffd}/note.md"), 1)
             .expect("test setup: byte-keyed registry row");
@@ -3151,6 +3169,7 @@ mod tests {
             mtime: 10,
             rel: path.rel.clone(),
             rel_bytes: whole,
+            file_id: None,
             size: 4,
         };
         (path, snapshot)
