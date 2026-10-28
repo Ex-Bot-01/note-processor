@@ -1,89 +1,112 @@
 # note-processor — handoff / todo
 
-**Read this first, then read the two documents below in order. Do not re-brainstorm: the design is
-approved by the human (2026-10-23) and the M1 plan is written and self-reviewed.**
+**Read this first.** The design is approved by the human (2026-10-23); M1 and the M2-hardening line are
+shipped. Do not re-brainstorm approved designs — execute against the roadmap, or write a design and get it
+reviewed before any code for something new.
 
-Repo: `/home/agent/note-processor` · remote `https://github.com/Ex-Bot-01/note-processor` (private,
-push works — `gh` is authenticated as `Ex-Bot-01`, git identity is set repo-local)
+Repo: `/home/agent/note-processor` · remote `https://github.com/Ex-Bot-01/note-processor` (private; `gh` is
+authenticated as `Ex-Bot-01`, git identity repo-local). Because it is private, release assets 404 for
+anonymous visitors — download while logged in.
 
 1. **Design (approved):** `docs/superpowers/specs/2026-10-23-note-processor-design.md`
-2. **Plan to execute now:** `docs/superpowers/plans/2026-10-23-note-processor-m1-core-catalog.md`
+2. **Roadmap being executed:** `docs/roadmap-2026-10-27.md` (Track A = correctness residue, Track B = product)
+3. **Current milestone design:** `docs/design-m2-embeddings.md` (M2a — chunk + vector storage; survived review)
+4. **Backlog of known defects and deferrals:** `docs/backlog-m2-followups.md`
+5. **Per-round working log:** `.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/m2-hardening-progress.md`
 
 ## What this product is (one paragraph)
 
-A single-user, local-first markdown workspace for ~1,500 messy existing notes plus new **daily
-files**. The human writes fast and out of order and cannot find things or tell what is still open.
-Two jobs: make the pile navigable (deterministic `INDEX.md` catalog + graph of links/tags/clusters,
-no API in that path) and make status visible (open/done/paused **item timelines**, latest written
-text wins; each new day opens with a fenced TODO segment generated from the last *n* days by a
-self-hosted OpenAI-compatible endpoint). A chat panel answers questions from the index/graph with
-`file:line` citations and shows **both** sides of any contradiction, unresolved.
+A single-user, local-first markdown workspace for ~1,500 messy existing notes plus new **daily files**. The
+human writes fast and out of order and cannot find things or tell what is still open. Two jobs: make the pile
+navigable (deterministic `INDEX.md` catalog + graph of links/tags/clusters, no API in that path) and make
+status visible (open/done/paused **item timelines**, latest written text wins; each new day opens with a fenced
+TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible endpoint). A chat panel answers
+questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
+unresolved.
 
-## Do now — Milestone 1
+## Shipped (main)
 
-Use **superpowers:subagent-driven-development** on the M1 plan (the human chose it): a fresh
-subagent implements each task, a fresh reviewer gates it before the next starts, whole-branch
-review at the end. Read both documents before dispatching anything; hand each subagent the spec path
-**and** the exact task text — executors see only their own task.
+- **M1 core catalog** — `np-core` + `np scan <workspace>` producing a byte-stable `INDEX.md` (+ shards) and a
+  SQLite registry: titles with provenance, headings, tags, checklist items, links resolved with evidence, word
+  counts, encoding. Incremental scans; re-parse versioning that never records a version it could not satisfy.
+- **M2 hardening line** — F13 byte-exact paths · F18 Windows refusal handling · F19 duplicate-note merge ·
+  F20 raw bytes in reports · F21 durable upgrade announcements · F22 bounded durable records · F23 ambiguous
+  rows marked rather than deleted · F24 per-fact merge assertions · F17 oversized indent refused, not clamped ·
+  F16 wide golden coverage · A4 durable file identity (`files.file_id`, one eligibility tally shared by admission
+  and pairing, re-parse whenever the stored digest moves).
+- **Releases** — `.github/workflows/release.yml`: a tag `v*` builds Windows/Linux/macOS and publishes a GitHub
+  Release. `v0.1.0` is live: `np-0.1.0-x86_64-pc-windows-msvc.zip` (contains `np.exe`) plus Linux and macOS
+  tarballs.
 
-M1 deliverable: `np-core` + `np scan <workspace>` producing a byte-stable catalog. Nothing else.
+Quality bar in force on every merge: `cargo fmt --check`; `cargo clippy --all-targets -- -D warnings`;
+`cargo test --workspace` counted by exit code and per-binary `FAILED` lines, never by summing `test result`
+lines; config suite with `HOME`/`XDG_CONFIG_HOME` unset; `RUSTDOCFLAGS="--deny warnings" cargo doc`; the cfg
+dead-code script; `verify_catalog_goldens.py` printing `GOLDEN CHECK: pass`; CI green on ubuntu **and**
+windows-latest. **Goldens are never regenerated** — a diff under `tests/golden*` stops the work and gets
+reported.
 
-- [ ] Task 1 — Cargo workspace, `np` binary, ubuntu+windows CI (**Step 0 installs Rust: it is not installed in this environment**)
-- [ ] Task 2 — config file (XDG/APPDATA), data dir, known-workspace registry
-- [ ] Task 3 — deterministic recursive walker, exclusions, Windows long-path helper
-- [ ] Task 4 — content hash + change classification (Added/Modified/Moved/Removed)
-- [ ] Task 5 — SQLite schema, move keeps identity, delete marks `stale`
-- [ ] Task 6 — markdown parse: frontmatter subset, title precedence, headings, tags
-- [ ] Task 7 — link extraction + ambiguity-safe resolution
-- [ ] Task 8 — item candidates + configurable open/done/paused markers
-- [ ] Task 9 — byte-stable `INDEX.md` render, wrapping at 100 cols, shards at 600 entries
-- [ ] Task 10 — `np scan` end-to-end, idempotency property test, fixture corpus
+## In progress — M2a (branch `m12/embeddings`)
 
-Branch: create `m1/core-catalog`, push as you go, and when M1 is green ask the human whether to
-squash-merge into `main` or open a PR (they have not chosen yet — do not decide for them).
+Chunking and vector storage, deliberately without clustering: the spec gates the model on throughput ("measured
+before we commit", §13 step 2), so M2 is cut into **M2a** (storage + chunker + provider seam + benchmark) and
+**M2b** (clustering, `clusters`/membership, review queue with evidence, the reserved `cluster` column — which
+will change every golden at once, by design, in one reviewed milestone).
 
-**Definition of done for M1:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test --workspace` and `cargo test --release -- --ignored` all pass on Linux **and** Windows
-CI, and `cargo run -p np-cli --bin np -- scan tests/fixtures/corpus --json` prints a report whose
-second run reports zero changes with byte-identical `INDEX.md`.
+Done on the branch: migration 7 (`models`, `chunks`, `embeddings`; FKs, `typeof='blob'` and length CHECKs pinned
+by tests) · `chunk.rs` (pure over decoded text, `MAX_CHUNK_BYTES = 1800`, block seams, char-boundary safe, its
+contract tested including a one-byte mutation case) · the review's P2 batch.
+
+Remaining for M2a: **Round 3** — provider seam where `provider = "none"` holds no HTTP client at all, chunk
+writes by per-row diff (never delete-and-reinsert, which would cascade away vectors), vectors written with
+`ON CONFLICT (chunk_id, model) DO UPDATE`, and `EMBED_VERSION` covering **chunker coverage only** (provider
+availability is a reported count, never version debt — see design §5's P0). Then the EmbeddingGemma benchmark.
 
 ## Locked decisions — do not revisit
 
-- Shape: **daemon owns everything, Tauri window is a dumb client** (`np-core` / `npd` / `np-app`).
-  Login autostart so today's file and TODO segment exist before the app opens. Linux **and** Windows.
+- Shape: **daemon owns everything, Tauri window is a dumb client** (`np-core` / `npd` / `np-app`). Login
+  autostart so today's file and TODO segment exist before the app opens. Linux **and** Windows.
 - Single machine, single user. Loopback HTTP + token in config (port 8765) — no cloud, no accounts.
-- Embeddings: self-hosted `google/embeddinggemma-2` **text tower only** (Apache-2.0), 512-d via MRL
-  truncation, mean-pool + L2-normalise, task prefixes per the model card; downloaded once by
-  `np models install`, sha256-pinned, recorded on every vector. Fallbacks in spec §9 (MiniLM
-  multilingual / GGUF Q8 / endpoint embeddings) are one config key each. M2 starts with a throughput
-  benchmark before committing.
-- Only four things may ever be written into the workspace: create today's daily file, replace the
-  fenced `<!-- np:todo -->` region, append approved `[[wikilink]]` under `## Related`, regenerate
-  `INDEX.md` (+ shards) and `processed/`. Note bodies are never touched by an LLM.
-- Status: **open is the default** (no marker), a tick means done; markers are config with German and
-  English defaults (spec §8.7). Item identity across files merges only on an anchor; fuzzy matches
-  go to the review queue as suggestions, never as assertions.
+- Embeddings: self-hosted `google/embeddinggemma-2` **text tower only** (Apache-2.0), 512-d via MRL truncation,
+  mean-pool + L2-normalise, task prefixes per the model card; downloaded once by `np models install`,
+  sha256-pinned, recorded on every vector. Fallbacks in spec §9 are one config key each. **Benchmark order set
+  2026-10-28: EmbeddingGemma first**, then the endpoint candidate, MiniLM only if both stall (design §9).
+- Endpoint candidate is the same self-hosted OpenAI-compatible server this project is developed against, serving
+  Qwen3.8-Flash-Next. **Base URL and key never enter the repo** — runtime `NP_EMBED_BASE_URL` /
+  `NP_EMBED_API_KEY`, read only by the provider; benchmark provenance is redacted; nothing in CI authenticates
+  to it. Whether it serves `/v1/embeddings` at all is a measured question, asked first.
+- Only four things may ever be written into the workspace: create today's daily file, replace the fenced
+  `<!-- np:todo -->` region, append approved `[[wikilink]]` under `## Related`, regenerate `INDEX.md` (+ shards)
+  and `processed/`. Note bodies are never touched by an LLM.
+- Status: **open is the default** (no marker), a tick means done; markers are config with German and English
+  defaults (spec §8.7). Item identity across files merges only on an anchor; fuzzy matches go to the review queue
+  as suggestions, never as assertions.
 - Derived data lives in the DB and `INDEX.md`, one catalog entry per note, **no importance filter**.
 - Frontend: React + Vite + TypeScript + CodeMirror 6 (M5).
 
+## Method (unchanged, and it is what keeps the defect count honest)
+
+`superpowers:subagent-driven-development`: fresh implementer per bounded round, fresh scoped reviewer after each,
+fix loop for Critical/Important, broad whole-branch review at the end, merge only on the human's word. **Design
+review before any code.** Two writers never share a worktree. Reviewers have no shell — they must say "static
+read" and list commands; the controller runs load-bearing claims himself. A subordinate's evidence outranks a
+controller instruction: refuse and explain rather than fake coverage. No behaviour claim about a platform until
+it was run there (F18's rule). Mutation testing means **production** mutations — deleting an assertion to see
+what fails is not a check, because removal makes tests pass.
+
 ## Environment facts
 
-- Rust: **not installed** — run Task 1 Step 0 (`rustup` minimal stable + `clippy`, `rustfmt`).
-- Node v22.22.1 + npm 9 present (needed from M5). `git` 2.53, `gh` 2.103 authenticated.
-- This harness: the `subagent` tool exists in a fresh session (verified 2026-10-23) — use it.
-- Never put the GitHub token in a command line or a file; `$GH_TOKEN` is already wired for `gh`.
+- Rust lives in `~/.cargo/bin` — `export PATH="$HOME/.cargo/bin:$PATH"` before any cargo command.
+- Node v22 + npm present (needed from M5). `git`, `gh` authenticated. Never put the GitHub token on a command
+  line or in a file; `$GH_TOKEN` is already wired for `gh`.
+- Subagent endpoints die around 30 minutes: keep rounds bounded, tell the implementer to `wip:`-commit as soon as
+  it compiles, and resume rather than restart.
 
 ## Open items to ask the human about, at the milestone that needs them
 
-- **M2/M4:** base URL + model id of their OpenAI-compatible endpoint (currently Qwen3-Next-class on
-  their server) and how they want the key stored. Nothing in M1 calls it.
-- **M3:** where daily files live inside the workspace (`YYYY-MM-DD.md` at root vs `daily/`).
-- **M4:** autostart specifics once you know the actual Linux distro (systemd user unit) and Windows
-  edition (logon Scheduled Task).
-- Later milestones get their own plan written from spec §13 — one plan per milestone, same cadence.
-
-## Working notes the human gave along the way
-
-They want to be asked rather than assumed when a choice changes what gets built; they like plain,
-concrete answers; their notes are mixed German/English; the original idea of a task tracker and voice
-memos stays out of v1 (kept as `SourceAdapter` trait seam only).
+- **M3:** where daily files live inside the workspace (`YYYY-MM-DD.md` at root vs `daily/`). Needed before M3's
+  design, not before.
+- **F18 residue:** Windows file identity (`VolumeSerialNumber` + `FileId`) needs real Windows hardware and a
+  recorded run; CI proves only that the path is inert.
+- **F25** (over-wide token renders a physical line holding only `-`) is filed and unadjudicated.
+- **Owed measurements:** A4's A/B/A benchmark and whole-branch review were skipped on instruction at merge time;
+  `typeof(vector)` has no string-bind probe yet (it lands with Round 3, where vectors are actually written).
