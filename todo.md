@@ -118,6 +118,11 @@ what fails is not a check, because removal makes tests pass.
   `/v1/embeddings`; EmbeddingGemma-2 runs locally and does all embedding, the LLM API is used only to answer chat
   questions (phase 2), and network appears only at setup to download the artifact. `install` therefore stays
   local-file-only and no HTTP embedding transport will be written. Design: `docs/design-m2-local-embeddings.md`.
-- **Before the first embed run, two backlog decisions:** D2 (is frontmatter part of the embedded text; do citations
-  index the file or the body) and D5 (does the embed round delete stale vectors or compare-and-skip). Both are cheap
-  now and expensive after 18k vectors exist.
+- **Before the first embed run, three backlog decisions:** D2 (is frontmatter part of the embedded text; do citations
+  index the file or the body), D5 (does the embed round delete stale vectors or compare-and-skip — answered in
+  `design-m2-local-embeddings.md` §6: only with their chunk row) and **D3 (a stale note's chunks must never read as
+  current, which bites the moment `np embed` becomes the first production reader of `chunk_state`/`chunk_digest`)**. All
+  three are cheap now and expensive after 18k vectors exist.
+- **Gates on R6b0** (the local-inference round): stored width stays **512 via MRL** unless this file's locked list is
+  amended; someone downloads `embeddinggemma-2-Q8_0.gguf` (309.9 MB, ungated); and the pinned Rust binding's vendored
+  llama.cpp revision must know `gemma-embedding2` — grep the vendored source, do not trust a changelog.
