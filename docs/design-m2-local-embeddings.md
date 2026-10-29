@@ -104,23 +104,32 @@ the id in it, never a silent no-op (that is `provider = "none"`'s behaviour and 
 
 ## 5. Width, tokens, prompts: what a vector actually is
 
-**Stored width is 512, and that is a locked decision, not this design's to change.** The spec says "Vectors: 512-dim via
-MRL truncation" and "768-d native with Matryoshka truncation to 512/256/128 (we use **512**, re-normalised after
-slicing)"; `todo.md` repeats it; the parent design prices it ("512 dimensions is 2 KiB", "18k × 512-d f32 ≈ 37 MB"); and
-the shipped config fixture already parses `dim = 512`. Draft v1 of this document said 768/3072 bytes by reading the
-model's own `1_Pooling/config.json` (`embedding_dimension = 768`) and never reconciling that with the decision — which is
-exactly how an approved choice gets silently overridden. So:
+**Stored width is 768 — amended by the human on 2026-10-29.** The decision this section was written to protect was "512-d
+via MRL truncation" (spec `:84`/`:234`/`:346`, `todo.md`), and draft v2 of this document recorded it as locked while noting
+that the model's own `1_Pooling/config.json` says `embedding_dimension = 768`. The human has now chosen native width, so all
+three documents agree on 768 and `todo.md` carries the amendment. What changed underneath is worth keeping in plain sight,
+because it is the reason the number was ever contested:
 
-- **native 768 → stored 512, in this order: mean-pool with the attention mask → L2-normalise → slice to 512 →
-  re-normalise.** Slicing before normalising leaves a non-unit vector and breaks §3's promise; re-normalising after
-  slicing is what makes cosine over stored vectors mean what we say it means.
-- **The truncation is part of identity** (§4): an id that stores 512 and an id that stores 768 are different rows, and
-  `models.dim` plus the row's `@n` both have to agree with the provider.
-- **Open, and measured in R6d rather than assumed:** whether EmbeddingGemma-2 was actually trained with Matryoshka
-  sub-vectors. If the first 512 dims of a 768-d vector are not a trained subspace, MRL truncation quietly costs recall —
-  and "we use 512" would then be a decision to re-take with the human, in the open, with a cosine distribution between
-  full and truncated vectors as the evidence. Keeping 768 instead is legitimate **only** as an amendment written into
-  `todo.md`'s locked list, not as a config detail discovered in a round.
+- **Cost, restated honestly:** a row is 768 `f32` = **3072 bytes**, so ~18k chunks is ≈**55 MB** rather than the 37 MB the
+  parent design priced. That is still small; it changes no architectural choice here.
+- **Truncation stays available and gets cheaper, not dearer.** Google's model card for `embeddinggemma-2` states MRL support
+  natively — "truncated embeddings across 128d, 256d, 512d, and 768d … up to a 6x reduction in vector storage costs with
+  minimal impact on quality" — which *closes the open question draft v2 left for R6d*: the sub-vectors are trained, not an
+  accident of slicing. So if 55 MB becomes a problem, narrowing is a **re-store of vectors already in the table** (slice to
+  N, re-normalise) rather than a re-embed — no model run at all. It is not free: it changes model identity (§4), so it means
+  a new `@n` and a migration over stored rows, and cosine comparisons must never mix widths. Order still matters if it ever
+  happens: mean-pool → L2-normalise → slice → **re-normalise** (slicing first leaves a non-unit vector).
+- **Window, now cited rather than reasoned about.** The card gives **8,192 tokens** of context for this model. Draft v2 said
+  "nothing here reads a trained window"; it does now. Consequences: `embeddings.max_tokens`'s default of 2048 sits comfortably
+  inside it, and `MAX_EMBEDDING_TOKENS = 32_768` **exceeds what the model can attend to** — recorded as a bound to tighten to
+  8,192 in R6b2 alongside the enforcement test, not silently left generous. (`max_position_embeddings = 262144` in
+  `config.json` is a RoPE/train-length property, not a usable embedding window; §5's refusal posture does not depend on which
+  of the two numbers you read.)
+- **Whole model means more than one file.** The card describes 740M parameters total — a 270M text backbone plus selectively
+  loadable vision (170M) and audio (300M) encoders, all mapping into the same 768-d space. `ggml-org/embeddinggemma-2-GGUF`
+  ships that split as `embeddinggemma-2-Q8_0.gguf` (309.9 MB) plus `mmproj-embeddinggemma-2-Q8_0.gguf` (554.8 MB). §12 covers
+  what carrying the extra encoders costs, including one thing I could not make work: **no image→embedding path in llama.cpp's
+  multimodal layer** as of `0ac1a7f`, so vision may be bytes we ship and never run. That needs your eye before R6b0.
 
 Pooling itself comes from the artifact: `pooling_mode = "mean"`, `include_prompt = true`, output `last_hidden_state`,
 then a normalise module — and the GGUF declares `gemma-embedding2.pooling_type` for the runtime to read. The mean must be
@@ -322,3 +331,62 @@ Claims I checked rather than trusted (reviewer had no shell, and this repo has a
 | candle lacks the architecture | `models/mod.rs` on `main`: gemma/2/3/4, paligemma, quantized_gemma3, recurrent variants — no `embedding_gemma2` | true; option (c) stays expensive |
 | Transformers may not support the model | HF API: `architectures = ["EmbeddingGemma2Model"]`, tags include `transformers`, `sentence-transformers` | reviewer's open question resolves *yes*, but it needs the 1488.9 MB safetensors — so §7 keeps it optional |
 | a maintained Rust binding exists | crates.io sparse index: `llama-cpp-2` `0.1.160`, not yanked, static build default | true; version pin and revision check are R6b0's job |
+
+## 12. Fetching the model on first start, and the marker that says it is happening
+
+Amended by the human 2026-10-29: *"it should be automatically downloaded in the first start. And while it downloads add a
+flag or marker which we can later use to indicate the user that the model download is currently going on."* That reverses two
+locked rules — "downloaded once by `np models install`, no API at index time" and "`install` stays local-file-only" (parent
+§10.2) — so it gets its own section rather than a quiet edit elsewhere. `install --path --sha256` is **kept** as the offline
+door: an air-gapped machine must still be able to install a model, and a download path that cannot fall back to a file the
+human placed by hand is one refusal too many.
+
+**What may not survive the amendment is trust-by-URL.** The pinned facts live in the binary, not in whatever the origin
+serves today: repo, filename, size and SHA-256 are recorded at build time (the Q8_0 pair's digests were read from Hugging
+Face's public LFS metadata on 2026-10-29 — `2188ac1d…` for the text file, `c4a8a526…` for the mmproj), and a fetched file is
+accepted only when it hashes to the recorded value. An unverified download is never published, never renamed into place, and
+never left behind as an artifact — same posture as `install`: refuse, name what was wrong, repair nothing.
+
+The rules this section proposes, each of which R6b0/R6c must be able to show a test for:
+
+1. **Who fetches.** `np models fetch <workspace> --id <id>` is the real command. "First start" means: when something needs
+   vectors and the configured row's artifact is absent, it reports the state and (for the daemon/app start) kicks off one
+   fetch; `np scan` does **not** dial out — indexing staying possible with a network down is spec §9's rule and the one worth
+   dying for. `np embed` refuses rather than fetching inline: a nine-minute download inside a command that then writes rows is
+   a transactional and UX mess at once.
+2. **The marker, and why it cannot be a column.** A `models` row is inserted only after an artifact is verified and renamed
+   into place (§4 of the install design), so there is no row to mark mid-download. The marker is therefore a sidecar in the
+   model directory — `<id>.fetching.json`, holding `{nonce, started_at, bytes_done, bytes_total, source_kind}` — written
+   before the first byte, updated periodically, and removed on both success and failure. `np models list` grows a fifth state,
+   `fetching`, read from that file rather than inferred from a partial one.
+3. **A stale marker is reported, never deleted silently.** If it is older than its own heartbeat interval with no writer
+   advancing it, readers say "a fetch started at X appears to have been interrupted" and name the path. Deleting it would be
+   repair; guessing that another process is mid-write would be a lie. `install`'s unclaimed-entry logic already draws this line
+   and should be reused rather than rethought.
+4. **One fetch per model id.** A second caller sees the marker and reports "already fetching" as its own exit state beside
+   §6's three — not an error, not a queue.
+5. **Partial bytes are invisible by construction.** Download to `<id>.<nonce>.part`, hash it streaming (the same pass that
+   counts progress), then rename — `install`'s publish path exactly, so there is one mechanism for "this file became an
+   artifact" instead of two with different failure modes.
+6. **Preflight and honest failure.** Free disk checked before the first byte (a 310 MB write into a full filesystem is the
+   worst time to discover it); offline, HTTP error, digest mismatch and out-of-disk each get their own refusal naming what was
+   attempted and the manual `--path` alternative. No retry loop inside a user-facing command, no exponential backoff hidden in
+   a scan.
+7. **Secrets and logs.** The artifact is ungated, so no credential is involved; the origin URL still does not go into logs at
+   info level or into any report, per parent §9's rule about hosts. `source_kind` in the marker is `"pinned-hf"`, not a URL.
+
+**Open, and needing the human before R6b0:** whether "the whole model" means carrying the encoders *now*. The three shapes
+are materially different, and only one of them is cheap:
+
+| shape | bytes | what it buys today | what it costs |
+| --- | --- | --- | --- |
+| text GGUF now, encoders later when something indexes images | 310 MB | everything the notes need | nothing; a second fetch when the need is real |
+| text + mmproj pair now | 865 MB | **possibly nothing**: at `0ac1a7f` I found no image→embedding path in llama.cpp's mtmd layer — it feeds images to generative models | 555 MB on disk, multi-file `install`/`fetch` support (one id, N digests), and a runtime feature we would have to verify exists before promising it |
+| HF safetensors, all encoders | 1489 MB | the real multimodal graph, via Transformers/sentence-transformers | a Python runtime in the product, ~1.5 GB of weights and a RAM envelope this host (~2 GB free) may not survive, and no self-contained binary |
+
+My recommendation is the first row with the second one's schema: **build `fetch` and `install` around N files with N pinned
+digests now** — that is the part which is expensive to retrofit — and download only the text artifact until something in the
+roadmap actually embeds an image. Say "carry both today" instead and I will, but then R6b0 starts by proving llama.cpp can
+produce an image embedding for this architecture at all, because I could not find a way today and shipping 555 MB of unrunnable
+weights to call it "the whole model" would be a claim, not a capability.
+

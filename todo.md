@@ -69,9 +69,13 @@ coverage only** (provider availability is a reported count, never version debt �
 - Shape: **daemon owns everything, Tauri window is a dumb client** (`np-core` / `npd` / `np-app`). Login
   autostart so today's file and TODO segment exist before the app opens. Linux **and** Windows.
 - Single machine, single user. Loopback HTTP + token in config (port 8765) — no cloud, no accounts.
-- Embeddings: self-hosted `google/embeddinggemma-2` **text tower only** (Apache-2.0), 512-d via MRL truncation,
-  mean-pool + L2-normalise, task prefixes per the model card; downloaded once by `np models install`,
-  sha256-pinned, recorded on every vector. Fallbacks in spec §9 are one config key each. **Benchmark order set
+- Embeddings: self-hosted `google/embeddinggemma-2` (Apache-2.0), **amended by the human 2026-10-29 on three points**:
+  **(a)** the **whole model**, not the text tower alone — vision and audio encoders are carried too, so the artifact set is
+  more than one file; **(b)** stored width is **768 with no MRL truncation** (the card says MRL is native at 128/256/512/768,
+  so narrowing later is a re-store of vectors we already hold, not a re-embed — but it changes model identity, §4);
+  **(c)** the artifact is **fetched automatically on first start**, with a marker that says a download is in progress so the
+  UI can say so later. `np models install --path/--sha256` stays as the offline door. mean-pool + L2-normalise, task
+  prefixes per the model card, sha256-pinned to digests recorded in the repo, recorded on every vector. Fallbacks in spec §9 are one config key each. **Benchmark order set
   2026-10-28: EmbeddingGemma first**, then the endpoint candidate, MiniLM only if both stall (design §9).
 - Endpoint candidate is the same self-hosted OpenAI-compatible server this project is developed against, serving
   Qwen3.8-Flash-Next. **Base URL and key never enter the repo** — runtime `NP_EMBED_BASE_URL` /
