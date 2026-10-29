@@ -751,9 +751,15 @@ fn publish_artifact(models_dir: &Path, id: &str, source: &Path) -> Result<(), Mo
 /// Installs inside one process need distinct temp names too, so two threads cannot write one name.
 static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// The `<nonce>` half of the temporary artifact name: this process's id, the current time, and a counter —
-/// digits and `-` only, so a temp name can never be mistaken for a valid id by [`validate_id`] if someone
-/// later feeds it one.
+/// The `<nonce>` half of the temporary artifact name: this process's id, the current time, and a counter.
+///
+/// **The claim this comment used to make — "digits and `-` only, so a temp name can never be mistaken for a valid
+/// id" — was false about the whole name, and design review caught it.** The nonce is digits and `-`, but it sits
+/// *inside* `<id>.<nonce>.tmp`, and `validate_id` allows `.`, `-` and `_` after the first character: so
+/// `alpha.4242-1730000000123456-0.tmp` is a legal model id. What actually protects installs is that a temp name is
+/// never *fed* to `validate_id`, plus `list`'s treatment of leftovers as unclaimed entries rather than as rows. The
+/// real lesson lives in `docs/design-m2-local-embeddings.md` §12: machinery names must be unforgeable by
+/// construction (leading `.`, which the first-character rule forbids for ids), not merely unlikely to collide.
 ///
 /// Process id **and** clock **and** counter because each half alone fails one way: two `np models install`
 /// processes started in the same nanosecond share a timestamp, and two calls in one process can share a

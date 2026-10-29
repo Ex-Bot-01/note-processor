@@ -276,8 +276,11 @@ fn a_buffer_longer_than_the_declared_dim_is_refused_by_name() {
 /// drifted back to `embeddinggemma-2-text@1` would stop exercising the thing that made ids carry quantisation.
 const LOCAL_ID: &str = "embeddinggemma-2-text-q8_0@1";
 
-/// The locked stored width (spec's 512-d MRL, which §5 refuses to renegotiate).
-const LOCAL_DIM: usize = 512;
+/// The stored width as amended on 2026-10-29: **native 768, no MRL truncation** — the human's decision, recorded in
+/// `todo.md` and `docs/design-m2-local-embeddings.md` §5. It used to be 512 via MRL, and this constant is where that
+/// survived longest: a fixture that keeps asserting "the locked width is 512" after the amendment is code arguing with
+/// its own design doc.
+const LOCAL_DIM: usize = 768;
 
 /// A prefix that is **not** empty and has no trailing whitespace of its own. Both halves matter: an empty
 /// `prefix_doc` would let a provider that ignores prefixes pass every assertion below, and a prefix ending in
@@ -405,7 +408,9 @@ fn a_row_of_a_different_width_is_refused_naming_both_numbers() {
     let tmp = TempDir::new().expect("test setup: tempdir");
     let artifact = installed_artifact(tmp.path());
 
-    for stored in [768_i64, 256, -3] {
+    // None of these can equal `configured`: 768 became the *accepted* width when §5 was amended, so the rejected
+    // arms are now the old locked 512, a small legal width, and a negative one a hand-edited row could hold.
+    for stored in [512_i64, 256, -3] {
         let err = LocalModelProvider::new(
             &installed_row(LOCAL_ID, stored, LOCAL_PREFIX),
             &artifact,
@@ -414,7 +419,7 @@ fn a_row_of_a_different_width_is_refused_naming_both_numbers() {
         .expect_err("a row whose width is not the configured one builds nothing");
         match &err {
             EmbedError::ProviderDimMismatch {
-                configured: 512,
+                configured: LOCAL_DIM,
                 provider,
             } => assert_eq!(
                 *provider, stored,
@@ -426,7 +431,7 @@ fn a_row_of_a_different_width_is_refused_naming_both_numbers() {
         }
         let message = err.to_string();
         assert!(
-            message.contains("512") && message.contains(&stored.to_string()),
+            message.contains(&LOCAL_DIM.to_string()) && message.contains(&stored.to_string()),
             "both numbers, in the message a human reads: {message}"
         );
 

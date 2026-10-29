@@ -127,6 +127,8 @@ what fails is not a check, because removal makes tests pass.
   `design-m2-local-embeddings.md` §6: only with their chunk row) and **D3 (a stale note's chunks must never read as
   current, which bites the moment `np embed` becomes the first production reader of `chunk_state`/`chunk_digest`)**. All
   three are cheap now and expensive after 18k vectors exist.
-- **Gates on R6b0** (the local-inference round): stored width stays **512 via MRL** unless this file's locked list is
-  amended; someone downloads `embeddinggemma-2-Q8_0.gguf` (309.9 MB, ungated); and the pinned Rust binding's vendored
-  llama.cpp revision must know `gemma-embedding2` — grep the vendored source, do not trust a changelog.
+- **Gates on R6b0** (the local-inference round): width and provenance are settled (native 768; `np` fetches it — see the locked
+  block above), so what remains is one check and one constraint: the pinned Rust binding's vendored llama.cpp revision must know
+  `gemma-embedding2` (grep the vendored source, never trust a changelog), and R6b2's cross-quantisation check needs free RAM it may
+  have to wait for. Assigned in R6b0 too: the four-step `--features local-model` CI job that design §2 promises and ci.yml does not
+  yet run.

@@ -852,6 +852,24 @@ fn an_unknown_key_outside_embeddings_still_loads() {
 /// the end — so a fixture cannot drift into accepting something `np models install` would refuse.
 const LOCAL_ID: &str = "embeddinggemma-2-text-q8_0@1";
 
+/// The token ceiling is a **model fact, not taste**: 8,192 is `embeddinggemma-2`'s attention window (Google's card, read
+/// 2026-10-29). It used to be 32 768, justified in its own comment by `max_position_embeddings = 262144` — a RoPE/train-length
+/// property the design has since disowned — and no test noticed, because every other case is written *relative to* the
+/// constant. Equality rather than `< some generous cap`, because a silent raise is precisely the failure being fenced: a bound
+/// above what the model can read is not generous, it is false. Raising this number must come with a citation and a provider-side
+/// home for the check (the spec's MiniLM fallback has ~512 tokens, so one global constant is already doing a per-model job).
+#[test]
+fn the_token_ceiling_is_the_models_attention_window() {
+    assert_eq!(
+        MAX_EMBEDDING_TOKENS, 8_192,
+        "the ceiling is a measured model window; changing it needs a source, not a wider number"
+    );
+    assert!(
+        DEFAULT_EMBEDDING_TOKENS < MAX_EMBEDDING_TOKENS,
+        "the default budget has to fit inside the window it is bounded by"
+    );
+}
+
 #[test]
 fn an_absent_max_tokens_takes_the_default_and_changes_nothing_else() {
     // R6a adds a key to a section that used to *refuse* it by name, so the property that matters is what an

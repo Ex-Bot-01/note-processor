@@ -78,24 +78,26 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 2048;
 
 /// Largest `embeddings.max_tokens` a config file may ask for.
 ///
-/// A product bound rather than a measurement, and the reasoning is §5's: the budget counts **what the model
-/// actually sees** — `prefix_doc` + chunk text + special tokens, because `include_prompt = true` means the
-/// counted sequence is not just our bytes — so it describes the runtime's work for one sequence, not a
-/// chunk's size. Two facts fix where a bound belongs: the artifact declares
-/// `max_position_embeddings = 262144`, so a budget only fences while it stays far below that; and
-/// [`crate::chunk`] caps a chunk at `MAX_CHUNK_BYTES = 1800`, which makes a four-digit-token sequence unlikely
-/// for prose. **Unlikely is the whole claim** — design §5 demoted this from a theorem after review, and the holes
-/// are named there: SentencePiece/NMT normalisation can *expand* bytes (so the bound is on normalised bytes, not
-/// stored ones), `decode` can hand over runs of U+FFFD that tokenise worse than plain text, and prefix plus
-/// specials cost tokens that come from no chunk bytes at all. R6d measures bytes-per-token on this corpus; until
-/// then nothing here may be read as "overflow is unreachable", and the `max_tokens` fence stays a fence precisely
-/// because it is not.
+/// The largest sequence the configured model can attend to in one embedding: **8,192 tokens**, from Google's
+/// `embeddinggemma-2` card (read 2026-10-29). This is a model fact, not a product judgement — and it replaced an
+/// earlier ceiling of 32 768 that was justified by `max_position_embeddings = 262144`, a RoPE/train-length property
+/// the design has since disowned (`docs/design-m2-local-embeddings.md` §5). A bound above what the model can read is
+/// not generous, it is false: `validate_embeddings` would have gone on inviting `max_tokens = 16384` values that no
+/// runtime can honour.
 ///
-/// What is not a judgement is that **some** finite bound must exist at load: the budget sizes the work R6b1's
-/// runtime will take on for one sequence, so `max_tokens = 999999999` has to be refused as data rather than
-/// discovered by an allocator. Same posture as [`MAX_CONTINUATION_INDENT`] (F17 §4): enforce at load, refuse
-/// rather than clamp, and let serde's line/column stay accurate for the cases this check never sees.
-pub const MAX_EMBEDDING_TOKENS: usize = 32_768;
+/// The budget counts **what the model sees** — `prefix_doc` + chunk text + special tokens, because
+/// `include_prompt = true` means the counted sequence is not just our bytes — so a caller near this ceiling has to
+/// leave room for the prefix and specials too. [`crate::chunk`] caps a chunk at `MAX_CHUNK_BYTES = 1800`, which makes
+/// a four-digit-token sequence unlikely for prose; **unlikely is the whole claim** (§5's holes are named there:
+/// normalisation can expand bytes, `decode` emits U+FFFD runs, prefix and specials cost tokens from no chunk bytes).
+/// R6d measures bytes-per-token on this corpus.
+///
+/// Two honest limits on the number itself. It is **model-independent while the window is not**: 8,192 is the smallest
+/// window any model configured *today* may have, and a spec-named fallback (MiniLM, ~512 tokens) would need a smaller
+/// bound — so the follow-up is to move this check next to the provider rather than leave a global constant doing a
+/// per-model job. And it is a load-time fence only: R6b2 enforces it over real token counts. Posture unchanged from
+/// [`MAX_CONTINUATION_INDENT`] (F17 §4): enforce at load, refuse rather than clamp.
+pub const MAX_EMBEDDING_TOKENS: usize = 8_192;
 
 /// How the catalog (`INDEX.md` and its shards) is laid out.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -410,7 +412,10 @@ impl Config {
 fn validate_embeddings(cfg: &Config) -> Result<(), ConfigError> {
     if !(1..=MAX_EMBEDDING_TOKENS).contains(&cfg.embeddings.max_tokens) {
         return Err(invalid_data(format!(
-            "invalid embeddings.max_tokens = {} (must be between 1 and {MAX_EMBEDDING_TOKENS})",
+            "invalid embeddings.max_tokens = {}: this model attends to at most \
+             {MAX_EMBEDDING_TOKENS} tokens per embedding, and the budget counts prefix + chunk + special tokens \
+             (google/embeddinggemma-2 card, read 2026-10-29), so the value must be between 1 and \
+             {MAX_EMBEDDING_TOKENS}",
             cfg.embeddings.max_tokens
         )));
     }
