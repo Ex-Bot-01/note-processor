@@ -48,6 +48,7 @@ use thiserror::Error;
 
 use crate::catalog::{self, CatalogEntry};
 use crate::change::{classify_with_identities, Change, FileIdentities};
+use crate::chunk::{chunk, CHUNKER_VERSION};
 use crate::config::{abs_path, Config, ConfigError, MarkerConfig, WorkspaceRegistry};
 use crate::db::{self, Db, DbError, LIVE_EDGE, PROSE_ORIGIN};
 use crate::hash::{sha256_bytes, sha256_file, Snapshot};
@@ -72,6 +73,16 @@ const INDEX_FILES_KEY: &str = "index_files";
 /// were written with. Absent means "written before this mechanism existed", which is not a version to
 /// compare against and therefore refreshes; see the comparison in `refresh_needed`.
 pub const PARSE_VERSION_KEY: &str = "parse_version";
+/// `meta` key holding [`crate::chunk::CHUNKER_VERSION`] for the workspace's `chunks` rows — the value
+/// design-m2-embeddings §5 calls `EMBED_VERSION`, spelled by its role rather than by a second number,
+/// because the only definition it can describe is the chunker that cut those rows. Recording a second
+/// constant beside `CHUNKER_VERSION` would let the two disagree in the file while claiming one fact.
+///
+/// **Chunker coverage only.** The record answers "did this build's chunking reach every note it owed", and
+/// nothing else. Provider availability is not version debt (§5's P0, and the decision comment sits on
+/// `record_chunk_version` where it is taken): with the default `embeddings.provider = "none"` the key is
+/// recorded anyway, because a withheld key would be a coverage gap no user can clear.
+pub const EMBED_VERSION_KEY: &str = "embed_version";
 /// `meta` key holding what the **last scan** of this workspace could not index, beside what its registry
 /// currently duplicates.
 ///
@@ -349,7 +360,55 @@ fn unindexable_record(
 /// 4). What does fail is a workspace that cannot be opened at all, an unusable `data_dir`, and a catalog
 /// file that cannot be written.
 pub fn scan(root: &Path, cfg: &Config) -> Result<ScanReport, ScanError> {
-    scan_with_inject(root, cfg, |_| {})
+    let mut chunks = ChunkTally::default();
+    scan_inner(root, cfg, |_| {}, &mut chunks)
+}
+
+/// What one scan's chunk pass did, counted per live note.
+///
+/// It reaches no report and no serialised output: [`ScanReport`] stays the classification truth (and its
+/// JSON shape is pinned by the CLI tests). The tally exists so `tests/scan.rs` can assert §5's warm-pass
+/// property — a note whose rows already carry its digest costs **one indexed lookup and no cutting** — as
+/// counted work rather than as a duration, which is the only honest way to state it on a shared machine.
+/// A test that cannot see the work can only measure it, and a measurement of 2,000 small notes proves
+/// nothing about 18k ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkTally {
+    /// Live notes whose stored chunk rows were consulted — §5's one indexed lookup each. A warm scan
+    /// raises this and nothing else.
+    pub consulted: usize,
+    /// Notes actually handed to [`crate::chunk::chunk`], because no stored row carried their current
+    /// digest (or a row lagged behind [`crate::chunk::CHUNKER_VERSION`]). Zero is the warm-pass answer.
+    pub cut: usize,
+}
+
+/// What the write pass carries to every note: the marker set that decides which lines become items, and the
+/// tally of chunk work this scan did.
+///
+/// They travel together to `index_file` for every note in the corpus, so they are one parameter. Splitting them
+/// into two made `apply_changes` and `index_file` eight-argument functions, which `clippy::too_many_arguments`
+/// refuses at `-D warnings`; bundling is the fix rather than an `#[allow]`, because an argument list this long is
+/// a fact about the design — every future per-note knob would otherwise add a ninth and tenth line here.
+struct WritePass<'a> {
+    markers: &'a MarkerConfig,
+    /// Accumulated through the write pass so [`scan_counting_chunks`] can hand it to a test; the tally is not a
+    /// field of [`Written`] because `Written` describes rows, and this counts work (§5's warm-pass property).
+    chunks: &'a mut ChunkTally,
+}
+
+/// [`scan`] plus the chunk pass's tally, for `tests/scan.rs`.
+///
+/// Public and `doc(hidden)` for the same reason as [`scan_with_inject`]: nothing outside this crate should
+/// build on it, and the property it exists to prove (nothing cut, nothing written, version still recorded)
+/// is invisible from the report — the rows a warm scan leaves behind are byte-identical either way.
+#[doc(hidden)]
+pub fn scan_counting_chunks(
+    root: &Path,
+    cfg: &Config,
+) -> Result<(ScanReport, ChunkTally), ScanError> {
+    let mut chunks = ChunkTally::default();
+    let report = scan_inner(root, cfg, |_| {}, &mut chunks)?;
+    Ok((report, chunks))
 }
 
 /// [`scan`] with a hook run immediately after the walk and before anything is read.
@@ -362,6 +421,17 @@ pub fn scan_with_inject(
     root: &Path,
     cfg: &Config,
     after_walk: impl FnOnce(&Path),
+) -> Result<ScanReport, ScanError> {
+    let mut chunks = ChunkTally::default();
+    scan_inner(root, cfg, after_walk, &mut chunks)
+}
+
+/// The pipeline behind both public entry points, with the chunk tally it accumulates into.
+fn scan_inner(
+    root: &Path,
+    cfg: &Config,
+    after_walk: impl FnOnce(&Path),
+    chunks: &mut ChunkTally,
 ) -> Result<ScanReport, ScanError> {
     let started = Instant::now();
     // An empty data dir would send every derived path next to the current directory — a `workspaces/`
@@ -414,6 +484,11 @@ pub fn scan_with_inject(
     // edited since an older build ran would keep its old derived rows forever (F15).
     let stored = parse_version(&db)?;
     let refresh = refresh_needed(stored);
+    // The same question one definition over: are this workspace's `chunks` rows labelled with the chunker
+    // this build cuts with. Read before the write pass for the same reason — this scan both does the work
+    // and records what it did it under.
+    let stored_chunk_version = chunker_version(&db)?;
+    let chunk_refresh = chunker_refresh_needed(stored_chunk_version);
     let now = now_secs();
     let known = known_rows(&db, &walked.unreadable, &walked.unrepresentable, &snapshots)?;
     let changes =
@@ -437,10 +512,27 @@ pub fn scan_with_inject(
         refresh,
         now,
         !cfg!(windows),
-        &cfg.markers,
+        // Markers and the chunk tally travel as one bundle; see [`WritePass`].
+        &mut WritePass {
+            markers: &cfg.markers,
+            chunks,
+        },
     )?;
-    // Decided here, before anything else writes, from what the write pass actually delivered.
-    let record_version = refresh && refresh_covered(&written, hidden);
+    // Decided here, before anything else writes, from what the write pass actually delivered. One coverage
+    // answer serves both versions, because §5 reuses `refresh_covered`'s two sources **unchanged**: a note
+    // that escaped this scan escaped chunking too, and inventing a second coverage rule for chunks would be
+    // a second thing to keep honest for no extra fact.
+    let covered = refresh_covered(&written, hidden);
+    let record_version = refresh && covered;
+    // **Provider availability is not version debt** (design-m2-embeddings §5's P0). Nothing above or below
+    // this line asks whether an embedder exists, and that is the whole decision: if recording waited for a
+    // provider, then with `embeddings.provider = "none"` — the default (§2), what every install runs until
+    // a human picks a model — the key would never be recorded, the coverage record would read as a gap
+    // nobody can clear, and any later reader that treats a missing key as "the corpus was never cut" would
+    // re-cut ~18k notes on every scan forever. Re-chunking fails for no external reason, so it is coverage
+    // debt; whether a vector exists is a per-row fact (`chunks.source_hash`), reported as a bounded count,
+    // never inferred from an absent meta key.
+    let record_chunk_version = chunk_refresh && covered;
     // Resolution waits for that pass so a link can land on a file that only appeared in this scan, and
     // comes after the stale-marking so nothing resolves onto a note that just left the live set.
     store_note_links(&db, &written.parsed)?;
@@ -466,6 +558,11 @@ pub fn scan_with_inject(
         // refresh again rather than leave half the corpus labelled as current. An up-to-date database
         // writes nothing here, so the steady-state scan pays one `SELECT` and no extra `INSERT`.
         set_meta(&db, PARSE_VERSION_KEY, &PARSE_VERSION.to_string())?;
+    }
+    if record_chunk_version {
+        // Same transaction, same reason: a scan that died halfway must not leave the corpus labelled as
+        // cut by this build. A workspace already carrying the number writes nothing here.
+        set_meta(&db, EMBED_VERSION_KEY, &CHUNKER_VERSION.to_string())?;
     }
     tx.commit().map_err(DbError::from)?;
     // After the commit, so nothing is announced about a scan that rolled itself back — the same rule
@@ -1119,6 +1216,10 @@ fn display_spelled(paths: &[UnknownPath]) -> Vec<UnknownPath> {
 ///
 /// The pending map is keyed on bytes, like every other identity in the pass (F13 §4.1): keyed on display
 /// `rel`, two twins read back **the same change** from one slot whatever the columns are called.
+///
+/// `chunks` accumulates what the chunk pass did ([`ChunkTally`]). It is a parameter rather than a field of
+/// [`Written`] because the tally has to reach a caller through [`scan_counting_chunks`] while `Written` stays
+/// private, and one `&mut` says that more honestly than a second return path.
 fn apply_changes(
     db: &Db,
     found: &[Found],
@@ -1126,7 +1227,7 @@ fn apply_changes(
     refresh: bool,
     now: i64,
     case_sensitive: bool,
-    markers: &MarkerConfig,
+    pass: &mut WritePass<'_>,
 ) -> Result<Written, ScanError> {
     let mut written = Written::default();
     let pending: HashMap<&[u8], &Change> = changes
@@ -1151,7 +1252,7 @@ fn apply_changes(
         }
         // `Removed` is keyed on a path that is not in `found`, so it cannot reach this lookup.
         let change = pending.get(readable.snapshot.rel_bytes.as_slice()).copied();
-        match index_file(db, readable, change, refresh, now, case_sensitive, markers)? {
+        match index_file(db, readable, change, refresh, now, case_sensitive, pass)? {
             Indexed::Taken => {
                 written.skipped.push(rel.to_string());
                 // A note that lost an identity conflict keeps the rows it already had, so the refresh is
@@ -1238,6 +1339,9 @@ enum Indexed {
 
 /// Bring one found file's row up to date and re-index its contents when they changed, or when `refresh`
 /// says the rules that wrote its derived rows are no longer this build's.
+///
+/// A note's chunks are refreshed on the same pass and inside the same transaction (§5: cheap, and atomic
+/// with the note rows) — see [`refresh_chunks`] for the order that work is decided in.
 fn index_file(
     db: &Db,
     readable: &Found,
@@ -1245,7 +1349,7 @@ fn index_file(
     refresh: bool,
     now: i64,
     case_sensitive: bool,
-    markers: &MarkerConfig,
+    pass: &mut WritePass<'_>,
 ) -> Result<Indexed, ScanError> {
     let snapshot = &readable.snapshot;
     let path = path_of(snapshot);
@@ -1310,9 +1414,17 @@ fn index_file(
         if rewritten || existing.is_none() {
             let doc = parse_markdown(text, file_stem(&path.rel));
             let links = doc.links.clone();
-            let items = extract_items(text, markers);
-            store_note(db, &path, existing, text, &doc, &items, readable.lossy)?;
+            let items = extract_items(text, pass.markers);
+            let id = store_note(db, &path, existing, text, &doc, &items, readable.lossy)?;
+            refresh_chunks(db, id, text, &snapshot.hash, &mut *pass.chunks)?;
             return Ok(Indexed::Done(Some((path, links))));
+        }
+        // Reached only when a note row exists and nothing re-parsed it: `existing` is therefore `Some`,
+        // because `rewritten || existing.is_none()` took every `None` above. The bytes did not move —
+        // `hash_changed` sits inside `rewritten` (A4) — but the stored chunk rows can still lag the chunker,
+        // which only [`db::chunk_state`] can see, so this arm consults it rather than assuming.
+        if let Some(id) = existing {
+            refresh_chunks(db, id, text, &snapshot.hash, &mut *pass.chunks)?;
         }
     } else {
         // Nothing to parse, so this is an attachment. Any note row still sitting on this path is a
@@ -1450,6 +1562,8 @@ fn folded_row(db: &Db, case_bytes: &[u8], rel_bytes: &[u8]) -> Result<Option<Rel
 /// `existing` is `None`, [`db::insert_note`] mints the id itself, so none is needed after the write either —
 /// and that call is where the note's byte key is written, not here (see its doc for why the insert lives in
 /// `db`).
+/// Returns the `notes.id` the row was written under — the id a re-parse keeps — because the chunk pass that
+/// follows hangs its rows off it and must not look it up a second time (F10's rule about a duplicated read).
 fn store_note(
     db: &Db,
     path: &RelPath,
@@ -1458,7 +1572,7 @@ fn store_note(
     doc: &NoteDoc,
     items: &[ItemCandidate],
     lossy: bool,
-) -> Result<(), DbError> {
+) -> Result<i64, DbError> {
     let encoding = if lossy { ENCODING_LOSSY } else { ENCODING_UTF8 };
     // The body is what the author wrote below any recognised frontmatter block: the metadata above it is
     // already stored as title, tags and title source, and [`body_start`] is the shared decision about
@@ -1529,6 +1643,46 @@ fn store_note(
             item.marker
         ])?;
     }
+    Ok(id)
+}
+
+/// Cut one note into chunks when its stored rows no longer describe its bytes.
+///
+/// **The order is the whole point** (design-m2-embeddings §5): [`db::chunk_state`] is consulted **first**, and
+/// only a note whose rows carry no single digest — none at all, a digest other than `note_digest`, or a row
+/// behind [`CHUNKER_VERSION`] — goes on to be cut. Nothing is re-read either: `text` is the string [`read_one`]
+/// decoded once for the parser (leading BOM stripped, bytes UTF-8 cannot hold replaced), which is exactly the
+/// domain §4 defines the offsets over. Cutting first and asking afterwards would slice every unchanged note in
+/// the vault on every warm scan to arrive at rows that are already there — the failure mode §5 exists to
+/// prevent — which is why [`ChunkTally::cut`] is asserted rather than timed.
+///
+/// `note_digest` is `files.hash`: the digest of the bytes on disk, BOM included ([`read_one`]). The offsets
+/// stay over the decoded text (§4), and that is not a contradiction: decoding is a pure function of those
+/// bytes, so one file digest still states exactly which decoded text these rows were cut from — and it is the
+/// only digest this call can compare without opening the file again.
+///
+/// **A note with nothing to cut has no rows to stamp**, so [`db::chunk_state`] answers `None` for it forever
+/// and it pays one indexed lookup plus an empty cut on every scan. §5's warm-pass property is about the notes
+/// that have rows; a blank note cuts nothing, writes nothing, and stays cheap in the way that matters.
+fn refresh_chunks(
+    db: &Db,
+    note_id: i64,
+    text: &str,
+    note_digest: &str,
+    chunks: &mut ChunkTally,
+) -> Result<(), DbError> {
+    chunks.consulted += 1;
+    // The texts are read for the embed round, which compares them chunk by chunk. Here only the digest arm
+    // decides, and `None` means "these rows describe no single set of bytes" — never "this note has none".
+    let (stamped, _) = db::chunk_state(db, note_id)?;
+    if stamped.as_deref() == Some(note_digest) {
+        return Ok(());
+    }
+    chunks.cut += 1;
+    let cut = chunk(text);
+    // No transaction of its own: `db::write_chunks_for_note` writes through the caller's handle, which here
+    // is the scan's single write transaction — §5 requires chunk rows to be atomic with the note rows.
+    db::write_chunks_for_note(db, note_id, &cut, note_digest)?;
     Ok(())
 }
 
@@ -1853,6 +2007,25 @@ fn parse_version(db: &Db) -> Result<Option<u32>, DbError> {
 /// full re-parse is cheap next to a catalog that quietly disagrees with the code that renders it.
 fn refresh_needed(stored: Option<u32>) -> bool {
     stored != Some(PARSE_VERSION)
+}
+
+/// The chunker version this workspace recorded under [`EMBED_VERSION_KEY`].
+///
+/// `None` covers an absent key and a value this build cannot read, exactly as [`parse_version`] does: both
+/// mean the rows carry no label worth trusting. Note what this number does **not** decide — which notes to
+/// re-cut. That is per row, from `chunks.chunker` and `chunks.source_hash`, via [`db::chunk_state`]; this key
+/// is the durable statement that the pass reached everything it owed.
+fn chunker_version(db: &Db) -> Result<Option<i64>, DbError> {
+    Ok(meta_value(db, EMBED_VERSION_KEY)?.and_then(|value| value.trim().parse().ok()))
+}
+
+/// Whether this scan has to record [`CHUNKER_VERSION`] afresh.
+///
+/// Equality and nothing else means up to date; a *higher* stored value is rewritten too, for the reason
+/// [`refresh_needed`] gives. Unlike the parse comparison this asks no work of its own: a row behind the
+/// chunker is stale on its own account ([`db::chunk_state`] reports it) whether or not the key lags.
+fn chunker_refresh_needed(stored: Option<i64>) -> bool {
+    stored != Some(CHUNKER_VERSION)
 }
 
 /// Whether a refresh reached every note it owed new derived rows.
@@ -2332,8 +2505,8 @@ mod tests {
     use super::{
         apply_changes, folded_row, is_unknown_path, known_rows, np_published, refresh_covered,
         remove_corpses, remove_file, report_refresh, report_refresh_gap, skipped_lines,
-        strip_marked_removals, under_unreadable, unindexable_record, unresolved_ambiguity, Found,
-        UnknownPath, Written, NAME_CAP, PARSE_VERSION,
+        strip_marked_removals, under_unreadable, unindexable_record, unresolved_ambiguity,
+        ChunkTally, Found, UnknownPath, WritePass, Written, NAME_CAP, PARSE_VERSION,
     };
     use crate::catalog::{HEADER, HEADER_CRLF};
     use crate::change::{classify, Change};
@@ -3153,7 +3326,10 @@ mod tests {
             true,
             1,
             true,
-            &MarkerConfig::default(),
+            &mut WritePass {
+                markers: &MarkerConfig::default(),
+                chunks: &mut ChunkTally::default(),
+            },
         )
         .expect("the write pass runs over the twin this scan read");
         assert_eq!(
@@ -3189,7 +3365,10 @@ mod tests {
             true,
             1,
             true,
-            &MarkerConfig::default(),
+            &mut WritePass {
+                markers: &MarkerConfig::default(),
+                chunks: &mut ChunkTally::default(),
+            },
         )
         .expect("the write pass runs over an unreadable twin");
         assert_eq!(

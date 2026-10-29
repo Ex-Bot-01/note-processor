@@ -11,10 +11,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use np_core::catalog;
-use np_core::config::{CatalogConfig, Config};
+use np_core::chunk::{chunk, CHUNKER_VERSION};
+use np_core::config::{CatalogConfig, Config, EmbeddingProvider};
 use np_core::db::{self, Db, NoteCounts};
 use np_core::hash::sha256_file;
 use np_core::parse::PARSE_VERSION;
+use np_core::scan::scan_counting_chunks;
 use np_core::{scan, scan_with_inject};
 use tempfile::TempDir;
 
@@ -5083,5 +5085,512 @@ fn an_unmerged_duplicate_pair_still_charges_the_refresh_and_withholds_the_versio
         ),
         ["Legacy second".to_string()],
         "the planted row keeps what it was written with"
+    );
+}
+
+// =============================================================================================
+// M2a Round 3b-ii — the scan writes `chunks`, and §5's cheap path decides that from the database.
+//
+// What is under test is an **order of work**, not a duration: `db::chunk_state` is consulted first, and only
+// a note whose rows carry no single current digest reaches `chunk::chunk`. The distinction is invisible in
+// the rows — a scan that sliced every unchanged note and then wrote nothing lands on byte-identical rows —
+// so these cases read the scan's own tally through `scan_counting_chunks`. A timing claim would be the wrong
+// instrument: it would pass on a quiet machine over 2,000 tiny notes and say nothing about the ~18k-chunk
+// vault design-m2-embeddings §5 is written for.
+// =============================================================================================
+
+/// Prose of `paragraphs` markdown blocks, each roughly 600 bytes, separated by blank lines.
+///
+/// Sized on purpose: [`np_core::chunk::MAX_CHUNK_BYTES`] is 1800 and a chunk's span includes the separators,
+/// so two of these blocks fit and a third does not — the notes below really do hold several chunk rows, which
+/// the cases that care about ordinals assert as a premise rather than assume.
+fn prose(paragraphs: usize) -> String {
+    (0..paragraphs)
+        .map(|index| {
+            format!(
+                "Paragraph {index}: {}\n\n",
+                "lorem ipsum dolor sit amet ".repeat(22)
+            )
+        })
+        .collect()
+}
+
+/// Lowercase bytes as the two uppercase hex digits SQLite's `hex()` produces, so a chunk cut in Rust can be
+/// compared against the BLOB stored for it.
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+/// One note's chunk rows as `ordinal start-end HEX(text)`, in ordinal order — the shape [`chunk`] can be
+/// compared against row for row.
+fn chunk_rows_for(open: &Db, rel: &str) -> Vec<String> {
+    texts(
+        open,
+        &format!(
+            "SELECT c.ordinal || ' ' || c.byte_start || '-' || c.byte_end || ' ' || hex(c.text)
+               FROM chunks c JOIN notes n ON n.id = c.note_id
+              WHERE n.rel = '{rel}' ORDER BY c.ordinal"
+        ),
+    )
+}
+
+/// Every chunk row in the workspace with the facts a rescan must not move, **`chunks.id` included**: §5's
+/// "re-embed only what moved" is a promise about row *identity*, so an id belongs in the comparison even
+/// though nothing outside this file reads it.
+fn all_chunk_rows(open: &Db) -> Vec<String> {
+    texts(
+        open,
+        "SELECT note_id || '@' || id || '#' || ordinal || ' ' || chunker || ' ' || byte_start || '-'
+                || byte_end || ' ' || hex(text) || ' @' || source_hash
+           FROM chunks ORDER BY note_id, ordinal",
+    )
+}
+
+/// The recorded chunker version, as the database holds it now. `None` is a workspace that never recorded one
+/// — which is what [`np_core::scan::EMBED_VERSION_KEY`] looks like before this round existed.
+fn recorded_chunk_version(open: &Db) -> Option<i64> {
+    open.0
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [np_core::scan::EMBED_VERSION_KEY],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Record `version` as the chunker this workspace's rows were cut with, whether or not a scan wrote a value:
+/// the fixture is hand-built. Writing a *different* number is exactly what bumping `CHUNKER_VERSION` looks
+/// like from the scan's side.
+fn record_chunk_version(open: &Db, version: i64) {
+    open.0
+        .execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![np_core::scan::EMBED_VERSION_KEY, version.to_string()],
+        )
+        .expect("test setup: record the lagging chunker version");
+    assert_eq!(
+        recorded_chunk_version(open),
+        Some(version),
+        "test setup: the lag is in place"
+    );
+}
+
+/// A stored chunker version this build must treat as out of date, without assuming [`CHUNKER_VERSION`] is
+/// nonzero — resetting that constant to 0 would underflow every fixture below into "up to date".
+fn stale_chunk_version() -> i64 {
+    CHUNKER_VERSION
+        .checked_sub(1)
+        .unwrap_or(CHUNKER_VERSION + 1)
+}
+
+/// Assert one note's stored rows are exactly what [`chunk`] produces for the **decoded** text, stamped with
+/// the digest of the raw file bytes.
+///
+/// The two spellings are the point: `bom.md` starts with a BOM, so an implementation that sliced the file's
+/// own bytes would report offsets three higher than these (§4's domain is the decoded text), while an
+/// implementation that stamped the decoded text would report a digest no `files.hash` comparison can produce.
+fn assert_chunks_match_the_chunker(ws: &Workspace, rel: &str) {
+    let path = ws.root.join(rel);
+    let raw = fs::read(&path).expect("test: read the note");
+    let stripped = strip_bom(&raw);
+    let text = String::from_utf8(stripped.to_vec())
+        .expect("test: the fixture is valid UTF-8 after the BOM");
+    let expected: Vec<String> = chunk(&text)
+        .iter()
+        .map(|piece| {
+            format!(
+                "{} {}-{} {}",
+                piece.ordinal,
+                piece.byte_start,
+                piece.byte_end,
+                hex_upper(piece.text.as_bytes())
+            )
+        })
+        .collect();
+    let db = ws.db();
+    assert_eq!(
+        chunk_rows_for(&db, rel),
+        expected,
+        "{rel}: the rows are `chunk`'s own output over the decoded text"
+    );
+    assert!(
+        !expected.is_empty(),
+        "test setup: {rel} has to hold at least one chunk for this to assert anything"
+    );
+    let digests = texts(
+        &db,
+        &format!(
+            "SELECT DISTINCT c.source_hash FROM chunks c JOIN notes n ON n.id = c.note_id WHERE n.rel = '{rel}'"
+        ),
+    );
+    assert_eq!(
+        digests,
+        vec![sha256_file(&path).expect("test: hash the note")],
+        "{rel}: every row is stamped with the digest of the bytes on disk, BOM included"
+    );
+}
+
+/// The file's bytes without a leading UTF-8 BOM — the same spelling `scan`'s private `decode` hands the
+/// parser, restated here because the test has to know what the chunker was given.
+fn strip_bom(bytes: &[u8]) -> &[u8] {
+    match bytes {
+        [0xef, 0xbb, 0xbf, rest @ ..] => rest,
+        whole => whole,
+    }
+}
+
+/// §5's cheap path, asserted as counted work: every live note costs one indexed lookup on a warm scan and
+/// **none** of them is cut.
+///
+/// Production mutation this pins: cutting the text before consulting `db::chunk_state` (or comparing the
+/// digest after the fact) puts `cut` at two here while leaving the rows byte-identical, which is exactly why
+/// no row-level assertion can stand in for it.
+#[test]
+fn a_warm_scan_consults_every_note_and_cuts_none_of_them() {
+    let ws = scratch(
+        &[
+            ("long.md", &prose(9)),
+            (
+                "bom.md",
+                "\u{feff}# Bom\n\nText with umlauts äöü and emoji 🎉, one block.\n",
+            ),
+        ],
+        50,
+    );
+
+    let (report, first) = scan_counting_chunks(&ws.root, &ws.cfg).expect("first scan");
+    assert_eq!((report.added as i64, report.notes), (2, 2), "{report:?}");
+    assert_eq!(
+        first.consulted, 2,
+        "one `chunk_state` lookup per live note is the whole bill a note owes"
+    );
+    assert_eq!(
+        first.cut, 2,
+        "a first scan has to cut what it indexes: nothing on disk can carry a digest yet"
+    );
+
+    // The domain and the stamp, checked against the pure chunker rather than against another scan.
+    assert_chunks_match_the_chunker(&ws, "long.md");
+    assert_chunks_match_the_chunker(&ws, "bom.md");
+    let db = ws.db();
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT byte_start FROM chunks c JOIN notes n ON n.id = c.note_id WHERE n.rel = 'bom.md' ORDER BY c.ordinal LIMIT 1"
+        ),
+        0,
+        "offsets index the decoded text: the file's first three bytes are the BOM, so an offset into the \
+         file would read 3 (§4)"
+    );
+    let rows = all_chunk_rows(&db);
+    assert!(
+        rows.len() >= 5,
+        "test premise: `prose(9)` has to span several chunks, got {rows:?}"
+    );
+    drop(db);
+
+    let (report, warm) = scan_counting_chunks(&ws.root, &ws.cfg).expect("warm scan");
+    assert_eq!(
+        (
+            report.added,
+            report.modified,
+            report.moved,
+            report.removed,
+            report.unchanged
+        ),
+        (0, 0, 0, 0, 2),
+        "nothing on disk moved: {report:?}"
+    );
+    assert_eq!(
+        warm.consulted, 2,
+        "the cheap path still asks the database once per note — that lookup is the property, not overhead"
+    );
+    assert_eq!(
+        warm.cut, 0,
+        "an unchanged note must never reach `chunk`: slicing before consulting `chunk_state` lands here"
+    );
+    let db = ws.db();
+    assert_eq!(
+        all_chunk_rows(&db),
+        rows,
+        "and the rows it did not write are byte-identical, ids included"
+    );
+}
+
+/// §5's P0, pinned on the shipping configuration: with `embeddings.provider = "none"` — what every install
+/// holds until a human picks a model — the chunker version is recorded anyway and nothing is re-cut.
+///
+/// Production mutation this pins: gating `record_chunk_version` on a provider existing (or on a vector having
+/// been written) leaves [`np_core::scan::EMBED_VERSION_KEY`] absent after both scans, which is the state that
+/// makes an install without a model chase its own corpus forever.
+#[test]
+fn the_default_provider_records_the_chunker_version_and_re_cuts_nothing() {
+    let ws = scratch(&[("a.md", &prose(3))], 50);
+    assert_eq!(
+        ws.cfg.embeddings.provider,
+        EmbeddingProvider::None,
+        "test premise: this is the default configuration, not a configured one"
+    );
+
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let db = ws.db();
+    assert_eq!(
+        recorded_chunk_version(&db),
+        Some(CHUNKER_VERSION),
+        "a first scan records coverage with no provider installed, no model chosen and no HTTP client built"
+    );
+    let rows = all_chunk_rows(&db);
+    drop(db);
+
+    let (report, warm) = scan_counting_chunks(&ws.root, &ws.cfg).expect("second scan");
+    assert_eq!(report.unchanged, 1, "{report:?}");
+    assert_eq!(
+        (warm.consulted, warm.cut),
+        (1, 0),
+        "zero chunk rows written: `ChunkWrite::default()` for the note"
+    );
+    let db = ws.db();
+    assert_eq!(
+        recorded_chunk_version(&db),
+        Some(CHUNKER_VERSION),
+        "the warm scan neither re-chunks nor withholds the version"
+    );
+    assert_eq!(all_chunk_rows(&db), rows, "and it writes nothing at all");
+}
+
+/// Coverage source 1 — a path that changed between the walk and the read. The write pass skips its marker, so
+/// the chunker version must not be recorded over it; the retry then cuts exactly the note that moved.
+#[test]
+fn a_note_that_moved_between_walk_and_read_withholds_the_chunker_version() {
+    let ws = scratch(&[("a.md", &prose(2)), ("b.md", &prose(2))], 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let stale = stale_chunk_version();
+    let db = ws.db();
+    record_chunk_version(&db, stale);
+    drop(db);
+
+    scan_with_inject(&ws.root, &ws.cfg, |root| {
+        fs::write(root.join("b.md"), prose(3)).expect("test: rewrite b.md after the walk");
+    })
+    .expect("a file changed mid-scan is skipped, not fatal");
+    assert_eq!(
+        recorded_chunk_version(&ws.db()),
+        Some(stale),
+        "one escaped note withholds the version: coverage means every note it owed"
+    );
+
+    let (report, retry) = scan_counting_chunks(&ws.root, &ws.cfg).expect("the next scan retries");
+    assert_eq!(report.modified, 1, "{report:?}");
+    assert_eq!(
+        (retry.consulted, retry.cut),
+        (2, 1),
+        "the retry consults both notes and cuts only the one whose bytes moved"
+    );
+    assert_eq!(
+        recorded_chunk_version(&ws.db()),
+        Some(CHUNKER_VERSION),
+        "and once the corpus is covered the version lands"
+    );
+}
+
+/// Coverage source 2 — a live row behind a directory this scan could not enter. Same charge as an unreadable
+/// file, and it clears when the obstruction does.
+#[cfg(unix)]
+#[test]
+fn a_live_row_behind_an_unreadable_directory_withholds_the_chunker_version() {
+    let ws = scratch(
+        &[("keep/one.md", &prose(2)), ("blocked/two.md", &prose(2))],
+        50,
+    );
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let stale = stale_chunk_version();
+    let db = ws.db();
+    record_chunk_version(&db, stale);
+    drop(db);
+
+    let blocked = ws.root.join("blocked");
+    let guard = deny_access(&blocked);
+    assert!(
+        denied(&blocked),
+        "test premise: this runner really was denied (not coverage)"
+    );
+    scan(&ws.root, &ws.cfg).expect("an unreadable directory is a loss, not a failure");
+    assert_eq!(
+        recorded_chunk_version(&ws.db()),
+        Some(stale),
+        "a live row this scan could not look at cannot be labelled as re-cut (F15's rule, reused)"
+    );
+
+    drop(guard);
+    scan(&ws.root, &ws.cfg).expect("the scan after the obstruction clears");
+    assert_eq!(
+        recorded_chunk_version(&ws.db()),
+        Some(CHUNKER_VERSION),
+        "and the charge is not permanent: it clears with the directory"
+    );
+}
+
+/// §5's third bullet, end to end: an edit near the top of a note **keeps every chunk row**, so the vector
+/// hanging off an untouched ordinal survives it.
+///
+/// Two production mutations die here. A blanket `DELETE FROM chunks WHERE note_id = ?` before re-inserting
+/// mints new ids, `ON DELETE CASCADE` takes the vector with them, and both assertions below go red; writing
+/// the rows outside the scan's transaction is pinned by
+/// [`chunk_rows_are_durable_with_the_note_rows_and_not_after_the_catalog`] instead.
+#[test]
+fn an_edit_near_the_top_keeps_every_chunk_row_and_the_vector_on_one() {
+    let ws = scratch(&[("a.md", &prose(9))], 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+
+    let db = ws.db();
+    let before: Vec<String> = texts(
+        &db,
+        "SELECT ordinal || '@' || id FROM chunks ORDER BY ordinal",
+    );
+    assert!(
+        before.len() >= 3,
+        "test premise: the note has to span several chunks, got {before:?}"
+    );
+    db.0.execute(
+        "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+         VALUES ('m@1', 2, NULL, '', '', 1)",
+        [],
+    )
+    .expect("test setup: model row");
+    let last_id: i64 = before
+        .last()
+        .and_then(|row| row.split('@').nth(1))
+        .and_then(|id| id.parse().ok())
+        .expect("test setup: the highest ordinal has a chunk id");
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'0000000000000000', 'whatever-the-chunk-said', 1)",
+        [last_id],
+    )
+    .expect("test setup: a vector for the last chunk");
+    drop(db);
+
+    // One wordier first paragraph: same block count, different length, so every offset behind it moves.
+    let edited = prose(9).replacen(
+        "Paragraph 0:",
+        "Paragraph zero, rewritten at greater length:",
+        1,
+    );
+    assert_ne!(
+        edited,
+        prose(9),
+        "test premise: the edit changes the note's bytes"
+    );
+    fs::write(ws.root.join("a.md"), &edited).expect("test: write the edited note");
+    scan(&ws.root, &ws.cfg).expect("scan of the edited note");
+
+    let db = ws.db();
+    let after: Vec<String> = texts(
+        &db,
+        "SELECT ordinal || '@' || id FROM chunks ORDER BY ordinal",
+    );
+    assert_eq!(
+        after, before,
+        "same ordinals, same `chunks.id`s — §5's re-embed-only-what-moved is a promise about row identity"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM embeddings"),
+        1,
+        "the vector survived the edit: a blanket delete would have cascaded it away"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM embeddings e JOIN chunks c ON c.id = e.chunk_id WHERE e.chunk_id = {last_id}")
+        ),
+        1,
+        "and it still hangs off the same row"
+    );
+}
+
+/// Chunk rows are durable **with** the note rows: a scan whose catalog write fails after the commit has left
+/// the chunks behind too, because they were in the same transaction.
+///
+/// Production mutation this pins: moving `write_chunks_for_note` after `tx.commit()` leaves the note row
+/// updated and its chunk rows describing the old bytes — a database that disagrees with itself, which is what
+/// §5 means by "must be atomic with the note rows". The write pass refusing to touch a path at all is pinned
+/// by [`a_refused_note_gets_no_chunk_work`].
+#[cfg(unix)]
+#[test]
+fn chunk_rows_are_durable_with_the_note_rows_and_not_after_the_catalog() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ws = scratch(&[("a.md", &prose(2))], 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let before = all_chunk_rows(&ws.db());
+
+    fs::write(ws.root.join("a.md"), prose(4)).expect("test: edit the note");
+    // Read and execute stay: the walk must still see the workspace. Only writes are refused, which is what
+    // makes `write_index_files` — the step after the commit — the thing that fails.
+    let mode = fs::metadata(&ws.root)
+        .expect("test setup: read the root's mode")
+        .permissions()
+        .mode()
+        & 0o7777;
+    fs::set_permissions(&ws.root, fs::Permissions::from_mode(0o500))
+        .expect("test: chmod 500 the root");
+    let failure = scan(&ws.root, &ws.cfg).err().unwrap_or_else(|| {
+        // Restore before failing, or the tempdir cleaner inherits an unremovable tree.
+        let _ = fs::set_permissions(&ws.root, fs::Permissions::from_mode(mode));
+        panic!("a workspace root that refuses writes has to fail the scan")
+    });
+    fs::set_permissions(&ws.root, fs::Permissions::from_mode(mode))
+        .expect("test: restore the root");
+
+    assert!(
+        matches!(failure, scan::ScanError::Io { .. }),
+        "and it fails on the catalog, not somewhere earlier: {failure:?}"
+    );
+
+    let db = ws.db();
+    let digest = sha256_file(&ws.root.join("a.md")).expect("test: hash the edited note");
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM chunks c JOIN notes n ON n.id = c.note_id WHERE n.rel = 'a.md' \
+                 AND c.source_hash <> '{digest}'"
+            )
+        ),
+        0,
+        "every chunk row of the edited note carries the new digest: they committed with the note row"
+    );
+    assert!(
+        all_chunk_rows(&db) != before,
+        "premise: the edit really did change those rows"
+    );
+}
+
+/// A path whose note rows refuse a winner gets no chunk work at all — nothing was written for it, so nothing
+/// may be stamped as current for it.
+#[test]
+fn a_refused_note_gets_no_chunk_work() {
+    let ws = scratch(&[("dup.md", &prose(2))], 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let db = ws.db();
+    plant_legacy_pair(&db, "dup.md");
+    let rows = all_chunk_rows(&db);
+    drop(db);
+
+    let (report, tally) =
+        scan_counting_chunks(&ws.root, &ws.cfg).expect("a legacy pair must not fail the scan");
+    assert_eq!(report.skipped, vec!["dup.md".to_string()], "{report:?}");
+    assert_eq!(
+        (tally.consulted, tally.cut),
+        (0, 0),
+        "no note row was rewritten, so no chunk rows were consulted or written for it"
+    );
+    assert_eq!(
+        all_chunk_rows(&ws.db()),
+        rows,
+        "and the rows that exist keep what an earlier scan wrote"
     );
 }
