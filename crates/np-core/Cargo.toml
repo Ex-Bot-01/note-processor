@@ -3,6 +3,21 @@ name = "np-core"
 version.workspace = true
 edition.workspace = true
 
+# `local-model` is the gate the local inference runtime lives behind
+# (`docs/design-m2-local-embeddings.md` §2, §6). It declares no dependency and gates no code **yet**,
+# which is the point of landing it in R6a: R6b0 adds the pinned `llama-cpp-2` binding under this name,
+# and a default `cargo test --workspace` must never grow a C++ build or a new required dependency
+# (§2's "Feature-gating (`np-core/local-model`) keeps default `cargo test --workspace` free of a C++
+# build"). The seam itself — `embed::LocalModelProvider` — compiles in the default build on purpose, so
+# CI and callers exercise the API while the runtime is still being chosen (§9 item 1).
+#
+# `cargo check --locked -p np-core --features local-model` is therefore a per-OS compile fence today
+# (§6: "One CI step per OS row") and becomes the fence that *matters* the moment R6b0 puts weights code
+# behind it. Release builds keep it off until a Windows build of it has been recorded in CI once (§2).
+[features]
+default = []
+local-model = []
+
 [dependencies]
 regex = { workspace = true }
 rusqlite = { workspace = true }
