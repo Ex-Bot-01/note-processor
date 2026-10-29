@@ -1,8 +1,8 @@
 # M2a Round 4a — `np models install`: pin a model artifact without a network path
 
-Date 2026-10-29. Branch `m12/embeddings` (`be78415`). Parent design:
-`docs/design-m2-embeddings.md` §2 (provider stays `none` by default), §3 (`models` table, migration 7), §6
-(benchmark order and the secret rule).
+Date 2026-10-29, revised same day after design review (verdict: blocked → corrections below). Branch
+`m12/embeddings` (`06302c4`). Parent design: `docs/design-m2-embeddings.md` §2 (provider stays `none` by default),
+§3 (`models` table, migration 7), §5 (transaction rule), §6 (benchmark order and the secret rule).
 
 ## 1. Why this round exists, and why it is cut here
 
@@ -11,110 +11,174 @@ foreign key to it. So today **nothing can be embedded even if a provider existed
 on the table, and no way to put an artifact on disk that the row could name. This round supplies exactly that, from
 the side that needs no network and no model decision.
 
-The cut is deliberate. The remaining M2a work splits cleanly:
+The cut is deliberate:
 
-- **4a (this design)** — install a file the human already has, verify it, record it. Testable offline, on CI, with no
+- **4a (this design)** — install a file the human already has, verify it, record it. Offline, CI-testable, no
   credentials, and it changes nothing about a workspace that never runs the command.
 - **4b** — transport (HTTP) and the benchmark. Both need facts I do not have: whether the self-hosted server serves
-  `/v1/embeddings` at all, which model, and what its vectors are worth. Design §6 makes the benchmark gate the model
-  choice, so writing an HTTP client first would be choosing the answer by convenience.
+  `/v1/embeddings` at all, which model, what its vectors are worth. §6 makes the benchmark gate the model choice, so
+  writing an HTTP client first would choose the answer by convenience.
 
-Environment facts this cut rests on (checked 2026-10-29 on `pi`, euid 1000): `NP_EMBED_BASE_URL` and `NP_EMBED_API_KEY`
-are **unset**; ~9.1 GB free on `/home`; egress to github.com answers; no HTTP client is currently a dependency of any
-crate in this workspace.
+**Deliberate deviation from the spec, recorded rather than hidden.** `spec:88` and `spec:236` describe
+`np models install` as *fetching* an artifact and slicing it into the data dir. 4a installs a local file only. §9 asks
+whether it ever accepts a URL; until that is answered this stands as a deviation from those two spec lines, not as
+their implementation.
+
+Environment facts this cut rests on (checked 2026-10-29 on `pi`, euid 1000): `NP_EMBED_BASE_URL` and
+`NP_EMBED_API_KEY` are **unset**; ~9.1 GB free on `/home`; egress to github.com answers; no HTTP client is a
+dependency of any crate here (np-cli depends on clap, np-core, serde_json — `rusqlite` is dev-only, used by
+`tests/cli.rs`).
 
 ## 2. Command surface
 
 ```
-np models install --id <id> --path <file> --dim <n> --sha256 <hex> [--prefix-doc <s>] [--prefix-query <s>]
+np models install <workspace> --id <id> --path <file> --dim <n> --sha256 <hex>
+                            [--prefix-doc <s>] [--prefix-query <s>] [--json]
 np models hash <file>
-np models list
+np models list <workspace> [--json]
 ```
 
+- **`<workspace>` is required on `install` and `list`.** This is the review's P0 and it was right: `models` lives in
+  the **per-workspace** database (`Config::workspace_db`, `config.rs:287-293`, which derives
+  `<data_dir>/workspaces/<hash-of-abs-path>.sqlite`; migration 7 creates the table there). The registry database
+  holds only `workspaces`. A command with no workspace operand cannot resolve a database at all, and a global artifact
+  directory next to per-workspace rows would let workspace B's install rename over the file workspace A's row names.
+  So both the row and the artifact are scoped to one workspace (§4). `hash` stays path-only — it touches no database.
 - **`--sha256` is mandatory for `install`.** The point of the row is that a vector written against model `X` can be
-  trusted to come from bytes `X`. A human who downloaded an artifact and does not know its digest gets it from
-  `np models hash <file>` and pastes it into the next command — two steps, both honest, instead of one command that
-  records a checksum it just computed from the same file it is installing (which pins nothing).
-- **`--dim` is declared by the human, not probed.** Probing needs to run the model, which is Round 4b's machinery and,
-  for an endpoint, a network call. A wrong `--dim` is caught later by the provider seam's `DimensionMismatch` — and
-  that path is currently raw-`DbError` debt (round 3b review), recorded here rather than silently fixed sideways.
-- **`--id`** must match `[a-z0-9][a-z0-9._@-]{0,63}` and is the `models.id` primary key. The charset is not cosmetic:
-  the id lands in a filename (§4), so a `/` or a leading `.` would be a path-traversal bug wearing a UI hat.
-- **No `--force`.** Replacing a model identity is exactly the operation that invalidates every vector stored against
-  it, and this project's answer to "silently make past work meaningless" has been refusal every time (F13, F19, F23).
+  trusted to come from bytes `X`. A human who does not know a digest gets it from `np models hash <file>` and pastes
+  it into `install` — two honest steps instead of one command that records a checksum it computed from the very file
+  it is installing, which pins nothing.
+- **`--dim` is declared by the human, not probed**, and is bounded: it parses as `u16`, so `0` is refused (a dim-0 row
+  admits zero-byte vectors that satisfy migration 7's `length(vector) = 4 * dim`) and anything above `65535` is
+  refused naming that ceiling. This matches the width already chosen for the same quantity in
+  `EmbeddingsConfig::dim: Option<u16>`. Refusing CLI-side keeps §6's "no new migration". A *wrong* dim is caught later
+  by `EmbedError::DimensionMismatch` — and that write path is currently raw-`DbError` debt (round 3b review), recorded
+  here rather than fixed sideways.
+- **`--id`** must match `[a-z0-9][a-z0-9._@-]{0,63}`, **not end in `.`**, and not be a Windows reserved device name
+  (`con prn aux nul com1-9 lpt1-9`, with or without a suffix). The charset is not cosmetic — the id becomes a
+  filename. Trailing `.` is legal on POSIX and stripped by NTFS, so `foo` and `foo.` would be two BINARY-distinct rows
+  over one artifact; a reserved name is a row whose file cannot exist. Uppercase is already rejected, which is why
+  there is no case-collision finding to make: `models.id` compares with BINARY collation while NTFS names do not, and
+  the charset is what keeps those two notions from disagreeing.
+- **No `--force`.** Replacing a model identity invalidates every vector stored against it; this project refuses that
+  (F13, F19, F23).
 
 ## 3. What install does, in order
 
-1. Validate `--id` against the charset; refuse with a message naming the bad characters.
-2. Open `--path`, stream it through SHA-256 (`crate::hash` already digests by streaming; no whole-file read — the
-   artifacts under discussion are hundreds of megabytes and the machine has 9 GB free).
-3. Compare against `--sha256`, case-insensitively on the hex, and refuse on mismatch with **both** digests in the
-   message: the file's digest is public information about a file the human already holds, so printing it leaks
-   nothing and its absence is what makes a mismatch diagnosable.
-4. Refuse a zero-length file (a truncated download is the failure this command exists to catch).
-5. Look up `models.id`: if a row exists with a **different** `sha256`, refuse (§2's no-`--force`). If it exists with
-   the same `sha256`, do nothing and report `already installed` — idempotence matters because installs will be retried
-   after Ctrl-C.
-6. Copy to `<data_dir>/models/<id>` through a temporary name in the same directory and one `rename`, the same
-   discipline as the catalog publish: a reader (or a later install) never sees half an artifact, and a failure leaves
-   no partial file behind. A workspace root that refuses writes must fail before any row is written.
-7. Insert the `models` row **after** the rename succeeds, in one transaction with nothing else. Ordering rationale: a
-   row naming a missing file is a lie the embed round would act on; a file with no row is inert and re-runnable.
+0. Resolve `<workspace>` to the same absolute spelling the scan uses (`abs_path`) and open its database through
+   `Config::workspace_db`. Everything below is against that one database; no command touches two.
+1. Validate `--id` (charset, trailing `.`, reserved names) **before any file access**, naming the rule that failed.
+2. Refuse an empty source: `fs::metadata(&path)?.len() == 0` → "refusing a zero-length artifact", before hashing. A
+   truncated-to-nothing download must get that diagnosis, not a digest mismatch.
+3. Digest with **`np_core::hash::sha256_file(&path)`** — do not open the file in np-cli. `hash.rs` streams
+   (`READ_CHUNK_BYTES`, `hash.rs:19,111-120`) and returns lowercase hex (`hex`, `hash.rs:129`). There is no public
+   `Read`-based API and none is added: adding one so np-cli can hand-roll the loop would introduce a second SHA-256
+   definition and a `sha2` dependency, which §7 test 9 exists to forbid.
+4. Validate `--sha256` as exactly 64 hex characters and **lowercase it once**; every later comparison and the stored
+   column use that lowered spelling. Without this, an install with an uppercase digest produces a row that every
+   subsequent lowercase comparison calls "different sha256" — and with no `--force`, that id is permanently
+   un-installable. On mismatch, refuse and print **both** digests: the file's digest is public information about a
+   file the human already holds, and its absence is what makes a mismatch diagnosable.
+5. Read the existing row for `id` (new helper `db::model_row`). If one exists, compare the **whole declared tuple** —
+   `(dim, sha256, prefix_doc, prefix_query)`. Any disagreement → refuse, naming stored and declared values side by
+   side; a sha-only comparison would report "already installed" while quietly changing `models.dim`, which is the
+   `expected` of every later dimension refusal. Full agreement → step 6's missing-file check, then report
+   `already installed` and write nothing.
+6. Artifact directory: `<data_dir>/workspaces/<db-hash>.models/`, i.e. derived from the *same* `Config::workspace_db`
+   key as the database so one row and one file always belong to one workspace (`.models` rather than a directory named
+   `<db-hash>` keeps the workspace's data dir listing free of a name that is both file and folder). Copy the source to
+   a temporary name in that directory and `rename` it into place as `<dir>/<id>` — the catalog publish's discipline:
+   no reader ever sees half an artifact, and a failed copy leaves no partial file.
+   - **Missing artifact with a live row** (row exists, digests agree, file is gone): verify the file against the
+     **row's** sha256; if it matches, re-copy and report `restored`, rewriting no column — this is re-materialising
+     what the row already attests, not repair. If the file exists and does not match, that is step 4's refusal, never
+     an overwrite.
+7. Insert the row with a new np-core helper **`db::insert_model(db, id, dim, sha256, prefix_doc, prefix_query, now)`**
+   after the rename succeeds, and print nothing before it (F21: durable record first, echo second). No transaction
+   language: one `INSERT` is already atomic in SQLite, and np-cli has no `rusqlite` dependency to build one with —
+   naming a helper rather than "in one transaction" also keeps this repo's rule that every write is a named function
+   taking `&Db`. What genuinely cannot be atomic is **rename vs row insert**; the crash window between them yields a
+   file with no row, which step 5 tolerates and step 6 re-materialises.
 
-`np models hash <file>` prints `<sha256>  <path>` and does not touch the database. `np models list` prints id, dim,
-sha256 (truncated to 12 hex with the full value available via `--json`), installed_at, and whether the artifact is
-present on disk — because a hand-deleted file with a live row is a state the human needs named, not one the tool
-should "helpfully" repair by deleting vectors.
+`np models hash <file>` prints `<sha256>  <path>` and touches no database. `np models list <workspace>` prints id,
+dim, sha256 (12 hex, full value under `--json`), `installed_at`, prefixes, and a per-row state: artifact present, or
+**missing on disk**. A hand-deleted file with a live row is a state to name, not to "helpfully" repair by deleting
+vectors. `list` also reports **unclaimed artifacts** — files under `<db-hash>.models/` that no row names — because
+step 7's ordering makes that state reachable by design, and an inventoried-but-unreachable file is the case where
+`list` earns its keep.
 
-## 4. Where the artifact lives
+## 4. Why the artifact is scoped per workspace
 
-`<data_dir>/models/<id>`. Not content-addressed (`<sha>.bin`) and not per-version: the id **is** the identity the
-vectors reference, so two ids for two builds of the same weights is the correct way to express "these vectors came
-from different bytes". The digest lives in the row and is verified at install; re-verifying on every embed is Round
-4b's cost decision (it reads the artifact anyway, so the marginal cost is a second pass, and §5 of the parent design
-already says what happens when stored vectors disagree with reality).
+`<data_dir>/workspaces/<db-hash>.models/<id>`. Not content-addressed: the id **is** the identity vectors reference, so
+two ids for two builds of the same weights is the correct way to say "these vectors came from different bytes". The
+digest lives in the row and is verified at install; re-verifying on every embed is 4b's cost decision (it reads the
+artifact anyway). Per-workspace placement costs a duplicate artifact if one model is installed into two workspaces,
+and buys the property that no install in one workspace can ever move a file another workspace's row points at.
 
-## 5. Non-goals for this round
+Destination writes go through `walk::to_open_path` for the same long-path spelling the rest of the codebase uses;
+mixing verbatim and `\\?\` spellings within one operation is worse than either.
 
-- **No HTTP client, no TLS dependency, no URL scheme.** Transport arrives with 4b's answer about the endpoint.
-- **No model execution** — no candle, no `local-model` feature yet (`cargo check --locked -p np-core --features
-  local-model` stays a per-OS debt recorded in §6 of the parent design).
-- **No embedding calls.** `chunk()` still has no production caller beyond the scan; nothing writes to `embeddings`
-  except tests.
-- **No config change.** `[embeddings].provider` keeps its `none` default; installing a model makes it *possible* to
-  choose one, and choosing is the human's call (parent design §2).
+## 5. Non-goals
 
-## 6. What must not move
+No HTTP client, no TLS dependency, no URL scheme (4b). No model execution — no candle, no `local-model` feature
+(per-OS `cargo check --locked -p np-core --features local-model` stays a recorded debt). No embedding calls; nothing
+writes to `embeddings` except tests. No config change: `[embeddings].provider` keeps its `none` default — installing a
+model makes choosing one *possible*, and choosing is the human's call (parent §2).
 
-- Catalog bytes and every golden: this adds a subcommand and touches no scan path. Any diff under `tests/golden*` is a
-  stop-and-report, as ever.
-- Existing CLI output for `scan`: unchanged, including stderr prose. The new commands print only what they did.
-- Migration set: **no new migration.** `models` exists since migration 7 and this round needs no column. If an
-  implementer finds themselves wanting one, that is a design gap to report, not a migration to add.
+## 6. What must not move, and what this round makes stale
 
-## 7. Tests (all offline, all tempdirs)
+- Catalog bytes and every golden: this adds subcommands and touches no scan path. Any diff under `tests/golden*` is a
+  stop-and-report.
+- Existing `scan` output including stderr prose. Verified against the current CLI suite: no test asserts usage text or
+  an unknown-subcommand message, none asserts argv shape, and stdout/stderr assertions are substring/count assertions
+  on scan output — so a new subcommand cannot satisfy or break them. **Two cautions for the implementer:** the test
+  helper `Workspace::command` appends the workspace root last (`cli.rs:56`) and ~20 cases depend on that shape, so the
+  new commands get their own builder rather than a generalisation of it; and np-cli has no `rusqlite` dependency,
+  which §3 step 7 respects by naming an np-core helper.
+- **No new migration.** `models` exists since migration 7 with exactly the six columns needed, and
+  `crates/np-core/tests/db.rs:188-254` pins the table and column list by name — a new column fails that test, which is
+  the fence wanted here. If this round seems to want a migration, that is a design gap to report.
+- **Premises this round retires.** Three documents state that `np scan` is the only command
+  (`docs/design-f21-durable-upgrade-announcement.md:48`, `docs/backlog-m2-followups.md:315`, `:433-434`). Nothing in
+  code depends on it — receipts ride `ScanReport`. Recorded here, and those lines get a note in this round's commit so
+  the next reader is not told something false. `install` is deliberately **not** a second path through migration or
+  merge logic, which is what F19's ruling actually forbade.
 
-1. install happy path: artifact present at the expected path, row present with the declared dim/sha/prefixes, exit ok.
-2. digest mismatch: nothing installed — no file at the target **and** no row — and the message names both digests.
-3. bad id charset: refused before any read (assert the file was never opened, e.g. a path that does not exist still
-   produces the charset error first).
-4. zero-length file refused.
-5. same id + same digest twice → second reports `already installed`, row unchanged (`installed_at` not rewritten), and
-   exactly one file on disk.
-6. same id + different digest → refused, original artifact and row untouched.
-7. write-refusing data dir → command fails, no row (the ordering of §3 step 7 pinned by the failure, not by prose).
-8. `models list` reports a live row whose file was deleted as missing-on-disk rather than repairing it.
-9. `models hash` on a known byte string equals the digest `crate::hash` computes for the same bytes (one definition of
-   SHA-256, two callers).
+## 7. Tests (offline, tempdirs, Linux and windows-latest)
 
-Mutations each assertion must die to are named per test in the code, and at least these are run: skipping the digest
-comparison, writing the row before the rename, dropping the temp-name+rename for a direct write, and turning the
-"different digest" refusal into an overwrite.
+1. install happy path: artifact at the expected per-workspace path, row with declared dim/sha/prefixes, ok exit.
+2. digest mismatch: no file at the target **and** no row; message names both digests.
+3. bad id (uppercase, trailing `.`, `nul`, over 64 chars): refused before any read — assert a `--path` that does not
+   exist still yields the charset error first.
+4. zero-length file → the empty-artifact refusal, not a digest mismatch (asserts step 2 precedes step 3).
+5. same id + same full tuple twice → second reports `already installed`, `installed_at` unchanged, one file on disk.
+6. same id + different digest → refused; original artifact and row untouched.
+   6b. same id, same digest, **different dim** → refused naming stored and declared dim (the sha-only blind spot).
+   6c. install with an uppercase `--sha256`, then re-install lowercase → `already installed`, and the stored column is
+   lowercase both times.
+7. artifact directory cannot be created: make `<db-hash>.models` an existing **regular file**, so directory creation
+   fails on both OSes while the database stays writable. The chmod-0500 variant stays as an additional
+   `#[cfg(unix)]` case, matching `tests/scan.rs:5540-5565`; it is not the portable test, and an unwritable *data dir*
+   would fail earlier at `Db::open` (`db.rs:384-396`) and pin nothing. Assert: command fails, no row.
+8. live row, artifact deleted → `list` reports missing-on-disk and repairs nothing; `install` with the matching digest
+   re-copies and reports `restored` with `installed_at` and `embeddings` unchanged.
+9. `models hash` on a known byte string equals `np_core::hash::sha256_file` on the same bytes (one SHA-256, two
+   callers).
+10. `list --json` names an unclaimed file under `<db-hash>.models/`.
 
-## 8. Open questions for the human (blocking 4b, not 4a)
+Mutations each assertion dies to are named in code; at least these get run: skipping the digest comparison, writing the
+row before the rename, dropping temp-name+rename for a direct write, turning the different-digest refusal into an
+overwrite, comparing only sha256 in step 5, and normalising the digest nowhere (so uppercase installs become
+un-installable).
 
-1. Does the self-hosted server expose `/v1/embeddings`, or only chat/completions? (Asked rather than assumed, per the
-   parent design's rule.)
-2. Which artifact should be pinned first — EmbeddingGemma-2 text tower (~540 MB) or MiniLM (~7 MB)? Disk here has
-   ~9 GB free; the download and the benchmark are both gated on that answer.
-3. Should `install` ever accept a URL, once transport exists, or stay local-file-only with the human doing downloads?
+## 8. Standing debts this round does not pretend away
+
+The wrong-dim provider answer is still raw `DbError` at the write; ordinal drift still makes "re-embed only what moved"
+a row-identity promise; the chunk-gap stderr line has no capture seam and so no assertion.
+
+## 9. Open questions for the human (blocking 4b, not 4a)
+
+1. Does the self-hosted server expose `/v1/embeddings`, or only chat/completions?
+2. Which artifact first — EmbeddingGemma-2 text tower (~540 MB) or MiniLM (~7 MB)? ~9 GB free handles either; the
+   download and benchmark both wait on this answer.
+3. Should `install` ever accept a URL once transport exists, or stay local-file-only with the human downloading?
