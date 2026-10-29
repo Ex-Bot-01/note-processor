@@ -15,10 +15,12 @@ use std::time::Duration;
 mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
+use np_core::chunk::Chunk;
 use np_core::config::Config;
 use np_core::db::{
-    apply_move, mark_stale, note_counts, upsert_file, Db, DbError, Migration, NoteCounts,
-    FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
+    apply_move, chunk_digest, chunk_state, delete_vectors_for_chunk, mark_stale, note_counts,
+    upsert_file, upsert_vector, write_chunks_for_note, ChunkWrite, Db, DbError, Migration,
+    NoteCounts, FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
 };
 use np_core::hash::{sha256_file, Snapshot};
 use np_core::path_keys::RelPath;
@@ -195,11 +197,14 @@ fn the_schema_is_what_the_plan_mandates() {
     assert_eq!(
         tables,
         [
+            "chunks",
+            "embeddings",
             "files",
             "headings",
             "items",
             "links",
             "meta",
+            "models",
             "notes",
             "schema_version",
             "tags"
@@ -241,6 +246,20 @@ fn the_schema_is_what_the_plan_mandates() {
         ("links", "src_note_id dst_note_id kind target line origin"),
         ("items", "note_id text line state marker"),
         ("meta", "key value"),
+        // Migration 7's three tables, pinned by the same argument as the rest: the chunker writes them and the
+        // provider reads them column by column, so a rename here has to break that code rather than merely differ.
+        (
+            "models",
+            "id dim sha256 prefix_doc prefix_query installed_at",
+        ),
+        (
+            "chunks",
+            "id note_id ordinal chunker text byte_start byte_end source_hash",
+        ),
+        (
+            "embeddings",
+            "chunk_id model dim vector source_hash embedded_at",
+        ),
     ] {
         assert_eq!(
             column_names(&db, table),
@@ -312,6 +331,26 @@ fn refuses_orphan(db: &Db, sql: &str) {
                 if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
         ),
         "expected a foreign-key violation from `{sql}`, got {err}"
+    );
+}
+
+/// Whether one statement is refused as a duplicate of a unique key that already exists.
+///
+/// The extended code once more, and `chunks` is the reason it matters: that table carries both an
+/// `INTEGER PRIMARY KEY` and a `UNIQUE (note_id, ordinal)`, and the two classes share the primary code.
+/// A test that matched only `ConstraintViolation` would pass on an id collision while the unique pair went
+/// unenforced — which is [`one_note_cannot_hold_two_chunks_at_the_same_ordinal`]'s whole subject.
+fn refuses_duplicate(db: &Db, sql: &str) {
+    let err =
+        db.0.execute(sql, [])
+            .expect_err("a row duplicating a unique key has to be refused");
+    assert!(
+        matches!(
+            &err,
+            rusqlite::Error::SqliteFailure(fault, _)
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        ),
+        "expected a unique-constraint violation from `{sql}`, got {err}"
     );
 }
 
@@ -413,6 +452,1130 @@ fn deleting_a_note_row_cascades_to_its_children_and_nulls_inbound_edges() {
     // The NULLed edge is still unresolved rather than forgotten: this is the count a scan reports.
     let counts = note_counts(&db).expect("counts");
     assert_eq!((counts.links, counts.unresolved_links), (1, 1));
+}
+
+/// A model row an embedding can name: identity, dimensionality, no weights (`sha256` NULL, which is the arm the
+/// default `embeddings.provider = "none"` ships on) and empty prefixes.
+fn insert_model(db: &Db, id: &str, dim: i64) {
+    db.0.execute(
+        "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+         VALUES (?1, ?2, NULL, '', '', 1)",
+        rusqlite::params![id, dim],
+    )
+    .expect("test setup: model row");
+}
+
+/// One chunk of `note`, cut by chunker 1 from bytes hashing to a fixed `source_hash`, returning its id.
+fn insert_chunk(db: &Db, note: i64, ordinal: i64) -> i64 {
+    db.0.execute(
+        "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+         VALUES (?1, ?2, 1, x'616263', 0, 3, 'chunk-source-hash')",
+        rusqlite::params![note, ordinal],
+    )
+    .expect("test setup: chunk row");
+    db.0.last_insert_rowid()
+}
+
+#[test]
+fn deleting_a_note_takes_its_chunks_and_their_vectors() {
+    // Migration 7's cascade is asserted at **runtime**, on a fresh database with enforcement on — not during the
+    // migration, which runs with `PRAGMA foreign_keys = OFF` and would therefore prove nothing about the ordinary
+    // write path (design-m2-embeddings §7). The pragma is read back first because the whole test rests on it: an
+    // enforcement-off connection makes every cascade below silently stop firing.
+    let db = Db::in_memory().expect("fresh database");
+    assert_eq!(scalar::<i64>(&db, "PRAGMA foreign_keys"), 1);
+
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row a");
+    upsert_file(&db, &snap("b.md", "hb"), Path::new("/ws/b.md"), 1)
+        .expect("test setup: registry row b");
+    let a = insert_note(&db, "a.md", "A");
+    let b = insert_note(&db, "b.md", "B");
+    insert_model(&db, "m@1", 2);
+    let chunk_a = insert_chunk(&db, a, 0);
+    let chunk_b = insert_chunk(&db, b, 0);
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'0000000000000000', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk_a],
+    )
+    .expect("test setup: vector for a's chunk");
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'00000000000000f0', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk_b],
+    )
+    .expect("test setup: vector for b's chunk");
+
+    // Only the note row goes away, which is what shows the schema does the rest on its own.
+    db.0.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![a])
+        .expect("delete the note row itself");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"),
+        1,
+        "the deleted note's chunk goes with it"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT note_id FROM chunks"),
+        b,
+        "the survivor is the other note's chunk: a delete sweeping the whole table satisfies the count above and fails here"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        1,
+        "the vector hangs off the chunk, so it goes too — one cascade, not two"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT chunk_id FROM embeddings"),
+        chunk_b,
+        "the surviving vector is the other note's"
+    );
+    // A model is workspace-wide, not a note's; deleting one note must not empty the registry that tells the next
+    // scan what is installed.
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM models"), 1);
+}
+
+#[test]
+fn deleting_a_model_takes_the_vectors_that_named_it() {
+    // The other direction of migration 7's second cascade: an uninstalled model must not leave vectors behind that
+    // name it. Without `ON DELETE CASCADE` on `embeddings.model` the delete below is *refused* by the foreign key,
+    // which fails this test rather than passing it quietly.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "gone@1", 2);
+    insert_model(&db, "kept@1", 2);
+    let chunk = insert_chunk(&db, a, 0);
+    for model in ["gone@1", "kept@1"] {
+        db.0.execute(
+            "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+             VALUES (?1, ?2, 2, x'0000000000000000', 'chunk-source-hash', 1)",
+            rusqlite::params![chunk, model],
+        )
+        .expect("test setup: vector under each model");
+    }
+
+    db.0.execute("DELETE FROM models WHERE id = 'gone@1'", [])
+        .expect("uninstall one model");
+
+    assert_eq!(
+        names(&db, "SELECT model FROM embeddings ORDER BY model"),
+        ["kept@1".to_string()],
+        "the vectors naming the removed model go with it, and only those"
+    );
+    // Chunks are cut from notes, not from models: dropping a model costs vectors and nothing else, which is what
+    // makes §3's "switching providers costs a re-embed and nothing else" true at the schema level.
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"), 1);
+}
+
+#[test]
+fn a_vector_that_is_not_four_times_dim_bytes_is_refused() {
+    // Storing little-endian f32 instead of the spec's q8 is a deliberate deviation, and the `CHECK` is what keeps it
+    // honest while the table is empty (design-m2-embeddings §3). Three wrong lengths and the exact fit are
+    // asserted: a `>=` mutant, or a `length(vector) = dim` mutant, passes a test that probes one short value only.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+    let chunk = insert_chunk(&db, a, 0);
+
+    for (bytes, shape) in [
+        ("00", "one byte, short of 2 * 4"),
+        ("000000", "three bytes, not a whole f32"),
+        ("000000000000000000", "nine bytes, one over 2 * 4"),
+    ] {
+        rejects(
+            &db,
+            &format!(
+                "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+                 VALUES ({chunk}, 'm@1', 2, x'{bytes}', 'chunk-source-hash', 1)"
+            ),
+            &format!("embeddings.vector ({shape})"),
+        );
+    }
+
+    // The exact fit goes in, which is the half of the assertion that says the CHECK is `= 4 * dim` and not merely
+    // "some length".
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'00000000000000f0', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk],
+    )
+    .expect("eight bytes for dim 2 is exactly right");
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"), 1);
+}
+
+#[test]
+fn an_embedding_that_names_no_installed_model_is_refused() {
+    // The orphan class migration 3 ended, one milestone later: an embedding naming a model that was never installed
+    // is invisible to `PRAGMA foreign_key_check` unless it is *declared* here, and it would be read back as a
+    // vector under a model nobody can name.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+    let chunk = insert_chunk(&db, a, 0);
+
+    // The chunk parent exists on purpose, so the only key this row can fail is `model` — the same discipline as
+    // [`rejects`], which names a parent that exists for every CHECK it probes.
+    refuses_orphan(
+        &db,
+        &format!(
+            "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+             VALUES ({chunk}, 'never-installed@1', 2, x'0000000000000000', 'chunk-source-hash', 1)"
+        ),
+    );
+
+    // The identical row naming the installed model goes in: what is refused is the missing parent, not the table.
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'0000000000000000', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk],
+    )
+    .expect("a vector under an installed model");
+}
+
+#[test]
+fn two_models_hold_vectors_for_one_chunk() {
+    // `PRIMARY KEY (chunk_id, model)` is what makes "switching providers costs a re-embed and nothing else" true.
+    // A key narrowed to `chunk_id` alone refuses the second INSERT; a key dropped altogether lets a third row in,
+    // so both directions are asserted.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "small@1", 2);
+    insert_model(&db, "large@1", 4);
+    let chunk = insert_chunk(&db, a, 0);
+
+    // Different dimensionalities on purpose: `dim` is the row's own, so the CHECK must read it per embedding rather
+    // than assume one model per database.
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'small@1', 2, x'0102030405060708', 'chunk-source-hash', 1)",
+        rusqlite::params![chunk],
+    )
+    .expect("the first model's vector");
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'large@1', 4, x'0102030405060708090a0b0c0d0e0f10', 'chunk-source-hash', 2)",
+        rusqlite::params![chunk],
+    )
+    .expect("the second model's vector, same chunk");
+
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"), 2);
+    // Each one reads back intact rather than one having overwritten the other.
+    for (model, bytes) in [
+        ("small@1", vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+        (
+            "large@1",
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        ),
+    ] {
+        assert_eq!(
+            scalar::<Vec<u8>>(
+                &db,
+                &format!("SELECT vector FROM embeddings WHERE model = '{model}'")
+            ),
+            bytes,
+            "{model}'s vector is the bytes that were written"
+        );
+    }
+
+    // And the pair really is the key: a second row for it is refused by the primary key, not accepted as a new
+    // version of the same fact.
+    let err =
+        db.0.execute(
+            "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'small@1', 2, x'0000000000000000', 'other-hash', 3)",
+            rusqlite::params![chunk],
+        )
+        .expect_err("the same (chunk_id, model) pair cannot be written twice");
+    assert!(
+        matches!(
+            &err,
+            rusqlite::Error::SqliteFailure(fault, _)
+                if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+        ),
+        "expected a primary-key violation from the repeated pair, got {err}"
+    );
+}
+
+#[test]
+fn one_note_cannot_hold_two_chunks_at_the_same_ordinal() {
+    // `UNIQUE (note_id, ordinal)` is what makes a chunk's ordinal addressable: §5's per-row staleness and
+    // the diff that replaces only the moved chunks both look rows up by that pair, so a second row on one
+    // pair means the note holds two different texts under one ordinal and every "did this chunk move" answer
+    // after it is a coin flip. Migration 7 declared the constraint while nothing wrote to `chunks` often enough
+    // to notice if it were missing — this is the probe that says it fires.
+    //
+    // Killed by: dropping `UNIQUE (note_id, ordinal)` from migration 7's `chunks` declaration (the second
+    // `(a, 0)` insert then succeeds and `refuses_duplicate` fails). Narrowing it to `UNIQUE (ordinal)` or
+    // `UNIQUE (note_id)` alone is killed by the three accepted inserts below rather than by the refusal.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row a");
+    upsert_file(&db, &snap("b.md", "hb"), Path::new("/ws/b.md"), 1)
+        .expect("test setup: registry row b");
+    let a = insert_note(&db, "a.md", "A");
+    let b = insert_note(&db, "b.md", "B");
+
+    // The positive controls first, so what refuses the last statement is the pair and not one column of it:
+    // one note holds several ordinals, and two notes reuse ordinal 0 freely — chunks are per-note.
+    insert_chunk(&db, a, 0);
+    insert_chunk(&db, a, 1);
+    insert_chunk(&db, b, 0);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"), 3);
+
+    // The same pair again, with different text: an append, not a new fact about the note.
+    refuses_duplicate(
+        &db,
+        &format!(
+            "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+             VALUES ({a}, 0, 1, x'646566', 0, 3, 'other-source-hash')"
+        ),
+    );
+
+    // Refused means not written: the table still holds exactly the three rows above, and neither of them was
+    // replaced by the statement that was turned away.
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"), 3);
+    assert_eq!(
+        scalar::<Vec<u8>>(
+            &db,
+            &format!("SELECT text FROM chunks WHERE note_id = {a} AND ordinal = 0")
+        ),
+        b"abc",
+        "the rejected insert left the chunk it collided with alone"
+    );
+}
+
+#[test]
+fn a_string_bind_is_refused_from_chunks_text() {
+    // `chunks.text` is BLOB because note bodies are arbitrary bytes (§3), and BLOB is an *affinity* rather
+    // than a constraint: without migration 7's `CHECK (typeof(text) = 'blob')` a Rust `String` bind lands as
+    // TEXT, conflicts with nothing, and violates nothing beside its own typeof check. The table would then
+    // hold one identity in two types that never compare equal — F13 §4's original bug, moved from paths to
+    // chunk text, where it reads back as a chunk whose bytes are not the note's.
+    //
+    // Killed by: deleting `CHECK (typeof(text) = 'blob')` from the `text` column in migration 7. The TEXT
+    // bind below is then stored happily and this probe's `expect_err` fails. It is also why the blob arm here
+    // has to stay: a mutant that refuses *every* bind into the column fails the accepted row instead.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    // The blob arm goes in: what is refused below is the type, not the table or the parent.
+    insert_chunk(&db, a, 0);
+
+    // `refuses_string_bind` binds the TEXT `'a.md'` into `?1`. The note parent exists and the ordinal is one the
+    // accepted row does not use, so neither the foreign key nor the unique pair can be what stops this
+    // statement — only the typeof CHECK can.
+    refuses_string_bind(
+        &db,
+        &format!(
+            "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+             VALUES ({a}, 5, 1, ?1, 0, 4, 'chunk-source-hash')"
+        ),
+        "chunks.text",
+    );
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"),
+        1,
+        "a refused text bind wrote no row at all"
+    );
+}
+
+/// One [`Chunk`] as [`np_core::chunk::chunk`] would hand it over: text plus the offsets it was sliced from.
+///
+/// Built by hand rather than cut, because what the four tests below measure is which **row** a write
+/// touches. `crates/np-core/tests/chunk.rs` owns the chunker's own contract.
+fn chunk_at(ordinal: u32, byte_start: usize, text: &str) -> Chunk {
+    Chunk {
+        ordinal,
+        byte_start,
+        byte_end: byte_start + text.len(),
+        text: text.to_string(),
+    }
+}
+
+/// One note's `chunks.id` values, ascending by ordinal.
+///
+/// Ids rather than a count: the promise around [`write_chunks_for_note`] is that row **identity** survives an
+/// edit, and `COUNT(*)` cannot see a delete-and-reinsert that replaced every row with a fresh one.
+fn chunk_ids(db: &Db, note: i64) -> Vec<i64> {
+    db.0.prepare("SELECT id FROM chunks WHERE note_id = ?1 ORDER BY ordinal")
+        .expect("chunks are readable")
+        .query_map(rusqlite::params![note], |row| row.get::<_, i64>(0))
+        .expect("chunk rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("chunk ids")
+}
+
+/// A `chunks` row written by hand, so a test can put the database into a shape no call to
+/// [`write_chunks_for_note`] would have produced — an ordinal out of order, another digest, another build's
+/// chunker. Returns its id.
+fn insert_chunk_stamped(
+    db: &Db,
+    note: i64,
+    ordinal: i64,
+    chunker: i64,
+    text: &[u8],
+    source_hash: &str,
+) -> i64 {
+    let byte_end = i64::try_from(text.len()).expect("a test chunk is shorter than i64::MAX");
+    db.0.execute(
+        "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+        rusqlite::params![note, ordinal, chunker, text, byte_end, source_hash],
+    )
+    .expect("test setup: stamped chunk row");
+    db.0.last_insert_rowid()
+}
+
+/// A second note holding one chunk row, created so that its `id` sits at the top of the `chunks` table.
+///
+/// This makes "the ids are unchanged" a falsifiable claim. An `INTEGER PRIMARY KEY` reuses the highest freed
+/// rowid, so when one note owns every row in the table, a blanket delete-and-reinsert hands back exactly the
+/// ids it just deleted and an id-survival assertion measures nothing. With another note's row holding the
+/// maximum, any re-insert mints ids above it.
+fn hold_the_high_water_mark(db: &Db, rel: &str) {
+    let abs = Path::new("/ws/").join(rel);
+    upsert_file(db, &snap(rel, "h"), &abs, 1).expect("test setup: registry row for the marker");
+    let note = insert_note(db, rel, "Marker");
+    insert_chunk(db, note, 0);
+}
+
+/// One note's `chunks` rows as `(ordinal, id)` pairs, ascending by ordinal.
+fn chunk_ordinals_and_ids(db: &Db, note: i64) -> Vec<(i64, i64)> {
+    db.0.prepare("SELECT ordinal, id FROM chunks WHERE note_id = ?1 ORDER BY ordinal")
+        .expect("chunks are readable")
+        .query_map(rusqlite::params![note], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("chunk rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("chunk pairs")
+}
+
+#[test]
+fn rewriting_the_same_chunks_writes_nothing_and_keeps_every_row_id() {
+    // The warm pass (§5's "an unchanged note costs one indexed lookup per scan"), and the half of it that a
+    // report has to be able to say out loud: nothing was touched, so nothing may be counted.
+    //
+    // Killed by: a blanket `DELETE FROM chunks WHERE note_id = ?1` followed by inserts. The marker note's row
+    // holds the top rowid, so those inserts come back with new ids and the comparison below fails — without
+    // that marker SQLite would hand back the same three rowids and the id assertion would be decoration.
+    // What this test does **not** claim to pin is the cheap path itself: removing it is not observable through
+    // counts, because a diff over identical rows also writes nothing. Its whole benefit is one indexed `COUNT`
+    // instead of reading the note's texts back, which no assertion here can see; what is pinned is that an
+    // unchanged rewrite reports no work and touched no row.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    let chunks = [
+        chunk_at(0, 0, "first paragraph"),
+        chunk_at(1, 17, "second paragraph"),
+        chunk_at(2, 35, "third"),
+    ];
+    assert_eq!(
+        write_chunks_for_note(&db, a, &chunks, "d1").expect("first write"),
+        ChunkWrite {
+            inserted: 3,
+            updated: 0,
+            deleted: 0
+        },
+        "a note with no rows yet inserts every chunk"
+    );
+    let before = chunk_ids(&db, a);
+    assert_eq!(before.len(), 3, "one row per chunk");
+    hold_the_high_water_mark(&db, "b.md");
+
+    // Same list, same digest: the cheap path, and nothing written.
+    assert_eq!(
+        write_chunks_for_note(&db, a, &chunks, "d1").expect("rewrite"),
+        ChunkWrite::default(),
+        "an unchanged note must report no work"
+    );
+    assert_eq!(
+        chunk_ids(&db, a),
+        before,
+        "the same three rows, not a set that happens to have the same size"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM chunks WHERE note_id = {a}")
+        ),
+        3,
+        "nothing was added either"
+    );
+
+    // And what was written is readable back through the helper the scan round will use: one digest, texts in
+    // ordinal order, bytes rather than a promise about UTF-8.
+    let (digest, texts) = chunk_state(&db, a).expect("state of a note that was just written");
+    assert_eq!(digest.as_deref(), Some("d1"));
+    assert_eq!(
+        texts,
+        [
+            (0, b"first paragraph".to_vec()),
+            (1, b"second paragraph".to_vec()),
+            (2, b"third".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn an_emptied_note_loses_its_chunks_and_the_vectors_hanging_off_them() {
+    // The cheap path's counterexample, made a fixture. A note whose body is cleared to blank lines yields no
+    // chunks at all (see `tests/chunk.rs`), so the wanted count is zero while three stamped-from-yesterday rows
+    // sit on the table: judged against the stamp alone, `0 == 0`, and the early return leaves the note holding
+    // chunks it does not have — with their vectors — on every scan from here to forever. Killed by: dropping
+    // the second count from the predicate (this test then reports ChunkWrite::default() and three live rows).
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "model-a", 1);
+
+    let original = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "beta"),
+        chunk_at(2, 13, "gamma"),
+    ];
+    write_chunks_for_note(&db, a, &original, "d1").expect("test setup: three chunks");
+    let need =
+        db.0.query_row(
+            &format!("SELECT id FROM chunks WHERE note_id = {a} AND ordinal = 0"),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("test setup: ordinal 0 has an id");
+    upsert_vector(&db, need, "model-a", 1, &0.5f32.to_le_bytes(), "c0", 5)
+        .expect("test setup: a vector hanging off ordinal 0");
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"), 1);
+
+    let emptied = write_chunks_for_note(&db, a, &[], "d2").expect("the note was cleared");
+    assert_eq!(
+        emptied,
+        ChunkWrite {
+            inserted: 0,
+            updated: 0,
+            deleted: 3
+        },
+        "clearing a note deletes its chunks; it does not report having done nothing"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM chunks WHERE note_id = {a}")
+        ),
+        0,
+        "no chunk row survives an emptied note"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        0,
+        "and the vector went with its chunk by cascade rather than being orphaned"
+    );
+
+    // The arm is idempotent afterwards: with nothing wanted and nothing stored, the cheap path may return
+    // zeros — that one is honest.
+    assert_eq!(
+        write_chunks_for_note(&db, a, &[], "d3").expect("still empty"),
+        ChunkWrite::default(),
+        "a genuinely empty note writes nothing on the second pass too"
+    );
+}
+
+#[test]
+fn editing_a_chunk_updates_that_row_and_a_shorter_list_deletes_the_tail() {
+    // §5's per-row diff: an edited note rewrites the rows that moved and deletes the ordinals the note no
+    // longer has — it does not replace the set.
+    //
+    // Killed by: a `DELETE FROM chunks WHERE note_id = ?` blanket delete (the surviving ids change); an
+    // off-by-one in the tail predicate (`ordinal > wanted`, which keeps one row too many, or `>=` aimed at the
+    // front, which deletes the wrong end) — both are caught by asserting **which** ids remain, not how many.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    let original = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "beta"),
+        chunk_at(2, 13, "gamma"),
+    ];
+    write_chunks_for_note(&db, a, &original, "d1").expect("test setup: three chunks");
+    let before = chunk_ids(&db, a);
+    hold_the_high_water_mark(&db, "b.md");
+
+    // One chunk's text moves, and the note digest moves with it.
+    let edited = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "BETA EDITED"),
+        chunk_at(2, 20, "gamma"),
+    ];
+    assert_eq!(
+        write_chunks_for_note(&db, a, &edited, "d2").expect("edit"),
+        ChunkWrite {
+            inserted: 0,
+            updated: 3,
+            deleted: 0
+        },
+        "three rows were rewritten: one because its text moved, two because their stamp did"
+    );
+    // `updated` is 3 and not 1 on purpose. `chunks.source_hash` names the **note** bytes (§3), so every row of
+    // an edited note has a stale stamp even where its text sat still, and restamping them is what makes the
+    // next scan take the cheap path (§5's one indexed lookup). The rows below are asserted to hold their old
+    // text and offsets — the restamp is the only thing that changed, and it touches no vector.
+    let after = chunk_ids(&db, a);
+    assert_eq!(
+        after, before,
+        "no row was replaced by an edit — and with another note's row holding the top rowid, a re-insert could
+         not have handed these ids back"
+    );
+    for (ordinal, want) in [(0, "alpha"), (1, "BETA EDITED"), (2, "gamma")] {
+        assert_eq!(
+            scalar::<Vec<u8>>(
+                &db,
+                &format!("SELECT text FROM chunks WHERE note_id = {a} AND ordinal = {ordinal}")
+            ),
+            want.as_bytes(),
+            "ordinal {ordinal} holds the text the diff was given"
+        );
+    }
+
+    // The note loses its last chunk: the tail goes, the rows that stay keep their ids.
+    let shorter = [chunk_at(0, 0, "alpha"), chunk_at(1, 7, "BETA EDITED")];
+    assert_eq!(
+        write_chunks_for_note(&db, a, &shorter, "d3").expect("shrink"),
+        ChunkWrite {
+            inserted: 0,
+            updated: 2,
+            deleted: 1
+        },
+        "one trailing row deleted, the two survivors restamped"
+    );
+    assert_eq!(
+        chunk_ordinals_and_ids(&db, a),
+        [(0, before[0]), (1, before[1])],
+        "the tail went and nothing else did: which ids survive is the assertion, not how many"
+    );
+
+    // Growing again mints rows only for the new ordinals.
+    let grown = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "BETA EDITED"),
+        chunk_at(2, 20, "gamma re-added"),
+    ];
+    assert_eq!(
+        write_chunks_for_note(&db, a, &grown, "d4").expect("grow"),
+        ChunkWrite {
+            inserted: 1,
+            updated: 2,
+            deleted: 0
+        },
+        "ordinal 2 is new; the other two only needed their stamp"
+    );
+    let grown_rows = chunk_ordinals_and_ids(&db, a);
+    assert_eq!(
+        (&grown_rows[..2]),
+        [(0, before[0]), (1, before[1])],
+        "the two survivors are still the same rows"
+    );
+    assert_ne!(grown_rows[2].1, before[2], "ordinal 2 is a fresh row");
+}
+
+#[test]
+fn a_moved_chunk_keeps_its_id_and_the_other_chunks_keep_their_vectors() {
+    // The test §5 exists for. `embeddings.chunk_id` cascades off `chunks.id`, so the delete-then-insert
+    // pattern this module uses for headings, tags and items would take an edited note's vectors with it —
+    // silently, correctly, and at exactly the cost §3 calls "the whole difference between a usable and an
+    // unusable incremental scan".
+    //
+    // Killed by: replacing the diff with `DELETE FROM chunks WHERE note_id = ?1` plus inserts. Every chunk id
+    // changes, the cascade empties `embeddings`, and both assertions below go red — the ids and, with them,
+    // the vectors that were supposed to survive.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+
+    let original = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "beta"),
+        chunk_at(2, 13, "gamma"),
+    ];
+    write_chunks_for_note(&db, a, &original, "d1").expect("test setup: three chunks");
+    let before = chunk_ids(&db, a);
+    hold_the_high_water_mark(&db, "b.md");
+    // One vector per chunk, each payload naming the ordinal it was written for.
+    for (ordinal, id) in [(0u8, before[0]), (1, before[1]), (2, before[2])] {
+        let payload = vec![ordinal, ordinal + 10, 0, 0, 0, 0, 0, 0];
+        upsert_vector(&db, id, "m@1", 2, &payload, "chunk-text-digest", 1)
+            .expect("test setup: one vector per chunk");
+    }
+
+    // Middle chunk's text moves; the outer two are handed over byte-identical.
+    let edited = [
+        chunk_at(0, 0, "alpha"),
+        chunk_at(1, 7, "beta with an edit"),
+        chunk_at(2, 24, "gamma"),
+    ];
+    write_chunks_for_note(&db, a, &edited, "d2").expect("edit one chunk");
+
+    let after = chunk_ids(&db, a);
+    assert_eq!(after, before, "every ordinal kept its row");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        3,
+        "an edit that moved one chunk cascaded away nothing"
+    );
+    for (ordinal, id) in [(0u8, after[0]), (1, after[1]), (2, after[2])] {
+        assert_eq!(
+            scalar::<Vec<u8>>(
+                &db,
+                &format!("SELECT vector FROM embeddings WHERE chunk_id = {id}")
+            ),
+            vec![ordinal, ordinal + 10, 0, 0, 0, 0, 0, 0],
+            "chunk {ordinal}'s vector is still attached to the row it was written against"
+        );
+    }
+}
+
+#[test]
+fn upsert_vector_twice_for_one_chunk_keeps_the_second_write_and_one_row() {
+    // §5's third bullet: F15 *expects* its retry, so writing the same vector twice has to be an ordinary
+    // event. A plain `INSERT` answers it with `SQLITE_CONSTRAINT_PRIMARYKEY`, and one `?` out of the scan's
+    // write pass rolls the whole scan back — provider trouble turned into data loss.
+    //
+    // Killed by: dropping the `ON CONFLICT … DO UPDATE` arm (the second call errors here). Also killed by
+    // trimming the update arm to `vector` only — `dim`, `source_hash` and `embedded_at` are asserted below, so a
+    // row that keeps its old facts beside a new vector fails too.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+    let chunk = insert_chunk(&db, a, 0);
+
+    upsert_vector(
+        &db,
+        chunk,
+        "m@1",
+        2,
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        "digest-1",
+        10,
+    )
+    .expect("first attempt");
+    upsert_vector(
+        &db,
+        chunk,
+        "m@1",
+        2,
+        &[9, 10, 11, 12, 13, 14, 15, 16],
+        "digest-2",
+        20,
+    )
+    .expect("retry after a partial failure");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        1,
+        "a retry is one row rewritten, not a second version of the same fact"
+    );
+    assert_eq!(
+        scalar::<Vec<u8>>(&db, "SELECT vector FROM embeddings"),
+        vec![9, 10, 11, 12, 13, 14, 15, 16],
+        "the second write is what the row holds"
+    );
+    assert_eq!(
+        scalar::<String>(&db, "SELECT source_hash FROM embeddings"),
+        "digest-2",
+        "and it states which chunk text that vector came from"
+    );
+    assert_eq!(scalar::<i64>(&db, "SELECT embedded_at FROM embeddings"), 20);
+}
+
+#[test]
+fn upsert_vector_keeps_both_models_rows() {
+    // Round 1 pinned `PRIMARY KEY (chunk_id, model)` at the schema. This pins the **conflict target**: name
+    // anything else and either the statement stops matching a unique index (SQLite refuses it at prepare) or
+    // the second model's row becomes the thing a first model's retry overwrites — which would make §3's
+    // "switching providers costs a re-embed and nothing else" false in the writer while true in the schema.
+    //
+    // Killed by: `ON CONFLICT (chunk_id)` (prepare-time error, so the first upsert fails) or
+    // `ON CONFLICT (model)` (same). Both leave the pair as the only target that can compile and pass.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "small@1", 2);
+    insert_model(&db, "large@1", 4);
+    let chunk = insert_chunk(&db, a, 0);
+
+    upsert_vector(
+        &db,
+        chunk,
+        "small@1",
+        2,
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        "cd-1",
+        1,
+    )
+    .expect("the first model's vector");
+    upsert_vector(
+        &db,
+        chunk,
+        "large@1",
+        4,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        "cd-1",
+        2,
+    )
+    .expect("a second model on the same chunk");
+    // A retry under the first model, with a different answer.
+    upsert_vector(
+        &db,
+        chunk,
+        "small@1",
+        2,
+        &[99, 98, 97, 96, 95, 94, 93, 92],
+        "cd-2",
+        3,
+    )
+    .expect("retrying one model");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        2,
+        "two models on one chunk are two rows"
+    );
+    assert_eq!(
+        scalar::<Vec<u8>>(&db, "SELECT vector FROM embeddings WHERE model = 'small@1'"),
+        vec![99, 98, 97, 96, 95, 94, 93, 92],
+        "the retry landed on its own model's row"
+    );
+    assert_eq!(
+        scalar::<Vec<u8>>(&db, "SELECT vector FROM embeddings WHERE model = 'large@1'"),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        "and left the other model's vector alone"
+    );
+}
+
+#[test]
+fn a_string_bind_is_refused_from_embeddings_vector() {
+    // The P2 item the review named, carried from `todo.md`: `chunks.text` has had this probe since migration 7
+    // and `embeddings.vector` did not. BLOB is an affinity rather than a constraint, so without the `typeof`
+    // arm a TEXT vector would satisfy `length(vector) = 4 * dim` by character count — F13 §4's split-type bug,
+    // arriving as garbage cosines instead of an error.
+    //
+    // Written with `dim = 1` on purpose: the bound TEXT value `'a.md'` is four characters, so
+    // `length(vector) = 4 * dim` **passes** and only the typeof arm can refuse it. A probe at dim 2 with a
+    // four-character string would be refused by its length arm and prove nothing.
+    //
+    // Killed by: deleting `CHECK (typeof(vector) = 'blob' AND …)` down to the length half — the TEXT bind is
+    // then stored happily. The blob arm below is the other half: a mutant that refuses every bind fails it.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 1);
+
+    // The positive control, through the writer itself: `upsert_vector` takes `&[u8]`, which is why nothing in
+    // this crate can bind text here at all. Four bytes for a one-component model.
+    let chunk = insert_chunk(&db, a, 0);
+    upsert_vector(&db, chunk, "m@1", 1, &[0, 0, 128, 63], "chunk-digest", 1)
+        .expect("four bytes for dim 1 is exactly right");
+
+    // The probe goes through raw SQL on a **different chunk**, so neither the primary key nor the foreign keys
+    // can be what stops it — only the typeof CHECK, exactly as [`refuses_string_bind`]'s own doc asks.
+    let other = insert_chunk(&db, a, 1);
+    refuses_string_bind(
+        &db,
+        &format!(
+            "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+             VALUES ({other}, 'm@1', 1, ?1, 'chunk-digest', 1)"
+        ),
+        "embeddings.vector",
+    );
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"),
+        1,
+        "a refused vector bind wrote no row at all"
+    );
+}
+
+#[test]
+fn chunk_state_returns_the_shared_digest_and_texts_in_ordinal_order() {
+    // The read helper's ordering promise, pinned the only way that shows it: rows inserted **out of** ordinal
+    // order, so a statement without `ORDER BY ordinal` reads them back in rowid order.
+    //
+    // Killed by: dropping `ORDER BY ordinal` from `stored_chunks` — the vec comes back [(5,…),(0,…),(2,…)].
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    insert_chunk_stamped(&db, a, 5, 1, b"five", "d1");
+    insert_chunk_stamped(&db, a, 0, 1, b"zero", "d1");
+    insert_chunk_stamped(&db, a, 2, 1, b"two", "d1");
+
+    let (digest, texts) = chunk_state(&db, a).expect("state of a note with rows");
+    assert_eq!(
+        digest.as_deref(),
+        Some("d1"),
+        "rows that agree on their stamp state one note digest"
+    );
+    assert_eq!(
+        texts,
+        [
+            (0, b"zero".to_vec()),
+            (2, b"two".to_vec()),
+            (5, b"five".to_vec()),
+        ],
+        "ascending by ordinal, whatever order the rows went in"
+    );
+}
+
+#[test]
+fn chunk_state_has_no_single_answer_when_the_rows_disagree() {
+    // `Some(digest)` is a claim a caller acts on — "this note needs no chunk work" — so it is only allowed
+    // when every row supports it. Three shapes refuse that claim, each asserted on its own note so each kills
+    // its own mutant.
+    let db = Db::in_memory().expect("fresh database");
+    for rel in ["empty.md", "old-chunker.md", "mixed.md"] {
+        let abs = Path::new("/ws/").join(rel);
+        upsert_file(&db, &snap(rel, "h"), &abs, 1)
+            .unwrap_or_else(|_| panic!("test setup: registry row for {rel}"));
+    }
+    let empty = insert_note(&db, "empty.md", "Empty");
+    let old_chunker = insert_note(&db, "old-chunker.md", "Old");
+    let mixed = insert_note(&db, "mixed.md", "Mixed");
+
+    // Nothing has been cut from this note: no digest to be current for.
+    let (digest, texts) = chunk_state(&db, empty).expect("state of a note with no rows");
+    assert_eq!(digest, None, "no rows state no digest");
+    assert!(texts.is_empty());
+
+    // A row behind another build's chunker. §4 stamps per row precisely so a `CHUNKER_VERSION` bump makes old
+    // rows identifiable, so those rows must never read as current — and this signature has no third slot to
+    // say it with, which is why the digest arm carries the answer.
+    insert_chunk_stamped(&db, old_chunker, 0, 99, b"cut elsewhere", "d1");
+    let (digest, texts) = chunk_state(&db, old_chunker).expect("state of an old-chunker note");
+    assert_eq!(digest, None, "rows from another chunker are not current");
+    assert_eq!(texts, [(0, b"cut elsewhere".to_vec())], "and still listed");
+
+    // Two rows, two digests: there is no single note these chunks were cut from.
+    insert_chunk_stamped(&db, mixed, 0, 1, b"one", "d1");
+    insert_chunk_stamped(&db, mixed, 1, 1, b"two", "d2");
+    let (digest, texts) = chunk_state(&db, mixed).expect("state of a mixed note");
+    assert_eq!(digest, None, "disagreeing rows state nothing");
+    assert_eq!(texts.len(), 2, "both rows are still reported");
+}
+
+/// `chunk_digest` answers the scan's question — "do these rows describe this note's bytes?" — from stamps alone.
+///
+/// Killed by: dropping the `chunker` arm (a bump would leave stale rows labelled current and never re-cut), the
+/// disagreement arm, the empty-set arm, or the addressability check that `chunk_state` also applies.
+#[test]
+fn chunk_digest_reads_stamps_and_ignores_text() {
+    use np_core::chunk::CHUNKER_VERSION;
+
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    // No rows is not "current": the same rule `chunk_state` states, because a scan must re-cut an uncut note.
+    assert_eq!(
+        chunk_digest(&db, a).expect("state of a note with no rows"),
+        None,
+        "a note that has never been cut has nothing to call current"
+    );
+
+    insert_chunk_stamped(&db, a, 0, CHUNKER_VERSION, b"zero", "d1");
+    insert_chunk_stamped(&db, a, 1, CHUNKER_VERSION, b"one", "d1");
+    assert_eq!(
+        chunk_digest(&db, a).expect("state of a current note"),
+        Some("d1".to_string()),
+        "rows that agree on the digest and carry this build's chunker are current"
+    );
+
+    // The cost decision, stated as a property: text is not consulted. Two chunks of different length under one
+    // stamp read current — which is sound only because every production writer stamps text and digest together
+    // (`write_chunks_for_note` writes both from the same call), and it is what keeps a warm scan off the BLOBs.
+    insert_chunk_stamped(
+        &db,
+        a,
+        2,
+        CHUNKER_VERSION,
+        b"a much longer piece of chunk text",
+        "d1",
+    );
+    assert_eq!(
+        chunk_digest(&db, a).expect("state after a longer row"),
+        Some("d1".to_string()),
+        "the stamps are the contract; reading text here is what this helper exists to avoid"
+    );
+
+    // A row behind another build's chunker decides `None` for the whole note, which is how a bump re-cuts it.
+    insert_chunk_stamped(&db, a, 3, CHUNKER_VERSION + 1, b"future", "d1");
+    assert_eq!(
+        chunk_digest(&db, a).expect("state with a future row"),
+        None,
+        "a row this build did not cut means the note is not current"
+    );
+    db.0.execute("DELETE FROM chunks WHERE ordinal = 3", [])
+        .expect("test setup: drop the future row");
+
+    insert_chunk_stamped(&db, a, 4, CHUNKER_VERSION, b"yesterday", "d0");
+    assert_eq!(
+        chunk_digest(&db, a).expect("state with a disagreeing row"),
+        None,
+        "rows that disagree describe no single set of bytes"
+    );
+    db.0.execute("DELETE FROM chunks WHERE ordinal = 4", [])
+        .expect("test setup: drop the stale row");
+
+    // An ordinal too wide to address is a hand-edited or future row; it reads as not-current rather than as a
+    // chunk the scan cannot reach — the same rule `chunk_state` applies.
+    db.0.execute(
+        "UPDATE chunks SET ordinal = 4294967296 WHERE ordinal = 1",
+        [],
+    )
+    .expect("test setup: widen an ordinal past u32");
+    assert_eq!(
+        chunk_digest(&db, a).expect("state with an unaddressable ordinal"),
+        None,
+        "a row the writer could not address is never current"
+    );
+}
+
+/// The two `source_hash` levels are different facts, and this is the only thing keeping them from being used
+/// interchangeably. Both are `String`, both are in scope during a scan, and passing `files.hash` to `upsert_vector`
+/// would compile and look plausible — while making every vector claim currency after a `CHUNKER_VERSION` bump,
+/// because that bump restamps `chunks.source_hash` to an unchanged note digest.
+#[test]
+fn a_vector_stamped_with_the_note_digest_is_not_found_by_a_chunk_text_question() {
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+
+    // Two chunks of one note: same note digest (what `chunks.source_hash` holds), different text — the ordinary
+    // shape of any real note.
+    let note_digest = "note-level-digest";
+    let first = insert_chunk_stamped(&db, a, 0, 1, b"alpha", note_digest);
+    insert_chunk_stamped(&db, a, 1, 1, b"beta", note_digest);
+
+    let alpha = np_core::hash::sha256_bytes(b"alpha");
+    upsert_vector(&db, first, "m@1", 2, &[0u8; 8], &alpha, 5).expect("embed ordinal 0 only");
+
+    // The question the embed round asks — "does a vector describe this chunk's current text?" — is answered by the
+    // chunk-text level alone.
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM embeddings WHERE source_hash = '{alpha}'")
+        ),
+        1,
+        "the one vector on the table answers for ordinal 0's bytes"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            "SELECT COUNT(*) FROM chunks c JOIN embeddings e ON e.chunk_id = c.id
+              WHERE e.source_hash = c.source_hash"
+        ),
+        0,
+        "and nothing is found by comparing against the note-level stamp — the levels never coincide by accident"
+    );
+
+    // The failure this pins: a caller that passed `files.hash` stores fine (nothing at the schema stops it) and is
+    // invisible to the question above while matching every note-level query. Assert the wrong call is detectable,
+    // not silently equivalent.
+    let other = insert_chunk_stamped(&db, a, 2, 1, b"gamma", note_digest);
+    upsert_vector(&db, other, "m@1", 2, &[0u8; 8], note_digest, 5)
+        .expect("test setup: the wrong level still stores");
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            "SELECT COUNT(*) FROM chunks c JOIN embeddings e ON e.chunk_id = c.id
+              WHERE e.source_hash = c.source_hash"
+        ),
+        1,
+        "a note-digest vector matches its row's note digest: exactly the false currency the doc forbids"
+    );
+}
+
+#[test]
+fn delete_vectors_for_chunk_takes_every_model_and_leaves_the_chunk() {
+    // The embeddings-side helper the scan round needs: dropping a chunk's vectors must not drop the chunk, and
+    // must not reach into another chunk's vectors — that would be the §5 data loss with the table renamed.
+    //
+    // Killed by: `DELETE FROM embeddings` (no predicate) or a predicate on `model` instead of `chunk_id` — both
+    // fail the surviving-pair list below. Repeating the call is asserted because "already gone" must not be an
+    // error for a retry.
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "small@1", 2);
+    insert_model(&db, "large@1", 4);
+    let first = insert_chunk(&db, a, 0);
+    let second = insert_chunk(&db, a, 1);
+    // `dim` beside its payload so the length CHECK cannot be what refuses a row this test needs written.
+    for (chunk, model, dim, bytes) in [
+        (first, "small@1", 2, "0102030405060708"),
+        (first, "large@1", 4, "0102030405060708090a0b0c0d0e0f10"),
+        (second, "small@1", 2, "0102030405060708"),
+    ] {
+        db.0.execute(
+            &format!(
+                "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+                 VALUES ({chunk}, '{model}', {dim}, x'{bytes}', 'chunk-digest', 1)"
+            ),
+            [],
+        )
+        .expect("test setup: vector row");
+    }
+
+    delete_vectors_for_chunk(&db, first).expect("drop one chunk's vectors");
+
+    let left: Vec<(i64, String)> =
+        db.0.prepare("SELECT chunk_id, model FROM embeddings ORDER BY chunk_id, model")
+            .expect("embeddings are readable")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("embedding rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("embedding pairs");
+    assert_eq!(
+        left,
+        [(second, "small@1".to_string())],
+        "only the named chunk's vectors went, under both models"
+    );
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM chunks"),
+        2,
+        "the chunk row itself stays, with its id and ordinal intact"
+    );
+
+    // A second call has nothing to do and says so by succeeding.
+    delete_vectors_for_chunk(&db, first).expect("deleting nothing is not an error");
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM embeddings"), 1);
 }
 
 /// The schema as of version 2 — the first two `MIGRATIONS` entries copied out verbatim, and
@@ -2167,13 +3330,22 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
     )
     .expect("test setup: plant two note rows on one key, their derived rows and the edges around them");
     // Rewind past migration 5 — and past the receipt its step wrote while this file was still empty. A
+    //
+    // The rewind deletes a version number, so it has to undo what every later entry **created** as well: the
+    // `file_id` column (migration 6) and migration 7's three tables. Leave those standing and the next open
+    // re-applies migration 7 onto a schema that already has them — `table models already exists`, and an upgrade
+    // path nobody tested. Child table first, which matters once rows exist (with empty tables either order works) — with rows present an implicit DELETE would be
+    // refused by `embeddings`' two foreign keys; here the tables are still empty, so it is defence, not necessity.
     // genuine version-four file has no `note_merges` row at all, and leaving a `merged=0` one behind would
     // let that step take its upsert's update arm instead of recording itself, which is the difference
     // between "never checked" and "checked and found none" (F21 §2).
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -2266,10 +3438,15 @@ fn seed_two_duplicate_groups_at_version_four(path: &Path) {
         ),
     )
     .expect("test setup: plant two duplicate groups, one of them a triple");
+    // Undo everything migrations 5+ wrote, migration 7's tables included — see
+    // [`seed_duplicate_pair_at_version_four`] for why the drops are child-first.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -2309,10 +3486,14 @@ fn seed_nine_duplicate_groups_at_version_four(path: &Path) {
          VALUES {note_rows};"
     ))
     .expect("test setup: plant nine duplicate groups");
+    // Migration 7's tables go too, child first: [`seed_duplicate_pair_at_version_four`] says why.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -2340,10 +3521,14 @@ fn seed_keyless_display_pair_at_version_four(path: &Path) {
         ),
     )
     .expect("test setup: plant a keyless-display pair on one byte key");
+    // Migration 7's tables go too, child first: [`seed_duplicate_pair_at_version_four`] says why.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -3009,10 +4194,14 @@ fn the_merge_gate_refuses_damage_that_no_merge_could_have_caused() {
             [],
         )
         .expect("test setup: a heading row whose note never existed");
+        // Migration 7's tables go too, child first: [`seed_duplicate_pair_at_version_four`] says why.
         db.0.execute_batch(&format!(
             "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
              DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
         ))
         .expect("test setup: rewind the file to version four");
 

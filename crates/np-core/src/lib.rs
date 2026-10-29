@@ -2,12 +2,15 @@
 
 pub mod catalog;
 pub mod change;
+pub mod chunk;
 pub mod config;
 pub mod db;
+pub mod embed;
 pub mod hash;
 pub mod index_names;
 pub mod items;
 pub mod links;
+pub mod models;
 pub mod parse;
 pub mod path_keys;
 pub mod scan;

@@ -20,8 +20,8 @@ mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
-    config_file_path, CatalogConfig, Config, ConfigError, MarkerConfig, WorkspaceRegistry,
-    MAX_CONTINUATION_INDENT,
+    config_file_path, CatalogConfig, Config, ConfigError, EmbeddingProvider, EmbeddingsConfig,
+    MarkerConfig, WorkspaceRegistry, MAX_CONTINUATION_INDENT,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -215,8 +215,14 @@ fn unparsable_config_file_is_a_parse_error() {
     let err = Config::load(Some(&path)).expect_err("bad TOML must not load");
 
     assert!(
-        matches!(err, ConfigError::Parse(_)),
+        matches!(err, ConfigError::Parse { .. }),
         "expected Parse, got {err:?}"
+    );
+    // The variant carries the path precisely because this message is what a person acts on: bad
+    // content in one of two possible files must say which.
+    assert!(
+        err.to_string().contains("config.toml"),
+        "a parse refusal must name the file it refused: {err}"
     );
 }
 
@@ -656,4 +662,165 @@ fn refusing_an_oversized_indent_leaves_the_default_alone() {
     let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 400\n");
     let cfg = Config::load(Some(&path)).expect("a file naming no indent keeps the default");
     assert_eq!(cfg.catalog.continuation_indent, 2);
+}
+
+/// Write `body` as a config file and load it, expecting refusal; return the file and the error.
+///
+/// The path comes back because "names the file" has to be asserted against the error's **own** text: a
+/// message built by concatenating the path would satisfy a `contains` check even if the refusal named no
+/// file at all, which is the exact hole this helper must not open.
+fn embeddings_refusal(body: &str) -> (PathBuf, ConfigError) {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), body);
+    let err = match Config::load(Some(&path)) {
+        Ok(cfg) => panic!(
+            "the file must be refused, loaded provider = {:?}",
+            cfg.embeddings.provider
+        ),
+        Err(err) => err,
+    };
+    (path, err)
+}
+
+#[test]
+fn a_misspelled_embeddings_key_is_refused_naming_key_and_file() {
+    // §7's scenario verbatim: `provide` instead of `provider`, with a perfectly valid value beside it.
+    // Lenient deserialisation would load that as `provider = "none"` and the owner would believe their
+    // corpus was embedding. The whole point of `deny_unknown_fields` on this one section is that the
+    // file is refused instead — naming the key, so it can be fixed, and the file, because two config
+    // files can be in play (F17's key+value+ceiling rule, same reasoning as
+    // `explicit_missing_config_file_is_an_io_error`).
+    let (path, err) = embeddings_refusal("[embeddings]\nprovide = \"openai-compatible\"\n");
+    let message = err.to_string();
+
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "an unknown key must travel as the typed parse refusal, got {err:?}"
+    );
+    // Quoted deliberately: toml names the bad key *and* lists the legal ones ("unknown field `provide`,
+    // expected one of `provider`, `model`, `dim`"), so an assertion on the bare word would be satisfied
+    // by the suggestion list. "\`provide\`" is not a substring of "\`provider\`".
+    assert!(
+        message.contains("`provide`"),
+        "the refusal must name the misspelled key as written: {message}"
+    );
+    assert!(
+        message.contains(&path.display().to_string()),
+        "and the file to go and fix, in its own words: {message}"
+    );
+
+    // Mutation this catches: dropping `deny_unknown_fields` from `EmbeddingsConfig`, which loads the
+    // typo as `provider = None` — the test then fails on the `panic!` inside `embeddings_refusal`, with
+    // the loaded provider printed.
+}
+
+#[test]
+fn an_unrecognised_embeddings_key_is_refused_even_beside_a_valid_one() {
+    // Half of "a typo must not mean none" that a single-key fixture cannot see: when *another* key in
+    // the same section is correct, a struct that merely ignored unknowns would load `provider` fine and
+    // the stray key would vanish. Refusal has to survive the company it keeps.
+    let (_path, err) =
+        embeddings_refusal("[embeddings]\nprovider = \"local-model\"\nmodell = \"gemma\"\n");
+    let message = err.to_string();
+    assert!(
+        message.contains("`modell`"),
+        "the stray key is named even though its neighbour is valid: {message}"
+    );
+
+    // Mutation this catches: replacing `deny_unknown_fields` with per-field defaults, i.e. the lenient
+    // posture of `CatalogConfig`, which would load this file as provider = LocalModel and drop `modell`.
+}
+
+#[test]
+fn omitting_the_embeddings_section_means_no_provider() {
+    // §2's shipping default, asserted on a file that says nothing about embeddings at all: no section,
+    // no download, no contact. This is also the half of the story the refusal above cannot tell — a
+    // reader who only saw the strict struct could not tell an omitted section from a refused one.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 400\n");
+
+    let cfg =
+        Config::load(Some(&path)).expect("a file with no [embeddings] section is a valid config");
+
+    assert_eq!(cfg.embeddings.provider, EmbeddingProvider::None);
+    assert_eq!(cfg.embeddings.model, None);
+    assert_eq!(cfg.embeddings.dim, None);
+    assert_eq!(
+        cfg.embeddings,
+        EmbeddingsConfig::default(),
+        "and that is the same state `Config::default()` describes for a fresh install"
+    );
+
+    // Mutation this catches: making `provider` mandatory (removing the container default), which turns
+    // every existing config file into a `MissingField`-style parse error.
+}
+
+#[test]
+fn every_provider_spelling_parses_and_a_partial_section_keeps_its_defaults() {
+    // The three kebab-case spellings §2 uses, pinned from the file rather than from the enum: dropping
+    // `rename_all` would silently start accepting `LocalModel` and refuse `local-model`.
+    for (spelling, expected) in [
+        ("none", EmbeddingProvider::None),
+        ("local-model", EmbeddingProvider::LocalModel),
+        ("openai-compatible", EmbeddingProvider::OpenAiCompatible),
+    ] {
+        let tmp = TempDir::new().expect("test setup: tempdir");
+        let path = write_config_with_data_dir(
+            tmp.path(),
+            &format!("[embeddings]\nprovider = \"{spelling}\"\n"),
+        );
+        let cfg = Config::load(Some(&path))
+            .unwrap_or_else(|err| panic!("\"{spelling}\" is a legal provider: {err}"));
+        assert_eq!(cfg.embeddings.provider, expected, "for {spelling}");
+        // Unread by production code in Round 3a, but they must arrive rather than be invented.
+        assert_eq!(cfg.embeddings.model, None, "absent model stays absent");
+        assert_eq!(cfg.embeddings.dim, None, "absent dim stays absent");
+    }
+
+    // The other two fields, and a section naming only one of them — which is what `EmbeddingsConfig`'s
+    // own container default exists for.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"embeddinggemma-2-text@1\"\ndim = 512\n",
+    );
+    let cfg = Config::load(Some(&path)).expect("a full [embeddings] section loads");
+    assert_eq!(
+        cfg.embeddings.model.as_deref(),
+        Some("embeddinggemma-2-text@1")
+    );
+    assert_eq!(cfg.embeddings.dim, Some(512));
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[embeddings]\nmodel = \"m@1\"\n");
+    let cfg = Config::load(Some(&path)).expect("a partial [embeddings] section loads");
+    assert_eq!(cfg.embeddings.provider, EmbeddingProvider::None);
+    assert_eq!(cfg.embeddings.dim, None);
+
+    // Mutations this catches, all three observed: dropping `#[serde(rename_all = "kebab-case")]`
+    // ("local-model" then fails to parse); dropping the hand-written `openai-compatible` rename, which
+    // leaves serde's own kebab-casing in charge and refuses §2's spelling with "expected one of `none`,
+    // `local-model`, `open-ai-compatible`"; and dropping the container `default`, which makes a partial
+    // section error on its missing sibling key.
+}
+
+#[test]
+fn an_unknown_key_outside_embeddings_still_loads() {
+    // The strictness is scoped, and this is the half that proves it: `[catalog]` and the top level keep
+    // the lenient posture every existing config file relies on. Without this case, a reader of the test
+    // above could not tell "one section refuses typos" from "the whole file does" — and flipping the
+    // file strict would be a silent behaviour change for every installed config.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        "stray_top_level = 1\n[catalog]\nmax_entries_per_file = 400\nstray = \"x\"\n",
+    );
+
+    let cfg = Config::load(Some(&path)).expect("unknown keys outside [embeddings] stay accepted");
+
+    assert_eq!(cfg.catalog.max_entries_per_file, 400);
+    assert_eq!(cfg.embeddings.provider, EmbeddingProvider::None);
+
+    // Mutation this catches: adding `deny_unknown_fields` to `Config` or `CatalogConfig`, which would
+    // refuse config files that work today.
 }

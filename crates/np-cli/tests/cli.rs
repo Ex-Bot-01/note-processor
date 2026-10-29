@@ -407,6 +407,40 @@ fn skipped(report: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// Write the chunker version this workspace recorded, the way an older build would have left it.
+#[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
+fn record_chunk_version(ws: &Workspace, version: i64) {
+    let cfg = Config {
+        data_dir: ws.data_dir(),
+        ..Config::default()
+    };
+    let db =
+        Db::open(&cfg.workspace_db(&ws.root)).expect("test setup: open the workspace database");
+    db.0.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (np_core::scan::EMBED_VERSION_KEY, version.to_string()),
+    )
+    .expect("test setup: record the chunker version");
+}
+
+/// The recorded chunker version, or `None` when the workspace never recorded one.
+#[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
+fn recorded_chunk_version(ws: &Workspace) -> Option<i64> {
+    let cfg = Config {
+        data_dir: ws.data_dir(),
+        ..Config::default()
+    };
+    let db = Db::open(&cfg.workspace_db(&ws.root)).expect("test: open the workspace database");
+    db.0.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        [np_core::scan::EMBED_VERSION_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|value| value.trim().parse().ok())
+}
+
 /// The note one case makes unreadable. Any corpus note will do; this one holds a heading, so it certainly
 /// owns derived rows that a refresh owes.
 #[cfg(unix)]
@@ -473,6 +507,47 @@ fn a_parse_rule_change_reports_the_re_parse_on_stderr() {
     assert!(
         !stderr.contains("not recorded"),
         "a refresh that covered the corpus must not also claim a gap:\n{stderr}"
+    );
+}
+
+/// The chunker's own gap line, asserted the way its sibling above asserts the parse one. Recorded because
+/// design-m2-models-install §8 claimed no capture seam exists for it — that was false: this file already captures a
+/// child's stderr and matches its sibling's sentence verbatim.
+#[cfg(unix)]
+#[test]
+fn an_incomplete_chunk_pass_reports_its_own_gap_on_stderr() {
+    use np_core::chunk::CHUNKER_VERSION;
+
+    let ws = workspace();
+    run(&mut ws.command(&["scan", "--json"])).assert_success();
+    // Parse current, chunker stamp not: a chunker-only bump is exactly the case where the parse receipt prints
+    // nothing at all and the chunk gap would otherwise be silent.
+    record_chunk_version(&ws, 0);
+    let _restore = deny_read(&ws.root.join(BLOCKED_NOTE));
+
+    let incomplete = run(&mut ws.command(&["scan", "--json"]));
+    incomplete.assert_success();
+    let expected = format!(
+        "note-processor: chunker v{CHUNKER_VERSION} not recorded — 1 note(s) were not cut this scan; the next scan will retry"
+    );
+    let stderr = incomplete.stderr();
+    assert!(
+        stderr.contains(&expected),
+        "`{expected}` missing from:\n{stderr}"
+    );
+
+    drop(_restore);
+    let settled = run(&mut ws.command(&["scan", "--json"]));
+    settled.assert_success();
+    assert!(
+        !settled.stderr().contains("chunker v"),
+        "with the note readable again the version records and the line goes quiet:\n{}",
+        settled.stderr()
+    );
+    assert_eq!(
+        recorded_chunk_version(&ws),
+        Some(CHUNKER_VERSION),
+        "the workspace records this build's chunker once the pass completes"
     );
 }
 
@@ -1020,10 +1095,16 @@ fn seed_duplicate_pair_at_version_four(ws: &Workspace) {
         abs("third.md")
     ))
     .expect("test setup: plant two note rows on one key, their derived rows and the edges around them");
+    // Undo what every entry above 4 created, migration 7's three tables included — a version-four file has no
+    // chunk storage, and the next open re-applies those entries. Child table first, which matters once rows exist (with empty tables either order works) — with rows present an implicit DELETE
+    // would be refused by `embeddings`' two foreign keys; these tables are still empty, so it is defence, not necessity.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -1169,10 +1250,14 @@ fn the_upgrading_scan_prints_the_merged_pair_on_stdout() {
 /// cannot answer with a group whatever the corpus on disk looks like.
 fn rewind_to_version_four_without_a_pair(ws: &Workspace) {
     let db = Db::open(&ws.db_path()).expect("test setup: create the current schema");
+    // Migration 7's tables go with the version number, child first — see `seed_duplicate_pair_at_version_four`.
     db.0.execute_batch(&format!(
         "DELETE FROM meta WHERE key = '{NOTE_MERGE_KEY}';
          DELETE FROM schema_version WHERE version > 4;
-         ALTER TABLE files DROP COLUMN file_id;"
+         ALTER TABLE files DROP COLUMN file_id;
+         DROP TABLE embeddings;
+         DROP TABLE chunks;
+         DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(

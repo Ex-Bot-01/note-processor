@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use thiserror::Error;
 
+use crate::chunk::{Chunk, CHUNKER_VERSION};
 use crate::hash::Snapshot;
 use crate::path_keys::{self, RelPath};
 
@@ -58,7 +59,7 @@ pub(crate) const BUSY_TIMEOUT_MS: u32 = 1800;
 /// ahead of this list is refused rather than trusted — a newer file read by an older binary
 /// would otherwise be written to a schema this code does not know.
 ///
-/// Five entries rather than one, split along the lines that matter (`files` + `notes` are the
+/// Seven entries rather than one, split along the lines that matter (`files` + `notes` are the
 /// registry and the note's identity; everything after them is derived from a note's contents
 /// and can be rebuilt from the file; the third adds the keys between those two groups; the fourth
 /// re-keys the registry's own pair onto bytes; the fifth folds the duplicate note rows that key may
@@ -166,6 +167,73 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(
         r#"
     ALTER TABLE files ADD COLUMN file_id BLOB;
+    "#,
+    ),
+    // Chunk and vector storage (design-m2-embeddings §3): the first derived data that hangs off a note *id* rather
+    // than a path, which is the F13 lesson applied forward — a chunk storing `rel_bytes` would inherit every
+    // lossy-name, rename and merge defect six milestones spent removing.
+    //
+    // Four things about this shape are decisions rather than accidents:
+    //
+    // - **`models.sha256` is nullable by design.** Weights are never committed and `np models install` verifies the
+    //   digest it fetched, but a provider with no weights — the default `embeddings.provider = "none"`, and every
+    //   endpoint provider — has nothing to verify. NULL is therefore the common arm, so there is no
+    //   `CHECK (typeof(sha256) = 'text')`: that CHECK would refuse the shipping configuration.
+    // - **`embeddings.model` is a real foreign key**, and `models` is declared before its child so the key reads in
+    //   file order. Without the reference an embedding row could name a model that was never installed, or one
+    //   removed and reinstalled under the same id — exactly the orphan class migration 3 exists to end ("Migration 3
+    //   gave every one of these five statements a twin in the schema", `scan.rs:1338-1340`) — and
+    //   `PRAGMA foreign_key_check` reads *declared* constraints and ignores the pragma, which is what
+    //   `first_violation`'s own comment says; a key that was never declared is a key that check can never see.
+    //   Declaring it here costs nothing at write time and buys the one audit that reaches every row.
+    // - **`vector` carries a length CHECK.** Little-endian f32 instead of the spec's q8 (`spec:85`) is a deliberate
+    //   deviation — quantisation is a quality decision that belongs with the model benchmark, not smuggled in as
+    //   storage trivia — and the CHECK keeps that deviation machine-enforced *now*, while the table is empty, so a
+    //   later switch to q8 fails at write instead of becoming subtly wrong cosines no test would notice. `dim` is
+    //   stored beside it so a mismatch is detectable at read time rather than producing garbage.
+    // - **No index beyond the primary keys and `UNIQUE (note_id, ordinal)`**, because nothing looks a chunk up by
+    //   anything but that pair. An index here would be written on every embed and paid for by every scan, to speed
+    //   up a query no reader makes.
+    Migration::Sql(
+        r#"
+    CREATE TABLE models (
+        id            TEXT    PRIMARY KEY,
+        dim           INTEGER NOT NULL,
+        -- NULL is a provider with no weights, which is the common case rather than the broken one.
+        sha256        TEXT,
+        prefix_doc    TEXT    NOT NULL DEFAULT '',
+        prefix_query  TEXT    NOT NULL DEFAULT '',
+        installed_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE chunks (
+        id            INTEGER PRIMARY KEY,
+        note_id       INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        ordinal       INTEGER NOT NULL,
+        chunker       INTEGER NOT NULL,
+        -- Raw UTF-8 bytes: `TEXT` would be a promise that note bodies are valid UTF-8, which F13 refuses to make.
+        -- `typeof = 'blob'` too, not just the declared affinity: a Rust `String` bind arrives as TEXT and
+        -- `length()` would then count characters, letting eight of them satisfy a 4*dim rule for dim=2.
+        -- Migration 4 learned this the hard way with its key columns (F13 §4).
+        text          BLOB    NOT NULL CHECK (typeof(text) = 'blob'),
+        byte_start    INTEGER NOT NULL,
+        byte_end      INTEGER NOT NULL,
+        source_hash   TEXT    NOT NULL,
+        UNIQUE (note_id, ordinal)
+    );
+
+    CREATE TABLE embeddings (
+        chunk_id      INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+        model         TEXT    NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        dim           INTEGER NOT NULL,
+        -- Same trap one table over: without the typeof arm a TEXT bind of eight characters would satisfy
+        -- `length(vector) = 4 * dim` at dim=2, and the failure would surface later as garbage cosines.
+        vector        BLOB    NOT NULL CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim),
+        source_hash   TEXT    NOT NULL,
+        embedded_at   INTEGER NOT NULL,
+        -- Re-embedding under a second model must not destroy the first, so the pair is the key.
+        PRIMARY KEY (chunk_id, model)
+    );
     "#,
     ),
 ];
@@ -1707,6 +1775,494 @@ pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
         targets.push(row?);
     }
     Ok(targets)
+}
+
+/// What one call to [`write_chunks_for_note`] touched, as counts of **rows touched**.
+///
+/// Each field counts rows whose stored content changed, not chunks that were looked at: a chunk already on
+/// file exactly as this build would write it appears in none of the three numbers. That is the shape §5's
+/// warm pass is about — an unchanged note answers [`ChunkWrite::default()`] — and a report claiming work it
+/// did not do is the lie F21 §3 refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChunkWrite {
+    /// Ordinals the note had no row for, so a fresh `chunks.id` was minted.
+    pub inserted: usize,
+    /// Rows rewritten in place — same `id`, new content. Includes a row whose text did not move but whose
+    /// stored `source_hash` or `chunker` lagged behind what this call writes; see
+    /// [`write_chunks_for_note`] for why that restamp is the cheap path's precondition rather than waste.
+    pub updated: usize,
+    /// Trailing rows deleted because the note holds fewer chunks than it did. Their vectors go with them
+    /// through `ON DELETE CASCADE`, which is the only cascade this module provokes from here.
+    pub deleted: usize,
+}
+
+/// Replace one note's chunk rows with `chunks`, by **per-ordinal diff**.
+///
+/// This is the program's only writer of `chunks`, and it diffs instead of delete-and-reinserting for one
+/// reason (design-m2-embeddings §5's third bullet): `embeddings.chunk_id` cascades off `chunks.id`, so the
+/// derived-row pattern used elsewhere (`crate::scan`'s delete-then-insert for headings, tags, items and
+/// links) would cascade away every vector of an edited note. "Re-embed only what moved" therefore depends
+/// on row *identity* surviving an edit, not merely on the final rows being right. Hence:
+///
+/// - rows are addressed by `UNIQUE (note_id, ordinal)` — the pair [`chunk_state`] reads back, and the
+///   constraint `one_note_cannot_hold_two_chunks_at_the_same_ordinal` probes;
+/// - an ordinal that already has a row is rewritten with `UPDATE … WHERE id = ?`, so its `id`, and every
+///   vector hanging off it, is unchanged;
+/// - ordinals the note no longer has (`ordinal >= chunks.len()`) are deleted, and only those.
+///
+/// Two facts go on every row this function writes: `chunker = CHUNKER_VERSION`, so a bump makes old rows
+/// *identifiable* rather than presumed stale (§4), and `source_hash = note_digest` — the digest of the
+/// **note** bytes the chunks were cut from. That is one level coarser than `embeddings.source_hash` (§3's
+/// two levels: a heading edit in paragraph 9 leaves chunk 2's own text alone, and that fact belongs to the
+/// vector row, never here). Stamping the digest onto rows whose text did not move is deliberate rather
+/// than sloppiness: it is what makes the cheap path below reachable on the *next* scan, which is §5's "an
+/// unchanged note costs one indexed lookup per scan". Its cost is one `UPDATE` per unchanged row on the
+/// one scan that notices an edit, and it touches no vector — this function never writes `embeddings`.
+///
+/// `Chunk::text` travels as bytes (`&[u8]`), never as `String` or `&str`: a text bind arrives at SQLite as
+/// TEXT, migration 7's `CHECK (typeof(text) = 'blob')` refuses it, and BLOB is an affinity rather than a
+/// constraint — F13 §4's split-type bug, kept armed by `a_string_bind_is_refused_from_chunks_text`.
+///
+/// ## The cheap path
+///
+/// When the note holds exactly `chunks.len()` rows stamped with this digest *and* this chunker, **and no other
+/// rows at all**, the stored set is what this call would write: nothing else writes `chunks`,
+/// [`crate::chunk::chunk`] is deterministic, and a row's stamp means it was cut from bytes hashing to that
+/// digest by this chunker. Two counts answer that in one indexed pass and nothing is written.
+///
+/// The second count is not paranoia. An **emptied** note — body cleared to blank lines, which [`crate::chunk::chunk`]
+/// returns no chunks for — wants zero rows and can hold three stamped with an older digest; against the stamp
+/// alone both sides read `0 == 0`, so a single-count predicate returns early and leaves those rows **and their
+/// vectors** on the table permanently, every later scan re-deriving the same empty list and taking the same arm.
+/// That is a report claiming work it did not do, which is the F21 §3 lie this module's own doc refuses.
+///
+/// ## Transaction
+///
+/// None of its own: chunk writes belong to whichever transaction the caller is in, which for the scan is
+/// its single write transaction — §5: "Chunk writes stay in the transaction — they are cheap and must be
+/// atomic with the note rows". A failure mid-diff therefore rolls back alongside the note rows it
+/// accompanied instead of leaving a note half-rechunked.
+pub fn write_chunks_for_note(
+    db: &Db,
+    note_id: i64,
+    chunks: &[Chunk],
+    note_digest: &str,
+) -> Result<ChunkWrite, DbError> {
+    // The row count as SQLite's INTEGER. Nothing here is near `i64::MAX` chunks, but a bare `as` would wrap
+    // such a length into a negative number that matches nothing (the same reasoning as [`upsert_file`]'s size).
+    let wanted = i64::try_from(chunks.len()).unwrap_or(i64::MAX);
+    // Two counts, not one. `stamped` alone answers "does every row I would keep carry this stamp?" but says
+    // nothing about rows that should be **gone**: an emptied note wants zero chunks and holds three, both
+    // numbers read 0 == 0 against today's stamp, and a single-count predicate would return early with those
+    // three rows — and their vectors — still on the table, forever, because every later scan derives the same
+    // empty list and takes the same arm. `total` is what makes the cheap path a proof rather than a hope: skip
+    // only when the stamped rows are as many as we want AND there are no others.
+    let (stamped, total): (i64, i64) = db
+        .0
+        .prepare_cached(
+            "SELECT COALESCE(SUM(CASE WHEN source_hash = ?2 AND chunker = ?3 THEN 1 ELSE 0 END), 0),
+                    COUNT(*)
+               FROM chunks WHERE note_id = ?1",
+        )?
+        .query_row(params![note_id, note_digest, CHUNKER_VERSION], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    if stamped == wanted && total == wanted {
+        return Ok(ChunkWrite::default());
+    }
+
+    let stored = stored_chunks(db, note_id)?;
+    let mut written = ChunkWrite {
+        // The tail first. A chunk the note no longer has is gone, and its vectors cascading away with it is
+        // the correct loss — unlike the cascade a blanket delete would cause for the rows that stay.
+        deleted: db
+            .0
+            .prepare_cached("DELETE FROM chunks WHERE note_id = ?1 AND ordinal >= ?2")?
+            .execute(params![note_id, wanted])?,
+        inserted: 0,
+        updated: 0,
+    };
+
+    for chunk in chunks {
+        let ordinal = i64::from(chunk.ordinal);
+        // Offsets are `usize` in Rust and `INTEGER` here; the same unreachable-but-refusing-to-wrap guard
+        // as `wanted` above.
+        let byte_start = i64::try_from(chunk.byte_start).unwrap_or(i64::MAX);
+        let byte_end = i64::try_from(chunk.byte_end).unwrap_or(i64::MAX);
+        // Bytes, not `&chunk.text`: see this function's doc for the CHECK that refuses a text bind.
+        let text: &[u8] = chunk.text.as_bytes();
+
+        // Binary search, not a scan: [`stored_chunks`] returns rows `ORDER BY ordinal`, which is what makes
+        // the ordinals searchable and keeps a note with hundreds of chunks off quadratic time. Rows deleted
+        // above all carry `ordinal >= wanted`, so nothing here can look up a row that was just removed.
+        match stored.binary_search_by_key(&ordinal, |row| row.ordinal) {
+            Ok(index) => {
+                let row = &stored[index];
+                if row.text != text
+                    || row.byte_start != byte_start
+                    || row.byte_end != byte_end
+                    || row.chunker != CHUNKER_VERSION
+                    || row.source_hash != note_digest
+                {
+                    // Matched on `id` — the whole point of the diff — with `note_id` in the predicate so a
+                    // row read for another note could never be rewritten by a stale index position.
+                    written.updated +=
+                        db.0.prepare_cached(
+                            "UPDATE chunks
+                                SET chunker = ?3, text = ?4, byte_start = ?5, byte_end = ?6,
+                                    source_hash = ?7
+                              WHERE id = ?1 AND note_id = ?2",
+                        )?
+                        .execute(params![
+                            row.id,
+                            note_id,
+                            CHUNKER_VERSION,
+                            text,
+                            byte_start,
+                            byte_end,
+                            note_digest
+                        ])?;
+                }
+            }
+            Err(_) => {
+                // No row at this ordinal, so the insert cannot collide with `UNIQUE (note_id, ordinal)`.
+                written.inserted +=
+                    db.0.prepare_cached(
+                        "INSERT INTO chunks
+                             (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    )?
+                    .execute(params![
+                        note_id,
+                        ordinal,
+                        CHUNKER_VERSION,
+                        text,
+                        byte_start,
+                        byte_end,
+                        note_digest
+                    ])?;
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// One stored `chunks` row, in the shape [`write_chunks_for_note`]'s diff compares against.
+struct StoredChunk {
+    /// `chunks.id`, which the update matches on so a rewrite cannot mint a new row and cascade vectors.
+    id: i64,
+    ordinal: i64,
+    chunker: i64,
+    byte_start: i64,
+    byte_end: i64,
+    /// Read back as bytes because the column is a BLOB holding note bytes (F13 §4): reading it into a
+    /// `String` would fail on exactly the lossy notes the column exists to hold.
+    text: Vec<u8>,
+    source_hash: String,
+}
+
+/// One note's chunk rows, ascending by ordinal.
+///
+/// The `ORDER BY` is load-bearing twice over: it is what lets [`write_chunks_for_note`] binary-search by
+/// ordinal, and it is the reason [`chunk_state`] returns texts in [`crate::chunk`]'s own order rather than
+/// in whatever order a later planner prefers — the same argument `rebuild_with_keys` (a code span; that
+/// function is private) makes about rowids.
+fn stored_chunks(db: &Db, note_id: i64) -> Result<Vec<StoredChunk>, DbError> {
+    let mut statement = db.0.prepare_cached(
+        "SELECT id, ordinal, chunker, byte_start, byte_end, text, source_hash
+           FROM chunks WHERE note_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement.query_map(params![note_id], |row| {
+        Ok(StoredChunk {
+            id: row.get(0)?,
+            ordinal: row.get(1)?,
+            chunker: row.get(2)?,
+            byte_start: row.get(3)?,
+            byte_end: row.get(4)?,
+            text: row.get(5)?,
+            source_hash: row.get(6)?,
+        })
+    })?;
+    let mut rows_out = Vec::new();
+    for row in rows {
+        rows_out.push(row?);
+    }
+    Ok(rows_out)
+}
+
+/// What one note's stored chunks say about themselves: the note digest they were cut from, and their text
+/// by ordinal.
+///
+/// The reader §5's staleness rule needs. A caller compares a fresh note digest against the first element to
+/// decide whether this note needs any chunk work at all, and compares each stored text against the chunk it
+/// just cut to decide which ordinals moved; both answers come from one indexed pass over one note's rows.
+///
+/// - **Ordering.** Texts come back ascending by `ordinal`, which is [`crate::chunk`]'s own order. The
+///   `ORDER BY` lives in the statement rather than being left to the planner, for the reason
+///   `rebuild_with_keys` (a code span; that function is private) gives about rowid order.
+/// - **The digest arm is `Some` only when there is one answer.** Every row must carry the same
+///   `source_hash`, and every row must carry the current [`CHUNKER_VERSION`]; otherwise these rows support
+///   no single statement and the caller has to re-chunk. Folding the chunker in follows from this signature
+///   having no third slot — and rows cut by an older chunker must never read as current, since §4 stamps
+///   per row precisely so a bump invalidates them. A note with no rows has no digest either: nothing has
+///   been cut from it yet, which is the same answer as "stale" and costs the caller one
+///   [`write_chunks_for_note`] call.
+/// - **A row this program cannot have written.** `chunks.ordinal` is a SQLite INTEGER, so a hand-edited file
+///   could hold a value above `u32::MAX`. [`crate::chunk::chunk`] refuses to mint one, so the honest reading
+///   is "not ours, not current": the digest arm comes back `None` and that row is reported at `u32::MAX`,
+///   which keeps it visible instead of silently dropping a row from the list.
+///
+/// Texts are `Vec<u8>` because the column holds note bytes, not a promise about UTF-8 (§3).
+// The tuple stays spelled out: the caller destructures `(digest, texts)`, and a public alias for
+// `Vec<(u32, Vec<u8>)>` would name one fact twice without saying anything the signature does not already.
+// clippy's heuristic counts nesting rather than meaning.
+#[allow(clippy::type_complexity)]
+/// Still **no production caller**: the scan decides currency from [`chunk_digest`], which reads stamps only, and
+/// this function's texts exist for the embed round that compares a chunk's stored bytes against what it would
+/// re-embed. `None` means "no single digest describes these rows", which a caller must not read as "no chunks".
+pub fn chunk_state(
+    db: &Db,
+    note_id: i64,
+) -> Result<(Option<String>, Vec<(u32, Vec<u8>)>), DbError> {
+    let rows = stored_chunks(db, note_id)?;
+    // One pass decides both arms: a row that disagrees with the first row's stamp, or carries another
+    // build's chunker, or cannot be addressed as a `u32` ordinal, sets `current` to false and stays in the
+    // text list.
+    let digest = rows.first().map(|row| row.source_hash.clone());
+    let mut current = !rows.is_empty();
+    let mut texts = Vec::with_capacity(rows.len());
+    for row in rows {
+        // `u32::MAX` rather than a wrap, and the ordinal is checked *before* it is narrowed: see this
+        // function's doc. A row that cannot be addressed also decides the digest arm, so no caller can
+        // mistake such a set for current.
+        let addressable = u32::try_from(row.ordinal).is_ok();
+        let ordinal = u32::try_from(row.ordinal).unwrap_or(u32::MAX);
+        current &= addressable
+            && row.chunker == CHUNKER_VERSION
+            && Some(row.source_hash.as_str()) == digest.as_deref();
+        texts.push((ordinal, row.text));
+    }
+    Ok((
+        if current {
+            // `digest` is `Some` here: `current` starts false for an empty row set.
+            digest
+        } else {
+            None
+        },
+        texts,
+    ))
+}
+
+/// The note digest one note's chunk rows agree on, **without reading their text**.
+///
+/// This is the scan's per-note decision (design §5: "an unchanged note costs one indexed lookup per scan"), and
+/// the stamps are all that decision uses. [`chunk_state`] answers the same question while materialising a `Vec<u8>`
+/// per chunk — on a warm scan over a real vault that is roughly the whole corpus read out of SQLite and thrown
+/// away, which is a different cost class from an index probe and one the suite cannot see, because the perf fixture's
+/// notes are ~350 bytes and cut one chunk each. Same rules as [`chunk_state`], same `None` arms: no rows, rows that
+/// disagree, a row behind another build's chunker, or an ordinal too wide to address.
+///
+/// No `ORDER BY`: nothing here is searched by position, and the answer is order-independent.
+pub fn chunk_digest(db: &Db, note_id: i64) -> Result<Option<String>, DbError> {
+    let mut statement =
+        db.0.prepare_cached("SELECT ordinal, chunker, source_hash FROM chunks WHERE note_id = ?1")?;
+    let mut rows = statement.query_map(params![note_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    // Folded as it reads, because the first row's digest is the only candidate: any row that disagrees with it
+    // decides `None`, so a caller never has to know how many rows disagreed.
+    let mut digest: Option<String> = None;
+    let mut current = true;
+    for row in &mut rows {
+        let (ordinal, chunker, source_hash) = row?;
+        let addressable = u32::try_from(ordinal).is_ok();
+        match &digest {
+            None => digest = Some(source_hash),
+            Some(first) => current &= first == &source_hash,
+        }
+        current &= addressable && chunker == CHUNKER_VERSION;
+    }
+    // An empty row set is `None` for the same reason [`chunk_state`] says: no rows is not "current".
+    Ok(if current { digest } else { None })
+}
+
+/// Store one vector for one chunk under one model, idempotently.
+///
+/// **`chunk_text_digest` is the SHA-256 of that chunk's own text — never `files.hash`.** The two levels look
+/// interchangeable (both `String`, both in scope during a scan) and are not: `chunks.source_hash` holds the note
+/// digest, so after a `CHUNKER_VERSION` bump every row is restamped to an unchanged `files.hash` while its text may
+/// have been re-cut — and a vector stamped with the note digest would then claim currency for bytes nobody has
+/// embedded since. Pinned by `a_vector_stamped_with_the_note_digest_is_not_found_by_a_chunk_text_question`.
+///
+/// `INSERT … ON CONFLICT (chunk_id, model) DO UPDATE` rather than a plain `INSERT`, and §5's third bullet is
+/// the reason: F15 *expects* its retry, so "this write already happened" is an ordinary event rather than a
+/// bug. A plain insert into `PRIMARY KEY (chunk_id, model)` answers that retry with
+/// `SQLITE_CONSTRAINT_PRIMARYKEY`, and because one `?` propagates out of the scan's write pass, the whole
+/// scan's indexing work would roll back over one repeated vector — a provider problem turned into data
+/// loss, which §5 forbids twice over ("Provider failure must not be data loss; neither may our own conflict
+/// handling be").
+///
+/// The conflict target is the **pair**, so re-embedding under a second model cannot disturb the first row —
+/// §3's "switching providers then costs a re-embed and nothing else", pinned at the schema by
+/// `two_models_hold_vectors_for_one_chunk` and at the writer by `upsert_vector_keeps_both_models_rows`. `dim`, `source_hash` and `embedded_at` travel in the
+/// update arm as well: a retry computed from chunk text that has since moved, or under a model whose answer
+/// changed, must leave the row stating what it now holds rather than keeping the older facts beside a new
+/// vector.
+///
+/// `bytes` is the little-endian f32 payload — [`crate::embed::Vector::to_bytes`] writes it — bound as bytes,
+/// which is the only spelling migration 7's `CHECK (typeof(vector) = 'blob' …)` accepts. Nothing here
+/// re-checks `bytes.len() == 4 * dim`: the `CHECK` does it at the write, and `Vector::from_bytes` is its
+/// twin on the read side (§3). An unknown `model` is refused by the foreign key rather than looked up here,
+/// which is why `models` must be written before any vector naming it (§3).
+pub fn upsert_vector(
+    db: &Db,
+    chunk_id: i64,
+    model: &str,
+    dim: usize,
+    bytes: &[u8],
+    chunk_text_digest: &str,
+    now: i64,
+) -> Result<(), DbError> {
+    // `models.dim` is an INTEGER; the guard is `upsert_file`'s, for a model that does not exist.
+    let dim = i64::try_from(dim).unwrap_or(i64::MAX);
+    db.0.prepare_cached(
+        "INSERT INTO embeddings
+             (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (chunk_id, model) DO UPDATE
+            SET vector = excluded.vector, dim = excluded.dim,
+                source_hash = excluded.source_hash, embedded_at = excluded.embedded_at",
+    )?
+    .execute(params![chunk_id, model, dim, bytes, chunk_text_digest, now])?;
+    Ok(())
+}
+
+/// Drop every vector stored for one chunk, under every model, leaving the chunk row itself alone.
+///
+/// The cascade already covers the case where the **chunk** goes away. This is the other case: the chunk row
+/// stays — keeping its ordinal and its `chunks.id`, which is what [`write_chunks_for_note`] exists to
+/// preserve — while its vectors do not. Deleting nothing is not an error: a chunk that was never embedded
+/// has no rows, and "no vectors behind it" is a fact rather than a missing thing.
+///
+/// Separate from [`write_chunks_for_note`] on purpose, because the two tables are written in different
+/// transactions (§5: chunk writes ride the scan's transaction, vector batches commit per batch outside it).
+pub fn delete_vectors_for_chunk(db: &Db, chunk_id: i64) -> Result<(), DbError> {
+    db.0.prepare_cached("DELETE FROM embeddings WHERE chunk_id = ?1")?
+        .execute(params![chunk_id])?;
+    Ok(())
+}
+
+/// One row of `models` (migration 7), read as the columns hold them.
+///
+/// `dim` and `installed_at` are `i64` rather than `u16`/a timestamp type on purpose: SQLite's `INTEGER`
+/// is untyped, so a hand-edited file can hold `-1`, `999999` or a value past `u64::MAX`'s neighbour in the
+/// column this program wrote as `8` and `1730000000`. Narrowing on the way out would turn that into a panic,
+/// a wrap, or a row that silently equals another ([`crate::models::install`] compares a *declared* dim with
+/// the stored one to decide "already installed"), so the reader reports what is there and lets the caller
+/// judge. A value not readable as an integer at all — TEXT in a column someone typed by hand — arrives as
+/// [`DbError::Sqlite`], which is the same honest answer: it is reported, not guessed past.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRow {
+    /// The identity vectors reference (`embeddings.model`'s foreign key), exactly as installed.
+    pub id: String,
+    /// Declared vector width. See this struct's note on `i64`.
+    pub dim: i64,
+    /// Lowercase-hex digest the artifact was verified against at install, or `None` for a provider with no
+    /// local weights — migration 7's ordinary arm, not a missing value.
+    pub sha256: Option<String>,
+    /// Text prefix added to documents.
+    pub prefix_doc: String,
+    /// Text prefix added to queries.
+    pub prefix_query: String,
+    /// Whole seconds since the Unix epoch, recorded once at install and rewritten by nothing — not even a
+    /// re-materialised artifact ([`crate::models::InstallOutcome::Restored]), because the row's claim about
+    /// *when this id became known* does not change when its file comes back.
+    pub installed_at: i64,
+}
+
+/// The `SELECT` column order every reader of `models` uses, so a row and a binder cannot disagree about
+/// which column is which by spelling the list twice.
+const MODEL_COLUMNS: &str = "id, dim, sha256, prefix_doc, prefix_query, installed_at";
+
+/// Read the one row naming `id`, or `None` when no model of that identity has been installed.
+///
+/// The reads live here rather than in the command because np-cli has no `rusqlite` dependency and must not
+/// grow one to answer a question about its own table (`docs/design-m2-models-install.md` §6), and because
+/// `install`'s idempotence test is *this* row read against the *declared* tuple — a comparison no caller may
+/// skip or partially perform.
+pub fn model_row(db: &Db, id: &str) -> Result<Option<ModelRow>, DbError> {
+    // The statement text is assembled per call rather than written out twice: `MODEL_COLUMNS` is the single
+    // spelling of the column order that [`read_model_row`] binds by position, and these two reads are one row
+    // per command, not a scan's per-file loop, so the allocation is not what `prepare_cached` exists to save.
+    Ok(db
+        .0
+        .prepare_cached(&format!("SELECT {MODEL_COLUMNS} FROM models WHERE id = ?1"))?
+        .query_row(params![id], read_model_row)
+        .optional()?)
+}
+
+/// Every installed model, ordered by `id`.
+///
+/// Ordered because `np models list` output is compared by a human and by tests: without `ORDER BY` SQLite
+/// answers in rowid order, which for a table whose primary key is TEXT is insertion order — so re-installing
+/// two ids in the other sequence would reorder the listing.
+pub fn model_rows(db: &Db) -> Result<Vec<ModelRow>, DbError> {
+    let mut statement =
+        db.0.prepare_cached(&format!("SELECT {MODEL_COLUMNS} FROM models ORDER BY id"))?;
+    let rows = statement.query_map([], read_model_row)?;
+    let mut rows_out = Vec::new();
+    for row in rows {
+        rows_out.push(row?);
+    }
+    Ok(rows_out)
+}
+
+/// One row of `models`, bound from the six columns of [`MODEL_COLUMNS`].
+fn read_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
+    Ok(ModelRow {
+        id: row.get(0)?,
+        dim: row.get(1)?,
+        sha256: row.get(2)?,
+        prefix_doc: row.get(3)?,
+        prefix_query: row.get(4)?,
+        installed_at: row.get(5)?,
+    })
+}
+
+/// Insert an installed model, reporting whether this call was the one that wrote it.
+///
+/// `ON CONFLICT (id) DO NOTHING` rather than a plain `INSERT`, and the reason is concurrent installs of one
+/// id (§6): two processes can both pass [`crate::models`]'s "is there already a row?" step, and if the loser
+/// raised `SQLITE_CONSTRAINT_PRIMARYKEY` the human would read a bare constraint violation about a table they
+/// have never opened. Returning `false` says what actually happened — somebody else installed this identity,
+/// and [`crate::models::install`] turns that into the same full-tuple comparison it applies to its own
+/// pre-flight read, so a *different* declaration is still refused rather than papered over.
+///
+/// `dim` and `now` arrive as `i64` because those are SQLite's `INTEGER` columns; the range rules on a
+/// declared dim (`u16`, never zero) belong to the caller that parses human input, not to the writer
+/// (`docs/design-m2-models-install.md` §2). `sha256` is `None` for a provider with no local weights —
+/// migration 7's nullable arm.
+pub fn insert_model(
+    db: &Db,
+    id: &str,
+    dim: i64,
+    sha256: Option<&str>,
+    prefix_doc: &str,
+    prefix_query: &str,
+    now: i64,
+) -> Result<bool, DbError> {
+    let written =
+        db.0.prepare_cached(
+            "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (id) DO NOTHING",
+        )?
+        .execute(params![id, dim, sha256, prefix_doc, prefix_query, now])?;
+    Ok(written == 1)
 }
 
 #[cfg(test)]
