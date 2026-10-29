@@ -304,6 +304,34 @@ fn installed_artifact(dir: &Path) -> PathBuf {
     path
 }
 
+/// Recorded so a future check cannot be built on a comfortable lie. A row with `sha256 = NULL` is
+/// `ArtifactState::NoArtifactExpected` — "a provider with no local weights" — and construction **does not look at
+/// the digest at all**, so such a row builds a provider whenever some file happens to sit where the caller pointed.
+/// Those are unattested bytes accepted because a path resolved: not a serviceable state (`provider = "none"` is the
+/// spelling for a model with no weights), and explicitly *not* what R6b0's digest decision would catch either, since
+/// there is no digest to compare against. If that round makes construction hash, this test is the one that says the
+/// NULL arm still needs its own rule.
+#[test]
+fn a_row_with_no_digest_and_a_file_where_the_caller_pointed_builds_a_provider() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let artifact = installed_artifact(tmp.path());
+    let mut row = installed_row(LOCAL_ID, LOCAL_DIM as i64, LOCAL_PREFIX);
+    row.sha256 = None;
+
+    let provider = LocalModelProvider::new(&row, &artifact, LOCAL_DIM)
+        .expect("today: construction never inspects `sha256`, so the file alone satisfies it");
+    assert_eq!(
+        provider.model_id(),
+        LOCAL_ID,
+        "identity still comes from the row"
+    );
+    assert_eq!(
+        provider.artifact(),
+        artifact,
+        "and the artifact is whatever path was handed in — attested or not"
+    );
+}
+
 #[test]
 fn the_local_provider_refuses_and_names_the_model_that_stayed_owed() {
     // §9 item 1's placeholder for R6b1's forward pass. The refusal is asserted as a *value* on a non-empty
@@ -359,8 +387,14 @@ fn identity_width_and_artifact_come_from_the_row_handed_in() {
         );
     }
 
-    // Mutations this catches: `fn model_id(&self) -> &str { LOCAL_ID }` (a constant borrowed from the
-    // fixture), or storing the configured width instead of the row's — either way one pair fails.
+    // Mutations this catches: anything that stops answering *from the row* — `model_id()` returning the fixture
+    // constant, `dim` hard-coded to `LOCAL_DIM`, `artifact` returning a path built from the id. The loop's second
+    // pair (`mini-l12-v2@1`, width 3) is what kills each of those; a single-row version of this test would not.
+    //
+    // What it does NOT catch, recorded because an earlier draft claimed the opposite: storing `configured` instead
+    // of `row.dim`. `new` refuses unless the two are equal, so no observable difference exists — that equivalence is
+    // a property of the constructor, and only a constructor-level change (accepting unequal widths) would make it
+    // testable here.
 }
 
 #[test]
@@ -396,8 +430,14 @@ fn a_row_of_a_different_width_is_refused_naming_both_numbers() {
             "both numbers, in the message a human reads: {message}"
         );
 
-        // Mutation this catches: comparing with `>=`, or narrowing `row.dim` to `usize` first — the second
-        // turns -3 into a huge width that neither number in the message would match.
+        // Mutations this catches: relaxing the guard (`Ok(dim) => dim`, which builds a provider over a row that
+        // disagrees with the config), or reporting `configured` where the payload takes `row.dim` — the second prints
+        // 512 twice, and the assertion above on `-3` is what dies.
+        //
+        // What it does NOT catch: narrowing only the *comparison* (`row.dim as usize == configured`). The refusal
+        // still happens and the payload is still `i64`, so both numbers still print. Verified by mutation rather than
+        // argued: that mutant compiles and stays green. Keeping the payload `i64` is what makes the message honest;
+        // a future change that narrows the payload as well must add its own test.
     }
 }
 
@@ -499,10 +539,16 @@ fn the_rows_prefix_is_prepended_by_the_provider_and_by_nobody_else() {
     runtime
         .embed(&refs)
         .expect("the recording fake always serves");
+    // Harness self-check, not production coverage: `CountingEmbedder` records verbatim what it is handed and
+    // `refs` borrows from `inputs`, so only an edit to *this file* can fail the assertion below. The production
+    // weight of the test lives entirely in the `inputs` assertion above. It stays because it documents the intent —
+    // what reaches the model is exactly what the provider prefixed — and because R6c's write boundary is where the
+    // fence this cannot be gets added: asserting `text.matches(PREFIX).count() == 1` over raw chunk text at the call
+    // site, which is the only shape that catches a caller prepending a second time.
     assert_eq!(
         runtime.texts(),
         inputs,
-        "what reaches the model is exactly what the provider prefixed"
+        "harness self-check: the fake was handed exactly the strings the provider built"
     );
 
     // Identity travels with the row, not with whatever implements the trait: the fake's own id is a different

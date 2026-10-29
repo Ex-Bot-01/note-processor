@@ -83,9 +83,13 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 2048;
 /// counted sequence is not just our bytes — so it describes the runtime's work for one sequence, not a
 /// chunk's size. Two facts fix where a bound belongs: the artifact declares
 /// `max_position_embeddings = 262144`, so a budget only fences while it stays far below that; and
-/// [`crate::chunk`] caps a chunk at `MAX_CHUNK_BYTES = 1800`, so no legitimate sequence reaches four digits
-/// of tokens even before prefix and specials — every value this ceiling admits is already generous next to
-/// real need, which is what keeps the fence from refusing a meaningful budget.
+/// [`crate::chunk`] caps a chunk at `MAX_CHUNK_BYTES = 1800`, which makes a four-digit-token sequence unlikely
+/// for prose. **Unlikely is the whole claim** — design §5 demoted this from a theorem after review, and the holes
+/// are named there: SentencePiece/NMT normalisation can *expand* bytes (so the bound is on normalised bytes, not
+/// stored ones), `decode` can hand over runs of U+FFFD that tokenise worse than plain text, and prefix plus
+/// specials cost tokens that come from no chunk bytes at all. R6d measures bytes-per-token on this corpus; until
+/// then nothing here may be read as "overflow is unreachable", and the `max_tokens` fence stays a fence precisely
+/// because it is not.
 ///
 /// What is not a judgement is that **some** finite bound must exist at load: the budget sizes the work R6b1's
 /// runtime will take on for one sequence, so `max_tokens = 999999999` has to be refused as data rather than
@@ -133,8 +137,10 @@ pub enum EmbeddingProvider {
     /// behaviour for anyone who has not chosen a model (§2) — not a stub awaiting a real one.
     #[default]
     None,
-    /// A model running inside this process (`local-model`): [`crate::embed::LocalModelProvider`], which owns
-    /// the API and refuses until R6b1 builds the runtime. What loading one costs is §6's benchmark's question.
+    /// A model running inside this process (`local-model`): [`crate::embed::LocalModelProvider`] is the type it
+    /// will resolve to, owning the API and refusing until R6b1 builds the runtime. **Nothing instantiates it from
+    /// this value yet** — the only code that reads the variant is [`Config::load`]'s own validation; the wiring
+    /// arrives with R6c. What loading one costs is §6's benchmark's question.
     ///
     /// Refused at [`Config::load`] unless [`EmbeddingsConfig::model`] names something `np models install`
     /// would accept — a local provider with no identity has nothing to write `embeddings.model` under, and
@@ -415,6 +421,18 @@ fn validate_embeddings(cfg: &Config) -> Result<(), ConfigError> {
             "embeddings.provider = \"openai-compatible\" names an HTTP endpoint provider, and embeddings are \
              local now: nothing in np dials out for a vector. Set embeddings.provider = \"local-model\" and \
              embeddings.model to an installed model id"
+                .to_string(),
+        ));
+    }
+    // A zero width is refused here as well as in `np models install --dim`, and for the same stated reason:
+    // migration 7's `CHECK (length(vector) = 4 * dim)` admits a zero-byte vector when `dim` is 0. R6a made this
+    // value load-bearing — it becomes [`crate::embed::LocalModelProvider::new`]'s `configured` argument — so the
+    // bound cannot live only in np-cli's `NonZeroU16`, which a config file routes around without ever parsing an
+    // argv. Refuse, do not clamp: F17's posture again.
+    if cfg.embeddings.dim == Some(0) {
+        return Err(invalid_data(
+            "invalid embeddings.dim = 0 (a zero-width model has no vector to compare; omit the key to leave the \
+             width unset)"
                 .to_string(),
         ));
     }

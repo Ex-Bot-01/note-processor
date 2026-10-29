@@ -699,7 +699,7 @@ fn a_misspelled_embeddings_key_is_refused_naming_key_and_file() {
         "an unknown key must travel as the typed parse refusal, got {err:?}"
     );
     // Quoted deliberately: toml names the bad key *and* lists the legal ones ("unknown field `provide`,
-    // expected one of `provider`, `model`, `dim`"), so an assertion on the bare word would be satisfied
+    // expected one of `provider`, `model`, `dim`, `max_tokens`"), so an assertion on the bare word would hold
     // by the suggestion list. "\`provide\`" is not a substring of "\`provider\`".
     assert!(
         message.contains("`provide`"),
@@ -949,6 +949,31 @@ fn a_max_tokens_outside_its_bounds_is_refused_naming_key_value_and_both_bounds()
         // Mutation this catches: dropping the range check (both load silently), or clamping to the ceiling — a
         // clamp would publish bytes the config file does not describe, which is why F17 refuses instead.
     }
+}
+
+/// `np models install --dim 0` is refused by np-cli's type; a config file is the other door to the same value, and
+/// R6a made it load-bearing (it becomes `LocalModelProvider::new`'s `configured` argument). Migration 7's
+/// `CHECK (length(vector) = 4 * dim)` admits a zero-byte vector at `dim = 0`, so both doors refuse.
+#[test]
+fn a_zero_width_is_refused_because_it_names_no_vector() {
+    let (_path, err) = embeddings_refusal(
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"gemma-2-text-q8_0@1\"\ndim = 0\n",
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("embeddings.dim") && message.contains("zero-width"),
+        "the refusal names the key and the reason: {message}"
+    );
+
+    // The absent arm stays legal: leaving the width unset is a different statement from asserting zero, and this is
+    // the shape every fresh install has.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[embeddings]\nprovider = \"none\"\n");
+    let unset = Config::load(Some(&path)).expect("omitting dim stays valid");
+    assert_eq!(unset.embeddings.dim, None, "unset is not zero");
+
+    // Mutation this catches: deleting the bound — the first `embeddings_refusal` then panics inside itself, which is
+    // how it reports a file that loaded when it should not have.
 }
 
 #[test]

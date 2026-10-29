@@ -19,8 +19,9 @@
 //! - [`EmbedError`] — one variant per thing that can go wrong, each saying one true thing. Notably
 //!   `Unavailable`'s payload is an opaque label rather than an endpoint, because this text ends up in
 //!   test-failure output and CI logs (§9).
-//! - [`LocalModelProvider`] — what `local-model` resolves to today: a [`ModelRow`], an artifact that
-//!   exists, the row's document prefix, and a refusal where the forward pass will go.
+//! - [`LocalModelProvider`] — the type `local-model` will resolve to: a [`ModelRow`], an artifact that exists,
+//!   the row's document prefix, and a refusal where the forward pass will go. Nothing constructs it from a
+//!   config yet; R6c wires `[embeddings]` to a provider (§9's split), so today it is reachable API only.
 //!
 //! The heavy dependency stays behind the `local-model` cargo feature (`crates/np-core/Cargo.toml`), while
 //! everything in this module compiles by default: §9 item 1 wants CI and callers to exercise the seam
@@ -136,6 +137,13 @@ pub enum EmbedError {
     /// would leak it on the first flake (§9). Nothing raises it today — `local-model`'s refusals are the
     /// specific ones below, which is what §10 of `docs/design-m2-local-embeddings.md` did to the class this
     /// variant was sketched for: there is no endpoint left that could be down.
+    ///
+    /// **Its home going forward is §3's fifth class**, "runtime error with a bounded message": R6b1 raises it with
+    /// a fixed label of our own choosing (`"inference failed"`, `"out of memory"`, `"context too small"`), never
+    /// the runtime's own diagnostic text — that text is exactly what this payload rule exists to keep out of logs,
+    /// and [`EmbedError::ArtifactNotLoadable`] deliberately declines to be its carrier. If R6b1 finds a bounded
+    /// label cannot describe a failure it actually meets, the honest move is a tenth variant named for that class,
+    /// not a wider payload here.
     #[error("embedding provider unavailable [{0}]")]
     Unavailable(String),
     /// A vector whose component count is not the declared one. `expected` is what was declared
@@ -172,7 +180,8 @@ pub enum EmbedError {
     ///
     /// Not folded into [`crate::models::ModelError::Artifact`], which is the reuse §3's "existing
     /// `ModelError`" line invites: that variant's message says the artifact could not be read **to compare
-    /// it with its row**, and this provider compares nothing — it was never going to hash a file. Claiming
+    /// it with its row**, and this provider compares nothing *today* — see [`LocalModelProvider::new`] for the
+    /// digest check that is R6b0/R6b1's to take, and which would make this the right variant to reuse. Claiming
     /// an operation that did not happen is the defect `models.rs` refuses on its own
     /// [`crate::models::ArtifactState::Mismatch`]. Naming the path is safe: a data-dir file, never note
     /// text and never a vault path.
@@ -312,8 +321,10 @@ impl Embedder for NoEmbeddingProvider {
 ///
 /// What it does **not** do: load anything, hold weights, or read a note. Construction stats the artifact and
 /// stops there — existence is checkable today, loading is R6b1's (§3: "Loading is explicit and bounded. One
-/// load per process, never per note").
-#[derive(Debug, Clone)]
+/// load per process, never per note"). `Clone` is deliberately **not** derived: today the struct holds only
+/// metadata, so a derive would be harmless, and in R6b1 it would either deep-copy weights or become a breaking
+/// removal. Nothing clones a provider (asserted by this round compiling without the derive).
+#[derive(Debug)]
 pub struct LocalModelProvider {
     /// `models.id`, verbatim.
     model_id: String,
@@ -344,10 +355,24 @@ impl LocalModelProvider {
     /// disagreement would spend an operation learning what the row already said — the same ordering argument
     /// that makes [`crate::models::install`] validate the digest *format* before hashing anything.
     ///
-    /// A row whose `sha256` is `NULL` — [`crate::models::ArtifactState::NoArtifactExpected`], "a provider
-    /// with no local weights" (parent §3) — is not servable by this type at all, and refusal 2 reaches it for
-    /// whatever path the caller names: with no artifact there is nothing to build a local provider from. That
-    /// is a refusal, not a repair; `provider = "none"` stays the spelling for a model with no weights.
+    /// **Digest verification is an open, costed decision and this constructor does not make it.** Nothing here
+    /// compares the file against `models.sha256`: construction stats one path. The case for hashing is strong —
+    /// `docs/design-m2-models-install.md` states as a safety property that "nothing embeds against a mismatching
+    /// row", and no code path currently enforces that — and the cost is smaller than it looks *if* §3's "one load
+    /// per process, never per note" holds, because then it is one streaming SHA-256 pass over ~310 MB per `np embed`
+    /// run, which [`crate::hash::sha256_file`] already does for `np models list`. It stays unmade in R6a because the
+    /// install design assigned it ("re-verifying on every embed is 4b's cost decision") and because whether an
+    /// mmap-first runtime even reads the whole file is a measurement (R6d), not an assumption. **R6b0/R6b1 owns it**,
+    /// and when it lands it refuses with both digests in [`crate::models::ModelError::ArtifactDisagrees`]'s shape —
+    /// never repairing, and never treating the check as the only thing standing between a row and a write.
+    ///
+    /// Related reality, recorded rather than papered over: a row whose `sha256` is `NULL`
+    /// ([`crate::models::ArtifactState::NoArtifactExpected`], "a provider with no local weights") has **no digest to
+    /// verify against ever**, so it can never be attested by that check either. Construction today does not look at
+    /// `sha256` at all, so such a row builds a provider whenever some file happens to sit where the caller pointed —
+    /// unattested bytes, accepted because a path resolved. That is a caller error, not a serviceable state: a model
+    /// with no weights is spelled `provider = "none"`, and the NULL-sha fixture in `tests/embed.rs` pins the
+    /// behaviour so the future digest check cannot quietly become the only fence.
     pub fn new(row: &ModelRow, artifact: &Path, configured: usize) -> Result<Self, EmbedError> {
         let dim = match usize::try_from(row.dim) {
             Ok(dim) if dim == configured => dim,
@@ -393,6 +418,10 @@ impl LocalModelProvider {
 
     /// What the model will be asked to embed for these chunks: each text with the row's `prefix_doc` in
     /// front, verbatim, with nothing added between the two.
+    ///
+    /// **This is the sequence [`crate::config::EmbeddingsConfig::max_tokens`] counts** (§5): prefix + text +
+    /// special tokens, not the chunk's bytes alone. R6b2 enforces the budget and must measure it over what this
+    /// returns — measuring the un-prefixed text would leave every existing test green while bounding something else.
     ///
     /// This is the one place that prefix is applied, which is what makes parent §3's "a provider that ignores
     /// prefixes is a bug" checkable *today* instead of in R6b1: `tests/embed.rs` hands the result to a
