@@ -30,8 +30,11 @@
 //!
 //! ## Why the domain is the decoded text, not the file
 //!
-//! [`chunk`] takes the same spelling as `notes.body`: the text `crate::scan`'s `decode` produces — a
-//! leading BOM stripped, bytes UTF-8 cannot hold replaced with U+FFFD. File offsets are the tempting
+//! [`chunk`] takes the whole decoded file that `crate::scan`'s `decode` produces — a
+//! leading BOM stripped, bytes UTF-8 cannot hold replaced with U+FFFD. It is **not** `notes.body`: frontmatter is
+//! still in there, so chunk 0 of a note with a YAML block embeds it and `byte_start` indexes the file — see
+//! `frontmatter_is_part_of_the_text_being_cut`, and backlog D2 for the decision that has to happen before anything
+//! embeds. File offsets are the tempting
 //! choice and they are a trap: `crate::hash` digests the **raw bytes on disk**, BOM included, so the two
 //! spellings differ for exactly the corpus F13/F18/F20/F23 refuse to key by — every BOM'd Windows export
 //! and every non-UTF-8 note. Offsets into the file would therefore mean one thing for ordinary notes and

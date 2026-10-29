@@ -312,7 +312,9 @@ fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(),
 /// what makes §7's test 9 (this command's output equals that function's, same bytes) a tautology rather than a
 /// coincidence.
 fn models_hash(file: &Path) -> Result<(), Box<dyn Error>> {
-    let digest = sha256_file(file)?;
+    // `models::access` is the spelling the OS wants (absolute, no symlink resolution); on Windows a long relative
+    // argument would otherwise reach `walk::to_open_path` still relative and fail with a raw prefix error.
+    let digest = sha256_file(&models::access(file))?;
     emit(&format!("{digest}  {}", file.display()));
     Ok(())
 }

@@ -1463,6 +1463,64 @@ fn chunk_digest_reads_stamps_and_ignores_text() {
     );
 }
 
+/// The two `source_hash` levels are different facts, and this is the only thing keeping them from being used
+/// interchangeably. Both are `String`, both are in scope during a scan, and passing `files.hash` to `upsert_vector`
+/// would compile and look plausible — while making every vector claim currency after a `CHUNKER_VERSION` bump,
+/// because that bump restamps `chunks.source_hash` to an unchanged note digest.
+#[test]
+fn a_vector_stamped_with_the_note_digest_is_not_found_by_a_chunk_text_question() {
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+    insert_model(&db, "m@1", 2);
+
+    // Two chunks of one note: same note digest (what `chunks.source_hash` holds), different text — the ordinary
+    // shape of any real note.
+    let note_digest = "note-level-digest";
+    let first = insert_chunk_stamped(&db, a, 0, 1, b"alpha", note_digest);
+    insert_chunk_stamped(&db, a, 1, 1, b"beta", note_digest);
+
+    let alpha = np_core::hash::sha256_bytes(b"alpha");
+    upsert_vector(&db, first, "m@1", 2, &[0u8; 8], &alpha, 5).expect("embed ordinal 0 only");
+
+    // The question the embed round asks — "does a vector describe this chunk's current text?" — is answered by the
+    // chunk-text level alone.
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM embeddings WHERE source_hash = '{alpha}'")
+        ),
+        1,
+        "the one vector on the table answers for ordinal 0's bytes"
+    );
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            "SELECT COUNT(*) FROM chunks c JOIN embeddings e ON e.chunk_id = c.id
+              WHERE e.source_hash = c.source_hash"
+        ),
+        0,
+        "and nothing is found by comparing against the note-level stamp — the levels never coincide by accident"
+    );
+
+    // The failure this pins: a caller that passed `files.hash` stores fine (nothing at the schema stops it) and is
+    // invisible to the question above while matching every note-level query. Assert the wrong call is detectable,
+    // not silently equivalent.
+    let other = insert_chunk_stamped(&db, a, 2, 1, b"gamma", note_digest);
+    upsert_vector(&db, other, "m@1", 2, &[0u8; 8], note_digest, 5)
+        .expect("test setup: the wrong level still stores");
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            "SELECT COUNT(*) FROM chunks c JOIN embeddings e ON e.chunk_id = c.id
+              WHERE e.source_hash = c.source_hash"
+        ),
+        1,
+        "a note-digest vector matches its row's note digest: exactly the false currency the doc forbids"
+    );
+}
+
 #[test]
 fn delete_vectors_for_chunk_takes_every_model_and_leaves_the_chunk() {
     // The embeddings-side helper the scan round needs: dropping a chunk's vectors must not drop the chunk, and

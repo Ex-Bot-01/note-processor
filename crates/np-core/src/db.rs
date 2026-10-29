@@ -2092,6 +2092,12 @@ pub fn chunk_digest(db: &Db, note_id: i64) -> Result<Option<String>, DbError> {
 
 /// Store one vector for one chunk under one model, idempotently.
 ///
+/// **`chunk_text_digest` is the SHA-256 of that chunk's own text — never `files.hash`.** The two levels look
+/// interchangeable (both `String`, both in scope during a scan) and are not: `chunks.source_hash` holds the note
+/// digest, so after a `CHUNKER_VERSION` bump every row is restamped to an unchanged `files.hash` while its text may
+/// have been re-cut — and a vector stamped with the note digest would then claim currency for bytes nobody has
+/// embedded since. Pinned by `a_vector_stamped_with_the_note_digest_is_not_found_by_a_chunk_text_question`.
+///
 /// `INSERT … ON CONFLICT (chunk_id, model) DO UPDATE` rather than a plain `INSERT`, and §5's third bullet is
 /// the reason: F15 *expects* its retry, so "this write already happened" is an ordinary event rather than a
 /// bug. A plain insert into `PRIMARY KEY (chunk_id, model)` answers that retry with

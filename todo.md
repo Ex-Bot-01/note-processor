@@ -59,7 +59,7 @@ contract tested including a one-byte mutation case) · the review's P2 batch · 
 key (pinned by `size_of == 0`) — and the `[embeddings]` config section (`provider` as an enum defaulting to `none`,
 `deny_unknown_fields` on that one section).
 
-Remaining for M2a: **Round 3b** — chunk writes by per-row diff (never delete-and-reinsert, which would cascade away
+**Shipped on `m12/embeddings`** (whole-branch review pending): Round 3b — chunk writes by per-row diff (never delete-and-reinsert, which would cascade away
 vectors), vectors written with `ON CONFLICT (chunk_id, model) DO UPDATE`, and `EMBED_VERSION` covering **chunker
 coverage only** (provider availability is a reported count, never version debt — see design §5's P0). Nothing reads
 `embeddings.model` / `embeddings.dim` yet; the scan wiring is where they get read. Then the EmbeddingGemma benchmark.
@@ -112,4 +112,4 @@ what fails is not a check, because removal makes tests pass.
   recorded run; CI proves only that the path is inert.
 - **F25** (over-wide token renders a physical line holding only `-`) is filed and unadjudicated.
 - **Owed measurements:** A4's A/B/A benchmark and whole-branch review were skipped on instruction at merge time;
-  `typeof(vector)` has no string-bind probe yet (it lands with Round 3, where vectors are actually written).
+  `typeof(vector)` is probed (`a_string_bind_is_refused_from_embeddings_vector`). Still open: the "chunks owed but unembedded" count in the scan report, and backlog D1–D10 from the M2a whole-branch review.

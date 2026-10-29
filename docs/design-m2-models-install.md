@@ -269,7 +269,9 @@ workspace name the row and the artifact land under different hashes, which is th
 ## 8. Standing debts this round does not pretend away
 
 The wrong-dim provider answer is still raw `DbError` at the write; ordinal drift still makes "re-embed only what moved"
-a row-identity promise; the chunk-gap stderr line has no capture seam and so no assertion. Added by this round:
+a row-identity promise. (The claim here that the chunk-gap stderr line had no capture seam was false — `np-cli/tests/cli.rs`
+captures a child's stderr for its sibling line, and `an_incomplete_chunk_pass_reports_its_own_gap_on_stderr` now does the
+same for this one.) Added by this round:
 per-workspace artifacts mean N copies (§4) and a new orphan class that nothing reclaims; and `models list` verifies by
 hashing, which costs one whole read per installed model per invocation (§3).
 

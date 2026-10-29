@@ -257,7 +257,7 @@ pub enum ModelError {
     /// [`ModelError::DigestMismatch`], which is about the file named by `--path`: saying "nothing was installed"
     /// here would be false — something is installed, and it is the thing that disagrees.
     #[error(
-        "the installed artifact {} hashes to {found}, but its row says {expected};          nothing was written, because an artifact that disagrees with its row is reported, not overwritten",
+        "the installed artifact {} hashes to {found}, but its row says {expected}; nothing was written, because an artifact that disagrees with its row is reported, not overwritten",
         .path.display()
     )]
     ArtifactDisagrees {
@@ -443,7 +443,7 @@ pub fn install(
             // rot this command's whole trust model exists to catch. So this arm, and only this arm, hashes the
             // artifact (§3: one hash of the source, plus this verification when it is what changes the answer).
             let target = models_dir.join(&request.id);
-            let on_disk = hash::sha256_file(&target).map_err(|err| ModelError::Io {
+            let on_disk = hash::sha256_file(&access(&target)).map_err(|err| ModelError::Io {
                 path: target.clone(),
                 source: hash_io(err),
             })?;
@@ -639,7 +639,11 @@ fn windows_device_name(id: &str) -> Option<&'static str> {
 
 /// Validate a declared digest as exactly `DIGEST_HEX_CHARS` (private) hex characters and return it lowered (§3 step 4).
 fn normalize_digest(declared: &str) -> Result<String, ModelError> {
-    if declared.len() != DIGEST_HEX_CHARS || !declared.bytes().all(|byte| byte.is_ascii_hexdigit())
+    // Characters on both sides. `len()` is bytes, so a pasted argument holding one non-ASCII character (a stray
+    // non-breaking space from a web page is the ordinary cause) was refused with "this argument holds 64" — a
+    // message contradicting itself exactly when it was most needed.
+    if declared.chars().count() != DIGEST_HEX_CHARS
+        || !declared.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(ModelError::InvalidDigest {
             chars: declared.chars().count(),
@@ -712,7 +716,7 @@ fn compare_declaration(
 /// `\\?\relative\...` and fail with a raw OS error. Identity is a separate question: the workspace key still
 /// comes from `Config::workspace_db`, which hashes the caller's spelling on purpose, and normalising *that*
 /// would silently move a database. Only filesystem access goes through here.
-fn access(path: &Path) -> PathBuf {
+pub fn access(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -771,7 +775,7 @@ fn nonce() -> String {
 /// than writing. The bytes behind it are a separate question: `install` verifies this one artifact when it is
 /// already there (§3), and [`artifact_state`] answers it for every row during `list`.
 fn artifact_present(models_dir: &Path, id: &str) -> bool {
-    fs::metadata(walk::to_open_path(&models_dir.join(id))).is_ok()
+    fs::metadata(walk::to_open_path(&access(&models_dir.join(id)))).is_ok()
 }
 
 /// One row's [`ArtifactState`], from its digest and what the directory holds (§3's table).
@@ -782,7 +786,7 @@ fn artifact_state(models_dir: &Path, row: &ModelRow) -> Result<ArtifactState, Mo
         return Ok(ArtifactState::NoArtifactExpected);
     };
     let target = models_dir.join(&row.id);
-    match fs::metadata(walk::to_open_path(&target)) {
+    match fs::metadata(walk::to_open_path(&access(&target))) {
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(ArtifactState::Missing),
         // Anything else — a permission refusal, an unreadable parent — says nothing about whether the
         // artifact is there, so it cannot become a verdict on the row.
@@ -792,10 +796,11 @@ fn artifact_state(models_dir: &Path, row: &ModelRow) -> Result<ArtifactState, Mo
         }),
         Ok(meta) if !meta.is_file() => Ok(ArtifactState::Mismatch),
         Ok(_) => {
-            let found = hash::sha256_file(&target).map_err(|err| ModelError::Artifact {
-                path: target.clone(),
-                source: hash_io(err),
-            })?;
+            let found =
+                hash::sha256_file(&access(&target)).map_err(|err| ModelError::Artifact {
+                    path: target.clone(),
+                    source: hash_io(err),
+                })?;
             Ok(if found == expected {
                 ArtifactState::Present
             } else {

@@ -117,6 +117,30 @@ fn assert_contract(text: &str, chunks: &[Chunk]) {
     }
 }
 
+/// Recorded, not approved: **frontmatter is inside the embedded domain.** `refresh_chunks` receives
+/// `readable.text`, the whole decoded file, while `notes.body` starts at the body — so chunk 0 of every
+/// note with a YAML block embeds that block, and `chunks.byte_start` indexes the file (minus BOM), not
+/// `notes.body`. Changing this later costs a `CHUNKER_VERSION` bump, i.e. re-cutting every row, so it is a decision
+/// to make **before** round 4b embeds anything. Until then this fixture states where we stand instead of leaving it
+/// implicit.
+#[test]
+fn frontmatter_is_part_of_the_text_being_cut() {
+    let doc = "---\ntitle: Weekly plan\ntags: [work]\n---\n\nMonday: rewrite the importer.\n";
+    let chunks = chunk(doc);
+    assert_eq!(chunks.len(), 1, "one short document cuts one chunk");
+    assert!(
+        chunks[0].text.starts_with("---"),
+        "chunk 0 begins at the file's first line, not at the body: {:?}",
+        chunks[0].text
+    );
+    assert_eq!(
+        chunks[0].byte_start,
+        0,
+        "its offset indexes the decoded file — a citation computed against `notes.body` would be wrong by the \
+         length of the frontmatter"
+    );
+}
+
 #[test]
 fn the_same_note_twice_yields_the_same_chunks() {
     // Determinism is §4's first word and it is what makes a re-scan comparable with the rows already

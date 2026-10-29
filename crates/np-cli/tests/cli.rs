@@ -410,6 +410,40 @@ fn skipped(report: &serde_json::Value) -> Vec<String> {
 /// The note one case makes unreadable. Any corpus note will do; this one holds a heading, so it certainly
 /// owns derived rows that a refresh owes.
 #[cfg(unix)]
+#[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
+/// Write the chunker version this workspace recorded, the way an older build would have left it.
+fn record_chunk_version(ws: &Workspace, version: i64) {
+    let cfg = Config {
+        data_dir: ws.data_dir(),
+        ..Config::default()
+    };
+    let db =
+        Db::open(&cfg.workspace_db(&ws.root)).expect("test setup: open the workspace database");
+    db.0.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (np_core::scan::EMBED_VERSION_KEY, version.to_string()),
+    )
+    .expect("test setup: record the chunker version");
+}
+
+#[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
+/// The recorded chunker version, or `None` when the workspace never recorded one.
+fn recorded_chunk_version(ws: &Workspace) -> Option<i64> {
+    let cfg = Config {
+        data_dir: ws.data_dir(),
+        ..Config::default()
+    };
+    let db = Db::open(&cfg.workspace_db(&ws.root)).expect("test: open the workspace database");
+    db.0.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        [np_core::scan::EMBED_VERSION_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|value| value.trim().parse().ok())
+}
+
 const BLOCKED_NOTE: &str = "sprint-review.md";
 
 /// Strip every permission bit from `path` and put whatever it had back on the way out, so a failing
@@ -479,6 +513,47 @@ fn a_parse_rule_change_reports_the_re_parse_on_stderr() {
 /// (b) The other half: a refresh that could not reach one note must say it did not record the version, or
 /// a workspace with one unreadable subtree re-parses its whole corpus on every scan in silence.
 #[cfg(unix)]
+/// The chunker's own gap line, asserted the way its sibling above asserts the parse one. Recorded because
+/// design-m2-models-install §8 claimed no capture seam exists for it — that was false: this file already captures a
+/// child's stderr and matches its sibling's sentence verbatim.
+#[cfg(unix)]
+#[test]
+fn an_incomplete_chunk_pass_reports_its_own_gap_on_stderr() {
+    use np_core::chunk::CHUNKER_VERSION;
+
+    let ws = workspace();
+    run(&mut ws.command(&["scan", "--json"])).assert_success();
+    // Parse current, chunker stamp not: a chunker-only bump is exactly the case where the parse receipt prints
+    // nothing at all and the chunk gap would otherwise be silent.
+    record_chunk_version(&ws, 0);
+    let _restore = deny_read(&ws.root.join(BLOCKED_NOTE));
+
+    let incomplete = run(&mut ws.command(&["scan", "--json"]));
+    incomplete.assert_success();
+    let expected = format!(
+        "note-processor: chunker v{CHUNKER_VERSION} not recorded — 1 note(s) were not cut this scan; the next scan will retry"
+    );
+    let stderr = incomplete.stderr();
+    assert!(
+        stderr.contains(&expected),
+        "`{expected}` missing from:\n{stderr}"
+    );
+
+    drop(_restore);
+    let settled = run(&mut ws.command(&["scan", "--json"]));
+    settled.assert_success();
+    assert!(
+        !settled.stderr().contains("chunker v"),
+        "with the note readable again the version records and the line goes quiet:\n{}",
+        settled.stderr()
+    );
+    assert_eq!(
+        recorded_chunk_version(&ws),
+        Some(CHUNKER_VERSION),
+        "the workspace records this build's chunker once the pass completes"
+    );
+}
+
 #[test]
 fn an_incomplete_refresh_reports_the_gap_on_stderr() {
     let ws = workspace();

@@ -553,3 +553,42 @@ one `CHUNKER_VERSION` bump rather than to a quiet patch.
 Embeddings and clustering, compression into `processed/`, item timelines and tick extraction, the daemon, API,
 watcher, scheduler, web UI and desktop shell remain separate milestones with their own specs — nothing here should
 be mistaken for them, and no table or module in this file pre-implements them.
+
+
+## Carried out of the M2a whole-branch review (2026-10-29)
+
+Found across the seams between rounds, where per-round review structurally cannot look. D2 and D5 are **decisions to
+make before round 4b embeds anything** — after that they cost vectors, not just rows.
+
+- **D1 — no version stamp covers `decode`, yet decode output is the chunker's domain.** Bumping `PARSE_VERSION` does
+  *not* re-cut chunks: `EMBED_VERSION` counts chunker coverage only. Either fold decode into that key's stated scope or
+  add a decode component to chunk currency. Until then a decoder change silently leaves every chunk describing bytes no
+  current build produces.
+- **D2 — frontmatter is embedded, and offsets index the file rather than `notes.body`.** Fixture
+  `frontmatter_is_part_of_the_text_being_cut` states where we stand. Decide before 4b: strip metadata from the embed
+  domain (costs a `CHUNKER_VERSION` bump = re-cut every row) or define citations against the file and say so in M2b.
+- **D3 — a stale note's chunks and vectors read as current.** `chunk_digest`/`chunk_state` take a `note_id` and never
+  join `files`, and `mark_stale` leaves `files.hash` at the last-known digest, so every chunk of a deleted file answers
+  "current". The catalog has exactly this liveness fence; these readers do not. Fix: join `files.state = 'ok'` on the
+  embed-side read, with a stale-note fixture.
+- **D4 — `embeddings.source_hash`'s level is documented and tested but unenforced.** Both levels are `String`, both in
+  scope during a scan; passing `files.hash` compiles and would claim currency after a chunker bump. Pinned by
+  `a_vector_stamped_with_the_note_digest_is_not_found_by_a_chunk_text_question`; still worth a newtype when the embed
+  round writes real vectors.
+- **D5 — nothing decides whether the embed round deletes or compares stale vectors.** When a chunk's text changes its
+  row keeps its id and its old vector survives with the old `embeddings.source_hash` (by design), but
+  `delete_vectors_for_chunk` has no production caller and no rule. Round 4b's brief must name which rule it is.
+- **D6 — no size or throughput number for chunk writes.** `chunks.text` stores the decoded corpus a second time
+  (`notes.body` already holds it), all of it inside the scan's single write transaction, whose `BUSY_TIMEOUT_MS = 1800`
+  doc says the write phase "has not been checked against a write phase over a large vault". Print chunk rows and
+  database bytes in `tests/perf.rs`; record cold/warm at realistic note sizes in the backlog.
+- **D7 — `install` copies up to ~540 MB before it can discover the workspace database is busy**, and then says
+  "model database: …" naming neither the path nor the competing command; the copy survives as an unclaimed file only
+  discoverable by running `list`. Add a variant that names the workspace DB and says re-run.
+- **D8 — `models::access()` (absolute-for-OS-access spelling) is applied to install's writes, artifact reads and hash**;
+  still worth the long-path unit case on Windows so a future call site cannot regress silently.
+- **D9 — chunk-gap stderr line: asserted now** (`an_incomplete_chunk_pass_reports_its_own_gap_on_stderr`, unix like its
+  sibling). Recorded because the reason given for not writing it ("no capture seam") was false.
+- **D10 — migration 5's hand-written child-row lists are chunk-safe only by declaration order.** It deletes children by
+  hand and does not list `chunks`/`embeddings`, which is correct solely because it runs before migration 7 creates them.
+  Any future duplicate healing must add both tables or it will orphan rows on a legacy database.

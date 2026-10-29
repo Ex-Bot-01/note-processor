@@ -13,8 +13,13 @@ one real cost of that model and is **measured before we commit**" (§13 step 2).
 covers the first half.
 
 **M2a (this design).** Chunking, vector storage, a provider seam with one offline implementation, staleness rules, and
-the benchmark that decides the model. After it, `np` can answer "which chunks does this workspace have, which are
-embedded, under which model" — and the catalog is byte-for-byte what it is today.
+the benchmark that decides the model. **What actually shipped** (corrected after whole-branch review, which found
+this sentence promising more than the round delivered): chunking, the `models`/`chunks`/`embeddings` tables, the
+provider seam with its offline implementation, staleness rules wired into the scan, and `np models install|hash|list`.
+So `np` can now say **which models exist and whether each artifact is present**, and it stores chunks — but no command
+and no report field answers "which chunks are embedded under which model", because nothing embeds yet: §5's bounded
+"chunks owed with no vector" count is unimplemented and is carried in the backlog. The catalog is byte-for-byte what it
+was before M2a.
 
 **M2b (next design, after the benchmark).** Clustering, `clusters` + membership, the review queue with evidence, the
 `cluster` column in the catalog entry line, nearest neighbours for orphans.
@@ -134,8 +139,13 @@ Notes on the shape, each of which is a decision and not an accident:
 - **The domain is the decoded text, not the file.** `scan.rs:681-687` strips a leading BOM and replaces invalid UTF-8
   before anything is parsed, while `files.hash` digests the raw bytes on disk — "BOM included", in that file's own words.
   Offsets into the *file* would therefore mean something else for precisely the corpus F13/F18/F20/F23 refuse to key by:
-  every BOM'd Windows export and every non-UTF-8 note. So offsets and `chunks.source_hash` are over the **decoded text
-  that is actually embedded** — the same spelling as `notes.body`. The consequence is stated rather than buried: for a
+  every BOM'd Windows export and every non-UTF-8 note. So **offsets** are over the **decoded text that is actually
+  embedded** — while `chunks.source_hash` is not: it holds `files.hash`, the digest of the *raw bytes on disk*, because
+  decoding is a pure function of those bytes and one file digest therefore still states exactly which decoded text a row
+  was cut from (and it is the only stamp the scan can compare without opening the file again). The domain is also **not**
+  `notes.body`: `refresh_chunks` receives the whole decoded file, frontmatter included, so chunk 0 of any note with a
+  YAML block embeds that block and offsets index the file-minus-BOM — recorded in `chunk.rs`'s
+  `frontmatter_is_part_of_the_text_being_cut`, and an open decision before round 4b (see backlog D2). The consequence is stated rather than buried: for a
   note whose `notes.encoding = 'lossy'` (already stored, no new column), byte offsets are *approximate* citations into
   the file, and M2b's evidence links must say so instead of pointing one character off.
 - **`chunks.chunker` stamps which chunking code produced the row**, and staleness is per row (`chunker = CHUNKER_VERSION
@@ -177,8 +187,8 @@ makes it safe: recording the version only when every owed note was actually re-p
   changed or went unread between walk and read, and a live row behind an unenterable directory or refused name — and the
   code refuses to charge anything else, because "Charging any of them would re-parse the whole corpus on every scan
   forever and repair nothing" (`scan.rs:1872-1873`). Re-parsing never fails for an *external* reason. Embedding does:
-  no model installed, endpoint down, out of memory. Gate `EMBED_VERSION` — a name this design introduces, not code: it
-  exists nowhere in the tree yet — on that and the **default** configuration
+  no model installed, endpoint down, out of memory. Gate `EMBED_VERSION` — landed as `scan::EMBED_VERSION_KEY`, recorded
+  in the scan's own transaction and deliberately **not** gated on a provider existing — on that and the **default** configuration
   (`embeddings.provider = "none"`, §2) withholds it on every scan forever — a full re-chunk of ~18k chunks each time,
   plus a gap line nobody can clear. So:
   - `EMBED_VERSION` covers **chunker-definition coverage only**, reusing `refresh_covered`'s two sources unchanged, and
