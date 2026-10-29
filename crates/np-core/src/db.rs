@@ -2150,6 +2150,115 @@ pub fn delete_vectors_for_chunk(db: &Db, chunk_id: i64) -> Result<(), DbError> {
     Ok(())
 }
 
+/// One row of `models` (migration 7), read as the columns hold them.
+///
+/// `dim` and `installed_at` are `i64` rather than `u16`/a timestamp type on purpose: SQLite's `INTEGER`
+/// is untyped, so a hand-edited file can hold `-1`, `999999` or a value past `u64::MAX`'s neighbour in the
+/// column this program wrote as `8` and `1730000000`. Narrowing on the way out would turn that into a panic,
+/// a wrap, or a row that silently equals another ([`crate::models::install`] compares a *declared* dim with
+/// the stored one to decide "already installed"), so the reader reports what is there and lets the caller
+/// judge. A value not readable as an integer at all — TEXT in a column someone typed by hand — arrives as
+/// [`DbError::Sqlite`], which is the same honest answer: it is reported, not guessed past.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRow {
+    /// The identity vectors reference (`embeddings.model`'s foreign key), exactly as installed.
+    pub id: String,
+    /// Declared vector width. See this struct's note on `i64`.
+    pub dim: i64,
+    /// Lowercase-hex digest the artifact was verified against at install, or `None` for a provider with no
+    /// local weights — migration 7's ordinary arm, not a missing value.
+    pub sha256: Option<String>,
+    /// Text prefix added to documents.
+    pub prefix_doc: String,
+    /// Text prefix added to queries.
+    pub prefix_query: String,
+    /// Whole seconds since the Unix epoch, recorded once at install and rewritten by nothing — not even a
+    /// re-materialised artifact ([`crate::models::InstallOutcome::Restored]), because the row's claim about
+    /// *when this id became known* does not change when its file comes back.
+    pub installed_at: i64,
+}
+
+/// The `SELECT` column order every reader of `models` uses, so a row and a binder cannot disagree about
+/// which column is which by spelling the list twice.
+const MODEL_COLUMNS: &str = "id, dim, sha256, prefix_doc, prefix_query, installed_at";
+
+/// Read the one row naming `id`, or `None` when no model of that identity has been installed.
+///
+/// The reads live here rather than in the command because np-cli has no `rusqlite` dependency and must not
+/// grow one to answer a question about its own table (`docs/design-m2-models-install.md` §6), and because
+/// `install`'s idempotence test is *this* row read against the *declared* tuple — a comparison no caller may
+/// skip or partially perform.
+pub fn model_row(db: &Db, id: &str) -> Result<Option<ModelRow>, DbError> {
+    // The statement text is assembled per call rather than written out twice: `MODEL_COLUMNS` is the single
+    // spelling of the column order that [`read_model_row`] binds by position, and these two reads are one row
+    // per command, not a scan's per-file loop, so the allocation is not what `prepare_cached` exists to save.
+    Ok(db
+        .0
+        .prepare_cached(&format!("SELECT {MODEL_COLUMNS} FROM models WHERE id = ?1"))?
+        .query_row(params![id], read_model_row)
+        .optional()?)
+}
+
+/// Every installed model, ordered by `id`.
+///
+/// Ordered because `np models list` output is compared by a human and by tests: without `ORDER BY` SQLite
+/// answers in rowid order, which for a table whose primary key is TEXT is insertion order — so re-installing
+/// two ids in the other sequence would reorder the listing.
+pub fn model_rows(db: &Db) -> Result<Vec<ModelRow>, DbError> {
+    let mut statement =
+        db.0.prepare_cached(&format!("SELECT {MODEL_COLUMNS} FROM models ORDER BY id"))?;
+    let rows = statement.query_map([], read_model_row)?;
+    let mut rows_out = Vec::new();
+    for row in rows {
+        rows_out.push(row?);
+    }
+    Ok(rows_out)
+}
+
+/// One row of `models`, bound from the six columns of [`MODEL_COLUMNS`].
+fn read_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
+    Ok(ModelRow {
+        id: row.get(0)?,
+        dim: row.get(1)?,
+        sha256: row.get(2)?,
+        prefix_doc: row.get(3)?,
+        prefix_query: row.get(4)?,
+        installed_at: row.get(5)?,
+    })
+}
+
+/// Insert an installed model, reporting whether this call was the one that wrote it.
+///
+/// `ON CONFLICT (id) DO NOTHING` rather than a plain `INSERT`, and the reason is concurrent installs of one
+/// id (§6): two processes can both pass [`crate::models`]'s "is there already a row?" step, and if the loser
+/// raised `SQLITE_CONSTRAINT_PRIMARYKEY` the human would read a bare constraint violation about a table they
+/// have never opened. Returning `false` says what actually happened — somebody else installed this identity,
+/// and [`crate::models::install`] turns that into the same full-tuple comparison it applies to its own
+/// pre-flight read, so a *different* declaration is still refused rather than papered over.
+///
+/// `dim` and `now` arrive as `i64` because those are SQLite's `INTEGER` columns; the range rules on a
+/// declared dim (`u16`, never zero) belong to the caller that parses human input, not to the writer
+/// (`docs/design-m2-models-install.md` §2). `sha256` is `None` for a provider with no local weights —
+/// migration 7's nullable arm.
+pub fn insert_model(
+    db: &Db,
+    id: &str,
+    dim: i64,
+    sha256: Option<&str>,
+    prefix_doc: &str,
+    prefix_query: &str,
+    now: i64,
+) -> Result<bool, DbError> {
+    let written =
+        db.0.prepare_cached(
+            "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (id) DO NOTHING",
+        )?
+        .execute(params![id, dim, sha256, prefix_doc, prefix_query, now])?;
+    Ok(written == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{orphan_total, rebase_abs, report_merges, report_orphans, OrphanCleanup};

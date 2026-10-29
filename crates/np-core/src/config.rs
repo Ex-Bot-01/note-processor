@@ -275,6 +275,9 @@ impl Config {
 
     /// This workspace's database: `data_dir/workspaces/<sha256(abs)[0..16]>.sqlite`.
     ///
+    /// [`Config::workspace_models_dir`] places the same workspace's model artifacts beside it, from the same
+    /// private `workspace_key`, because a row and the file it names belong to one workspace or to neither.
+    ///
     /// The workspace need not exist: the absolute spelling of `workspace` (current
     /// directory prepended when relative, no symlink resolution) is hashed as
     /// given, so the same input always yields the same path.
@@ -285,12 +288,51 @@ impl Config {
     /// other's notes stale on alternate scans. Windows has no byte-exact spelling of a path to reach
     /// for, so it keeps the lossy one.
     pub fn workspace_db(&self, workspace: &Path) -> PathBuf {
-        let digest = Sha256::digest(path_bytes(&abs_path(workspace)));
-        let name = hex_prefix(&digest[..DB_HASH_BYTES]);
+        self.workspaces_join(&workspace_key(workspace), "sqlite")
+    }
+
+    /// This workspace's model-artifact directory: `data_dir/workspaces/<db-hash>.models`.
+    ///
+    /// The name is `workspace_key` (private) — **the same key as [`Config::workspace_db`]**, which is the whole
+    /// point of this function existing rather than the caller building a path (`docs/design-m2-models-install.md`
+    /// §3 step 0). `models` rows live in the per-workspace database, so an artifact directory derived by any
+    /// other rule would let an install in workspace A rename over the file workspace B's row names — the P0
+    /// that design review raised, and the reason `install`/`list` take a workspace operand at all. Two
+    /// spellings of "one workspace" must never be computed twice: `abs_path` is `pub(crate)` while
+    /// `hex_prefix` and `DB_HASH_BYTES` are private, so a second derivation outside this file would have
+    /// to re-implement the digest — and the two obvious shortcuts both diverge here. Over `path::Display`
+    /// they diverge for a name UTF-8 cannot hold (the same collision `path_bytes` refuses inside a
+    /// workspace), and through `canonicalize()` they diverge because neither function resolves symlinks.
+    ///
+    /// `.models` is a suffix on the key rather than a directory named by it so that `<hash>` is never both a
+    /// file and a folder in one listing, and so `list` can tell an artifact directory from SQLite's own
+    /// `<hash>.sqlite{-wal,-shm}` siblings at a glance.
+    ///
+    /// Like [`Config::workspace_db`], this derives a path for a workspace that does not exist — refusing
+    /// such a workspace is the caller's job and is spelled
+    /// [`crate::models::require_workspace_dir`].
+    pub fn workspace_models_dir(&self, workspace: &Path) -> PathBuf {
+        self.workspaces_join(&workspace_key(workspace), "models")
+    }
+
+    /// `data_dir/workspaces/<key>.<extension>` — the one place that assembles a per-workspace path, so the
+    /// database and the artifact directory cannot be placed in different directories by two format strings.
+    fn workspaces_join(&self, key: &str, extension: &str) -> PathBuf {
         self.data_dir
             .join("workspaces")
-            .join(format!("{name}.sqlite"))
+            .join(format!("{key}.{extension}"))
     }
+}
+
+/// The per-workspace name: the leading `DB_HASH_BYTES` bytes of the workspace path digest, as lowercase
+/// hex. Shared by [`Config::workspace_db`] and [`Config::workspace_models_dir`].
+///
+/// Everything that decides *which workspace a row and an artifact belong to* goes through this one function,
+/// which is why it hashes [`path_bytes`] of [`abs_path`] rather than anything a caller could spell
+/// differently: see [`Config::workspace_db`] for the two divergences this forecloses.
+fn workspace_key(workspace: &Path) -> String {
+    let digest = Sha256::digest(path_bytes(&abs_path(workspace)));
+    hex_prefix(&digest[..DB_HASH_BYTES])
 }
 
 /// Location of the config file: `$XDG_CONFIG_HOME/note-processor/config.toml`,

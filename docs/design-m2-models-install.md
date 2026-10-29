@@ -103,9 +103,21 @@ np models list <workspace> [--json]
    `rename` it into place as `<dir>/<id>` — the catalog publish's discipline: no reader ever sees half an artifact, and
    a failed copy leaves no partial file. The temp spelling is pinned because §7 test 10's premise is precisely a
    leftover from a crash here: a `*.tmp` entry is never claimed by a row and `list` reports it under its own heading.
-   **Exactly one `sha256_file` call per install**, in step 3: step 6's verification reuses that digest, because the
-   row's sha equals `--sha256` (step 5) and `--sha256` equals the file's (steps 3-4), so a second pass would read
-   ~540 MB for nothing.
+   **One hash of the source** (step 3). The review asked for exactly one `sha256_file` call per install, on the
+   arithmetic that row sha = `--sha256` = the source's digest — and that arithmetic is right about *whether to copy*.
+   It is wrong about **what may be claimed**: when an artifact is already present, the thing being reported on is that
+   file, not the source, and the source's digest says nothing about bytes that have sat on disk since the earlier
+   install. Answering `already installed` over a rotted artifact is precisely the false status claim this project
+   treats as a defect (F21), so **this one arm — row agrees and artifact present — also hashes the artifact**, and
+   refuses with `ArtifactDisagrees { path, expected, found }` rather than overwriting it. Cost: one read of the
+   artifact on a repeat install, which is an interactive command where the alternative is lying. Nothing else in
+   install re-reads anything.
+
+   `list` does hash every artifact with a non-null digest, because its four states are claims about bytes and an
+   unverified "present" would be a weaker word than the design promises. For several hundred-megabyte models that is
+   seconds per invocation; it is an explicit human command, not something the scan calls. If that ever needs to be
+   cheap, the honest shape is a separate `--quick` that says *unverified* out loud rather than quietly softening
+   `present`.
 
    Every path in that operation — `create_dir_all`, the temp write, the rename — goes through `walk::to_open_path`,
    not just the final name: a long temp name can cross the prefix threshold while the final name does not
@@ -247,7 +259,8 @@ workspace name the row and the artifact land under different hashes, which is th
 
 The wrong-dim provider answer is still raw `DbError` at the write; ordinal drift still makes "re-embed only what moved"
 a row-identity promise; the chunk-gap stderr line has no capture seam and so no assertion. Added by this round:
-per-workspace artifacts mean N copies (§4) and a new orphan class that nothing reclaims.
+per-workspace artifacts mean N copies (§4) and a new orphan class that nothing reclaims; and `models list` verifies by
+hashing, which costs one whole read per installed model per invocation (§3).
 
 ## 9. Open questions for the human (blocking 4b, not 4a)
 
