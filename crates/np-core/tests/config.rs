@@ -853,21 +853,39 @@ fn an_unknown_key_outside_embeddings_still_loads() {
 const LOCAL_ID: &str = "embeddinggemma-2-text-q8_0@1";
 
 /// The token ceiling is a **model fact, not taste**: 8,192 is `embeddinggemma-2`'s attention window (Google's card, read
-/// 2026-10-29). It used to be 32 768, justified in its own comment by `max_position_embeddings = 262144` — a RoPE/train-length
-/// property the design has since disowned — and no test noticed, because every other case is written *relative to* the
-/// constant. Equality rather than `< some generous cap`, because a silent raise is precisely the failure being fenced: a bound
-/// above what the model can read is not generous, it is false. Raising this number must come with a citation and a provider-side
-/// home for the check (the spec's MiniLM fallback has ~512 tokens, so one global constant is already doing a per-model job).
+/// 2026-10-29). It used to be 32 768, justified by `max_position_embeddings = 262144` — a RoPE/train-length property the design has
+/// since disowned — and **no test noticed**, because every other case is written *relative to* the constant. So the window is pinned
+/// through behaviour rather than a constant comparison (which clippy correctly refuses as `assertions_on_constants`, and which would
+/// anyway only restate the source): a budget one over the ceiling must be refused, and the sentence that refuses it must carry the
+/// model's number. Change the ceiling without a citation and this fails on the message. Raising it also means moving the check beside
+/// the provider — the spec's MiniLM fallback has ~512 tokens, so one global constant is already doing a per-model job.
 #[test]
-fn the_token_ceiling_is_the_models_attention_window() {
-    assert_eq!(
-        MAX_EMBEDDING_TOKENS, 8_192,
-        "the ceiling is a measured model window; changing it needs a source, not a wider number"
-    );
+fn the_token_ceiling_carries_the_models_attention_window_into_its_refusal() {
+    let (_path, err) = embeddings_refusal(&format!(
+        "[embeddings]\nmax_tokens = {}\n",
+        MAX_EMBEDDING_TOKENS + 1
+    ));
+    let message = err.to_string();
     assert!(
-        DEFAULT_EMBEDDING_TOKENS < MAX_EMBEDDING_TOKENS,
-        "the default budget has to fit inside the window it is bounded by"
+        message.contains("8192") && message.contains("attends to at most"),
+        "the refusal has to teach the reader the model's window, not just reject a number: {message}"
     );
+
+    // And the ceiling itself is reachable: asking for exactly the window is legal, so the fence bounds the model rather than
+    // refusing every real budget.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        &format!("[embeddings]\nmax_tokens = {}\n", MAX_EMBEDDING_TOKENS),
+    );
+    let cfg = Config::load(Some(&path)).expect("the ceiling itself must be accepted");
+    assert!(
+        DEFAULT_EMBEDDING_TOKENS <= cfg.embeddings.max_tokens,
+        "the default budget cannot exceed the bound it is validated against"
+    );
+
+    // Mutation this catches: raising `MAX_EMBEDDING_TOKENS` back to 32 768 — the message then prints a number no model can honour and
+    // the assertion above dies. Lowering it below the default trips the second half.
 }
 
 #[test]
