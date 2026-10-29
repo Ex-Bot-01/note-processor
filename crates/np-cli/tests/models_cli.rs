@@ -225,6 +225,118 @@ fn install_one(ws: &Scratch) -> (PathBuf, String) {
     (source, digest)
 }
 
+/// §7's portable fence for the P0: the artifact directory and the database must come from **one** key. Asserted
+/// on the directory listing rather than through `Config::workspace_models_dir`, because deriving both sides with
+/// the same call is exactly the circle that lets a re-derivation pass unseen — and unlike the non-UTF-8 workspace
+/// case in `np-core/tests/models.rs` (unix-only), this one runs on Windows too.
+#[test]
+fn the_artifact_directory_and_the_database_share_one_stem() {
+    let ws = Scratch::new();
+    let source = ws.source("artifact.bin", b"the bytes one model stands for\n");
+    let digest = source_digest(&source);
+    run(&mut ws.install(&source, "384", &digest)).assert_success();
+
+    let mut pairs: Vec<(String, String)> = fs::read_dir(ws.data_dir().join("workspaces"))
+        .expect("test: the workspaces directory is readable")
+        .map(|entry| entry.expect("test: readable entry").path())
+        .filter_map(|path| {
+            Some((
+                path.file_stem()?.to_str()?.to_string(),
+                path.extension()?.to_str()?.to_string(),
+            ))
+        })
+        .collect();
+    pairs.sort();
+    let databases: Vec<&str> = pairs
+        .iter()
+        .filter(|(_, ext)| ext == "sqlite")
+        .map(|(stem, _)| stem.as_str())
+        .collect();
+    let models_dirs: Vec<&str> = pairs
+        .iter()
+        .filter(|(_, ext)| ext == "models")
+        .map(|(stem, _)| stem.as_str())
+        .collect();
+    let names: Vec<String> = pairs
+        .iter()
+        .map(|(stem, ext)| format!("{stem}.{ext}"))
+        .collect();
+    assert_eq!(
+        databases.len(),
+        1,
+        "one workspace leaves exactly one database: {names:?}"
+    );
+    assert_eq!(
+        models_dirs, databases,
+        "and its artifact directory carries the very same stem — one key, so a row and its artifact cannot end up
+         in different workspaces (§2's P0). Listing seen: {names:?}"
+    );
+}
+
+/// §3's third outcome string end to end: delete the artifact and re-install must say `restored`, exit 0, and
+/// carry the same word in `--json`. The three strings are pinned by the design, so renaming one has to break.
+#[test]
+fn reinstalling_after_the_artifact_vanished_says_restored_in_both_channels() {
+    let ws = Scratch::new();
+    let source = ws.source("artifact.bin", b"the bytes one model stands for\n");
+    let digest = source_digest(&source);
+    run(&mut ws.install(&source, "384", &digest)).assert_success();
+
+    fs::remove_file(ws.models_dir().join(ID)).expect("test setup: delete the artifact");
+    let restored = run(&mut ws.install(&source, "384", &digest));
+    restored.assert_success();
+    assert_eq!(
+        restored.stdout(),
+        "restored\n",
+        "the text channel names the outcome"
+    );
+
+    let mut again = ws.install(&source, "384", &digest);
+    again.arg("--json");
+    let json = run(&mut again);
+    json.assert_success();
+    // Parsed rather than substring-hunted: the CLI prints pretty JSON, and an assertion that only matches one
+    // spacing would be testing serde's formatter instead of §3's contract.
+    let report = json.json();
+    assert_eq!(
+        keys(&report),
+        ["id", "state"],
+        "install's key set is exactly what §3 pins"
+    );
+    assert_eq!(
+        report["state"], "already installed",
+        "and the field carries the outcome"
+    );
+    assert_eq!(report["id"], ID);
+}
+
+#[test]
+fn hash_refuses_a_directory_with_nothing_on_stdout() {
+    let ws = Scratch::new();
+    let mut cmd = ws.command(&["models", "hash"]);
+    cmd.arg(&ws.root);
+    let refused = run(&mut cmd);
+    refused.assert_refused();
+    assert_eq!(
+        refused.stdout(),
+        "",
+        "a refusal prints no digest line to capture"
+    );
+}
+
+#[test]
+fn install_refuses_a_malformed_digest_through_the_cli() {
+    let ws = Scratch::new();
+    let source = ws.source("artifact.bin", b"the bytes one model stands for\n");
+    let refused = run(&mut ws.install(&source, "384", "deadbeef"));
+    refused.assert_refused();
+    assert_eq!(
+        refused.stdout(),
+        "",
+        "and no outcome word accompanies the refusal"
+    );
+}
+
 #[test]
 fn install_prints_the_outcome_word_and_places_the_artifact() {
     let ws = Scratch::new();

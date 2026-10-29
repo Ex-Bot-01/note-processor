@@ -274,6 +274,77 @@ fn a_digest_mismatch_names_both_and_leaves_no_file_and_no_row() {
 /// An argument that is not 64 hex characters is refused as the format problem it is (§3 step 4), rather than
 /// being compared against a real digest and reported as a mismatch.
 #[test]
+fn a_malformed_digest_is_refused_before_the_source_is_touched() {
+    // The ordering this round moved. A bad `--sha256` is a fact about argv, so it must not cost a read of the
+    // file: killed by moving `normalize_digest` back below the digest step, which discovers the missing file
+    // first and answers with a read failure instead.
+    let fx = Fixture::new();
+    let db = fx.db();
+    let missing = fx._tmp.path().join("never-downloaded.bin");
+    let failure = install(&fx, &db, &request("alpha", &missing, "deadbeef", 8))
+        .expect_err("a truncated digest is refused whatever the file says");
+    assert!(
+        matches!(failure, ModelError::InvalidDigest { .. }),
+        "the format refusal wins over a source that cannot even be opened: {failure}"
+    );
+}
+
+#[test]
+fn a_source_that_cannot_be_read_names_the_source_and_not_the_artifact() {
+    // `--path` pointing at a directory is the ordinary way to hit this. The message must say "install source"
+    // and name a *read*: calling the human's input "the model artifact" is the wrong-fact-in-the-message class,
+    // which this project treats as a defect rather than as cosmetics.
+    let fx = Fixture::new();
+    let db = fx.db();
+    let failure = install(
+        &fx,
+        &db,
+        &request("alpha", fx._tmp.path(), &"0".repeat(64), 8),
+    )
+    .expect_err("a directory is not an artifact");
+    match failure {
+        ModelError::Source { path, .. } => assert!(
+            path.ends_with(
+                fx._tmp
+                    .path()
+                    .file_name()
+                    .expect("test: the tempdir has a name")
+            ),
+            "the refusal names the input it could not read: {path:?}"
+        ),
+        other => panic!("a directory as `--path` is a read refusal, got {other}"),
+    }
+}
+
+/// An artifact that cannot be hashed fails the **whole** listing rather than degrading into a per-row verdict:
+/// "I could not read it" must never be reported as "its bytes disagree".
+#[cfg(unix)]
+#[test]
+fn an_unreadable_artifact_fails_the_listing_instead_of_becoming_a_verdict() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    let source = fx.source("weights-v1.bin", b"weights v1");
+    let digest = sha256_file(&source).expect("test setup: hash the source");
+    let db = fx.db();
+    install(&fx, &db, &request("alpha", &source, &digest, 8)).expect("first install");
+
+    fs::set_permissions(fx.artifact("alpha"), fs::Permissions::from_mode(0o000))
+        .expect("test setup: take every bit away from the artifact");
+    let listing = models::list(&db, &fx.config, &fx.workspace);
+    fs::set_permissions(fx.artifact("alpha"), fs::Permissions::from_mode(0o600))
+        .expect("test: give the artifact back to its owner");
+
+    match listing {
+        Err(ModelError::Artifact { path, .. }) => assert!(
+            path.ends_with("alpha"),
+            "the refusal names the artifact it could not hash: {path:?}"
+        ),
+        other => panic!("an unreadable artifact is a read failure, not a state: {other:?}"),
+    }
+}
+
+#[test]
 fn a_digest_that_is_not_64_hex_characters_is_refused_as_a_format_problem() {
     let fx = Fixture::new();
     let source = fx.source("weights-v1.bin", b"weights v1");

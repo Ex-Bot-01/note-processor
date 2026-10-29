@@ -157,7 +157,11 @@ subdirectory is reported as one rather than recursed; unclaimed entries never ch
 **Machine-readable output is pinned here, not left to the implementer.** `--json` emits one object whose key set is
 identical for every state — per row `{ "id", "dim", "sha256", "prefix_doc", "prefix_query", "installed_at", "state" }`,
 plus `"unclaimed": [...]`, plus `"models_dir_error"` when listing fails. Install's three outcomes are the strings
-`installed`, `already installed`, `restored`, in that same `state` field. Precedent: `cli.rs:777`, *one JSON shape for
+`installed`, `already installed`, `restored`, in that same `state` field. `list --json` wraps those rows in a top-level `"models"` array;
+`install --json` is the object `{ "id", "state" }` and nothing else. Both names are frozen by tests, so they are
+pinned here too — otherwise a later rename breaks a consumer and no document says who decided it. **Exit codes
+split on purpose**: argv refusals (bad flag, missing operand) exit **2** from clap; every runtime refusal exits
+**1**. A script that wants to tell "you typed it wrong" from "the workspace refused" branches on that. Precedent: `cli.rs:777`, *one JSON shape for
 every outcome, not one per outcome* — and if it is not named now, a later round renames `state` or `unclaimed` and no
 test dies.
 
@@ -174,6 +178,13 @@ copy-then-rename: two models at ~540 MB each is ~1.1 GB on disk and ~1.6 GB at t
 ~9.1 GB free measured in §1. What it buys is the property that no install in one workspace can ever move a file
 another workspace's row points at — the P0. If N copies becomes unacceptable the fix is a shared content-addressed
 store with per-workspace references, which is a design change and not this round.
+
+**One window install does not close.** With no row at step 5 it publishes the artifact first and learns of a conflict
+only when `insert_model` reports that it inserted nothing — so two processes installing one id with *different* bytes
+can end with the loser's rename having replaced the winner's artifact before the loser is refused. Closing it properly
+needs a lock; what makes it survivable rather than silent is that `list` hashes artifacts and will call the result
+`mismatch`, and nothing embeds against a mismatching row. Recorded rather than papered over, since §7 declines to
+simulate the cross-process race.
 
 Orphans get heavier too: renaming or deleting a workspace already orphans `<hash>.sqlite` forever (`config.rs:416`,
 "Rows are never deleted", and `np repair` was ruled out), and 4a adds an orphan class measured in hundreds of

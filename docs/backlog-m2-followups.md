@@ -312,7 +312,7 @@ What these numbers can and cannot carry:
 - **Fix:** a migration that merges duplicate note rows for one `rel_bytes` — keeping the older `notes.id` so
   derived rows stay attached, re-pointing edges that named the loser, and reporting what it merged rather than
   choosing silently — after which the version records normally. **A `np repair` command was considered and ruled
-  out** (design §7): this program's only command is `np scan`, whose open already runs every schema fact, and a
+  out** (design §7): [this program's only command is `np scan` — historical as of round 4a: `np models install|hash|list` now exist, and none of them is a second path through migration or merge logic, which is what this ruling forbids], whose open already runs every schema fact, and a
   user-facing second path through the same logic is a second thing to keep in agreement with the first. So do not
   build one on the strength of this entry — the entry is closed, and migration 5 at open is the merge path.
   **Do when:** a workspace holding a legacy duplicate converges to `uncovered = 0` on the scan after the repair,
@@ -431,7 +431,7 @@ What these numbers can and cannot carry:
   mechanism.
 - **Fix:** reuse what F21 built rather than inventing a second mechanism — a bounded record in `meta`, the value
   carried on the open handle, and an always-present `ScanReport` field surfaced by `np scan`. (`np status` does not
-  exist; `np scan` is this program's only command, as F21 §3 records.) Keep the single list but word the entry with its
+  exist; `np scan` is this program's only command, as F21 §3 records — historical as of round 4a, which added `np models install|hash|list`; see design-m2-models-install §6.) Keep the single list but word the entry with its
   cause where the walk knows it — `skipped: unreadable directory` against `skipped: name this build cannot key`.
   Report text plus a `meta` key only, so catalog goldens stay put. **Do when:** a workspace scanned with stderr
   refusing writes still lets a later `np scan` name the refused path, and the two causes are distinguishable in the

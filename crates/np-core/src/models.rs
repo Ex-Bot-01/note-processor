@@ -316,6 +316,16 @@ pub enum ModelError {
         source: io::Error,
     },
     /// A copy or rename into the artifact directory failed; `path` is the name that could not be written.
+    /// Reading **the human's** file failed — missing, a directory, unreadable (§3 steps 2-3). Distinct from
+    /// [`ModelError::Io`], which is about writing our own temp or target: naming the input file "the model
+    /// artifact" and calling a read a write puts the wrong fact in the message.
+    #[error("cannot read the install source {}: {source}", .path.display())]
+    Source {
+        /// The `--path` that could not be read.
+        path: PathBuf,
+        /// Why not.
+        source: io::Error,
+    },
     #[error("cannot write the model artifact {}: {source}", .path.display())]
     Io {
         /// The path that failed, temp or final.
@@ -378,11 +388,17 @@ pub fn install(
     require_workspace_dir(workspace)?;
     validate_id(&request.id)?;
 
-    // Step 2, before hashing: an empty file is a truncated download, and the digest of nothing is a real
-    // digest that would only report "mismatch" against whatever the human expected.
-    let open_source = walk::to_open_path(&request.source);
+    // Step 4's **format** check runs first, deliberately ahead of steps 2 and 3: a mistyped or truncated digest
+    // is a fact about argv, and making the human watch up to ~540 MB get read before "must be exactly 64
+    // hexadecimal characters" spends the expensive operation to learn something the command line already said.
+    // Lowering still happens exactly once (§3), just earlier.
+    let declared = normalize_digest(&request.sha256)?;
+
+    // Step 2, now that the arguments are known good: an empty file is a truncated download, and the digest of
+    // nothing is a real digest that would only report "mismatch" against whatever the human expected.
+    let open_source = walk::to_open_path(&access(&request.source));
     let size = fs::metadata(&open_source)
-        .map_err(|source| ModelError::Io {
+        .map_err(|source| ModelError::Source {
             path: request.source.clone(),
             source,
         })?
@@ -393,18 +409,13 @@ pub fn install(
         });
     }
 
-    // Step 3, and the only digest computed by this call. Step 6 does not re-hash what it copied: the row's sha
-    // equals `--sha256` (step 5) and `--sha256` equals the file's (step 4), so a second pass would read ~540 MB
-    // to confirm arithmetic (§3).
-    let found = hash::sha256_file(&request.source).map_err(|err| ModelError::Io {
+    // Step 3, and the only digest computed over the source by this call. Step 6 does not re-hash what it copied:
+    // the row's sha equals `--sha256` (step 5) and `--sha256` equals the file's, so a second pass would read
+    // ~540 MB to confirm arithmetic (§3).
+    let found = hash::sha256_file(&open_source).map_err(|err| ModelError::Source {
         path: request.source.clone(),
         source: hash_io(err),
     })?;
-
-    // Step 4. Lowered once, here, so every comparison below and the stored column share one spelling — an
-    // uppercase digest stored verbatim would make every later lowercase comparison call it "different", and
-    // with no `--force` that id would be permanently un-installable (§3).
-    let declared = normalize_digest(&request.sha256)?;
     if declared != found {
         return Err(ModelError::DigestMismatch {
             path: request.source.clone(),
@@ -538,7 +549,7 @@ pub fn require_workspace_dir(workspace: &Path) -> Result<(), ModelError> {
         workspace: workspace.to_path_buf(),
         source,
     };
-    match fs::metadata(walk::to_open_path(workspace)) {
+    match fs::metadata(walk::to_open_path(&access(workspace))) {
         Ok(meta) if meta.is_dir() => Ok(()),
         // `is_file` would name one of several non-directories; the kind says what every other reader here
         // says and keeps the message a fact rather than a guess.
@@ -686,19 +697,34 @@ fn compare_declaration(
 /// The temp name is `<id>.<nonce>.tmp`, pinned by §3 rather than left to taste: `list`'s unclaimed rule is
 /// stated in terms of it, and a failed copy leaves that spelling behind on purpose — removing it would be
 /// this module deleting a file no row has ever attested, which is not its authority.
+/// The spelling to hand to the OS: absolute and lexically normalised, **no symlink resolution**.
+///
+/// `walk::to_open_path` documents that it expects an absolute path (a prefixed relative path is not valid on
+/// Windows) and adds its prefix at ~260 characters, so a long relative `--path` from argv would become
+/// `\\?\relative\...` and fail with a raw OS error. Identity is a separate question: the workspace key still
+/// comes from `Config::workspace_db`, which hashes the caller's spelling on purpose, and normalising *that*
+/// would silently move a database. Only filesystem access goes through here.
+fn access(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn publish_artifact(models_dir: &Path, id: &str, source: &Path) -> Result<(), ModelError> {
-    fs::create_dir_all(walk::to_open_path(models_dir)).map_err(|source| ModelError::ModelsDir {
-        path: models_dir.to_path_buf(),
-        source,
+    fs::create_dir_all(walk::to_open_path(&access(models_dir))).map_err(|source| {
+        ModelError::ModelsDir {
+            path: models_dir.to_path_buf(),
+            source,
+        }
     })?;
 
     let temp = models_dir.join(format!("{id}.{}{TEMP_SUFFIX}", nonce()));
     let target = models_dir.join(id);
-    fs::copy(walk::to_open_path(source), walk::to_open_path(&temp)).map_err(|source| {
-        ModelError::Io {
-            path: temp.clone(),
-            source,
-        }
+    fs::copy(
+        walk::to_open_path(&access(source)),
+        walk::to_open_path(&temp),
+    )
+    .map_err(|source| ModelError::Io {
+        path: temp.clone(),
+        source,
     })?;
     // Atomic within one directory: a reader either sees the previous artifact or this one, never half.
     fs::rename(walk::to_open_path(&temp), walk::to_open_path(&target)).map_err(|source| {

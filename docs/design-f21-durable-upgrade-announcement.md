@@ -45,7 +45,7 @@ never to hide. Consequences:
 
 ## 3. Surfacing it again without nagging forever
 
-`np scan` is the only command in this program (`np-cli` has no `status`), so the second announcement has to ride the
+[`np scan` is the only command in this program — historical as of round 4a, which added `np models install|hash|list`; the point stands because those commands announce nothing and touch no receipt] (`np-cli` has no `status`), so the second announcement has to ride the
 scan report. Rule: **a scan echoes the receipt only when its own process performed that migration.**
 
 - `Db::open` remembers, for the lifetime of the handle, whether *this* open ran the orphan cleanup, and keeps the
