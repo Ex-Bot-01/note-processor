@@ -510,9 +510,6 @@ fn a_parse_rule_change_reports_the_re_parse_on_stderr() {
     );
 }
 
-/// (b) The other half: a refresh that could not reach one note must say it did not record the version, or
-/// a workspace with one unreadable subtree re-parses its whole corpus on every scan in silence.
-#[cfg(unix)]
 /// The chunker's own gap line, asserted the way its sibling above asserts the parse one. Recorded because
 /// design-m2-models-install §8 claimed no capture seam exists for it — that was false: this file already captures a
 /// child's stderr and matches its sibling's sentence verbatim.
@@ -554,6 +551,9 @@ fn an_incomplete_chunk_pass_reports_its_own_gap_on_stderr() {
     );
 }
 
+/// (b) The other half: a refresh that could not reach one note must say it did not record the version, or
+/// a workspace with one unreadable subtree re-parses its whole corpus on every scan in silence.
+#[cfg(unix)]
 #[test]
 fn an_incomplete_refresh_reports_the_gap_on_stderr() {
     let ws = workspace();
