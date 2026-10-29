@@ -2017,9 +2017,9 @@ fn stored_chunks(db: &Db, note_id: i64) -> Result<Vec<StoredChunk>, DbError> {
 // `Vec<(u32, Vec<u8>)>` would name one fact twice without saying anything the signature does not already.
 // clippy's heuristic counts nesting rather than meaning.
 #[allow(clippy::type_complexity)]
-/// No production caller yet: the scan round (design §5) is what will read this back. Stated because a helper
-/// whose semantics no test exercises through real use can drift quietly, and its `None` arm in particular means
-/// "no single digest describes these rows", which a caller must not read as "no chunks".
+/// Still **no production caller**: the scan decides currency from [`chunk_digest`], which reads stamps only, and
+/// this function's texts exist for the embed round that compares a chunk's stored bytes against what it would
+/// re-embed. `None` means "no single digest describes these rows", which a caller must not read as "no chunks".
 pub fn chunk_state(
     db: &Db,
     note_id: i64,
@@ -2051,6 +2051,43 @@ pub fn chunk_state(
         },
         texts,
     ))
+}
+
+/// The note digest one note's chunk rows agree on, **without reading their text**.
+///
+/// This is the scan's per-note decision (design §5: "an unchanged note costs one indexed lookup per scan"), and
+/// the stamps are all that decision uses. [`chunk_state`] answers the same question while materialising a `Vec<u8>`
+/// per chunk — on a warm scan over a real vault that is roughly the whole corpus read out of SQLite and thrown
+/// away, which is a different cost class from an index probe and one the suite cannot see, because the perf fixture's
+/// notes are ~350 bytes and cut one chunk each. Same rules as [`chunk_state`], same `None` arms: no rows, rows that
+/// disagree, a row behind another build's chunker, or an ordinal too wide to address.
+///
+/// No `ORDER BY`: nothing here is searched by position, and the answer is order-independent.
+pub fn chunk_digest(db: &Db, note_id: i64) -> Result<Option<String>, DbError> {
+    let mut statement =
+        db.0.prepare_cached("SELECT ordinal, chunker, source_hash FROM chunks WHERE note_id = ?1")?;
+    let mut rows = statement.query_map(params![note_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    // Folded as it reads, because the first row's digest is the only candidate: any row that disagrees with it
+    // decides `None`, so a caller never has to know how many rows disagreed.
+    let mut digest: Option<String> = None;
+    let mut current = true;
+    for row in &mut rows {
+        let (ordinal, chunker, source_hash) = row?;
+        let addressable = u32::try_from(ordinal).is_ok();
+        match &digest {
+            None => digest = Some(source_hash),
+            Some(first) => current &= first == &source_hash,
+        }
+        current &= addressable && chunker == CHUNKER_VERSION;
+    }
+    // An empty row set is `None` for the same reason [`chunk_state`] says: no rows is not "current".
+    Ok(if current { digest } else { None })
 }
 
 /// Store one vector for one chunk under one model, idempotently.

@@ -5496,6 +5496,18 @@ fn an_edit_near_the_top_keeps_every_chunk_row_and_the_vector_on_one() {
         after, before,
         "same ordinals, same `chunks.id`s — §5's re-embed-only-what-moved is a promise about row identity"
     );
+    // The premise this test was missing: id equality alone is also satisfied by a writer that keeps every row,
+    // changes nothing, and lets the note keep chunks cut from bytes it no longer holds. Production mutation killed
+    // here: forcing the UPDATE predicate in `write_chunks_for_note` to false — ids survive, content and stamp rot.
+    let digest = sha256_file(&ws.root.join("a.md")).expect("test: hash the edited note");
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM chunks WHERE source_hash <> '{digest}'")
+        ),
+        0,
+        "and the rows that survived were also rewritten: every chunk carries the edited note's digest"
+    );
     assert_eq!(
         scalar(&db, "SELECT COUNT(*) FROM embeddings"),
         1,
@@ -5511,16 +5523,23 @@ fn an_edit_near_the_top_keeps_every_chunk_row_and_the_vector_on_one() {
     );
 }
 
-/// Chunk rows are durable **with** the note rows: a scan whose catalog write fails after the commit has left
-/// the chunks behind too, because they were in the same transaction.
+/// Chunk rows are written **before** the catalog publish, so a scan that fails on the index still leaves its
+/// chunk work committed alongside the note row.
 ///
-/// Production mutation this pins: moving `write_chunks_for_note` after `tx.commit()` leaves the note row
-/// updated and its chunk rows describing the old bytes — a database that disagrees with itself, which is what
-/// §5 means by "must be atomic with the note rows". The write pass refusing to touch a path at all is pinned
-/// by [`a_refused_note_gets_no_chunk_work`].
+/// What this pins, precisely: the only failure it injects is the catalog write, which happens after `tx.commit()`,
+/// and its assertion is "the edited note's chunk rows carry the new digest". Any placement of the chunk writes
+/// before that publish satisfies it — **including** moving them after `tx.commit()`, which stays green. So this is
+/// an ordering test, not an atomicity test, and it is named for what it demonstrates.
+///
+/// The atomicity §5 asks for ("must be atomic with the note rows") holds **by construction**: one transaction
+/// handle for the write pass (`scan_inner`'s `unchecked_transaction`) and every chunk statement running on that
+/// same connection. No test asserts the rollback half, because no mid-transaction failure seam exists — `after_walk`
+/// runs before the transaction opens. Naming that gap rather than implying it is closed is the honest version of
+/// this comment; a claim of safety nothing exercises is the thing this project refuses elsewhere. The write pass
+/// refusing to touch a path at all is pinned by [`a_refused_note_gets_no_chunk_work`].
 #[cfg(unix)]
 #[test]
-fn chunk_rows_are_durable_with_the_note_rows_and_not_after_the_catalog() {
+fn chunk_rows_are_written_before_the_catalog_publish_that_can_fail() {
     use std::os::unix::fs::PermissionsExt;
 
     let ws = scratch(&[("a.md", &prose(2))], 50);
@@ -5566,6 +5585,60 @@ fn chunk_rows_are_durable_with_the_note_rows_and_not_after_the_catalog() {
     assert!(
         all_chunk_rows(&db) != before,
         "premise: the edit really did change those rows"
+    );
+}
+
+/// A note **emptied** on disk loses its chunk rows through the scan, and the vectors with them.
+///
+/// Round 3b-i pinned this inside `write_chunks_for_note` (the second count in the cheap path), but the composition
+/// was unpinned: `refresh_chunks` is free to decide "nothing to cut, nothing to do" and skip the write. Production
+/// mutation killed here — and by nothing else —: `if cut.is_empty() { return Ok(()); }` before the write leaves
+/// every test green while emptied notes keep rows and vectors forever.
+#[test]
+fn an_emptied_note_loses_its_chunk_rows_through_the_scan() {
+    let ws = scratch(&[("a.md", &prose(9))], 50);
+    scan(&ws.root, &ws.cfg).expect("first scan");
+    let db = ws.db();
+    assert!(
+        chunk_rows_for(&db, "a.md").len() > 1,
+        "test premise: the note spans several chunks"
+    );
+    db.0.execute(
+        "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+         VALUES ('m@1', 2, NULL, '', '', 1)",
+        [],
+    )
+    .expect("test setup: model row");
+    let first_id: i64 = texts(
+        &db,
+        "SELECT CAST(c.id AS TEXT) FROM chunks c JOIN notes n ON n.id = c.note_id
+          WHERE n.rel = 'a.md' ORDER BY c.ordinal LIMIT 1",
+    )
+    .first()
+    .and_then(|id| id.parse().ok())
+    .expect("test setup: ordinal 0 has a chunk id");
+    db.0.execute(
+        "INSERT INTO embeddings (chunk_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, 'm@1', 2, x'0000000000000000', 'whatever-the-chunk-said', 1)",
+        [first_id],
+    )
+    .expect("test setup: a vector for the first chunk");
+    drop(db);
+
+    // Blank lines only: `chunk` cuts nothing from this, which is the case the cheap path used to get wrong.
+    fs::write(ws.root.join("a.md"), "\n\n   \n\t\n").expect("test: empty the note");
+    scan(&ws.root, &ws.cfg).expect("scan of the emptied note");
+
+    let db = ws.db();
+    assert_eq!(
+        chunk_rows_for(&db, "a.md"),
+        Vec::<String>::new(),
+        "a note with nothing to cut holds no chunk rows"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM embeddings"),
+        0,
+        "and its vector went with the row by cascade rather than being orphaned"
     );
 }
 

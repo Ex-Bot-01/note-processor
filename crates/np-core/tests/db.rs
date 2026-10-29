@@ -18,9 +18,9 @@ use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_
 use np_core::chunk::Chunk;
 use np_core::config::Config;
 use np_core::db::{
-    apply_move, chunk_state, delete_vectors_for_chunk, mark_stale, note_counts, upsert_file,
-    upsert_vector, write_chunks_for_note, ChunkWrite, Db, DbError, Migration, NoteCounts,
-    FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
+    apply_move, chunk_digest, chunk_state, delete_vectors_for_chunk, mark_stale, note_counts,
+    upsert_file, upsert_vector, write_chunks_for_note, ChunkWrite, Db, DbError, Migration,
+    NoteCounts, FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
 };
 use np_core::hash::{sha256_file, Snapshot};
 use np_core::path_keys::RelPath;
@@ -1383,6 +1383,84 @@ fn chunk_state_has_no_single_answer_when_the_rows_disagree() {
     let (digest, texts) = chunk_state(&db, mixed).expect("state of a mixed note");
     assert_eq!(digest, None, "disagreeing rows state nothing");
     assert_eq!(texts.len(), 2, "both rows are still reported");
+}
+
+/// `chunk_digest` answers the scan's question — "do these rows describe this note's bytes?" — from stamps alone.
+///
+/// Killed by: dropping the `chunker` arm (a bump would leave stale rows labelled current and never re-cut), the
+/// disagreement arm, the empty-set arm, or the addressability check that `chunk_state` also applies.
+#[test]
+fn chunk_digest_reads_stamps_and_ignores_text() {
+    use np_core::chunk::CHUNKER_VERSION;
+
+    let db = Db::in_memory().expect("fresh database");
+    upsert_file(&db, &snap("a.md", "ha"), Path::new("/ws/a.md"), 1)
+        .expect("test setup: registry row");
+    let a = insert_note(&db, "a.md", "A");
+
+    // No rows is not "current": the same rule `chunk_state` states, because a scan must re-cut an uncut note.
+    assert_eq!(
+        chunk_digest(&db, a).expect("state of a note with no rows"),
+        None,
+        "a note that has never been cut has nothing to call current"
+    );
+
+    insert_chunk_stamped(&db, a, 0, CHUNKER_VERSION, b"zero", "d1");
+    insert_chunk_stamped(&db, a, 1, CHUNKER_VERSION, b"one", "d1");
+    assert_eq!(
+        chunk_digest(&db, a).expect("state of a current note"),
+        Some("d1".to_string()),
+        "rows that agree on the digest and carry this build's chunker are current"
+    );
+
+    // The cost decision, stated as a property: text is not consulted. Two chunks of different length under one
+    // stamp read current — which is sound only because every production writer stamps text and digest together
+    // (`write_chunks_for_note` writes both from the same call), and it is what keeps a warm scan off the BLOBs.
+    insert_chunk_stamped(
+        &db,
+        a,
+        2,
+        CHUNKER_VERSION,
+        b"a much longer piece of chunk text",
+        "d1",
+    );
+    assert_eq!(
+        chunk_digest(&db, a).expect("state after a longer row"),
+        Some("d1".to_string()),
+        "the stamps are the contract; reading text here is what this helper exists to avoid"
+    );
+
+    // A row behind another build's chunker decides `None` for the whole note, which is how a bump re-cuts it.
+    insert_chunk_stamped(&db, a, 3, CHUNKER_VERSION + 1, b"future", "d1");
+    assert_eq!(
+        chunk_digest(&db, a).expect("state with a future row"),
+        None,
+        "a row this build did not cut means the note is not current"
+    );
+    db.0.execute("DELETE FROM chunks WHERE ordinal = 3", [])
+        .expect("test setup: drop the future row");
+
+    insert_chunk_stamped(&db, a, 4, CHUNKER_VERSION, b"yesterday", "d0");
+    assert_eq!(
+        chunk_digest(&db, a).expect("state with a disagreeing row"),
+        None,
+        "rows that disagree describe no single set of bytes"
+    );
+    db.0.execute("DELETE FROM chunks WHERE ordinal = 4", [])
+        .expect("test setup: drop the stale row");
+
+    // An ordinal too wide to address is a hand-edited or future row; it reads as not-current rather than as a
+    // chunk the scan cannot reach — the same rule `chunk_state` applies.
+    db.0.execute(
+        "UPDATE chunks SET ordinal = 4294967296 WHERE ordinal = 1",
+        [],
+    )
+    .expect("test setup: widen an ordinal past u32");
+    assert_eq!(
+        chunk_digest(&db, a).expect("state with an unaddressable ordinal"),
+        None,
+        "a row the writer could not address is never current"
+    );
 }
 
 #[test]

@@ -378,7 +378,12 @@ pub struct ChunkTally {
     /// raises this and nothing else.
     pub consulted: usize,
     /// Notes actually handed to [`crate::chunk::chunk`], because no stored row carried their current
-    /// digest (or a row lagged behind [`crate::chunk::CHUNKER_VERSION`]). Zero is the warm-pass answer.
+    /// digest (or a row lagged behind [`crate::chunk::CHUNKER_VERSION`]).
+    ///
+    /// Zero on a warm pass **for a corpus of notes that hold text**. A note with nothing to cut has no rows to
+    /// carry a stamp, so `refresh_chunks` can never find it current and counts it every scan — one blank
+    /// note in a vault makes `cut == 0` false forever. Read this number as "notes re-cut", never as "the warm
+    /// path worked"; the warm-pass assertion belongs to [`ChunkTally::consulted`] plus unchanged row ids.
     pub cut: usize,
 }
 
@@ -573,6 +578,14 @@ fn scan_inner(
         // Without this line a workspace with one unreadable directory would re-parse its whole corpus on
         // every scan in silence, which looks exactly like the version never being written by accident.
         report_refresh_gap(&mut io::stderr(), written.uncovered + hidden);
+    }
+    if chunk_refresh && !record_chunk_version {
+        // The same silence is worse here than it is for parse rules. `report_refresh` above prints nothing when
+        // this scan re-parsed nothing, which is exactly the shape of a chunker-only bump: the version is withheld
+        // by an F18 refused name or an unmerged duplicate pair, and no line is written about it on any scan, so a
+        // coverage gap nobody is told about is indistinguishable from a corpus that was never cut. §5's case for
+        // recording anyway rests on that gap being bad; this line is what makes it visible.
+        report_chunk_gap(&mut io::stderr(), written.uncovered + hidden);
     }
 
     // The durable record of what this scan could not index, written **after** the commit it describes — the
@@ -1648,9 +1661,13 @@ fn store_note(
 
 /// Cut one note into chunks when its stored rows no longer describe its bytes.
 ///
-/// **The order is the whole point** (design-m2-embeddings §5): [`db::chunk_state`] is consulted **first**, and
+/// **The order is the whole point** (design-m2-embeddings §5): [`db::chunk_digest`] is consulted **first**, and
 /// only a note whose rows carry no single digest — none at all, a digest other than `note_digest`, or a row
-/// behind [`CHUNKER_VERSION`] — goes on to be cut. Nothing is re-read either: `text` is the string [`read_one`]
+/// behind [`CHUNKER_VERSION`] — goes on to be cut. The stamp read deliberately excludes `chunks.text`: reading
+/// the texts here would make a warm scan pull roughly the whole corpus out of SQLite and discard it, which is
+/// not §5's "one indexed lookup" and is invisible to a fixture whose notes are one chunk each.
+///
+/// Nothing is re-read either: `text` is the string [`read_one`]
 /// decoded once for the parser (leading BOM stripped, bytes UTF-8 cannot hold replaced), which is exactly the
 /// domain §4 defines the offsets over. Cutting first and asking afterwards would slice every unchanged note in
 /// the vault on every warm scan to arrive at rows that are already there — the failure mode §5 exists to
@@ -1661,7 +1678,7 @@ fn store_note(
 /// bytes, so one file digest still states exactly which decoded text these rows were cut from — and it is the
 /// only digest this call can compare without opening the file again.
 ///
-/// **A note with nothing to cut has no rows to stamp**, so [`db::chunk_state`] answers `None` for it forever
+/// **A note with nothing to cut has no rows to stamp**, so [`db::chunk_digest`] answers `None` for it forever
 /// and it pays one indexed lookup plus an empty cut on every scan. §5's warm-pass property is about the notes
 /// that have rows; a blank note cuts nothing, writes nothing, and stays cheap in the way that matters.
 fn refresh_chunks(
@@ -1672,9 +1689,10 @@ fn refresh_chunks(
     chunks: &mut ChunkTally,
 ) -> Result<(), DbError> {
     chunks.consulted += 1;
-    // The texts are read for the embed round, which compares them chunk by chunk. Here only the digest arm
-    // decides, and `None` means "these rows describe no single set of bytes" — never "this note has none".
-    let (stamped, _) = db::chunk_state(db, note_id)?;
+    // Stamps only, never texts: see this function's doc for the cost that decides. `None` means "these rows
+    // describe no single set of bytes" — never "this note has none", which is why an emptied note still reaches
+    // the write below and loses its rows.
+    let stamped = db::chunk_digest(db, note_id)?;
     if stamped.as_deref() == Some(note_digest) {
         return Ok(());
     }
@@ -2128,6 +2146,18 @@ fn report_refresh(out: &mut dyn io::Write, stored: Option<u32>, notes: usize) {
 /// stderr for the same reason as [`report_refresh`]: stdout stays machine-readable JSON. `missed` counts
 /// both ways a note escapes — skipped during the write pass and hidden behind an unreadable directory or
 /// a refused name — and the write result is dropped for the reason spelled out on [`report_refresh`].
+fn report_chunk_gap(out: &mut dyn io::Write, missed: usize) {
+    if missed == 0 {
+        return;
+    }
+    // Worded as its own fact rather than reusing the parse line: a reader who sees "parse rules" and has just
+    // bumped a chunker would look in the wrong place, and the two gaps can disagree about which notes they name.
+    let _ = writeln!(
+        out,
+        "note-processor: chunker v{CHUNKER_VERSION} not recorded — {missed} note(s) were not cut this scan; the next scan will retry"
+    );
+}
+
 fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
     if missed == 0 {
         return;
