@@ -322,10 +322,10 @@ answer to compare against.
 **Benchmark order: `embeddinggemma-2` text tower first**, then the OpenAI-compatible endpoint candidate, then MiniLM
 only if both stall. §6's one-evening arithmetic decides, not preference.
 
-**Endpoint candidate:** the same self-hosted OpenAI-compatible server this project is developed against, serving the
-Qwen3.8-Flash-Next model. Whether it exposes `/v1/embeddings` at all is a **measured question**, asked first: if it
-serves only completions, that candidate is reported as unavailable rather than approximated by embedding through a chat
-endpoint, which would silently produce vectors whose meaning nobody verified.
+**Endpoint candidate (superseded 2026-10-29, see §10):** the same self-hosted OpenAI-compatible server this project is
+developed against, serving the Qwen3.8-Flash-Next model, *if* it exposed `/v1/embeddings`. It does not. The measured
+answer came back "no", so this candidate is recorded as unavailable rather than approximated — which is exactly what
+this paragraph asked for, and it is why §10 replaced the transport round instead of implementing it.
 
 **Secret handling — a hard rule, not a preference.** The base URL and key never enter the repository in any form: not in
 `config.toml` examples, not in fixtures, not in a benchmark report, not in a test failure message, not in a commit
@@ -339,3 +339,42 @@ Consequences that are part of the design rather than tidiness:
   CI logs on the first flake, so the provider's error type carries the endpoint only as an opaque label.
 - Nothing in CI authenticates to it. Per §7, real-endpoint work is gated on the runtime variable being present, which CI
   never sets — so a leaked key cannot be exercised by a public-facing job either.
+
+## 10. The decision that removed the transport round (2026-10-29)
+
+Asked directly, the human answered: **the self-hosted server does not expose `/v1/embeddings`**, and it was never meant
+to carry this. The architecture is:
+
+- **Embedding is local, always.** EmbeddingGemma-2 runs inside/behind the application and produces every vector for
+  every file. This is the heavy lifting, and it happens with no network at all.
+- **The LLM API is used only to answer a question** — "chat with my notes" — and that is *phase 2*, against the same
+  self-hosted server. It is optional in the sense that indexing must work completely without it.
+- **Network appears once: setup**, to obtain the model artifact. After `np models install`, a laptop on a train
+  indexes and searches.
+
+Consequences, stated so nobody re-litigates them in code:
+
+1. **There is no embedding HTTP transport.** The round planned as "transport + benchmark" becomes "local inference +
+   benchmark" (`docs/design-m2-local-embeddings.md`). `NP_EMBED_BASE_URL` / `NP_EMBED_API_KEY` are not read by anything,
+   because nothing dials out; §9's secret rules stay written because they still describe the phase-2 chat client.
+2. **`install` stays local-file-only.** This is now a consequence of the architecture rather than a preference: the
+   download is a human action with a human credential, and `np models install <ws> --path … --sha256 …` verifies what
+   that human obtained. A URL argument would make `np` a downloader with an unbounded trust model for 300 MB of weights.
+3. **`embeddings.provider = "openai-compatible"` names nothing implementable.** It parses today and no code path can
+   satisfy it. Whether to delete the variant or keep it as a forward-compatible spelling is a decision for the local
+   inference design (§2 there), not something to leave silently misleading.
+4. **The benchmark's question changed shape.** Not "which endpoint answers faster" but "can this machine run this model
+   at all, at what resident cost, and how long does 18k chunks take" — with the same ≥2-runs-and-report-the-spread rule.
+
+**Measured facts behind it**, from Hugging Face's public API on 2026-10-29 (no credentials used):
+`google/embeddinggemma-2` is **not gated** and ships `model.safetensors` at 1488.9 MB (bf16, multimodal wrapper: it
+carries vision and audio towers this project will not use); `ggml-org/embeddinggemma-2-GGUF` ships text-only
+`embeddinggemma-2-Q8_0.gguf` at **309.9 MB** and BF16 at 558.0 MB; `onnx-community/embeddinggemma-2-ONNX` exists too.
+The repo's `config.json` says what the vectors must be: text tower `hidden_size = 512`, 24 layers, 4 heads / 2 KV,
+`head_dim = 256`, `intermediate_size = 2048`, `sliding_window = 512`, vocab 262,144; pooling **mean** with
+`include_prompt: true`, output `last_hidden_state`, then an L2-normalize module, and `embedding_dimension = 768`. So the
+row in `embeddings` is 768 `f32` components — 3072 bytes — for any chunk that made it through the model.
+
+**This host, measured the same day:** 16 cores, 8.9 GB free disk, ~2 GB of the 7 GB total currently available, and
+network to `huggingface.co`, `index.crates.io` and `static.crates.io`. The Q8_0 artifact fits that memory envelope; the
+1.5 GB safetensors probably does not while other work is running, which is a benchmark measurement and not an assumption.

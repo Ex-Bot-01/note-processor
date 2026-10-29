@@ -113,3 +113,11 @@ what fails is not a check, because removal makes tests pass.
 - **F25** (over-wide token renders a physical line holding only `-`) is filed and unadjudicated.
 - **Owed measurements:** A4's A/B/A benchmark and whole-branch review were skipped on instruction at merge time;
   `typeof(vector)` is probed (`a_string_bind_is_refused_from_embeddings_vector`). Still open: the "chunks owed but unembedded" count in the scan report, and backlog D1–D10 from the M2a whole-branch review.
+
+- **Answered by the human (2026-10-29): embeddings are local.** The self-hosted server does not serve
+  `/v1/embeddings`; EmbeddingGemma-2 runs locally and does all embedding, the LLM API is used only to answer chat
+  questions (phase 2), and network appears only at setup to download the artifact. `install` therefore stays
+  local-file-only and no HTTP embedding transport will be written. Design: `docs/design-m2-local-embeddings.md`.
+- **Before the first embed run, two backlog decisions:** D2 (is frontmatter part of the embedded text; do citations
+  index the file or the body) and D5 (does the embed round delete stale vectors or compare-and-skip). Both are cheap
+  now and expensive after 18k vectors exist.
