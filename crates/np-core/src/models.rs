@@ -397,13 +397,21 @@ pub fn install(
     // Step 2, now that the arguments are known good: an empty file is a truncated download, and the digest of
     // nothing is a real digest that would only report "mismatch" against whatever the human expected.
     let open_source = walk::to_open_path(&access(&request.source));
-    let size = fs::metadata(&open_source)
-        .map_err(|source| ModelError::Source {
+    let meta = fs::metadata(&open_source).map_err(|source| ModelError::Source {
+        path: request.source.clone(),
+        source,
+    })?;
+    // A directory is not a truncated download, and the two platforms disagree about what reading one even
+    // means — `Metadata::len()` reports 0 for a directory on Windows, so a length-only test would answer "a
+    // zero-length artifact" there while Linux reached for a hash and failed at open. Name the kind instead:
+    // both spellings of "that is not a file" arrive as the same read refusal on every OS.
+    if !meta.is_file() {
+        return Err(ModelError::Source {
             path: request.source.clone(),
-            source,
-        })?
-        .len();
-    if size == 0 {
+            source: io::Error::new(io::ErrorKind::NotADirectory, "not a regular file"),
+        });
+    }
+    if meta.len() == 0 {
         return Err(ModelError::EmptySource {
             path: request.source.clone(),
         });
