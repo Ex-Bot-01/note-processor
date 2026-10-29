@@ -407,11 +407,8 @@ fn skipped(report: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// The note one case makes unreadable. Any corpus note will do; this one holds a heading, so it certainly
-/// owns derived rows that a refresh owes.
-#[cfg(unix)]
-#[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
 /// Write the chunker version this workspace recorded, the way an older build would have left it.
+#[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
 fn record_chunk_version(ws: &Workspace, version: i64) {
     let cfg = Config {
         data_dir: ws.data_dir(),
@@ -427,8 +424,8 @@ fn record_chunk_version(ws: &Workspace, version: i64) {
     .expect("test setup: record the chunker version");
 }
 
-#[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
 /// The recorded chunker version, or `None` when the workspace never recorded one.
+#[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
 fn recorded_chunk_version(ws: &Workspace) -> Option<i64> {
     let cfg = Config {
         data_dir: ws.data_dir(),
@@ -444,6 +441,9 @@ fn recorded_chunk_version(ws: &Workspace) -> Option<i64> {
     .and_then(|value| value.trim().parse().ok())
 }
 
+/// The note one case makes unreadable. Any corpus note will do; this one holds a heading, so it certainly
+/// owns derived rows that a refresh owes.
+#[cfg(unix)]
 const BLOCKED_NOTE: &str = "sprint-review.md";
 
 /// Strip every permission bit from `path` and put whatever it had back on the way out, so a failing
