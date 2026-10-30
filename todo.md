@@ -166,7 +166,7 @@ what fails is not a check, because removal makes tests pass.
   encoder path (`src/llama-context.cpp:1845-1847`; measured: `llama_get_memory(ctx)` is `(nil)`) and *that* asserts `n_ubatch >= n_tokens`
   (`src/llama-context.cpp:1631`, not the decoder's `:1918`/`:1920`, which never run here). `GGML_ASSERT` → `GGML_ABORT` survives `NDEBUG`.
   At llama.cpp's default `n_ubatch = 512` a
-  **600-token sequence killed the process (exit 134)** — reachable from an ordinary ~1,800-byte note, since `max_tokens` accepts up to
+  **600-token sequence killed the process (exit 134)** — reachable from an ordinary ~1,800-byte note, since `max_tokens` then accepted up to
   8,192. `load` now sets `n_ctx = n_batch = n_ubatch = 4096`, and a 633-token decode returns rc=0 with ‖v‖ = 1.0 instead.
   **Three numbers, none of them asserted** — only throughput is printed by a test (`decode_throughput_is_printed_not_asserted`); size comes
   from `cargo build --release` plus `nm`, and the RSS curve from `crates/np-core/tests/probes/decode_probe.c`: ~**130 tok/s** (543 tok in

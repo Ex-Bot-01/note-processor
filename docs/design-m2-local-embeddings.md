@@ -45,17 +45,24 @@ is that derived data must be *provably* derived from the bytes.
 Feature-gating (`np-core/local-model`) keeps default `cargo test --workspace` free of a C++ build, which protects every
 gate in the standing list. A feature nothing compiles rots, and what rots silently is specific: clippy lints inside
 `cfg(feature)`, rustdoc warnings in gated docs, and artifact-gated tests whose early return is indistinguishable from a
-pass forever. **None of the four steps below exists yet** — `.github/workflows/ci.yml` has no `--features local-model` row
-at all (verified: `grep -n "features" .github/workflows/ci.yml` → no match), so this paragraph is a promise with an owner
-now rather than a description: **R6b0 adds it**, per §6 of the parent design ("**One CI step per OS row** runs
-`cargo check --locked -p np-core --features local-model`"):
+pass forever.
 
-1. `cargo check --locked -p np-core --features local-model` — **on both ubuntu and windows rows**, compile-only;
+**Status, 2026-10-30.** R6b0 shipped steps 1–4 as the `feature-local-model` job — `ci.yml:84`, `:86`, `:95`, `:117` — on
+**`ubuntu-latest` only**. The Windows row this paragraph promised ("one CI step per OS row") is **still owed**, and
+deliberately so: `build.rs` refuses to build the feature off Linux (§14), so a Windows step today would record a written refusal
+rather than a compile. What used to be true here — "`.github/workflows/ci.yml` has no `--features local-model` row at all" — is
+history now, kept because §9's round table points at it (Scope B review P1-1 caught this paragraph still asserting it in the
+present tense, four lines above the job that disproves it).
+
+1. `cargo check --locked -p np-core --features local-model` — compile-only, **ubuntu today** (the Windows row is the owed half
+   named above);
 2. `cargo clippy --locked -p np-core --features local-model --all-targets -- -D warnings`;
 3. `RUSTDOCFLAGS="--deny warnings" cargo doc --locked -p np-core --features local-model --no-deps`;
 4. `cargo test --locked -p np-core --features local-model` where anything needing a real artifact prints a named
    `NOT COVERAGE: <test> — no artifact` line and returns (the F18 precedent), and the job greps that line into its log so
-   "compiled, never ran" is written on the record instead of implied.
+   "compiled, never ran" is written on the record instead of implied. **The first version of that step did not achieve it**
+   (Scope B review P1-3): libtest captures a passing test's stdout and discards it, so measured under the exact CI command with no
+   artifact the count was **0**, and 12 only with `-- --nocapture`. The step now passes `-- --nocapture` and prints the count.
 
 **Release builds keep the feature OFF** until R6d lands and a Windows build of it has been recorded once in CI. Shipping
 release binaries whose heavy path was compiled on one OS only would be F18's mistake with a different noun.
@@ -141,6 +148,9 @@ worth keeping in plain sight, because it is why the number was ever contested:
   of the two numbers you read.)
   **Annotated by R6b1 (2026-10-30), because this sentence is stale and I would rather mark it than let the next round re-derive
   it:** the tightening already landed — `crates/np-core/src/config.rs` declares `MAX_EMBEDDING_TOKENS: usize = 8_192`, which is
+  *(annotated again the same day by decision B: that line now reads `4_096`, and the number stopped being a card fact at all — it is
+  the width of the context we build, paired with `REQUESTED_CTX` by a compile-time assert. Read the sentence above as R6b1 wrote it,
+  not as the current state: Scope B review P1-2 found this exact line convincing a merge reviewer that decision B had not landed.)*
   §9's pre-round row, not R6b2's. What R6b2 still owes is the enforcement test over prefix + text + specials, not the constant.
   The R6b1 brief repeated this document's 32 768-era framing as "conflicts with `MAX_EMBEDDING_TOKENS = 8_192`"; the code half of
   that was already true and the prose half was not.
@@ -165,13 +175,14 @@ then a normalise module — and the GGUF declares `gemma-embedding2.pooling_type
 over real tokens, not padding; that is what an attention mask is for, and it is invisible until recall is bad, which is
 why §7 tests batch invariance rather than trusting it.
 
-**Token budget.** `max_position_embeddings = 262144` is not a licence to embed a 200k-token file. (Reasoning, not
-measurement: nothing here reads a trained window; the model card would be the citation and R6d should record one.) The
-posture stays refuse-loudly:
+**Token budget.** `max_position_embeddings = 262144` is not a licence to embed a 200k-token file. (That framing is draft-v2
+reasoning: the parenthetical here used to say "nothing here reads a trained window", and it does now — `ModelFacts::n_ctx_train`,
+measured in the table below. Scope B review P2-4 flagged the old and new claims sitting four lines apart.) The posture stays
+refuse-loudly:
 
 - `embeddings.max_tokens` (**default 1,024** since §5's decision B; 2,048 when R6a added it, together with its default-when-absent; note `EmbeddingsConfig`
-  is `#[serde(deny_unknown_fields)]`, so today writing that key is refused naming key and file — that is the round that
-  changes it) applies to **what the model actually sees**: `prefix_doc` + chunk text + special tokens, since
+  is `#[serde(deny_unknown_fields)]`, so before R6a writing that key was refused naming key and file, and R6a is the round that
+  changed it — past tense now, because "today" outlived its round: Scope B review P2-3) applies to **what the model actually sees**: `prefix_doc` + chunk text + special tokens, since
   `include_prompt = true` means the counted sequence is not just our bytes.
 - An over-budget chunk is a **reported** condition, never a silent truncation: truncation stamps
   `source_hash = <the whole chunk's digest>` on a vector that read a prefix — a row claiming currency for bytes it never
@@ -199,7 +210,7 @@ loading it through llama.cpp v0.8.0 — agree. Artifact: `/home/agent/models/emb
 | `general.architecture` | `gemma-embedding2` | the reason v0.8.0 is the pin; the tree really does resolve it — the load succeeds |
 | `gemma-embedding2.embedding_length` | 512 | internal width, and what `llama_model_n_embd_inp` answers. **Not** the stored width |
 | `gemma-embedding2.embedding_length_out` | **768** | what `llama_model_n_embd_out` answers, and therefore what a declared width is compared against (§6's refusal) |
-| `gemma-embedding2.context_length` | **262,144** | `llama_model_n_ctx_train`. The open question below — it is *not* our ceiling |
+| `gemma-embedding2.context_length` | **262,144** | `llama_model_n_ctx_train`. Was an open question; closed by decision B below — it is *not* our ceiling |
 | `gemma-embedding2.pooling_type` | 1 (MEAN) | the context resolves `UNSPECIFIED` to this, so we read it and never override it; a context answering `NONE` is refused as "cannot produce a sentence vector" |
 | `gemma-embedding2.attention.causal` | `false` (BOOL) | bidirectional, as an embedding model needs |
 | `tokenizer.ggml.model` | `gemma4` | v0.8.0 knows the pre-tokenizer type; R6b2 gets tokens out of this vocabulary |
@@ -234,7 +245,10 @@ Three things follow, and they are separate decisions:
    default 512 a 600-token sequence exits 134 rather than returning anything. (An earlier draft of this subsection blamed the decoder's
    asserts at `:1918`/`:1920`, which never run here — R6b2 review P1-1.) So today the honest ceiling is the window, and `embed_text` refuses
    between the two numbers — `TokenBudgetExceeded` over `embeddings.max_tokens`, "the sequence is longer than this context can hold"
-   above the window. Raising `MAX_EMBEDDING_TOKENS` toward 262,144 would mean raising `REQUESTED_CTX` too, and §14's curve says what
+   above the window. **Since decision B that band is empty for a validated config**, because both numbers are 4,096. The window refusal
+   still earns its place twice over: an artifact trained narrower than `REQUESTED_CTX` makes `window()` the smaller bound, and a direct
+   `embed_text` caller may pass any budget it likes — which is how `tests/local_embed.rs` reaches this arm. R6c should not design a report
+   state for a config-reachable case (Scope B review P2-6). Raising `MAX_EMBEDDING_TOKENS` toward 262,144 would mean raising `REQUESTED_CTX` too, and §14's curve says what
    that costs: **+458 MiB** of peak RSS at 4,085 tokens, growing from there.
 2. **Cost rises with length, and it is slow enough to matter.** Measured points: **543 tokens in 3.85 s (141 tok/s)** and **2,163 tokens in
    18.0 s (120 tok/s)**. Everything beyond them is **extrapolation on a falling rate**, not measurement — including the headline that
@@ -340,7 +354,9 @@ the quantisation gap measured in check 3.
 
 Testing otherwise stays as before: fake-provider tests for determinism, ordering, budget refusal, dim mismatch, resume,
 and "unchanged chunk → provider called zero times" run everywhere; the feature-gated runtime gets §2's four-step CI job
-with no artifact and no network; real-model work is gated on a runtime env var with a clean early return (`NP_MODELS_DIR`),
+with no artifact and no network; real-model work is gated on a runtime env var with a clean early return (**`NP_TEST_MODEL_PATH`**,
+the name the tests and `ci.yml:104` actually read — this section said `NP_MODELS_DIR`, which nothing reads, so a human exporting the
+named variable would have bought a green run and no coverage: Scope B review P2-10),
 **never `#[ignore]`**. No credentials anywhere: `ggml-org/embeddinggemma-2-GGUF` is ungated, so setup is one file
 downloaded by a human and installed by path.
 
@@ -421,8 +437,8 @@ locked decisions that the human reversed, which is their right and this document
 amendments, and §5 names exactly which documents still hold the old numbers as history.
 
 What remains genuinely open for review or measurement, not for preference: whether a pooled multimodal embedding works at all
-(§5, R7c), what an mmap-first load actually reads from disk (R6d, decides §12's digest cost), and whether 8,192 belongs beside
-the provider rather than in a global constant (§5's own note on the MiniLM fallback).
+(§5, R7c), what an mmap-first load actually reads from disk (R6d, decides §12's digest cost), and whether the token ceiling — 4,096
+since decision B — belongs beside the provider rather than in a global constant (§5's own note on the MiniLM fallback).
 
 **For review (folded into §2/§5/§7 above):** whether the `openai-compatible` spelling should be deleted or kept-parseable-
 and-refused — resolved here in favour of **keeping it parseable and refusing at `Config::load`**, because deletion alone

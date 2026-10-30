@@ -162,7 +162,8 @@ pub enum EmbeddingProvider {
     #[default]
     None,
     /// A model running inside this process (`local-model`): [`crate::embed::LocalModelProvider`] is the type it
-    /// will resolve to, owning the API and refusing until R6b1 builds the runtime. **Nothing instantiates it from
+    /// will resolve to, owning the API. The runtime exists now — `local_model` opens a GGUF and embeds through it — but
+    /// **nothing instantiates this provider from
     /// this value yet** — the only code that reads the variant is [`Config::load`]'s own validation; the wiring
     /// arrives with R6c. What loading one costs is §6's benchmark's question.
     ///

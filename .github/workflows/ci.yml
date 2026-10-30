@@ -108,13 +108,25 @@ jobs:
       # "every refusal" was false: every `Unavailable` arm and the width refusal need an artifact.
       #
       # `--test local_embed` is R6b2's forward pass, and on GitHub it is **compilation plus twelve printed
-      # `NOT COVERAGE` lines and nothing else** - every case there asks a model for a vector. What runs locally
+      # `NOT COVERAGE` lines and nothing else** - every case there asks a model for a vector (four of
+      # local_load's seven, the same way). What runs locally
       # with the artifact (and is the actual deliverable) is the unit-length and determinism checks, the cosine
       # ordering, the token-budget and window refusals, the 600-token no-abort regression, and the throughput
       # figures. Listing it here still earns its place: a test file that does not compile against the pinned
       # header is caught on the row, which is where a re-pin first shows up.
       - name: Link proof
-        run: cargo test --locked -p np-core --features local-model --lib --test local_runtime --test local_load --test local_embed
+        # `--nocapture` is load-bearing, not cosmetics (Scope B review P1-3). libtest captures a passing test's stdout
+        # and throws it away, so the twelve `NOT COVERAGE` lines this job exists to print never reached the log: measured
+        # under the previous command with no artifact the count was **0**, and 12 only with the flag. The count is then
+        # echoed so "compiled, never ran" is written on the record (§2 step 4) rather than implied - and the test exit
+        # code, not the grep, is what fails the job.
+        run: |
+          set -uo pipefail
+          cargo test --locked -p np-core --features local-model --lib --test local_runtime \
+            --test local_load --test local_embed -- --nocapture 2>&1 | tee /tmp/feature-tests.log
+          status=${PIPESTATUS[0]}
+          echo "NOT COVERAGE occurrences: $(grep -c 'NOT COVERAGE' /tmp/feature-tests.log || true)"
+          exit "${status}"
       # "A green run means llama.cpp was called" is only worth saying if the run can also say *which* llama.cpp.
       # `-l static=llama` is not an exclusive search path, so two cheap probes back it up: no shared llama in the
       # test binary, and `llama_version` defined in it (i.e. it came from an archive we built, not from a

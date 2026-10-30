@@ -45,7 +45,13 @@ match is refused before a byte is copied; an artifact that disagrees with its ow
 ```sh
 cargo build --workspace
 cargo test --workspace
-```
 
-Linux and Windows are both tested on every push in CI. Release binaries are built for Linux, Windows and macOS; the
+Default builds contain no C++ and no inference runtime. The `local-model` feature on `np-core` (and a matching passthrough
+on `np-cli`) builds llama.cpp from the sha256-pinned source under `third_party/`, is **Linux-only by refusal** in `build.rs`,
+and is off in releases; it needs `cmake` (set `CMAKE=/path/to/cmake`) and nothing else new. Nothing embeds yet: no command
+writes a vector, which is what the next round is for.```
+
+CI is **configured** to build and test on Linux and Windows on every push. Read that as configuration rather than
+evidence: no job has started since 2026-10-29 (an account-side Actions problem), so today every measured claim in this
+repo comes from one Linux host, and anything else is a written refusal rather than a tested platform. Release binaries are built for Linux, Windows and macOS; the
 macOS artefact is compiled, not run, so treat its behaviour as unverified until someone runs it.

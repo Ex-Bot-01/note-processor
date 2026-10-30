@@ -116,7 +116,6 @@ mod embedding {
         v.components().to_vec()
     }
 
-    /// `n` copies of [`UNIT`], for inputs measured in tokens rather than bytes.
     /// The token count of `text`, **including** when it exceeds `count_tokens`' own ceiling — where the refusal's
     /// payload is exactly the number the caller wanted. Bytes-per-token has never been load-bearing in this file, and
     /// an over-window input is the one place a test cannot get its count from `Ok`.
@@ -133,8 +132,50 @@ mod embedding {
         }
     }
 
+    /// `n` copies of [`UNIT`], for inputs measured in tokens rather than bytes.
     fn text_of_about(n_copies: usize) -> String {
         UNIT.repeat(n_copies)
+    }
+
+    /// Drop the last `k` space-separated words from `text`, or `None` when there are not that many to drop.
+    fn drop_words(text: &str, k: usize) -> Option<String> {
+        let mut parts: Vec<&str> = text.split(' ').collect();
+        if parts.len() <= k + 1 {
+            return None;
+        }
+        parts.truncate(parts.len() - k);
+        Some(parts.join(" "))
+    }
+
+    /// Grow `note`, then trim it word by word, until its token count sits on or just above `target` — with the
+    /// model's own count as the oracle and **never** a bytes-per-token estimate. Returns the text and the count that
+    /// was actually measured, because "just above" is not always reachable: one word can be worth several tokens, so
+    /// the caller gets the number rather than the promise. Used where a test needs to be over a line by *one*, which is
+    /// the only way to show a refusal fires at the boundary instead of somewhere above it.
+    fn note_at_least_tokens(model: &LoadedModel, target: usize) -> (String, usize) {
+        let mut note = text_of_about(target / 9);
+        let mut n = count_even_over_ceiling(model, &note);
+        while n < target {
+            note.push_str(UNIT);
+            n = count_even_over_ceiling(model, &note);
+        }
+        // Trim by dropping words from the end, halving the step whenever a cut would cross below the line. The naive
+        // one-word-at-a-time loop spends ~450 tokenizations of a 40 KB string closing a ~450-token gap — measured at
+        // +55 s on this file — for nothing this test needs; halving converges in a couple of dozen counts.
+        let mut step = n - target;
+        while n > target && step > 0 {
+            let Some(trimmed) = drop_words(&note, step) else {
+                break;
+            };
+            let m = count_even_over_ceiling(model, &trimmed);
+            if m >= target {
+                note = trimmed;
+                n = m;
+            } else {
+                step /= 2;
+            }
+        }
+        (note, n)
     }
 
     /// The shape of a real vector: 768 finite components at unit length.
@@ -311,6 +352,15 @@ mod embedding {
             .embed_text("", sentence, 12)
             .expect("23 bytes and 9 tokens fits a budget of 12 — bytes would have refused it");
 
+        // **Boundary equality.** §5 promises refusal only *over* budget, so a chunk measuring exactly its budget must
+        // embed. Every other call in this file sits strictly above or strictly below its own count, and Scope B review
+        // P2-12 showed what that costs: changing `>` to `>=` at **both** budget sites left all twelve cases here and the
+        // whole default suite green (measured, not predicted). This call is the pair that kills it — refused at 8 below,
+        // accepted at 9 here.
+        model
+            .embed_text("", sentence, 9)
+            .expect("a chunk exactly at its own count is not over budget");
+
         // And the refusal reports the number that actually broke the rule. `tokens: 9` rather than `23` is the
         // assertion that this is a token budget with a byte-length implementation or not.
         let problem = model
@@ -356,9 +406,14 @@ mod embedding {
     /// Above the **window** (not the budget) is a typed refusal, and it fires before `llama_decode` sees the
     /// sequence.
     ///
-    /// Honest limit of this case: if the window arithmetic regressed so the check let the sequence through, the
-    /// runtime would abort the whole test binary rather than fail this assertion — a crash is visible, but it is
-    /// not this test passing. What it does prove is that the refusal exists, fires at the right threshold, and
+    /// Two honest limits. First: if the window arithmetic regressed so the check let the sequence through, the runtime
+    /// would abort the whole test binary rather than fail this assertion — a crash is visible, but it is not this test
+    /// passing. Second, and narrower (Scope B review P2-12): nothing asserts that **exactly** `window` tokens is
+    /// *accepted*. The refusal side is pinned to one token above; the accepting side at the boundary would cost a
+    /// ~40-second decode of a synthetic 4,096-token note on every run of this file, so it is left to R6d's benchmark,
+    /// which decodes at those lengths anyway. A `>=` mutant on the window arm therefore survives today — and since the
+    /// ceiling now equals the window, it would refuse a chunk no chunker produces (`MAX_CHUNK_BYTES = 1800` is roughly
+    /// 500 tokens), which is why this is recorded rather than paid for. What it does prove is that the refusal exists, fires at the right threshold, and
     /// names the window rather than the budget.
     #[test]
     fn over_the_window_is_refused_before_the_runtime_decides() {
@@ -380,6 +435,30 @@ mod embedding {
         // below, because then this case would quietly exercise the budget arm instead of the window arm — that guard
         // sits **after** the loop, where a failure is possible (R6b2 review P2-2 caught it living inside).
         let budget = window + 4_096;
+
+        // **The threshold itself, approached from above.** The coarse case below uses ~5,400 tokens, which a mutant that
+        // refuses only at *twice* the window would also satisfy — so it proves an arm exists, not where the arm sits. One
+        // token past the window is the cheapest thing that pins the boundary, and the boundary is the arm's whole purpose:
+        // `n_ubatch >= n_tokens` aborts one token above it (`src/llama-context.cpp:1631`). No decode happens here, so this
+        // costs tokenization alone.
+        let (tight, tight_tokens) = note_at_least_tokens(&model, window + 1);
+        assert!(
+            tight_tokens > window,
+            "the helper returned {tight_tokens} tokens for a target of {} tokens, so it never crossed the window of {}",
+            window + 1,
+            window
+        );
+        match model.embed_text("", &tight, budget) {
+            Err(EmbedError::Unavailable(label)) => assert_eq!(
+                label,
+                "the sequence is longer than this context can hold",
+                "one token over the window must be refused by the window arm"
+            ),
+            Ok(_) => panic!("{tight_tokens} tokens over a window of {window} decoded: the refusal sits above its own boundary"),
+            Err(other) => panic!("expected the window refusal, got {other:?}"),
+        }
+        println!("REFUSE: {tight_tokens} tokens is just over a window of {window}");
+
         let mut note = text_of_about(300);
         let mut tokens = count_even_over_ceiling(&model, &note);
         while tokens <= window {

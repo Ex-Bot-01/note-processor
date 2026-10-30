@@ -133,7 +133,7 @@ mod loading {
         );
         assert_eq!(
             facts.n_ctx_train, 262_144,
-            "`gemma-embedding2.context_length` is 262 144 — above `MAX_EMBEDDING_TOKENS`, which §5 keeps open"
+            "`gemma-embedding2.context_length` is 262 144 — above `MAX_EMBEDDING_TOKENS`, whose gap §5 closed as decision B"
         );
         assert!(
             facts.n_vocab == 262_144,

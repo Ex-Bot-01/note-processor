@@ -19,7 +19,8 @@
 //! - [`EmbedError`] — one variant per thing that can go wrong, each saying one true thing. Notably
 //!   `Unavailable`'s payload is an opaque label rather than an endpoint, because this text ends up in
 //!   test-failure output and CI logs (§9).
-//! - [`LocalModelProvider`] — the type `local-model` resolves to **without the feature**: a [`ModelRow`], an
+//! - [`LocalModelProvider`] — the type `local-model` resolves to, **feature or no feature**: the cargo feature builds a
+//!   runtime, it does not change this provider's refusal, which stays unconditional until R6c wires storage. A [`ModelRow`], an
 //!   artifact that exists, the row's document prefix, and a refusal where the forward pass goes. Nothing
 //!   constructs it from a config yet; R6c wires `[embeddings]` to a provider (§9's split), so today it is
 //!   reachable API only.

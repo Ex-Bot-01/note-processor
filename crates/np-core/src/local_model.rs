@@ -309,8 +309,10 @@ impl LoadedModel {
         if n > budget {
             return Err(EmbedError::TokenBudgetExceeded { tokens: n, budget });
         }
-        // Then the window. Between the two sits the case `embeddings.max_tokens` above 4,096 creates: legal by
-        // config, impossible for this context, and worth a sentence of its own rather than an assert.
+        // Then the window. Since §5's decision B the configured budget and this window are the same number, so no
+        // validated config lands between the two refusals (Scope B review P2-6). The check still earns its place twice:
+        // an artifact trained narrower than `REQUESTED_CTX` makes `window()` the smaller bound, and a direct caller may
+        // pass any budget it likes — which is exactly how `tests/local_embed.rs` exercises this arm.
         if n > self.window {
             return Err(EmbedError::Unavailable(
                 "the sequence is longer than this context can hold".to_string(),
