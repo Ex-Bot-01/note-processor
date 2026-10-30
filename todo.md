@@ -127,8 +127,10 @@ what fails is not a check, because removal makes tests pass.
   `design-m2-local-embeddings.md` §6: only with their chunk row) and **D3 (a stale note's chunks must never read as
   current, which bites the moment `np embed` becomes the first production reader of `chunk_state`/`chunk_digest`)**. All
   three are cheap now and expensive after 18k vectors exist.
-- **Gates on R6b0** (the local-inference round): width and provenance are settled (native 768; `np` fetches it — see the locked
-  block above), so what remains is one check and one constraint: the pinned Rust binding's vendored llama.cpp revision must know
-  `gemma-embedding2` (grep the vendored source, never trust a changelog), and R6b2's cross-quantisation check needs free RAM it may
-  have to wait for. Assigned in R6b0 too: the four-step `--features local-model` CI job that design §2 promises and ci.yml does not
-  yet run.
+- **Direction set 2026-10-29: steer toward Prototype 1** (`docs/roadmap-2026-10-27.md` §3C) — `scan → fetch → embed → search`, CLI-only, on the
+  real corpus. Rounds that don't put a queryable vector in front of the human sooner wait, and whatever waits gets named out loud.
+
+- **R6b0's gate is answered, and it failed**: the pinned binding (`llama-cpp-sys-2` 0.1.160, newest published) vendors a llama.cpp that knows
+  `LLM_ARCH_GEMMA_EMBEDDING` but **not** `GEMMA_EMBEDDING2`, `build.rs` has no source override (always cmake), and this host has no `cmake` and
+  no root. Full evidence and the three shapes with prices: `docs/design-m2-local-embeddings.md` §13. **Waiting on the human**: prototype with
+  EmbeddingGemma-300M today, or pay for a self-built llama.cpp to keep EmbeddingGemma-2.

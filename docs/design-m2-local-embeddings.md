@@ -502,3 +502,54 @@ seen this model still refuses anything that does not hash to what the build expe
 embedding works. §5's open spike (R7c) owns that, and until it lands the encoders are carried because the human asked for the whole model —
 with this section saying so out loud rather than letting 865 MB imply a capability nobody has demonstrated.
 
+
+---
+
+## 13. The runtime reality check (2026-10-29), which fails §9's third gate
+
+Before briefing R6b0 I ran the pre-check that gate asked for — **grep the vendored source, not upstream HEAD**. It failed, and the way it
+failed changes what "local embeddings" costs. All of this is measured on this host at 2026-10-29; nothing below is recalled from a changelog.
+
+**What the pinned binding actually contains.** `llama-cpp-sys-2 0.1.160` vendors llama.cpp (40 MB of source, `LLAMA_VERSION` 0.6.x) and is
+the **newest published version** (`index.crates.io/ll/am/llama-cpp-sys-2`, last entry). Grepping its vendored tree for the architecture this
+model declares:
+
+```
+$ grep -rhoE "LLM_ARCH_GEMMA[A-Z0-9_]*" llama.cpp | sort -u
+LLM_ARCH_GEMMA  LLM_ARCH_GEMMA2  LLM_ARCH_GEMMA3  LLM_ARCH_GEMMA3N  LLM_ARCH_GEMMA4
+LLM_ARCH_GEMMA4_ASSISTANT  LLM_ARCH_GEMMA_EMBEDDING
+```
+
+`gemma-embedding2` is **absent**. Upstream at `0ac1a7f` has it (verified earlier by clone), so the gap is between upstream and the crate's
+vendored revision — which means the pinned binding cannot resolve `general.architecture = gemma-embedding2` no matter what our code does. mtmd
+*is* present (`mtmd_encode_chunk` ×2 in `tools/mtmd/mtmd.h`), so R7c is unaffected by this particular gap.
+
+**There is no override knob.** `build.rs` imports `cmake::Config` and always builds its vendored copy; the env vars it reads are
+`BUILD_DEBUG`, `LLAMA_LIB_PROFILE`, `LLAMA_BUILD_SHARED_LIBS`, `CMAKE_*`, backend SDK paths — nothing that points at a different llama.cpp
+source tree. `dynamic-link` links against libraries you supply, which means building upstream yourself (still cmake) and owning that build for
+three OSes.
+
+**And this host cannot build C++ right now:** `cmake` is **missing**, there is no root (`sudo -n` → "interactive authentication is required"),
+and the apt candidate can't be installed. The official Kitware tarball *is* reachable (HTTP 206 on a ranged GET), so provisioning is possible
+without root — it just isn't free, and it must be written down rather than discovered mid-round. Resources measured now: **6.3 GB RAM free,
+6.8 GB disk free on `/home`, 16 cores** — enough for one llama.cpp build plus a 310 MB artifact, not enough to be careless (the earlier "2 GB
+free" note in the session record is stale; `free -m` says otherwise today).
+
+**The consequence for width and window.** A model fact cannot be pinned globally while the model is undecided: §5's 8,192 is EmbeddingGemma-2's
+window, and it now sits in a constant. Whatever shape is chosen below, the follow-up named in §5 — move the check beside the provider — stops
+being a nicety and becomes part of the change.
+
+### The three shapes, with their real prices
+
+| | A. Prototype on EmbeddingGemma-**1** | B. Keep EmbeddingGemma-**2**, build llama.cpp ourselves | C. Wait for a binding release |
+| --- | --- | --- | --- |
+| What it is | `ggml-org/embeddinggemma-300M-GGUF` declares `gemma-embedding.*`, which the pinned binding **does** implement (verified in the vendored enum above; repo ungated, 377k downloads) | Pin a llama.cpp git revision that has `gemma-embedding2`, build it with cmake, link through `dynamic-link`; or vendor a patched `-sys` crate | Do nothing until `llama-cpp-sys-2` ships the newer vendored revision |
+| Reaches a prototype | Fastest: no toolchain work, one dependency, one model file | Slowest by weeks: cmake provisioning locally (tarball, no root), plus a reproducible C++ build in CI on Linux/Windows/macOS | Unknown; R6b stalls at "cannot load the model" |
+| Keeps your amendments | Text-only — **no vision, no audio**, so amendment (a) is deferred rather than met | Yes: whole model, pair of files, R7c spike stays live | Yes |
+| Vector identity | New `@n`, and stored vectors are **not comparable** with EmbeddingGemma-2's; §5's narrowing migration must never mix them | as designed | as designed |
+| Honest cost statement | We ship a retrieval prototype whose quality we can measure on your corpus today, and say plainly it is the 300M text model | We spend the next several rounds on build plumbing before one vector exists | We have a plan and no prototype |
+
+**My recommendation for a prototype-first direction is A, with B kept as the upgrade path rather than abandoned**: the seam already takes width
+and prefix from the installed row, so switching models later is a new pinned id plus a re-embed — the thing §5 already designed as a migration.
+A gets `np search` in front of you while there is still a decision to make about quality; B buys the encoders nobody has yet demonstrated that we
+can query. This is your call, not mine: it changes which model answers every question the app will ever ask your notes.
