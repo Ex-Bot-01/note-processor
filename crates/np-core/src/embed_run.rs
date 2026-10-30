@@ -407,12 +407,10 @@ pub fn embed_with_inject(
         let inputs: Vec<&str> = batch.iter().map(|item| item.input.as_str()).collect();
         match provider.embed(&inputs) {
             Ok(vectors) => match paired(batch, &vectors, provider.dim()) {
-                Ok(rows) => {
-                    match write_batch(&db, &model_id, &rows)? {
-                        BatchWrite::Written => embedded += rows.len(),
-                        BatchWrite::Busy => busy_gap += 1,
-                    }
-                }
+                Ok(rows) => match write_batch(&db, &model_id, &rows)? {
+                    BatchWrite::Written => embedded += rows.len(),
+                    BatchWrite::Busy => busy_gap += 1,
+                },
                 Err(message) => {
                     errors += 1;
                     reason = Some(message);
@@ -424,22 +422,25 @@ pub fn embed_with_inject(
             Err(EmbedError::TokenBudgetExceeded { .. }) => {
                 for item in batch {
                     match provider.embed(&[item.input.as_str()]) {
-                        Ok(vectors) => match paired(std::slice::from_ref(item), &vectors, provider.dim()) {
-                            Ok(rows) => match write_batch(&db, &model_id, &rows)? {
-                                BatchWrite::Written => embedded += rows.len(),
-                                BatchWrite::Busy => busy_gap += 1,
-                            },
-                            Err(message) => {
-                                errors += 1;
-                                reason = Some(message);
-                                break 'batches;
+                        Ok(vectors) => {
+                            match paired(std::slice::from_ref(item), &vectors, provider.dim()) {
+                                Ok(rows) => match write_batch(&db, &model_id, &rows)? {
+                                    BatchWrite::Written => embedded += rows.len(),
+                                    BatchWrite::Busy => busy_gap += 1,
+                                },
+                                Err(message) => {
+                                    errors += 1;
+                                    reason = Some(message);
+                                    break 'batches;
+                                }
                             }
-                        },
+                        }
                         Err(EmbedError::TokenBudgetExceeded { tokens, budget }) => {
                             refused_budget += 1;
                             // Keep the numbers even when the run goes on: they are the whole diagnosis, and
                             // they survive into the arm sentence below rather than being summarised away.
-                            budget_detail = Some(format!("{tokens} tokens needed, budget {budget}"));
+                            budget_detail =
+                                Some(format!("{tokens} tokens needed, budget {budget}"));
                         }
                         Err(other) => {
                             errors += 1;
@@ -512,12 +513,14 @@ fn configured_model(cfg: &Config) -> Result<String, EmbedOutcome> {
             key: "embeddings.provider",
             id: Some("none".to_string()),
         }),
-        EmbeddingProvider::LocalModel | EmbeddingProvider::OpenAiCompatible => {
-            cfg.embeddings.model.clone().ok_or(EmbedOutcome::ConfigurationDisabled {
+        EmbeddingProvider::LocalModel | EmbeddingProvider::OpenAiCompatible => cfg
+            .embeddings
+            .model
+            .clone()
+            .ok_or(EmbedOutcome::ConfigurationDisabled {
                 key: "embeddings.model",
                 id: None,
-            })
-        }
+            }),
     }
 }
 

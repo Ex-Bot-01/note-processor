@@ -278,7 +278,12 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     }
     // `detail()` is `None` only for arm (i), which returned above; the empty fallback keeps this from being a
     // second place that has to know which arms carry a sentence.
-    Err(format!("{}: {}", report.outcome.label(), report.outcome.detail().unwrap_or_default()).into())
+    Err(format!(
+        "{}: {}",
+        report.outcome.label(),
+        report.outcome.detail().unwrap_or_default()
+    )
+    .into())
 }
 
 /// The provider `[embeddings]` names.

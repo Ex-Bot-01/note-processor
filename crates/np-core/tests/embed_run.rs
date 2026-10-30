@@ -17,9 +17,7 @@ use std::sync::{Mutex, Once};
 use np_core::config::{Config, EmbeddingProvider, EmbeddingsConfig};
 use np_core::db::{self, Db};
 use np_core::embed::{EmbedError, Embedder, Vector};
-use np_core::embed_run::{
-    embed, embed_with_inject, EmbedOutcome, EMBED_BATCH_CHUNKS,
-};
+use np_core::embed_run::{embed, embed_with_inject, EmbedOutcome, EMBED_BATCH_CHUNKS};
 use np_core::hash::sha256_bytes;
 use np_core::{scan, ScanReport};
 use tempfile::TempDir;
@@ -75,8 +73,16 @@ impl Setup {
     /// a few bytes here, and `install` would refuse it against any real declaration.
     fn install_model(&self, dim: i64, prefix_doc: &str) {
         let db = self.db();
-        let wrote = db::insert_model(&db, MODEL_ID, dim, Some("00"), prefix_doc, "", 1_730_000_000)
-            .expect("test setup: insert model row");
+        let wrote = db::insert_model(
+            &db,
+            MODEL_ID,
+            dim,
+            Some("00"),
+            prefix_doc,
+            "",
+            1_730_000_000,
+        )
+        .expect("test setup: insert model row");
         assert!(wrote, "test setup: the row is not already there");
     }
 
@@ -245,8 +251,7 @@ impl Embedder for Fake {
         self.batches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(texts.iter().map(|text| (*text).to_string())
-                .collect());
+            .push(texts.iter().map(|text| (*text).to_string()).collect());
         let over_budget = self
             .over_budget
             .as_deref()
@@ -274,7 +279,8 @@ static RECORDER_CHECK: Once = Once::new();
 fn assert_recorder_works() {
     RECORDER_CHECK.call_once(|| {
         let fake = Fake::new();
-        fake.embed(&["one", "two"]).expect("test setup: fake answers");
+        fake.embed(&["one", "two"])
+            .expect("test setup: fake answers");
         assert_eq!(fake.calls(), 1);
         assert_eq!(
             fake.texts(),
@@ -317,7 +323,10 @@ fn chunks_reach_the_provider_in_chunk_order_and_are_stamped_with_what_it_read() 
     let batches = fake.batches();
     assert_eq!(batches.len(), 1, "three chunks fit one bounded batch");
     let expected: Vec<String> = live.iter().map(|(_, text)| text.clone()).collect();
-    assert_eq!(batches[0], expected, "the batch is the chunk texts in order");
+    assert_eq!(
+        batches[0], expected,
+        "the batch is the chunk texts in order"
+    );
 
     // The stamp rule (§6, backlog D4): digest of the bytes handed over — here an empty prefix, so the text.
     let stored: HashMap<i64, String> = setup.vectors().into_iter().collect();
@@ -397,7 +406,11 @@ fn an_unchanged_corpus_never_reaches_the_provider() {
 
     let second = Fake::new();
     let report = embed(&setup.root, &setup.cfg(), &second).expect("second run");
-    assert_eq!(second.calls(), 0, "a current corpus must not be re-embedded");
+    assert_eq!(
+        second.calls(),
+        0,
+        "a current corpus must not be re-embedded"
+    );
     assert_eq!(report.chunks_seen, 2);
     assert_eq!(report.current, 2);
     assert_eq!(report.embedded, 0);
@@ -407,7 +420,11 @@ fn an_unchanged_corpus_never_reaches_the_provider() {
     rescan(&setup);
     let third = Fake::new();
     embed(&setup.root, &setup.cfg(), &third).expect("third run");
-    assert_eq!(third.calls(), 0, "an unchanged note stays current across a scan");
+    assert_eq!(
+        third.calls(),
+        0,
+        "an unchanged note stays current across a scan"
+    );
 }
 
 /// Changing only `prefix_doc` makes every stored vector stale, because the stamp is of the prefixed bytes.
@@ -434,7 +451,11 @@ fn a_changed_prefix_makes_a_stored_vector_stale() {
 
     let fake = Fake::new();
     let report = embed(&setup.root, &setup.cfg(), &fake).expect("second run");
-    assert_eq!(fake.calls(), 1, "the same text under a new prefix is owed again");
+    assert_eq!(
+        fake.calls(),
+        1,
+        "the same text under a new prefix is owed again"
+    );
     assert_eq!(report.current, 0);
     assert_eq!(report.embedded, 1);
 }
@@ -452,7 +473,10 @@ fn an_over_budget_chunk_is_reported_and_stamps_nothing() {
     let fake = Fake::over_budget("body text 1 ");
     let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
 
-    assert_eq!(report.embedded, 2, "the two chunks that fit are still embedded");
+    assert_eq!(
+        report.embedded, 2,
+        "the two chunks that fit are still embedded"
+    );
     assert_eq!(report.current, 0);
     // The offender is refused rather than truncated, so it is owed and unproduced: arm (iv), exit non-zero.
     assert!(!report.succeeded(), "{:?}", report.outcome);
@@ -461,7 +485,9 @@ fn an_over_budget_chunk_is_reported_and_stamps_nothing() {
         other => panic!("expected the owed-and-not-produced arm, got {other:?}"),
     };
     assert!(
-        reason.contains("over the token budget") && reason.contains("4242") && reason.contains("1024"),
+        reason.contains("over the token budget")
+            && reason.contains("4242")
+            && reason.contains("1024"),
         "the report must say it refused rather than truncated, with both numbers: {reason}"
     );
 
@@ -521,7 +547,11 @@ fn a_wrong_width_provider_is_refused_before_any_write() {
         text.contains(&FAKE_DIM.to_string()) && text.contains(&(FAKE_DIM + 1).to_string()),
         "both numbers belong in the message: {text}"
     );
-    assert_eq!(fake.calls(), 0, "the refusal comes before the provider runs");
+    assert_eq!(
+        fake.calls(),
+        0,
+        "the refusal comes before the provider runs"
+    );
     assert!(setup.vectors().is_empty(), "and before anything is written");
 }
 
@@ -551,7 +581,11 @@ fn an_interrupted_run_resumes_with_only_what_is_left() {
     assert!(report.succeeded(), "{:?}", report.outcome);
     assert_eq!(report.current, EMBED_BATCH_CHUNKS);
     assert_eq!(report.embedded, 1);
-    assert_eq!(resumed.calls(), 1, "only the remaining chunk reaches the model");
+    assert_eq!(
+        resumed.calls(),
+        1,
+        "only the remaining chunk reaches the model"
+    );
     assert_eq!(resumed.texts().len(), 1);
     assert_eq!(setup.vectors().len(), total);
 }
@@ -589,7 +623,11 @@ fn a_repeated_batch_updates_instead_of_failing() {
     assert_eq!(report.embedded, 1);
     let stored = setup.vectors();
     assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].1, sha256_bytes(text.as_bytes()), "the row now says what it holds");
+    assert_eq!(
+        stored[0].1,
+        sha256_bytes(text.as_bytes()),
+        "the row now says what it holds"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -606,11 +644,18 @@ fn a_stale_note_s_chunks_are_never_owed() {
     ]);
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
-    assert_eq!(setup.live_chunks().len(), 2, "both notes are live to start with");
+    assert_eq!(
+        setup.live_chunks().len(),
+        2,
+        "both notes are live to start with"
+    );
 
     fs::remove_file(setup.root.join("gone.md")).expect("test: delete one note");
     let report = rescan(&setup);
-    assert_eq!(report.removed, 1, "the scan marked it stale rather than forgetting it");
+    assert_eq!(
+        report.removed, 1,
+        "the scan marked it stale rather than forgetting it"
+    );
 
     let fake = Fake::new();
     let embed_report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
@@ -706,13 +751,23 @@ fn an_absent_artifact_names_a_command_that_exists() {
     let fake = Fake::new();
     let report = embed(&setup.root, &setup.cfg(), &fake).expect("the arm is a report");
     assert_eq!(report.outcome.label(), "artifact absent");
-    let detail = report.outcome.detail().expect("arm (iii) carries its advice");
+    let detail = report
+        .outcome
+        .detail()
+        .expect("arm (iii) carries its advice");
     assert!(detail.contains("np models install"), "{detail}");
     assert!(!detail.contains("np models fetch"), "{detail}");
     assert!(detail.contains("not implemented"), "{detail}");
-    assert_eq!(report.chunks_seen, 2, "the corpus was read before the arm fired");
+    assert_eq!(
+        report.chunks_seen, 2,
+        "the corpus was read before the arm fired"
+    );
     assert_eq!(report.embedded, 0);
-    assert_eq!(fake.calls(), 0, "no provider call is attempted without an artifact");
+    assert_eq!(
+        fake.calls(),
+        0,
+        "no provider call is attempted without an artifact"
+    );
     assert!(!report.succeeded());
 }
 
@@ -730,7 +785,10 @@ fn nothing_owed_exits_zero_even_with_no_artifact() {
     let fake = Fake::new();
     let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
     assert_eq!(report.outcome, EmbedOutcome::Current);
-    assert!(report.succeeded(), "§6's exit state (i) is 0 whatever else is true");
+    assert!(
+        report.succeeded(),
+        "§6's exit state (i) is 0 whatever else is true"
+    );
     assert_eq!(fake.calls(), 0);
 }
 
@@ -784,11 +842,15 @@ fn a_busy_batch_stamps_nothing_and_is_reported() {
         .expect("test setup: take the write lock");
 
     let fake = Fake::new();
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("a busy batch is reported, not raised");
+    let report =
+        embed(&setup.root, &setup.cfg(), &fake).expect("a busy batch is reported, not raised");
     assert_eq!(report.busy_gap, 1, "one batch met the lock");
     assert_eq!(report.embedded, 0);
     assert_eq!(report.errors, 0, "a lock is a gap, not an error count");
-    assert!(setup.vectors().is_empty(), "nothing is stamped for that batch");
+    assert!(
+        setup.vectors().is_empty(),
+        "nothing is stamped for that batch"
+    );
     let reason = match &report.outcome {
         EmbedOutcome::NotProduced { reason } => reason.clone(),
         other => panic!("expected arm (iv), got {other:?}"),
@@ -820,24 +882,23 @@ fn a_scan_can_take_the_write_lock_between_batches() {
     let cfg = setup.cfg();
     let mut scans = 0usize;
     let fake = Fake::new();
-    let report = embed_with_inject(
-        &setup.root,
-        &setup.cfg(),
-        &fake,
-        &mut |db_path| {
-            assert!(
-                db_path.exists(),
-                "the hook is handed the database an embed is writing"
-            );
-            // Count batches by how often we are called: more than once means the loop really is batched.
-            scans += 1;
-            scan(&root, &cfg).expect("a scan must succeed while an embed sits between batches");
-        },
-    )
+    let report = embed_with_inject(&setup.root, &setup.cfg(), &fake, &mut |db_path| {
+        assert!(
+            db_path.exists(),
+            "the hook is handed the database an embed is writing"
+        );
+        // Count batches by how often we are called: more than once means the loop really is batched.
+        scans += 1;
+        scan(&root, &cfg).expect("a scan must succeed while an embed sits between batches");
+    })
     .expect("run");
 
     assert!(report.succeeded(), "{:?}", report.outcome);
-    assert_eq!(fake.batches().len(), 2, "two bounded batches for {total} chunks");
+    assert_eq!(
+        fake.batches().len(),
+        2,
+        "two bounded batches for {total} chunks"
+    );
     assert_eq!(scans, 2, "one hook call per committed batch");
     assert_eq!(setup.vectors().len(), total);
 }
