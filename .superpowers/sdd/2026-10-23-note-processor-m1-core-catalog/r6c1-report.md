@@ -84,3 +84,51 @@ if one moves, `embeddings.source_hash` silently stops describing the bytes the m
 * No artifact-gated run of this path (the round is designed to be testable without one), so no real vector has been written
   to a database yet — that is R6c2, together with batch invariance under a non-empty `prefix_doc`.
 * CI: cannot start jobs account-side since 2026-10-29; nothing here was verified on any platform but Linux.
+
+---
+
+## 2026-10-31 — controller section: D-2 fixed and verified, D-3 landed, third timeout
+
+The fix round (`b5feb5ab`) timed out at its 25-minute deadline **after committing D-2 (`98f701e`) and leaving D-3's
+`crates/np-cli/tests/cli.rs` (+364 lines) uncommitted**. I recovered it from the tree rather than rerunning the work: it
+passes as written. Its own report section was never written — this section is mine, and every claim below is something I
+ran.
+
+**D-2, as fixed.** np-cli's provider resolution now returns `Option<Box<dyn Embedder>>`, and `None` means exactly one
+thing — the row exists, its width matches the run, only the bytes are missing — which the call site turns into
+`Resolution::ArtifactAbsent`. `embed_run` skips the width comparison in that case rather than comparing a placeholder's
+zero. The comment at the mutation point says why: a filesystem fact cannot be recovered downstream from configuration.
+
+**Verified against the binary by me** (scratch workspace, default build, artifact file moved aside):
+
+```
+outcome    artifact absent
+detail     install the artifact with `np models install /tmp/np-smoke2/ws --id <id> --path <file> --dim <width> --sha256 <digest>` (fetching a model is not implemented in this build)
+artifact   /tmp/np-smoke2/data/workspaces/f4163026c4741177.models/tiny-model@1
+seen 1  current 0  embedded 0  refused 0  busy-gap 0  errors 0
+verify     self-consistent, not verified
+exit 1
+```
+`--json` carries the same fact as `outcome["artifact-absent"]{artifact, hint, model}`; putting the file back returns to arm
+(iv) *owed and not produced* through `RuntimeNotBuilt`. No "dimensions" sentence anywhere.
+
+**Mutation evidence for D-3's regression test.** Reintroducing the old routing (`ArtifactUnreadable => placeholder`) makes
+exactly two cases fail — `embed_with_the_artifact_file_missing_names_installing_it` and
+`embed_json_reports_the_same_outcome_and_counts_as_the_summary` — 23 passed / 2 failed; restored with `cp`, verified with
+`cmp`, suite back to 25 passed. So the test bites on the routing decision, not just on a string.
+
+**Gates after this state (all by exit code):** fmt 0 · clippy `--all-targets -D warnings` 0 · **default suite 461 passed /
+0 failed** (436 baseline → +19 np-core embed_run cases → +6 np-cli argv-level cases) · config-no-HOME 33 · rustdoc
+`--deny warnings` 0 both ways · fences pass · **GOLDEN CHECK: pass** · feature-on check/clippy(np-core+np-cli)/doc 0.
+
+**Still open after this round:** D-4 (the prefix spelling lives in both `embed_run` and `LocalModelProvider::model_inputs`),
+D-5 (budget refusals are inherited from the runtime's error, which the module doc must state plainly), README not listing
+`np embed`, design §6 still naming the non-existent `np models fetch`, `todo.md` and the `EmbeddingsConfig.model`/`.dim`
+comments claiming nothing reads them, and R6c2 (real runtime wiring, artifact-gated vectors, batch invariance under a
+non-empty `prefix_doc`).
+
+**Orchestration note, because it is now three for three:** every implementer round in this session has died at its deadline
+— 30 min twice, then 25 min — while committing checkpoints only when told to. The rounds are not too big conceptually; they
+are paying for full-workspace gates (clippy `--all-targets`, `cargo test --workspace`, four doc builds) inside the same
+window as the code. Next round starts with the smallest falsifiable change committed first, and the gate sweep moves to the
+controller.
