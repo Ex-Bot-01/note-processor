@@ -553,3 +553,62 @@ being a nicety and becomes part of the change.
 and prefix from the installed row, so switching models later is a new pinned id plus a re-embed — the thing §5 already designed as a migration.
 A gets `np search` in front of you while there is still a decision to make about quality; B buys the encoders nobody has yet demonstrated that we
 can query. This is your call, not mine: it changes which model answers every question the app will ever ask your notes.
+
+
+---
+
+## 14. We own the llama.cpp build (decided 2026-10-29, measured the same day)
+
+You answered the §13 question: **use llama.cpp in the back and keep EmbeddingGemma-2**, accepting a bigger package "as long as it is not
+getting too big". That closes shape B — and the measurements below are why B turns out to be cheaper than §13 feared, and also why it is
+**not** the pinned Rust binding.
+
+### Measured on this host, no root
+
+| Fact | Value | How |
+| --- | --- | --- |
+| cmake without root | works: Kitware 3.30.5 tarball, 51 MB, unpacked to `~/tools/cmake` | `curl -L … && tar xzf` (apt candidate exists but `sudo -n` needs a password) |
+| llama.cpp pinned revision | **v0.8.0** (released 2026-10-28), tarball 38,680,037 B, `sha256 = 51b1e025d7b12e83fa55736e65bc254acd9d23e49f546be7531368fef82210ee` | GitHub release tarball |
+| Does that revision know the architecture? | **yes** — its arch enum contains `LLM_ARCH_GEMMA_EMBEDDING2` alongside `GEMMA_EMBEDDING`, `GEMMA4`, `GEMMA3N` | grep of the unpacked tree |
+| Build time here | **23 s** for target `llama` at `-j 14` (plus a 17 s configure) | `cmake --build build --target llama` |
+| Static archives | `libllama.a` **10.0 MB**, `libggml-cpu.a` 1.4 MB, `libggml-base.a` 1.3 MB → ~13 MB of archives; build dir 32 MB, source tree 214 MB | `ls -la build/**/lib*.a` |
+| Today's binary, for scale | `np` release **5.5 MB stripped** (6.7 MB unstripped) | `cargo build --release && strip` |
+| C++ toolchain | g++ 15.2 present; `clang` absent but **libclang 21 is installed** (`/usr/lib/x86_64-linux-gnu/libclang-21.so.21`) | probe |
+
+So the honest reading of "blow up the package a little": static-linking the referenced objects of ~13 MB of archives lands `np` somewhere
+around **15–20 MB**, against 5.5 MB today. That is worth it for local inference, and §14 sets a ceiling rather than trusting taste:
+**≤ 40 MB stripped per platform binary**, measured and printed by the release workflow from R6d on. The headroom is not padding — mtmd
+(R7c) would be linked in later under the same budget, and if it breaks the ceiling that is a decision to bring back to you, not one a round
+makes quietly.
+
+### Why not the pinned Rust binding (`llama-cpp-2` / `llama-cpp-sys-2`)
+
+Three independent reasons, each verified rather than recalled:
+
+1. **It cannot be given our source.** `build.rs` imports `cmake::Config` and always compiles *its own* vendored tree; the env vars it reads
+   are debug/profile/backend/SDK paths. There is no `SOURCE_DIR`-style override, and `dynamic-link` only sets `BUILD_SHARED_LIBS=ON` — it
+   still builds the vendored copy. So we would be shipping a fork of the `-sys` crate to change one directory.
+2. **Its vendored tree is the wrong revision anyway**: no `LLM_ARCH_GEMMA_EMBEDDING2` (§13), and 0.1.160 is the newest published version.
+3. **It drags bindgen into every build**, i.e. a libclang dependency on three OSes, plus `bindgen 0.72`/`cc`/`cmake` build-dependencies and
+   their own breakage surface — to save us from declaring the handful of C functions we actually call.
+
+### The shape R6b0 implements
+
+- **Pin the source, don't commit it.** `third_party/llama-cpp.toml` records tag `v0.8.0`, the tarball URL and that sha256. A fetch step
+  verifies the digest before unpacking — the same discipline `np models install` applies to a model artifact, applied to our own dependency.
+  `NP_LLAMA_CPP_SRC=/path/to/source` overrides for offline and CI-cached builds; **no network during `cargo build` by default**, because a
+  build that quietly reaches out is a build that fails in the ways we cannot reproduce.
+- **Our own `build.rs`, behind `local-model`.** Configures with the options that keep the binary small (`LLAMA_CURL=OFF`, tests/examples/app/
+  tools/UI off), builds target `llama`, static-links. If cmake is missing it **refuses with a sentence naming `CMAKE` and the tag**, never
+  silently compiles the feature out — a release that quietly loses inference is worse than one that fails loudly.
+- **Hand-written `extern "C"` declarations, no bindgen.** llama.cpp's public API is C (`include/llama.h`), pointers are opaque to us, and the
+  surface R6b1 needs is small: model load/AUTO device, `model_n_vocab/n_ctx_train`, tokenize, batch set logits, `decode`,
+  `get_embeddings_seq`/`_dbg`, free. Each declaration gets a comment naming what it does to memory, because that is where the unsafety lives.
+- **Per-OS honesty.** Linux is proven here (23 s build). Windows and macOS are *not* claimed: MSVC needs `LLAMA_STATIC_CRT` thought-through
+  and the release matrix builds it; §2's four-step feature job runs on Linux first, and the Windows feature row lands when someone has seen it
+  green — F18's rule, unchanged.
+
+### What this decides about §5's amendments
+
+Keeping EmbeddingGemma-2 keeps amendment (a) alive: the two-file artifact pair stays in the plan, and R7c's spike now runs against v0.8.0's
+`tools/mtmd` headers rather than a hypothetical. Native 768-d storage (§5) is unaffected — that was a width decision, not a runtime one.

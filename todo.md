@@ -127,6 +127,13 @@ what fails is not a check, because removal makes tests pass.
   `design-m2-local-embeddings.md` §6: only with their chunk row) and **D3 (a stale note's chunks must never read as
   current, which bites the moment `np embed` becomes the first production reader of `chunk_state`/`chunk_digest`)**. All
   three are cheap now and expensive after 18k vectors exist.
+- **Runtime decided 2026-10-29 (you answered §13): use llama.cpp in the back and keep EmbeddingGemma-2**, accepting a bigger package.
+  We build llama.cpp ourselves from a pinned, sha256-verified tarball (**v0.8.0**, `sha256 = 51b1e025…210ee`) behind the `local-model` feature
+  and declare the C API by hand — the published Rust binding cannot be fed our source, vendors a revision without `gemma-embedding2`, and would
+  add bindgen/libclang to every build. Measured here: builds in 23 s; ~13 MB of static archives against a 5.5 MB stripped `np` today.
+  **Package ceiling: ≤ 40 MB stripped per platform**, printed by the release workflow from R6d. Evidence and reasoning:
+  `docs/design-m2-local-embeddings.md` §14.
+
 - **Direction set 2026-10-29: steer toward Prototype 1** (`docs/roadmap-2026-10-27.md` §3C) — `scan → fetch → embed → search`, CLI-only, on the
   real corpus. Rounds that don't put a queryable vector in front of the human sooner wait, and whatever waits gets named out loud.
 
