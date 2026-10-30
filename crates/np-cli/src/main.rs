@@ -1,7 +1,7 @@
 //! `np` — command line entry point for note-processor.
 //!
-//! Two command groups: `np scan`, and the M2a model commands under `np models`. Both are parsers and
-//! printers only — every decision about what an install means, which id is legal, or what state an artifact
+//! Three command groups: `np scan`, `np embed`, and the M2a model commands under `np models`. All are parsers
+//! and printers only — every decision about what an install means, which id is legal, or what state an artifact
 //! is in lives in [`np_core::models`], so this file holds no SQL and defines no second SHA-256
 //! ([`np_core::hash::sha256_file`] is the one digest in the program, and `np models hash` calls it).
 
@@ -14,8 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use np_core::catalog::size_human;
-use np_core::config::Config;
-use np_core::db::{orphan_total, Db};
+use np_core::config::{Config, EmbeddingProvider};
+use np_core::db::{model_row, orphan_total, Db};
+use np_core::embed::{Embedder, LocalModelProvider, NoEmbeddingProvider};
+use np_core::embed_run::{self, EmbedOutcome, EmbedReport};
 use np_core::hash::sha256_file;
 use np_core::models::{
     self, FetchEntry, FetchState, Install, ListedModel, Listing, ModelError, Unclaimed,
@@ -38,6 +40,14 @@ enum Command {
     /// Index a note workspace and regenerate its catalog.
     Scan {
         /// Workspace root to index.
+        workspace: PathBuf,
+        /// Print the report as JSON instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Embed the notes a workspace owes, for the configured model.
+    Embed {
+        /// Workspace root to embed.
         workspace: PathBuf,
         /// Print the report as JSON instead of a summary.
         #[arg(long)]
@@ -104,6 +114,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Scan { workspace, json } => scan_workspace(&workspace, json),
+        Command::Embed { workspace, json } => embed_workspace(&workspace, json),
         Command::Models { command } => match command {
             ModelsCommand::Install {
                 workspace,
@@ -238,6 +249,116 @@ fn print_summary(report: &ScanReport) {
     }
     let _ = writeln!(out, "index      {}", report.index_files.join(", "));
     let _ = writeln!(out, "elapsed    {} ms", report.elapsed_ms);
+}
+
+// ---------------------------------------------------------------------------
+// `np embed` — design-m2-local-embeddings.md §6.
+//
+// The command resolves *which* provider the configuration names and prints what came back; every decision
+// about currency, batching, exit arms and the stamp rule lives in [`np_core::embed_run`]. That split is why
+// there is no SQL here beyond `db.rs`'s own readers and no second digest.
+// ---------------------------------------------------------------------------
+
+/// Embed `workspace` and print its report.
+///
+/// Three of the four arms leave as exit 1 with the arm's sentence on stderr *and* in the printed report: two
+/// channels for one fact, the posture `np models list` already takes for a directory-level failure. No new exit
+/// code is introduced — §6 says so, and clap keeps argv failures at 2.
+fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
+    let cfg = load_config()?;
+    let provider = embed_provider(&cfg, workspace)?;
+    let report = embed_run::embed(workspace, &cfg, provider.as_ref())?;
+    if json {
+        emit_json(&serde_json::to_value(&report)?);
+    } else {
+        print_embed_summary(&report);
+    }
+    if report.succeeded() {
+        return Ok(());
+    }
+    // `detail()` is `None` only for arm (i), which returned above; the empty fallback keeps this from being a
+    // second place that has to know which arms carry a sentence.
+    Err(format!("{}: {}", report.outcome.label(), report.outcome.detail().unwrap_or_default()).into())
+}
+
+/// The provider `[embeddings]` names.
+///
+/// Two of the three returns hand over [`NoEmbeddingProvider`] as a **placeholder for a state that refuses before
+/// any vector is asked for**: no provider can be built from `provider = "none"`, from a missing
+/// [`np_core::config::EmbeddingsConfig::model`], from an id naming no installed row, or from a row whose declared
+/// width is not a number. Each of those is answered by [`np_core::embed_run`] as arm (ii) — or, for a missing
+/// artifact, arm (iii), whose message names the command that exists — and none of them reaches the placeholder,
+/// because both arms fire before the writer loop.
+///
+/// The row is read through a connection that closes when this function returns, before `embed_run` opens its
+/// own: np-cli holds no SQL of its own, and one workspace's [`np_core::db::ModelRow`] is where a local provider's
+/// identity comes from (§3).
+fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Box<dyn Embedder>, Box<dyn Error>> {
+    match cfg.embeddings.provider {
+        // The default. Nothing is built, nothing is contacted, and the report says *configuration disabled*
+        // rather than a fault (§2, §6).
+        EmbeddingProvider::None => Ok(Box::new(NoEmbeddingProvider)),
+        EmbeddingProvider::OpenAiCompatible => {
+            // Unreachable through `Config::load`, which refuses this variant by name; kept as a refusal rather
+            // than a fallthrough into the local branch, because dialling out is not what this build does.
+            Err("embeddings.provider = \"openai-compatible\" names an endpoint provider this build cannot serve".into())
+        }
+        EmbeddingProvider::LocalModel => {
+            let Some(id) = cfg.embeddings.model.as_deref() else {
+                return Ok(Box::new(NoEmbeddingProvider));
+            };
+            let db = workspace_db(cfg, workspace)?;
+            let Some(row) = model_row(&db, id)? else {
+                return Ok(Box::new(NoEmbeddingProvider));
+            };
+            // The width this run needs: `[embeddings] dim`, or the row's own declaration when the config
+            // declares none. `embed_run` applies the same rule and refuses a disagreement before any write, so
+            // a declared width that is not a number at all travels to it as the arm that names the row.
+            let Some(configured) = cfg
+                .embeddings
+                .dim
+                .map(usize::from)
+                .or_else(|| usize::try_from(row.dim).ok())
+            else {
+                return Ok(Box::new(NoEmbeddingProvider));
+            };
+            let artifact = cfg.workspace_models_dir(workspace).join(id);
+            match LocalModelProvider::new(&row, &artifact, configured) {
+                Ok(provider) => Ok(Box::new(provider)),
+                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => {
+                    Ok(Box::new(NoEmbeddingProvider))
+                }
+                Err(err) => Err(err.into()),
+            }
+        }
+    }
+}
+
+/// The human-readable form of an embed report: the arm first, then §6's six counts, then §7's caveat.
+///
+/// Same aligned-label shape as [`print_summary`], and every line written to one locked stdout handle with its
+/// result dropped for the same reason: a descriptor that refuses writes must not turn a finished run into a
+/// panic. The verification line is printed even when nothing was embedded, because §7's whole point is that the
+/// caveat is read at 2 a.m. rather than filed.
+fn print_embed_summary(report: &EmbedReport) {
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "model      {}", report.model.as_deref().unwrap_or("-"));
+    let _ = writeln!(out, "outcome    {}", report.outcome.label());
+    if let Some(detail) = report.outcome.detail() {
+        let _ = writeln!(out, "detail     {detail}");
+    }
+    // The path arm (iii) looked at, printed apart from the hint so a reader can `ls` it. It is a data-dir file
+    // this program wrote, which is why naming it is safe (§3's payload rule).
+    if let EmbedOutcome::ArtifactAbsent { artifact, .. } = &report.outcome {
+        let _ = writeln!(out, "artifact   {}", artifact.display());
+    }
+    let _ = writeln!(out, "seen       {}", report.chunks_seen);
+    let _ = writeln!(out, "current    {}", report.current);
+    let _ = writeln!(out, "embedded   {}", report.embedded);
+    let _ = writeln!(out, "refused    {}", report.refused_budget);
+    let _ = writeln!(out, "busy-gap   {}", report.busy_gap);
+    let _ = writeln!(out, "errors     {}", report.errors);
+    let _ = writeln!(out, "verify     {}", report.verification);
 }
 
 // ---------------------------------------------------------------------------

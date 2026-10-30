@@ -2156,6 +2156,91 @@ pub fn delete_vectors_for_chunk(db: &Db, chunk_id: i64) -> Result<(), DbError> {
     Ok(())
 }
 
+/// One stored vector's currency stamp under one model: the chunk it belongs to, and the digest of the bytes
+/// that were handed to the model to make it.
+///
+/// Only those two fields, because they are the whole answer to "is this vector still current": §6's rule is
+/// that `embeddings.source_hash` holds the digest of **the bytes the model read** (backlog D4), so currency is
+/// one string comparison and needs neither the vector nor the timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorStamp {
+    /// `embeddings.chunk_id` — the row whose text produced this vector.
+    pub chunk_id: i64,
+    /// `embeddings.source_hash`: digest of the prefixed text the model was given, written by
+    /// [`crate::embed_run`]. Not `chunks.source_hash` (the note digest) and not `files.hash`.
+    pub source_hash: String,
+}
+
+/// Every vector stored under one model id, ascending by chunk.
+///
+/// The `model` filter is not optional and that is the whole reason this reader exists
+/// (`docs/design-m2-local-embeddings.md` §6: "every read filters on an explicit model id … no such reader
+/// exists yet"): `PRIMARY KEY (chunk_id, model)` lets two models hold a vector for one chunk, and comparing
+/// one model's stamps against another's vectors would call a stale row current — or the other way round,
+/// re-embedding forever. A caller that wants "all vectors" can ask twice with two ids; there is no query here
+/// that mixes them.
+///
+/// Ordered by `chunk_id` so a caller building a map gets one deterministic pass and a report whose counts do
+/// not depend on the planner's mood.
+pub fn vectors_for(db: &Db, model: &str) -> Result<Vec<VectorStamp>, DbError> {
+    let mut statement = db.0.prepare_cached(
+        "SELECT chunk_id, source_hash FROM embeddings WHERE model = ?1 ORDER BY chunk_id",
+    )?;
+    let rows = statement.query_map(params![model], |row| {
+        Ok(VectorStamp {
+            chunk_id: row.get(0)?,
+            source_hash: row.get(1)?,
+        })
+    })?;
+    let mut stamps = Vec::new();
+    for row in rows {
+        stamps.push(row?);
+    }
+    Ok(stamps)
+}
+
+/// One chunk the catalog can still show a reader: its id and its stored text.
+///
+/// The `files.state = 'ok'` join is §6's liveness fence (backlog D3). A note whose file is gone keeps its row
+/// with `state = 'stale'` and every child row intact — [`mark_stale`] says so in its own words — so an
+/// un-fenced read over `chunks` is the first production reader that computes vectors for a deleted file's text
+/// and reports them current. Joining through `notes.rel_bytes = files.rel_bytes` rather than `rel` because the
+/// byte key is the identity (F13 §4, migration 4): an ASCII-lossy display spelling could fold two paths into
+/// one.
+///
+/// Ordered by `chunks.id`, which is the order [`crate::embed_run`] batches in — deterministic batching is what
+/// makes a resumed run produce the same rows as an uninterrupted one.
+pub fn live_chunks(db: &Db) -> Result<Vec<LiveChunk>, DbError> {
+    let mut statement = db.0.prepare_cached(
+        "SELECT c.id, c.text
+           FROM chunks c
+           JOIN notes n ON n.id = c.note_id
+           JOIN files f ON f.rel_bytes = n.rel_bytes
+          WHERE f.state = 'ok'
+          ORDER BY c.id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(LiveChunk {
+            id: row.get(0)?,
+            text: row.get(1)?,
+        })
+    })?;
+    let mut chunks = Vec::new();
+    for row in rows {
+        chunks.push(row?);
+    }
+    Ok(chunks)
+}
+
+/// One chunk row as [`live_chunks`] reads it.
+pub struct LiveChunk {
+    /// `chunks.id`, the key `embeddings.chunk_id` references.
+    pub id: i64,
+    /// The stored BLOB. Still bytes, for the reason [`StoredChunk::text`] gives: this column holds note text
+    /// and makes no UTF-8 promise.
+    pub text: Vec<u8>,
+}
+
 /// One row of `models` (migration 7), read as the columns hold them.
 ///
 /// `dim` and `installed_at` are `i64` rather than `u16`/a timestamp type on purpose: SQLite's `INTEGER`
