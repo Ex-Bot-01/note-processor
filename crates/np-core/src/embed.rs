@@ -134,15 +134,20 @@ pub enum EmbedError {
     ///
     /// The payload is an **opaque label** (a provider kind, a host category, anything a secret could not
     /// take): this enum's text lands in test-failure output and CI logs, so an error that formatted one
-    /// would leak it on the first flake (§9). Nothing raises it today — `local-model`'s refusals are the
+    /// would leak it on the first flake (§9). R6b1's loader raises it today — `local-model`'s refusals are the
     /// specific ones below, which is what §10 of `docs/design-m2-local-embeddings.md` did to the class this
     /// variant was sketched for: there is no endpoint left that could be down.
     ///
-    /// **Its home going forward is §3's fifth class**, "runtime error with a bounded message": R6b1 raises it with
-    /// a fixed label of our own choosing (`"inference failed"`, `"out of memory"`, `"context too small"`), never
+    /// **Its home is §3's fifth class**, "runtime error with a bounded message": every label is one we chose, never
     /// the runtime's own diagnostic text — that text is exactly what this payload rule exists to keep out of logs,
-    /// and [`EmbedError::ArtifactNotLoadable`] deliberately declines to be its carrier. If R6b1 finds a bounded
-    /// label cannot describe a failure it actually meets, the honest move is a tenth variant named for that class,
+    /// and [`EmbedError::ArtifactNotLoadable`] deliberately declines to be its carrier.
+    ///
+    /// The labels `local-model` emits today, verbatim, are six: `"the runtime refused to build a context for this
+    /// model"`, `"this artifact cannot produce a sentence vector: the context pools with NONE"`,
+    /// `"the loaded model exposed no vocabulary"`, and from the count guard `"the model reported no output width"`,
+    /// `"... no input width"`, `"... no training context"` / `"an empty vocabulary"`. R6b2 adds the inference-side
+    /// ones (`"inference failed"`, `"out of memory"`, `"context too small"` — planned, not yet reachable). If a
+    /// failure arrives that no bounded label can describe, the honest move is a tenth variant named for that class,
     /// not a wider payload here.
     #[error("embedding provider unavailable [{0}]")]
     Unavailable(String),
@@ -196,7 +201,9 @@ pub enum EmbedError {
     /// An artifact that **is** readable is not loadable as a model by any runtime this build has.
     ///
     /// Distinct from [`EmbedError::ArtifactUnreadable`]: there the bytes could not be reached, here they
-    /// were reached and meant nothing. Nothing raises it yet — R6b1's loader does — and it is deliberately
+    /// were reached and meant nothing. `local_model::load` raises it when llama.cpp returns null — bad magic, an unknown
+    /// architecture, or a file whose tensor data runs past its end (measured: a 310 MB artifact truncated to
+    /// 128 MiB comes back null rather than aborting) — and it is deliberately
     /// not the home for a runtime's own diagnostic text: §3 keeps "runtime error with a bounded message"
     /// as its own class, and giving that a payload no runtime has produced yet would be a variant written
     /// backwards.
@@ -232,12 +239,15 @@ pub enum EmbedError {
     /// or absurd width must be **reported**, not narrowed into a `usize` that would print something else —
     /// the reasoning [`ModelRow`] gives for its own column types.
     #[error(
-        "the model row declares {provider} dimensions but this run needs {configured}; refused before any write, because one model id cannot mean two widths"
+        "the model declares {provider} dimensions but this run needs {configured}; refused before any write, because one model id cannot mean two widths"
     )]
     ProviderDimMismatch {
         /// The width the caller asked this provider to serve.
         configured: usize,
-        /// The width the installed row declares, verbatim from the database.
+        /// The width the model itself answers with (`llama_model_n_embd_out`), or the installed row's `dim` when
+        /// the refusal came from a provider built against a row. Not always "from the database": R6b1's loader
+        /// raises this before any row is consulted, so the sentence below says "the model declares", not
+        /// "the row declares" (R6b1 review P2-3).
         provider: i64,
     },
 }

@@ -11,7 +11,10 @@
 //!
 //! What this module owns is therefore exactly the unsafe part: who holds the two C handles, in what order they
 //! die, and which refusals happen before anything is allocated. [`load`] is the only place in the crate that
-//! calls `llama_model_load_from_file`, and `LoadedModel`'s `Drop` the only place that frees either handle.
+//! calls `llama_model_load_from_file`, and `LoadedModel`'s `Drop` the only place that frees the handles of a
+//! **successful** load. A refusal frees too, in two other places — [`load`]’s numbered list names them: the model
+//! on any error after it was loaded, and the context when pooling is refused. Reading `Drop` as the only free site
+//! makes those two look like double frees; they are not (R6b1 review P2-2).
 //!
 //! ## Two facts about the artifact this was measured against
 //!
@@ -477,13 +480,31 @@ mod tests {
 
     /// A path with an interior NUL cannot be named to C. Refused as unreadable, before any syscall and long
     /// before any panic — this is the input most likely to arrive from a hand-edited config or a corrupt row.
+    ///
+    /// The assertion that matters is *which* refusal: `fs::metadata` on such a path also yields
+    /// `ArtifactUnreadable`, so deleting the `CString` guard would keep a variant-only test green. Pinning our own
+    /// message text (`"path contains a NUL byte"`, `InvalidInput`) is what distinguishes our ordering claim from a
+    /// std error we never intended to produce (R6b1 review P2-5).
     #[test]
     fn a_path_that_cannot_be_named_to_c_is_refused() {
         let path = PathBuf::from("inner\0.gguf");
         let problem = load(&path, 768).expect_err("a NUL inside a path cannot name a file");
         match problem {
-            EmbedError::ArtifactUnreadable { path: named, .. } => {
+            EmbedError::ArtifactUnreadable {
+                path: named,
+                source,
+            } => {
                 assert_eq!(named, path, "the refusal names the path the caller gave");
+                assert_eq!(
+                    source.kind(),
+                    io::ErrorKind::InvalidInput,
+                    "our own guard fires, not a syscall that happened to fail: {source}"
+                );
+                assert_eq!(
+                    source.to_string(),
+                    "path contains a NUL byte",
+                    "the message is ours — std's nul-byte error would read \"data provided contains a nul byte\""
+                );
             }
             other => panic!("expected an unreadable-artifact refusal, got {other:?}"),
         }

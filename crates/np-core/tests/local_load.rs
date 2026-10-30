@@ -1,12 +1,16 @@
 //! R6b1's claim about a **real** GGUF: llama.cpp v0.8.0 loads `embeddinggemma-2-Q8_0.gguf` through our own
 //! FFI, and the numbers it answers with are the numbers in that file's header.
 //!
-//! Four of these tests need nothing but the feature and run on every `local-model` CI row: two refusals that
-//! never reach a model file (an absent path, a directory), one that reaches llama.cpp with bytes that mean
-//! nothing, and the wrong-declared-width case once an artifact is present. The rest are **artifact-gated** on
-//! `NP_TEST_MODEL_PATH`, and when that variable is unset they print `NOT COVERAGE` and pass — F18's rule: an
-//! absent 310 MB file must not look like a failure, and must not look like coverage either. There is no
-//! `#[ignore]` here, because an ignored test is exactly the silent skip that rule exists to forbid.
+//! **Three** cases need nothing but the feature and run on every `local-model` CI row: two refusals that never
+//! reach a model file (an absent path, a directory), and one that reaches llama.cpp with bytes that mean nothing.
+//! Everything else is **artifact-gated** on `NP_TEST_MODEL_PATH` — four cases: the real-file facts, the
+//! wrong-declared-width refusal, the three-round load/drop cycle, and the truncated-artifact refusal — and when
+//! the variable is unset each prints `NOT COVERAGE` and passes. F18's rule: an absent 310 MB file must not look
+//! like a failure, and must not look like coverage either. There is no `#[ignore]` here, because an ignored test
+//! is exactly the silent skip that rule exists to forbid.
+//!
+//! Counted plainly because the CI row is where this distinction matters: on GitHub there is no artifact, so the
+//! width refusal and every real number are measured locally, not there.
 //!
 //! ```text
 //! NP_TEST_MODEL_PATH=/path/to/embeddinggemma-2-Q8_0.gguf \
@@ -24,7 +28,7 @@
 mod loading {
     use std::error::Error;
     use std::fs;
-    use std::io::Write;
+    use std::io::{self, Read, Write};
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard};
     use std::time::Instant;
@@ -132,10 +136,15 @@ mod loading {
             "`gemma-embedding2.context_length` is 262 144 — above `MAX_EMBEDDING_TOKENS`, which §5 keeps open"
         );
         assert!(
-            facts.n_vocab > 200_000,
+            facts.n_vocab == 262_144,
             "the pinned artifact declares a 262 144-entry vocabulary, got {}",
             facts.n_vocab
         );
+        // Pinned exactly rather than as "> 200 000", and with this note attached on purpose: this artifact answers
+        // **262 144 for both `n_ctx_train` and `n_vocab`**, so no assertion on either value can catch the two
+        // accessors being swapped — even an exact one. Catching that needs a second artifact whose two numbers
+        // differ, which is a reason to keep `crates/np-core/tests/probes/model_load_probe.c` around: it prints both
+        // from C, so a Rust-side swap shows up as a disagreement between the two programs rather than as a pass.
         assert_eq!(
             facts.pooling,
             Pooling::Mean,
@@ -268,12 +277,56 @@ mod loading {
         );
     }
 
+    /// An interrupted download or a moved `.part` file produces exactly this shape: valid GGUF metadata, tensor
+    /// data that runs past the end of the file. Measured on this host (2026-10-30) because `load`'s doc promises the
+    /// refusal and nothing tested it: llama.cpp logs `tensor 'token_embd.weight' data is not within the file bounds`
+    /// and **returns null** — it does not `GGML_ABORT`, so the process survives and the caller gets a typed refusal.
+    ///
+    /// Costs 128 MiB of temp space for the duration of the case, on the same filesystem as the artifact's own
+    /// directory when that is writable, else in the temp dir. Deleted before returning.
+    #[test]
+    fn an_incomplete_artifact_is_refused_rather_than_aborting() {
+        let source = artifact_or_not_coverage!();
+        let _serial = artifact_lock();
+
+        let dir = tempfile::tempdir().expect("a temp dir for the truncated copy");
+        let truncated = dir.path().join("truncated.gguf");
+        const KEEP: u64 = 128 * 1024 * 1024;
+
+        let mut from = fs::File::open(&source).expect("the artifact opens for reading");
+        let mut to = fs::File::create(&truncated).expect("a writable temp file");
+        // `&mut File` is itself a `Read`, so `take` needs no `by_ref` — whose name is ambiguous here because
+        // both `Read` and `Write` are in scope for `File`.
+        let mut head = (&mut from).take(KEEP);
+        io::copy(&mut head, &mut to).expect("128 MiB copies");
+        drop(to);
+
+        let problem = local_model::load(&truncated, DIM)
+            .expect_err("a file whose tensors run past its end must be refused, not loaded");
+        match &problem {
+            // The point of the case: refusal #2 (reached and meant nothing), not a panic and not a hang.
+            EmbedError::ArtifactNotLoadable { path } => {
+                assert_eq!(path, &truncated, "the refusal names the incomplete file");
+            }
+            other => {
+                panic!("expected a not-loadable refusal for a truncated artifact, got {other:?}")
+            }
+        }
+
+        fs::remove_file(&truncated).expect("the truncated copy is deleted");
+    }
+
     /// Load and release the real artifact three times in one process, asserting the same facts each round.
     ///
     /// This is the crash test for ownership: a double free or a use-after-free in `LoadedModel`'s `Drop`, or a
     /// model freed while its context still points at it, shows up here as SIGABRT or a segfault rather than as
-    /// a theory about drop order. Repeated loads also answer the practical question §3's "one load per process"
-    /// rule is judged against — a leak would make the second or third round fail with an allocation refusal.
+    /// a theory about drop order.
+    ///
+    /// **What it cannot do is detect a leak.** A `Drop` that freed nothing would print three identical fact sets,
+    /// grow the `ROUND` lines, and pass: three leaked loads cost ~1.2 GB against ~6 GB available, and most of what
+    /// a load touches is mapped weights, i.e. reclaimable. §14's rule against memory thresholds (a bound on a
+    /// page-cache-dependent number is a flake factory) means the growth is printed for a human to read, not asserted.
+    /// Crash detection and idempotent facts are the coverage; say so rather than implying more (R6b1 review P2-1).
     #[test]
     fn loading_and_dropping_three_times_costs_the_same_each_time() {
         let path = artifact_or_not_coverage!();

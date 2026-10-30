@@ -601,65 +601,26 @@ getting too big". That closes shape B — and the measurements below are why B t
 
 ### Measured on this host, no root
 
-| Fact | Value | How |
-| --- | --- | --- |
-| cmake without root | works: Kitware 3.30.5 tarball, 51 MB, unpacked to `~/tools/cmake` | `curl -L … && tar xzf` (apt candidate exists but `sudo -n` needs a password) |
-| llama.cpp pinned revision | **v0.8.0** (released 2026-10-28), tarball 38,680,037 B, `sha256 = 51b1e025d7b12e83fa55736e65bc254acd9d23e49f546be7531368fef82210ee` | GitHub release tarball |
-| Does that revision know the architecture? | **yes** — its arch enum contains `LLM_ARCH_GEMMA_EMBEDDING2` alongside `GEMMA_EMBEDDING`, `GEMMA4`, `GEMMA3N` | grep of the unpacked tree |
-| Build time here | **23 s** for target `llama` at `-j 14` (plus a 17 s configure) | `cmake --build build --target llama` |
-| Static archives | `libllama.a` **10.0 MB**, `libggml-cpu.a` 1.4 MB, `libggml-base.a` 1.3 MB → ~13 MB of archives; build dir 32 MB, source tree 214 MB | `ls -la build/**/lib*.a` |
-| Today's binary, for scale | `np` release **5.5 MB stripped** (6.7 MB unstripped) | `cargo build --release && strip` |
-| C++ toolchain | g++ 15.2 present; `clang` absent but **libclang 21 is installed** (`/usr/lib/x86_64-linux-gnu/libclang-21.so.21`) | probe |
-
-So the honest reading of "blow up the package a little": static-linking the referenced objects of ~13 MB of archives lands `np` somewhere
-around **15–20 MB**, against 5.5 MB today. That is worth it for local inference, and §14 sets a ceiling rather than trusting taste:
-**≤ 40 MB stripped per platform binary**, measured and printed by the release workflow from R6d on. The headroom is not padding — mtmd
-(R7c) would be linked in later under the same budget, and if it breaks the ceiling that is a decision to bring back to you, not one a round
-makes quietly.
-
-### Why not the pinned Rust binding (`llama-cpp-2` / `llama-cpp-sys-2`)
-
-Three independent reasons, each verified rather than recalled:
-
-1. **It cannot be given our source.** `build.rs` imports `cmake::Config` and always compiles *its own* vendored tree; the env vars it reads
-   are debug/profile/backend/SDK paths. There is no `SOURCE_DIR`-style override, and `dynamic-link` only sets `BUILD_SHARED_LIBS=ON` — it
-   still builds the vendored copy. So we would be shipping a fork of the `-sys` crate to change one directory.
-2. **Its vendored tree is the wrong revision anyway**: no `LLM_ARCH_GEMMA_EMBEDDING2` (§13), and 0.1.160 is the newest published version.
-3. **It drags bindgen into every build**, i.e. a libclang dependency on three OSes, plus `bindgen 0.72`/`cc`/`cmake` build-dependencies and
-   their own breakage surface — to save us from declaring the handful of C functions we actually call.
-
-### The shape R6b0 implements
-
-- **Pin the source, don't commit it.** `third_party/llama-cpp.toml` records tag `v0.8.0`, the tarball URL and that sha256. A fetch step
-  verifies the digest before unpacking — the same discipline `np models install` applies to a model artifact, applied to our own dependency.
-  `NP_LLAMA_CPP_SRC=/path/to/source` overrides for offline and CI-cached builds; **no network during `cargo build` by default**, because a
-  build that quietly reaches out is a build that fails in the ways we cannot reproduce.
-- **Our own `build.rs`, behind `local-model`.** Configures with the options that keep the binary small (`LLAMA_CURL=OFF`, tests/examples/app/
-  tools/UI off), builds target `llama`, static-links. If cmake is missing it **refuses with a sentence naming `CMAKE` and the tag**, never
-  silently compiles the feature out — a release that quietly loses inference is worse than one that fails loudly.
-- **Hand-written `extern "C"` declarations, no bindgen.** llama.cpp's public API is C (`include/llama.h`), pointers are opaque to us, and the
-  surface R6b1 needs is small: model load/AUTO device, `model_n_vocab/n_ctx_train`, tokenize, batch set logits, `decode`,
-  `get_embeddings_seq`/`_dbg`, free. Each declaration gets a comment naming what it does to memory, because that is where the unsafety lives.
-- **Per-OS honesty.** Linux is proven here (23 s build). Windows and macOS are *not* claimed: MSVC needs `LLAMA_STATIC_CRT` thought-through
-  and the release matrix builds it; §2's four-step feature job runs on Linux first, and the Windows feature row lands when someone has seen it
-  green — F18's rule, unchanged.
-
-### What it costs to open the model (R6b1, measured 2026-10-30)
-
-§13 priced the *package*; nobody had priced the *act of loading*, which is the number a laptop user actually feels. Measured on this
-host (7.4 GB total, ~6 GB available, no swap) against the artifact of §5's table, through the archives this section's build produces:
+All figures re-measured on 2026-10-30 on this host and reproducible: the Rust side is
+`cargo test -p np-core --features local-model --test local_load -- --nocapture [--test-threads=1]`, the C side is
+`crates/np-core/tests/probes/model_load_probe.c` (committed precisely so the "Rust costs nothing over C" sentence below
+has a C number to be compared against; build line in that file's header). **Memory is MiB** — `VmHWM`/`VmRSS` from
+`/proc/self/status`, which are KiB, divided by 1024.
 
 | Fact | Value | How |
 | --- | --- | --- |
-| Load, warm page cache | **0.35 s** (0.30 s on repeat loads) | `llama_model_load_from_file` timed around one call |
-| Load, after evicting the artifact from the page cache | **0.42 s** | `posix_fadvise(POSIX_FADV_DONTNEED)` first, then the same call — so the disk read is ≈ 0.07 s of it |
-| Peak RSS, bare C loader probe | **429,504–431,760 kB (≈ 420 MB)**; 391 MB resident with the model open, 104 MB after both frees | `VmHWM` in `/proc/self/status`, and `/usr/bin/time -v` agreeing to within 256 kB |
-| Peak RSS, our own test process, loads serialized | **431,268 kB**; one load moves resident memory **130,832 → 417,124 kB** | the same field read by `tests/local_load.rs` and printed with `--nocapture --test-threads=1` — i.e. the Rust side costs nothing over the C probe |
-| The same suite on libtest's default threads | **538,560 kB**, ~107 MB higher | two artifact cases in flight share one process-wide `VmHWM`. Measured first, then fixed by holding a mutex across loads: an unattributed peak is a worse number than a serialized one |
-| Three load-and-drop cycles in one process | peak moves **+232 kB** total, no growth per round, no crash | `loading_and_dropping_three_times_costs_the_same_each_time`, serialized run |
-| Context on top of the model | **+1.8 MB** resident at `n_ctx = 4096` | same probe; the KV cache is not what dominates — the weights are |
+| Load, warm page cache | **0.35 s** first call, 0.30 s on repeats | C probe and the Rust test agree to ~0.05 s; `llama_model_load_from_file` timed around one call |
+| Load, artifact evicted from our page-cache view | **0.44 s** | the probe's `--drop-cache`: `posix_fadvise(POSIX_FADV_DONTNEED)` on the file first — no root needed to evict one file's pages, so this is "cold from our side"; the block layer may still hold them, and the honest reading is that the disk read costs ≈ 0.1 s |
+| Peak RSS, bare C loader probe (warm) | **419.4 MiB** (5.0 MiB before → 419.4 MiB with the model open) | `model_load_probe`, no Rust runtime in the process |
+| Peak RSS, our test process, loads serialized | **421.1 MiB**; one load moves resident memory 127.8 → 407.4 MiB (+**279.6 MiB**) | `--test-threads=1`, printed per round with `--nocapture` |
+| Rust over C, same artifact | **+1.7 MiB** | 421.1 − 419.4. Not "nothing": earlier prose here said the Rust side cost nothing, which was a rounding of an unattributed pair. It is ~0.4% of the load, and it is now a number rather than an adjective |
+| The same suite on libtest's default threads | **523.8 MiB** peak — *not attributable to one load* | concurrent artifact cases share one process-wide `VmHWM`. Loads are serialized by a mutex in the test so the headline figure means something; an unattributed peak is a worse number than a serialized one |
+| Three load-and-drop cycles, serialized | open-state RSS 407.5 MiB on all three rounds (±28 KiB), peak moves +164 KiB total, no crash | `loading_and_dropping_three_times_costs_the_same_each_time`. This detects double-free/UAF by crashing; it does **not** detect leaks (see the test's own doc) |
+| Context on top of the model | **+1.8 MiB** resident at `n_ctx = 4096` | same probe; the KV cache is not what dominates — the weights are |
+| Independent cross-check of the FFI mirror | C prints `n_embd_out 768, n_embd_inp 512, n_ctx_train 262144, vocab 262144, pooling 1`; Rust's `ModelFacts` prints the same five numbers | two programs, one artifact: a wrong struct field in our mirror shows up as a disagreement rather than as a green suite |
 
-Two readings worth writing down. First, **~420 MB to open a model is a real prototype constraint** — it is not the 40 MB package ceiling
+
+Two readings worth writing down. First, **~420 MiB to open a model is a real prototype constraint** — it is not the 40 MB package ceiling
 this section argued about, and on an 8 GB laptop with a browser open it is the difference between "indexes in the background" and "swap
 begins". R6d's benchmark should treat peak RSS as a headline number beside tokens/sec, and §3's "one load per process, never per note"
 went from a tidiness rule to the thing keeping the host responsive. Second, resident memory moves *with* the open model rather than with

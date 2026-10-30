@@ -236,8 +236,14 @@ extern "C" {
 
     /// The vocabulary inside a model.
     ///
-    /// Memory: owned by `model`, valid as long as the model is, never freed on its own. Passing null is
-    /// accepted by llama.cpp but returns null.
+    /// Memory: owned by `model`, valid as long as the model is, never freed on its own.
+    ///
+    /// **`model` may not be null.** v0.8.0's body is `return &model->vocab;` (`src/llama-model.cpp:3406-3408`) —
+    /// no check — so a null in produces a *non-null pointer to nowhere*, not null: a caller that guards on
+    /// "returns null" would pass its own guard and then dereference inside [`llama_vocab_n_tokens`]. We never
+    /// reach that because the only handle here comes from a `NonNull` model ([`crate::local_model`] refuses a
+    /// load that answered null). R6b0 review P1-1's lesson, applied to prose: this entry used to claim llama.cpp
+    /// accepts null, and it does not.
     pub fn llama_model_get_vocab(model: *const llama_model) -> *const llama_vocab;
 
     /// Trained context window — a fact about the artifact (§5's token ceiling reads this rather than a
@@ -268,9 +274,10 @@ extern "C" {
     ///
     /// Not the deprecated `llama_add_bos_token`, which v0.8.0 keeps alive with the same behaviour
     /// (`include/llama.h:1251`): declaring both would make the wrong spelling reachable without a compile
-    /// error. `vocab` may be null
-    /// (llama.cpp checks), but we never pass null — see [`crate::local_model`]'s refusal when the model
-    /// exposes no vocabulary at all.
+    /// error. **`vocab` may not be null:** `src/llama-vocab.cpp:4768-4774` is `return vocab->get_add_bos();` and
+    /// the same for EOS, both unconditional dereferences — the header's silence is not a null contract. We never
+    /// pass null: the only vocabulary handle in this crate comes from a live model (see
+    /// [`crate::local_model`]’s `read_numbers`, which reads all three vocab facts while the model is alive).
     pub fn llama_vocab_get_add_bos(vocab: *const llama_vocab) -> bool;
 
     /// Whether a tokenisation request with `add_special = true` appends the EOS token. Same owner and same

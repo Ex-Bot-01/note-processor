@@ -95,14 +95,17 @@ jobs:
         run: cargo doc --locked -p np-core --features local-model --no-deps
       # `--lib` alongside the link-proof test: the struct-layout pins in `src/llama_ffi.rs` only compile
       # with the feature on, and a wrong field order is an unsound memory bug rather than a compile
-      # error. §2 step 4 wants skipped work printed as `NOT COVERAGE`; nothing here may skip - the link
-      # proof has no artifact gate and no env-var escape, so a green run means llama.cpp was called.
+      # error. §2 step 4 wants skipped work printed as `NOT COVERAGE`. `local_runtime.rs` cannot skip at all -
+      # no artifact gate, no env-var escape - so a green run there means llama.cpp was called.
       #
-      # `--test local_load` is here so R6b1's loader compiles and runs on this row. Honest about what it
-      # proves there: the runner has no 310 MB artifact and `NP_TEST_MODEL_PATH` is unset, so the two
-      # artifact-gated cases print `NOT COVERAGE` and pass - the real-file numbers are measured locally, not
-      # on GitHub. What this row does cover without a model file is every refusal (`local_load.rs` names
-      # which ones), and that `LoadedModel`'s drop order is exercised at all would need the artifact.
+      # `--test local_load` is here so R6b1's loader compiles and runs on this row. What it does NOT prove on a
+      # runner: the runner has no 310 MB artifact, so **three** of its six cases print `NOT COVERAGE` and pass -
+      # the real-file facts (768/512/262144/MEAN), the declared-vs-actual width refusal, and the three-round
+      # load/drop cycle. Those are measured locally with `NP_TEST_MODEL_PATH` set.
+      # What this row does cover without a model file: the two pre-runtime refusals (absent path, directory),
+      # the runtime's own bad-magic refusal (bytes reach `llama_model_load_from_file` and come back null), and
+      # the module's synthetic unit tests for pooling/positive-count refusals. Say it that plainly because
+      # "every refusal" was false: every `Unavailable` arm and the width refusal need an artifact.
       - name: Link proof
         run: cargo test --locked -p np-core --features local-model --lib --test local_runtime --test local_load
       # "A green run means llama.cpp was called" is only worth saying if the run can also say *which* llama.cpp.
