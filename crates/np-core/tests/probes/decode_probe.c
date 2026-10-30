@@ -1,0 +1,157 @@
+/*
+ * The decode-side companion to `model_load_probe.c`: one forward pass through our own pinned archives, so the
+ * three numbers §14 of `docs/design-m2-local-embeddings.md` quotes for a *running* model have a C answer beside
+ * the Rust one. Committed for the same reason its sibling is — so that "measured" means reproducible.
+ *
+ * What it prints, and why each line exists:
+ *
+ *   MEMPROBE   `llama_get_memory(ctx)` — NULL proves this architecture has no KV cache, i.e. that
+ *              `llama_context::decode` diverts to `encode` (`src/llama-context.cpp:1845-1847`) and the assert that
+ *              a long sequence would hit is the encoder's at `:1631`, not the decoder's at `:1918`/`:1920`. Also
+ *              prints `llama_n_threads{,_batch}`, which is how ~392% CPU happens with `GGML_OPENMP=OFF`.
+ *   PROBE      token count, `llama_decode`'s return code, whether a pooled row came back, its raw L2 length (the
+ *              reason R6b2 normalises: it is ≈184–220 here, never 1), and peak RSS before/after the pass.
+ *
+ * Build (archives from a `--features local-model` build of np-core; see `model_load_probe.c` for the same line):
+ *
+ *   B=$(ls -dt target/debug/build/np-core-HASH/out/llama-cpp-llama | head -1) && \
+ *   gcc -O2 -o /tmp/decode_probe crates/np-core/tests/probes/decode_probe.c \
+ *     -I .vendor/llama.cpp-v0.8.0/include -I .vendor/llama.cpp-v0.8.0/ggml/include \
+ *     "$B"/src/libllama.a "$B"/ggml/src/libggml.a "$B"/ggml/src/libggml-cpu.a \
+ *     "$B"/ggml/src/libggml-base.a -lstdc++ -lm -lpthread -ldl
+ *
+ * The unit directory is `llama-cpp-llama`, not a hash, and with `NP_LLAMA_CPP_SRC` pointing at an already-configured
+ * tree the archives live in that tree's own `build/` instead (A2 review P2-6). Archives are listed dependents-first,
+ * matching `ARCHIVES` in build.rs.
+ *
+ * **What this probe does not measure:** wall-clock time. It prints token counts, return codes, pooled norms, thread
+ * counts and RSS — throughput figures anywhere in §14 come from the Rust test, not from here (A2 review P2-7).
+ *
+ * Run:
+ *
+ *   /tmp/decode_probe /path/to/embeddinggemma-2-Q8_0.gguf 2048          # llama.cpp's own defaults
+ *   /tmp/decode_probe /path/to/embeddinggemma-2-Q8_0.gguf 2048 wide     # n_ctx = n_batch = n_ubatch = 4096
+ *   /tmp/decode_probe /path/to/embeddinggemma-2-Q8_0.gguf 512 --drop-cache   # evict our page-cache view first
+ *
+ * `wide` is what `local_model::load` does. Without it a sequence over 512 tokens **aborts the process**
+ * (`GGML_ASSERT` → `GGML_ABORT`, live under NDEBUG) — that is the bug this probe was written to demonstrate, and
+ * exit status 134 from the first form is the expected result, not a broken probe.
+ */
+/* `open`/`posix_fadvise` need the GNU extensions; without this a `-std=c11` build turns that call into an
+ * implicit declaration. The sibling probe does the same. */
+#define _GNU_SOURCE 1
+#include "llama.h"
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static long vmhwm(void) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "VmHWM:", 6)) { kb = atol(line + 6); break; }
+    }
+    fclose(f);
+    return kb;
+}
+
+int main(int argc, char ** argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s model.gguf n_tokens [wide] [nctx=N] [--drop-cache]\n", argv[0]);
+        return 2;
+    }
+    const char * path = argv[1];
+    int want = atoi(argv[2]);
+    int wide = 0, drop_cache = 0;
+    /* The width asked of the context, applied to n_ctx, n_batch and n_ubatch together — the shape `local_model::load`
+     * uses, because a batch wider than the built ubatch aborts the encoder path instead of returning a code. Default
+     * 4096 is what that constant was when this probe was written; `nctx=N` exists so §14 can price a different one
+     * without editing C (measured 2026-10-30 for the 8,192 ceiling: see design-m2-local-embeddings.md §5/§14). */
+    int width = 4096;
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "wide")) {
+            wide = 1;
+        } else if (!strncmp(argv[i], "nctx=", 5)) {
+            width = atoi(argv[i] + 5);
+            if (width <= 0) {
+                fprintf(stderr, "nctx= wants a positive integer, got: %s\n", argv[i]);
+                return 2;
+            }
+            wide = 1; /* same shape as load(): all three numbers move together */
+        } else if (!strcmp(argv[i], "--drop-cache")) {
+            drop_cache = 1;
+        } else {
+            /* A typo'd `wide` would otherwise reproduce the narrow case — exit 134, an abort — with no hint that
+             * the flag was never read. Fail loudly rather than misreport which configuration ran. */
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 2;
+        }
+    }
+
+    /* Evict our own view of the artifact first (no root needed for one file's pages). The block layer may still
+     * hold them, so read this as "cold from our side", the same caveat §14 attaches to the load figures. */
+    if (drop_cache) {
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* advisory, best effort: may fail on some FS */
+            close(fd);
+        }
+    }
+
+    struct llama_model_params mp = llama_model_default_params();
+    struct llama_model * m = llama_model_load_from_file(path, mp);
+    if (!m) { fprintf(stderr, "load refused\n"); return 1; }
+
+    struct llama_context_params cp = llama_context_default_params();
+    cp.embeddings = true;
+    cp.n_ctx = (uint32_t)width;
+    if (wide) { cp.n_batch = (uint32_t)width; cp.n_ubatch = (uint32_t)width; }
+    struct llama_context * c = llama_init_from_model(m, cp);
+    if (!c) { fprintf(stderr, "ctx refused\n"); return 1; }
+
+    /* Requested **and** built widths, side by side: `include/llama.h:575-581` warns they can differ, and the encoder's
+     * no-abort argument rests on the built `n_ubatch` (A1 review P1-1). If these two ever disagree here, so does the
+     * Rust side's readback. */
+    printf("MEMPROBE: memory=%p n_threads=%d n_threads_batch=%d (wide=%d requested_nctx=%d built n_ctx=%u built n_ubatch=%u)\n",
+           (void *)llama_get_memory(c), llama_n_threads(c), llama_n_threads_batch(c), wide, width,
+           llama_n_ctx(c), llama_n_ubatch(c));
+    fflush(stdout);
+
+    const struct llama_vocab * v = llama_model_get_vocab(m);
+    static const char unit[] =
+        "The quick brown fox jumps over the lazy dog while the rain falls softly on the roof. ";
+    llama_token * tok = calloc((size_t)want + 8, sizeof(llama_token));
+    int n = 0;
+    while (n < want) {
+        int32_t r = llama_tokenize(v, unit, (int32_t)strlen(unit), tok + n, want + 8 - n, false, false);
+        if (r <= 0) { fprintf(stderr, "tokenize returned %d\n", r); break; }
+        n += r;
+    }
+    /* Measure **inside** the window this run asked for. Feeding more tokens than the built `n_ubatch` does not return a
+     * code on the encoder path, it aborts (`src/llama-context.cpp:1631`) — true, but not a measurement, so the cap
+     * follows `nctx=` rather than being pinned to 4,096 and silently making an 8,192 run impossible to take. */
+    if (n > width - 1) {
+        fprintf(stderr, "capped %d -> %d tokens to fit nctx=%d\n", n, width - 1, width);
+        n = width - 1;
+    }
+
+    long before = vmhwm();
+    struct llama_batch b = llama_batch_get_one(tok, n);
+    int rc = llama_decode(c, b);
+    const float * e = llama_get_embeddings_seq(c, 0);
+    double norm = 0;
+    if (e) { for (int i = 0; i < 768; i++) norm += (double)e[i] * (double)e[i]; }
+
+    printf("PROBE %s n=%d rc=%d emb=%s raw_norm=%.6f peak_rss %ld -> %ld kB\n",
+           wide ? "wide" : "default", n, rc, e ? "ok" : "NULL",
+           e ? __builtin_sqrt(norm) : -1.0, before, vmhwm());
+
+    llama_free(c);
+    llama_model_free(m);
+    free(tok);
+    return rc == 0 && e ? 0 : 1;
+}

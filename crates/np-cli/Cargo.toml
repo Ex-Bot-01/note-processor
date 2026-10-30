@@ -8,6 +8,16 @@ description = "note-processor command line interface"
 name = "np"
 path = "src/main.rs"
 
+[features]
+# `local-model` belongs to np-core, the crate that owns the FFI and the C++ build. This passthrough exists for
+# one reason: §14's "the binary must stay under ~40 MB" is a claim about the artifact a user downloads, so it
+# has to be measured on `np` itself rather than on a synthetic example that leaves clap out. Default **off** —
+# the shipped binary links no C++ (§9) — and note what that does *not* mean: no `np` command reaches `embed` or
+# `local_model` yet, so it is the provider *type* that answers `RuntimeNotBuilt`, not any subcommand; R6c adds the
+# command. The default CI row must keep proving
+# exactly that.
+local-model = ["np-core/local-model"]
+
 [dependencies]
 clap = { workspace = true }
 np-core = { path = "../np-core" }

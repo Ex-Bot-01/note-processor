@@ -7,3 +7,6 @@
 # between writing the temporary and renaming it.
 tests/fixtures/corpus/INDEX*.md
 tests/fixtures/corpus/INDEX*.tmp
+# The pinned llama.cpp source, fetched once by scripts/vendor-llama-cpp.sh (§14). Never committed,
+# and never fetched by cargo: build.rs only ever reads a directory that already exists.
+/.vendor

@@ -68,6 +68,66 @@ impl From<rusqlite::Error> for ConfigError {
 /// (`docs/design-f17-indent-clamp.md` §4).
 pub const MAX_CONTINUATION_INDENT: usize = 16;
 
+/// `[embeddings] max_tokens` when the key is absent (`docs/design-m2-local-embeddings.md` §5).
+///
+/// The default is a *budget*, not a target: an over-budget chunk is reported, never truncated (§5), so the
+/// number has to sit above what the chunker normally produces while still being a fence. **1,024** is the human's
+/// decision of 2026-10-30 (design §5, "decision B"), taken from R6b2's measured cost curve rather than from an
+/// argument: at ~120–141 tokens/s a 1,024-token chunk is **~8 s** of CPU on this host — interpolated between the
+/// two measured points (543 tok / 3.85 s and 2,163 tok / 18.0 s), so quote it as an interpolation, not a
+/// measurement — while a whole corpus at ~500 tokens per note stays near the faster end of that curve. It also
+/// leaves room for `prefix_doc` plus two special tokens on top of a `MAX_CHUNK_BYTES = 1800` chunk, which is what
+/// the old 2048 was justified by; nothing about the chunker changed, so this is now slack rather than headroom.
+///
+/// Raising it is cheap to do and expensive to run: the number is a config key, so **nothing here blocks a later
+/// increase** — what §5 asks for first is a re-measurement (R6d's throughput run with OpenMP decided), not a
+/// constant edit.
+pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
+
+/// Largest `embeddings.max_tokens` a config file may ask for: **8,192 tokens**, which is the width of the context
+/// this build asks llama.cpp for (`local_model::REQUESTED_CTX`), not a fact about any model card.
+///
+/// **Set by the human on 2026-10-30, superseding the same day's §5 option B (4,096) with option C.** What did not
+/// change is the rule that made B worth having: **the ceiling equals the window this build creates**, so a config
+/// value near the ceiling describes something the runtime can actually do. Raising the number alone would have
+/// re-opened the exact defect B closed — `max_tokens = 8192` parsing happily and then being refused by a different
+/// sentence, because the context was only 4,096 wide — so `REQUESTED_CTX` moved with it, and the compile-time
+/// assertion under that constant is what keeps the pair from drifting apart again.
+///
+/// The price of 8,192, measured on this host the same afternoon (`tests/probes/decode_probe.c nctx=8192`, §14):
+///
+/// * **an 8,192-wide context costs nothing until something long runs through it** — with a 133-token sequence the peak
+///   is 429,248 kB against a 429,528 kB model-open baseline, i.e. +0 MiB. The compute buffer is *touched* per forward
+///   pass, not reserved per window;
+/// * **a chunk near the ceiling costs about a gigabyte and about ninety seconds**: 7,999 tokens decoded rc 0 with peak
+///   RSS **1,478 MiB (+1,058 MiB over baseline)** in 101 s — ~79 tok/s, continuing the falling rate (141 at 543,
+///   120 at 2,163). That is a per-chunk commitment, not a per-note one: `DEFAULT_EMBEDDING_TOKENS` stays 1,024, and
+///   `MAX_CHUNK_BYTES = 1800` keeps ordinary prose near 500 tokens;
+/// * the window really is built as asked here — the probe reads back `n_ctx = 8192`, `n_ubatch = 8192` from the
+///   context, which is the A1 review P1-1 pair this build now checks in Rust too.
+///
+/// Earlier versions of this constant cited Google's `embeddinggemma-2` card (8,192) and before that
+/// `max_position_embeddings = 262144`, a RoPE/train-length property the design disowned (§5). Both were the wrong
+/// *kind* of authority: what a model was trained on says nothing about what one embedding run can hold. The card's
+/// number is now recorded in §5 as context for a long-note experiment, not as a bound we enforce.
+///
+/// The budget counts **what the model sees** — `prefix_doc` + chunk text + special tokens, because
+/// `include_prompt = true` means the counted sequence is not just our bytes — so a caller near this ceiling has to
+/// leave room for the prefix and specials too. [`crate::chunk`] caps a chunk at `MAX_CHUNK_BYTES = 1800`, which makes
+/// a four-digit-token sequence unlikely for prose; **unlikely is the whole claim** (§5's holes are named there:
+/// normalisation can expand bytes, `decode` emits U+FFFD runs, prefix and specials cost tokens from no chunk bytes).
+/// R6d measures bytes-per-token on this corpus.
+///
+/// Three honest limits on the number itself. **(1) It is a global constant doing a per-model job**: 8,192 happens to
+/// be *this* build's window, and a spec-named fallback (MiniLM, ~512 tokens) needs a smaller bound — so the follow-up
+/// stays exactly as §5 wrote it, move the check beside the provider. **(2) It is now coupled to a build choice**, which
+/// is why `local_model` carries a compile-time assertion that `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX`: raising one
+/// without the other either produces budgets that cannot run or a window nobody can reach, and neither should be
+/// discovered by a user. **(3)** It is a load-time fence over *configured* numbers only; R6b2 enforces it over real
+/// token counts, including prefix and specials. Posture unchanged from [`MAX_CONTINUATION_INDENT`] (F17 §4): enforce
+/// at load, refuse rather than clamp.
+pub const MAX_EMBEDDING_TOKENS: usize = 8_192;
+
 /// How the catalog (`INDEX.md` and its shards) is laid out.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -108,23 +168,43 @@ pub enum EmbeddingProvider {
     /// behaviour for anyone who has not chosen a model (§2) — not a stub awaiting a real one.
     #[default]
     None,
-    /// A model running inside this process (`local-model`). What that costs and how it is loaded is
-    /// §6's benchmark's question; nothing in this crate reads the variant yet.
+    /// A model running inside this process (`local-model`): [`crate::embed::LocalModelProvider`] is the type it
+    /// will resolve to, owning the API. The runtime exists now — `local_model` opens a GGUF and embeds through it — but
+    /// **nothing instantiates this provider from
+    /// this value yet** — the only code that reads the variant is [`Config::load`]'s own validation; the wiring
+    /// arrives with R6c. What loading one costs is §6's benchmark's question.
+    ///
+    /// Refused at [`Config::load`] unless [`EmbeddingsConfig::model`] names something `np models install`
+    /// would accept — a local provider with no identity has nothing to write `embeddings.model` under, and
+    /// guessing one would be a second source of model identity (§4).
     LocalModel,
-    /// An OpenAI-compatible HTTP endpoint. Its base URL and key arrive at runtime as
-    /// `NP_EMBED_BASE_URL` / `NP_EMBED_API_KEY` and never enter a config file (§9), so this section
-    /// holds no endpoint field to leak.
+    /// An OpenAI-compatible HTTP endpoint. **Kept parseable and refused at [`Config::load`]**, because
+    /// embeddings are local now: `docs/design-m2-embeddings.md` §10 records that the self-hosted server
+    /// exposes no embeddings route and nothing in this program dials out for a vector, so the spelling names
+    /// something no code path can satisfy.
+    ///
+    /// Deleting it instead was decided against (`docs/design-m2-local-embeddings.md` §10): an existing
+    /// `config.toml` would then fail with serde's verbatim "unknown variant" text — which
+    /// [`ConfigError::Parse`] passes through — accusing a valid file of being broken and stopping `np scan`
+    /// cold without naming a reason. F17's `continuation_indent` precedent is this exact shape: refuse at load
+    /// in our own words, naming what changed and which key to set instead.
     ///
     /// Renamed by hand because `rename_all` cannot know it: serde kebab-cases `OpenAiCompatible` into
-    /// `open-ai-compatible`, while §2 and the roadmap spell the config value `openai-compatible`. The
-    /// explicit attribute is what keeps the documented spelling the only accepted one — and
-    /// `tests/config.rs` parses every variant from a file precisely so this cannot drift.
+    /// `open-ai-compatible`, while §2 and the roadmap spell the config value `openai-compatible`. The explicit
+    /// attribute is what keeps the documented spelling the only one that reaches our refusal, and
+    /// `tests/config.rs` sends every variant through a file precisely so this cannot drift — a lost rename
+    /// turns the refusal into serde's, which that test fails on.
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
 }
 
 /// The `[embeddings]` section: which provider to ask, and the two identity fields that provider will
 /// need (`docs/design-m2-embeddings.md` §2, §7).
+///
+/// Every field has a default, and `max_tokens` is no exception: a config written before R6a keeps parsing to
+/// exactly the values it parsed to then, plus [`DEFAULT_EMBEDDING_TOKENS`] — which is the property
+/// `tests/config.rs` pins, because "adding a key must not change what an existing file means" is the half of
+/// a strict-section story that a refusal test cannot see.
 ///
 /// **`deny_unknown_fields`, unlike every other struct in this file.** That is a deliberate break with
 /// the lenient posture of [`CatalogConfig`] and [`MarkerConfig`], and §7 says why: those structs guard
@@ -133,7 +213,7 @@ pub enum EmbeddingProvider {
 /// `provider = "none"` by omission, so the file is refused instead. The strictness stops at this
 /// section's boundary: unknown keys elsewhere keep loading as they always have (`tests/config.rs`
 /// asserts both halves, because a reader of one half cannot tell a scoped rule from a global one).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingsConfig {
     /// Which provider to ask. Absent means [`EmbeddingProvider::None`].
@@ -149,11 +229,35 @@ pub struct EmbeddingsConfig {
     /// Vector width the provider must produce, in `f32` components — the number
     /// `embeddings.dim`/[`crate::embed::Vector::dim`] speaks.
     ///
-    /// Also unread so far, for the same reason as [`EmbeddingsConfig::model`]. `u16` rather than
-    /// `usize` because it is a *declared* width and the schema's `CHECK (length(vector) = 4 * dim)`
-    /// has to hold: 65 535 components is 256 KiB per row, already past any model this project would
-    /// run, so the type refuses an absurdity before a provider has to.
+    /// Still unread by any decision, and that is not this round's oversight: it becomes the `configured`
+    /// argument of [`crate::embed::LocalModelProvider::new`] when R6c wires a config to a provider, and until
+    /// then nothing can disagree with it. `u16` rather than `usize` because it is a *declared* width and the
+    /// schema's `CHECK (length(vector) = 4 * dim)` has to hold: 65 535 components is 256 KiB per row, already
+    /// past any model this project would run, so the type refuses an absurdity before a provider has to.
     pub dim: Option<u16>,
+    /// Token ceiling for one sequence handed to the model, **default
+    /// [`DEFAULT_EMBEDDING_TOKENS`]** — counted over `prefix_doc` + chunk text + special tokens, not over the
+    /// chunk's bytes alone, because `include_prompt = true` means the model sees the prefix too
+    /// (`docs/design-m2-local-embeddings.md` §5).
+    ///
+    /// An over-budget chunk is *reported*, never silently truncated: truncation would stamp the whole chunk's
+    /// digest onto a vector that read part of it. Enforcing the budget needs a tokenizer and so belongs to
+    /// R6b2; what R6a does is make the key legal, defaulted and bounded, since `deny_unknown_fields` means
+    /// this section refused it by name before this round.
+    pub max_tokens: usize,
+}
+
+/// Hand-written rather than derived, so the default `max_tokens` is one number in one place — and so a later
+/// field cannot quietly default to `0`, which this file refuses as a budget.
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            provider: EmbeddingProvider::None,
+            model: None,
+            dim: None,
+            max_tokens: DEFAULT_EMBEDDING_TOKENS,
+        }
+    }
 }
 
 /// Status markers (spec §8.7). Stored exactly as written here; later tasks match
@@ -270,6 +374,7 @@ impl Config {
                 ),
             )));
         }
+        validate_embeddings(&cfg)?;
         Ok(cfg)
     }
 
@@ -322,6 +427,81 @@ impl Config {
             .join("workspaces")
             .join(format!("{key}.{extension}"))
     }
+}
+
+/// Refuse an `[embeddings]` section that cannot be served, in our own words rather than serde's.
+///
+/// Three refusals, all travelling as `Io(InvalidData)` for the reason F17 established and
+/// [`ConfigError::Parse`]'s doc states: the TOML is *valid*, so a variant whose payload is a driver error
+/// would accuse a well-formed file of being broken — and only our own sentence can name what changed and which
+/// key to set. `Parse` stays reserved for bytes serde cannot read.
+///
+/// The checks are ordered value-first: a number outside its bounds is wrong whatever the provider says, and it
+/// is checked before the provider-specific rules so an absurd budget cannot be hidden behind a refusal about a
+/// model name.
+fn validate_embeddings(cfg: &Config) -> Result<(), ConfigError> {
+    if !(1..=MAX_EMBEDDING_TOKENS).contains(&cfg.embeddings.max_tokens) {
+        return Err(invalid_data(format!(
+            "invalid embeddings.max_tokens = {}: one embedding holds at most \
+             {MAX_EMBEDDING_TOKENS} tokens in this build — that is how wide a context it creates, not the largest \
+             the model was trained on — and the budget counts prefix + chunk + special tokens, so the value must be \
+             between 1 and {MAX_EMBEDDING_TOKENS}. Long notes are chunked; raise no key to embed one whole file",
+            cfg.embeddings.max_tokens
+        )));
+    }
+    if cfg.embeddings.provider == EmbeddingProvider::OpenAiCompatible {
+        // §10's decision: the variant stays, the capability does not. Naming both halves — what went away and
+        // what to write instead — is what makes this a refusal a user can act on rather than a regression.
+        return Err(invalid_data(
+            "embeddings.provider = \"openai-compatible\" names an HTTP endpoint provider, and embeddings are \
+             local now: nothing in np dials out for a vector. Set embeddings.provider = \"local-model\" and \
+             embeddings.model to an installed model id"
+                .to_string(),
+        ));
+    }
+    // A zero width is refused here as well as in `np models install --dim`, and for the same stated reason:
+    // migration 7's `CHECK (length(vector) = 4 * dim)` admits a zero-byte vector when `dim` is 0. R6a made this
+    // value load-bearing — it becomes [`crate::embed::LocalModelProvider::new`]'s `configured` argument — so the
+    // bound cannot live only in np-cli's `NonZeroU16`, which a config file routes around without ever parsing an
+    // argv. Refuse, do not clamp: F17's posture again.
+    if cfg.embeddings.dim == Some(0) {
+        return Err(invalid_data(
+            "invalid embeddings.dim = 0 (a zero-width model has no vector to compare; omit the key to leave the \
+             width unset)"
+                .to_string(),
+        ));
+    }
+    if cfg.embeddings.provider == EmbeddingProvider::LocalModel {
+        let Some(model) = cfg.embeddings.model.as_deref() else {
+            return Err(invalid_data(
+                "embeddings.provider = \"local-model\" needs embeddings.model to name an installed model; \
+                 none is set"
+                    .to_string(),
+            ));
+        };
+        // The id rule is `models::validate_id`'s, not a second one written here: whether an id can name an
+        // installed row at all is decided by what `np models install` would accept (§2 of that design), and a
+        // config naming something uninstallable is refused now instead of at embed time. Whether such a row
+        // *is* installed needs the workspace database, so that half stays with the caller that holds one —
+        // `db::model_row` returning `None`, and no provider constructible without a row (`embed::LocalModelProvider`).
+        if let Err(err) = crate::models::validate_id(model) {
+            let rule = match err {
+                crate::models::ModelError::InvalidId { rule, .. } => rule,
+                // `validate_id` has no other failure today; naming the value beats a claim about a rule that
+                // was not broken if that ever changes.
+                other => return Err(invalid_data(other.to_string())),
+            };
+            return Err(invalid_data(format!(
+                "embeddings.model `{model}` cannot name an installed model: {rule}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A config *value* refused as data, the way F17 refuses an oversized indent — see [`validate_embeddings`].
+fn invalid_data(message: String) -> ConfigError {
+    ConfigError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
 /// The per-workspace name: the leading `DB_HASH_BYTES` bytes of the workspace path digest, as lowercase

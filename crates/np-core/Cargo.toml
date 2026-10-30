@@ -3,6 +3,25 @@ name = "np-core"
 version.workspace = true
 edition.workspace = true
 
+# `local-model` is the gate the local inference runtime lives behind
+# (`docs/design-m2-local-embeddings.md` §2, §6, §14). It still declares no dependency crate — §14 chose
+# hand-written FFI over the pinned Rust binding precisely to avoid bindgen and its build-dependencies.
+# What it now gates is real: `build.rs` compiles the pinned llama.cpp (`third_party/llama-cpp.toml`) and
+# `src/llama_ffi.rs` mirrors that revision's C API. So the honest statement of the cost has changed:
+# with the feature off, nothing; with it on, a cmake + C++ toolchain and a source tree that
+# `scripts/vendor-llama-cpp.sh` fetched — neither of which the default build may ever need (§2's promise,
+# proven by the default gate list running with no cmake on PATH).
+#
+# The seam itself — `embed::LocalModelProvider` — still compiles in the default build on purpose, so
+# callers and CI exercise the API without paying for inference (§9 item 1).
+#
+# `cargo check --locked -p np-core --features local-model` is the fence that matters now, and it runs on
+# the Linux row only until someone has watched it go green elsewhere (§14's per-OS honesty). Release
+# builds keep the feature off until a Windows build of it is recorded in CI once (§2).
+[features]
+default = []
+local-model = []
+
 [dependencies]
 regex = { workspace = true }
 rusqlite = { workspace = true }

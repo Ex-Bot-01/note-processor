@@ -1,0 +1,83 @@
+# The llama.cpp pin, as data.
+#
+# This file answers the question "where did 10 MB of binary come from", so it records both *which*
+# source we build and *how* it is configured. Design authority: `docs/design-m2-local-embeddings.md`
+# §14 — the human's decision of 2026-10-29 to keep EmbeddingGemma-2 and own the llama.cpp build,
+# against a ceiling of **≤ 40 MB stripped per platform binary** (measured `np` without it: 5.5 MB).
+#
+# Why a pin file rather than a committed tree or a crate:
+#   * The pinned Rust binding (`llama-cpp-sys-2` 0.1.160) cannot be pointed at our source, vendors a
+#     revision without `LLM_ARCH_GEMMA_EMBEDDING2`, and drags bindgen into every build (§13, §14).
+#   * Committing 214 MB of vendored C/C++ to answer one question is worse than the question.
+# So: the source is fetched once, explicitly, by `scripts/vendor-llama-cpp.sh` — never by `cargo build`.
+#
+# Two readers parse this file and they must stay in agreement:
+#   * `scripts/vendor-llama-cpp.sh` — tag, url, sha256 (the network step).
+#   * `crates/np-core/build.rs`      — tag, the `[cmake]` table (the build step), behind `local-model`.
+# Parsing is a line scan for `key = "value"`, so keep every value a quoted string on one line.
+
+tag = "v0.8.0"
+
+# GitHub's tarball of the tag. Not a release asset: the asset list moves, the archive endpoint does not.
+url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.8.0.tar.gz"
+
+# sha256 of the tarball (38,680,037 bytes), measured on 2026-10-29 by downloading it here. The vendor
+# script refuses to unpack anything whose digest differs — the same discipline `np models install`
+# applies to a model artifact (§14: "Pin the source, don't commit it").
+sha256 = "51b1e025d7b12e83fa55736e65bc254acd9d23e49f546be7531368fef82210ee"
+
+# sha256 of `include/llama.h` inside that tarball — the header `crates/np-core/src/llama_ffi.rs` mirrors by hand.
+#
+# Why a second digest when the tarball is already pinned: version numbers cannot identify a tree. llama.cpp sets
+# `LLAMA_BUILD_IS_DEV` ON by default, so every commit between v0.8.0 and v0.8.1 reports `llama_version()` as
+# "0.8.0-dev" (measured here: the linked test binary carries that exact string), and the arch token is present in
+# all of them too. So a tree that is *not* the revision we mirrored would compile, link and turn every gate green
+# — while a hand-written FFI mirror is only sound against the exact field order it was read out of.
+#
+# build.rs hashes the resolved tree's header on every feature-on build and refuses naming both digests. The vendor
+# script prints this value too, so a deliberate re-pin changes one line here and says so out loud.
+header_sha256 = "c0854771d3760a41642c4e59429c5b3b9fc774887c59d37eeadc4527681732cd"
+
+# Does this revision know our model? Yes: its arch enum contains `LLM_ARCH_GEMMA_EMBEDDING2`
+# (grep of the unpacked tree, §14). That is the whole reason for pinning v0.8.0 rather than any other.
+
+# CMake options for target `llama`, passed verbatim as -D<key>=<value> by build.rs. Each one is here
+# because it keeps bytes out of `np`; anything not listed stays at llama.cpp's own default, which is
+# what §14 measured (23 s at -j 14, `libllama.a` 10.0 MB + `libggml-cpu.a` 1.4 MB + `libggml-base.a`
+# 1.3 MB). Do not "improve" this list without re-measuring the stripped binary against the ceiling.
+[cmake]
+# Debug info and assertions are pure size, and we do not debug C++ we did not write.
+CMAKE_BUILD_TYPE = "Release"
+
+# One static archive set linked into one binary. A shared lib would move size out of `np` only to add
+# a runtime lookup path we would have to ship and find on three OSes.
+BUILD_SHARED_LIBS = "OFF"
+
+# No `LLAMA_CURL` line here, and that absence is a fact worth recording: v0.8.0 turned that flag into a
+# deprecation notice (`CMakeLists.txt`: `llama_option_depr(WARNING LLAMA_CURL)`) and nothing under `src/`
+# mentions curl any more — measured, `grep -rn CURL src/` returns nothing and the cache filed our `-DLLAMA_CURL=OFF`
+# as `UNINITIALIZED`. build.rs now refuses any option cmake filed that way, so a rename upstream shows up as a
+# refusal rather than as a quiet default. (What we actually want — no HTTP in the indexing path — is guaranteed
+# by `np` never calling those APIs, not by a llama.cpp flag.)
+
+# Build targets that produce executables we never link, plus the shared library the server and tools build
+# against. Stated rather than assumed, because their defaults differ: `LLAMA_BUILD_TESTS/TOOLS/EXAMPLES/SERVER`
+# default to `${LLAMA_STANDALONE}` (ON when llama.cpp is the top-level project — measured in this tree's cache,
+# which had SERVER and COMMON ON), while `LLAMA_BUILD_UI` already defaults OFF. `--target llama` compiles none
+# of them either way; naming them keeps the configure step honest about what we asked for, and COMMON is here
+# because it is the dependency those executables share.
+LLAMA_BUILD_TESTS = "OFF"
+LLAMA_BUILD_TOOLS = "OFF"
+LLAMA_BUILD_EXAMPLES = "OFF"
+LLAMA_BUILD_APP = "OFF"
+LLAMA_BUILD_UI = "OFF"
+LLAMA_BUILD_COMMON = "OFF"
+LLAMA_BUILD_SERVER = "OFF"
+
+# OpenMP off: the release artifact is one self-contained binary. Left at llama.cpp's default (ON) the
+# link line gains `-l dylib=gomp`, and a user on a machine without libgomp.so.1 gets a loader error at
+# exec time — which is a prototype-killer on a clean host, and silent until someone runs it there.
+# The cost is CPU tensor throughput on some ops; R6d measures it against the benchmark, and flipping
+# this one line back to ON (or shipping libgomp in the tarball) is that round's decision to make with
+# numbers rather than this one's guess. Measured here: build.rs no longer emits a gomp link line.
+GGML_OPENMP = "OFF"

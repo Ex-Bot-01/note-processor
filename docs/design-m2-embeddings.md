@@ -96,7 +96,8 @@ CREATE TABLE embeddings (
 Notes on the shape, each of which is a decision and not an accident:
 
 - **`text BLOB`, `vector BLOB`.** Notes are arbitrary bytes; `TEXT` would be a promise that they are UTF-8. The vector
-  is stored as raw little-endian f32 rather than serialised JSON: 512 dimensions is 2 KiB, and hex or JSON would triple
+  is stored as raw little-endian f32 rather than serialised JSON: 512 dimensions is 2 KiB *(priced before the 2026-10-29
+  amendment to native 768 — a row is 3 KiB now; `design-m2-local-embeddings.md` §5 carries the amendment)*, and hex or JSON would triple
   it for no benefit — **a deliberate deviation from the spec's "q8 ≈ 19 MB"** (`spec:85`, `spec:227`), accepted here
   because quantisation is a quality decision that belongs with the model benchmark and not smuggled in as storage
   trivia. `CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim)` makes that deviation machine-enforced **now**, while the table is empty, so
@@ -232,7 +233,8 @@ The spec's gate is throughput, so the deliverable is a measurement and an honest
   without the threshold they were judged against are how a benchmark becomes a poster.
 - **Buildability is measured, not assumed.** One CI step per OS row runs `cargo check --locked -p np-core --features
   local-model`, because `cargo clippy --all-targets` never compiles a feature-gated heavy dependency. That answers the
-  Windows question §8 asks with a build instead of hope.
+  Windows question §8 asks with a build instead of hope — **annotated 2026-10-30: the step exists on ubuntu only**
+  (`feature-local-model`, and `build.rs` refuses the feature anywhere else), so the Windows half is still hope, not build.
 - **Stated limit:** this host is not your laptop, and a single machine's tokens/sec does not prove the model will feel
   fast on a fanless one. The claim it can support is "X is N× the cost of Y at the same quality question", which is
   what §2's decision needs.
@@ -306,9 +308,9 @@ answer to compare against.
    day one: CI already builds and tests the workspace on `windows-latest` (`ci.yml:20`, `:29-41`) and byte-exactness is
    engineered for (`.gitattributes:3`, fixtures exempted at `:5-7`). What CI does *not* cover is an optional heavy
    provider: a feature-gated `candle`/`ggml` dependency is invisible to `--all-targets` unless asked for, and the GGUF
-   fallback additionally needs a C++ toolchain. §6's per-OS `cargo check --features local-model` is the measurement; until
-   it runs, no claim about Windows model support is made here (F18's rule).
-2. **Memory ceiling.** 18k × 512-d f32 ≈ 37 MB in RAM is fine; the danger is loading 540 MB of weights inside a scan on
+   fallback additionally needs a C++ toolchain. §6's per-OS `cargo check --features local-model` is the measurement, and **it has not
+   run on Windows**: the feature job is ubuntu-only today, so no claim about Windows model support is made here (F18's rule).
+2. **Memory ceiling.** 18k × 512-d f32 ≈ 37 MB in RAM is fine *(≈55 MB at the amended 768; same conclusion)*; the danger is loading 540 MB of weights inside a scan on
    a small machine. The provider gets an explicit load/release boundary and the scan embeds in bounded batches.
 3. **Chunker churn.** §4's byte-bounded first cut will be replaced by a tokenizer-aware one, and if that lands without a
    version bump it silently invalidates every vector. `EMBED_VERSION` plus `models.id` is the mitigation; the risk is

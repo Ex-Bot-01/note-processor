@@ -69,9 +69,13 @@ coverage only** (provider availability is a reported count, never version debt �
 - Shape: **daemon owns everything, Tauri window is a dumb client** (`np-core` / `npd` / `np-app`). Login
   autostart so today's file and TODO segment exist before the app opens. Linux **and** Windows.
 - Single machine, single user. Loopback HTTP + token in config (port 8765) — no cloud, no accounts.
-- Embeddings: self-hosted `google/embeddinggemma-2` **text tower only** (Apache-2.0), 512-d via MRL truncation,
-  mean-pool + L2-normalise, task prefixes per the model card; downloaded once by `np models install`,
-  sha256-pinned, recorded on every vector. Fallbacks in spec §9 are one config key each. **Benchmark order set
+- Embeddings: self-hosted `google/embeddinggemma-2` (Apache-2.0), **amended by the human 2026-10-29 on three points**:
+  **(a)** the **whole model**, not the text tower alone — vision and audio encoders are carried too, so the artifact set is
+  more than one file; **(b)** stored width is **768 with no MRL truncation** (the card says MRL is native at 128/256/512/768,
+  so narrowing later is a re-store of vectors we already hold, not a re-embed — but it changes model identity, §4);
+  **(c)** the artifact is **fetched automatically on first start**, with a marker that says a download is in progress so the
+  UI can say so later. `np models install --path/--sha256` stays as the offline door. mean-pool + L2-normalise, task
+  prefixes per the model card, sha256-pinned to digests recorded in the repo, recorded on every vector. Fallbacks in spec §9 are one config key each. **Benchmark order set
   2026-10-28: EmbeddingGemma first**, then the endpoint candidate, MiniLM only if both stall (design §9).
 - Endpoint candidate is the same self-hosted OpenAI-compatible server this project is developed against, serving
   Qwen3.8-Flash-Next. **Base URL and key never enter the repo** — runtime `NP_EMBED_BASE_URL` /
@@ -123,6 +127,64 @@ what fails is not a check, because removal makes tests pass.
   `design-m2-local-embeddings.md` §6: only with their chunk row) and **D3 (a stale note's chunks must never read as
   current, which bites the moment `np embed` becomes the first production reader of `chunk_state`/`chunk_digest`)**. All
   three are cheap now and expensive after 18k vectors exist.
-- **Gates on R6b0** (the local-inference round): stored width stays **512 via MRL** unless this file's locked list is
-  amended; someone downloads `embeddinggemma-2-Q8_0.gguf` (309.9 MB, ungated); and the pinned Rust binding's vendored
-  llama.cpp revision must know `gemma-embedding2` — grep the vendored source, do not trust a changelog.
+- **Runtime decided 2026-10-29 (you answered §13): use llama.cpp in the back and keep EmbeddingGemma-2**, accepting a bigger package.
+  We build llama.cpp ourselves from a pinned, sha256-verified tarball (**v0.8.0**, `sha256 = 51b1e025…210ee`) behind the `local-model` feature
+  and declare the C API by hand — the published Rust binding cannot be fed our source, vendors a revision without `gemma-embedding2`, and would
+  add bindgen/libclang to every build. Measured here: builds in 23 s; ~13 MB of static archives against a 5.5 MB stripped `np` today.
+  **Package ceiling: ≤ 40 MB stripped per platform**, printed by the release workflow from R6d. Evidence and reasoning:
+  `docs/design-m2-local-embeddings.md` §14.
+
+- **Direction set 2026-10-29: steer toward Prototype 1** (`docs/roadmap-2026-10-27.md` §3C) — `scan → fetch → embed → search`, CLI-only, on the
+  real corpus. Rounds that don't put a queryable vector in front of the human sooner wait, and whatever waits gets named out loud.
+
+- **R6b0's gate is answered, and it failed**: the pinned binding (`llama-cpp-sys-2` 0.1.160, newest published) vendors a llama.cpp that knows
+  `LLM_ARCH_GEMMA_EMBEDDING` but **not** `GEMMA_EMBEDDING2`, `build.rs` has no source override (always cmake), and this host has no `cmake` and
+  no root. Full evidence and the three shapes with prices: `docs/design-m2-local-embeddings.md` §13. **Waiting on the human**: prototype with
+  EmbeddingGemma-300M today, or pay for a self-built llama.cpp to keep EmbeddingGemma-2.
+
+- **R6b1 shipped (`local-model`, loader only — no tokenizing, no decode, no vectors):** `crates/np-core/src/local_model.rs` loads a GGUF through our
+  own FFI into a `LoadedModel` (two handles, one `Drop` order: `llama_free` then `llama_model_free`) and reports what the artifact answers. The
+  largest unknown in the prototype is now dead: **v0.8.0 loads `embeddinggemma-2-Q8_0.gguf` on this host** — `n_embd_out 768`, `n_embd_inp 512`,
+  `n_ctx_train 262144`, `n_vocab 262144`, pooling MEAN read from metadata and not overridden, `add_bos` **and** `add_eos` both true (R6b2's token
+  count budgets two specials). Cost of opening it here (§14's table has the method; `crates/np-core/tests/probes/model_load_probe.c` is the C half):
+  **0.35 s warm / 0.44 s cold from our side**, peak RSS **419.4 MiB** in the bare C probe and **421.1 MiB** with loads serialized in Rust — **+1.7 MiB for
+  us**, not zero. The ~524 MiB figure is the same suite on libtest's default threads and belongs to no single load; do not quote it as a per-load cost.
+  Three load-and-drop cycles hold the same open-state RSS (±28 KiB) and do not crash — that is crash detection, **not** leak detection.
+  The declared-vs-actual width debt is closed at the only place it can be: `load(path, configured_dim)` refuses against `llama_model_n_embd_out`, so
+  declaring 512 against this file names both numbers before a context exists. `tests/local_load.rs` is artifact-gated on `NP_TEST_MODEL_PATH` and
+  prints `NOT COVERAGE` without it — the CI feature row proves the refusals, not the 768.
+
+- **R6b2 shipped (text in, one unit-length 768-d vector out):** `LoadedModel::embed_text(prefix, text, budget)` tokenizes with
+  `add_special = true` and sizes its buffer from llama.cpp's own "you needed N slots" answer (`src/llama-vocab.cpp:4645-4647`, measured:
+  a 2-slot buffer for a 17-token sentence returns `-17`), refuses over the configured **token** budget — first production use of
+  `TokenBudgetExceeded`, and it reports tokens (a 23-byte sentence is **9**) — then refuses above the context window, decodes once with a
+  borrowed `llama_batch_get_one`, copies the pooled row out of the buffer the context rewrites next decode, and L2-normalises, refusing a
+  zero vector or a non-finite component instead of storing a row that silently scores 0.0 against everything. `LocalEmbedder`
+  (`LoadedModel` + a row's two prefixes + budget) implements `Embedder` on the document path; `LocalModelProvider` still answers
+  `RuntimeNotBuilt`, because R6c decides who holds ~420 MB and when.
+  **The abort that was found first:** this artifact is an encoder — `create_memory` returns null for it, so `llama_decode` diverts to the
+  encoder path (`src/llama-context.cpp:1845-1847`; measured: `llama_get_memory(ctx)` is `(nil)`) and *that* asserts `n_ubatch >= n_tokens`
+  (`src/llama-context.cpp:1631`, not the decoder's `:1918`/`:1920`, which never run here). `GGML_ASSERT` → `GGML_ABORT` survives `NDEBUG`.
+  At llama.cpp's default `n_ubatch = 512` a
+  **600-token sequence killed the process (exit 134)** — reachable from an ordinary ~1,800-byte note, since `max_tokens` then accepted up to
+  8,192. `load` now sets `n_ctx = n_batch = n_ubatch = 4096`, and a 633-token decode returns rc=0 with ‖v‖ = 1.0 instead.
+  **Three numbers, none of them asserted** — only throughput is printed by a test (`decode_throughput_is_printed_not_asserted`); size comes
+  from `cargo build --release` plus `nm`, and the RSS curve from `crates/np-core/tests/probes/decode_probe.c`: ~**130 tok/s** (543 tok in
+  3.85 s, 2,163 tok in 18.0 s; 392% CPU because ggml runs its own thread pool — `llama_n_threads_batch` = 4 — so OpenMP-off is not
+  single-threaded, and R6d still owes the A/B), stripped release size **5.5 MiB → 11.0 MiB** with the feature (**+5.5 MiB** against
+  §14's ≤ 40 MB ceiling; symbol counts must be taken on the *unstripped* binary, since `strip` removes the table and then "0 llama symbols"
+  means nothing), and peak RSS **+0 / +47 / +109 / +218 / +458 MiB** above baseline at 133 / 513 / 1,026 / 2,052 / 4,085 tokens — the compute
+  buffer is reserved at init and touched per decode, so long notes cost memory and ordinary chunks cost nothing.
+  Semantic sanity is an ordering, not a score: `cos(cat, feline) = 0.8302` vs `cos(cat, revenue) = 0.5887`. Empty input is not an error —
+  it embeds BOS+EOS (2 tokens) into a real unit vector, which is what the artifact does rather than a rule we invented.
+  **§5's ceiling question is decided (2026-10-30, option B):** `MAX_EMBEDDING_TOKENS` **8,192 → 4,096**, because that is the width of the context
+  this build creates and a ceiling above the window only produces configs refused later by a different sentence; default `embeddings.max_tokens`
+  **2,048 → 1,024** (≈8 s per worst-case chunk at ~120–141 tok/s, interpolated between the measured points). Both stay revisitable — config numbers
+  with no stored data behind them yet — and `local_model` now asserts `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX` at compile time so the pair cannot drift.
+  **Decision C, later on 2026-10-30:** the human asked for the 8,192 ceiling back, so `MAX_EMBEDDING_TOKENS` and `REQUESTED_CTX` moved to
+  **8,192 together** — raising only the first would have re-created the config-refused-later-by-another-sentence defect B removed. Measured
+  before asking for the wider window (`decode_probe nctx=8192`): +0 MiB at rest (133 tokens), and 7,999 tokens in **101 s** at peak
+  **1,478 MiB (+1,058 MiB)** — so `DEFAULT_EMBEDDING_TOKENS` stays 1,024 and the interpolated "~63 s per 8k chunk" is replaced by that
+  measurement (~79 tok/s). Still unmeasured: whether long-note *recall* improves above the window; we refuse there because one decode cannot
+  hold more in this build, not because the model cannot represent it. Long-note retrieval is bounded by chunking either way. Still owed: R6c wiring config → provider → `embeddings`
+  rows, and R6d's corpus-scale benchmark (batching across texts is deliberately not in this API yet).

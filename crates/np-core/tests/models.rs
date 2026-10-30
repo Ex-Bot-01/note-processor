@@ -15,6 +15,7 @@
 //! exist**, and an empty file against **the true digest of nothing**, so a mutant that reorders or drops a step
 //! changes which error appears rather than merely which message text.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,8 @@ use np_core::config::Config;
 use np_core::db::{self, Db, ModelRow};
 use np_core::hash::{sha256_bytes, sha256_file};
 use np_core::models::{
-    self, ArtifactState, Install, InstallOutcome, ListedModel, ModelError, Unclaimed, UnclaimedKind,
+    self, ArtifactState, FetchFields, Install, InstallOutcome, ListedModel, ModelError, Unclaimed,
+    UnclaimedKind,
 };
 use rusqlite::params;
 use tempfile::TempDir;
@@ -1102,4 +1104,572 @@ fn an_unwritable_models_directory_is_refused_on_unix() {
         Err(ModelError::ModelsDir { .. }) => {}
         other => panic!("an unreadable directory is a workspace-level failure, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// R7a — the fetch marker: reserved names, reading them, reporting them
+// (`docs/design-m2-local-embeddings.md` §12 rules 2, 3 and 4).
+//
+// **No writer exists.** Nothing in this round can create a marker, so every marker below is planted by hand —
+// which is also why the reading half is testable at all before R7b's network path exists. Nothing here dials
+// out: these fixtures touch one tempdir and nothing else.
+// ---------------------------------------------------------------------------
+
+/// Plant bytes at one exact name inside the workspace's artifact directory, creating the directory (a fetch
+/// writes its marker into a directory that `install` would otherwise have made).
+fn plant(fx: &Fixture, name: &str, bytes: &[u8]) -> PathBuf {
+    fs::create_dir_all(fx.models_dir()).expect("test setup: the models dir");
+    let path = fx.models_dir().join(name);
+    fs::write(&path, bytes).expect("test setup: plant the file");
+    path
+}
+
+/// Plant a marker for `id` holding `body`, at the path **the library** derives.
+///
+/// Spelling `.fetching.<id>.json` out here instead would let a test pass against a build whose reader and
+/// writer disagree — the same argument this file already makes about never spelling the artifact directory.
+fn plant_marker(fx: &Fixture, id: &str, body: &[u8]) -> PathBuf {
+    let path = models::marker_path(&fx.models_dir(), id);
+    fs::create_dir_all(fx.models_dir()).expect("test setup: the models dir");
+    fs::write(&path, body).expect("test setup: plant the marker");
+    path
+}
+
+/// The one marker body these fixtures plant when the fields are not the subject.
+const MARKER_BODY: &[u8] =
+    br#"{"nonce":"4242-1762000000123456789-0","started_at":1762000000,"bytes_done":43970560,"bytes_total":324839936}"#;
+
+/// The fix against the bug it replaces (§11's addendum, §12 rule 2).
+///
+/// The first draft named the marker `<id>.fetching.json`, and that is a **legal model id** — so row `alpha`'s
+/// artifact path and row `alpha`'s marker path were the same file, and writing a marker could overwrite a
+/// verified artifact. Both halves are pinned here rather than argued in prose: the leading dot is refused as an
+/// id by the first-character rule, and the old spelling is accepted as an id by the very charset that makes it
+/// dangerous.
+#[test]
+fn no_model_id_can_name_a_fetch_file_and_the_old_scheme_could() {
+    for name in [".fetching.alpha.json", ".part.alpha.1-2-3"] {
+        let failure = models::validate_id(name).expect_err(&format!(
+            "`{name}` starts with a dot, so no id can be spelled that way"
+        ));
+        assert!(
+            matches!(&failure, ModelError::InvalidId { rule, .. } if rule.contains("first character")),
+            "the refusal has to name the rule that makes these names unforgeable: {failure}"
+        );
+    }
+
+    // The asymmetry itself: `alpha.fetching.json` satisfies `[a-z0-9][a-z0-9._@-]{0,63}` and installs. That is
+    // not a hole to patch in `validate_id` — ids allow dots on purpose — it is the reason the fetch names do
+    // not start where ids can.
+    models::validate_id("alpha.fetching.json")
+        .expect("the old scheme's name really was a legal id");
+}
+
+/// The reserved shapes, accepted — including the round trip from [`models::marker_path`], which is what keeps
+/// the reader and R7b's writer from drifting apart silently.
+#[test]
+fn the_recogniser_accepts_exactly_the_two_reserved_shapes() {
+    let fx = Fixture::new();
+    let cases: &[(&str, Option<models::FetchName<'_>>)] = &[
+        (
+            ".fetching.alpha.json",
+            Some(models::FetchName::Marker("alpha")),
+        ),
+        // Ids carry dots, `@`, `-`, `_` and digits (§2), so the recogniser has to survive all of them.
+        (
+            ".fetching.embeddinggemma-2-text-q8_0@1.json",
+            Some(models::FetchName::Marker("embeddinggemma-2-text-q8_0@1")),
+        ),
+        (".fetching.a.b.json", Some(models::FetchName::Marker("a.b"))),
+        (
+            ".part.alpha.4242-1730000000123456789-0",
+            Some(models::FetchName::Part("alpha")),
+        ),
+        // `<id>.<nonce>` splits at the **last** dot, because `a.b` is an id and not two fields.
+        (".part.a.b.1-2-3", Some(models::FetchName::Part("a.b"))),
+        // Nothing else in the directory is a fetch name — including a row's own artifact and install's temp.
+        ("alpha", None),
+        ("alpha.4242-1730000000123456789-0.tmp", None),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            models::fetch_name(OsStr::new(name)),
+            *expected,
+            "`{name}` was classified wrongly"
+        );
+    }
+
+    // Round trip: every id shape `validate_id` accepts is recognised back from the path the library builds.
+    for id in [
+        "a",
+        "alpha",
+        "0",
+        "embeddinggemma-2-text-q8_0@1",
+        "a.b.c",
+        "x-y_z",
+    ] {
+        models::validate_id(id).expect("test: these are legal ids");
+        let path = models::marker_path(&fx.models_dir(), id);
+        let name = path
+            .file_name()
+            .unwrap_or_else(|| panic!("test: `{path:?}` has a file name"));
+        assert_eq!(
+            models::fetch_name(name),
+            Some(models::FetchName::Marker(id)),
+            "`{name:?}` must read back as the marker of `{id}`"
+        );
+    }
+}
+
+/// The near-misses, refused — each one a name that would either invent a fetch for an id that cannot exist, or
+/// hide a real junk file from `unclaimed`.
+#[test]
+fn the_recogniser_refuses_every_near_miss_of_either_shape() {
+    for name in [
+        // No id, or an empty one.
+        ".fetching.json",
+        ".fetching..json",
+        ".part.x",
+        ".part.",
+        // Not a prefix of this program.
+        "x.fetching.json",
+        "fetching.alpha.json",
+        ".fetchin.alpha.json",
+        // Byte-exact and case-sensitive: an uppercase name is not one of ours, and neither is an id that could
+        // never install. `validate_id` refusing `A` is what makes `.fetching.A.json` junk rather than a fetch
+        // of a model no row can ever name.
+        ".FETCHING.a.json",
+        ".Part.a.1-0",
+        ".fetching.A.json",
+        ".fetching.a b.json",
+        // Missing half.
+        ".fetching.a",
+        ".fetching.a.txt",
+        ".part.alpha",
+        ".part.alpha.",
+        // A path, not an entry name: `read_dir` never hands one over, so this is the fence against a caller
+        // that passes a path where it meant a file name.
+        ".fetching.a/b.json",
+        ".fetching.../../etc.json",
+        ".part.a\\b.1-0",
+        // **The two cases where only the separator guard can refuse.** Above, a separator also breaks
+        // `validate_id`'s charset, so deleting that guard changes nothing observable — which is how an unpinned
+        // defence hides. Here the id is legal (`x`, `a`) and the separator sits in the **nonce**, which is
+        // deliberately not charset-checked: without the guard these read as fetches of `x` and `a`.
+        ".part.x.y/z",
+        ".part.a.b\\c",
+        // The empty name and a plain dot.
+        "",
+        ".",
+    ] {
+        assert_eq!(
+            models::fetch_name(OsStr::new(name)),
+            None,
+            "`{name}` is not one of the two reserved shapes"
+        );
+    }
+
+    // Pinned rather than assumed: a temporary for a **marker** rewrite (`.fetching.<id>.json.<nonce>.tmp`, which
+    // §12 rule 2 forecasts) is *not* recognised today, because the suffix rule that makes `.fetching.a.json` a
+    // marker also refuses anything hanging off it. R7a writes no marker, so this name cannot exist yet; when
+    // R7b rewrites one atomically it must either choose a spelling this recogniser already covers or extend
+    // this test deliberately. Leaving it unrecognised means such a temp is reported under `unclaimed` — noisy,
+    // but never invisible, which is the posture §12 rule 2 keeps.
+    assert_eq!(
+        models::fetch_name(OsStr::new(".fetching.a.json.1-0.tmp")),
+        None
+    );
+}
+
+/// Reading a marker yields §12's four fields typed, and both spellings of "no size announced" mean the same
+/// thing: unknown, never zero (§12 rule 12).
+#[test]
+fn fetch_state_reads_the_fields_and_both_spellings_of_unknown_size() {
+    let fx = Fixture::new();
+
+    // Nothing planted at all: absent, which is the ordinary state of a workspace with no fetch running.
+    assert_eq!(
+        models::fetch_state(&fx.models_dir(), "alpha"),
+        models::FetchState::Absent
+    );
+
+    plant_marker(&fx, "alpha", MARKER_BODY);
+    let read = models::fetch_state(&fx.models_dir(), "alpha");
+    let models::FetchState::Present(fields) = read else {
+        panic!("a complete marker reads as present, got {read:?}");
+    };
+    assert_eq!(
+        fields,
+        FetchFields {
+            nonce: "4242-1762000000123456789-0".to_string(),
+            started_at: 1_762_000_000,
+            bytes_done: 43_970_560,
+            bytes_total: Some(324_839_936),
+        }
+    );
+
+    // `"bytes_total": null` and an absent field are the same fact (§12 rule 12).
+    for body in [
+        r#"{"nonce":"n","started_at":1,"bytes_done":2,"bytes_total":null}"#,
+        r#"{"nonce":"n","started_at":1,"bytes_done":2}"#,
+    ] {
+        plant_marker(&fx, "beta", body.as_bytes());
+        let read = models::fetch_state(&fx.models_dir(), "beta");
+        let models::FetchState::Present(fields) = read else {
+            panic!("{body} reads as present, got {read:?}");
+        };
+        assert_eq!(fields.bytes_total, None, "for {body}");
+        assert_eq!(fields.nonce, "n");
+    }
+
+    // Field order and insignificant whitespace carry no meaning, so a marker written by a different build in a
+    // different order still reads.
+    plant_marker(
+        &fx,
+        "gamma",
+        b"{\n  \"bytes_done\" : 7,\n  \"nonce\":\"z\",\n  \"started_at\": -1\n}\n",
+    );
+    let read = models::fetch_state(&fx.models_dir(), "gamma");
+    let models::FetchState::Present(fields) = read else {
+        panic!("a reordered marker reads, got {read:?}");
+    };
+    assert_eq!(
+        fields,
+        FetchFields {
+            nonce: "z".to_string(),
+            // `started_at` is **displayed**, never compared with a clock (§12 rule 4), so a value this program
+            // would never write is still reported rather than refused: refusing it would invent a rule the
+            // design does not state.
+            started_at: -1,
+            bytes_done: 7,
+            bytes_total: None,
+        }
+    );
+}
+
+/// A marker that will not parse is **reported**, with a reason that says what was wrong — never read as absent,
+/// which would make a truncated write look like "no fetch is running".
+#[test]
+fn a_marker_that_will_not_parse_is_reported_with_a_reason() {
+    let fx = Fixture::new();
+    // `(body, a substring the reason must name)`. `""` means "any non-empty reason".
+    let cases: &[(&str, &str)] = &[
+        // Truncated mid-write — the shape of a fetch killed while flushing.
+        (r#"{"nonce":"n","started_at":1,"bytes_done":2,"#, ""),
+        ("", "object"),
+        ("{", ""),
+        ("[]", "object"),
+        (r#"[{"nonce":"n"}]"#, "object"),
+        // A required field absent, and a field the parser has never heard of.
+        (r#"{"nonce":"n","started_at":1}"#, "bytes_done"),
+        (r#"{"started_at":1,"bytes_done":2}"#, "nonce"),
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":2,"member":"mmproj.gguf"}"#,
+            "member",
+        ),
+        // Two values for one field is a contradiction, not a last-one-wins choice.
+        (
+            r#"{"nonce":"a","nonce":"b","started_at":1,"bytes_done":2}"#,
+            "twice",
+        ),
+        // Wrong kind per field: the shape of "we read the wrong thing" rather than "there was nothing".
+        (r#"{"nonce":5,"started_at":1,"bytes_done":2}"#, "nonce"),
+        (
+            r#"{"nonce":"n","started_at":"yesterday","bytes_done":2}"#,
+            "started_at",
+        ),
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":"41 MB"}"#,
+            "bytes_done",
+        ),
+        // `null` is legal for `bytes_total` only.
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":null}"#,
+            "bytes_done",
+        ),
+        (r#"{"nonce":null,"started_at":1,"bytes_done":2}"#, "nonce"),
+        // A number that is not whole, or not a number: read as whatever a cast gives, each one would put a
+        // fabricated byte count in front of a human (§12 rule 12).
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":41.9}"#,
+            "bytes_done",
+        ),
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":1e7}"#,
+            "bytes_done",
+        ),
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":-5}"#,
+            "bytes_done",
+        ),
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":0x10}"#,
+            "bytes_done",
+        ),
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":+5}"#,
+            "bytes_done",
+        ),
+        // Grammar a strict reader refuses.
+        (r#"{"nonce":"n","started_at":1,"bytes_done":2,}"#, ","),
+        (
+            r#"{"nonce":"n","started_at":1,"bytes_done":2} trailing"#,
+            "",
+        ),
+        (r#"{nonce:"n"}"#, "quoted"),
+    ];
+    for (index, (body, expected)) in cases.iter().enumerate() {
+        let id = format!("id{index}");
+        plant_marker(&fx, &id, body.as_bytes());
+        let read = models::fetch_state(&fx.models_dir(), &id);
+        let models::FetchState::Unreadable { path, reason } = read else {
+            panic!("`{body}` must be reported as unreadable, got {read:?}");
+        };
+        assert_eq!(path, models::marker_path(&fx.models_dir(), &id));
+        assert!(!reason.is_empty(), "`{body}` refused with no reason");
+        assert!(
+            expected.is_empty() || reason.contains(expected),
+            "`{body}` reported as {reason:?}, which does not name `{expected}`"
+        );
+    }
+
+    // Non-UTF-8 **content** (a name that is not UTF-8 is the `unclaimed` case, already pinned above) and a
+    // backslash escape: both arrive as refusals naming what they are.
+    plant_marker(
+        &fx,
+        "raw",
+        b"{\"nonce\":\"a\xff\",\"started_at\":1,\"bytes_done\":2}",
+    );
+    let raw = models::fetch_state(&fx.models_dir(), "raw");
+    assert!(
+        matches!(&raw, models::FetchState::Unreadable { reason, .. } if reason.contains("UTF-8")),
+        "bytes that are not UTF-8 have to say so: {raw:?}"
+    );
+    plant_marker(
+        &fx,
+        "escaped",
+        br#"{"nonce":"a\nb","started_at":1,"bytes_done":2}"#,
+    );
+    assert!(
+        matches!(&models::fetch_state(&fx.models_dir(), "escaped"), models::FetchState::Unreadable { reason, .. } if reason.contains("escape")),
+        "an escape means this file did not come from this program, and the reason has to say that"
+    );
+}
+
+/// A name that cannot be read at all — a directory wearing a marker's name, or a file too big to be one — is
+/// `Unreadable`, not `Absent`. "Cannot look" must never read as "nothing there".
+#[test]
+fn a_marker_that_cannot_be_read_at_all_is_unreadable_not_absent() {
+    let fx = Fixture::new();
+    fs::create_dir_all(fx.models_dir()).expect("test setup: the models dir");
+
+    // A directory at the marker path. Which OS-level error produces that is platform business and **not claimed
+    // here** (CI cannot start jobs, so no Windows behaviour is earned — roadmap §4's Windows note): the OS may
+    // refuse the open or refuse the read, and this program now refuses even to open it. Either way the one claim
+    // both platforms can keep is pinned: reported, with a reason, never treated as absent.
+    let path = models::marker_path(&fx.models_dir(), "alpha");
+    fs::create_dir(&path).expect("test setup: a directory at the marker path");
+    let dir_as_marker = models::fetch_state(&fx.models_dir(), "alpha");
+    assert!(
+        matches!(dir_as_marker, models::FetchState::Unreadable { .. }),
+        "a directory under a marker's name is not a fetch report, got {dir_as_marker:?}"
+    );
+
+    // Larger than any marker can be: refused at the bound rather than loaded to discover it is not one.
+    fs::remove_dir(&path).expect("test setup: clear the directory");
+    let oversized = vec![b' '; 64 * 1024 + 8];
+    fs::write(&path, &oversized).expect("test setup: write an oversized marker");
+    let read = models::fetch_state(&fx.models_dir(), "alpha");
+    assert!(
+        matches!(&read, models::FetchState::Unreadable { reason, .. } if reason.contains("larger than")),
+        "an oversized file has to name the bound it broke: {read:?}"
+    );
+}
+
+/// §12 rule 3's section, end to end at the seam np-cli calls: an id with **no row at all** is reported (the
+/// first-start case the human asked about), and neither reserved name is announced as junk.
+#[test]
+fn a_fetch_is_listed_for_an_id_with_no_row_and_never_reported_as_unclaimed() {
+    let fx = Fixture::new();
+    let source = fx.source("weights-v1.bin", b"weights v1");
+    let digest = sha256_file(&source).expect("test setup: hash the source");
+    let db = fx.db();
+    install(&fx, &db, &request("alpha", &source, &digest, 8)).expect("first install");
+
+    // A fetch of a second model that has no row yet — exactly the state `np models fetch` is in for its first
+    // byte — plus the partial download it is writing, plus one piece of genuine junk.
+    plant_marker(&fx, "beta", MARKER_BODY);
+    plant(&fx, ".part.beta.4242-1762000000123456789-0", b"half of it");
+    plant(&fx, "notes-backup.txt", b"not a model thing at all");
+
+    let listing =
+        models::list(&db, &fx.config, &fx.workspace).expect("a fetch never fails a listing");
+
+    assert_eq!(
+        listing
+            .fetching
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["beta"],
+        "the marker of an id no row names still gets reported"
+    );
+    let models::FetchState::Present(fields) = &listing.fetching[0].state else {
+        panic!(
+            "the planted marker parses, got {:?}",
+            listing.fetching[0].state
+        );
+    };
+    assert_eq!(fields.bytes_total, Some(324_839_936));
+    assert_eq!(
+        listing.fetching[0].path,
+        models::marker_path(&fx.models_dir(), "beta")
+    );
+
+    // The rows answer what they answered before this section existed: a fetch is orthogonal to `ArtifactState`,
+    // which is why there are four arms and not five.
+    assert_eq!(states(&listing), [("alpha", ArtifactState::Present)]);
+
+    // Neither reserved name is junk, and the real leftover still is.
+    assert_eq!(
+        listing
+            .unclaimed
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["notes-backup.txt"],
+        "a fetch that was going to be announced as garbage is the defect §11's addendum records"
+    );
+}
+
+/// §12 rule 3's *other* half: a model that is already installed can be re-fetching. The row keeps its own verdict
+/// and the fetch appears beside it — which is exactly where a refactor is tempted to "resolve" the overlap by
+/// dropping one of them, so it is pinned rather than left to the module doc's sentence about orthogonality.
+#[test]
+fn a_re_fetch_of_an_installed_model_shows_the_row_and_the_fetch_together() {
+    let fx = Fixture::new();
+    let source = fx.source("weights-v1.bin", b"weights v1");
+    let digest = sha256_file(&source).expect("test setup: hash the source");
+    let db = fx.db();
+    install(&fx, &db, &request("alpha", &source, &digest, 8)).expect("first install");
+
+    plant_marker(&fx, "alpha", MARKER_BODY);
+
+    let listing =
+        models::list(&db, &fx.config, &fx.workspace).expect("a re-fetch never fails a listing");
+    assert_eq!(
+        states(&listing),
+        [("alpha", ArtifactState::Present)],
+        "the artifact keeps its own verdict while a newer copy is arriving"
+    );
+    assert_eq!(
+        listing
+            .fetching
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha"],
+        "and the fetch is reported beside it, not instead of it"
+    );
+    assert!(
+        listing.unclaimed.is_empty(),
+        "the marker is a recognised name: {:?}",
+        listing.unclaimed
+    );
+}
+
+/// The read bound is pinned at both edges: a marker of exactly `MARKER_MAX_BYTES` is read (it is a marker, and the
+/// bound exists to refuse *oversized* files), and one byte more is refused. Without the exact-size case, `>` and
+/// `>=` are indistinguishable — a 64 KiB marker would silently flip from `Present` to `Unreadable`.
+#[test]
+fn a_marker_of_exactly_the_read_bound_is_read_and_one_byte_more_is_not() {
+    let fx = Fixture::new();
+    // The nonce is opaque and unchecked, so it is the honest place to grow a marker to a chosen size.
+    let fixed = r#"{"nonce":"","started_at":1,"bytes_done":1}"#.len();
+    let bound = 64 * 1024;
+
+    let exact = format!(
+        r#"{{"nonce":"{}","started_at":1,"bytes_done":1}}"#,
+        "n".repeat(bound - fixed)
+    );
+    assert_eq!(exact.len(), bound, "test setup: exactly at the bound");
+    plant_marker(&fx, "alpha", exact.as_bytes());
+    let read = models::fetch_state(&fx.models_dir(), "alpha");
+    assert!(
+        matches!(read, models::FetchState::Present(_)),
+        "a marker of exactly the bound is a marker, got {read:?}"
+    );
+
+    let over = format!(
+        r#"{{"nonce":"{}","started_at":1,"bytes_done":1}}"#,
+        "n".repeat(bound - fixed + 1)
+    );
+    assert_eq!(over.len(), bound + 1, "test setup: one past the bound");
+    plant_marker(&fx, "alpha", over.as_bytes());
+    let read = models::fetch_state(&fx.models_dir(), "alpha");
+    assert!(
+        matches!(&read, models::FetchState::Unreadable { reason, .. } if reason.contains("larger than")),
+        "one byte past the bound is refused by name: {read:?}"
+    );
+}
+
+/// An empty nonce names no `.part` file — `fetch_name` refuses `.part.<id>.` outright — so a marker carrying one is
+/// unreadable rather than a link to nothing. Without this, R7b could write one spelling and read the other.
+#[test]
+fn an_empty_nonce_is_refused_because_it_names_no_partial_download() {
+    let fx = Fixture::new();
+    plant_marker(
+        &fx,
+        "alpha",
+        br#"{"nonce":"","started_at":1,"bytes_done":1}"#,
+    );
+    let read = models::fetch_state(&fx.models_dir(), "alpha");
+    assert!(
+        matches!(&read, models::FetchState::Unreadable { reason, .. }
+            if reason.contains("nonce") && reason.contains("empty")),
+        "an empty nonce is refused with a sentence naming the field: {read:?}"
+    );
+}
+
+/// A malformed marker keeps its place in the listing, keeps its bytes on disk, and does not fail the call —
+/// the F22/F23 posture applied to a file this program wrote but cannot read back.
+#[test]
+fn an_unreadable_marker_is_listed_and_left_on_disk() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    let body = br#"{"nonce":"n","started_at":1762000000,"bytes_done"#;
+    let path = plant_marker(&fx, "alpha", body);
+
+    let listing =
+        models::list(&db, &fx.config, &fx.workspace).expect("a broken marker is data, not a fault");
+    assert_eq!(listing.fetching.len(), 1);
+    assert_eq!(listing.fetching[0].id, "alpha");
+    let models::FetchState::Unreadable { reason, .. } = &listing.fetching[0].state else {
+        panic!(
+            "a truncated marker reports itself unreadable, got {:?}",
+            listing.fetching[0].state
+        );
+    };
+    assert!(!reason.is_empty());
+
+    // Still there, byte for byte. Nothing in this round deletes a marker: §12 rule 4 makes liveness consent,
+    // and an implicit cleanup here would be `list` deciding a download nobody watched was worthless.
+    assert_eq!(
+        fs::read(&path).expect("test: the marker is still readable"),
+        body,
+        "`list` reports a marker it cannot parse; deleting it is not this command's authority"
+    );
+}
+
+/// A workspace nothing was installed into has no artifact directory at all. That is not an unreadable
+/// directory (§3's distinction), and it lists as no fetches rather than as a failure.
+#[test]
+fn a_workspace_with_no_models_directory_lists_no_fetch() {
+    let fx = Fixture::new();
+    let db = fx.db();
+
+    let listing =
+        models::list(&db, &fx.config, &fx.workspace).expect("an absent directory is listable");
+    assert!(listing.fetching.is_empty());
+    assert!(listing.unclaimed.is_empty());
 }

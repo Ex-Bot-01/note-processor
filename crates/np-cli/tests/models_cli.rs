@@ -203,8 +203,14 @@ fn keys(value: &serde_json::Value) -> Vec<String> {
     names
 }
 
-/// The pinned top-level key set of `np models list --json` (§3).
-const LIST_KEYS: &[&str] = &["models", "models_dir_error", "unclaimed"];
+/// The pinned top-level key set of `np models list --json` (§3), sorted for [`keys`].
+///
+/// **`fetching` is a deliberate protocol change**, not an accident of this round: `docs/design-m2-local-embeddings.md`
+/// §12 rule 3 puts a fetch beside `unclaimed` rather than inside `ArtifactState`, because fetching is orthogonal to
+/// all four verdicts (a first start has no row at all, and a present row can be re-fetching). Adding the key had to
+/// fail this fence — three cases did, naming the new key on the left of every diff — and updating it here, with the
+/// design section named as the authority, is the whole point of pinning a key set instead of printing one.
+const LIST_KEYS: &[&str] = &["fetching", "models", "models_dir_error", "unclaimed"];
 
 /// The pinned per-row key set of `np models list --json` (§3), sorted for [`keys`].
 const ROW_KEYS: &[&str] = &[
@@ -216,6 +222,37 @@ const ROW_KEYS: &[&str] = &[
     "sha256",
     "state",
 ];
+
+/// The pinned per-entry key set of `np models list --json`'s `fetching` array (§12 rules 4 and 12), sorted.
+///
+/// One shape for every marker state, the way `models_dir_error` works one level up: a marker that will not parse
+/// answers with null fields plus `marker_error`, rather than a different set of keys — so a reader never has to
+/// guess whether an absent key meant "no marker" or "unreadable marker".
+const FETCH_KEYS: &[&str] = &[
+    "bytes_done",
+    "bytes_total",
+    "id",
+    "marker_error",
+    "nonce",
+    "path",
+    "started_at",
+];
+
+/// Plant a fetch marker for `id` holding `body`, at the path the **library** derives for it.
+///
+/// Derived rather than spelled: a literal `.fetching.<id>.json` here would keep passing against a build whose
+/// reader and writer disagreed about the name, which is the same reason [`Scratch::models_dir`] refuses to spell
+/// the artifact directory.
+fn plant_marker(ws: &Scratch, id: &str, body: &str) -> PathBuf {
+    let path = np_core::models::marker_path(&ws.models_dir(), id);
+    fs::create_dir_all(path.parent().expect("test setup: a marker has a parent"))
+        .expect("test setup: the models dir");
+    fs::write(&path, body).expect("test setup: plant the marker");
+    path
+}
+
+/// The marker body these cases plant when the fields are not the subject.
+const MARKER_BODY: &str = r#"{"nonce":"4242-1762000000123456789-0","started_at":1762000000,"bytes_done":43970560,"bytes_total":324839936}"#;
 
 /// Install once, successfully, and return the source that was installed together with its digest.
 fn install_one(ws: &Scratch) -> (PathBuf, String) {
@@ -836,6 +873,14 @@ fn a_models_directory_that_cannot_be_listed_is_not_a_per_row_verdict() {
     assert_eq!(keys(&report), LIST_KEYS, "{report}");
     assert_eq!(report["models"].as_array().map(Vec::len), Some(0));
     assert_eq!(report["unclaimed"].as_array().map(Vec::len), Some(0));
+    // The new section follows the rule its two neighbours already keep on this path. An empty `fetching` here
+    // means "nothing was looked at", not "nothing is downloading"; that distinction is carried by
+    // `models_dir_error` and the non-zero exit, both of which therefore have to stay.
+    assert_eq!(
+        report["fetching"].as_array().map(Vec::len),
+        Some(0),
+        "a directory nobody looked at cannot be reported as idle: {report}"
+    );
     let error = report["models_dir_error"]
         .as_str()
         .unwrap_or_else(|| panic!("the failure has to be reported under the pinned key: {report}"));
@@ -860,4 +905,302 @@ fn names_of(dir: &Path) -> Vec<String> {
         .collect();
     found.sort();
     found
+}
+
+// ---------------------------------------------------------------------------
+// R7a — `np models list`'s `fetching` section (`docs/design-m2-local-embeddings.md` §12 rules 2–4).
+//
+// **No command can create a marker yet**: the fetcher is R7b, behind a feature that does not exist. Every
+// marker below is planted by hand, and what these cases pin is the human-visible half — the names, the reading,
+// and the reporting. Nothing here implies that progress is displayed anywhere in production.
+// ---------------------------------------------------------------------------
+
+/// §12 rule 3's re-fetch half, through the CLI: an installed model that is fetching again keeps its row line *and*
+/// gains a fetch line. Pinned at this level because the temptation to collapse the overlap lives in the printer.
+#[test]
+fn a_re_fetch_shows_the_installed_row_and_the_fetch_together() {
+    let ws = Scratch::new();
+    install_one(&ws);
+    plant_marker(&ws, ID, MARKER_BODY);
+
+    let listed = run(&mut ws.list(true));
+    listed.assert_success();
+    let report = listed.json();
+    assert_eq!(report["models"][0]["id"], ID, "{report}");
+    assert_eq!(report["models"][0]["state"], "present", "{report}");
+    assert_eq!(
+        report["fetching"].as_array().map(|v| v.len()),
+        Some(1),
+        "{report}"
+    );
+    assert_eq!(report["fetching"][0]["id"], ID, "{report}");
+    assert!(
+        report["unclaimed"].as_array().map(|v| v.is_empty()) == Some(true),
+        "a marker for an installed id is not junk: {report}"
+    );
+
+    let plain = run(&mut ws.list(false));
+    let text = plain.stdout();
+    assert!(text.contains(&format!("{ID}  present")), "{text}");
+    assert!(
+        text.contains(&format!("1 fetch in progress · {ID} (")),
+        "the row line and the fetch line both appear:\n{text}"
+    );
+}
+
+/// A fetch in progress gets its own section in both channels, and neither reserved name is announced as junk.
+#[test]
+fn a_fetch_in_progress_is_listed_in_both_channels_and_is_never_unclaimed() {
+    let ws = Scratch::new();
+    install_one(&ws);
+    // A second model, with no row yet — the first-start case §12 rule 3 exists for — plus the partial download
+    // it is writing and one piece of genuine junk.
+    plant_marker(&ws, "beta", MARKER_BODY);
+    fs::write(
+        ws.models_dir()
+            .join(".part.beta.4242-1762000000123456789-0"),
+        b"half of it",
+    )
+    .expect("test setup: plant the partial download");
+    fs::write(
+        ws.models_dir().join("notes-backup.txt"),
+        b"not a model thing",
+    )
+    .expect("test setup: plant the junk");
+
+    let listed = run(&mut ws.list(true));
+    // A fetch never changes an exit code, any more than an unclaimed entry does.
+    listed.assert_success();
+    let report = listed.json();
+    assert_eq!(keys(&report), LIST_KEYS, "{report}");
+
+    let fetching = report["fetching"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("`fetching` is an array on every state: {report}"));
+    assert_eq!(fetching.len(), 1, "one marker, one entry: {report}");
+    assert_eq!(keys(&fetching[0]), FETCH_KEYS, "{report}");
+    assert_eq!(fetching[0]["id"], "beta");
+    assert_eq!(fetching[0]["nonce"], "4242-1762000000123456789-0");
+    assert_eq!(fetching[0]["started_at"], 1_762_000_000);
+    assert_eq!(fetching[0]["bytes_done"], 43_970_560);
+    assert_eq!(fetching[0]["bytes_total"], 324_839_936);
+    assert!(
+        fetching[0]["marker_error"].is_null(),
+        "a marker that parses reports no error: {report}"
+    );
+    // The path is the library's own, so a human can act on §12 rule 4's advice without guessing where the
+    // artifact directory is (its name is a hash of the workspace path).
+    assert_eq!(
+        fetching[0]["path"],
+        np_core::models::marker_path(&ws.models_dir(), "beta")
+            .to_string_lossy()
+            .as_ref()
+    );
+
+    // The row list answers what it answered before this section existed: `fetching` is beside it, not a fifth
+    // verdict inside it.
+    assert_eq!(report["models"][0]["id"], ID);
+    assert_eq!(report["models"][0]["state"], "present");
+
+    // Neither `.fetching.beta.json` nor `.part.beta.…` is junk; the one file nothing recognises still is.
+    let unclaimed: Vec<&str> = report["unclaimed"]
+        .as_array()
+        .expect("`unclaimed` is an array on every state")
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("every entry has a name"))
+        .collect();
+    assert_eq!(unclaimed, ["notes-backup.txt"], "{report}");
+
+    // Text mode: one line per fetch, between the rows and the unclaimed heading. The byte sizes come from
+    // `np_core::catalog::size_human` — the program's only formatter — so this asserts the composition while the
+    // literal below pins today's rendering of those two numbers.
+    let plain = run(&mut ws.list(false));
+    plain.assert_success();
+    let text = plain.stdout();
+    let line = format!(
+        "1 fetch in progress · beta (started 1762000000, {} / {})",
+        np_core::catalog::size_human(43_970_560),
+        np_core::catalog::size_human(324_839_936)
+    );
+    assert!(
+        text.contains(&line),
+        "one line per fetch, naming the id, the start time and both sizes:\n{text}"
+    );
+    assert!(
+        text.contains("41.9 MB / 309.8 MB"),
+        "the sizes are the catalog's spelling, not a second formatter:\n{text}"
+    );
+    assert!(
+        !text.contains(".part.beta."),
+        "a partial download is a recognised name, so it must not appear as junk:\n{text}"
+    );
+    assert!(
+        text.contains("  notes-backup.txt  file"),
+        "the genuine leftover is still reported:\n{text}"
+    );
+    // The fetch line sits between the two sections it belongs beside.
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing:\n{text}"))
+    };
+    assert!(at(&line) > at("models     1\n"), "{text}");
+    assert!(at(&line) < at("unclaimed  1\n"), "{text}");
+}
+
+/// Two fetches: both listed, ordered by id, and the count says two.
+#[test]
+fn two_fetches_in_progress_pluralise_the_count_and_both_appear() {
+    let ws = Scratch::new();
+    plant_marker(&ws, "beta", MARKER_BODY);
+    plant_marker(
+        &ws,
+        "alpha",
+        r#"{"nonce":"1-0","started_at":1762000500,"bytes_done":1024,"bytes_total":4096}"#,
+    );
+
+    let listed = run(&mut ws.list(true));
+    listed.assert_success();
+    let report = listed.json();
+    let ids: Vec<&str> = report["fetching"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("every entry has an id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["alpha", "beta"],
+        "ordered by id so output is deterministic"
+    );
+
+    let plain = run(&mut ws.list(false));
+    plain.assert_success();
+    let text = plain.stdout();
+    // The count rides on every line, because each line has to be readable on its own when someone greps stdout
+    // for `fetch`. Pinned plural and all, so the shape is a decision on the record.
+    assert!(
+        text.contains("2 fetches in progress · alpha (started 1762000500, "),
+        "{text}"
+    );
+    assert!(
+        text.contains("2 fetches in progress · beta (started 1762000000, "),
+        "{text}"
+    );
+}
+
+/// §12 rule 12: an unknown size is printed as unknown. A denominator this program invented would be a number a
+/// human could divide by.
+#[test]
+fn a_fetch_with_an_unknown_size_says_so_and_invents_no_denominator() {
+    let ws = Scratch::new();
+    plant_marker(
+        &ws,
+        "beta",
+        r#"{"nonce":"1-0","started_at":1762000000,"bytes_done":43970560}"#,
+    );
+
+    let listed = run(&mut ws.list(true));
+    listed.assert_success();
+    let report = listed.json();
+    assert!(
+        report["fetching"][0]["bytes_total"].is_null(),
+        "an absent `bytes_total` is null, never 0: {report}"
+    );
+
+    let plain = run(&mut ws.list(false));
+    plain.assert_success();
+    let text = plain.stdout();
+    assert!(
+        text.contains("41.9 MB, size unknown"),
+        "the words have to be there:\n{text}"
+    );
+    assert!(
+        !text.contains('/'),
+        "and no fraction with a fabricated bottom half:\n{text}"
+    );
+}
+
+/// A truncated marker is reported in both channels, names the file, keeps its bytes on disk, and exits 0.
+#[test]
+fn a_truncated_marker_is_reported_and_left_where_it_is() {
+    let ws = Scratch::new();
+    let body = r#"{"nonce":"n","started_at":1762000000,"bytes_done"#;
+    let path = plant_marker(&ws, "beta", body);
+
+    let plain = run(&mut ws.list(false));
+    // Reporting a marker this build cannot read is not a fault of the workspace: no non-zero exit.
+    plain.assert_success();
+    let text = plain.stdout();
+    assert!(
+        text.contains("1 fetch in progress · beta (unreadable marker "),
+        "the line has to say the marker could not be read:\n{text}"
+    );
+    assert!(
+        text.contains(&path.to_string_lossy().into_owned()),
+        "and name the file a human has to look at:\n{text}"
+    );
+    assert!(
+        text.contains("runs off the end of the file"),
+        "and say what was wrong — this file stops mid-write, which is what its reason says:\n{text}"
+    );
+
+    let listed = run(&mut ws.list(true));
+    listed.assert_success();
+    let report = listed.json();
+    assert_eq!(keys(&report["fetching"][0]), FETCH_KEYS, "{report}");
+    assert_eq!(report["fetching"][0]["id"], "beta");
+    // One shape for every state: the fields stay, as null, and `marker_error` says why.
+    assert!(report["fetching"][0]["nonce"].is_null(), "{report}");
+    assert!(report["fetching"][0]["started_at"].is_null(), "{report}");
+    assert!(report["fetching"][0]["bytes_done"].is_null(), "{report}");
+    let reason = report["fetching"][0]["marker_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an unreadable marker names why: {report}"));
+    // One value, two channels — the shape the scan receipts use: the text line is not a paraphrase of this
+    // string, it is this string, so a report read yesterday can be compared with one opened today.
+    assert!(
+        plain.stdout().contains(reason),
+        "the text channel carries the same sentence as `marker_error`: {reason} / {}",
+        plain.stdout()
+    );
+
+    // Both runs reported it; neither removed it. §12 rule 4 makes liveness consent, so an implicit cleanup is
+    // not this command's authority even for a file it cannot parse.
+    assert_eq!(
+        fs::read(&path).expect("test: the marker is still on disk"),
+        body.as_bytes(),
+        "`list` reports a truncated marker; deleting it is a human's call"
+    );
+}
+
+/// Nothing fetching prints exactly what it printed before this section existed — no header, no zero count.
+#[test]
+fn nothing_fetching_prints_no_extra_line() {
+    let ws = Scratch::new();
+    install_one(&ws);
+    fs::write(ws.models_dir().join("stray.tmp"), b"junk").expect("test setup: plant junk");
+
+    let plain = run(&mut ws.list(false));
+    plain.assert_success();
+    let text = plain.stdout();
+    // Four lines and no word about fetching: `models`, the row, `unclaimed`, the leftover. `list_on_an_empty_workspace_reports_both_counts_as_zero`
+    // already pins the byte-exact output of an empty workspace, which is the same claim with fewer parts — this
+    // case is here because it says the same thing about a workspace that *has* rows and leftovers, where a
+    // "fetching 0" header would otherwise be tempting.
+    assert_eq!(text.lines().count(), 4, "{text}");
+    assert!(text.starts_with("models     1\n"), "{text}");
+    assert!(text.contains("unclaimed  1\n"), "{text}");
+    assert!(
+        !text.contains("fetch"),
+        "nothing is downloading, so nothing may say so — and nothing may announce a zero count either:\n{text}"
+    );
+
+    let listed = run(&mut ws.list(true));
+    listed.assert_success();
+    assert_eq!(
+        listed.json()["fetching"].as_array().map(Vec::len),
+        Some(0),
+        "the key is present and empty, never suppressed"
+    );
 }

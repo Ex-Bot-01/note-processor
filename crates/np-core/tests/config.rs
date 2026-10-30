@@ -21,7 +21,8 @@ mod common;
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
     config_file_path, CatalogConfig, Config, ConfigError, EmbeddingProvider, EmbeddingsConfig,
-    MarkerConfig, WorkspaceRegistry, MAX_CONTINUATION_INDENT,
+    MarkerConfig, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS, MAX_CONTINUATION_INDENT,
+    MAX_EMBEDDING_TOKENS,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -698,7 +699,7 @@ fn a_misspelled_embeddings_key_is_refused_naming_key_and_file() {
         "an unknown key must travel as the typed parse refusal, got {err:?}"
     );
     // Quoted deliberately: toml names the bad key *and* lists the legal ones ("unknown field `provide`,
-    // expected one of `provider`, `model`, `dim`"), so an assertion on the bare word would be satisfied
+    // expected one of `provider`, `model`, `dim`, `max_tokens`"), so an assertion on the bare word would hold
     // by the suggestion list. "\`provide\`" is not a substring of "\`provider\`".
     assert!(
         message.contains("`provide`"),
@@ -757,25 +758,42 @@ fn omitting_the_embeddings_section_means_no_provider() {
 
 #[test]
 fn every_provider_spelling_parses_and_a_partial_section_keeps_its_defaults() {
-    // The three kebab-case spellings §2 uses, pinned from the file rather than from the enum: dropping
-    // `rename_all` would silently start accepting `LocalModel` and refuse `local-model`.
-    for (spelling, expected) in [
-        ("none", EmbeddingProvider::None),
-        ("local-model", EmbeddingProvider::LocalModel),
-        ("openai-compatible", EmbeddingProvider::OpenAiCompatible),
-    ] {
+    // The three kebab-case spellings §2 uses, pinned from a file rather than from the enum. R6a changed what
+    // each spelling *earns*, not what it parses to: `none` and `local-model` load (`local-model` only beside
+    // a model — §4 refuses a local provider with no identity), and `openai-compatible` is refused by **us**.
+    // That still pins serde's renaming attributes, and this is how: had a rename drifted, the failure would be
+    // `ConfigError::Parse` — serde unable to read the file — while §10's refusal is `Io(InvalidData)` on data
+    // it read perfectly. So the loop asserts the variant, which is the half that survives the refusal.
+    let section = |spelling: &str| {
+        format!("[embeddings]\nprovider = \"{spelling}\"\nmodel = \"{LOCAL_ID}\"\n")
+    };
+    for spelling in ["none", "local-model", "openai-compatible"] {
         let tmp = TempDir::new().expect("test setup: tempdir");
-        let path = write_config_with_data_dir(
-            tmp.path(),
-            &format!("[embeddings]\nprovider = \"{spelling}\"\n"),
-        );
-        let cfg = Config::load(Some(&path))
-            .unwrap_or_else(|err| panic!("\"{spelling}\" is a legal provider: {err}"));
-        assert_eq!(cfg.embeddings.provider, expected, "for {spelling}");
-        // Unread by production code in Round 3a, but they must arrive rather than be invented.
-        assert_eq!(cfg.embeddings.model, None, "absent model stays absent");
-        assert_eq!(cfg.embeddings.dim, None, "absent dim stays absent");
+        let path = write_config_with_data_dir(tmp.path(), &section(spelling));
+        match Config::load(Some(&path)) {
+            Ok(cfg) => assert_eq!(
+                cfg.embeddings.model.as_deref(),
+                Some(LOCAL_ID),
+                "a key the file spelled out must arrive rather than be invented"
+            ),
+            Err(ConfigError::Parse { source, .. }) => panic!(
+                "\"{spelling}\" is a legal spelling; serde was the one that refused it: {source}"
+            ),
+            Err(err) => assert!(
+                matches!(err, ConfigError::Io(_)),
+                "a refusal has to be ours, in our words, not the driver's: {err:?}"
+            ),
+        }
     }
+
+    // Absent keys stay absent — the part of §2's shipping default a full section cannot show.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[embeddings]\nprovider = \"none\"\n");
+    let cfg = Config::load(Some(&path))
+        .unwrap_or_else(|err| panic!("\"none\" is the default provider: {err}"));
+    assert_eq!(cfg.embeddings.provider, EmbeddingProvider::None);
+    assert_eq!(cfg.embeddings.model, None, "absent model stays absent");
+    assert_eq!(cfg.embeddings.dim, None, "absent dim stays absent");
 
     // The other two fields, and a section naming only one of them — which is what `EmbeddingsConfig`'s
     // own container default exists for.
@@ -797,11 +815,11 @@ fn every_provider_spelling_parses_and_a_partial_section_keeps_its_defaults() {
     assert_eq!(cfg.embeddings.provider, EmbeddingProvider::None);
     assert_eq!(cfg.embeddings.dim, None);
 
-    // Mutations this catches, all three observed: dropping `#[serde(rename_all = "kebab-case")]`
-    // ("local-model" then fails to parse); dropping the hand-written `openai-compatible` rename, which
-    // leaves serde's own kebab-casing in charge and refuses §2's spelling with "expected one of `none`,
-    // `local-model`, `open-ai-compatible`"; and dropping the container `default`, which makes a partial
-    // section error on its missing sibling key.
+    // Mutations this catches, all three still fatal: dropping `#[serde(rename_all = "kebab-case")]`
+    // ("local-model" then arrives as `ConfigError::Parse`, which the loop panics on); dropping the
+    // hand-written `openai-compatible` rename, which leaves serde's own kebab-casing in charge and refuses §2's
+    // spelling with "expected one of `none`, `local-model`, `open-ai-compatible`" — again a `Parse`; and
+    // dropping the container `default`, which makes the partial section below error on its missing sibling.
 }
 
 #[test]
@@ -823,4 +841,288 @@ fn an_unknown_key_outside_embeddings_still_loads() {
 
     // Mutation this catches: adding `deny_unknown_fields` to `Config` or `CatalogConfig`, which would
     // refuse config files that work today.
+}
+
+// ---------------------------------------------------------------------------
+// R6a: `[embeddings] max_tokens`, and the two provider refusals
+// (`docs/design-m2-local-embeddings.md` §5, §6, §10).
+// ---------------------------------------------------------------------------
+
+/// An id of the shape `docs/design-m2-local-embeddings.md` §4 mandates — quantisation inside the id, `@n` on
+/// the end — so a fixture cannot drift into accepting something `np models install` would refuse.
+const LOCAL_ID: &str = "embeddinggemma-2-text-q8_0@1";
+
+/// The token ceiling is a **build fact, and the refusal must say so**: 8,192 is how wide a context this build creates
+/// (`local_model::REQUESTED_CTX`), decided as design §5's option C on 2026-10-30 — the same day's option B put it at
+/// 4,096 and moved back with the window. History is the reason for the wording: it was 32 768 (justified by
+/// `max_position_embeddings = 262144`, a RoPE/train-length property since disowned), then 8,192 (the model card's
+/// attention window) — and **no test noticed either time**, because every other case is written
+/// *relative to* the constant. So the number is pinned through behaviour rather than a constant comparison (which clippy
+/// correctly refuses as `assertions_on_constants`, and which would only restate the source): a budget one over the
+/// ceiling must be refused, and the sentence must describe what the ceiling really is. A refusal that blames the model
+/// for a build choice sends the reader to a different GGUF when the answer is a shorter chunk — which is why this test
+/// asserts the message does *not* claim the model cannot attend to that many tokens.
+#[test]
+fn the_token_ceiling_carries_the_builds_window_into_its_refusal() {
+    let (_path, err) = embeddings_refusal(&format!(
+        "[embeddings]\nmax_tokens = {}\n",
+        MAX_EMBEDDING_TOKENS + 1
+    ));
+    let message = err.to_string();
+    assert!(
+        // The number is a literal on purpose. Reading it from `MAX_EMBEDDING_TOKENS` would make the assertion true by
+        // construction and blind to exactly the edit this test exists to catch — someone retuning the ceiling (as
+        // happened twice in 2026-10-30) without touching the decision record.
+        message.contains("8192") && message.contains("in this build"),
+        "the refusal has to teach the reader where the limit comes from, not just reject a number: {message}"
+    );
+    assert!(
+        !message.contains("this model attends"),
+        "the ceiling is our context width, not a claim about the artifact's training: {message}"
+    );
+
+    // And the ceiling itself is reachable: asking for exactly the window is legal, so the fence bounds the build rather than
+    // refusing every real budget.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        &format!("[embeddings]\nmax_tokens = {}\n", MAX_EMBEDDING_TOKENS),
+    );
+    let cfg = Config::load(Some(&path)).expect("the ceiling itself must be accepted");
+    assert!(
+        DEFAULT_EMBEDDING_TOKENS <= cfg.embeddings.max_tokens,
+        "the default budget cannot exceed the bound it is validated against"
+    );
+
+    // Mutations this catches: editing the ceiling without the decision record (the message stops naming the build),
+    // re-wording the refusal back to blaming the model, and lowering the ceiling below the default — the last of which
+    // `local_model`'s compile-time `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX` also refuses to build past.
+}
+
+#[test]
+fn an_absent_max_tokens_takes_the_default_and_changes_nothing_else() {
+    // R6a adds a key to a section that used to *refuse* it by name, so the property that matters is what an
+    // existing file still means: two fixtures written before this round — one silent about embeddings, one
+    // naming provider/model/dim — must parse to exactly the values they parsed to then, plus the default budget. A
+    // default that only appeared in `Config::default()` and not in the container default would fail here on the
+    // second fixture while the first stayed green.
+    //
+    // 1,024 is design §5's decision B (2026-10-30), priced by R6b2's throughput curve; the number before it was 2048,
+    // which was justified by arithmetic about chunk bytes rather than by a measured cost. Changing it again is a §5
+    // change with a measurement attached, not an edit to this line.
+    assert_eq!(
+        DEFAULT_EMBEDDING_TOKENS, 1_024,
+        "§5 fixes the budget at 1,024 tokens; changing it needs a re-measurement and a design note, not a constant edit"
+    );
+
+    for body in [
+        "[catalog]\nmax_entries_per_file = 400\n",
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"embeddinggemma-2-text@1\"\ndim = 512\n",
+    ] {
+        let tmp = TempDir::new().expect("test setup: tempdir");
+        let path = write_config_with_data_dir(tmp.path(), body);
+        let cfg = Config::load(Some(&path))
+            .unwrap_or_else(|err| panic!("a file that never mentions max_tokens is still valid: {err}"));
+        assert_eq!(
+            cfg.embeddings.max_tokens, DEFAULT_EMBEDDING_TOKENS,
+            "absent means the default, for {body:?}"
+        );
+    }
+
+    // The values the pre-R6a file already meant, asserted rather than assumed.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"embeddinggemma-2-text@1\"\ndim = 512\n",
+    );
+    let cfg = Config::load(Some(&path)).expect("test setup: load the pre-R6a file");
+    assert_eq!(cfg.embeddings.provider, EmbeddingProvider::LocalModel);
+    assert_eq!(
+        cfg.embeddings.model.as_deref(),
+        Some("embeddinggemma-2-text@1")
+    );
+    assert_eq!(cfg.embeddings.dim, Some(512));
+    assert_eq!(
+        cfg.catalog.max_entries_per_file, 600,
+        "untouched sections stay default"
+    );
+
+    // Mutations this catches: `max_tokens: usize` with no manual `Default` (absent becomes 0, which the loader
+    // then refuses — both fixtures fail to load), and editing the constant.
+}
+
+#[test]
+fn an_explicit_max_tokens_is_taken_verbatim_up_to_the_ceiling() {
+    // The boundaries of the accepted range: 1 is a legal if brutal budget, and `MAX_EMBEDDING_TOKENS` itself
+    // must load — a check that refuses its own ceiling has off-by-one-drifted into breaking documented range,
+    // which is the reason `the_ceiling_itself_is_accepted_and_zero_means_no_indent` exists for the indent.
+    for tokens in [1_usize, 512, DEFAULT_EMBEDDING_TOKENS, MAX_EMBEDDING_TOKENS] {
+        let tmp = TempDir::new().expect("test setup: tempdir");
+        let path = write_config_with_data_dir(
+            tmp.path(),
+            &format!("[embeddings]\nprovider = \"none\"\nmax_tokens = {tokens}\n"),
+        );
+        let cfg = Config::load(Some(&path))
+            .unwrap_or_else(|err| panic!("{tokens} tokens is inside the documented range: {err}"));
+        assert_eq!(cfg.embeddings.max_tokens, tokens, "for {tokens}");
+    }
+
+    // Mutation this catches: `1..MAX_EMBEDDING_TOKENS` instead of `1..=`, which refuses the ceiling.
+}
+
+#[test]
+fn a_max_tokens_outside_its_bounds_is_refused_naming_key_value_and_both_bounds() {
+    // Zero is the refusal that matters most: a budget of nothing refuses every chunk, and a report that said
+    // "0 chunks embedded" over it would read as a corpus already done. The ceiling case is the typo
+    // (`999999999`) this bound exists to catch before R6b1's runtime allocates for it.
+    for tokens in [0_usize, MAX_EMBEDDING_TOKENS + 1, 999_999_999] {
+        let (_path, err) = embeddings_refusal(&format!(
+            "[embeddings]\nprovider = \"none\"\nmax_tokens = {tokens}\n"
+        ));
+        let message = err.to_string();
+        assert!(
+            message.contains("embeddings.max_tokens"),
+            "the refusal must name the key to fix: {message}"
+        );
+        assert!(
+            message.contains(&tokens.to_string()),
+            "and the offending value: {message}"
+        );
+        assert!(
+            message.contains("1 and") && message.contains(&MAX_EMBEDDING_TOKENS.to_string()),
+            "and the range to aim at, so it is actionable from the message alone like F17's indent: {message}"
+        );
+        let ConfigError::Io(io_err) = &err else {
+            panic!("an out-of-range value must travel as Io(InvalidData), got {err:?}");
+        };
+        assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+
+        // Mutation this catches: dropping the range check (both load silently), or clamping to the ceiling — a
+        // clamp would publish bytes the config file does not describe, which is why F17 refuses instead.
+    }
+}
+
+/// `np models install --dim 0` is refused by np-cli's type; a config file is the other door to the same value, and
+/// R6a made it load-bearing (it becomes `LocalModelProvider::new`'s `configured` argument). Migration 7's
+/// `CHECK (length(vector) = 4 * dim)` admits a zero-byte vector at `dim = 0`, so both doors refuse.
+#[test]
+fn a_zero_width_is_refused_because_it_names_no_vector() {
+    let (_path, err) = embeddings_refusal(
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"gemma-2-text-q8_0@1\"\ndim = 0\n",
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("embeddings.dim") && message.contains("zero-width"),
+        "the refusal names the key and the reason: {message}"
+    );
+
+    // The absent arm stays legal: leaving the width unset is a different statement from asserting zero, and this is
+    // the shape every fresh install has.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[embeddings]\nprovider = \"none\"\n");
+    let unset = Config::load(Some(&path)).expect("omitting dim stays valid");
+    assert_eq!(unset.embeddings.dim, None, "unset is not zero");
+
+    // Mutation this catches: deleting the bound — the first `embeddings_refusal` then panics inside itself, which is
+    // how it reports a file that loaded when it should not have.
+}
+
+#[test]
+fn local_model_without_a_model_is_refused_naming_the_key_it_needs() {
+    // §6's exit state (ii) starts here: a chosen provider with no identity cannot write `embeddings.model`,
+    // and loading it happily would make `np embed` report "nothing owed" for a corpus nothing named.
+    let (_path, err) = embeddings_refusal("[embeddings]\nprovider = \"local-model\"\n");
+    let message = err.to_string();
+    assert!(
+        message.contains("local-model") && message.contains("embeddings.model"),
+        "the refusal has to name both the provider that needs it and the key that supplies it: {message}"
+    );
+    let ConfigError::Io(io_err) = &err else {
+        panic!("valid TOML carrying an unservable choice must not be reported as a parse error: {err:?}");
+    };
+    assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+
+    // Mutation this catches: defaulting the model to something (`\"none\"`, the first row in `models`) — the
+    // file then loads, this test fails on the panic inside `embeddings_refusal`, and a corpus gets embedded
+    // under a model nobody chose.
+}
+
+#[test]
+fn local_model_with_an_uninstallable_id_is_refused_naming_the_id_and_the_rule() {
+    // "a `model` naming an installed row", the half that needs no database: whether an id *can* name a row is
+    // `models::validate_id`'s rule, reused here rather than restated — and the id itself goes in the message,
+    // because the reader has to know which of their keys to edit.
+    for model in ["GEMMA-2", "has space", ".hidden", "trailing."] {
+        let (_path, err) = embeddings_refusal(&format!(
+            "[embeddings]\nprovider = \"local-model\"\nmodel = \"{model}\"\n"
+        ));
+        let message = err.to_string();
+        assert!(
+            message.contains(model),
+            "the refusal must carry the id it refused: {message}"
+        );
+        assert!(
+            message.contains("embeddings.model"),
+            "and say which key holds it: {message}"
+        );
+
+        // Mutation this catches: dropping the `validate_id` call (this file loads, and the refusal moves to
+        // embed time — or never arrives, because no row can ever be installed under these ids).
+    }
+
+    // And an id that *is* installable is accepted, even though no such row exists yet: whether one does is a
+    // question for the caller holding the workspace database (`db::model_row`), not for a config file.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        &format!("[embeddings]\nprovider = \"local-model\"\nmodel = \"{LOCAL_ID}\"\n"),
+    );
+    let cfg = Config::load(Some(&path))
+        .unwrap_or_else(|err| panic!("`{LOCAL_ID}` is exactly what §4 says to install: {err}"));
+    assert_eq!(cfg.embeddings.model.as_deref(), Some(LOCAL_ID));
+}
+
+#[test]
+fn openai_compatible_still_parses_and_refuses_at_load_naming_what_changed() {
+    // §10's decision, fenced: the variant stays so an existing file is not told it is malformed, and the
+    // refusal is ours so it can say what went away and what to write instead. The F17 precedent is exactly this
+    // shape — `ConfigError::Parse` passes serde's text through verbatim, which would accuse valid TOML.
+    let (_path, err) = embeddings_refusal("[embeddings]\nprovider = \"openai-compatible\"\n");
+    let message = err.to_string();
+    assert!(
+        message.contains("openai-compatible"),
+        "the refusal must name the spelling it refused, or it cannot be matched to the file: {message}"
+    );
+    assert!(
+        message.contains("local") && message.contains("local-model"),
+        "what changed (embeddings are local) and what to write instead, both in one sentence: {message}"
+    );
+    let ConfigError::Io(io_err) = &err else {
+        panic!(
+            "a valid file must be refused by our rule, not by serde's unknown-variant text: {err:?}"
+        );
+    };
+    assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+
+    // Mutations this catches: deleting the variant (serde's `Parse` then answers a well-formed file and this
+    // test fails on the `Io` match), and serving the spelling anyway — which the panic inside
+    // `embeddings_refusal` reports, loaded provider and all.
+}
+
+#[test]
+fn the_new_refusals_are_scoped_to_the_provider_that_needs_them() {
+    // The other half of "refuse loudly", and the half a single fixture cannot see: an id that would be refused
+    // beside `local-model` is ordinary text beside `none`, because nothing will embed. Refusing it there would
+    // break config files that work today — the same scoping argument as
+    // `an_unknown_key_outside_embeddings_still_loads`, one level down.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path =
+        write_config_with_data_dir(tmp.path(), "[embeddings]\nmodel = \"GEMMA-2\"\ndim = 512\n");
+    let cfg = Config::load(Some(&path))
+        .expect("a default provider does not need its unread model key to be an installable id");
+    assert_eq!(cfg.embeddings.provider, EmbeddingProvider::None);
+    assert_eq!(cfg.embeddings.model.as_deref(), Some("GEMMA-2"));
+
+    // Mutation this catches: running `validate_id` on `model` regardless of provider, which turns every
+    // existing file holding a placeholder string into a refusal.
 }

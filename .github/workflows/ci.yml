@@ -33,9 +33,138 @@ jobs:
         env:
           RUSTDOCFLAGS: --deny warnings
         run: cargo doc --locked --workspace --no-deps
+      # `CMAKE` points at nothing on purpose. Both runners have cmake preinstalled, so "the default build never
+      # touches the C++" would otherwise be unprovable here: a regression that probed cmake with the feature off
+      # would stay green and just get slower. With this set, build.rs meeting cmake at all is impossible - it
+      # returns before reading the variable (R6b0 review P2-10), and if that ever stops being true this row fails.
       - name: Test
+        env:
+          CMAKE: /nonexistent
         run: cargo test --locked --workspace
       # The release-only cases (`#[ignore]`d huge-input tests) run here, so a linear-time
       # regression in `items` or `links` cannot land unmeasured.
       - name: Release tests
         run: cargo test --locked --release -- --ignored
+
+  # The `local-model` row that design-m2-local-embeddings.md §2 promised, now that there is something
+  # behind the feature to rot. A feature nothing compiles is invisible in exactly three ways - clippy
+  # lints inside `cfg(feature)`, rustdoc warnings in gated docs, and tests whose early return looks like
+  # a pass - and this job is what makes each of those fail loudly instead.
+  #
+  # Linux only, on purpose. §14 measured the C++ build here (23 s for target `llama`) and has seen
+  # nothing on Windows or macOS, so adding those rows would put a claim in YAML that nobody has watched
+  # happen - F18's mistake with a different noun. The Windows feature row lands when someone has seen it
+  # green, and §2 keeps release binaries on the feature off until then.
+  #
+  # Honest caveat: GitHub Actions is currently down account-side (2026-10-29), so none of this has run
+  # in CI yet. It was written and executed locally, gate for gate; treat the first green run as evidence
+  # still owed, not as coverage already banked.
+  feature-local-model:
+    name: Feature local-model (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain components
+        run: rustup component add clippy rustfmt
+      # The one network step in this repository's build. Keyed on the pin file (where both digests live) *and*
+      # on the script that produces the directory: an unpack layout change - strip-components, stamp location -
+      # has to invalidate the cache too, or CI keeps restoring the old-shaped tree while the new script refuses
+      # to re-unpack over it (R6b0 review P2-3). The script is idempotent and verifies content by header digest,
+      # so a cache miss costs one 38.7 MB download rather than a stale-tree surprise.
+      - name: Cache the pinned llama.cpp source
+        uses: actions/cache@v4
+        with:
+          path: .vendor
+          key: llama-cpp-${{ hashFiles('third_party/llama-cpp.toml', 'scripts/vendor-llama-cpp.sh') }}
+      - name: Vendor llama.cpp
+        run: ./scripts/vendor-llama-cpp.sh
+      # cmake is preinstalled on ubuntu-latest; `build.rs` honours a `CMAKE` override for hosts where it
+      # is not, and refuses with that name if it cannot find one at all.
+      - name: Check
+        run: cargo check --locked -p np-core --features local-model
+      - name: Clippy
+        run: cargo clippy --locked -p np-core --features local-model --all-targets -- -D warnings
+      # The third way a feature is invisible, and the reason this step exists: `llama_ffi` is gated in
+      # `src/lib.rs`, so the default job's Docs step never compiles the module and none of its intra-doc links
+      # are resolved by any run. The job comment names rustdoc as one of the three gaps it closes, so it has
+      # to run here (R6b0 review P1-4). Measured locally on 2026-10-29: this passes today, so it is coverage
+      # being closed rather than a warning being unhidden.
+      - name: Docs (feature on)
+        env:
+          RUSTDOCFLAGS: "--deny warnings"
+        run: cargo doc --locked -p np-core --features local-model --no-deps
+      # `--lib` alongside the link-proof test: the struct-layout pins in `src/llama_ffi.rs` only compile
+      # with the feature on, and a wrong field order is an unsound memory bug rather than a compile
+      # error. §2 step 4 wants skipped work printed as `NOT COVERAGE`. `local_runtime.rs` cannot skip at all -
+      # no artifact gate, no env-var escape - so a green run there means llama.cpp was called.
+      #
+      # `--test local_load` is here so R6b1's loader compiles and runs on this row. What it does NOT prove on a
+      # runner: there is no 310 MB artifact, so **four** of its seven cases print `NOT COVERAGE` and pass - the
+      # real-file facts (768/512/262144/MEAN), the declared-vs-actual width refusal, the three-round load/drop
+      # cycle, and the truncated-artifact refusal. Those are measured locally with `NP_TEST_MODEL_PATH` set.
+      # What this row does cover without a model file: the two pre-runtime refusals (absent path, directory),
+      # the runtime's own bad-magic refusal (bytes reach `llama_model_load_from_file` and come back null), and
+      # the module's synthetic unit tests for pooling/positive-count refusals. Say it that plainly because
+      # "every refusal" was false: every `Unavailable` arm and the width refusal need an artifact.
+      #
+      # `--test local_embed` is R6b2's forward pass, and on GitHub it is **compilation plus twelve printed
+      # `NOT COVERAGE` lines and nothing else** - every case there asks a model for a vector (four of
+      # local_load's seven, the same way). What runs locally
+      # with the artifact (and is the actual deliverable) is the unit-length and determinism checks, the cosine
+      # ordering, the token-budget and window refusals, the 600-token no-abort regression, and the throughput
+      # figures. Listing it here still earns its place: a test file that does not compile against the pinned
+      # header is caught on the row, which is where a re-pin first shows up.
+      - name: Link proof
+        # `--nocapture` is load-bearing, not cosmetics (Scope B review P1-3). libtest captures a passing test's stdout
+        # and throws it away, so the twelve `NOT COVERAGE` lines this job exists to print never reached the log: measured
+        # under the previous command with no artifact the count was **0**, and 12 only with the flag. The count is then
+        # echoed so "compiled, never ran" is written on the record (§2 step 4) rather than implied - and the test exit
+        # code, not the grep, is what fails the job.
+        run: |
+          # `set +e` first, deliberately: the runner starts these blocks with errexit on, and under errexit a failing
+          # `cargo test` aborts the shell at that pipeline - which is exactly when the count matters most (A2 review
+          # P2-3). Capture the status, print the record, then exit with cargo's code so the test result stays what
+          # fails the job.
+          set +e
+          set -uo pipefail
+          cargo test --locked -p np-core --features local-model --lib --test local_runtime \
+            --test local_load --test local_embed -- --nocapture 2>&1 | tee /tmp/feature-tests.log
+          status=${PIPESTATUS[0]}
+          count=$(grep -c 'NOT COVERAGE' /tmp/feature-tests.log)
+          echo "NOT COVERAGE occurrences: $count"
+          if [ "$status" -ne 0 ]; then
+            echo "the feature test row failed (exit $status); the count above is context, not the verdict" >&2
+            exit "$status"
+          fi
+          # The step asserts something about the number it exists to print (A2 review P2-4). Twelve cases in
+          # local_embed plus four of seven in local_load print this line when no artifact is configured; a smaller
+          # total means the prints stopped reaching the log - `--nocapture` lost, or a case silently became a real pass
+          # with no artifact - and "compiled, never ran" would be back to being implied rather than stated.
+          if [ "$count" -lt 16 ]; then
+            echo "expected at least 16 NOT COVERAGE lines with no artifact, saw $count: §2 step 4 is not on the record" >&2
+            exit 1
+          fi
+      # "A green run means llama.cpp was called" is only worth saying if the run can also say *which* llama.cpp.
+      # `-l static=llama` is not an exclusive search path, so two cheap probes back it up: no shared llama in the
+      # test binary, and `llama_version` defined in it. Read what the two do and do not say (A2 review P2-5): together
+      # they show **static linkage from an archive this run produced**. A runner that happened to have llama.cpp
+      # installed statically would satisfy both just the same - every post-v0.8.0 revision reports `0.8.0-dev` as well
+      # (`LLAMA_BUILD_IS_DEV=ON`) - so the pinned header digest enforced in build.rs is what identifies the tree, and
+      # this step proves only which linkage we got (R6b0 review P2-5).
+      - name: Link identity probes
+        run: |
+          set -euo pipefail
+          bin=$(cargo test --locked -p np-core --features local-model --test local_runtime --no-run --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*local_runtime[^"]*\)".*/\1/p' | tail -n 1)
+          test -n "$bin" && test -x "$bin"
+          echo "inspecting $bin"
+          if ldd "$bin" | grep -i llama; then
+            echo "FAIL: a shared llama.cpp was picked up off the loader path" >&2
+            exit 1
+          fi
+          echo "ok: no shared llama dependency"
+          if ! nm --defined-only "$bin" | grep -q ' T llama_version'; then
+            echo "FAIL: llama_version is not defined in the test binary; it did not come from our archive" >&2
+            exit 1
+          fi
+          echo "ok: llama_version defined locally (static linkage from an archive this build produced)"

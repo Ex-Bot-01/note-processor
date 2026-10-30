@@ -2,13 +2,25 @@
 //!
 //! This is the whole of round 4a's behaviour, as core functions rather than as CLI code: `install` puts a
 //! file the human already holds under the workspace's artifact directory, verifies it against a digest the
-//! human declared, and records the row; `list` says what each row's artifact looks like. Both take `&Db` and
+//! human declared, and records the row; `list` says what each row's artifact looks like **and any fetch in
+//! progress beside the rows**. Both take `&Db` and
 //! `&Config` so np-cli stays a parser of text into [`Install`] plus a printer of [`InstallOutcome`] and
 //! [`Listing`] — the reason §6 names reads and writes in `db.rs` instead of letting a command hold SQL.
 //!
 //! Nothing here contacts anything: no HTTP client, no URL, no key, no model execution (§5). The one digest
 //! implementation is [`crate::hash::sha256_file`] — this module defines no second SHA-256, and §7's test 9
-//! exists to keep it that way.
+//! exists to keep it that way. R7a keeps that sentence true: reading a fetch marker ([`fetch_state`]) opens one
+//! file in the workspace's own artifact directory, and nothing in this module can name a host or open a socket.
+//! The transfer itself belongs to a separate module behind its own feature (`design-m2-local-embeddings`
+//! §12 rule 1), which does not exist yet — so **no code path here can create a marker**, and R7a has nothing of
+//! *this program's own* to report. A marker any other hand placed is still reported: [`list`] reads names, not
+//! authorship, which is what makes the first-start case work before R7b writes its first byte.
+//!
+//! **`fetching` is not an [`ArtifactState`]** (§12 rule 3). The four arms above are mutually exclusive verdicts
+//! on one artifact, while a fetch is orthogonal to all of them: on a first start there is *no row at all*, and a
+//! row that is `present` can be re-fetching. So a fetch is reported beside the rows — [`Listing::fetching`],
+//! which the listing renders as its own section — and adding a fifth arm would make "the artifact is fine and it
+//! is also being replaced" inexpressible rather than merely unusual.
 //!
 //! Two properties the rest of the crate cares about, both structural rather than incidental:
 //!
@@ -21,9 +33,9 @@
 //!   representation in [`Listing`] and so leaves as [`ModelError::ModelsDir`].
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -51,6 +63,18 @@ const DIGEST_HEX_CHARS: usize = 64;
 /// `list`'s unclaimed heading (§3) rather than deleted, because nothing here deletes anything a row may
 /// still be naming.
 const TEMP_SUFFIX: &str = ".tmp";
+
+/// Leading dot of both fetch names, and the half that makes them unforgeable: [`validate_id`] refuses an id whose
+/// first character is not a lowercase letter or a digit (§12 rule 2).
+const FETCH_MARKER_PREFIX: &str = ".fetching.";
+
+/// The marker's extension. Spelled `.json` because the file holds §12's four fields as one JSON object, and read
+/// back by [`parse_marker`] rather than by a dependency this crate does not have.
+const FETCH_MARKER_SUFFIX: &str = ".json";
+
+/// Leading dot plus the word for a partial download: `.part.<id>.<nonce>` (§12 rule 2). R7a recognises this name
+/// and reads nothing from it — its only consumer today is `list`'s rule that a fetch is never announced as junk.
+const PART_PREFIX: &str = ".part.";
 
 /// Names Windows refuses as file names in any extension (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
 /// `LPT1`-`LPT9`). §2's rule, because an id is a file name: such a row is one whose artifact cannot exist on
@@ -193,6 +217,492 @@ pub enum UnclaimedKind {
     Directory,
 }
 
+/// Which fetch name one directory entry spells, per [`fetch_name`].
+///
+/// Two arms because two names exist (§12 rule 2), and the id is borrowed from the entry name rather than copied:
+/// the caller that wants an owned one says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchName<'a> {
+    /// `.fetching.<id>.json` — the marker that says a fetch of `id` is running.
+    Marker(&'a str),
+    /// `.part.<id>.<nonce>` — bytes of `id`'s artifact that are still arriving.
+    Part(&'a str),
+}
+
+/// §12 rule 2's **single** recogniser: what fetch name (if any) a directory entry spells, byte-exact and
+/// case-sensitive.
+///
+/// Every caller goes through here — `list`'s exclusion from `unclaimed`, and nothing else reads these names — so
+/// "the program recognises this name" has one definition. Two properties make the names safe rather than merely
+/// conventional:
+///
+/// - **No model id can forge either name.** Both start with `.`, and [`validate_id`] requires a first character
+///   that is a lowercase letter or a digit, so no id can ever *be* one of these names; the artifact path of
+///   every row is therefore distinct from every marker and every partial download. (The first draft's
+///   `<id>.fetching.json` was forgeable — `alpha.fetching.json` is a legal id. `tests/models.rs` pins both
+///   halves of that asymmetry rather than trusting this sentence.)
+/// - **The id half is validated, not guessed.** A name whose middle is not a legal id (`f.fetching.json`,
+///   `.fetching..json`, `.FETCHING.a.json`, anything holding a path separator) is *not* a fetch name; it is
+///   junk, and `list` says so under `unclaimed` like any other unrecognised entry.
+///
+/// A name that UTF-8 cannot hold returns `None`: such a name cannot be an id either, so it is junk by the same
+/// rule rather than by a decoding guess.
+pub fn fetch_name(name: &OsStr) -> Option<FetchName<'_>> {
+    let text = name.to_str()?;
+    // A separator anywhere means this is not one entry name, whatever the caller was handed. `read_dir` never
+    // produces one, so this is the fence against a caller feeding a path in where it meant a file name.
+    if text.contains('/') || text.contains('\\') {
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix(FETCH_MARKER_PREFIX) {
+        let id = rest.strip_suffix(FETCH_MARKER_SUFFIX)?;
+        if validate_id(id).is_ok() {
+            Some(FetchName::Marker(id))
+        } else {
+            None
+        }
+    } else if let Some(rest) = text.strip_prefix(PART_PREFIX) {
+        // `<id>.<nonce>`, split at the **last** dot because ids contain dots: `.part.a.b.4242-1-0` is id `a.b`
+        // with nonce `4242-1-0`. The nonce itself is not charset-checked — only `fetch_name` and the listing
+        // read this name in R7a, and a partial download whose nonce spelling this build has never written is
+        // still a partial download of that id, which is the fact the listing needs.
+        let (id, nonce) = rest.rsplit_once('.')?;
+        if nonce.is_empty() || validate_id(id).is_err() {
+            return None;
+        }
+        Some(FetchName::Part(id))
+    } else {
+        None
+    }
+}
+
+/// The marker path for `id` — the other direction of [`fetch_name`]’s rule, and the only place that spelling is
+/// built.
+///
+/// `tests/models.rs` pins the round trip: for every id shape `validate_id` accepts, the name this returns is
+/// recognised back as [`FetchName::Marker`] with that same id. Without that fence the reader and the writer
+/// (R7b) could drift apart and `list` would report a fetch it cannot find.
+pub fn marker_path(models_dir: &Path, id: &str) -> PathBuf {
+    models_dir.join(format!("{FETCH_MARKER_PREFIX}{id}{FETCH_MARKER_SUFFIX}"))
+}
+
+/// What one fetch marker says about the download in progress (§12 rules 4 and 12).
+///
+/// Four fields, all **displayed and never acted on**: §12 rule 4 makes liveness a matter of consent, so
+/// `started_at` is printed rather than compared with a clock. `bytes_total` is optional because a chunked
+/// transfer or a missing `Content-Length` really does leave it unknown (§12 rule 12); `None` prints as "size
+/// unknown", never as a denominator this program invented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchFields {
+    /// The nonce naming the `.part.<id>.<nonce>` file this fetch writes — the human's link between the marker
+    /// and the bytes on disk. Kept opaque: `list` prints it and decides nothing from it.
+    ///
+    /// **Never empty.** [`fetch_name`] refuses `.part.<id>.`, so a marker carrying `""` would point at a name this
+    /// program's own recogniser calls junk; the reader rejects it as unreadable rather than storing a link that
+    /// resolves to nothing.
+    pub nonce: String,
+    /// Whole seconds since the Unix epoch, as written. Displayed only.
+    pub started_at: i64,
+    /// Bytes received so far.
+    pub bytes_done: u64,
+    /// The size this fetch expects, when the transfer announced one (§12 rule 12).
+    pub bytes_total: Option<u64>,
+}
+
+/// What reading one workspace's fetch marker for one id said. Never a `Result`: no marker condition is a fault
+/// of the listing (§12 rule 3), so every answer below is data the report prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchState {
+    /// No marker file. The ordinary state of a workspace with no fetch running.
+    Absent,
+    /// A marker that reads as §12's field set.
+    Present(FetchFields),
+    /// A marker exists and this build cannot read it — truncated mid-write, not UTF-8, not an object, a field
+    /// of the wrong type, or a file whose bytes cannot be opened at all.
+    ///
+    /// **Reported, never deleted, never skipped** (the F22/F23 posture: record what you found and let the human
+    /// decide). `reason` is the parser's own sentence about this file, and `path` is there because §12 rule 4's
+    /// advice — "if no fetch is running, delete this file and re-run" — is useless without it.
+    Unreadable {
+        /// The marker that could not be read.
+        path: PathBuf,
+        /// What was wrong with it, naming the field or the failure.
+        reason: String,
+    },
+}
+
+/// Read this workspace's fetch marker for `id` (§12 rule 4's "read-only" half).
+///
+/// `models_dir` comes from [`Config::workspace_models_dir`] like every other path here, and `id` is expected to
+/// be one [`validate_id`] accepts — the ids `list` passes come out of [`fetch_name`], which already checked.
+///
+/// Nothing in this function deletes, renames or repairs. A marker whose bytes are unreadable stays exactly where
+/// it is: an implicit deletion would be this program deciding that a download nobody is watching was worthless,
+/// and §12 rule 4 refuses that decision to any command but an explicit `--discard-marker` (R7b's, not here).
+pub fn fetch_state(models_dir: &Path, id: &str) -> FetchState {
+    let path = marker_path(models_dir, id);
+    // **Look before opening.** A name alone does not promise a regular file, and one of the alternatives blocks:
+    // `fs::File::open` on a FIFO waits for a writer, so a stray `.fetching.<id>.json` pipe would hang
+    // `np models list` forever — the exact power [`MARKER_MAX_BYTES`] exists to deny a stray file. Artifacts are
+    // read the same way ([`artifact_state`] checks `is_file()` before hashing), and the answer is the one a
+    // directory already got: reported as unreadable, never deleted, never "absent".
+    //
+    // **This guard is defence-in-depth, not a covered branch, and it is written down rather than simulated.** No
+    // test distinguishes it: on Linux a *directory* at the marker path still reaches `Unreadable` through the read
+    // failing, so deleting the block changes nothing any unit test can see (verified — the mutant survived). What it
+    // actually buys was measured end to end instead: with a FIFO planted at `.fetching.gamma.json`, `np models list`
+    // blocked until `timeout` killed it (exit 124) before this guard and now completes, printing
+    // "it is not a regular file" for that id. A test would need `mkfifo`, i.e. a libc dependency or an external
+    // binary plus a skip path on Windows — the skipped-branch class this project refuses to write coverage about.
+    match fs::metadata(walk::to_open_path(&path)) {
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return FetchState::Absent,
+        Err(source) => {
+            return FetchState::Unreadable {
+                path,
+                reason: source.to_string(),
+            }
+        }
+        Ok(meta) if !meta.is_file() => {
+            return FetchState::Unreadable {
+                path,
+                reason: "it is not a regular file".to_string(),
+            }
+        }
+        Ok(_) => {}
+    }
+    let opened = fs::File::open(walk::to_open_path(&access(&path)));
+    let file = match opened {
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return FetchState::Absent,
+        // A permission refusal — or a name that is a directory, which Linux opens and refuses to read — says
+        // nothing about the marker's contents. That is why it shares `Unreadable` with a malformed one rather
+        // than becoming `Absent`: "cannot look" must not read as "nothing there".
+        Err(source) => {
+            return FetchState::Unreadable {
+                path,
+                reason: source.to_string(),
+            }
+        }
+        Ok(file) => file,
+    };
+    // Read with a ceiling rather than [`fs::read`], so an oversized file under a marker's name cannot decide how
+    // much memory a listing allocates. One byte past the bound is enough to know it has been passed.
+    let mut bytes = Vec::new();
+    let read = (&file).take(MARKER_MAX_BYTES + 1).read_to_end(&mut bytes);
+    if let Err(source) = read {
+        return FetchState::Unreadable {
+            path,
+            reason: source.to_string(),
+        };
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MARKER_MAX_BYTES {
+        return FetchState::Unreadable {
+            path,
+            reason: format!("it is larger than {MARKER_MAX_BYTES} bytes"),
+        };
+    }
+    match parse_marker(&bytes) {
+        Ok(fields) => FetchState::Present(fields),
+        Err(reason) => FetchState::Unreadable { path, reason },
+    }
+}
+
+/// Largest marker file this program reads, in bytes.
+///
+/// A marker holds four fields, so the honest size is a couple of hundred bytes. The bound exists because `list`
+/// reads this file to write one report line: a name like `.fetching.alpha.json` filled with five gigabytes of
+/// anything would otherwise be loaded into memory before this module got to say "that is not a marker", and one
+/// stray file must not decide whether `np models list` survives. Refused as unreadable, never truncated silently.
+const MARKER_MAX_BYTES: u64 = 64 * 1024;
+
+/// Read one marker's bytes as §12's field set, or say why they are not that.
+///
+/// **Why this is a hand-written reader rather than a JSON dependency**: `np-core` has no JSON reader today and
+/// R7a adds none (no dependency additions, and `serde_json` would arrive in the graph of every binary that links
+/// this crate for one four-field file). So the accepted grammar is deliberately narrow — **one flat object of
+/// string keys with string, whole-number or `null` values, nothing else** — and everything outside it is reported
+/// as unreadable rather than guessed at:
+///
+/// - a non-object, a nested object or array, a trailing comma, or text after the closing `}`
+/// - a field name this build does not know (a marker from a build with rules this one has cannot half-read)
+/// - a field twice, a required field absent (`nonce`, `started_at`, `bytes_done` — only `bytes_total` is
+///   optional, §12 rule 12), or a value of the wrong kind for its field
+/// - a number that is not whole: `41.9`, `1e5` and `0x10` are refused rather than read as whatever a cast gives,
+///   because a byte count invented by rounding is exactly the fabricated denominator §12 rule 12 forbids
+/// - bytes that are not UTF-8, or a string holding a control character or a `\` escape (this program writes
+///   neither, so their presence means the file did not come from this program)
+fn parse_marker(bytes: &[u8]) -> Result<FetchFields, String> {
+    let mut reader = MarkerReader::new(bytes);
+    reader.skip_spaces();
+    if reader.peek() != Some(b'{') {
+        // Covers the empty file and a truncated write that stopped before the first brace: both are "a marker
+        // this build cannot read", which is what `FetchState::Unreadable` exists to report.
+        return Err("expected one JSON object".to_string());
+    }
+    reader.pos += 1;
+
+    let mut nonce: Option<String> = None;
+    let mut started_at: Option<i64> = None;
+    let mut bytes_done: Option<u64> = None;
+    // Two layers on purpose: outer "the field was there", inner "and it was not `null`". Both spellings of
+    // unknown size mean the same thing to the report (§12 rule 12), so they meet at `flatten()` below.
+    let mut bytes_total: Option<Option<u64>> = None;
+
+    loop {
+        reader.skip_spaces();
+        if reader.peek() == Some(b'}') {
+            // `{}` is a well-formed object that holds none of the four fields; the missing-field refusals below
+            // are the honest report, not "expected a field name".
+            reader.pos += 1;
+            break;
+        }
+        let key = reader.quoted()?;
+        reader.skip_spaces();
+        if reader.peek() != Some(b':') {
+            return Err(format!("field `{key}` is not followed by `:`"));
+        }
+        reader.pos += 1;
+        reader.skip_spaces();
+        let value = reader.value(key)?;
+        match key {
+            "nonce" => {
+                if nonce.is_some() {
+                    return Err(duplicate("nonce"));
+                }
+                // Empty is refused, not stored: `.part.<id>.` is a name [`fetch_name`] rejects, so an empty nonce
+                // would be a link to nothing (§12 rule 2). Keeping the two spellings of "no nonce" in step here is
+                // cheaper than trusting R7b to write one and read the other.
+                let written = value.text("nonce")?;
+                if written.is_empty() {
+                    return Err(unparsable("nonce", "an empty string"));
+                }
+                nonce = Some(written);
+            }
+            "started_at" => {
+                if started_at.is_some() {
+                    return Err(duplicate("started_at"));
+                }
+                started_at = Some(value.signed("started_at")?);
+            }
+            "bytes_done" => {
+                if bytes_done.is_some() {
+                    return Err(duplicate("bytes_done"));
+                }
+                bytes_done = Some(value.count("bytes_done")?);
+            }
+            "bytes_total" => {
+                if bytes_total.is_some() {
+                    return Err(duplicate("bytes_total"));
+                }
+                bytes_total = Some(value.optional_count("bytes_total")?);
+            }
+            other => return Err(format!("unknown field `{other}`")),
+        }
+        reader.skip_spaces();
+        match reader.peek() {
+            Some(b',') => {
+                reader.pos += 1;
+                reader.skip_spaces();
+                if reader.peek() == Some(b'}') {
+                    return Err("a `,` before the closing `}`".to_string());
+                }
+            }
+            Some(b'}') => {
+                reader.pos += 1;
+                break;
+            }
+            // Truncated mid-file lands here too, which is the point: a marker written by a fetch killed halfway
+            // is reported with its fields unknown rather than trusted for the half that arrived.
+            _ => return Err("expected `,` or `}` after a field".to_string()),
+        }
+    }
+
+    reader.skip_spaces();
+    if !reader.at_end() {
+        return Err("text after the closing `}`".to_string());
+    }
+    Ok(FetchFields {
+        nonce: nonce.ok_or_else(|| "no `nonce` field".to_string())?,
+        started_at: started_at.ok_or_else(|| "no `started_at` field".to_string())?,
+        bytes_done: bytes_done.ok_or_else(|| "no `bytes_done` field".to_string())?,
+        bytes_total: bytes_total.flatten(),
+    })
+}
+
+/// The reason a field arrived twice, which is a contradiction rather than a last-one-wins choice.
+fn duplicate(field: &str) -> String {
+    format!("field `{field}` appears twice")
+}
+
+/// One marker value, before its field name says what it has to be.
+#[derive(Debug, Clone, Copy)]
+enum MarkerValue<'a> {
+    /// A quoted string, unescaped (escapes are refused at [`MarkerReader::quoted`]).
+    Text(&'a str),
+    /// The digits of a whole number, not yet parsed into a width.
+    Count(&'a str),
+    /// `null` — legal only for `bytes_total`.
+    Null,
+}
+
+impl<'a> MarkerValue<'a> {
+    fn text(self, field: &str) -> Result<String, String> {
+        match self {
+            Self::Text(text) => Ok(text.to_owned()),
+            _ => Err(wrong_kind(field, "a quoted string")),
+        }
+    }
+
+    /// A count that may be negative: `started_at` is a clock reading this program only **displays** (§12 rule 4),
+    /// so refusing a value it cannot explain would be inventing a rule the design does not state.
+    fn signed(self, field: &str) -> Result<i64, String> {
+        let digits = self.digits(field)?;
+        digits.parse::<i64>().map_err(|_| unparsable(field, digits))
+    }
+
+    /// A byte count. Negative is refused here and not at the display: bytes received cannot be fewer than none,
+    /// and a report printing `-5 B / 309.9 MB` would be reporting a download that cannot have happened.
+    fn count(self, field: &str) -> Result<u64, String> {
+        let digits = self.digits(field)?;
+        digits.parse::<u64>().map_err(|_| unparsable(field, digits))
+    }
+
+    /// `bytes_total`, where `null` and an absent field both mean "size unknown" (§12 rule 12).
+    fn optional_count(self, field: &str) -> Result<Option<u64>, String> {
+        match self {
+            Self::Null => Ok(None),
+            other => other.count(field).map(Some),
+        }
+    }
+
+    fn digits(self, field: &str) -> Result<&'a str, String> {
+        match self {
+            Self::Count(digits) => Ok(digits),
+            _ => Err(wrong_kind(field, "a whole number")),
+        }
+    }
+}
+
+fn wrong_kind(field: &str, expected: &str) -> String {
+    format!("`{field}` holds the wrong kind of value; expected {expected}")
+}
+
+fn unparsable(field: &str, found: &str) -> String {
+    format!("`{field}` is not a whole number this build can read: `{found}`")
+}
+
+/// A cursor over one marker's bytes. Working on bytes rather than `&str` keeps the comparison byte-exact (the
+/// same rule [`fetch_name`] uses) and lets non-UTF-8 content reach a refusal instead of a lossy decode.
+struct MarkerReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> MarkerReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    /// JSON's four insignificant whitespace bytes.
+    fn skip_spaces(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    /// One quoted string, with the quotes consumed. Escapes and control bytes are refused rather than decoded:
+    /// a marker's two string values are a field name and a nonce of digits and `-`, so anything needing an escape
+    /// did not come from this program.
+    fn quoted(&mut self) -> Result<&'a str, String> {
+        if self.peek() != Some(b'"') {
+            return Err("expected a quoted field name".to_string());
+        }
+        self.pos += 1;
+        let start = self.pos;
+        loop {
+            match self.peek() {
+                None => return Err("a quoted string runs off the end of the file".to_string()),
+                Some(b'"') => {
+                    let bytes: &'a [u8] = self.bytes;
+                    let text = &bytes[start..self.pos];
+                    self.pos += 1;
+                    return std::str::from_utf8(text)
+                        .map_err(|_| "text that is not UTF-8".to_string());
+                }
+                Some(b'\\') => {
+                    return Err("a `\\` escape, which this program never writes".to_string())
+                }
+                Some(byte) if byte < 0x20 => {
+                    return Err("a control character inside a quoted string".to_string())
+                }
+                Some(_) => self.pos += 1,
+            }
+        }
+    }
+
+    /// The digits of one number, ending at the first byte that cannot continue one. That delimiter test is what
+    /// refuses `41.9`, `1e5` and `12MB`: a value that continues past the digits is not a count this report may
+    /// round into one.
+    fn number(&mut self, field: &str) -> Result<&'a str, String> {
+        let start = self.pos;
+        while matches!(self.peek(), Some(byte) if byte == b'-' || byte.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        let bytes: &'a [u8] = self.bytes;
+        let digits = &bytes[start..self.pos];
+        if digits.is_empty() {
+            return Err(format!(
+                "`{field}` is not a number, `null`, or a quoted string"
+            ));
+        }
+        if !matches!(
+            self.peek(),
+            None | Some(b',' | b'}' | b' ' | b'\t' | b'\n' | b'\r')
+        ) {
+            return Err(format!("`{field}` is not a whole number"));
+        }
+        // Every byte collected above is `-` or an ASCII digit, so this decode cannot fail; `map_err` keeps it
+        // total without reaching for a panic in a report path.
+        std::str::from_utf8(digits).map_err(|_| format!("`{field}` is not a number"))
+    }
+
+    fn value(&mut self, field: &str) -> Result<MarkerValue<'a>, String> {
+        match self.peek() {
+            Some(b'"') => Ok(MarkerValue::Text(self.quoted()?)),
+            Some(b'n') => {
+                let bytes: &'a [u8] = self.bytes;
+                if !bytes[self.pos..].starts_with(b"null") {
+                    return Err(format!("`{field}` starts with `n` but is not `null`"));
+                }
+                self.pos += 4;
+                Ok(MarkerValue::Null)
+            }
+            _ => Ok(MarkerValue::Count(self.number(field)?)),
+        }
+    }
+}
+
+/// One entry of [`Listing::fetching`]: a recognised marker and what it said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchEntry {
+    /// The id the marker's **name** carries — not read from the file, so a marker whose fields disagree with its
+    /// own name cannot rename a fetch this listing did not see.
+    pub id: String,
+    /// The marker file itself, for a report to name (rule 4's delete-this-file advice needs a path).
+    pub path: PathBuf,
+    /// What reading it produced. `Absent` means the marker vanished between listing the directory and reading
+    /// it — a fetch that finished inside that window — and [`list`] drops such an entry rather than announcing
+    /// a download that has stopped.
+    pub state: FetchState,
+}
+
 /// What `np models list <workspace>` found.
 ///
 /// Note what is **not** here: no field for "the artifact directory could not be read". That failure cannot be
@@ -205,7 +715,15 @@ pub struct Listing {
     pub models_dir: PathBuf,
     /// One entry per row, ordered by id ([`db::model_rows`] decides the order so output is deterministic).
     pub models: Vec<ListedModel>,
-    /// Entries no row names, sorted by display name (§3). These never change an exit code.
+    /// One entry per marker file, sorted by id — **independent of [`Listing::models`]**, which is what §12 rule
+    /// 3 means by orthogonal: an id with no row at all (a first start) appears here and nowhere else, and an id
+    /// with a row can appear in both.
+    ///
+    /// Entries come from the **directory**, not from the rows: a marker nothing claims is exactly the case the
+    /// human asked about ("is it downloading?"), and answering it from the row list would drop it.
+    pub fetching: Vec<FetchEntry>,
+    /// Entries no row names **and this program does not recognise**, sorted by display name (§3). These never
+    /// change an exit code. Fetch names are absent by construction — see [`fetch_name`].
     pub unclaimed: Vec<Unclaimed>,
 }
 
@@ -492,10 +1010,15 @@ pub fn install(
     }
 }
 
-/// Report every installed model of `workspace` and what its artifact looks like.
+/// Report every installed model of `workspace`, any fetch in progress, and what each artifact looks like.
 ///
 /// Reads only: nothing here repairs, re-hashes into place, or deletes — including the unclaimed entries,
-/// which are leftovers this command cannot prove are garbage (§3).
+/// which are leftovers this command cannot prove are garbage (§3), and including a marker that will not parse
+/// ([`fetch_state`] reports it and leaves it alone).
+///
+/// A marker that is malformed, truncated, unreadable, or a directory **cannot fail this call**: `fetching` holds
+/// one entry per marker name either way, because "the listing broke" is a worse answer than "here is the file I
+/// could not read" (§12 rule 3's section exists to be looked at while a fetch is running).
 ///
 /// An artifact directory that cannot be **listed** leaves as [`ModelError::ModelsDir`] with no [`Listing`] at
 /// all, so a per-row `missing` verdict cannot be produced for rows nobody looked at. A directory that is
@@ -527,7 +1050,7 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
     // the OS spelling against them needs no lossy round trip — a name UTF-8 cannot hold is by construction
     // not an id and lands in `unclaimed`, rendered with replacements.
     let claimed: HashSet<OsString> = rows.iter().map(|row| OsString::from(&row.id)).collect();
-    let unclaimed = entries.unclaimed(&claimed);
+    let (unclaimed, marker_ids) = entries.split(&claimed);
 
     let mut models = Vec::with_capacity(rows.len());
     for row in rows {
@@ -535,11 +1058,40 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
         models.push(ListedModel { row, state });
     }
 
+    // Markers are read last: every failure above this point throws the whole listing away, and reading (and
+    // parsing) a marker for a listing that is then discarded is work with no reader.
+    let fetching = fetch_entries(&models_dir, marker_ids);
+
     Ok(Listing {
         models_dir,
         models,
+        fetching,
         unclaimed,
     })
+}
+
+/// One [`FetchEntry`] per marker id, in id order, dropping any whose file vanished meanwhile.
+///
+/// Reading each marker is [`fetch_state`]'s job and this function adds no verdict of its own — see [`Listing::fetching`]
+/// for why the ids come from the directory rather than from the rows.
+fn fetch_entries(models_dir: &Path, mut marker_ids: Vec<String>) -> Vec<FetchEntry> {
+    marker_ids.sort();
+    let mut entries = Vec::with_capacity(marker_ids.len());
+    for id in marker_ids {
+        let state = fetch_state(models_dir, &id);
+        if matches!(state, FetchState::Absent) {
+            // The fetch finished (or its marker was removed) between `read_dir` and this read. Reporting a
+            // download that has stopped is the false status; reporting nothing is honest about a state that has
+            // already left the directory, and the next listing answers from what is there.
+            continue;
+        }
+        entries.push(FetchEntry {
+            path: marker_path(models_dir, &id),
+            id,
+            state,
+        });
+    }
+    entries
 }
 
 /// Refuse a `workspace` operand that is not a directory that exists (§3 step 0).
@@ -751,9 +1303,15 @@ fn publish_artifact(models_dir: &Path, id: &str, source: &Path) -> Result<(), Mo
 /// Installs inside one process need distinct temp names too, so two threads cannot write one name.
 static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// The `<nonce>` half of the temporary artifact name: this process's id, the current time, and a counter —
-/// digits and `-` only, so a temp name can never be mistaken for a valid id by [`validate_id`] if someone
-/// later feeds it one.
+/// The `<nonce>` half of the temporary artifact name: this process's id, the current time, and a counter.
+///
+/// **The claim this comment used to make — "digits and `-` only, so a temp name can never be mistaken for a valid
+/// id" — was false about the whole name, and design review caught it.** The nonce is digits and `-`, but it sits
+/// *inside* `<id>.<nonce>.tmp`, and `validate_id` allows `.`, `-` and `_` after the first character: so
+/// `alpha.4242-1730000000123456-0.tmp` is a legal model id. What actually protects installs is that a temp name is
+/// never *fed* to `validate_id`, plus `list`'s treatment of leftovers as unclaimed entries rather than as rows. The
+/// real lesson lives in `docs/design-m2-local-embeddings.md` §12: machinery names must be unforgeable by
+/// construction (leading `.`, which the first-character rule forbids for ids), not merely unlikely to collide.
 ///
 /// Process id **and** clock **and** counter because each half alone fails one way: two `np models install`
 /// processes started in the same nanosecond share a timestamp, and two calls in one process can share a
@@ -810,28 +1368,47 @@ fn artifact_state(models_dir: &Path, row: &ModelRow) -> Result<ArtifactState, Mo
     }
 }
 
-/// The entries of one `read_dir`, kept as the two facts `list` reports: name and directory-or-not.
+/// The entries of one `read_dir`, kept as the two facts a listing can say about a name: its spelling and
+/// directory-or-not.
 ///
 /// A separate type because [`fs::ReadDir`] is a lazy iterator that cannot be re-walked, while [`list`] needs
-/// it twice — once to decide what nothing claims, and once for nothing else, since rows are answered from the
-/// database rather than from the directory.
+/// it once and in one pass — deciding per name whether it is a fetch name, a claimed artifact, or junk cannot be
+/// done three times over three filters without reading the directory three times.
 #[derive(Debug, Default)]
 struct EntryList(Vec<(OsString, UnclaimedKind)>);
 
 impl EntryList {
-    /// Every entry no row names, sorted by its lossy display name so output is deterministic (§3).
-    fn unclaimed(mut self, claimed: &HashSet<OsString>) -> Vec<Unclaimed> {
-        self.0.retain(|(name, _)| !claimed.contains(name));
-        let mut unclaimed: Vec<Unclaimed> = self
-            .0
-            .into_iter()
-            .map(|(name, kind)| Unclaimed {
-                name: name.to_string_lossy().into_owned(),
-                kind,
-            })
-            .collect();
+    /// Split one directory into the entries nothing claims **and nothing recognises**, and the ids whose marker
+    /// file is present.
+    ///
+    /// Two outputs from one pass because the two rules are one decision, made per name, in this order:
+    ///
+    /// 1. A name [`fetch_name`] recognises is never unclaimed (§12 rule 2). A marker *and* a `.part` both leave
+    ///    here rather than being announced as junk — otherwise a first start reports its own progress file as
+    ///    garbage, which is the defect §11's addendum records the first draft having.
+    /// 2. Of those names, only a marker contributes an id to report; a `.part` is recognised and left at that,
+    ///    because it holds no fields and R7a writes none (§12 rule 5 gives it to the fetcher).
+    /// 3. Otherwise a row naming the name claims it; what nothing claims is reported, sorted by its lossy display
+    ///    name so output is deterministic (§3).
+    fn split(self, claimed: &HashSet<OsString>) -> (Vec<Unclaimed>, Vec<String>) {
+        let mut unclaimed = Vec::new();
+        let mut markers = Vec::new();
+        for (name, kind) in self.0 {
+            match fetch_name(&name) {
+                Some(FetchName::Marker(id)) => markers.push(id.to_owned()),
+                Some(FetchName::Part(_)) => {}
+                None => {
+                    if !claimed.contains(&name) {
+                        unclaimed.push(Unclaimed {
+                            name: name.to_string_lossy().into_owned(),
+                            kind,
+                        });
+                    }
+                }
+            }
+        }
         unclaimed.sort_by(|left, right| left.name.cmp(&right.name));
-        unclaimed
+        (unclaimed, markers)
     }
 }
 
