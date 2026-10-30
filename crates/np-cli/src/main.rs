@@ -17,7 +17,7 @@ use np_core::catalog::size_human;
 use np_core::config::{Config, EmbeddingProvider};
 use np_core::db::{model_row, orphan_total, Db};
 use np_core::embed::{Embedder, LocalModelProvider, NoEmbeddingProvider};
-use np_core::embed_run::{self, EmbedOutcome, EmbedReport};
+use np_core::embed_run::{self, EmbedOutcome, EmbedReport, Resolution};
 use np_core::hash::sha256_file;
 use np_core::models::{
     self, FetchEntry, FetchState, Install, ListedModel, Listing, ModelError, Unclaimed,
@@ -267,7 +267,14 @@ fn print_summary(report: &ScanReport) {
 fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
     let provider = embed_provider(&cfg, workspace)?;
-    let report = embed_run::embed(workspace, &cfg, provider.as_ref())?;
+    // The reason a provider could not be built goes to `embed_run` as a value. Handing over a placeholder
+    // instead is how R6c1 D-2 happened: an absent artifact became a provider that declares 0 dimensions, and the
+    // run refused with a sentence about widths when the truth was a missing file (see [`Resolution`]).
+    let resolution = match &provider {
+        Some(provider) => Resolution::Provider(provider.as_ref()),
+        None => Resolution::ArtifactAbsent,
+    };
+    let report = embed_run::embed_with_resolution(workspace, &cfg, resolution)?;
     if json {
         emit_json(&serde_json::to_value(&report)?);
     } else {
@@ -286,23 +293,27 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     .into())
 }
 
-/// The provider `[embeddings]` names.
+/// The provider `[embeddings]` names, or `None` when the installed row's artifact file is not there to load.
 ///
-/// Two of the three returns hand over [`NoEmbeddingProvider`] as a **placeholder for a state that refuses before
-/// any vector is asked for**: no provider can be built from `provider = "none"`, from a missing
-/// [`np_core::config::EmbeddingsConfig::model`], from an id naming no installed row, or from a row whose declared
-/// width is not a number. Each of those is answered by [`np_core::embed_run`] as arm (ii) — or, for a missing
-/// artifact, arm (iii), whose message names the command that exists — and none of them reaches the placeholder,
-/// because both arms fire before the writer loop.
+/// `None` means **exactly that one thing**, and the call site turns it into [`Resolution::ArtifactAbsent`] so
+/// §6's arm (iii) can say so. It is not the spelling for "no provider could be built" in general: the
+/// configuration states (`provider = "none"`, a missing [`np_core::config::EmbeddingsConfig::model`], an id
+/// naming no installed row, a row whose declared width is not a number) still hand over [`NoEmbeddingProvider`]
+/// as a **placeholder for a state that refuses before any vector is asked for**, because [`np_core::embed_run`]
+/// derives each of those arms from configuration and the `models` table — the sources that hold the fact — and
+/// its arm (ii) returns before anything reads a provider's width.
 ///
 /// The row is read through a connection that closes when this function returns, before `embed_run` opens its
 /// own: np-cli holds no SQL of its own, and one workspace's [`np_core::db::ModelRow`] is where a local provider's
 /// identity comes from (§3).
-fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Box<dyn Embedder>, Box<dyn Error>> {
+fn embed_provider(
+    cfg: &Config,
+    workspace: &Path,
+) -> Result<Option<Box<dyn Embedder>>, Box<dyn Error>> {
     match cfg.embeddings.provider {
         // The default. Nothing is built, nothing is contacted, and the report says *configuration disabled*
         // rather than a fault (§2, §6).
-        EmbeddingProvider::None => Ok(Box::new(NoEmbeddingProvider)),
+        EmbeddingProvider::None => Ok(Some(Box::new(NoEmbeddingProvider))),
         EmbeddingProvider::OpenAiCompatible => {
             // Unreachable through `Config::load`, which refuses this variant by name; kept as a refusal rather
             // than a fallthrough into the local branch, because dialling out is not what this build does.
@@ -310,11 +321,11 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Box<dyn Embedder>, B
         }
         EmbeddingProvider::LocalModel => {
             let Some(id) = cfg.embeddings.model.as_deref() else {
-                return Ok(Box::new(NoEmbeddingProvider));
+                return Ok(Some(Box::new(NoEmbeddingProvider)));
             };
             let db = workspace_db(cfg, workspace)?;
             let Some(row) = model_row(&db, id)? else {
-                return Ok(Box::new(NoEmbeddingProvider));
+                return Ok(Some(Box::new(NoEmbeddingProvider)));
             };
             // The width this run needs: `[embeddings] dim`, or the row's own declaration when the config
             // declares none. `embed_run` applies the same rule and refuses a disagreement before any write, so
@@ -325,14 +336,16 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Box<dyn Embedder>, B
                 .map(usize::from)
                 .or_else(|| usize::try_from(row.dim).ok())
             else {
-                return Ok(Box::new(NoEmbeddingProvider));
+                return Ok(Some(Box::new(NoEmbeddingProvider)));
             };
             let artifact = cfg.workspace_models_dir(workspace).join(id);
             match LocalModelProvider::new(&row, &artifact, configured) {
-                Ok(provider) => Ok(Box::new(provider)),
-                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => {
-                    Ok(Box::new(NoEmbeddingProvider))
-                }
+                Ok(provider) => Ok(Some(Box::new(provider))),
+                // The row is installed and its width is the run's; only the bytes are missing. That is a fact
+                // about the filesystem, not about configuration, so it cannot be recovered downstream — hence
+                // `None` here rather than a placeholder provider whose declared width would then be compared
+                // with the row's (R6c1 D-2).
+                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => Ok(None),
                 Err(err) => Err(err.into()),
             }
         }

@@ -35,6 +35,11 @@
 //! build implements four, as the round brief directs. No new exit codes exist here: every non-zero arm is
 //! `ExitCode::FAILURE`, and argv problems stay clap's 2.
 //!
+//! A caller that could not build a provider says so through [`Resolution`] rather than handing over something
+//! that stands in for a provider. Which arm a state belongs to stays this module's decision — the caller
+//! supplies a fact, not a verdict — and [`Resolution::ArtifactAbsent`] exists because arm (iii) is the one
+//! state the caller knows and this module cannot recover from configuration.
+//!
 //! A wrong-dim provider is refused **before any write** naming both numbers, as §6 requires — but it is not a
 //! fifth arm. It leaves as [`EmbedRunError::ProviderDimMismatch`], which np-cli prints on stderr with exit 1,
 //! because "this run cannot be served at all" is a refusal rather than a state of the corpus.
@@ -246,15 +251,57 @@ enum BatchWrite {
     Busy,
 }
 
+/// What resolving `[embeddings]` to a provider produced: a provider that can serve, or the one fact about the
+/// artifact that this module cannot recover by itself.
+///
+/// **Why a reason travels as a value (R6c1 D-2).** np-cli used to answer an unreadable artifact with
+/// [`crate::embed::NoEmbeddingProvider`], whose [`Embedder::dim`] is 0, and the width comparison inside this
+/// module's private `run` read that 0 as a claim about the model. The run then refused with §6's wrong-dim
+/// sentence — *"the model declares 0 dimensions but this run needs 768"* — about a row that declares **768** and
+/// an artifact file that is simply not there. A width cannot carry a reason: the placeholder had no width to
+/// declare, so the reason now arrives as [`Resolution::ArtifactAbsent`] and the comparison is skipped when there
+/// is nothing to compare.
+///
+/// The three *configuration* states (`provider = "none"`, no [`crate::config::EmbeddingsConfig::model`], an id
+/// naming no installed row) are deliberately not variants: arm (ii) derives them from configuration and the
+/// `models` table in that same `run`, which is where those facts live, and it returns before anything here reads
+/// a provider. np-cli still hands over [`crate::embed::NoEmbeddingProvider`] for those states, and that
+/// placeholder can no longer reach a width comparison.
+pub enum Resolution<'a> {
+    /// A provider built from the configured row — the only thing this run can write a vector from, and the only
+    /// [`Embedder::dim`] §6's wrong-dim refusal may quote.
+    Provider(&'a dyn Embedder),
+    /// The caller tried to build a local provider from the installed row and could not read its artifact file.
+    ///
+    /// Taken as the fact for this run instead of re-statting the path: a file appearing between the caller's
+    /// check and here would otherwise turn a refusal into an embed attempt with no provider at all, which is a
+    /// worse answer to the same question. The next run re-reads the directory.
+    ArtifactAbsent,
+}
+
 /// Embed what this workspace owes, through the injected provider.
 ///
-/// Equivalent to [`embed_with_inject`] with an empty hook, and the shape `np-cli` calls.
+/// Equivalent to [`embed_with_inject`] with an empty hook.
 pub fn embed(
     workspace: &Path,
     cfg: &Config,
     provider: &dyn Embedder,
 ) -> Result<EmbedReport, EmbedRunError> {
     embed_with_inject(workspace, cfg, provider, &mut |_| {})
+}
+
+/// The entry point for a caller that resolved `[embeddings]` rather than building a provider it had to invent an
+/// answer for.
+///
+/// Equivalent to [`embed`] with an empty hook, and both go through one body: the arms and their order cannot
+/// differ between the two, so a caller that built no provider still cannot skip the currency read that decides
+/// whether anything is owed.
+pub fn embed_with_resolution(
+    workspace: &Path,
+    cfg: &Config,
+    resolution: Resolution<'_>,
+) -> Result<EmbedReport, EmbedRunError> {
+    run(workspace, cfg, resolution, &mut |_| {})
 }
 
 /// The same run with a hook called **between batches**, outside every transaction.
@@ -267,6 +314,21 @@ pub fn embed_with_inject(
     workspace: &Path,
     cfg: &Config,
     provider: &dyn Embedder,
+    between_batches: &mut dyn FnMut(&Path),
+) -> Result<EmbedReport, EmbedRunError> {
+    run(
+        workspace,
+        cfg,
+        Resolution::Provider(provider),
+        between_batches,
+    )
+}
+
+/// The body of every entry point above.
+fn run(
+    workspace: &Path,
+    cfg: &Config,
+    resolution: Resolution<'_>,
     between_batches: &mut dyn FnMut(&Path),
 ) -> Result<EmbedReport, EmbedRunError> {
     // The same fence `crate::scan` raises: an empty data dir would derive a database path beside the current
@@ -305,23 +367,30 @@ pub fn embed_with_inject(
     // could stop claiming nothing reads it.
     let declared = usize::try_from(row.dim).ok();
     let configured = cfg.embeddings.dim.map(usize::from).or(declared);
-    match configured {
-        // A row whose `dim` is not a non-negative integer cannot describe a width this run stores, and there is
-        // no number to compare `provider.dim()` against. Report the row's own value rather than narrow it.
-        None => {
-            return Err(EmbedRunError::ProviderDimMismatch {
-                configured: provider.dim(),
-                provider: row.dim,
-            })
-        }
-        Some(width) if width == provider.dim() => {}
-        Some(width) => {
-            return Err(EmbedRunError::ProviderDimMismatch {
-                configured: width,
-                provider: i64::try_from(provider.dim()).unwrap_or(i64::MAX),
-            })
+    if let Resolution::Provider(provider) = resolution {
+        match configured {
+            // A row whose `dim` is not a non-negative integer cannot describe a width this run stores, and there
+            // is no number to compare `provider.dim()` against. Report the row's own value rather than narrow it.
+            None => {
+                return Err(EmbedRunError::ProviderDimMismatch {
+                    configured: provider.dim(),
+                    provider: row.dim,
+                })
+            }
+            Some(width) if width == provider.dim() => {}
+            Some(width) => {
+                return Err(EmbedRunError::ProviderDimMismatch {
+                    configured: width,
+                    provider: i64::try_from(provider.dim()).unwrap_or(i64::MAX),
+                })
+            }
         }
     }
+    // `Resolution::ArtifactAbsent` skips the comparison, and skipping it is not a hole: §6's refusal compares two
+    // declarations and one of them does not exist. A real disagreement still refuses — np-cli builds its local
+    // provider through [`crate::embed::LocalModelProvider::new`], which checks the row against the width this run
+    // needs *before* it can report an unreadable artifact, so `ArtifactAbsent` arrives only with widths that
+    // already agreed.
 
     // ---- the currency read: live chunks against this model's stored stamps.
     let stamps = db::vectors_for(&db, &model_id)?
@@ -377,23 +446,31 @@ pub fn embed_with_inject(
     // Checked here rather than first because a corpus that needs no work needs no model; §6's exit state (i)
     // says nothing owed is exit 0 whatever else is true.
     let artifact = cfg.workspace_models_dir(&root).join(&model_id);
-    if !artifact_file_exists(&artifact) {
-        return Ok(EmbedReport {
-            model: Some(model_id.clone()),
-            outcome: EmbedOutcome::ArtifactAbsent {
-                model: model_id,
-                hint: install_hint(workspace),
-                artifact,
-            },
-            chunks_seen: seen,
-            current,
-            embedded: 0,
-            refused_budget: 0,
-            busy_gap: 0,
-            errors,
-            verification: CAVEAT,
-        });
-    }
+    let provider = match resolution {
+        // The artifact is there and readable, so the provider that was built against it can run.
+        Resolution::Provider(provider) if artifact_file_exists(&artifact) => provider,
+        // Two ways to meet this arm: the caller already failed to read the file (`ArtifactAbsent`, taken as the
+        // fact for this run — see its doc), or the file stopped being there between that read and here. Either
+        // way there is no provider to hand the owed chunks to, so §6's arm (iii) answers, and one report literal
+        // means the two halves cannot grow different sentences.
+        Resolution::Provider(_) | Resolution::ArtifactAbsent => {
+            return Ok(EmbedReport {
+                model: Some(model_id.clone()),
+                outcome: EmbedOutcome::ArtifactAbsent {
+                    model: model_id,
+                    hint: install_hint(workspace),
+                    artifact,
+                },
+                chunks_seen: seen,
+                current,
+                embedded: 0,
+                refused_budget: 0,
+                busy_gap: 0,
+                errors,
+                verification: CAVEAT,
+            });
+        }
+    };
 
     // ---- the writer loop: model work outside the transaction, one bounded transaction per batch.
     let mut embedded = 0usize;
