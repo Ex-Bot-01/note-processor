@@ -852,10 +852,11 @@ fn an_unknown_key_outside_embeddings_still_loads() {
 /// the end — so a fixture cannot drift into accepting something `np models install` would refuse.
 const LOCAL_ID: &str = "embeddinggemma-2-text-q8_0@1";
 
-/// The token ceiling is a **build fact, and the refusal must say so**: 4,096 is how wide a context this build creates
-/// (`local_model::REQUESTED_CTX`), decided as design §5's option B on 2026-10-30. History is the reason for the wording:
-/// it was 32 768 (justified by `max_position_embeddings = 262144`, a RoPE/train-length property since disowned), then
-/// 8,192 (the model card's attention window) — and **no test noticed either time**, because every other case is written
+/// The token ceiling is a **build fact, and the refusal must say so**: 8,192 is how wide a context this build creates
+/// (`local_model::REQUESTED_CTX`), decided as design §5's option C on 2026-10-30 — the same day's option B put it at
+/// 4,096 and moved back with the window. History is the reason for the wording: it was 32 768 (justified by
+/// `max_position_embeddings = 262144`, a RoPE/train-length property since disowned), then 8,192 (the model card's
+/// attention window) — and **no test noticed either time**, because every other case is written
 /// *relative to* the constant. So the number is pinned through behaviour rather than a constant comparison (which clippy
 /// correctly refuses as `assertions_on_constants`, and which would only restate the source): a budget one over the
 /// ceiling must be refused, and the sentence must describe what the ceiling really is. A refusal that blames the model
@@ -869,7 +870,10 @@ fn the_token_ceiling_carries_the_builds_window_into_its_refusal() {
     ));
     let message = err.to_string();
     assert!(
-        message.contains("4096") && message.contains("in this build"),
+        // The number is a literal on purpose. Reading it from `MAX_EMBEDDING_TOKENS` would make the assertion true by
+        // construction and blind to exactly the edit this test exists to catch — someone retuning the ceiling (as
+        // happened twice in 2026-10-30) without touching the decision record.
+        message.contains("8192") && message.contains("in this build"),
         "the refusal has to teach the reader where the limit comes from, not just reject a number: {message}"
     );
     assert!(

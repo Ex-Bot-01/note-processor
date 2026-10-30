@@ -61,15 +61,27 @@ static long vmhwm(void) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.gguf n_tokens [wide] [--drop-cache]\n", argv[0]);
+        fprintf(stderr, "usage: %s model.gguf n_tokens [wide] [nctx=N] [--drop-cache]\n", argv[0]);
         return 2;
     }
     const char * path = argv[1];
     int want = atoi(argv[2]);
     int wide = 0, drop_cache = 0;
+    /* The width asked of the context, applied to n_ctx, n_batch and n_ubatch together — the shape `local_model::load`
+     * uses, because a batch wider than the built ubatch aborts the encoder path instead of returning a code. Default
+     * 4096 is what that constant was when this probe was written; `nctx=N` exists so §14 can price a different one
+     * without editing C (measured 2026-10-30 for the 8,192 ceiling: see design-m2-local-embeddings.md §5/§14). */
+    int width = 4096;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "wide")) {
             wide = 1;
+        } else if (!strncmp(argv[i], "nctx=", 5)) {
+            width = atoi(argv[i] + 5);
+            if (width <= 0) {
+                fprintf(stderr, "nctx= wants a positive integer, got: %s\n", argv[i]);
+                return 2;
+            }
+            wide = 1; /* same shape as load(): all three numbers move together */
         } else if (!strcmp(argv[i], "--drop-cache")) {
             drop_cache = 1;
         } else {
@@ -96,13 +108,17 @@ int main(int argc, char ** argv) {
 
     struct llama_context_params cp = llama_context_default_params();
     cp.embeddings = true;
-    cp.n_ctx = 4096;
-    if (wide) { cp.n_batch = 4096; cp.n_ubatch = 4096; }
+    cp.n_ctx = (uint32_t)width;
+    if (wide) { cp.n_batch = (uint32_t)width; cp.n_ubatch = (uint32_t)width; }
     struct llama_context * c = llama_init_from_model(m, cp);
     if (!c) { fprintf(stderr, "ctx refused\n"); return 1; }
 
-    printf("MEMPROBE: memory=%p n_threads=%d n_threads_batch=%d (wide=%d)\n",
-           (void *)llama_get_memory(c), llama_n_threads(c), llama_n_threads_batch(c), wide);
+    /* Requested **and** built widths, side by side: `include/llama.h:575-581` warns they can differ, and the encoder's
+     * no-abort argument rests on the built `n_ubatch` (A1 review P1-1). If these two ever disagree here, so does the
+     * Rust side's readback. */
+    printf("MEMPROBE: memory=%p n_threads=%d n_threads_batch=%d (wide=%d requested_nctx=%d built n_ctx=%u built n_ubatch=%u)\n",
+           (void *)llama_get_memory(c), llama_n_threads(c), llama_n_threads_batch(c), wide, width,
+           llama_n_ctx(c), llama_n_ubatch(c));
     fflush(stdout);
 
     const struct llama_vocab * v = llama_model_get_vocab(m);
@@ -115,7 +131,13 @@ int main(int argc, char ** argv) {
         if (r <= 0) { fprintf(stderr, "tokenize returned %d\n", r); break; }
         n += r;
     }
-    if (n > 4090) n = 4090;
+    /* Measure **inside** the window this run asked for. Feeding more tokens than the built `n_ubatch` does not return a
+     * code on the encoder path, it aborts (`src/llama-context.cpp:1631`) — true, but not a measurement, so the cap
+     * follows `nctx=` rather than being pinned to 4,096 and silently making an 8,192 run impossible to take. */
+    if (n > width - 1) {
+        fprintf(stderr, "capped %d -> %d tokens to fit nctx=%d\n", n, width - 1, width);
+        n = width - 1;
+    }
 
     long before = vmhwm();
     struct llama_batch b = llama_batch_get_one(tok, n);

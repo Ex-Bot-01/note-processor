@@ -84,20 +84,27 @@ pub const MAX_CONTINUATION_INDENT: usize = 16;
 /// constant edit.
 pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
 
-/// Largest `embeddings.max_tokens` a config file may ask for: **4,096 tokens**, which is the width of the context
+/// Largest `embeddings.max_tokens` a config file may ask for: **8,192 tokens**, which is the width of the context
 /// this build asks llama.cpp for (`local_model::REQUESTED_CTX`), not a fact about any model card.
 ///
-/// **Chosen 2026-10-30 by the human as design §5's option B**, with R6b2's measurements in front of them, and
-/// explicitly revisitable: it is a config bound, so raising it later costs a constant and a re-measure, not a
-/// migration. The reasoning that made 4,096 right rather than generous:
+/// **Set by the human on 2026-10-30, superseding the same day's §5 option B (4,096) with option C.** What did not
+/// change is the rule that made B worth having: **the ceiling equals the window this build creates**, so a config
+/// value near the ceiling describes something the runtime can actually do. Raising the number alone would have
+/// re-opened the exact defect B closed — `max_tokens = 8192` parsing happily and then being refused by a different
+/// sentence, because the context was only 4,096 wide — so `REQUESTED_CTX` moved with it, and the compile-time
+/// assertion under that constant is what keeps the pair from drifting apart again.
 ///
-/// * the runtime cannot hold more than this in one embedding anyway — this artifact is an encoder with no KV cache,
-///   so `llama_context.cpp:1631`'s `n_ubatch >= n_tokens` assert is what a longer sequence meets, and we refuse
-///   before it. A ceiling above the window invites `max_tokens = 8192` values that parse happily and are then
-///   refused at run time by a different sentence;
-/// * length costs memory super-linearly here: peak RSS runs **+458 MiB above the C baseline at 4,085 tokens**
-///   (§14's curve), so a wider ceiling is a RAM commitment on the small machines this tool targets;
-/// * and it costs time on a falling rate — ~120 tok/s at 2,163 tokens against ~141 at 543.
+/// The price of 8,192, measured on this host the same afternoon (`tests/probes/decode_probe.c nctx=8192`, §14):
+///
+/// * **an 8,192-wide context costs nothing until something long runs through it** — with a 133-token sequence the peak
+///   is 429,248 kB against a 429,528 kB model-open baseline, i.e. +0 MiB. The compute buffer is *touched* per forward
+///   pass, not reserved per window;
+/// * **a chunk near the ceiling costs about a gigabyte and about ninety seconds**: 7,999 tokens decoded rc 0 with peak
+///   RSS **1,478 MiB (+1,058 MiB over baseline)** in 101 s — ~79 tok/s, continuing the falling rate (141 at 543,
+///   120 at 2,163). That is a per-chunk commitment, not a per-note one: `DEFAULT_EMBEDDING_TOKENS` stays 1,024, and
+///   `MAX_CHUNK_BYTES = 1800` keeps ordinary prose near 500 tokens;
+/// * the window really is built as asked here — the probe reads back `n_ctx = 8192`, `n_ubatch = 8192` from the
+///   context, which is the A1 review P1-1 pair this build now checks in Rust too.
 ///
 /// Earlier versions of this constant cited Google's `embeddinggemma-2` card (8,192) and before that
 /// `max_position_embeddings = 262144`, a RoPE/train-length property the design disowned (§5). Both were the wrong
@@ -111,7 +118,7 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
 /// normalisation can expand bytes, `decode` emits U+FFFD runs, prefix and specials cost tokens from no chunk bytes).
 /// R6d measures bytes-per-token on this corpus.
 ///
-/// Three honest limits on the number itself. **(1) It is a global constant doing a per-model job**: 4,096 happens to
+/// Three honest limits on the number itself. **(1) It is a global constant doing a per-model job**: 8,192 happens to
 /// be *this* build's window, and a spec-named fallback (MiniLM, ~512 tokens) needs a smaller bound — so the follow-up
 /// stays exactly as §5 wrote it, move the check beside the provider. **(2) It is now coupled to a build choice**, which
 /// is why `local_model` carries a compile-time assertion that `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX`: raising one
@@ -119,7 +126,7 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
 /// discovered by a user. **(3)** It is a load-time fence over *configured* numbers only; R6b2 enforces it over real
 /// token counts, including prefix and specials. Posture unchanged from [`MAX_CONTINUATION_INDENT`] (F17 §4): enforce
 /// at load, refuse rather than clamp.
-pub const MAX_EMBEDDING_TOKENS: usize = 4_096;
+pub const MAX_EMBEDDING_TOKENS: usize = 8_192;
 
 /// How the catalog (`INDEX.md` and its shards) is laid out.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

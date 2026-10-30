@@ -181,7 +181,10 @@ what fails is not a check, because removal makes tests pass.
   this build creates and a ceiling above the window only produces configs refused later by a different sentence; default `embeddings.max_tokens`
   **2,048 → 1,024** (≈8 s per worst-case chunk at ~120–141 tok/s, interpolated between the measured points). Both stay revisitable — config numbers
   with no stored data behind them yet — and `local_model` now asserts `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX` at compile time so the pair cannot drift.
-  Still unmeasured: whether long-note *recall* improves above 4,096 tokens; we refuse there because one decode cannot hold more here, not because the
-  model cannot represent it. Long-note retrieval is bounded by chunking either way. Any budget above the window is refused until
-  `REQUESTED_CTX` moves — which §14's curve says costs +458 MiB by 4,085 tokens. Still owed: R6c wiring config → provider → `embeddings`
+  **Decision C, later on 2026-10-30:** the human asked for the 8,192 ceiling back, so `MAX_EMBEDDING_TOKENS` and `REQUESTED_CTX` moved to
+  **8,192 together** — raising only the first would have re-created the config-refused-later-by-another-sentence defect B removed. Measured
+  before asking for the wider window (`decode_probe nctx=8192`): +0 MiB at rest (133 tokens), and 7,999 tokens in **101 s** at peak
+  **1,478 MiB (+1,058 MiB)** — so `DEFAULT_EMBEDDING_TOKENS` stays 1,024 and the interpolated "~63 s per 8k chunk" is replaced by that
+  measurement (~79 tok/s). Still unmeasured: whether long-note *recall* improves above the window; we refuse there because one decode cannot
+  hold more in this build, not because the model cannot represent it. Long-note retrieval is bounded by chunking either way. Still owed: R6c wiring config → provider → `embeddings`
   rows, and R6d's corpus-scale benchmark (batching across texts is deliberately not in this API yet).

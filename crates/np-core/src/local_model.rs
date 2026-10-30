@@ -31,7 +31,8 @@
 //! 600-token sequence **aborted the process** (measured: exit 134, no return code at all). Since
 //! `embeddings.max_tokens` accepted up to 8,192, that abort was reachable from an ordinary ~1,800-byte note. See
 //! `REQUESTED_CTX` for what the wider window costs and [`LoadedModel::window`] for the refusal that guards it. The
-//! budget ceiling is now **4,096** (§5's decision B), so the two numbers meet: no validated config can ask for more
+//! budget ceiling is **8,192** and the context this file creates is 8,192 wide (§5's decision C), so the two numbers
+//! meet: no validated config can ask for more
 //! than this context can hold, which is what the assertion under `REQUESTED_CTX` keeps true.
 //!
 //! What this module owns is therefore exactly the unsafe part: who holds the two C handles, in what order they
@@ -46,7 +47,7 @@
 //! `embeddinggemma-2-Q8_0.gguf` answers `n_embd_out = 768` and `n_embd_inp = 512`: the model runs at 512
 //! inside and projects to 768, which is why [`load`] compares a declared width against **out**, and why the
 //! deprecated `llama_n_embd` is not declared anywhere in this crate. It also answers `n_ctx_train = 262_144`
-//! while `MAX_EMBEDDING_TOKENS` is 4,096 — a 64× gap §5 used to keep as an open question and has now closed as a
+//! while `MAX_EMBEDDING_TOKENS` is 8,192 — a 32× gap §5 used to keep as an open question and has now closed as a
 //! decision (2026-10-30): the trained window is not something one embedding can spend here, so the ceiling follows the
 //! context we build rather than the artifact's number. `ModelFacts::n_ctx_train` still reports the artifact's figure,
 //! because a refusal that names the wrong limit wastes the reader's time.
@@ -85,12 +86,18 @@ use crate::walk;
 /// baseline is that program's own 419.4 MiB with the model open (§14; our Rust process sits 1.7 MiB higher, at
 /// 421.1 MiB): 133 tokens **+0 MiB**, 513 **+47**, 1,026 **+109**, 2,052 **+218**, 4,085 **+458**. The compute
 /// buffer is reserved at context creation but its pages are touched per forward pass, so the price
-/// tracks the **longest sequence actually run**, not the ceiling asked for — which is why 4,096 costs nothing
+/// tracks the **longest sequence actually run**, not the ceiling asked for — which is why a window this wide costs
 /// on ordinary chunks and why a smaller ceiling would not have bought much. Keeping it a constant rather than
 /// a parameter is [`load`]'s choice, not the design's: legal input length comes from `embeddings.max_tokens`,
 /// so when R6c wires config to a provider this becomes an argument, and until then a workspace configured
-/// above 4,096 gets [`LoadedModel::window`]'s refusal instead of an abort.
-const REQUESTED_CTX: usize = 4_096;
+/// above it gets [`LoadedModel::window`]'s refusal instead of an abort.
+///
+/// **8,192 since 2026-10-30**, moved up beside `MAX_EMBEDDING_TOKENS` when the human restored that ceiling (§5's
+/// decision C): a ceiling the context cannot reach is a config that lies, so the two move together or not at all —
+/// which is what the assertion below enforces. Measured here before asking for it (`tests/probes/decode_probe.c
+/// nctx=8192`): the context reports `n_ctx = 8192`, `n_ubatch = 8192` back, a short sequence through the wider window
+/// costs +0 MiB, and a near-ceiling 7,999-token chunk peaks at 1,478 MiB in ~101 s.
+const REQUESTED_CTX: usize = 8_192;
 
 /// The one cross-file invariant worth compiling rather than commenting: **a validated budget must fit the context we
 /// build**. `window()` is `min(REQUESTED_CTX, n_ctx_train)`, so this guarantees that any `embeddings.max_tokens` which
@@ -325,7 +332,8 @@ impl LoadedModel {
         // reach `llama_batch_free` (see [`crate::llama_ffi`]). `tokens` outlives the call below, which is the
         // whole obligation. `n` is positive (a tokenization always yields at least the special tokens) and at most
         // `self.window`, which equals the `n_ubatch` [`load`] asked for — that equality is what keeps
-        // `src/llama-context.cpp:1631`'s encoder assert out of reach, and `n as i32` cannot truncate at 4,096.
+        // `src/llama-context.cpp:1631`'s encoder assert out of reach, and `n as i32` cannot truncate at any window
+        // this build creates.
 
         let batch = unsafe { llama_ffi::llama_batch_get_one(tokens.as_mut_ptr(), n as i32) };
 
@@ -1009,12 +1017,23 @@ mod tests {
         assert_eq!(Pooling::from_c(99), None);
     }
 
-    /// The window ceiling: 4,096 for a model with a bigger trained window, the model's own number when it is
-    /// smaller, and never 0 — because llama.cpp reads 0 as "no ceiling".
+    /// The window ceiling: `REQUESTED_CTX` (8,192 today) for a model with a bigger trained window, the model's own
+    /// number when it is smaller, and never 0 — because llama.cpp reads 0 as "no ceiling".
     #[test]
     fn context_size_is_capped_and_never_zero() {
-        assert_eq!(requested_ctx(262_144), 4_096);
-        assert_eq!(requested_ctx(REQUESTED_CTX), 4_096);
+        // `as u32` because the constant is a `usize` and the function answers `u32` (llama.cpp's field width);
+        // `REQUESTED_CTX` is four digits, and the compile-time assertion above is what keeps it below any real limit.
+        assert_eq!(requested_ctx(262_144), REQUESTED_CTX as u32);
+        assert_eq!(requested_ctx(REQUESTED_CTX), REQUESTED_CTX as u32);
+        // The pair §5's decision C holds together: the widest budget a config may name has to fit the context this
+        // file creates. Asserted at compile time above; asserted here as a number too, because `requested_ctx` is
+        // where a future re-tune could quietly make the two disagree.
+        assert!(
+            crate::config::MAX_EMBEDDING_TOKENS <= requested_ctx(usize::MAX) as usize,
+            "a config may ask for {} tokens but this build only ever creates a {}-token window",
+            crate::config::MAX_EMBEDDING_TOKENS,
+            REQUESTED_CTX
+        );
         assert_eq!(requested_ctx(2_048), 2_048);
         assert_eq!(requested_ctx(1), 1);
     }

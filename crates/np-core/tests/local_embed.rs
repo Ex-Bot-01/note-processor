@@ -410,7 +410,8 @@ mod embedding {
     /// would abort the whole test binary rather than fail this assertion — a crash is visible, but it is not this test
     /// passing. Second, and narrower (Scope B review P2-12): nothing asserts that **exactly** `window` tokens is
     /// *accepted*. The refusal side is pinned to one token above; the accepting side at the boundary would cost a
-    /// ~40-second decode of a synthetic 4,096-token note on every run of this file, so it is left to R6d's benchmark,
+    /// ~90-second decode of a synthetic window-length note (8,192 tokens measured 2026-10-30: 7,999 tokens in 101 s)
+    /// on every run of this file, so it is left to R6d's benchmark,
     /// which decodes at those lengths anyway. A `>=` mutant on the window arm therefore survives today — and since the
     /// ceiling now equals the window, it would refuse a chunk no chunker produces (`MAX_CHUNK_BYTES = 1800` is roughly
     /// 500 tokens), which is why this is recorded rather than paid for. What it does prove is that the refusal exists, fires at the right threshold, and
@@ -426,7 +427,8 @@ mod embedding {
 
         // Build something longer than the window and **prove** it, rather than trusting bytes-per-token. Proving it
         // is subtler than it looks now §5's decision B made the counting ceiling equal to the window: `count_tokens`
-        // refuses above its own 4,096, so an over-window note never returns a count at all. The refusal is the
+        // refuses above its own ceiling (equal to the window since §5's decision C), so an over-window note never
+        // returns a count at all. The refusal is the
         // evidence — `TokenBudgetExceeded { tokens, .. }` carries llama.cpp's own count — which is why this case reads
         // the number out of the error instead of expecting `Ok`.
         //
@@ -698,7 +700,8 @@ mod embedding {
     }
 
     /// Throughput and first-embed latency, **printed**. §5's ceiling question — closed as option B on 2026-10-30:
-    /// budget ceiling 4,096 (this build's window) and default 1,024 — was decided from numbers like these rather than
+    /// budget ceiling 8,192 (this build's window, decision C) and default 1,024 — was decided from numbers like these
+    /// rather than
     /// from the artifact's trained window, and §14's OpenMP trade-off is another such decision. Nothing here asserts a
     /// bound: a shared host, a cold page cache and eleven other rounds' build load all move this number by more than
     /// any regression would.

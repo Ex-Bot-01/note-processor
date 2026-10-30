@@ -234,32 +234,60 @@ R6b2 submits tokens, so the question above finally has evidence attached. On thi
 | --- | --- | --- |
 | ~500-token note | 543 | **3.85 s** (141 tok/s) |
 | ~2,000-token note | 2,163 | **18.0 s** (120 tok/s) |
-| over the context window | > 4,096 | refused before decoding — see below |
+| over the context window | > 8,192 (4,096 until decision C below) | refused before decoding — see below |
 
 Three things follow, and they are separate decisions:
 
-1. **The runtime's usable window is 4,096, not 8,192 and not 262,144.** `load` sets `n_ctx = n_batch = n_ubatch = 4096`, because this
+1. **The runtime's usable window is the window we ask for, not 262,144** — 4,096 when this was written, **8,192 since decision C**.
+   `load` sets `n_ctx = n_batch = n_ubatch = REQUESTED_CTX`, because this
    artifact is an encoder — `create_memory` returns null for `LLM_ARCH_GEMMA_EMBEDDING2` (`src/llama-model.cpp:2825`; measured through our
    FFI, `llama_get_memory(ctx)` is `(nil)`) — so `llama_decode` diverts to the encoder path (`src/llama-context.cpp:1845-1847`) and *that*
    path asserts `n_ubatch >= n_tokens` at `src/llama-context.cpp:1631`. `GGML_ASSERT` is `GGML_ABORT` even under `NDEBUG`, so with llama.cpp's
    default 512 a 600-token sequence exits 134 rather than returning anything. (An earlier draft of this subsection blamed the decoder's
    asserts at `:1918`/`:1920`, which never run here — R6b2 review P1-1.) So today the honest ceiling is the window, and `embed_text` refuses
    between the two numbers — `TokenBudgetExceeded` over `embeddings.max_tokens`, "the sequence is longer than this context can hold"
-   above the window. **Since decision B that band is empty for a validated config**, because both numbers are 4,096. The window refusal
+   above the window. **Since decision B that band is empty for a validated config** — both numbers are 4,096 as of B and 8,192 as of C,
+   and the compile-time assertion is what keeps them equal through a retune. The window refusal
    still earns its place twice over: an artifact trained narrower than `REQUESTED_CTX` makes `window()` the smaller bound, and a direct
    `embed_text` caller may pass any budget it likes — which is how `tests/local_embed.rs` reaches this arm. R6c should not design a report
-   state for a config-reachable case (Scope B review P2-6). Raising `MAX_EMBEDDING_TOKENS` toward 262,144 would mean raising `REQUESTED_CTX` too, and §14's curve says what
-   that costs: **+458 MiB** of peak RSS at 4,085 tokens, growing from there.
+   state for a config-reachable case (Scope B review P2-6). Raising `MAX_EMBEDDING_TOKENS` toward 262,144 means raising `REQUESTED_CTX` in
+   the same change, and §14's curve says what that costs: **+458 MiB** of peak RSS at 4,085 tokens, **+1,058 MiB at 7,999** (measured
+   2026-10-30 with `nctx=8192`), growing from there.
 2. **Cost rises with length, and it is slow enough to matter.** Measured points: **543 tokens in 3.85 s (141 tok/s)** and **2,163 tokens in
    18.0 s (120 tok/s)**. Everything beyond them is **extrapolation on a falling rate**, not measurement — including the headline that
-   `max_tokens = 8,192` would cost roughly a minute per chunk (~63 s at 130 tok/s, more if the decline continues), which matters chiefly
-   because the shipped code refuses above 4,096 anyway and nobody has embedded 8,192 tokens here. The two measured points also price the
+   `max_tokens = 8,192` would cost roughly a minute per chunk (~63 s at 130 tok/s, more if the decline continues). **That extrapolation has
+   since been measured**: decision C's re-pin ran 7,999 tokens through an 8,192-wide context in **101 s (≈79 tok/s)** at peak RSS 1,478 MiB —
+   the decline was steeper than interpolated, so quote the measurement and not the estimate. The two original points also price the
    default: 2,048 interpolates to a ~16-second worst case between them (it is not itself a measured length).
 3. **Throughput, not the window, is what a corpus feels.** 5,000 notes × 500 tokens ≈ 2.5 M tokens ≈ **5.3 hours** at this rate,
    single-process. That is R6d's problem (OpenMP A/B, batching across texts in one decode — `embed_text` is deliberately one decode per
    text today), and it is the number worth optimising, because no ceiling choice changes it by more than a factor of a few.
 
-### Decision B, taken 2026-10-30 — the ceiling follows the build, not the card
+### Decision C, later on 2026-10-30 — back to 8,192, with the window moved up to meet it
+
+The human asked for the 8,192 ceiling back after the whole-branch review landed. Honouring that *coherently* meant moving two constants,
+not one: a ceiling of 8,192 over a 4,096-wide context is exactly the config-that-lies decision B existed to remove (a `max_tokens = 6000`
+would parse, validate, and then be refused by the window sentence). So `REQUESTED_CTX` went to 8,192 beside it, and the compile-time
+assertion that pairs them stayed exactly as written — it is what makes "raise one" impossible without "raise the other".
+
+| Key | Decision B | Decision C | Why |
+| --- | --- | --- | --- |
+| `MAX_EMBEDDING_TOKENS` | 4,096 | **8,192** | the human's call, and now a number the runtime can actually spend |
+| `local_model::REQUESTED_CTX` | 4,096 | **8,192** | moves with the ceiling; measured before asking for it (below) |
+| `DEFAULT_EMBEDDING_TOKENS` | 1,024 | **1,024** — unchanged | the ordinary chunk is still ~500 tokens (`MAX_CHUNK_BYTES = 1800`); raising the default would pay the tail cost on every note |
+
+What was measured first, on this host, with `crates/np-core/tests/probes/decode_probe.c nctx=8192` (the argument and the built-width readback
+printed in its output were added for this decision):
+
+* **an 8,192-wide context costs nothing at rest**: a 133-token sequence peaks at 429,248 kB against a 429,528 kB model-open baseline — +0 MiB.
+  §14's rule held: the compute buffer is touched per forward pass, not reserved per window;
+* **a near-ceiling chunk is expensive**: 7,999 tokens, rc 0, `‖v‖` finite, peak **1,513,380 kB (1,478 MiB)**, **+1,058 MiB** over baseline,
+  **101 s** wall. On an 8 GB machine that is the difference between indexing and swapping *while* a long chunk runs, which is why the default
+  stayed at 1,024;
+* **the built context matches the request**: `llama_n_ctx` = 8192 and `llama_n_ubatch` = 8192, the A1 review P1-1 readback — so the refusal
+  added in that round stays silent here and fires only if a future build shrinks under us.
+
+### Decision B, taken 2026-10-30 — the ceiling follows the build, not the card *(superseded the same day by decision C above; kept because the reasoning about drift is what C preserved)*
 
 The human chose **option B** from the three priced above, with those numbers in front of them and "we can change it later if it is not
 sufficient" attached. Concretely:
@@ -276,7 +304,8 @@ layout pins, because a test-only check lets two constants in two files drift apa
 raising `REQUESTED_CTX` in the same change and re-reading §14's RSS curve; that friction is the point.
 
 **What it does not settle.** Whether 262,144-token embeddings would improve retrieval on long notes stays unmeasured, and the honest statement
-is that we refuse above 4,096 because that is what one decode can hold here — not that the model cannot represent more. The follow-up named
+is that we refuse above the window (8,192 today) because that is what one decode can hold here — not that the model cannot represent more. The
+follow-up named
 above also survives: this is a **global** constant doing a **per-model** job, and a second configured model (the spec's MiniLM, ~512 tokens)
 needs the check moved beside the provider. And recall on long notes is bounded by *chunking*, not by this number: a 3,000-token note becomes
 several embeddings whatever the ceiling says, so if long-note retrieval is the worry, the lever is chunk overlap and ranking, not `max_tokens`.
@@ -437,8 +466,8 @@ locked decisions that the human reversed, which is their right and this document
 amendments, and §5 names exactly which documents still hold the old numbers as history.
 
 What remains genuinely open for review or measurement, not for preference: whether a pooled multimodal embedding works at all
-(§5, R7c), what an mmap-first load actually reads from disk (R6d, decides §12's digest cost), and whether the token ceiling — 4,096
-since decision B — belongs beside the provider rather than in a global constant (§5's own note on the MiniLM fallback).
+(§5, R7c), what an mmap-first load actually reads from disk (R6d, decides §12's digest cost), and whether the token ceiling — 8,192 since
+decision C, paired with `REQUESTED_CTX` — belongs beside the provider rather than in a global constant (§5's own note on the MiniLM fallback).
 
 **For review (folded into §2/§5/§7 above):** whether the `openai-compatible` spelling should be deleted or kept-parseable-
 and-refused — resolved here in favour of **keeping it parseable and refusing at `Config::load`**, because deletion alone
@@ -640,7 +669,7 @@ without root — it just isn't free, and it must be written down rather than dis
 free" note in the session record is stale; `free -m` says otherwise today).
 
 **The consequence for width and window.** A model fact cannot be pinned globally while the model is undecided. §5's ceiling used to be that kind
-of pin (8,192, EmbeddingGemma-2's card) and since decision B it is a *build* fact instead — 4,096, the width of the context we create, checked
+of pin (8,192, EmbeddingGemma-2's card) and since decision B it is a *build* fact instead — 8,192 today, the width of the context we create (C moved both together), checked
 against `REQUESTED_CTX` at compile time. That removes one wrong authority without removing the real problem: whatever shape is chosen below, the
 follow-up named in §5 — move the check beside the provider — stops being a nicety and becomes part of the change.
 
@@ -706,8 +735,10 @@ has a C number to be compared against; build line in that file's header). **Memo
 | Rust over C, same artifact | **+1.7 MiB** | 421.1 − 419.4. Not "nothing": earlier prose here said the Rust side cost nothing, which was a rounding of an unattributed pair. It is ~0.4% of the load, and it is now a number rather than an adjective |
 | The same suite on libtest's default threads | **523.8 MiB** peak — *not attributable to one load* | concurrent artifact cases share one process-wide `VmHWM`. Loads are serialized by a mutex in the test so the headline figure means something; an unattributed peak is a worse number than a serialized one |
 | Three load-and-drop cycles, serialized | open-state RSS 407.5 MiB on all three rounds (±28 KiB), peak moves +164 KiB total, no crash | `loading_and_dropping_three_times_costs_the_same_each_time`. This detects double-free/UAF by crashing; it does **not** detect leaks (see the test's own doc) |
+| Widening the window to 8,192 costs nothing at rest | **+0 MiB**: a 133-token sequence through an 8,192-wide context peaks at 429,248 kB against the 429,528 kB model-open baseline (2026-10-30) | `decode_probe nctx=8192`, which also prints `built n_ctx=8192 built n_ubatch=8192` — the readback A1 review P1-1 asked the Rust side to check. This row is why decision C could raise the window without raising the idle footprint |
+| **A near-ceiling chunk, measured (decision C's price)** | 7,999 tokens: rc 0, finite pooled row, peak **1,478 MiB** (**+1,058 MiB** over baseline), **101 s** ≈ **79 tok/s** | same probe at `nctx=8192`. The falling rate continues (141 → 120 → 79 tok/s), so §5's interpolated "~63 s for an 8,192-token chunk" was optimistic by ~60% and the measurement supersedes it |
 | Context on top of the model, nothing decoded | **+1.8 MiB** resident at `n_ctx = 4096` | same probe. The weights dominate, not the context — and this artifact has no KV cache to dominate anything (`create_memory` returns null), so what that 1.8 MiB buys is a compute buffer and a window number |
-| **Corrected in R6b2: that +1.8 MiB was the whole story only because nothing had decoded.** Peak RSS above the C probe's own 419.4 MiB with the model open, by longest sequence run (`n_ctx = n_batch = n_ubatch = 4096`) | 133 tok **+0 MiB** · 513 **+47** · 1,026 **+109** · 2,052 **+218** · 4,085 **+458** | `crates/np-core/tests/probes/decode_probe.c` (committed, build line in its header — it also prints `memory=(nil)` and `n_threads=4`, the two facts behind the encoder-path and CPU-utilisation claims above); a compute buffer is *reserved* at context creation and *touched* per forward pass, so cost tracks the longest sequence actually run, not the ceiling asked for. This is why widening the window to 4,096 to escape the `n_ubatch` abort bought memory only for long notes, and it is the number R6d's peak-RSS headline should be read against |
+| **Corrected in R6b2: that +1.8 MiB was the whole story only because nothing had decoded.** Peak RSS above the C probe's own 419.4 MiB with the model open, by longest sequence run (`n_ctx = n_batch = n_ubatch = 4096`) | 133 tok **+0 MiB** · 513 **+47** · 1,026 **+109** · 2,052 **+218** · 4,085 **+458** | `crates/np-core/tests/probes/decode_probe.c` (committed, build line in its header — it also prints `memory=(nil)` and `n_threads=4`, the two facts behind the encoder-path and CPU-utilisation claims above); a compute buffer is *reserved* at context creation and *touched* per forward pass, so cost tracks the longest sequence actually run, not the ceiling asked for. This is why widening the window to escape the `n_ubatch` abort bought memory only for long notes, and it is the number R6d's peak-RSS headline should be read against. The 8,192 row above extends this curve: the shape holds at the wider window (+0 MiB at rest, ~+1 GiB near the ceiling) |
 | **Package size, stripped** (`cargo build --release --bin np`, `strip`) | feature **off 5.5 MiB** (5,780,432 B) · feature **on 11.0 MiB** (11,554,872 B) · **+5.5 MiB**, against this section's ≤ **40 MB** ceiling | measured 2026-10-30 with `np-cli`'s `local-model` passthrough. **Why the C++ is retained is not that `np` calls it** — nothing in `np-cli` reaches `local_model`; retention follows from np-core's own public code referencing those symbols while `build.rs` emits a plain `-l static=llama` with no `--whole-archive`, so the linker pulls what the references name. That makes +5.5 MiB today's figure rather than a floor: an LTO or `codegen-units` change could reclaim part of it, and R6d re-measures on the release profile before this section's headroom is quoted again. Symbol counts come from the *unstripped* files (`nm --defined-only`: 252 `T llama_` and 1,276 `llama_`/`ggml_` total with the feature on, zero without) — a stripped binary has no symbol table, so counting on it says "0" either way and reads as "nothing was linked in" while 5.7 MB of C++ sits in the file |
 | Throughput, `GGML_OPENMP = OFF`, this host | **141 tok/s** at 543 tokens, **120 tok/s** at 2,163 tokens (3.85 s and 18.0 s per decode; first decode of a run is no slower than a warm one) | `tests/local_embed.rs`'s throughput case prints it on every artifact run — the only one of R6b2's three numbers a test prints. `/usr/bin/time -v` on a 2,052-token pass reports **392% CPU**: with OpenMP off, ggml runs its own pthread pool (`ggml/src/ggml-cpu/ggml-cpu.c` — `ggml_threadpool_new_impl` at `:3324`, created per graph plan at `:3418`, with non-OpenMP worker state under `#ifndef GGML_USE_OPENMP` at `:509` and its barrier at `:2756`) and `llama_n_threads_batch` answers **4**. So "OpenMP off" is not "one core"; R6d's A/B against `GGML_OPENMP=ON` settles whether the self-containment trade is worth its price
 | Independent cross-check of the FFI mirror | C prints `n_embd_out 768, n_embd_inp 512, n_ctx_train 262144, vocab 262144, pooling 1`; Rust's `ModelFacts` prints the same five numbers | two programs, one artifact: a wrong struct field in our mirror shows up as a disagreement rather than as a green suite |
