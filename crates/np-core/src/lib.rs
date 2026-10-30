@@ -15,6 +15,9 @@ pub mod links;
 // tree that is not the pin (`docs/design-m2-local-embeddings.md` §14).
 #[cfg(feature = "local-model")]
 pub mod llama_ffi;
+// The one place that opens a GGUF: it needs the archives `build.rs` links, so it shares `llama_ffi`'s gate.
+#[cfg(feature = "local-model")]
+pub mod local_model;
 pub mod models;
 pub mod parse;
 pub mod path_keys;

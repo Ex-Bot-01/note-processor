@@ -14,8 +14,12 @@
 //! * There is no `llama_model_n_vocab`. Token count moved to the vocabulary object:
 //!   [`llama_model_get_vocab`] + [`llama_vocab_n_tokens`].
 //! * The deprecated spellings — `llama_load_model_from_file`, `llama_free_model`, `llama_n_ctx_train`,
-//!   `llama_n_vocab` — are deliberately absent. Declaring them would make it possible to reach the
-//!   wrong one without a compile error, since they still exist in v0.8.0.
+//!   `llama_n_vocab`, `llama_new_context_with_model`, and the three R6b1 was tempted by (`llama_n_embd`,
+//!   `llama_add_bos_token`, `llama_add_eos_token`) — are deliberately absent. Declaring them would make it
+//!   possible to reach the wrong one without a compile error, since they still exist in v0.8.0. The last
+//!   three matter more than a rename usually does: `llama_n_embd` answers with the model's **internal**
+//!   width, so a loader that used it would read 512 for a model whose vectors are 768 (§5's width decision
+//!   would be enforced against the wrong number and pass).
 //! * The `llama_batch_ext_*` family is also absent, on purpose: choosing it over
 //!   [`llama_batch_get_one`] plus the `logits` array of [`llama_batch`] is R6b1's design question (§14),
 //!   and declaring both would decide it by accident.
@@ -41,6 +45,30 @@ pub enum llama_model {}
 pub enum llama_context {}
 /// Vocabulary: owned by the model that produced it, never freed directly.
 pub enum llama_vocab {}
+
+/// `enum llama_pooling_type` (`include/llama.h:177-184`), mirrored as constants rather than a Rust enum.
+///
+/// It reaches us in two places only: as `llama_context_params.pooling_type`, which this file types `i32`
+/// (the struct's own layout pins already vouch for its 4-byte width at offset 44), and as the return value
+/// of [`llama_pooling_type`]. Constants rather than a `#[repr(C)]` enum because the field is mirrored as
+/// `i32` today, and because C's `sizeof(enum)` is not something Rust can pin anyway — see `layout`'s "What
+/// these pins cannot see".
+///
+/// **All six values are declared, including [`LLAMA_POOLING_TYPE_UNSPECIFIED`]**, because "-1 means ask the
+/// model" is a fact R6b1/R6b2 must not re-guess: leaving it out would invite a zero-initialised field, and 0
+/// is `NONE`, which silently disables pooling rather than asking. The mapping to a Rust type with only the
+/// vector-producing cases lives in [`crate::local_model::Pooling`].
+pub const LLAMA_POOLING_TYPE_UNSPECIFIED: i32 = -1;
+/// No pooling: the context answers per token and never with one sentence vector.
+pub const LLAMA_POOLING_TYPE_NONE: i32 = 0;
+/// Mean over the real tokens of a sequence — what `gemma-embedding2` declares (`pooling_type = 1`).
+pub const LLAMA_POOLING_TYPE_MEAN: i32 = 1;
+/// Use the `[CLS]`-style first-token row.
+pub const LLAMA_POOLING_TYPE_CLS: i32 = 2;
+/// Use the last token's row.
+pub const LLAMA_POOLING_TYPE_LAST: i32 = 3;
+/// Reranking head; not a sentence vector.
+pub const LLAMA_POOLING_TYPE_RANK: i32 = 4;
 
 /// `typedef int32_t llama_token;` & friends (`include/llama.h`, "C interface"). Fixed-width on purpose:
 /// C `int32_t` is 4 bytes on all three release targets, so these aliases cannot drift per platform.
@@ -216,8 +244,39 @@ extern "C" {
     /// constant). Reads metadata only, so it is valid on a `no_alloc` model.
     pub fn llama_model_n_ctx_train(model: *const llama_model) -> i32;
 
+    /// Width of the vector this model **answers with** — for an embedding model, the width of one stored
+    /// row. Distinct from [`llama_model_n_embd_inp`]: `gemma-embedding2` runs at 512 internally and projects
+    /// to 768 (`src/llama-model.cpp:3430`: `return model->hparams.n_embd_out()`, which is
+    /// `n_embd_out_impl` when the artifact declares `…embedding_length_out`, else `n_embd`).
+    ///
+    /// This is the number a declared width must be checked against — not [`llama_model_n_embd_inp`], and not
+    /// the deprecated `llama_n_embd`, which returns the *internal* width and would let a 512-declared row
+    /// pass while every stored vector was 768 wide.
+    pub fn llama_model_n_embd_out(model: *const llama_model) -> i32;
+
+    /// Width of a token-embedding row fed **into** the transformer (`src/llama-model.cpp:3426`:
+    /// `hparams.n_embd_inp()`, i.e. `n_embd_inp_impl` or `n_embd`). A model can take input rows of one width
+    /// and answer with another, so this is never the check for a stored vector.
+    pub fn llama_model_n_embd_inp(model: *const llama_model) -> i32;
+
     /// Vocabulary size, i.e. the number of rows in the output projection.
     pub fn llama_vocab_n_tokens(vocab: *const llama_vocab) -> i32;
+
+    /// Whether a tokenisation request with `add_special = true` prepends the BOS token
+    /// (`tokenizer.ggml.add_bos_token`). A flag, not a count — but R6b2's token budget must still add one
+    /// for it when it is set.
+    ///
+    /// Not the deprecated `llama_add_bos_token`, which v0.8.0 keeps alive with the same behaviour
+    /// (`include/llama.h:1251`): declaring both would make the wrong spelling reachable without a compile
+    /// error. `vocab` may be null
+    /// (llama.cpp checks), but we never pass null — see [`crate::local_model`]'s refusal when the model
+    /// exposes no vocabulary at all.
+    pub fn llama_vocab_get_add_bos(vocab: *const llama_vocab) -> bool;
+
+    /// Whether a tokenisation request with `add_special = true` appends the EOS token. Same owner and same
+    /// deprecation warning as [`llama_vocab_get_add_bos`]; both are set for `embeddinggemma-2`, which is why
+    /// this round reads them separately instead of assuming one.
+    pub fn llama_vocab_get_add_eos(vocab: *const llama_vocab) -> bool;
 
     // ---- context --------------------------------------------------------------
 
@@ -233,6 +292,17 @@ extern "C" {
     /// Free a context from [`llama_init_from_model`] (and with it its KV cache and output buffers —
     /// every pointer handed out by [`llama_get_embeddings_seq`] dies here).
     pub fn llama_free(ctx: *mut llama_context);
+
+    /// The pooling strategy this **context** will apply, which is not necessarily what the caller asked for:
+    /// `src/llama-context.cpp` keeps `params.pooling_type` when it is not
+    /// [`LLAMA_POOLING_TYPE_UNSPECIFIED`] and otherwise copies the model's own value — resolving an
+    /// unspecified pair to [`LLAMA_POOLING_TYPE_NONE`].
+    ///
+    /// Read it after the context exists rather than trusting metadata: with `NONE` the decode path writes
+    /// per-token rows and never the sequence map, so [`llama_get_embeddings_seq`] can only return null — an
+    /// artifact that cannot produce a sentence vector (`src/llama-context.cpp`: `get_embeddings_seq` looks up
+    /// `embd_seq`, and only the MEAN/CLS/LAST/RANK arms of the embedding extraction write it).
+    pub fn llama_pooling_type(ctx: *const llama_context) -> i32;
 
     // ---- tokens ---------------------------------------------------------------
 
