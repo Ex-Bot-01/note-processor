@@ -177,8 +177,11 @@ what fails is not a check, because removal makes tests pass.
   buffer is reserved at init and touched per decode, so long notes cost memory and ordinary chunks cost nothing.
   Semantic sanity is an ordering, not a score: `cos(cat, feline) = 0.8302` vs `cos(cat, revenue) = 0.5887`. Empty input is not an error —
   it embeds BOS+EOS (2 tokens) into a real unit vector, which is what the artifact does rather than a rule we invented.
-  **§5's ceiling question now has a price attached and still needs the human:** extrapolating the measured rate (which falls with length),
-  `max_tokens = 8192` is roughly a **minute per chunk** — an input the shipped code refuses above 4,096 anyway — while the default 2,048 interpolates to ~16 s
-  between those two measured points; and the runtime window is 4,096 today, so anything above that is refused until
+  **§5's ceiling question is decided (2026-10-30, option B):** `MAX_EMBEDDING_TOKENS` **8,192 → 4,096**, because that is the width of the context
+  this build creates and a ceiling above the window only produces configs refused later by a different sentence; default `embeddings.max_tokens`
+  **2,048 → 1,024** (≈8 s per worst-case chunk at ~120–141 tok/s, interpolated between the measured points). Both stay revisitable — config numbers
+  with no stored data behind them yet — and `local_model` now asserts `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX` at compile time so the pair cannot drift.
+  Still unmeasured: whether long-note *recall* improves above 4,096 tokens; we refuse there because one decode cannot hold more here, not because the
+  model cannot represent it. Long-note retrieval is bounded by chunking either way. Any budget above the window is refused until
   `REQUESTED_CTX` moves — which §14's curve says costs +458 MiB by 4,085 tokens. Still owed: R6c wiring config → provider → `embeddings`
   rows, and R6d's corpus-scale benchmark (batching across texts is deliberately not in this API yet).

@@ -117,6 +117,22 @@ mod embedding {
     }
 
     /// `n` copies of [`UNIT`], for inputs measured in tokens rather than bytes.
+    /// The token count of `text`, **including** when it exceeds `count_tokens`' own ceiling — where the refusal's
+    /// payload is exactly the number the caller wanted. Bytes-per-token has never been load-bearing in this file, and
+    /// an over-window input is the one place a test cannot get its count from `Ok`.
+    fn count_even_over_ceiling(model: &LoadedModel, text: &str) -> usize {
+        match model.count_tokens("", text) {
+            Ok(n) => n,
+            Err(EmbedError::TokenBudgetExceeded { tokens, budget }) => {
+                assert!(tokens > budget, "a budget refusal that names {tokens} against a ceiling of {budget} is not over its own ceiling: this refusal would be a bug, not evidence");
+                tokens
+            }
+            Err(other) => {
+                panic!("counting should either answer or refuse on budget, got {other:?}")
+            }
+        }
+    }
+
     fn text_of_about(n_copies: usize) -> String {
         UNIT.repeat(n_copies)
     }
@@ -353,24 +369,34 @@ mod embedding {
         let window = model.window();
         assert!(window > 0, "a context with no window cannot embed anything");
 
-        // Grow until the token count passes the window. The starting point (~5,100 tokens) is already over a
-        // 4,096 window, so this loop normally runs zero times — it exists for a re-pin or a model with a larger
-        // trained window, and the bound that matters sits **after** it, where a failure is possible: an input that
-        // grew past the 8,192 hard ceiling would produce a budget refusal and this case would quietly be testing
-        // the wrong arm. R6b2 review P2-2 caught that guard living inside the loop, where nothing could reach it.
+        // Build something longer than the window and **prove** it, rather than trusting bytes-per-token. Proving it
+        // is subtler than it looks now §5's decision B made the counting ceiling equal to the window: `count_tokens`
+        // refuses above its own 4,096, so an over-window note never returns a count at all. The refusal is the
+        // evidence — `TokenBudgetExceeded { tokens, .. }` carries llama.cpp's own count — which is why this case reads
+        // the number out of the error instead of expecting `Ok`.
+        //
+        // The loop is for an artifact with a wider window than our ceiling (a re-pin); on today's build the first
+        // count already refuses. What must not happen is the input growing past the budget handed to `embed_text`
+        // below, because then this case would quietly exercise the budget arm instead of the window arm — that guard
+        // sits **after** the loop, where a failure is possible (R6b2 review P2-2 caught it living inside).
+        let budget = window + 4_096;
         let mut note = text_of_about(300);
-        let mut tokens = model.count_tokens("", &note).expect("counted");
+        let mut tokens = count_even_over_ceiling(&model, &note);
         while tokens <= window {
             note.push_str(UNIT);
-            tokens = model.count_tokens("", &note).expect("counted");
+            tokens = count_even_over_ceiling(&model, &note);
         }
         assert!(
-            tokens <= 8_192,
-            "the input reached {tokens} tokens passing a window of {window}, past the 8,192 hard ceiling: this case              would then report a budget refusal rather than the window refusal it names"
+            tokens > window,
+            "the loop stopped without passing a window of {window}: it counted {tokens}, so this case proves nothing"
+        );
+        assert!(
+            tokens <= budget,
+            "the input reached {tokens} tokens passing a window of {window}, past the {budget} budget this case              passes to embed_text: it would then report a budget refusal rather than the window refusal it names"
         );
 
         let problem = model
-            .embed_text("", &note, 8_192)
+            .embed_text("", &note, budget)
             .expect_err("a sequence over the window must be refused, not decoded");
         match &problem {
             EmbedError::Unavailable(label) => assert_eq!(
@@ -592,10 +618,11 @@ mod embedding {
         }
     }
 
-    /// Throughput and first-embed latency, **printed**. §5's open question (8,192 vs the artifact's 262,144) and
-    /// §14's OpenMP trade-off are both cost decisions, and a cost decision needs tokens per second rather than an
-    /// adjective. Nothing here asserts a bound: a shared host, a cold page cache and eleven other rounds' build
-    /// load all move this number by more than any regression would.
+    /// Throughput and first-embed latency, **printed**. §5's ceiling question — closed as option B on 2026-10-30:
+    /// budget ceiling 4,096 (this build's window) and default 1,024 — was decided from numbers like these rather than
+    /// from the artifact's trained window, and §14's OpenMP trade-off is another such decision. Nothing here asserts a
+    /// bound: a shared host, a cold page cache and eleven other rounds' build load all move this number by more than
+    /// any regression would.
     #[test]
     fn decode_throughput_is_printed_not_asserted() {
         let path = artifact_or_not_coverage!();

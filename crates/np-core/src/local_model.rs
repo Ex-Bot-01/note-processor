@@ -29,8 +29,10 @@
 //! is unchanged either way because `n_ubatch` is the number in all three.) `GGML_ASSERT` maps to `GGML_ABORT`
 //! (`ggml/include/ggml.h:287-288`) and so survives `NDEBUG`: at llama.cpp's default `n_ubatch = 512`, a
 //! 600-token sequence **aborted the process** (measured: exit 134, no return code at all). Since
-//! `embeddings.max_tokens` accepts up to 8,192, that abort was reachable from an ordinary ~1,800-byte note. See
-//! `REQUESTED_CTX` for what the wider window costs and [`LoadedModel::window`] for the refusal that guards it.
+//! `embeddings.max_tokens` accepted up to 8,192, that abort was reachable from an ordinary ~1,800-byte note. See
+//! `REQUESTED_CTX` for what the wider window costs and [`LoadedModel::window`] for the refusal that guards it. The
+//! budget ceiling is now **4,096** (§5's decision B), so the two numbers meet: no validated config can ask for more
+//! than this context can hold, which is what the assertion under `REQUESTED_CTX` keeps true.
 //!
 //! What this module owns is therefore exactly the unsafe part: who holds the two C handles, in what order they
 //! die, and which refusals happen before anything is allocated. [`load`] is the only place in the crate that
@@ -44,9 +46,10 @@
 //! `embeddinggemma-2-Q8_0.gguf` answers `n_embd_out = 768` and `n_embd_inp = 512`: the model runs at 512
 //! inside and projects to 768, which is why [`load`] compares a declared width against **out**, and why the
 //! deprecated `llama_n_embd` is not declared anywhere in this crate. It also answers `n_ctx_train = 262_144`
-//! while `MAX_EMBEDDING_TOKENS` is 8,192 — see §5 of `docs/design-m2-local-embeddings.md`, which records that
-//! conflict as an open question rather than a decision, and `ModelFacts::n_ctx_train` for what we do with the
-//! difference.
+//! while `MAX_EMBEDDING_TOKENS` is 4,096 — a 64× gap §5 used to keep as an open question and has now closed as a
+//! decision (2026-10-30): the trained window is not something one embedding can spend here, so the ceiling follows the
+//! context we build rather than the artifact's number. `ModelFacts::n_ctx_train` still reports the artifact's figure,
+//! because a refusal that names the wrong limit wastes the reader's time.
 //!
 //! ## Portability
 //!
@@ -72,9 +75,11 @@ use crate::walk;
 /// The context window [`load`] asks llama.cpp for, and the number it also gets for `n_batch` and `n_ubatch`:
 /// `min(REQUESTED_CTX, n_ctx_train)`.
 ///
-/// Not the model's trained window (§5 leaves 262,144 vs 8,192 open), and not `embeddings.max_tokens` either —
-/// the budget decides what a caller may submit, this decides what the runtime can hold, and
-/// [`LoadedModel::embed_text`] refuses between the two rather than letting llama.cpp decide with an assert.
+/// Not the model's trained window (262,144 here; §5 closed that gap as decision B on 2026-10-30), and not
+/// `embeddings.max_tokens` either — the budget decides what a caller may submit, this decides what the runtime can
+/// hold, and [`LoadedModel::embed_text`] refuses between the two rather than letting llama.cpp decide with an assert.
+/// Since decision B those two numbers are equal for a validated config, which is what the assertion below turns into a
+/// compile-time fact.
 ///
 /// **What it costs, measured** by `tests/probes/decode_probe.c` — the bare C loader plus one forward pass, so the
 /// baseline is that program's own 419.4 MiB with the model open (§14; our Rust process sits 1.7 MiB higher, at
@@ -86,6 +91,20 @@ use crate::walk;
 /// so when R6c wires config to a provider this becomes an argument, and until then a workspace configured
 /// above 4,096 gets [`LoadedModel::window`]'s refusal instead of an abort.
 const REQUESTED_CTX: usize = 4_096;
+
+/// The one cross-file invariant worth compiling rather than commenting: **a validated budget must fit the context we
+/// build**. `window()` is `min(REQUESTED_CTX, n_ctx_train)`, so this guarantees that any `embeddings.max_tokens` which
+/// passed config validation reaches the runtime inside the window on an artifact trained at least this wide — and that
+/// the only thing between a configured sequence and llama.cpp's encoder assert (`src/llama-context.cpp:1631`, which
+/// aborts the process) is our own refusal.
+///
+/// Outside `#[cfg(test)]` deliberately, like the layout pins in [`crate::llama_ffi`]: someone widening
+/// `MAX_EMBEDDING_TOKENS` to spend a bigger window has to touch this file to do it safely, and a test-only check would
+/// let the two constants drift apart in a build that still compiles (design §5's decision B is what pairs them today).
+const _: () = assert!(
+    crate::config::MAX_EMBEDDING_TOKENS <= REQUESTED_CTX,
+    "embeddings.max_tokens must never allow a budget wider than the context this build creates"
+);
 
 /// How a context turns per-token rows into one sentence vector.
 ///
@@ -142,9 +161,11 @@ pub struct ModelFacts {
     /// rows are this wide while the stored vectors are `n_embd_out` wide.
     pub n_embd_inp: usize,
     /// Tokens the model was trained with (unit: tokens) — a fact about the artifact, **not** our ceiling.
-    /// `embeddings.max_tokens` inside `MAX_EMBEDDING_TOKENS` stays the bound a sequence is refused against (§5
-    /// keeps the gap between the two as an open question), and it is not the window we ask llama.cpp for
-    /// either, which is `REQUESTED_CTX`.
+    /// `embeddings.max_tokens` inside `MAX_EMBEDDING_TOKENS` is the bound a sequence is refused against, and the
+    /// window we ask llama.cpp for is `REQUESTED_CTX`; §5 closed the gap between those and this number as a decision
+    /// on 2026-10-30 rather than leaving it open. It is reported anyway because it is the number a reader reaches
+    /// for first, and because on an artifact trained *narrower* than `REQUESTED_CTX` it is `window()` that saves the
+    /// run.
     pub n_ctx_train: usize,
     /// Entries in the vocabulary (unit: tokens). Valid token ids are `0..n_vocab`.
     pub n_vocab: usize,
@@ -369,8 +390,8 @@ impl LoadedModel {
     ) -> Result<Vec<llama_ffi::llama_token>, EmbedError> {
         let bytes = joined.as_bytes();
         // `text_len` is an `int32_t`, and the buffer size derived from the count has to stay in range too.
-        // Unreachable through any budget (8,192 tokens cannot come from 2 GiB of text), but `as i32` would
-        // otherwise wrap into a negative `n_tokens_max`.
+        // Unreachable through any budget a config can name (four thousand tokens cannot come from 2 GiB of text),
+        // but `as i32` would otherwise wrap into a negative `n_tokens_max`.
         if bytes.len() > i32::MAX as usize - 2 {
             return Err(EmbedError::Unavailable(
                 "the sequence is too long to hand to the tokenizer".to_string(),

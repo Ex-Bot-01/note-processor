@@ -852,26 +852,32 @@ fn an_unknown_key_outside_embeddings_still_loads() {
 /// the end — so a fixture cannot drift into accepting something `np models install` would refuse.
 const LOCAL_ID: &str = "embeddinggemma-2-text-q8_0@1";
 
-/// The token ceiling is a **model fact, not taste**: 8,192 is `embeddinggemma-2`'s attention window (Google's card, read
-/// 2026-10-29). It used to be 32 768, justified by `max_position_embeddings = 262144` — a RoPE/train-length property the design has
-/// since disowned — and **no test noticed**, because every other case is written *relative to* the constant. So the window is pinned
-/// through behaviour rather than a constant comparison (which clippy correctly refuses as `assertions_on_constants`, and which would
-/// anyway only restate the source): a budget one over the ceiling must be refused, and the sentence that refuses it must carry the
-/// model's number. Change the ceiling without a citation and this fails on the message. Raising it also means moving the check beside
-/// the provider — the spec's MiniLM fallback has ~512 tokens, so one global constant is already doing a per-model job.
+/// The token ceiling is a **build fact, and the refusal must say so**: 4,096 is how wide a context this build creates
+/// (`local_model::REQUESTED_CTX`), decided as design §5's option B on 2026-10-30. History is the reason for the wording:
+/// it was 32 768 (justified by `max_position_embeddings = 262144`, a RoPE/train-length property since disowned), then
+/// 8,192 (the model card's attention window) — and **no test noticed either time**, because every other case is written
+/// *relative to* the constant. So the number is pinned through behaviour rather than a constant comparison (which clippy
+/// correctly refuses as `assertions_on_constants`, and which would only restate the source): a budget one over the
+/// ceiling must be refused, and the sentence must describe what the ceiling really is. A refusal that blames the model
+/// for a build choice sends the reader to a different GGUF when the answer is a shorter chunk — which is why this test
+/// asserts the message does *not* claim the model cannot attend to that many tokens.
 #[test]
-fn the_token_ceiling_carries_the_models_attention_window_into_its_refusal() {
+fn the_token_ceiling_carries_the_builds_window_into_its_refusal() {
     let (_path, err) = embeddings_refusal(&format!(
         "[embeddings]\nmax_tokens = {}\n",
         MAX_EMBEDDING_TOKENS + 1
     ));
     let message = err.to_string();
     assert!(
-        message.contains("8192") && message.contains("attends to at most"),
-        "the refusal has to teach the reader the model's window, not just reject a number: {message}"
+        message.contains("4096") && message.contains("in this build"),
+        "the refusal has to teach the reader where the limit comes from, not just reject a number: {message}"
+    );
+    assert!(
+        !message.contains("this model attends"),
+        "the ceiling is our context width, not a claim about the artifact's training: {message}"
     );
 
-    // And the ceiling itself is reachable: asking for exactly the window is legal, so the fence bounds the model rather than
+    // And the ceiling itself is reachable: asking for exactly the window is legal, so the fence bounds the build rather than
     // refusing every real budget.
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = write_config_with_data_dir(
@@ -884,20 +890,25 @@ fn the_token_ceiling_carries_the_models_attention_window_into_its_refusal() {
         "the default budget cannot exceed the bound it is validated against"
     );
 
-    // Mutation this catches: raising `MAX_EMBEDDING_TOKENS` back to 32 768 — the message then prints a number no model can honour and
-    // the assertion above dies. Lowering it below the default trips the second half.
+    // Mutations this catches: editing the ceiling without the decision record (the message stops naming the build),
+    // re-wording the refusal back to blaming the model, and lowering the ceiling below the default — the last of which
+    // `local_model`'s compile-time `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX` also refuses to build past.
 }
 
 #[test]
 fn an_absent_max_tokens_takes_the_default_and_changes_nothing_else() {
     // R6a adds a key to a section that used to *refuse* it by name, so the property that matters is what an
     // existing file still means: two fixtures written before this round — one silent about embeddings, one
-    // naming provider/model/dim — must parse to exactly the values they parsed to then, plus 2048. A default
-    // that only appeared in `Config::default()` and not in the container default would fail here on the second
-    // fixture while the first stayed green.
+    // naming provider/model/dim — must parse to exactly the values they parsed to then, plus the default budget. A
+    // default that only appeared in `Config::default()` and not in the container default would fail here on the
+    // second fixture while the first stayed green.
+    //
+    // 1,024 is design §5's decision B (2026-10-30), priced by R6b2's throughput curve; the number before it was 2048,
+    // which was justified by arithmetic about chunk bytes rather than by a measured cost. Changing it again is a §5
+    // change with a measurement attached, not an edit to this line.
     assert_eq!(
-        DEFAULT_EMBEDDING_TOKENS, 2048,
-        "§5 fixes the budget at 2048 tokens; changing it is a design change, not a constant edit"
+        DEFAULT_EMBEDDING_TOKENS, 1_024,
+        "§5 fixes the budget at 1,024 tokens; changing it needs a re-measurement and a design note, not a constant edit"
     );
 
     for body in [

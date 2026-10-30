@@ -133,9 +133,10 @@ worth keeping in plain sight, because it is why the number was ever contested:
     So narrowing needs a row-creating path that is not `install`.
   - **No round between R6a and R6d performs this.** It gets its own design section when a real storage problem exists.
 - **Window, now cited rather than reasoned about.** The card gives **8,192 tokens** of context for this model. Draft v2 said
-  "nothing here reads a trained window"; it does now. Consequences: `embeddings.max_tokens`'s default of 2048 sits comfortably
+  "nothing here reads a trained window"; it does now. Consequences then: `embeddings.max_tokens`'s default of 2048 sits comfortably
   inside it, and `MAX_EMBEDDING_TOKENS = 32_768` **exceeds what the model can attend to** — recorded as a bound to tighten to
-  8,192 in R6b2 alongside the enforcement test, not silently left generous. (`max_position_embeddings = 262144` in
+  8,192 in R6b2 alongside the enforcement test, not silently left generous. (Both numbers have moved since, and neither moved the way this
+  sentence predicted: decision B below sets the ceiling from the context we build rather than from the card.) (`max_position_embeddings = 262144` in
   `config.json` is a RoPE/train-length property, not a usable embedding window; §5's refusal posture does not depend on which
   of the two numbers you read.)
   **Annotated by R6b1 (2026-10-30), because this sentence is stale and I would rather mark it than let the next round re-derive
@@ -168,7 +169,7 @@ why §7 tests batch invariance rather than trusting it.
 measurement: nothing here reads a trained window; the model card would be the citation and R6d should record one.) The
 posture stays refuse-loudly:
 
-- `embeddings.max_tokens` (**default 2048**, added in R6a together with its default-when-absent; note `EmbeddingsConfig`
+- `embeddings.max_tokens` (**default 1,024** since §5's decision B; 2,048 when R6a added it, together with its default-when-absent; note `EmbeddingsConfig`
   is `#[serde(deny_unknown_fields)]`, so today writing that key is refused naming key and file — that is the round that
   changes it) applies to **what the model actually sees**: `prefix_doc` + chunk text + special tokens, since
   `include_prompt = true` means the counted sequence is not just our bytes.
@@ -207,14 +208,12 @@ loading it through llama.cpp v0.8.0 — agree. Artifact: `/home/agent/models/emb
 | `gemma-embedding2.block_count` | 24 | sanity only (`n_layer`) |
 | `general.size_label` | `271M` | the "300M" of older prose is the family, not this file (§13's price list) |
 
-**Open question, kept open — it is not this round's decision and no code changed because of it.** The artifact declares a trained
-window of **262,144 tokens** while `MAX_EMBEDDING_TOKENS` is **8,192** (itself taken from the model card's usable embedding window,
-above). So the ceiling we refuse at is ~32× below what the file claims it was trained for, and one of three things is true: the card
-is right and the GGUF's `context_length` is a RoPE train-length nobody can spend on an embedding; or the window really is usable
-and 8,192 leaves recall on the table for long notes; or the number is aspirational and llama.cpp would refuse or degrade long before
-it. Nothing measured today distinguishes these — R6b1 loads the file and never submits a token, so it has no evidence to trade, and
-`ModelFacts::n_ctx_train` deliberately reports the artifact's number next to (not instead of) our own bound. Whoever runs a long-note
-case in R6b2/R6d should record which of the three it was, and until then `max_tokens` stays inside 8,192.
+**Was an open question; closed below.** The artifact declares a trained window of **262,144 tokens** while the ceiling we refuse at
+was **8,192** (taken from the model card's attention window). Three readings were possible: the card is right and `context_length` is a
+RoPE train-length nobody can spend on one embedding; or the window really is usable and 8,192 leaves recall on the table for long notes;
+or the number is aspirational and llama.cpp refuses or degrades long before it. R6b1 could not distinguish them — it loads the file and
+never submits a token — so `ModelFacts::n_ctx_train` reports the artifact's number next to (not instead of) our own bound, which is still
+true and still worth doing: a refusal that names the wrong limit wastes the reader's time.
 
 ### R6b2 measured what a token costs (2026-10-30) — the ceiling is now priced, not cited
 
@@ -240,12 +239,33 @@ Three things follow, and they are separate decisions:
 2. **Cost rises with length, and it is slow enough to matter.** Measured points: **543 tokens in 3.85 s (141 tok/s)** and **2,163 tokens in
    18.0 s (120 tok/s)**. Everything beyond them is **extrapolation on a falling rate**, not measurement — including the headline that
    `max_tokens = 8,192` would cost roughly a minute per chunk (~63 s at 130 tok/s, more if the decline continues), which matters chiefly
-   because the shipped code refuses above 4,096 anyway and nobody has embedded 8,192 tokens here. What the two measured points do support is
-   the default: 2,048 is a ~16-second worst case at a length where it was actually measured. Nobody has yet chosen a ceiling *on that basis*,
-   which is §10's question with numbers attached rather than an argument settled.
+   because the shipped code refuses above 4,096 anyway and nobody has embedded 8,192 tokens here. The two measured points also price the
+   default: 2,048 interpolates to a ~16-second worst case between them (it is not itself a measured length).
 3. **Throughput, not the window, is what a corpus feels.** 5,000 notes × 500 tokens ≈ 2.5 M tokens ≈ **5.3 hours** at this rate,
    single-process. That is R6d's problem (OpenMP A/B, batching across texts in one decode — `embed_text` is deliberately one decode per
    text today), and it is the number worth optimising, because no ceiling choice changes it by more than a factor of a few.
+
+### Decision B, taken 2026-10-30 — the ceiling follows the build, not the card
+
+The human chose **option B** from the three priced above, with those numbers in front of them and "we can change it later if it is not
+sufficient" attached. Concretely:
+
+| Key | Before | After | Why this value |
+| --- | --- | --- | --- |
+| `MAX_EMBEDDING_TOKENS` (config ceiling) | 8,192 — the model card's attention window | **4,096** | equal to the context this build creates (`local_model::REQUESTED_CTX`). A ceiling above the window is a config that parses happily and is then refused at run time by a different sentence, so it is not generous but misleading. Length also costs RAM super-linearly here (**+458 MiB** over the C baseline at 4,085 tokens) on the class of machine this tool targets |
+| `DEFAULT_EMBEDDING_TOKENS` | 2,048 — justified by chunk-byte arithmetic | **1,024** | ≈**8 s** of CPU per worst-case chunk at ~120–141 tok/s (interpolated between the two measured points; say so when quoting it), and a real corpus sits nearer the fast end. It still leaves room for `prefix_doc` + two specials over a 1,800-byte chunk, so the old justification becomes slack rather than headroom |
+
+**Why this is revisitable rather than provisional.** Both are config-level numbers with no stored data behind them yet: raising the default is
+one key per workspace, and raising the ceiling is a constant plus a re-measurement. What must not happen is drift between the ceiling and the
+window, so `local_model` carries a compile-time assertion that `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX` — outside `#[cfg(test)]`, like the FFI
+layout pins, because a test-only check lets two constants in two files drift apart in a build that still compiles. Raising the ceiling means
+raising `REQUESTED_CTX` in the same change and re-reading §14's RSS curve; that friction is the point.
+
+**What it does not settle.** Whether 262,144-token embeddings would improve retrieval on long notes stays unmeasured, and the honest statement
+is that we refuse above 4,096 because that is what one decode can hold here — not that the model cannot represent more. The follow-up named
+above also survives: this is a **global** constant doing a **per-model** job, and a second configured model (the spec's MiniLM, ~512 tokens)
+needs the check moved beside the provider. And recall on long notes is bounded by *chunking*, not by this number: a 3,000-token note becomes
+several embeddings whatever the ceiling says, so if long-note retrieval is the worry, the lever is chunk overlap and ranking, not `max_tokens`.
 
 ## 6. `np embed <workspace>`: what it writes, and what it must never do
 
@@ -351,7 +371,7 @@ Every brief mandates a `wip:` commit at first compile — five workers this sess
 ones with a checkpoint cost nothing.
 
 1. **R6a — seam + feature.** `local-model` cargo feature, provider type that loads nothing yet but owns the API, error
-   taxonomy, dim-mismatch refusal, `[embeddings] max_tokens` (default 2048) and config validation (`provider =
+   taxonomy, dim-mismatch refusal, `[embeddings] max_tokens` (default 2048 then — decision B moved it to 1,024) and config validation (`provider =
    "local-model"` requires a `model` naming an installed row), plus fake-provider tests including §3's "the prefix on the
    row reaches the model". No C++ in default builds; gates unchanged. *If the implementer is still writing error variants at
    25 minutes, config validation splits off.*
@@ -603,9 +623,10 @@ without root — it just isn't free, and it must be written down rather than dis
 6.8 GB disk free on `/home`, 16 cores** — enough for one llama.cpp build plus a 310 MB artifact, not enough to be careless (the earlier "2 GB
 free" note in the session record is stale; `free -m` says otherwise today).
 
-**The consequence for width and window.** A model fact cannot be pinned globally while the model is undecided: §5's 8,192 is EmbeddingGemma-2's
-window, and it now sits in a constant. Whatever shape is chosen below, the follow-up named in §5 — move the check beside the provider — stops
-being a nicety and becomes part of the change.
+**The consequence for width and window.** A model fact cannot be pinned globally while the model is undecided. §5's ceiling used to be that kind
+of pin (8,192, EmbeddingGemma-2's card) and since decision B it is a *build* fact instead — 4,096, the width of the context we create, checked
+against `REQUESTED_CTX` at compile time. That removes one wrong authority without removing the real problem: whatever shape is chosen below, the
+follow-up named in §5 — move the check beside the provider — stops being a nicety and becomes part of the change.
 
 ### The three shapes, with their real prices
 

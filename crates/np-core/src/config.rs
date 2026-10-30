@@ -71,19 +71,38 @@ pub const MAX_CONTINUATION_INDENT: usize = 16;
 /// `[embeddings] max_tokens` when the key is absent (`docs/design-m2-local-embeddings.md` §5).
 ///
 /// The default is a *budget*, not a target: an over-budget chunk is reported, never truncated (§5), so the
-/// number has to sit above what the chunker normally produces while still being a fence. §5's own arithmetic
-/// says 2048 leaves room for `prefix_doc` plus specials on top of a `MAX_CHUNK_BYTES = 1800` chunk, and R6d
-/// measures real bytes-per-token before anyone moves it.
-pub const DEFAULT_EMBEDDING_TOKENS: usize = 2048;
-
-/// Largest `embeddings.max_tokens` a config file may ask for.
+/// number has to sit above what the chunker normally produces while still being a fence. **1,024** is the human's
+/// decision of 2026-10-30 (design §5, "decision B"), taken from R6b2's measured cost curve rather than from an
+/// argument: at ~120–141 tokens/s a 1,024-token chunk is **~8 s** of CPU on this host — interpolated between the
+/// two measured points (543 tok / 3.85 s and 2,163 tok / 18.0 s), so quote it as an interpolation, not a
+/// measurement — while a whole corpus at ~500 tokens per note stays near the faster end of that curve. It also
+/// leaves room for `prefix_doc` plus two special tokens on top of a `MAX_CHUNK_BYTES = 1800` chunk, which is what
+/// the old 2048 was justified by; nothing about the chunker changed, so this is now slack rather than headroom.
 ///
-/// The largest sequence the configured model can attend to in one embedding: **8,192 tokens**, from Google's
-/// `embeddinggemma-2` card (read 2026-10-29). This is a model fact, not a product judgement — and it replaced an
-/// earlier ceiling of 32 768 that was justified by `max_position_embeddings = 262144`, a RoPE/train-length property
-/// the design has since disowned (`docs/design-m2-local-embeddings.md` §5). A bound above what the model can read is
-/// not generous, it is false: `validate_embeddings` would have gone on inviting `max_tokens = 16384` values that no
-/// runtime can honour.
+/// Raising it is cheap to do and expensive to run: the number is a config key, so **nothing here blocks a later
+/// increase** — what §5 asks for first is a re-measurement (R6d's throughput run with OpenMP decided), not a
+/// constant edit.
+pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
+
+/// Largest `embeddings.max_tokens` a config file may ask for: **4,096 tokens**, which is the width of the context
+/// this build asks llama.cpp for (`local_model::REQUESTED_CTX`), not a fact about any model card.
+///
+/// **Chosen 2026-10-30 by the human as design §5's option B**, with R6b2's measurements in front of them, and
+/// explicitly revisitable: it is a config bound, so raising it later costs a constant and a re-measure, not a
+/// migration. The reasoning that made 4,096 right rather than generous:
+///
+/// * the runtime cannot hold more than this in one embedding anyway — this artifact is an encoder with no KV cache,
+///   so `llama_context.cpp:1631`'s `n_ubatch >= n_tokens` assert is what a longer sequence meets, and we refuse
+///   before it. A ceiling above the window invites `max_tokens = 8192` values that parse happily and are then
+///   refused at run time by a different sentence;
+/// * length costs memory super-linearly here: peak RSS runs **+458 MiB above the C baseline at 4,085 tokens**
+///   (§14's curve), so a wider ceiling is a RAM commitment on the small machines this tool targets;
+/// * and it costs time on a falling rate — ~120 tok/s at 2,163 tokens against ~141 at 543.
+///
+/// Earlier versions of this constant cited Google's `embeddinggemma-2` card (8,192) and before that
+/// `max_position_embeddings = 262144`, a RoPE/train-length property the design disowned (§5). Both were the wrong
+/// *kind* of authority: what a model was trained on says nothing about what one embedding run can hold. The card's
+/// number is now recorded in §5 as context for a long-note experiment, not as a bound we enforce.
 ///
 /// The budget counts **what the model sees** — `prefix_doc` + chunk text + special tokens, because
 /// `include_prompt = true` means the counted sequence is not just our bytes — so a caller near this ceiling has to
@@ -92,12 +111,15 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 2048;
 /// normalisation can expand bytes, `decode` emits U+FFFD runs, prefix and specials cost tokens from no chunk bytes).
 /// R6d measures bytes-per-token on this corpus.
 ///
-/// Two honest limits on the number itself. It is **model-independent while the window is not**: 8,192 is the smallest
-/// window any model configured *today* may have, and a spec-named fallback (MiniLM, ~512 tokens) would need a smaller
-/// bound — so the follow-up is to move this check next to the provider rather than leave a global constant doing a
-/// per-model job. And it is a load-time fence only: R6b2 enforces it over real token counts. Posture unchanged from
-/// [`MAX_CONTINUATION_INDENT`] (F17 §4): enforce at load, refuse rather than clamp.
-pub const MAX_EMBEDDING_TOKENS: usize = 8_192;
+/// Three honest limits on the number itself. **(1) It is a global constant doing a per-model job**: 4,096 happens to
+/// be *this* build's window, and a spec-named fallback (MiniLM, ~512 tokens) needs a smaller bound — so the follow-up
+/// stays exactly as §5 wrote it, move the check beside the provider. **(2) It is now coupled to a build choice**, which
+/// is why `local_model` carries a compile-time assertion that `MAX_EMBEDDING_TOKENS <= REQUESTED_CTX`: raising one
+/// without the other either produces budgets that cannot run or a window nobody can reach, and neither should be
+/// discovered by a user. **(3)** It is a load-time fence over *configured* numbers only; R6b2 enforces it over real
+/// token counts, including prefix and specials. Posture unchanged from [`MAX_CONTINUATION_INDENT`] (F17 §4): enforce
+/// at load, refuse rather than clamp.
+pub const MAX_EMBEDDING_TOKENS: usize = 4_096;
 
 /// How the catalog (`INDEX.md` and its shards) is laid out.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -412,10 +434,10 @@ impl Config {
 fn validate_embeddings(cfg: &Config) -> Result<(), ConfigError> {
     if !(1..=MAX_EMBEDDING_TOKENS).contains(&cfg.embeddings.max_tokens) {
         return Err(invalid_data(format!(
-            "invalid embeddings.max_tokens = {}: this model attends to at most \
-             {MAX_EMBEDDING_TOKENS} tokens per embedding, and the budget counts prefix + chunk + special tokens \
-             (google/embeddinggemma-2 card, read 2026-10-29), so the value must be between 1 and \
-             {MAX_EMBEDDING_TOKENS}",
+            "invalid embeddings.max_tokens = {}: one embedding holds at most \
+             {MAX_EMBEDDING_TOKENS} tokens in this build — that is how wide a context it creates, not the largest \
+             the model was trained on — and the budget counts prefix + chunk + special tokens, so the value must be \
+             between 1 and {MAX_EMBEDDING_TOKENS}. Long notes are chunked; raise no key to embed one whole file",
             cfg.embeddings.max_tokens
         )));
     }
