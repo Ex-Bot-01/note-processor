@@ -222,7 +222,12 @@ impl LoadedModel {
     /// One text per call, therefore one decode per text: a caller wanting N vectors pays N decodes today.
     /// Multi-text batching is R6d's optimisation to take with throughput evidence, not something to assume in
     /// the shape of this API.
-    pub fn embed_text(&self, prefix: &str, text: &str, budget: usize) -> Result<Vector, EmbedError> {
+    pub fn embed_text(
+        &self,
+        prefix: &str,
+        text: &str,
+        budget: usize,
+    ) -> Result<Vector, EmbedError> {
         let joined = format!("{prefix}{text}");
         let mut tokens = self.tokenize(&joined)?;
         let n = tokens.len();
@@ -435,6 +440,7 @@ pub enum TextKind {
 /// Owns one [`LoadedModel`], so it owns ~420 MB of resident weights (§14) and is neither `Send` nor `Sync`
 /// because the handles inside it are neither. One per process, held for the run's lifetime: §3's "one load per
 /// process, never per note".
+#[derive(Debug)]
 pub struct LocalEmbedder {
     model: LoadedModel,
     /// `models.id`, verbatim — [`Embedder::model_id`] is what a write stamps into `embeddings.model`.
@@ -453,11 +459,7 @@ impl LocalEmbedder {
     /// under is **that** row. Without it, a provider built from one model's row around another model's handles
     /// would write 768-wide vectors stamped with a different id — the exact §6 defect the schema's `CHECK`
     /// catches only after something has been computed.
-    pub fn new(
-        model: LoadedModel,
-        row: &ModelRow,
-        max_tokens: usize,
-    ) -> Result<Self, EmbedError> {
+    pub fn new(model: LoadedModel, row: &ModelRow, max_tokens: usize) -> Result<Self, EmbedError> {
         let declared = usize::try_from(row.dim);
         match declared {
             Ok(dim) if dim == model.facts().n_embd_out => Ok(Self {

@@ -99,15 +99,22 @@ jobs:
       # no artifact gate, no env-var escape - so a green run there means llama.cpp was called.
       #
       # `--test local_load` is here so R6b1's loader compiles and runs on this row. What it does NOT prove on a
-      # runner: the runner has no 310 MB artifact, so **three** of its six cases print `NOT COVERAGE` and pass -
-      # the real-file facts (768/512/262144/MEAN), the declared-vs-actual width refusal, and the three-round
-      # load/drop cycle. Those are measured locally with `NP_TEST_MODEL_PATH` set.
+      # runner: there is no 310 MB artifact, so **four** of its seven cases print `NOT COVERAGE` and pass - the
+      # real-file facts (768/512/262144/MEAN), the declared-vs-actual width refusal, the three-round load/drop
+      # cycle, and the truncated-artifact refusal. Those are measured locally with `NP_TEST_MODEL_PATH` set.
       # What this row does cover without a model file: the two pre-runtime refusals (absent path, directory),
       # the runtime's own bad-magic refusal (bytes reach `llama_model_load_from_file` and come back null), and
       # the module's synthetic unit tests for pooling/positive-count refusals. Say it that plainly because
       # "every refusal" was false: every `Unavailable` arm and the width refusal need an artifact.
+      #
+      # `--test local_embed` is R6b2's forward pass, and on GitHub it is **compilation plus twelve printed
+      # `NOT COVERAGE` lines and nothing else** - every case there asks a model for a vector. What runs locally
+      # with the artifact (and is the actual deliverable) is the unit-length and determinism checks, the cosine
+      # ordering, the token-budget and window refusals, the 600-token no-abort regression, and the throughput
+      # figures. Listing it here still earns its place: a test file that does not compile against the pinned
+      # header is caught on the row, which is where a re-pin first shows up.
       - name: Link proof
-        run: cargo test --locked -p np-core --features local-model --lib --test local_runtime --test local_load
+        run: cargo test --locked -p np-core --features local-model --lib --test local_runtime --test local_load --test local_embed
       # "A green run means llama.cpp was called" is only worth saying if the run can also say *which* llama.cpp.
       # `-l static=llama` is not an exclusive search path, so two cheap probes back it up: no shared llama in the
       # test binary, and `llama_version` defined in it (i.e. it came from an archive we built, not from a

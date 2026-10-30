@@ -19,9 +19,14 @@
 //! - [`EmbedError`] — one variant per thing that can go wrong, each saying one true thing. Notably
 //!   `Unavailable`'s payload is an opaque label rather than an endpoint, because this text ends up in
 //!   test-failure output and CI logs (§9).
-//! - [`LocalModelProvider`] — the type `local-model` will resolve to: a [`ModelRow`], an artifact that exists,
-//!   the row's document prefix, and a refusal where the forward pass will go. Nothing constructs it from a
-//!   config yet; R6c wires `[embeddings]` to a provider (§9's split), so today it is reachable API only.
+//! - [`LocalModelProvider`] — the type `local-model` resolves to **without the feature**: a [`ModelRow`], an
+//!   artifact that exists, the row's document prefix, and a refusal where the forward pass goes. Nothing
+//!   constructs it from a config yet; R6c wires `[embeddings]` to a provider (§9's split), so today it is
+//!   reachable API only.
+//! - [`crate::local_model::LocalEmbedder`] — the same shape **with** the feature: one loaded model, the row's two
+//!   prefixes, a token budget, and real vectors from R6b2 onward. The two types stay separate because the seam's
+//!   honest refusal is what a default build must keep answering, and a `Result` inside one provider would let
+//!   "this build has no runtime" quietly become "this call happened to fail".
 //!
 //! The heavy dependency stays behind the `local-model` cargo feature (`crates/np-core/Cargo.toml`), while
 //! everything in this module compiles by default: §9 item 1 wants CI and callers to exercise the seam
@@ -57,6 +62,15 @@ impl Vector {
     /// [`Embedder::dim`] promises.
     pub fn dim(&self) -> usize {
         self.0.len()
+    }
+
+    /// The components themselves, in order.
+    ///
+    /// The read side of [`Vector::to_bytes`]: a stored row is bytes, an in-memory one is numbers, and anything
+    /// that compares two vectors (R6d's cosine ranking) needs this rather than a round trip through the storage
+    /// form. Borrowed, not copied — a 768-component row is 3 KiB and a search reads thousands of them.
+    pub fn components(&self) -> &[f32] {
+        &self.0
     }
 
     /// The bytes to store: every component little-endian, so exactly `4 * dim()` of them.
@@ -134,21 +148,37 @@ pub enum EmbedError {
     ///
     /// The payload is an **opaque label** (a provider kind, a host category, anything a secret could not
     /// take): this enum's text lands in test-failure output and CI logs, so an error that formatted one
-    /// would leak it on the first flake (§9). R6b1's loader raises it today — `local-model`'s refusals are the
-    /// specific ones below, which is what §10 of `docs/design-m2-local-embeddings.md` did to the class this
-    /// variant was sketched for: there is no endpoint left that could be down.
+    /// would leak it on the first flake (§9). R6b1's loader and R6b2's forward pass raise it — `local-model`'s
+    /// refusals are the specific ones below, which is what §10 of `docs/design-m2-local-embeddings.md` did to the
+    /// class this variant was sketched for: there is no endpoint left that could be down.
     ///
     /// **Its home is §3's fifth class**, "runtime error with a bounded message": every label is one we chose, never
     /// the runtime's own diagnostic text — that text is exactly what this payload rule exists to keep out of logs,
     /// and [`EmbedError::ArtifactNotLoadable`] deliberately declines to be its carrier.
     ///
-    /// The labels `local-model` emits today, verbatim, are six: `"the runtime refused to build a context for this
-    /// model"`, `"this artifact cannot produce a sentence vector: the context pools with NONE"`,
-    /// `"the loaded model exposed no vocabulary"`, and from the count guard `"the model reported no output width"`,
-    /// `"... no input width"`, `"... no training context"` / `"an empty vocabulary"`. R6b2 adds the inference-side
-    /// ones (`"inference failed"`, `"out of memory"`, `"context too small"` — planned, not yet reachable). If a
-    /// failure arrives that no bounded label can describe, the honest move is a tenth variant named for that class,
-    /// not a wider payload here.
+    /// **Every label `local-model` emits, verbatim** — seventeen, because this list is the only place a reader can
+    /// see what the runtime can actually answer, and "planned, not yet reachable" prose once sat here for two
+    /// rounds after the code could reach them.
+    ///
+    /// From [`crate::local_model::load`] (eight):
+    /// `"the model reported no output width"`, `"... no input width"`, `"... no training context"`,
+    /// `"... an empty vocabulary"` (one guard, four labels), `"the loaded model exposed no vocabulary"`,
+    /// `"the runtime refused to build a context for this model"`,
+    /// `"this artifact cannot produce a sentence vector: the context pools with NONE"`,
+    /// `"the runtime reported a pooling strategy this build does not know"`.
+    ///
+    /// From [`crate::local_model::LoadedModel::embed_text`] (nine):
+    /// `"the sequence is too long to hand to the tokenizer"`, `"the tokenizer refused to count this sequence"`,
+    /// `"the tokenizer's count did not fit its own buffer"`, **`"the sequence is longer than this context can
+    /// hold"`** (over the window; worded so the reader shortens a chunk instead of freeing RAM — it replaced the
+    /// planned `"context too small"`, which would have pointed at the wrong lever),
+    /// `"the context ran out of KV space for this sequence"`, `"the runtime refused to run this sequence"`,
+    /// `"the runtime produced no pooled embedding"`, `"the model produced a component that is not a number"`,
+    /// `"the model produced a zero vector"`.
+    ///
+    /// Not one of them is llama.cpp's diagnostic text, which is §3's fifth class in the abstract and this payload
+    /// rule in practice. If a failure arrives that none of the seventeen describes, the honest move is an
+    /// eighteenth label named for that class — not a wider payload here.
     #[error("embedding provider unavailable [{0}]")]
     Unavailable(String),
     /// A vector whose component count is not the declared one. `expected` is what was declared
@@ -216,6 +246,10 @@ pub enum EmbedError {
     /// truncated chunk stamps `source_hash = <the whole chunk's digest>` onto a vector that read part of it
     /// — "a row claiming currency for bytes it never saw". The message carries both numbers and no text:
     /// the reader needs to know how far over, and must not need the note to say so.
+    ///
+    /// Raised by [`crate::local_model::LoadedModel::embed_text`] (R6b2) over the count **llama.cpp's tokenizer
+    /// returned**, never a byte length — `tokens` for a 23-byte sentence on this artifact is 9, and a
+    /// byte-based check would refuse text that fits while accepting multibyte text that does not.
     #[error(
         "sequence needs {tokens} tokens, over the embeddings.max_tokens budget of {budget}; refused rather than truncated"
     )]
