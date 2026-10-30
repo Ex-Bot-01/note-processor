@@ -12,8 +12,8 @@
 //! 1. reads `third_party/llama-cpp.toml` — the pin, which is the only place the tag, the digest and
 //!    the CMake options are written;
 //! 2. finds a source tree (`NP_LLAMA_CPP_SRC`, else `.vendor/llama.cpp-<tag>/`) and **verifies it is
-//!    the pin** by reading its version numbers and the architecture token we pinned it for, rather
-//!    than trusting a directory name;
+//!    the pin**: the digest of `include/llama.h` (the file our FFI mirror was copied from), then the
+//!    version numbers, then the architecture token — never a directory name;
 //! 3. configures and builds target `llama` with cmake;
 //! 4. emits the link search paths, the four static archives, and the system libraries they need.
 //!
@@ -24,6 +24,14 @@
 //!   * **Never silently disable.** Every failure here is a panic naming what was missing and the
 //!     command that fixes it. A release that quietly loses inference is worse than a loud failure —
 //!     and unlike `cargo:warning=`, a panic cannot be scrolled past.
+//!
+//! One limit worth knowing before you edit C++ to debug something. Cargo asks us to run when `build.rs`,
+//! the pin file, or one of the three environment variables changes, and — since R6b0's review — when
+//! `include/llama.h` or `CMakeLists.txt` in the resolved tree changes, because a hand-written mirror must
+//! not drift from the header it mirrors. It is **not** re-run by an edit to some other `.cpp`, so such an
+//! edit does not reach the archive we link: the stale `libllama.a` stays. Watch every file in a 214 MB tree
+//! would cost a recursive fingerprint per feature-on cargo invocation; naming two files costs nothing and
+//! covers the unsound half. After a C++ edit, `touch crates/np-core/build.rs`.
 
 use std::env;
 use std::ffi::OsString;
@@ -109,6 +117,18 @@ fn link_pinned_llama() -> Result<(), String> {
     );
 
     let source = resolve_source(&root, &pin)?;
+
+    // The two files in the resolved tree whose contents change what we may claim about it. Naming them is
+    // also what makes a deleted tree loud: cargo re-runs this script when a named input is *missing*, so
+    // `rm -rf .vendor/llama.cpp-<tag>` now reaches [`resolve_source`]'s refusal instead of linking the stale
+    // archive left in `OUT_DIR` (measured before the fix: exit 0, nothing rebuilt, no message).
+    for important in ["include/llama.h", "CMakeLists.txt"] {
+        println!(
+            "cargo::rerun-if-changed={}",
+            source.join(important).display()
+        );
+    }
+
     check_that_this_is_the_pin(&source, &pin)?;
 
     let cmake = cmake_command()?;
@@ -158,6 +178,29 @@ fn check_that_this_is_the_pin(source: &Path, pin: &Pin) -> Result<(), String> {
     if !source.join("include").join("llama.h").is_file() {
         return Err(format!(
             "{} has no include/llama.h, so it is not a llama.cpp source tree.",
+            source.display()
+        ));
+    }
+
+    // The strongest and cheapest identity check first: one 70 KB read. Version numbers cannot tell v0.8.0
+    // from any commit after it (`LLAMA_BUILD_IS_DEV` makes them all report "0.8.0-dev"), and only this digest
+    // can tell the header we mirrored from a header that merely has the same version.
+    let header = source.join("include").join("llama.h");
+    let found_digest = sha256_hex(
+        &fs::read(&header).map_err(|e| format!("cannot read {}: {e}", header.display()))?,
+    );
+    if found_digest != pin.header_sha256 {
+        return Err(format!(
+            "{} is not the header our FFI mirror was copied from.\
+             \n  found:  {}\
+             \n  pinned: {} ({PIN}: header_sha256)\
+             \n  tree:   {}\
+             \n`{PIN}` mirrors field-for-field one revision of `include/llama.h`; building a different one is \
+             unsound memory with a green test suite. Re-pin deliberately (and re-check the mirror), or point \
+             NP_LLAMA_CPP_SRC at the pinned tree.",
+            header.display(),
+            found_digest,
+            pin.header_sha256,
             source.display()
         ));
     }
@@ -505,6 +548,9 @@ fn find_archive(build_dir: &Path, name: &str) -> Result<PathBuf, String> {
 /// The parsed subset of the pin we build from: the tag, and the `[cmake]` table in file order.
 struct Pin {
     tag: String,
+    /// sha256 of `include/llama.h` in the pinned tree — see the pin file's comment for why a tarball digest
+    /// and a version triple are not enough to identify the header our FFI mirror copies.
+    header_sha256: String,
     options: Vec<(String, String)>,
 }
 
@@ -516,6 +562,7 @@ impl Pin {
     fn read(path: &Path) -> Result<Self, String> {
         let text = read(path)?;
         let mut tag = None;
+        let mut header_sha256 = None;
         let mut options = Vec::new();
         let mut section = None;
 
@@ -550,8 +597,10 @@ impl Pin {
                 })?;
             match section.as_deref() {
                 None if key.trim() == "tag" => tag = Some(value.to_string()),
-                // `url` and `sha256` are the vendor script's business; a build script that could
-                // download them would be the thing §14 rules out.
+                None if key.trim() == "header_sha256" => header_sha256 = Some(value.to_string()),
+                // `url` and the tarball `sha256` are the vendor script's business; a build script that could
+                // download them would be the thing §14 rules out. `header_sha256` is ours: it identifies what
+                // is already on disk.
                 None => {}
                 Some("cmake") => options.push((key.trim().to_string(), value.to_string())),
                 Some(other) => {
@@ -564,6 +613,15 @@ impl Pin {
         }
 
         let tag = tag.ok_or_else(|| format!("{}: no `tag` in the pin file", path.display()))?;
+        // Required rather than optional: a pin without it would silently restore the weaker check that R6b0's
+        // review rejected — "some 0.8.x tree linked" reported as "the pinned tree answered".
+        let header_sha256 = header_sha256.ok_or_else(|| {
+            format!(
+                "{}: no `header_sha256` in the pin file. It is the digest of the header \
+                 `crates/np-core/src/llama_ffi.rs` mirrors; a re-pin updates it deliberately.",
+                path.display()
+            )
+        })?;
         if options.is_empty() {
             return Err(format!(
                 "{}: no `[cmake]` options, so the build would use llama.cpp's own defaults — which \
@@ -571,7 +629,11 @@ impl Pin {
                 path.display()
             ));
         }
-        Ok(Self { tag, options })
+        Ok(Self {
+            tag,
+            header_sha256,
+            options,
+        })
     }
 }
 
@@ -603,4 +665,92 @@ fn path_env(name: &str) -> Result<PathBuf, String> {
     env::var_os(name)
         .map(PathBuf::from)
         .ok_or_else(|| format!("{name} is not set"))
+}
+
+/// SHA-256 (FIPS 180-4) over a whole file, written out rather than pulled from a crate: this script's rule is
+/// zero build-dependencies (§14 added none precisely so bindgen could not creep back in), and the alternative
+/// to hashing is trusting a directory name — which is what this replaces. A wrong implementation fails loudly
+/// as a refusal, never as a wrong binary.
+///
+/// Verified against coreutils `sha256sum` on 2026-10-29 for: an empty file, a 3-byte file, and files of 55,
+/// 56 and 64 bytes (the three padding shapes), 3 MB of random bytes, and the pinned `include/llama.h` itself.
+fn sha256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    // Padding: the message, one 1 bit, zeros to 56 mod 64, then the 64-bit big-endian bit length.
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut block: Vec<u8> = Vec::with_capacity(bytes.len() + 72);
+    block.extend_from_slice(bytes);
+    block.push(0x80);
+    while block.len() % 64 != 56 {
+        block.push(0);
+    }
+    block.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in block.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut v = h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+            let t1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v[7] = v[6];
+            v[6] = v[5];
+            v[5] = v[4];
+            v[4] = v[3].wrapping_add(t1);
+            v[3] = v[2];
+            v[2] = v[1];
+            v[1] = v[0];
+            v[0] = t1.wrapping_add(t2);
+        }
+        for i in 0..8 {
+            h[i] = h[i].wrapping_add(v[i]);
+        }
+    }
+
+    let mut out = String::with_capacity(64);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
 }

@@ -129,7 +129,19 @@ pub struct llama_context_params {
     pub yarn_beta_slow: f32,
     pub yarn_orig_ctx: u32,
     pub defrag_thold: f32,
-    pub cb_eval: Option<extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> bool>,
+    /// `ggml_backend_sched_eval_callback` takes **three** parameters (`ggml-backend.h:
+    /// bool (*cb)(struct ggml_tensor * t, bool ask, void * user_data)`). Declaring it with two compiles,
+    /// leaves every pinned offset unchanged (all function pointers are 8 bytes) and then reads `user_data`
+    /// from the register that held `ask` — a wild pointer whose upper bits the psABI leaves unspecified.
+    /// R6b0 review P1-1: this was the one declaration here that disagreed with the pinned header, and the
+    /// layout pins cannot see callback-shape drift.
+    pub cb_eval: Option<
+        extern "C" fn(
+            t: *mut std::ffi::c_void,
+            ask: bool,
+            user_data: *mut std::ffi::c_void,
+        ) -> bool,
+    >,
     pub cb_eval_user_data: *mut std::ffi::c_void,
     pub type_k: i32,
     pub type_v: i32,

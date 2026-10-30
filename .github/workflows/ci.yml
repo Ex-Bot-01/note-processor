@@ -77,6 +77,15 @@ jobs:
         run: cargo check --locked -p np-core --features local-model
       - name: Clippy
         run: cargo clippy --locked -p np-core --features local-model --all-targets -- -D warnings
+      # The third way a feature is invisible, and the reason this step exists: `llama_ffi` is gated in
+      # `src/lib.rs`, so the default job's Docs step never compiles the module and none of its intra-doc links
+      # are resolved by any run. The job comment names rustdoc as one of the three gaps it closes, so it has
+      # to run here (R6b0 review P1-4). Measured locally on 2026-10-29: this passes today, so it is coverage
+      # being closed rather than a warning being unhidden.
+      - name: Docs (feature on)
+        env:
+          RUSTDOCFLAGS: "--deny warnings"
+        run: cargo doc --locked -p np-core --features local-model --no-deps
       # `--lib` alongside the link-proof test: the struct-layout pins in `src/llama_ffi.rs` only compile
       # with the feature on, and a wrong field order is an unsound memory bug rather than a compile
       # error. §2 step 4 wants skipped work printed as `NOT COVERAGE`; nothing here may skip - the link

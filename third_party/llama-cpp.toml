@@ -26,6 +26,18 @@ url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.8.0.tar.gz"
 # applies to a model artifact (§14: "Pin the source, don't commit it").
 sha256 = "51b1e025d7b12e83fa55736e65bc254acd9d23e49f546be7531368fef82210ee"
 
+# sha256 of `include/llama.h` inside that tarball — the header `crates/np-core/src/llama_ffi.rs` mirrors by hand.
+#
+# Why a second digest when the tarball is already pinned: version numbers cannot identify a tree. llama.cpp sets
+# `LLAMA_BUILD_IS_DEV` ON by default, so every commit between v0.8.0 and v0.8.1 reports `llama_version()` as
+# "0.8.0-dev" (measured here: the linked test binary carries that exact string), and the arch token is present in
+# all of them too. So a tree that is *not* the revision we mirrored would compile, link and turn every gate green
+# — while a hand-written FFI mirror is only sound against the exact field order it was read out of.
+#
+# build.rs hashes the resolved tree's header on every feature-on build and refuses naming both digests. The vendor
+# script prints this value too, so a deliberate re-pin changes one line here and says so out loud.
+header_sha256 = "c0854771d3760a41642c4e59429c5b3b9fc774887c59d37eeadc4527681732cd"
+
 # Does this revision know our model? Yes: its arch enum contains `LLM_ARCH_GEMMA_EMBEDDING2`
 # (grep of the unpacked tree, §14). That is the whole reason for pinning v0.8.0 rather than any other.
 
