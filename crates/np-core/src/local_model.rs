@@ -206,21 +206,30 @@ impl LoadedModel {
         self.window
     }
 
-    /// How many tokens the model would see for `text` with its special tokens, without running a forward pass.
+    /// How many tokens the model would see for **`prefix + text`** with its special tokens, without running a
+    /// forward pass.
     ///
-    /// The count is llama.cpp's own, so it includes whatever the artifact's vocabulary decides to add — 2 for
-    /// an empty string on this artifact (BOS + EOS, both of which [`ModelFacts::add_bos`] and
-    /// [`ModelFacts::add_eos`] say are enabled). A caller that wants to check a chunk against
-    /// `embeddings.max_tokens` before paying for a decode uses this; [`LoadedModel::embed_text`] checks the
-    /// same number itself, so this is a convenience and never a second authority.
+    /// The prefix argument is not decoration: §5's budget counts `prefix_doc + chunk + specials`, so counting
+    /// `text` alone prices a different string than the one [`LoadedModel::embed_text`] refuses on, and a
+    /// pre-flight "it fits" would be wrong by exactly the prefix (R6b2 re-review P1-1). Pass the prefix you will
+    /// embed with; [`LocalEmbedder`] keeps both halves of that decision together, so a caller built on it cannot
+    /// drift.
+    ///
+    /// The count is llama.cpp's own, so it includes whatever the artifact's vocabulary decides to add — 2 for an
+    /// empty string on this artifact (BOS + EOS, both of which [`ModelFacts::add_bos`] and
+    /// [`ModelFacts::add_eos`] say are enabled). [`LoadedModel::embed_text`] re-checks the same number itself, so
+    /// this is a convenience and never a second authority.
     ///
     /// Its own ceiling is [`MAX_EMBEDDING_TOKENS`](crate::config::MAX_EMBEDDING_TOKENS) — the hard bound config
     /// validation already enforces for `embeddings.max_tokens` — because counting without one would size a buffer
     /// for text nothing could ever embed. Above it this refuses with [`EmbedError::TokenBudgetExceeded`], naming
     /// that ceiling as the budget.
-    pub fn count_tokens(&self, text: &str) -> Result<usize, EmbedError> {
+    pub fn count_tokens(&self, prefix: &str, text: &str) -> Result<usize, EmbedError> {
         Ok(self
-            .tokenize(text, crate::config::MAX_EMBEDDING_TOKENS)?
+            .tokenize(
+                &format!("{prefix}{text}"),
+                crate::config::MAX_EMBEDDING_TOKENS,
+            )?
             .len())
     }
 
@@ -260,10 +269,22 @@ impl LoadedModel {
         // so an over-budget note is refused before a single token slot is allocated rather than after.
         let mut tokens = self.tokenize(&joined, budget)?;
         let n = tokens.len();
+        if n == 0 {
+            // Nothing for the model to read. `llama_context::encode` would answer -1 for an empty batch
+            // (`src/llama-context.cpp:1600-1603`), so this refusal is a courtesy rather than a safety measure — it
+            // names the real cause instead of blaming the runtime for refusing.
+            return Err(EmbedError::Unavailable(
+                "the sequence produced no tokens for the model to read".to_string(),
+            ));
+        }
 
-        // The budget over the count llama.cpp returned, not over `joined.len()`: a byte comparison would accept
-        // a 1,800-byte note that tokenizes to 2,400 and refuse a multibyte one that fits. Measured on this
-        // artifact: 60 bytes of Japanese is 11 tokens with specials, 23 bytes of English is 9.
+        // **Belt-and-braces, unreachable today** (R6b2 re-review P2-3): `tokenize` already refused a count above
+        // `budget` before allocating, and `truncate(n)` guarantees `n <= needed <= budget`. It stays because the
+        // invariant it guards — no sequence longer than the budget reaches the runtime — is what §5's
+        // never-truncated rule rests on, and a local check costs less than a proof about `tokenize`. The
+        // *operative* guard is the one in `tokenize`; both raise identical payloads, so
+        // `the_budget_counts_tokens_and_says_so` passes for the right reason either way. Counting is over tokens
+        // and never bytes: 60 bytes of Japanese is 11 tokens with specials on this artifact, 23 bytes of English 9.
         if n > budget {
             return Err(EmbedError::TokenBudgetExceeded { tokens: n, budget });
         }
@@ -290,7 +311,8 @@ impl LoadedModel {
         match rc {
             0 => {}
             // 1 means "no memory slot for this batch" in a context that has a KV cache. This artifact has none
-            // (`create_memory` returns null, so `decode` diverts to `encode`, which answers 0 or a negative), so
+            // (`create_memory` returns null, so `decode` diverts to `encode`, which answers 0, `2` for an aborted
+            // run (`src/llama-context.cpp:1677`, `include/llama.h:1002`), or a negative), so
             // **this arm cannot fire on this model** — it stays because `llama_decode`'s contract promises it and
             // because a re-pin to a decoder architecture would make it real. Naming it separately is what turns
             // "our window arithmetic was wrong" into a distinguishable event if that day comes.
@@ -356,11 +378,17 @@ impl LoadedModel {
         }
         let vocab = self.vocab()?;
 
-        // The probe: zero writable slots, so the only useful answer is `Needed(n)`.
+        // The probe: zero writable slots. On an artifact that adds specials this always answers `Needed(n)` —
+        // `src/llama-vocab.cpp:4645` compares against the size of a result that already carries them, so it is
+        // never zero here (measured: `""` gives 2). It *can* legitimately answer `Written(0)` on an artifact with
+        // both specials off and nothing but whitespace to tokenize: that is an empty tokenization, not a lie from
+        // C, so it yields an empty vector and the caller refuses on its own terms (R6b2 re-review P2-4 — accusing
+        // the runtime of a write it did not perform would have been our bug, not the artifact's).
         let needed = match self.tokenize_into(vocab, bytes, &mut [])? {
             Tokenize::Needed(n) => n,
-            // A "success" from a call that had nowhere to write means the runtime no longer obeys the rule this
-            // sizing depends on. Refuse rather than guess what it wrote, or where.
+            Tokenize::Written(0) => return Ok(Vec::new()),
+            // Non-zero from a buffer with no room means the runtime no longer obeys the rule this sizing depends
+            // on. Refuse rather than guess what it wrote, or where.
             Tokenize::Written(_) => {
                 return Err(EmbedError::Unavailable(
                     "the tokenizer wrote into a buffer with no room".to_string(),
@@ -423,7 +451,7 @@ impl LoadedModel {
             return Ok(Tokenize::Written(n as usize));
         }
         if n == i32::MIN {
-            // `include/llama.h:1273` documents this as its own outcome — "INT32_MIN on overflow" — and
+            // `include/llama.h:1274` documents this as its own outcome — "INT32_MIN on overflow" — and
             // `src/llama-vocab.cpp:4640-4642` returns it **before** the size check, so it is never a resize
             // signal. Negating it would overflow; no real note is anywhere near that long.
             return Err(EmbedError::Unavailable(
@@ -466,9 +494,9 @@ fn normalise(row: &[f32]) -> Result<Vector, EmbedError> {
             "the model produced a component that is not a number".to_string(),
         ));
     }
-    // Summed in f64: 768 squares of values around 10 add up to ~3.4e4, which f32 handles, but a row that
-    // legitimately reached 1e20 would overflow f32 into +inf and then read as "not a number" instead of as the
-    // enormous-but-finite vector it is.
+    // Summed in f64. The measured raw rows here have ‖v‖ ≈ 184–220 — squared sums of ~3.4e4 to ~4.8e4, trivially
+    // inside f32 — but a row that legitimately reached 1e20 per component would overflow an f32 accumulator into
+    // +inf and then read as "not a number" instead of as the enormous-but-finite vector it is.
     let sum: f64 = row.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
     if sum == 0.0 {
         return Err(EmbedError::Unavailable(
@@ -489,7 +517,7 @@ fn normalise(row: &[f32]) -> Result<Vector, EmbedError> {
 
 /// What one `llama_tokenize` call answered.
 enum Tokenize {
-    /// Tokens written into the caller's buffer — never more than its length (`include/llama.h:1271`).
+    /// Tokens written into the caller's buffer — never more than its length (`include/llama.h:1272`).
     Written(usize),
     /// The buffer was too small: nothing was written, and this is the exact number of slots needed, specials
     /// included (`src/llama-vocab.cpp:4645-4647`).

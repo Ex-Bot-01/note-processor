@@ -163,7 +163,8 @@ mod loading {
     /// The standing debt this closes: a declared width that disagrees with the artifact was previously refused
     /// only against the *row* (`LocalModelProvider::new`), never against the file. Declaring 512 against a
     /// model that answers 768 must be a named, typed refusal carrying both numbers — and it must happen before
-    /// a context is built, so the refusal costs one load rather than a load plus a KV cache.
+    /// a context is built, so the refusal costs one load rather than a load plus a context — and this artifact has
+    /// no KV cache at all (`local_model`'s module header), which is why "context" is the honest noun here.
     #[test]
     fn declaring_the_wrong_width_is_refused_naming_both_numbers() {
         let path = artifact_or_not_coverage!();

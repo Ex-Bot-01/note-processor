@@ -85,10 +85,11 @@ pub type llama_seq_id = i32;
 /// ([`llama_batch_get_one`]). `logits` is how a batch asks for output per token — v0.8.0 has no
 /// `llama_add_logits` C function; setting `logits[i] = 1` is what marks token *i* as an output, and `NULL` means
 /// "only the last token is output **if embeddings are disabled**" (`include/llama.h:259-261`). The condition is
-/// load-bearing for this crate: with `embeddings = true` — which is what [`crate::local_model::load`] sets —
-/// `src/llama-context.cpp:1907` forces `output_all`, so every token is an output and a pooled row still arrives
-/// with `logits == NULL`. Drop the "if embeddings" clause from that paraphrase and the next reader could conclude
-/// an embedding run needs a logits array.
+/// load-bearing for this crate: with `embeddings = true` — which is what [`crate::local_model::load`] sets — every
+/// token becomes an output and a pooled row still arrives with `logits == NULL`. On the encoder path our artifact
+/// actually takes that is `memory || cparams.embeddings` at `src/llama-context.cpp:1619`; on the decoder path it is
+/// `output_all`, defined from `cparams.embeddings` at `:1866` and used at `:1909`. Drop the "if embeddings" clause
+/// from that paraphrase and the next reader could conclude an embedding run needs a logits array.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct llama_batch {
@@ -327,7 +328,7 @@ extern "C" {
     /// * `>= 0` — tokens written, never more than `n_tokens_max`;
     /// * any other negative value — the buffer was too small and nothing was written; its magnitude is the number
     ///   of slots needed, **special tokens included**;
-    /// * `i32::MIN` exactly — "INT32_MIN on overflow" (`include/llama.h:1273`), returned at
+    /// * `i32::MIN` exactly — "INT32_MIN on overflow" (`include/llama.h:1274`), returned at
     ///   `src/llama-vocab.cpp:4640-4642` **before** the size check, for a result at or past `INT32_MAX` tokens.
     ///   Negating it overflows and allocating to its magnitude asks for ~8 GiB, so it is a refusal on its own
     ///   terms; [`crate::local_model`] separates all three with an enum rather than signs for exactly that reason.
@@ -380,7 +381,8 @@ extern "C" {
     /// **The `1` needs a context that has a KV cache.** An architecture whose `create_memory` returns null — which
     /// includes `LLM_ARCH_GEMMA_EMBEDDING2`, `src/llama-model.cpp:2825` — has none: `llama_context::decode` logs
     /// "cannot decode batches with this context (calling encode() instead)" (`src/llama-context.cpp:1845-1847`) and
-    /// the encoder path answers 0 or negative, asserting on `n_ubatch >= n_tokens` (`:1631`) rather than reporting
+    /// the encoder path answers 0, `2` (aborted — `src/llama-context.cpp:1677`, and the header's outcome list at
+    /// `include/llama.h:1002`) or negative, asserting on `n_ubatch >= n_tokens` (`:1631`) rather than reporting
     /// fullness. So callers on such an artifact get a refusal or an abort, never a `1`.
     ///
     /// Memory: allocates nothing for us to free. The results live in the context's own output buffer

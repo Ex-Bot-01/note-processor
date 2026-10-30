@@ -243,12 +243,12 @@ mod embedding {
         let model = load(&path);
 
         assert_eq!(
-            model.count_tokens("").expect("counting an empty string cannot fail"),
+            model.count_tokens("", "").expect("counting an empty string cannot fail"),
             2,
             "measured: BOS + EOS and nothing else — the specials are what remains when the text is nothing"
         );
         assert_eq!(
-            model.count_tokens("   ").expect("spaces count"),
+            model.count_tokens("", "   ").expect("spaces count"),
             3,
             "measured: BOS + one whitespace piece + EOS"
         );
@@ -267,7 +267,7 @@ mod embedding {
         );
         println!(
             "EMBED: \"\" -> {} tokens, cos with \"cat\" = {:.6} (a real vector, of an empty sequence)",
-            model.count_tokens("").expect("counted above"),
+            model.count_tokens("", "").expect("counted above"),
             cosine(&empty, &cat)
         );
     }
@@ -287,7 +287,7 @@ mod embedding {
         // what this case says they mean.
         assert_eq!(sentence.len(), 23);
         assert_eq!(
-            model.count_tokens(sentence).expect("counted"),
+            model.count_tokens("", sentence).expect("counted"),
             9,
             "the artifact's own count for this string"
         );
@@ -321,7 +321,7 @@ mod embedding {
         let model = load(&path);
 
         let note = text_of_about(35); // measured 633 tokens with specials on this artifact
-        let tokens = model.count_tokens(&note).expect("counted");
+        let tokens = model.count_tokens("", &note).expect("counted");
         assert!(
             tokens > 512 && tokens < 1_024,
             "this case is only a regression test if it clears the old 512 threshold: {tokens} tokens"
@@ -359,10 +359,10 @@ mod embedding {
         // grew past the 8,192 hard ceiling would produce a budget refusal and this case would quietly be testing
         // the wrong arm. R6b2 review P2-2 caught that guard living inside the loop, where nothing could reach it.
         let mut note = text_of_about(300);
-        let mut tokens = model.count_tokens(&note).expect("counted");
+        let mut tokens = model.count_tokens("", &note).expect("counted");
         while tokens <= window {
             note.push_str(UNIT);
-            tokens = model.count_tokens(&note).expect("counted");
+            tokens = model.count_tokens("", &note).expect("counted");
         }
         assert!(
             tokens <= 8_192,
@@ -475,6 +475,44 @@ mod embedding {
             doc, query,
             "both prefixes produced one row: the prefix never reached the model"
         );
+
+        // And the trait path is the *document* path, which is its own rule (a stored vector is always written
+        // under `prefix_doc`) and its own mutation: pointing `Embedder::embed` at `TextKind::Query` survives
+        // every other case in this file, because they all call `embed_as` with an explicit kind (R6b2 re-review
+        // P2-6). This row is built with empty prefixes on purpose elsewhere; here it uses the real ones.
+        let via_trait = embedder
+            .embed(&[text])
+            .expect("the trait path embeds")
+            .remove(0);
+        assert_eq!(
+            components(&via_trait),
+            doc,
+            "Embedder::embed did not use the document prefix"
+        );
+        // The counting side prices the **same string** as the embedding side (R6b2 re-review P1-1): §5's budget is
+        // `prefix_doc + chunk + specials`, so a pre-flight count that dropped the prefix would say "it fits" and
+        // then watch `embed_text` refuse. Two directions, because either half can regress alone: the prefixed count
+        // is strictly larger than the bare one, and it equals the number `embed_text` itself reports when refused
+        // one token below.
+        let with_prefix = model
+            .count_tokens("title: ", text)
+            .expect("counting a short note cannot fail");
+        let bare = model.count_tokens("", text).expect("counted");
+        assert!(
+            with_prefix > bare,
+            "count_tokens priced the text without its prefix: {with_prefix} prefixed vs {bare} bare"
+        );
+        match model.embed_text("title: ", text, with_prefix - 1) {
+            Err(EmbedError::TokenBudgetExceeded { tokens, budget }) => {
+                assert_eq!(
+                    tokens, with_prefix,
+                    "embed_text counted a different sequence than count_tokens did"
+                );
+                assert_eq!(budget, with_prefix - 1);
+            }
+            other => panic!("expected a budget refusal one token below, got {other:?}"),
+        }
+
         for v in [&doc, &query] {
             let n = norm(v);
             assert!((n - 1.0).abs() < 1e-6, "‖v‖ = {n}");
@@ -495,12 +533,16 @@ mod embedding {
 
         let embedder = LocalEmbedder::new(model, &row("", ""), 2_048).expect("768 matches the row");
         assert_eq!(embedder.model_id(), "embeddinggemma-2");
+        // A pin, not evidence: `LocalEmbedder::new` refuses any row whose width is not the model's, and the model
+        // was loaded with `DIM`, so this cannot fail today. It documents that the trait's width promise is the
+        // model's answer rather than the row's claim. The independent 768 pin is `tests/local_load.rs`.
         assert_eq!(embedder.dim(), DIM);
 
         let texts = ["first note", "second note", "third note"];
         let vectors = embedder.embed(&texts).expect("three short texts embed");
         assert_eq!(vectors.len(), texts.len(), "one vector per text");
         for v in &vectors {
+            // Pin (see above): the width comes from the copy, so this is a regression fence, not a measurement.
             assert_eq!(v.dim(), DIM);
             let n = norm(&components(v));
             assert!((n - 1.0).abs() < 1e-6, "‖v‖ = {n}");
@@ -540,6 +582,8 @@ mod embedding {
                 configured,
                 provider,
             } => {
+                // `configured` is the model's width by construction here; the load-bearing half of this arm is
+                // `provider == 512`, which is the row's number reaching the message.
                 assert_eq!(configured, DIM);
                 assert_eq!(provider, 512, "the refusal names the row's number");
                 println!("REFUSE: {problem}");
@@ -563,7 +607,7 @@ mod embedding {
 
         for copies in [30_usize, 120] {
             let text = text_of_about(copies);
-            let tokens = model.count_tokens(&text).expect("counted");
+            let tokens = model.count_tokens("", &text).expect("counted");
             let first = Instant::now();
             model
                 .embed_text("", &text, 8_192)

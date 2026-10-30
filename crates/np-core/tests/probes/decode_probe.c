@@ -30,6 +30,9 @@
  * (`GGML_ASSERT` → `GGML_ABORT`, live under NDEBUG) — that is the bug this probe was written to demonstrate, and
  * exit status 134 from the first form is the expected result, not a broken probe.
  */
+/* `open`/`posix_fadvise` need the GNU extensions; without this a `-std=c11` build turns that call into an
+ * implicit declaration. The sibling probe does the same. */
+#define _GNU_SOURCE 1
 #include "llama.h"
 #include <fcntl.h>
 #include <stdio.h>
@@ -58,15 +61,26 @@ int main(int argc, char ** argv) {
     int want = atoi(argv[2]);
     int wide = 0, drop_cache = 0;
     for (int i = 3; i < argc; i++) {
-        if (!strcmp(argv[i], "wide")) wide = 1;
-        else if (!strcmp(argv[i], "--drop-cache")) drop_cache = 1;
+        if (!strcmp(argv[i], "wide")) {
+            wide = 1;
+        } else if (!strcmp(argv[i], "--drop-cache")) {
+            drop_cache = 1;
+        } else {
+            /* A typo'd `wide` would otherwise reproduce the narrow case — exit 134, an abort — with no hint that
+             * the flag was never read. Fail loudly rather than misreport which configuration ran. */
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 2;
+        }
     }
 
     /* Evict our own view of the artifact first (no root needed for one file's pages). The block layer may still
      * hold them, so read this as "cold from our side", the same caveat §14 attaches to the load figures. */
     if (drop_cache) {
         int fd = open(path, O_RDONLY);
-        if (fd >= 0) { posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); close(fd); }
+        if (fd >= 0) {
+            (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* advisory, best effort: may fail on some FS */
+            close(fd);
+        }
     }
 
     struct llama_model_params mp = llama_model_default_params();

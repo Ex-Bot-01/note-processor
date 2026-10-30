@@ -178,7 +178,7 @@ what fails is not a check, because removal makes tests pass.
   Semantic sanity is an ordering, not a score: `cos(cat, feline) = 0.8302` vs `cos(cat, revenue) = 0.5887`. Empty input is not an error —
   it embeds BOS+EOS (2 tokens) into a real unit vector, which is what the artifact does rather than a rule we invented.
   **§5's ceiling question now has a price attached and still needs the human:** extrapolating the measured rate (which falls with length),
-  `max_tokens = 8192` is roughly a **minute per chunk** — an input the shipped code refuses above 4,096 anyway — while the default 2,048 is a
-  measured ~16 s; and the runtime window is 4,096 today, so anything above that is refused until
+  `max_tokens = 8192` is roughly a **minute per chunk** — an input the shipped code refuses above 4,096 anyway — while the default 2,048 interpolates to ~16 s
+  between those two measured points; and the runtime window is 4,096 today, so anything above that is refused until
   `REQUESTED_CTX` moves — which §14's curve says costs +458 MiB by 4,085 tokens. Still owed: R6c wiring config → provider → `embeddings`
   rows, and R6d's corpus-scale benchmark (batching across texts is deliberately not in this API yet).
