@@ -53,20 +53,26 @@ CMAKE_BUILD_TYPE = "Release"
 # a runtime lookup path we would have to ship and find on three OSes.
 BUILD_SHARED_LIBS = "OFF"
 
-# Downloads models from Hugging Face at runtime. We load a file `np models install` already verified,
-# so this would pull libcurl into the binary and give the indexing path a network dependency (§9's
-# "no network in the indexing path").
-LLAMA_CURL = "OFF"
+# No `LLAMA_CURL` line here, and that absence is a fact worth recording: v0.8.0 turned that flag into a
+# deprecation notice (`CMakeLists.txt`: `llama_option_depr(WARNING LLAMA_CURL)`) and nothing under `src/`
+# mentions curl any more — measured, `grep -rn CURL src/` returns nothing and the cache filed our `-DLLAMA_CURL=OFF`
+# as `UNINITIALIZED`. build.rs now refuses any option cmake filed that way, so a rename upstream shows up as a
+# refusal rather than as a quiet default. (What we actually want — no HTTP in the indexing path — is guaranteed
+# by `np` never calling those APIs, not by a llama.cpp flag.)
 
-# The five build targets that produce executables we never link. Each also drags its own dependencies
-# (httplib, the UI assets, the test fixtures) into the configure step and lengthens the build for a
-# binary `np` does not contain. Defaults are ON when llama.cpp is the top-level project, so they are
-# stated rather than assumed.
+# Build targets that produce executables we never link, plus the shared library the server and tools build
+# against. Stated rather than assumed, because their defaults differ: `LLAMA_BUILD_TESTS/TOOLS/EXAMPLES/SERVER`
+# default to `${LLAMA_STANDALONE}` (ON when llama.cpp is the top-level project — measured in this tree's cache,
+# which had SERVER and COMMON ON), while `LLAMA_BUILD_UI` already defaults OFF. `--target llama` compiles none
+# of them either way; naming them keeps the configure step honest about what we asked for, and COMMON is here
+# because it is the dependency those executables share.
 LLAMA_BUILD_TESTS = "OFF"
 LLAMA_BUILD_TOOLS = "OFF"
 LLAMA_BUILD_EXAMPLES = "OFF"
 LLAMA_BUILD_APP = "OFF"
 LLAMA_BUILD_UI = "OFF"
+LLAMA_BUILD_COMMON = "OFF"
+LLAMA_BUILD_SERVER = "OFF"
 
 # OpenMP off: the release artifact is one self-contained binary. Left at llama.cpp's default (ON) the
 # link line gains `-l dylib=gomp`, and a user on a machine without libgomp.so.1 gets a loader error at

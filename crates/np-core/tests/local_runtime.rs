@@ -103,8 +103,8 @@ mod link_proof {
 
     /// A struct returned **by value** from C++ lands where our `#[repr(C)]` mirror says it does.
     ///
-    /// The unit tests in `src/llama_ffi.rs` compare our layout with the header; only this test can show
-    /// that the compiled C++ agrees. If a field were missing or misordered, `n_gpu_layers` would not be
+    /// The unit tests in `src/llama_ffi.rs` compare our layout with **constants measured from** the header
+    /// (the probe is published there); only this test can show that the compiled C++ agrees. If a field were missing or misordered, `n_gpu_layers` would not be
     /// -1 at the offset we read it from (`src/llama-model.cpp`: `/*.n_gpu_layers =*/ -1`, and
     /// `use_extra_bufts = true`). No model, no file, no allocation — a plain return value.
     #[test]
@@ -125,6 +125,104 @@ mod link_proof {
         assert!(!params.no_alloc);
         assert!(params.progress_callback.is_none());
         assert!(params.kv_overrides.is_null());
+    }
+
+    /// The second struct returned by value, and the one R6b1 actually configures. `llama_model_default_params`
+    /// alone left two of the three mirrored structs with no runtime evidence at all (R6b0 review P2-6); this is
+    /// the cheapest thing that changes that, and it still needs no model, no file and no inference.
+    ///
+    /// What it proves is a field-order claim: `n_ctx` and `n_batch` are read at offsets 0 and 4, `n_threads`
+    /// where our mirror says 28, `embeddings` at 153-ish among the tail bools. A shifted struct would show up
+    /// as a zero context size or a garbage thread count, not as a subtle difference.
+    #[test]
+    fn context_params_cross_the_boundary_in_our_layout() {
+        // SAFETY: a value-type struct of plain data; nothing is allocated, nothing is freed.
+        let params = unsafe { llama_ffi::llama_context_default_params() };
+        assert!(
+            params.n_ctx > 0,
+            "llama.cpp defaults n_ctx to a non-zero size; reading 0 here means we are looking at the wrong \
+             four bytes"
+        );
+        assert!(
+            params.n_batch > 0,
+            "n_batch is at offset 4 in the pinned header and must be non-zero by default"
+        );
+        assert!(
+            params.n_threads > 0,
+            "n_threads (offset 28) defaults to a thread count, not zero or noise"
+        );
+        assert!(
+            params.cb_eval.is_none(),
+            "the default context installs no eval callback — and reading this field is what the three-parameter \
+             `cb_eval` declaration is for"
+        );
+        assert!(
+            params.abort_callback.is_none(),
+            "the default context installs no abort callback"
+        );
+        assert!(
+            !params.embeddings,
+            "embeddings are opt-in; R6b1 sets this, the default is false"
+        );
+    }
+
+    /// The third struct, and the only one of the three that owns memory on the C side. It also carries the
+    /// fact R6b1 is most likely to get wrong, discovered while writing this test: `llama_batch_init`'s first
+    /// argument is a **capacity**, and `src/llama-batch.cpp` returns `n_tokens = 0`. An assertion that "init(4)
+    /// gives n_tokens 4" was written here first and failed with `left: 0` — the test earns its keep by pinning
+    /// the real behaviour rather than the guess.
+    ///
+    /// Writing through the returned pointers and reading the bytes back is the layout proof: if `token` were
+    /// our version of `embd`, or the offset were wrong, we would be writing outside llama.cpp's allocation
+    /// (and under a sanitiser, that is a crash; here, the value still has to survive the round trip through the
+    /// pointer C handed us). Freed with `llama_batch_free`, which v0.8.0 takes **by value** — the only place
+    /// the suite exercises that ownership rule end to end. No model, no inference.
+    #[test]
+    fn batch_init_hands_back_the_layout_we_declare() {
+        // SAFETY: an allocation owned by the returned struct, freed at the end of this function by llama.cpp.
+        let batch = unsafe { llama_ffi::llama_batch_init(4, 0, 1) };
+        assert_eq!(
+            batch.n_tokens, 0,
+            "a freshly initialised batch is empty — the argument was a capacity"
+        );
+        assert!(
+            !batch.token.is_null(),
+            "embd=0 means token-driven: the token array must be allocated"
+        );
+        assert!(
+            batch.embd.is_null(),
+            "with embd=0 no embedding array is allocated — a non-null here means we read the wrong pointer \
+             field"
+        );
+        assert!(
+            !batch.pos.is_null() && !batch.n_seq_id.is_null() && !batch.seq_id.is_null(),
+            "the remaining arrays are allocated for the requested capacity"
+        );
+        // SAFETY: `llama_batch_init(4, 0, 1)` mallocs 4 tokens, 4 positions, 4 counts and 4 sequence arrays of
+        // 1 entry each; every write below is inside index 0 of an allocation we own until the free.
+        unsafe {
+            *batch.token.add(0) = 4242;
+            *batch.n_seq_id.add(0) = 1;
+            // `seq_id` is `llama_seq_id **`: an array of per-token arrays. Both levels get exercised.
+            let first_token_sequences = *batch.seq_id.add(0);
+            assert!(
+                !first_token_sequences.is_null(),
+                "llama.cpp allocates one sequence array per token slot"
+            );
+            *first_token_sequences.add(0) = 3;
+            assert_eq!(
+                *batch.token, 4242,
+                "the token pointer in our mirror points at llama.cpp's own array"
+            );
+            assert_eq!(*batch.n_seq_id.add(0), 1);
+            assert_eq!(
+                *first_token_sequences, 3,
+                "reading back through both pointer levels proves `seq_id` is where the header says"
+            );
+        }
+        // SAFETY: this batch came from `llama_batch_init`, so freeing it is correct (never a
+        // `llama_batch_get_one` batch, which borrows the caller's arrays).
+        unsafe { llama_ffi::llama_batch_free(batch) };
     }
 }
 

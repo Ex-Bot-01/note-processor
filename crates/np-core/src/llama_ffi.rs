@@ -263,9 +263,15 @@ extern "C" {
 
     /// Allocate arrays for up to `n_tokens` entries (`embd == 0` means "token ids").
     ///
+    /// **`n_tokens` is a capacity, not a count.** `src/llama-batch.cpp` builds the struct as
+    /// `{ /*n_tokens =*/ 0, … }` and then `malloc`s each array for `n_tokens_alloc` entries, so the returned
+    /// batch is empty: R6b1 must set `n_tokens` itself after filling `token`/`pos`/`seq_id`. (llama.cpp's own
+    /// header comment says "all members are left uninitialized"; the source initialises `n_tokens` to 0, and
+    /// the measured behaviour — asserted in `tests/local_runtime.rs` — is the source.)
+    ///
     /// Memory: the returned struct owns `malloc`'d arrays. Exactly one [`llama_batch_free`] per call,
-    /// and nothing may be read through the struct afterwards. All fields are left uninitialised by
-    /// llama.cpp — fill before use.
+    /// and nothing may be read through the struct afterwards. The array *contents* are uninitialised — fill
+    /// before use.
     pub fn llama_batch_init(n_tokens: i32, embd: i32, n_seq_max: i32) -> llama_batch;
 
     /// Free the arrays inside a batch from [`llama_batch_init`].
@@ -297,132 +303,178 @@ extern "C" {
     pub fn llama_get_embeddings_ith(ctx: *mut llama_context, i: i32) -> *mut f32;
 }
 
-#[cfg(test)]
 mod layout {
-    //! Layout pins for the three structs that cross the FFI by value.
+    //! Layout pins for the three structs that cross the FFI by value — see below for what they can and
+    //! cannot catch.
     //!
-    //! A wrong field order or missing padding is not a compile error — it is C reading past what Rust
-    //! wrote, into whichever field happens to sit there. So each struct's expected size comes from the
-    //! pinned header itself, measured on this host with gcc against the real `include/llama.h`:
+    //! A wrong field order or missing padding is not a compile error: it is C reading past what Rust wrote,
+    //! into whichever field happens to sit there. So every expected size and offset here was measured against
+    //! the pinned header with a C probe, not transcribed by eye:
     //!
     //! ```text
-    //! $ cd .vendor/llama.cpp-v0.8.0 && gcc -fsyntax-only … probe.c   # (full command in r6b0-report.md)
-    //! sizeof(llama_batch)=56  token=8 embd=16 pos=24 n_seq_id=32 seq_id=40 logits=48
-    //! sizeof(llama_model_params)=80  devices=0 tensor_buft_overrides=8 n_gpu_layers=16 split_mode=20
-    //!   load_mode=24 lazy_mode=28 main_gpu=32 tensor_split=40 progress_callback=48 …_user_data=56
-    //!   kv_overrides=64 vocab_only=72 check_tensors=73 use_extra_bufts=74 no_host=75 no_alloc=76 load_mtp=77
-    //! sizeof(llama_context_params)=168  n_ctx=0 … pooling_type=44 … embeddings=136 … ctx_other=160
+    //! $ gcc -I .vendor/llama.cpp-v0.8.0/include -I .vendor/llama.cpp-v0.8.0/ggml/include \
+    //!       -std=c11 -o /tmp/layout_probe /tmp/layout_probe.c && /tmp/layout_probe
+    //! sizeof(llama_batch)=56
+    //!   n_tokens=0 token=8 embd=16 pos=24 n_seq_id=32 seq_id=40 logits=48
+    //! sizeof(llama_model_params)=80
+    //!   devices=0 tensor_buft_overrides=8 n_gpu_layers=16 split_mode=20 load_mode=24 lazy_mode=28
+    //!   main_gpu=32 tensor_split=40 progress_callback=48 progress_callback_user_data=56 kv_overrides=64
+    //!   vocab_only=72 check_tensors=73 use_extra_bufts=74 no_host=75 no_alloc=76 load_mtp=77
+    //! sizeof(llama_context_params)=168
+    //!   n_ctx=0 n_batch=4 n_threads=28 n_threads_batch=32 pooling_type=44 flash_attn_type=52
+    //!   rope_freq_base=56 yarn_orig_ctx=80 defrag_thold=84 cb_eval=88 cb_eval_user_data=96 type_k=104
+    //!   type_v=108 moe_cache_size=112 abort_callback=120 embeddings=136 kv_unified=141 samplers=144
+    //!   n_samplers=152 ctx_other=160
+    //! sizeof(enum llama_pooling_type)=4 sizeof(enum ggml_type)=4 sizeof(llama_token)=4
+    //! sizeof(llama_pos)=4 sizeof(llama_seq_id)=4
     //! ```
     //!
-    //! Those numbers are the SysV x86-64 / AArch64 LP64 layout, and also MSVC's for these structs: all
-    //! three release targets have 8-byte pointers, 4-byte `int`/`enum`, 1-byte `bool`, and no
-    //! bitfields here — so the field order below is what produces the same offsets everywhere. The
-    //! pointer-width assumption is why each test checks `size_of::<*mut u8>() == 8` first: on a
-    //! 32-bit host these constants would fail loudly instead of silently disagreeing with C.
+    //! Run on 2026-10-29 against `include/llama.h` whose sha256 is `c0854771…` — the value pinned in
+    //! `third_party/llama-cpp.toml` and re-checked by `build.rs` on every feature-on build, so these numbers
+    //! belong to a named tree rather than to "some 0.8.x". The same run produced the field-name list checked
+    //! below; a re-pin re-runs the probe and updates the constants deliberately.
+    //!
+    //! **Names and order too, not just offsets.** A second check compares the three header structs against
+    //! this file field by field: `llama_batch` 7 fields, `llama_model_params` 17, `llama_context_params` 38 —
+    //! identical names in identical order as measured on 2026-10-29. That matters because Rust does not care
+    //! what a field is called: a mirror that renames `n_seq_id` to `pos` compiles, keeps every offset, and
+    //! hands R6b1 a plausible-looking wrong field.
+    //!
+    //! ## What these pins cannot see
+    //!
+    //!   * **A callback with the wrong shape.** Every function pointer is 8 bytes, so `cb_eval` declared with
+    //!     two parameters instead of the header's three left every number below unchanged and the suite green;
+    //!     it was caught by reading `ggml-backend.h` (R6b0 review P1-1). Signature review against the header
+    //!     is a human step, and this file is where its absence would show up.
+    //!   * **A field added into existing tail padding** (`llama_context_params` pads at 142–143): size and
+    //!     offsets unchanged, C and Rust disagreeing about what lives there. Benign in practice because R6b1
+    //!     starts every struct from llama.cpp's own `*_default_params()` and changes named fields — it never
+    //!     constructs one field-by-field-default and hands it over. If that ever changes, this sentence stops
+    //!     being the defence and the header digest becomes load-bearing instead.
+    //!   * **C's `sizeof(enum)`.** The probe measured 4 for every enum here on this ABI; nothing in Rust can
+    //!     detect llama.cpp being built with `-fshort-enums`. Recorded rather than covered.
+    //!
+    //! The numbers are the SysV x86-64 / AArch64 LP64 layout and also MSVC's for these structs: 8-byte
+    //! pointers, 4-byte `int`/`enum`, 1-byte `bool`, no bitfields — which is why the pointer-width guard below
+    //! fails loudly on a 32-bit host instead of silently disagreeing with C.
 
     use super::*;
     use std::mem::{align_of, offset_of, size_of};
 
-    #[test]
-    fn batch_layout_matches_the_pinned_header() {
-        assert_eq!(
-            size_of::<*mut u8>(),
-            8,
-            "these constants are the 64-bit layout"
-        );
-        assert_eq!(size_of::<llama_batch>(), 56);
-        assert_eq!(align_of::<llama_batch>(), 8);
+    // These pins are **not** behind `#[cfg(test)]`, on purpose: a wrong mirror then fails any
+    // `cargo build`/`check` with `--features local-model`, not only a test run. Measured — deleting
+    // `llama_batch::n_seq_id` survived plain `cargo check` while these pins sat in `#[cfg(test)]`, and failed
+    // the build once they left it; widening `n_ctx` to `i64` fails with "assertion failed:
+    // size_of::<llama_context_params>() == 168". (R6b0 review P2-6 asked for const assertions; this is the
+    // placement that actually bites.) The cost is honest: on a 32-bit host this module stops compiling at all,
+    // which is the loud failure the pointer-width guard below was always trying to produce.
+
+    const _: () = assert!(
+        size_of::<*mut u8>() == 8,
+        "these constants are the 64-bit layout"
+    );
+
+    const _: () = {
+        assert!(size_of::<llama_batch>() == 56);
+        assert!(align_of::<llama_batch>() == 8);
         // `n_tokens` is an i32 followed by pointers, so 4 bytes of padding must appear at offset 4.
-        assert_eq!(offset_of!(llama_batch, n_tokens), 0);
-        assert_eq!(offset_of!(llama_batch, token), 8);
-        assert_eq!(offset_of!(llama_batch, embd), 16);
-        assert_eq!(offset_of!(llama_batch, pos), 24);
-        assert_eq!(offset_of!(llama_batch, n_seq_id), 32);
-        assert_eq!(offset_of!(llama_batch, seq_id), 40);
-        assert_eq!(offset_of!(llama_batch, logits), 48);
-    }
+        assert!(offset_of!(llama_batch, n_tokens) == 0);
+        assert!(offset_of!(llama_batch, token) == 8);
+        assert!(offset_of!(llama_batch, embd) == 16);
+        assert!(offset_of!(llama_batch, pos) == 24);
+        assert!(offset_of!(llama_batch, n_seq_id) == 32);
+        assert!(offset_of!(llama_batch, seq_id) == 40);
+        assert!(offset_of!(llama_batch, logits) == 48);
+    };
 
-    #[test]
-    fn model_params_layout_matches_the_pinned_header() {
-        assert_eq!(
-            size_of::<*mut u8>(),
-            8,
-            "these constants are the 64-bit layout"
-        );
-        assert_eq!(size_of::<llama_model_params>(), 80);
-        assert_eq!(align_of::<llama_model_params>(), 8);
-        assert_eq!(offset_of!(llama_model_params, devices), 0);
-        assert_eq!(offset_of!(llama_model_params, tensor_buft_overrides), 8);
-        // The four enums sit between the pointers with no padding: 16, 20, 24, 28, then main_gpu at 32.
-        assert_eq!(offset_of!(llama_model_params, n_gpu_layers), 16);
-        assert_eq!(offset_of!(llama_model_params, split_mode), 20);
-        assert_eq!(offset_of!(llama_model_params, load_mode), 24);
-        assert_eq!(offset_of!(llama_model_params, lazy_mode), 28);
-        assert_eq!(offset_of!(llama_model_params, main_gpu), 32);
-        assert_eq!(offset_of!(llama_model_params, tensor_split), 40);
-        assert_eq!(offset_of!(llama_model_params, progress_callback), 48);
-        assert_eq!(
-            offset_of!(llama_model_params, progress_callback_user_data),
-            56
-        );
-        assert_eq!(offset_of!(llama_model_params, kv_overrides), 64);
-        // The six bools are packed at the tail: 72..77, and the struct rounds up to 80.
-        assert_eq!(offset_of!(llama_model_params, vocab_only), 72);
-        assert_eq!(offset_of!(llama_model_params, load_mtp), 77);
-    }
+    const _: () = {
+        assert!(size_of::<llama_model_params>() == 80);
+        assert!(align_of::<llama_model_params>() == 8);
+        assert!(offset_of!(llama_model_params, devices) == 0);
+        assert!(offset_of!(llama_model_params, tensor_buft_overrides) == 8);
+        // Four enums packed between the pointers with no padding: 16, 20, 24, 28, then main_gpu at 32.
+        assert!(offset_of!(llama_model_params, n_gpu_layers) == 16);
+        assert!(offset_of!(llama_model_params, split_mode) == 20);
+        assert!(offset_of!(llama_model_params, load_mode) == 24);
+        assert!(offset_of!(llama_model_params, lazy_mode) == 28);
+        assert!(offset_of!(llama_model_params, main_gpu) == 32);
+        assert!(offset_of!(llama_model_params, tensor_split) == 40);
+        assert!(offset_of!(llama_model_params, progress_callback) == 48);
+        assert!(offset_of!(llama_model_params, progress_callback_user_data) == 56);
+        assert!(offset_of!(llama_model_params, kv_overrides) == 64);
+        // Six bools packed at the tail: 72..77, and the struct rounds up to 80.
+        assert!(offset_of!(llama_model_params, vocab_only) == 72);
+        assert!(offset_of!(llama_model_params, check_tensors) == 73);
+        assert!(offset_of!(llama_model_params, use_extra_bufts) == 74);
+        assert!(offset_of!(llama_model_params, no_host) == 75);
+        assert!(offset_of!(llama_model_params, no_alloc) == 76);
+        assert!(offset_of!(llama_model_params, load_mtp) == 77);
+    };
 
-    #[test]
-    fn context_params_layout_matches_the_pinned_header() {
-        assert_eq!(
-            size_of::<*mut u8>(),
-            8,
-            "these constants are the 64-bit layout"
-        );
-        assert_eq!(size_of::<llama_context_params>(), 168);
-        assert_eq!(align_of::<llama_context_params>(), 8);
-        assert_eq!(offset_of!(llama_context_params, n_ctx), 0);
-        assert_eq!(offset_of!(llama_context_params, n_threads_batch), 32);
-        // The field R6b1 must set for pooling, and the one it must set for embeddings at all.
-        assert_eq!(offset_of!(llama_context_params, pooling_type), 44);
-        assert_eq!(offset_of!(llama_context_params, flash_attn_type), 52);
-        assert_eq!(offset_of!(llama_context_params, yarn_orig_ctx), 80);
-        assert_eq!(offset_of!(llama_context_params, cb_eval), 88);
-        assert_eq!(offset_of!(llama_context_params, type_k), 104);
-        assert_eq!(offset_of!(llama_context_params, moe_cache_size), 112);
-        assert_eq!(offset_of!(llama_context_params, embeddings), 136);
-        assert_eq!(offset_of!(llama_context_params, kv_unified), 141);
-        assert_eq!(offset_of!(llama_context_params, samplers), 144);
-        assert_eq!(offset_of!(llama_context_params, ctx_other), 160);
-    }
+    const _: () = {
+        assert!(size_of::<llama_context_params>() == 168);
+        assert!(align_of::<llama_context_params>() == 8);
+        assert!(offset_of!(llama_context_params, n_ctx) == 0);
+        assert!(offset_of!(llama_context_params, n_batch) == 4);
+        assert!(offset_of!(llama_context_params, n_threads) == 28);
+        assert!(offset_of!(llama_context_params, n_threads_batch) == 32);
+        // The two fields R6b1 must set: pooling strategy, and `embeddings` itself.
+        assert!(offset_of!(llama_context_params, pooling_type) == 44);
+        assert!(offset_of!(llama_context_params, flash_attn_type) == 52);
+        assert!(offset_of!(llama_context_params, yarn_orig_ctx) == 80);
+        assert!(offset_of!(llama_context_params, cb_eval) == 88);
+        assert!(offset_of!(llama_context_params, type_k) == 104);
+        assert!(offset_of!(llama_context_params, moe_cache_size) == 112);
+        assert!(offset_of!(llama_context_params, embeddings) == 136);
+        assert!(offset_of!(llama_context_params, kv_unified) == 141);
+        assert!(offset_of!(llama_context_params, samplers) == 144);
+        assert!(offset_of!(llama_context_params, ctx_other) == 160);
+    };
 
-    /// The C enums are declared as `i32` above, which is only correct while `sizeof(enum) == 4`.
-    /// Measured with the same probe (`sizeof(enum llama_pooling_type)=4`, `sizeof(enum ggml_type)=4`).
-    #[test]
-    fn enums_are_i32_sized() {
-        assert_eq!(size_of::<i32>(), 4);
-        assert_eq!(size_of::<llama_token>(), size_of::<i32>());
-        assert_eq!(size_of::<llama_pos>(), size_of::<i32>());
-        assert_eq!(size_of::<llama_seq_id>(), size_of::<i32>());
-    }
+    /// Our side of the enum mirror: `llama_token`, `llama_pos` and `llama_seq_id` are `i32`, which is what the
+    /// probe measured C to be. Asserted at compile time — as a `#[test]` this could not fail (the aliases *are*
+    /// `i32`), which is precisely why the old runtime version of it was dropped (R6b0 review P2-6). The C-side
+    /// width is the part no Rust assertion can pin; see "What these pins cannot see".
+    const _: () = {
+        assert!(size_of::<llama_token>() == 4);
+        assert!(size_of::<llama_pos>() == 4);
+        assert!(size_of::<llama_seq_id>() == 4);
+    };
 
-    /// `llama_batch` is passed by value in two signatures; if Rust ever stopped laying it out like the
-    /// C struct that is copy-by-value, every one of those calls would be a silent memory bug.
-    #[test]
-    fn batch_is_passed_by_value_as_a_plain_copied_struct() {
-        assert!(
-            !std::mem::needs_drop::<llama_batch>(),
-            "a by-value FFI struct cannot own anything"
-        );
-        let copied: llama_batch = llama_batch {
-            n_tokens: 1,
-            token: std::ptr::null_mut(),
-            embd: std::ptr::null_mut(),
-            pos: std::ptr::null_mut(),
-            n_seq_id: std::ptr::null_mut(),
-            seq_id: std::ptr::null_mut(),
-            logits: std::ptr::null_mut(),
-        };
-        let also: llama_batch = copied;
-        assert_eq!(copied.n_tokens, also.n_tokens);
+    /// The compile-time pins above are the guarantee; these two are the same claims restated where
+    /// `cargo test` can show them. Cheap, and CI's `--lib` line keeps reporting that layout was checked.
+    #[cfg(test)]
+    mod runtime_checks {
+        use super::*;
+
+        /// The same three sizes, checked in the running binary. Cheap, and it keeps a visible line in
+        /// `cargo test --features local-model --lib` for anyone reading CI output rather than this file.
+        #[test]
+        fn layout_constants_hold_in_the_running_binary() {
+            assert_eq!(size_of::<llama_batch>(), 56);
+            assert_eq!(size_of::<llama_model_params>(), 80);
+            assert_eq!(size_of::<llama_context_params>(), 168);
+        }
+
+        /// `llama_batch` is passed by value in two signatures; if Rust ever stopped laying it out like the
+        /// C struct that is copy-by-value, every one of those calls would be a silent memory bug.
+        #[test]
+        fn batch_is_passed_by_value_as_a_plain_copied_struct() {
+            assert!(
+                !std::mem::needs_drop::<llama_batch>(),
+                "a by-value FFI struct cannot own anything"
+            );
+            let copied: llama_batch = llama_batch {
+                n_tokens: 1,
+                token: std::ptr::null_mut(),
+                embd: std::ptr::null_mut(),
+                pos: std::ptr::null_mut(),
+                n_seq_id: std::ptr::null_mut(),
+                seq_id: std::ptr::null_mut(),
+                logits: std::ptr::null_mut(),
+            };
+            let also: llama_batch = copied;
+            assert_eq!(copied.n_tokens, also.n_tokens);
+        }
     }
 }

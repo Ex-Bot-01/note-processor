@@ -93,8 +93,30 @@ fn main() {
 fn link_pinned_llama() -> Result<(), String> {
     // Every variable read below gets a `rerun-if-env-changed`, so re-pointing the build at a
     // different tree or a different cmake is enough to make cargo ask us again.
-    for name in ["NP_LLAMA_CPP_SRC", "CMAKE", "NP_LLAMA_CPP_JOBS"] {
+    // `CC`/`CXX` are here because cmake caches the compiler it found first: switching compilers by env
+    // without this line leaves a stale cache that cmake usually (not always) catches, and our own reuse rule
+    // would happily link the archive set built by the other one.
+    for name in [
+        "NP_LLAMA_CPP_SRC",
+        "CMAKE",
+        "NP_LLAMA_CPP_JOBS",
+        "CC",
+        "CXX",
+    ] {
         println!("cargo::rerun-if-env-changed={name}");
+    }
+
+    // §14 claims nothing about Windows or macOS, so say that instead of letting a stranger meet `-l stdc++`
+    // cannot find (macOS) or four wrong archive names (MSVC). A refusal that names the design section is a
+    // scope statement; a linker error is a mystery.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "linux" {
+        return Err(format!(
+            "`local-model` is built and tested on Linux only. This target is {target_os:?}.\n  \
+             design-m2-local-embeddings.md §14: the C++ build has been measured on one host and no claim \n  \
+             exists for any other platform — F18's rule. The system library set here (`stdc++`, `m`, \n  \
+             `pthread`, `dl`) and the four archive names are GNU/Linux's; see §14 for what Windows needs.",
+        ));
     }
 
     let manifest = path_env("CARGO_MANIFEST_DIR")?;
@@ -376,12 +398,53 @@ fn configure(
         .map(|(key, want)| format!("{key}={want}"))
         .collect();
 
-    if cache.contains_key("CMAKE_BUILD_TYPE") && stale.is_empty() {
+    // **A cache cannot tell you that an option stopped existing, and it cannot tell you that one was removed
+    // from the pin.** cmake files an `-DFOO=` for an option no `CMakeLists.txt` declares under type
+    // `UNINITIALIZED`: measured here, `LLAMA_CURL:UNINITIALIZED=OFF` while every live option is `BOOL`, and
+    // v0.8.0 turns that flag into a deprecation notice (`CMakeLists.txt: llama_option_depr(WARNING LLAMA_CURL)`).
+    // Since the reuse test compares values only — deliberately, so UNINITIALIZED entries look fresh — a typo or
+    // an upstream rename reads as "matches the pin" forever while the build uses upstream's default, and deleting
+    // a line from the pin leaves the old cached value in charge. Both faces are closed here: the exact `-D` set is
+    // recorded next to the cache, and after configuring every pinned key must exist with a real type.
+    let option_stamp = build_dir.join(OPTION_STAMP);
+    let recorded = fs::read_to_string(&option_stamp).unwrap_or_default();
+    let wanted = pin.option_stamp();
+    let set_changed = !recorded.is_empty() && recorded != wanted;
+
+    if cache.contains_key("CMAKE_BUILD_TYPE") && stale.is_empty() && !set_changed {
+        // Warm cache: still verify it understood our options. A cache that filed half of them as UNINITIALIZED
+        // is exactly the state a reuse path must not certify as fresh.
+        verify_options_understood(build_dir, pin)?;
         eprintln!(
             "np-core: {} already configured for the pin's options; skipping configure",
             build_dir.display()
         );
         return Ok(());
+    }
+
+    if set_changed {
+        eprintln!(
+            "np-core: the option set changed ({} -> {}), reconfiguring {}",
+            recorded.lines().count(),
+            wanted.lines().count(),
+            build_dir.display()
+        );
+    }
+    if !build_dir.starts_with(out_dir) && !cache.is_empty() {
+        // Reconfiguring a tree that is not ours to own is defensible — linking a tree built with shared libs or
+        // extra targets on would put bytes in `np` that nothing here chose — but it must be said out loud, in
+        // terms of whose directory it is.
+        eprintln!(
+            "np-core: reconfiguring {} (a build directory inside the source tree {}) to match {}'s options: {}",
+            build_dir.display(),
+            source.display(),
+            PIN,
+            if stale.is_empty() {
+                "option set changed".to_string()
+            } else {
+                stale.join(", ")
+            }
+        );
     }
 
     fs::create_dir_all(build_dir)
@@ -405,7 +468,44 @@ fn configure(
             stale.join(", ")
         }
     );
-    run(cmake, &args, "configure").map(drop)
+    run(cmake, &args, "configure")?;
+    verify_options_understood(build_dir, pin)?;
+
+    fs::write(&option_stamp, wanted)
+        .map_err(|e| format!("cannot write {}: {e}", option_stamp.display()))?;
+    Ok(())
+}
+
+/// Every option in the pin must appear in the cache with a real type. `UNINITIALIZED` means cmake stored the
+/// value because we asked it to and no `CMakeLists.txt` ever read it — so the build ran with upstream's default
+/// while the pin claimed a setting. Measured on this tree: `LLAMA_CURL:UNINITIALIZED=OFF`, which v0.8.0 turns
+/// into a deprecation notice, and that is how this check earned its place.
+fn verify_options_understood(build_dir: &Path, pin: &Pin) -> Result<(), String> {
+    let cache = build_dir.join("CMakeCache.txt");
+    let types = read_cache_types(&cache);
+    let ignored: Vec<String> = pin
+        .options
+        .iter()
+        .filter(|(key, _)| {
+            matches!(
+                types.get(key.as_str()).map(String::as_str),
+                None | Some("UNINITIALIZED")
+            )
+        })
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    if !ignored.is_empty() {
+        return Err(format!(
+            "cmake accepted these options from {} but filed them as UNINITIALIZED, meaning this revision \n  \
+             has no such option — the build ran with upstream's default instead:\n    {}\n  \
+             Either the option was renamed upstream (find the new name and re-pin it) or it is misspelled. \n  \
+             Leaving them in place would let {} keep claiming settings that nothing applied.",
+            PIN,
+            ignored.join(", "),
+            PIN
+        ));
+    }
+    Ok(())
 }
 
 fn compile(cmake: &OsString, build_dir: &Path) -> Result<(), String> {
@@ -534,6 +634,21 @@ fn find_archive(build_dir: &Path, name: &str) -> Result<PathBuf, String> {
     }
 
     found.sort();
+    if found.len() > 1 {
+        // A reconfigure that moved the output directory leaves two `libllama.a` under one build tree, and
+        // choosing the lexicographically first would pick by spelling rather than by which build is current —
+        // plausibly the stale one. Measured today: exactly one per name, so this fires only on the next revision.
+        return Err(format!(
+            "found {} archives named for `{name}` under {}; refusing to guess which build is current:\n    {}",
+            found.len(),
+            build_dir.display(),
+            found
+                .iter()
+                .map(|p| format!("{}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n    ")
+        ));
+    }
     found.into_iter().next().ok_or_else(|| {
         format!(
             "the build produced no {name} archive under {}.\n  \
@@ -544,6 +659,11 @@ fn find_archive(build_dir: &Path, name: &str) -> Result<PathBuf, String> {
         )
     })
 }
+
+/// Where the exact `-D` set passed to cmake is recorded, beside the cache it describes. Its absence means
+/// "configured before this file existed"; a difference means an option was added, changed **or removed** — the
+/// one edit a value comparison against the cache can never see, because cmake keeps the old value.
+const OPTION_STAMP: &str = ".np-cmake-options";
 
 /// The parsed subset of the pin we build from: the tag, and the `[cmake]` table in file order.
 struct Pin {
@@ -635,6 +755,15 @@ impl Pin {
             options,
         })
     }
+
+    /// The option set as written to [`OPTION_STAMP`]: file order, one `key=value` per line. Deterministic
+    /// because it is compared byte for byte against the previous configure's record.
+    fn option_stamp(&self) -> String {
+        self.options
+            .iter()
+            .map(|(key, value)| format!("{key}={value}\n"))
+            .collect()
+    }
 }
 
 /// `KEY:TYPE=VALUE` lines of a CMakeCache file; missing or unreadable is an empty map, which the
@@ -651,6 +780,26 @@ fn read_cache(path: &Path) -> std::collections::BTreeMap<String, String> {
         if let Some((key, rest)) = line.split_once(':') {
             if let Some((_, value)) = rest.split_once('=') {
                 entries.insert(key.to_string(), value.trim().to_string());
+            }
+        }
+    }
+    entries
+}
+
+/// `KEY:TYPE=VALUE` — the type half, which [`read_cache`] drops. It is the only evidence of whether cmake
+/// recognised an option at all (`BOOL`/`STRING`/`FILEPATH` mean it exists; `UNINITIALIZED` means nobody read it).
+fn read_cache_types(path: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut entries = std::collections::BTreeMap::new();
+    let Ok(text) = fs::read_to_string(path) else {
+        return entries;
+    };
+    for line in text.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some((key, rest)) = line.split_once(':') {
+            if let Some((ty, _)) = rest.split_once('=') {
+                entries.insert(key.to_string(), ty.to_string());
             }
         }
     }
