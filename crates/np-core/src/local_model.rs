@@ -16,14 +16,21 @@
 //!
 //! ## The window is three numbers, not one
 //!
-//! [`load`] sets `n_ctx = n_batch = n_ubatch = REQUESTED_CTX`. The last two are not decoration: this artifact
-//! declares `attention.causal = 0`, and for non-causal attention v0.8.0 asserts
-//! `n_ubatch >= n_tokens` (`src/llama-context.cpp:1920`) **and** `n_tokens <= n_batch` (`:1919`).
-//! `GGML_ASSERT` maps to `GGML_ABORT` (`ggml/include/ggml.h:287-288`) and so survives `NDEBUG`: with
-//! llama.cpp's default `n_ubatch = 512`, a 600-token sequence **aborted the process** (measured: exit 134, no
-//! return code at all). Since `embeddings.max_tokens` accepts up to 8,192, that abort was reachable from an
-//! ordinary ~1,800-byte note. One window, asked for once, is what makes the assert unreachable; see
-//! `REQUESTED_CTX` for what it costs and [`LoadedModel::window`] for the refusal that guards it.
+//! [`load`] sets `n_ctx = n_batch = n_ubatch = REQUESTED_CTX`, because one number is what keeps a long note from
+//! killing the process. **Which assert that is** took a measurement to answer: this architecture has no KV cache
+//! at all — `src/llama-model.cpp:2825` lists `LLM_ARCH_GEMMA_EMBEDDING2` among the architectures whose
+//! `create_memory` returns `nullptr`, so `llama_context::decode` logs "cannot decode batches with this context
+//! (calling encode() instead)" (`src/llama-context.cpp:1845-1847`) and takes the encoder path. Confirmed through
+//! our own FFI: `llama_get_memory(ctx)` prints `(nil)` for this artifact.
+//!
+//! So the line that would have aborted us is **`src/llama-context.cpp:1631` — `GGML_ASSERT(cparams.n_ubatch >=
+//! n_tokens && "encoder requires n_ubatch >= n_tokens")`** — not the decoder's pair at `:1918` / `:1920`, which
+//! never execute here. (R6b2's first draft of this paragraph cited those; R6b2 review P1-1 caught it, and the fix
+//! is unchanged either way because `n_ubatch` is the number in all three.) `GGML_ASSERT` maps to `GGML_ABORT`
+//! (`ggml/include/ggml.h:287-288`) and so survives `NDEBUG`: at llama.cpp's default `n_ubatch = 512`, a
+//! 600-token sequence **aborted the process** (measured: exit 134, no return code at all). Since
+//! `embeddings.max_tokens` accepts up to 8,192, that abort was reachable from an ordinary ~1,800-byte note. See
+//! `REQUESTED_CTX` for what the wider window costs and [`LoadedModel::window`] for the refusal that guards it.
 //!
 //! What this module owns is therefore exactly the unsafe part: who holds the two C handles, in what order they
 //! die, and which refusals happen before anything is allocated. [`load`] is the only place in the crate that
@@ -69,9 +76,10 @@ use crate::walk;
 /// the budget decides what a caller may submit, this decides what the runtime can hold, and
 /// [`LoadedModel::embed_text`] refuses between the two rather than letting llama.cpp decide with an assert.
 ///
-/// **What it costs, measured** (peak RSS above a 419 MiB baseline, same process, wide window,
-/// `GGML_OPENMP=OFF`): 133 tokens **+0 MiB**, 513 **+47**, 1,026 **+109**, 2,052 **+218**, 4,085 **+458**.
-/// The compute buffer is reserved at context creation but its pages are touched per decode, so the price
+/// **What it costs, measured** by `tests/probes/decode_probe.c` — the bare C loader plus one forward pass, so the
+/// baseline is that program's own 419.4 MiB with the model open (§14; our Rust process sits 1.7 MiB higher, at
+/// 421.1 MiB): 133 tokens **+0 MiB**, 513 **+47**, 1,026 **+109**, 2,052 **+218**, 4,085 **+458**. The compute
+/// buffer is reserved at context creation but its pages are touched per forward pass, so the price
 /// tracks the **longest sequence actually run**, not the ceiling asked for — which is why 4,096 costs nothing
 /// on ordinary chunks and why a smaller ceiling would not have bought much. Keeping it a constant rather than
 /// a parameter is [`load`]'s choice, not the design's: legal input length comes from `embeddings.max_tokens`,
@@ -96,7 +104,11 @@ pub enum Pooling {
     Cls,
     /// The last token's row.
     Last,
-    /// The reranking head; produces a score, not an embedding (§5's stored width does not apply to it).
+    /// The reranking head: a score, not an embedding — and **refused by [`load`]**, because its pooled buffer is
+    /// `float[n_cls_out]` wide (`include/llama.h:1167`) rather than `n_embd_out`, so reading it at the stored width
+    /// would be an over-read. It stays in this enum instead of falling into the unknown-value refusal because
+    /// "this artifact ranks, it does not embed" is a true and useful sentence to say back to someone who pointed at
+    /// a reranker; what the refusal removes is the unsafe consequence of modelling it.
     Rank,
 }
 
@@ -142,7 +154,9 @@ pub struct ModelFacts {
     /// Whether the same request appends EOS. Read separately from [`ModelFacts::add_bos`] because both are set
     /// here, and a token count that assumed one would be one short (§5's budget counts specials).
     pub add_eos: bool,
-    /// How this context pools (unit: none — a strategy, not a number). Never `NONE`: see [`Pooling`].
+    /// How this context pools (unit: none — a strategy, not a number). Never `NONE` and never `Rank`: [`load`]
+    /// refuses both — the first cannot produce a sentence vector at all, the second produces one of a different
+    /// width. See [`Pooling`].
     pub pooling: Pooling,
 }
 
@@ -164,10 +178,11 @@ pub struct LoadedModel {
     /// From [`llama_ffi::llama_init_from_model`]; freed first, by the `Drop` implementation below.
     ctx: NonNull<llama_context>,
     facts: ModelFacts,
-    /// Tokens this context holds in **one** decode — see [`LoadedModel::window`]. Equal to the `n_ctx`,
+    /// Tokens this context holds in **one forward pass** — see [`LoadedModel::window`]. Equal to the `n_ctx`,
     /// `n_batch` and `n_ubatch` [`load`] asked for, kept beside the handles because a refusal has to quote the
     /// window that was actually built rather than the constant that was requested (a model trained on fewer
-    /// tokens gets the smaller of the two).
+    /// tokens gets the smaller of the two). "Forward pass" rather than "decode" on purpose: this artifact encodes
+    /// (`llama_get_memory(ctx)` is null), so there is no KV cache whose capacity the number would describe.
     window: usize,
 }
 
@@ -183,6 +198,10 @@ impl LoadedModel {
     /// what [`LoadedModel::embed_text`] refuses against after the configured budget has passed. Reading it
     /// rather than re-deriving it is what lets a refusal name the real limit when the model's trained window
     /// was the smaller number.
+    ///
+    /// It is also this context's `n_ubatch`, which on an encoder-only artifact is the runtime's own hard limit —
+    /// `src/llama-context.cpp:1631` aborts above it rather than returning anything. The refusal exists so that
+    /// line is never reached.
     pub fn window(&self) -> usize {
         self.window
     }
@@ -194,8 +213,15 @@ impl LoadedModel {
     /// [`ModelFacts::add_eos`] say are enabled). A caller that wants to check a chunk against
     /// `embeddings.max_tokens` before paying for a decode uses this; [`LoadedModel::embed_text`] checks the
     /// same number itself, so this is a convenience and never a second authority.
+    ///
+    /// Its own ceiling is [`MAX_EMBEDDING_TOKENS`](crate::config::MAX_EMBEDDING_TOKENS) — the hard bound config
+    /// validation already enforces for `embeddings.max_tokens` — because counting without one would size a buffer
+    /// for text nothing could ever embed. Above it this refuses with [`EmbedError::TokenBudgetExceeded`], naming
+    /// that ceiling as the budget.
     pub fn count_tokens(&self, text: &str) -> Result<usize, EmbedError> {
-        Ok(self.tokenize(text)?.len())
+        Ok(self
+            .tokenize(text, crate::config::MAX_EMBEDDING_TOKENS)?
+            .len())
     }
 
     /// Tokenize `prefix + text`, run **one** forward pass, and return the pooled row as a unit-length vector.
@@ -213,7 +239,8 @@ impl LoadedModel {
     ///    budget but not [`LoadedModel::window`]. Worded as it is on purpose: "context too small" would send a
     ///    user to free memory, when the fix is a shorter chunk or a re-tuned `REQUESTED_CTX`;
     /// 3. [`EmbedError::Unavailable`] with a fixed label for anything the runtime answers wrongly — a refused
-    ///    forward pass, a null pooled row, a vector of zeros, a component that is not a number.
+    ///    forward pass, a null pooled row, a vector of zeros, one too large to normalise, a component that is not
+    ///    a number.
     ///
     /// The pooled row is **copied** out immediately: `llama_get_embeddings_seq` hands back a buffer the context
     /// owns and rewrites on the next decode ([`crate::llama_ffi`]'s note on it), so nothing here keeps the
@@ -229,7 +256,9 @@ impl LoadedModel {
         budget: usize,
     ) -> Result<Vector, EmbedError> {
         let joined = format!("{prefix}{text}");
-        let mut tokens = self.tokenize(&joined)?;
+        // The budget goes to `tokenize` as well as being checked here: llama.cpp names the exact buffer it needs,
+        // so an over-budget note is refused before a single token slot is allocated rather than after.
+        let mut tokens = self.tokenize(&joined, budget)?;
         let n = tokens.len();
 
         // The budget over the count llama.cpp returned, not over `joined.len()`: a byte comparison would accept
@@ -246,11 +275,13 @@ impl LoadedModel {
             ));
         }
 
-        // SAFETY: `llama_batch_get_one` borrows the array — it stores the pointer, copies nothing, and the
-        // returned batch must never reach `llama_batch_free` (see [`crate::llama_ffi`]). `tokens` outlives the
-        // decode below, which is the whole obligation. `n` is positive (a tokenization always yields at least
-        // the special tokens) and at most `self.window`, which is what keeps v0.8.0's `n_tokens <= n_batch` and
-        // non-causal `n_ubatch >= n_tokens` asserts out of reach.
+        // SAFETY: `llama_batch_get_one` borrows the array — it stores the pointer and copies nothing
+        // (`src/llama-batch.cpp:1077-1091` sets only `n_tokens` and `token`), and the returned batch must never
+        // reach `llama_batch_free` (see [`crate::llama_ffi`]). `tokens` outlives the call below, which is the
+        // whole obligation. `n` is positive (a tokenization always yields at least the special tokens) and at most
+        // `self.window`, which equals the `n_ubatch` [`load`] asked for — that equality is what keeps
+        // `src/llama-context.cpp:1631`'s encoder assert out of reach, and `n as i32` cannot truncate at 4,096.
+
         let batch = unsafe { llama_ffi::llama_batch_get_one(tokens.as_mut_ptr(), n as i32) };
 
         // SAFETY: `ctx` is non-null by the type; `batch` borrows live memory as above. The return value is an
@@ -258,12 +289,14 @@ impl LoadedModel {
         let rc = unsafe { llama_ffi::llama_decode(self.ctx.as_ptr(), batch) };
         match rc {
             0 => {}
-            // 1 is documented in `include/llama.h` as "the KV cache ran out" — with the window check above it
-            // should be unreachable, and is still reported separately because if it ever fires it is reporting
-            // that our own window arithmetic is wrong.
+            // 1 means "no memory slot for this batch" in a context that has a KV cache. This artifact has none
+            // (`create_memory` returns null, so `decode` diverts to `encode`, which answers 0 or a negative), so
+            // **this arm cannot fire on this model** — it stays because `llama_decode`'s contract promises it and
+            // because a re-pin to a decoder architecture would make it real. Naming it separately is what turns
+            // "our window arithmetic was wrong" into a distinguishable event if that day comes.
             1 => {
                 return Err(EmbedError::Unavailable(
-                    "the context ran out of KV space for this sequence".to_string(),
+                    "the runtime reported a full KV window for this sequence".to_string(),
                 ))
             }
             _ => {
@@ -282,69 +315,99 @@ impl LoadedModel {
             ));
         }
 
-        // SAFETY: a non-null `pooled` points at `n_embd_out` floats owned by the context — the width [`load`]
-        // read from the model and checked against the declared one. Copied out here, on the far side of the
-        // only decode this call performs, so nothing can rewrite it before the copy.
+        // SAFETY: a non-null `pooled` points at `n_embd_out` floats owned by the context —
+        // `src/llama-context.cpp:1725-1727` and `:2113-2120` size that buffer with `hparams.n_embd_out()`, the same
+        // accessor behind `llama_model_n_embd_out`, which [`load`] checked against the declared width. **The
+        // exception is RANK pooling, whose buffer is `float[n_cls_out]`** (`include/llama.h:1167`; `n_cls_out`
+        // defaults to 1 in `src/llama-hparams.h:253`) — reading that at 768 floats is a ~3 KiB over-read, so
+        // [`load`] refuses `Pooling::Rank` (R6b2 review P0-2) and this line is reached only for MEAN / CLS / LAST.
+        // Copied out on the far side of the only forward pass this call performs, so nothing can rewrite it first.
+
         let row = unsafe { std::slice::from_raw_parts(pooled, self.facts.n_embd_out) };
         normalise(row)
     }
 
-    /// Tokenize with `add_special = true`, sizing the buffer from llama.cpp's own answer rather than a guess.
+    /// Tokenize with `add_special = true`, **asking for the size before allocating for it**.
     ///
     /// The rule is [`src/llama-vocab.cpp:4645-4647`]: when `n_tokens_max` is too small the call writes nothing
-    /// and returns **minus the exact count needed, specials included** (measured: a 2-slot buffer for a
-    /// 17-token sentence returned `-17`). So one undersized guess costs one retry, and no assumption about
-    /// bytes-per-token is load-bearing — the first allocation is only an optimisation.
-    fn tokenize(&self, joined: &str) -> Result<Vec<llama_ffi::llama_token>, EmbedError> {
+    /// and returns minus the exact count needed, specials included (measured: a 2-slot buffer for a 17-token
+    /// sentence returned `-17`). So the first call deliberately passes an **empty** buffer — it cannot succeed,
+    /// and the number it names is the size to allocate. Nothing about bytes-per-token is load-bearing anywhere in
+    /// this file, which is the point: R6b2's first draft guessed `bytes.len() + 2`, treated a short buffer as
+    /// success, and so would have decoded a buffer of zero-valued token ids and returned a confident unit vector
+    /// for text it never read (R6b2 review **P0-1**, reproduced: forcing the short buffer left every assertion
+    /// green and changed the output). Probing costs one extra tokenization pass over text we tokenize again —
+    /// microseconds beside a multi-second forward pass.
+    ///
+    /// `budget` is checked against that count **before** allocating, so an over-budget note never sizes a buffer.
+    fn tokenize(
+        &self,
+        joined: &str,
+        budget: usize,
+    ) -> Result<Vec<llama_ffi::llama_token>, EmbedError> {
         let bytes = joined.as_bytes();
-        // `text_len` is an `int32_t`; a larger input cannot be named to C at all. Unreachable through the
-        // budget (8,192 tokens cannot come from 2 GiB of text), but `as i32` would otherwise wrap silently.
-        if bytes.len() > i32::MAX as usize {
+        // `text_len` is an `int32_t`, and the buffer size derived from the count has to stay in range too.
+        // Unreachable through any budget (8,192 tokens cannot come from 2 GiB of text), but `as i32` would
+        // otherwise wrap into a negative `n_tokens_max`.
+        if bytes.len() > i32::MAX as usize - 2 {
             return Err(EmbedError::Unavailable(
                 "the sequence is too long to hand to the tokenizer".to_string(),
             ));
         }
         let vocab = self.vocab()?;
 
-        // One token per byte plus the specials is an upper bound for any byte-level tokenizer (every piece
-        // consumes at least one byte), so this is a first guess that is nearly always right — measured, 23
-        // bytes of English needs 9 slots and 60 bytes of Japanese needs 11.
-        let mut tokens = vec![0 as llama_ffi::llama_token; bytes.len().saturating_add(2).max(4)];
-        let written = self.tokenize_into(vocab, bytes, &mut tokens)?;
-        if written >= 0 {
-            tokens.truncate(written as usize);
-            return Ok(tokens);
+        // The probe: zero writable slots, so the only useful answer is `Needed(n)`.
+        let needed = match self.tokenize_into(vocab, bytes, &mut [])? {
+            Tokenize::Needed(n) => n,
+            // A "success" from a call that had nowhere to write means the runtime no longer obeys the rule this
+            // sizing depends on. Refuse rather than guess what it wrote, or where.
+            Tokenize::Written(_) => {
+                return Err(EmbedError::Unavailable(
+                    "the tokenizer wrote into a buffer with no room".to_string(),
+                ))
+            }
+        };
+        if needed > budget {
+            return Err(EmbedError::TokenBudgetExceeded {
+                tokens: needed,
+                budget,
+            });
         }
 
-        // The buffer was short and llama.cpp named the exact size it needed. Allocate that and try once: a
-        // second shortfall would mean its own count was wrong, which is a runtime refusal rather than a size
-        // to keep chasing.
-        let needed = written.unsigned_abs() as usize;
-        let mut sized = vec![0 as llama_ffi::llama_token; needed];
-        let again = self.tokenize_into(vocab, bytes, &mut sized)?;
-        if again < 0 {
-            return Err(EmbedError::Unavailable(
+        let mut tokens = vec![0 as llama_ffi::llama_token; needed];
+        match self.tokenize_into(vocab, bytes, &mut tokens)? {
+            Tokenize::Written(n) => {
+                // `truncate`, never `resize`: if the answer came back smaller than the count the probe named, the
+                // spare slots were never written and must not be read as token ids.
+                tokens.truncate(n);
+                Ok(tokens)
+            }
+            // The runtime named a size, we allocated exactly that, and it now wants more: a contract violation
+            // rather than a sizing problem, so chasing it with another allocation would be wrong.
+            Tokenize::Needed(_) => Err(EmbedError::Unavailable(
                 "the tokenizer's count did not fit its own buffer".to_string(),
-            ));
+            )),
         }
-        sized.truncate(again as usize);
-        Ok(sized)
     }
 
-    /// One `llama_tokenize` call: `Ok(n)` with `n >= 0` is the number of tokens written into `tokens`, and
-    /// `Ok(n)` with `n < 0` is llama.cpp's own "you needed `-n` slots" answer (widened to `i64` so the caller
-    /// can negate it without the `i32::MIN` overflow). Writes nothing in the negative case.
+    /// One `llama_tokenize` call, with llama.cpp's answers separated into types instead of signs.
+    ///
+    /// The signs are deliberately not the interface. R6b2's first draft normalised "needed N slots" to a positive
+    /// `i64` while its caller still read negatives as the resize signal, which is how a dead resize path and a
+    /// silent-garbage path shipped in the same commit. An enum cannot be misread that way.
     fn tokenize_into(
         &self,
         vocab: *const llama_ffi::llama_vocab,
         bytes: &[u8],
         tokens: &mut [llama_ffi::llama_token],
-    ) -> Result<i64, EmbedError> {
+    ) -> Result<Tokenize, EmbedError> {
         // SAFETY: `vocab` is non-null (checked by [`Self::vocab`]); `bytes` is a Rust slice whose length fits
         // `i32` (checked by the caller) and is read, not freed; `tokens` has exactly `tokens.len()` writable
-        // slots, which is what `n_tokens_max` promises. `add_special = true` because §5's budget counts what the
-        // model sees, and `parse_special = false` because a note's text is data — treating it as markup would
-        // let a file that contains a control token spell vocabulary entries the tokenizer then obeys.
+        // slots, which is what `n_tokens_max` promises — including the empty slice the probe passes, where
+        // `as_mut_ptr` yields a valid aligned pointer that C must not write through, and per the rule above does
+        // not. `add_special = true` because §5's budget counts what the model sees, and `parse_special = false`
+        // because a note's text is data — treating it as markup would let a file containing a control token spell
+        // vocabulary entries the tokenizer then obeys.
         let n = unsafe {
             llama_ffi::llama_tokenize(
                 vocab,
@@ -357,16 +420,17 @@ impl LoadedModel {
             )
         };
         if n >= 0 {
-            return Ok(i64::from(n));
+            return Ok(Tokenize::Written(n as usize));
         }
         if n == i32::MIN {
-            // `llama_vocab::tokenize` answers this for results at or past `INT32_MAX` tokens
-            // (`src/llama-vocab.cpp:4640-4642`) — negating it would overflow, and no real note is that long.
+            // `include/llama.h:1273` documents this as its own outcome — "INT32_MIN on overflow" — and
+            // `src/llama-vocab.cpp:4640-4642` returns it **before** the size check, so it is never a resize
+            // signal. Negating it would overflow; no real note is anywhere near that long.
             return Err(EmbedError::Unavailable(
                 "the tokenizer refused to count this sequence".to_string(),
             ));
         }
-        Ok(-i64::from(n))
+        Ok(Tokenize::Needed((-n) as usize))
     }
 
     /// The vocabulary handle the tokenizer calls need.
@@ -406,13 +470,30 @@ fn normalise(row: &[f32]) -> Result<Vector, EmbedError> {
     // legitimately reached 1e20 would overflow f32 into +inf and then read as "not a number" instead of as the
     // enormous-but-finite vector it is.
     let sum: f64 = row.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
-    if sum == 0.0 || !sum.is_finite() {
+    if sum == 0.0 {
         return Err(EmbedError::Unavailable(
             "the model produced a zero vector".to_string(),
         ));
     }
+    if !sum.is_finite() {
+        // Distinct from the label above and from "not a number": every component passed `is_finite`, so this is a
+        // row of enormous-but-finite values whose squared length overflowed f64. Calling that a zero vector would
+        // describe the opposite of what happened.
+        return Err(EmbedError::Unavailable(
+            "the model produced a vector too large to normalise".to_string(),
+        ));
+    }
     let scale = (1.0 / sum.sqrt()) as f32;
     Ok(Vector::new(row.iter().map(|x| x * scale).collect()))
+}
+
+/// What one `llama_tokenize` call answered.
+enum Tokenize {
+    /// Tokens written into the caller's buffer — never more than its length (`include/llama.h:1271`).
+    Written(usize),
+    /// The buffer was too small: nothing was written, and this is the exact number of slots needed, specials
+    /// included (`src/llama-vocab.cpp:4645-4647`).
+    Needed(usize),
 }
 
 /// Which side of a search a piece of text is on.
@@ -679,6 +760,17 @@ fn open_context(
     // SAFETY: `ctx` is non-null (checked above) and owned by us; the call reads one field of its parameters.
     let pooling = unsafe { llama_ffi::llama_pooling_type(ctx.as_ptr()) };
     match Pooling::from_c(pooling) {
+        Some(Pooling::Rank) => {
+            // A reranker's pooled row is `float[n_cls_out]` (`include/llama.h:1167`), so every read in
+            // `embed_text` would run past it. Refused here, where there is still a context to hand back and no
+            // vector has been promised — see [`Pooling::Rank`].
+            // SAFETY: as in the arm below — this context came from `llama_init_from_model` above and is not owned
+            // by any `LoadedModel` yet.
+            unsafe { llama_ffi::llama_free(ctx.as_ptr()) };
+            Err(EmbedError::Unavailable(
+                "this artifact produces a score, not a sentence vector".to_string(),
+            ))
+        }
         Some(kind) => Ok((
             ctx,
             ModelFacts {
@@ -805,6 +897,10 @@ mod tests {
     /// Every value the pinned `enum llama_pooling_type` declares, mapped or refused — the table this module's
     /// whole pooling posture rests on. None of it can be reached from an artifact: the only file we have
     /// answers MEAN, so `NONE`, `UNSPECIFIED` and an out-of-range number would otherwise never be exercised.
+    ///
+    /// Note what this test does **not** say about `Rank`: mapping it is not accepting it. `open_context` refuses
+    /// RANK because its pooled row is `n_cls_out` wide rather than `n_embd_out` (R6b2 review P0-2), and that
+    /// refusal needs a reranker artifact to exercise, so it is reasoned here rather than covered.
     #[test]
     fn pooling_maps_the_pinned_enum_and_refuses_the_rest() {
         assert_eq!(

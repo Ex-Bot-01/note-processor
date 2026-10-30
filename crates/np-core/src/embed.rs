@@ -157,29 +157,39 @@ pub enum EmbedError {
     /// the runtime's own diagnostic text — that text is exactly what this payload rule exists to keep out of logs,
     /// and [`EmbedError::ArtifactNotLoadable`] deliberately declines to be its carrier.
     ///
-    /// **Every label `local-model` emits, verbatim** — seventeen, because this list is the only place a reader can
-    /// see what the runtime can actually answer, and "planned, not yet reachable" prose once sat here for two
+    /// **Every label `local-model` emits, verbatim** — twenty, spelled out in full because this list is the only
+    /// place a reader can see what the runtime may answer, and a grep for any of them should find the string. It
+    /// replaced an earlier version that listed six and described the rest as "planned, not yet reachable" for two
     /// rounds after the code could reach them.
     ///
-    /// From `local_model::load` (eight):
-    /// `"the model reported no output width"`, `"... no input width"`, `"... no training context"`,
-    /// `"... an empty vocabulary"` (one guard, four labels), `"the loaded model exposed no vocabulary"`,
-    /// `"the runtime refused to build a context for this model"`,
+    /// From `local_model::load` (nine):
+    /// `"the model reported no output width"`, `"the model reported no input width"`,
+    /// `"the model reported no training context"`, `"the model reported an empty vocabulary"` (one guard, four
+    /// labels), `"the loaded model exposed no vocabulary"` (raised from two sites — reading the model's facts and
+    /// resolving the tokenizer's vocabulary), `"the runtime refused to build a context for this model"`,
     /// `"this artifact cannot produce a sentence vector: the context pools with NONE"`,
+    /// `"this artifact produces a score, not a sentence vector"` (RANK pooling: its row is `n_cls_out` wide, not
+    /// the stored width — see `crate::local_model::Pooling`), and
     /// `"the runtime reported a pooling strategy this build does not know"`.
     ///
-    /// From `local_model::LoadedModel::embed_text` (nine):
+    /// From `local_model::LoadedModel::embed_text` (eleven):
     /// `"the sequence is too long to hand to the tokenizer"`, `"the tokenizer refused to count this sequence"`,
-    /// `"the tokenizer's count did not fit its own buffer"`, **`"the sequence is longer than this context can
-    /// hold"`** (over the window; worded so the reader shortens a chunk instead of freeing RAM — it replaced the
-    /// planned `"context too small"`, which would have pointed at the wrong lever),
-    /// `"the context ran out of KV space for this sequence"`, `"the runtime refused to run this sequence"`,
-    /// `"the runtime produced no pooled embedding"`, `"the model produced a component that is not a number"`,
-    /// `"the model produced a zero vector"`.
+    /// `"the tokenizer's count did not fit its own buffer"`, `"the tokenizer wrote into a buffer with no room"`,
+    /// `"the sequence is longer than this context can hold"` (over the window; worded so the reader shortens a
+    /// chunk instead of freeing RAM), `"the runtime reported a full KV window for this sequence"`,
+    /// `"the runtime refused to run this sequence"`, `"the runtime produced no pooled embedding"`,
+    /// `"the model produced a component that is not a number"`, `"the model produced a zero vector"`, and
+    /// `"the model produced a vector too large to normalise"`.
+    ///
+    /// Two honesty notes, because a list of what can happen invites reading it as a list of what has: **the KV
+    /// window label cannot fire on this artifact** (it has no KV cache — `create_memory` returns null, so
+    /// `llama_decode` diverts to the encoder path, which answers 0 or negative), and the last three normalisation
+    /// labels have never been produced by any input here (§8's "untested" list in the round report says so too).
+    /// They exist because storing such a row is how a search silently returns nothing.
     ///
     /// Not one of them is llama.cpp's diagnostic text, which is §3's fifth class in the abstract and this payload
-    /// rule in practice. If a failure arrives that none of the seventeen describes, the honest move is an
-    /// eighteenth label named for that class — not a wider payload here.
+    /// rule in practice. If a failure arrives that none of the twenty describes, the honest move is a twenty-first
+    /// label named for that class — not a wider payload here.
     #[error("embedding provider unavailable [{0}]")]
     Unavailable(String),
     /// A vector whose component count is not the declared one. `expected` is what was declared

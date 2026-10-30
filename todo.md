@@ -162,18 +162,23 @@ what fails is not a check, because removal makes tests pass.
   zero vector or a non-finite component instead of storing a row that silently scores 0.0 against everything. `LocalEmbedder`
   (`LoadedModel` + a row's two prefixes + budget) implements `Embedder` on the document path; `LocalModelProvider` still answers
   `RuntimeNotBuilt`, because R6c decides who holds ~420 MB and when.
-  **The abort that was found first:** this artifact is non-causal, so v0.8.0 asserts `n_ubatch >= n_tokens`
-  (`src/llama-context.cpp:1920`) and `GGML_ASSERT` → `GGML_ABORT` survives `NDEBUG`. At llama.cpp's default `n_ubatch = 512` a
+  **The abort that was found first:** this artifact is an encoder — `create_memory` returns null for it, so `llama_decode` diverts to the
+  encoder path (`src/llama-context.cpp:1845-1847`; measured: `llama_get_memory(ctx)` is `(nil)`) and *that* asserts `n_ubatch >= n_tokens`
+  (`src/llama-context.cpp:1631`, not the decoder's `:1918`/`:1920`, which never run here). `GGML_ASSERT` → `GGML_ABORT` survives `NDEBUG`.
+  At llama.cpp's default `n_ubatch = 512` a
   **600-token sequence killed the process (exit 134)** — reachable from an ordinary ~1,800-byte note, since `max_tokens` accepts up to
   8,192. `load` now sets `n_ctx = n_batch = n_ubatch = 4096`, and a 633-token decode returns rc=0 with ‖v‖ = 1.0 instead.
-  **Three numbers, all printed by the tests rather than asserted:** ~**130 tok/s** (543 tok in 3.85 s, 2,163 tok in 18.0 s; 392% CPU, so
-  OpenMP-off is not single-threaded — R6d owes the A/B), stripped release size **5.5 MiB → 11.0 MiB** with the feature (**+5.5 MiB** against
+  **Three numbers, none of them asserted** — only throughput is printed by a test (`decode_throughput_is_printed_not_asserted`); size comes
+  from `cargo build --release` plus `nm`, and the RSS curve from `crates/np-core/tests/probes/decode_probe.c`: ~**130 tok/s** (543 tok in
+  3.85 s, 2,163 tok in 18.0 s; 392% CPU because ggml runs its own thread pool — `llama_n_threads_batch` = 4 — so OpenMP-off is not
+  single-threaded, and R6d still owes the A/B), stripped release size **5.5 MiB → 11.0 MiB** with the feature (**+5.5 MiB** against
   §14's ≤ 40 MB ceiling; symbol counts must be taken on the *unstripped* binary, since `strip` removes the table and then "0 llama symbols"
   means nothing), and peak RSS **+0 / +47 / +109 / +218 / +458 MiB** above baseline at 133 / 513 / 1,026 / 2,052 / 4,085 tokens — the compute
   buffer is reserved at init and touched per decode, so long notes cost memory and ordinary chunks cost nothing.
   Semantic sanity is an ordering, not a score: `cos(cat, feline) = 0.8302` vs `cos(cat, revenue) = 0.5887`. Empty input is not an error —
   it embeds BOS+EOS (2 tokens) into a real unit vector, which is what the artifact does rather than a rule we invented.
-  **§5's ceiling question now has a price attached and still needs the human:** at ~130 tok/s, `max_tokens = 8192` means a **63-second worst
-  case for one chunk**, while the default 2,048 means 16 s; and the runtime window is 4,096 today, so anything above that is refused until
+  **§5's ceiling question now has a price attached and still needs the human:** extrapolating the measured rate (which falls with length),
+  `max_tokens = 8192` is roughly a **minute per chunk** — an input the shipped code refuses above 4,096 anyway — while the default 2,048 is a
+  measured ~16 s; and the runtime window is 4,096 today, so anything above that is refused until
   `REQUESTED_CTX` moves — which §14's curve says costs +458 MiB by 4,085 tokens. Still owed: R6c wiring config → provider → `embeddings`
   rows, and R6d's corpus-scale benchmark (batching across texts is deliberately not in this API yet).

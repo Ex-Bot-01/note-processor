@@ -3,8 +3,10 @@
 //! Everything here needs the artifact, because every claim is about what *this* model answers — so each case
 //! prints `NOT COVERAGE` and passes when `NP_TEST_MODEL_PATH` is unset (F18: an absent 310 MB file must not look
 //! like a failure, and must not look like coverage either). No `#[ignore]`, for the reason R6b1's file states: an
-//! ignored test is the silent skip that rule exists to forbid. On a GitHub runner this file contributes nothing
-//! but four printed lines; the vectors, the cosine ordering and the throughput figures are measured locally.
+//! ignored test is the silent skip that rule exists to forbid. On a GitHub runner this file contributes twelve
+//! printed `NOT COVERAGE` lines and the proof that it compiles against the pinned header — every case asks a model
+//! for a vector. That is what `.github/workflows/ci.yml`'s feature row says, and it corrects an earlier claim here
+//! of "four lines", which was true of `local_load.rs` and copied across wrongly.
 //!
 //! ```text
 //! NP_TEST_MODEL_PATH=/path/to/embeddinggemma-2-Q8_0.gguf \
@@ -131,6 +133,9 @@ mod embedding {
             .expect("a 9-token sentence is inside every budget in play");
         let parts = components(&v);
 
+        // Both are pins against a future change rather than independent evidence: `embed_text` copies exactly
+        // `n_embd_out` floats, so nothing here could notice a width the copy itself got wrong. What can fail on its
+        // own is the norm below, plus `tests/local_load.rs` reading 768 out of the model.
         assert_eq!(v.dim(), DIM, "the vector is as wide as the model declares");
         assert_eq!(parts.len(), DIM);
         assert!(
@@ -278,6 +283,8 @@ mod embedding {
         // Measured on this artifact: 23 bytes, **9 tokens** with specials. A byte comparison against a budget of
         // 12 would refuse it; the token count accepts it, which is the whole difference between the two rules.
         let sentence = "The cat sat on the mat.";
+        // A fixture pin, not a claim about tokenizers: if the string is edited, the two numbers below stop meaning
+        // what this case says they mean.
         assert_eq!(sentence.len(), 23);
         assert_eq!(
             model.count_tokens(sentence).expect("counted"),
@@ -313,7 +320,7 @@ mod embedding {
         let _serial = artifact_lock();
         let model = load(&path);
 
-        let note = text_of_about(35); // ~595 tokens of text plus 2 specials
+        let note = text_of_about(35); // measured 633 tokens with specials on this artifact
         let tokens = model.count_tokens(&note).expect("counted");
         assert!(
             tokens > 512 && tokens < 1_024,
@@ -346,19 +353,21 @@ mod embedding {
         let window = model.window();
         assert!(window > 0, "a context with no window cannot embed anything");
 
-        // Grow until the token count passes the window. One `count_tokens` per step rather than one per copy:
-        // tokenizing 4,000 tokens costs milliseconds and the loop runs a handful of times.
+        // Grow until the token count passes the window. The starting point (~5,100 tokens) is already over a
+        // 4,096 window, so this loop normally runs zero times — it exists for a re-pin or a model with a larger
+        // trained window, and the bound that matters sits **after** it, where a failure is possible: an input that
+        // grew past the 8,192 hard ceiling would produce a budget refusal and this case would quietly be testing
+        // the wrong arm. R6b2 review P2-2 caught that guard living inside the loop, where nothing could reach it.
         let mut note = text_of_about(300);
         let mut tokens = model.count_tokens(&note).expect("counted");
         while tokens <= window {
             note.push_str(UNIT);
             tokens = model.count_tokens(&note).expect("counted");
-            assert!(
-                tokens <= 8_192,
-                "the input grew past the 8,192 hard ceiling ({tokens}) before it passed the window \
-                 ({window}); this case would report a budget refusal instead of a window one"
-            );
         }
+        assert!(
+            tokens <= 8_192,
+            "the input reached {tokens} tokens passing a window of {window}, past the 8,192 hard ceiling: this case              would then report a budget refusal rather than the window refusal it names"
+        );
 
         let problem = model
             .embed_text("", &note, 8_192)
@@ -438,6 +447,30 @@ mod embedding {
                 .expect("query path"),
         );
 
+        // `doc != query` alone survives **swapping** the two prefixes (R6b2 review P2-3), and a swap is the
+        // realistic bug: documents embedded under `prefix_doc`, queries under `prefix_query`, both quietly
+        // reversed. So each side is compared against the same text embedded with its prefix spelled out here —
+        // that decides *which* prefix, not merely that they differ.
+        let model = embedder.model();
+        assert_eq!(
+            doc,
+            components(
+                &model
+                    .embed_text("title: ", text, 2_048)
+                    .expect("explicit document prefix")
+            ),
+            "TextKind::Document did not embed under prefix_doc"
+        );
+        assert_eq!(
+            query,
+            components(
+                &model
+                    .embed_text("query: ", text, 2_048)
+                    .expect("explicit query prefix")
+            ),
+            "TextKind::Query did not embed under prefix_query"
+        );
+
         assert_ne!(
             doc, query,
             "both prefixes produced one row: the prefix never reached the model"
@@ -475,12 +508,17 @@ mod embedding {
 
         // Order matters: a scan writes `embeddings` rows keyed by chunk id and never re-reads the text, so a
         // provider that sorted or shuffled its batch would silently attach the wrong vector to each note.
-        let one = embedder.embed(&["first note"]).expect("single");
-        assert_eq!(
-            components(&one[0]),
-            components(&vectors[0]),
-            "the first vector in a batch is the first text's"
-        );
+        // Every position, not just index 0. A provider that sorted or shuffled the tail survives an element-0
+        // check, and R6c keys `embeddings` rows by chunk id from exactly this order — a shuffle would attach the
+        // wrong vector to notes nobody notices were reordered.
+        for (i, text) in texts.iter().enumerate() {
+            let alone = embedder.embed(&[*text]).expect("single");
+            assert_eq!(
+                components(&alone[0]),
+                components(&vectors[i]),
+                "batch position {i} is not the vector this text produces on its own"
+            );
+        }
     }
 
     /// A row whose width disagrees with the loaded handles is refused before anything can be embedded.

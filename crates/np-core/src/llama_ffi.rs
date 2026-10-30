@@ -83,8 +83,12 @@ pub type llama_seq_id = i32;
 /// Field order and types copied from v0.8.0's header. The pointers do not own what they point at:
 /// either they address arrays we allocated ([`llama_batch_init`]) or arrays the caller owns
 /// ([`llama_batch_get_one`]). `logits` is how a batch asks for output per token — v0.8.0 has no
-/// `llama_add_logits` C function; setting `logits[i] = 1` is what marks token *i* as an output, and
-/// `NULL` means "only the last token" (header: "if set to NULL ... only the last token is output").
+/// `llama_add_logits` C function; setting `logits[i] = 1` is what marks token *i* as an output, and `NULL` means
+/// "only the last token is output **if embeddings are disabled**" (`include/llama.h:259-261`). The condition is
+/// load-bearing for this crate: with `embeddings = true` — which is what [`crate::local_model::load`] sets —
+/// `src/llama-context.cpp:1907` forces `output_all`, so every token is an output and a pooled row still arrives
+/// with `logits == NULL`. Drop the "if embeddings" clause from that paraphrase and the next reader could conclude
+/// an embedding run needs a logits array.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct llama_batch {
@@ -313,12 +317,22 @@ extern "C" {
 
     // ---- tokens ---------------------------------------------------------------
 
-    /// Text to tokens. Writes at most `n_tokens_max` entries into `tokens` (caller-owned, and the
-    /// caller must size it: v0.8.0 gives no upper bound other than its own return value).
+    /// Text to tokens. Writes at most `n_tokens_max` entries into `tokens` (caller-owned — and the caller can
+    /// learn the exact size it needs by calling with `n_tokens_max = 0`, which writes nothing and answers with
+    /// that number; `LoadedModel::tokenize` sizes every buffer that way).
     ///
-    /// Returns the count written, or a negative value whose magnitude is how many would have been
-    /// needed — so a negative result is a resize signal, not an error to report as-is. `text` need not
-    /// be NUL-terminated; `text_len` decides. Thread-safe per the header.
+    /// **Three outcomes, and the third is not a resize signal** (`include/llama.h:1271-1273`, implementation
+    /// `src/llama-vocab.cpp:4632-4655`):
+    ///
+    /// * `>= 0` — tokens written, never more than `n_tokens_max`;
+    /// * any other negative value — the buffer was too small and nothing was written; its magnitude is the number
+    ///   of slots needed, **special tokens included**;
+    /// * `i32::MIN` exactly — "INT32_MIN on overflow" (`include/llama.h:1273`), returned at
+    ///   `src/llama-vocab.cpp:4640-4642` **before** the size check, for a result at or past `INT32_MAX` tokens.
+    ///   Negating it overflows and allocating to its magnitude asks for ~8 GiB, so it is a refusal on its own
+    ///   terms; [`crate::local_model`] separates all three with an enum rather than signs for exactly that reason.
+    ///
+    /// `text` need not be NUL-terminated; `text_len` decides. Thread-safe per the header.
     pub fn llama_tokenize(
         vocab: *const llama_vocab,
         text: *const std::ffi::c_char,
@@ -363,12 +377,25 @@ extern "C" {
     /// Run the model over `batch`. Returns 0 on success, 1 when the KV cache is full, and negative on
     /// error (header: on error the memory state is restored).
     ///
+    /// **The `1` needs a context that has a KV cache.** An architecture whose `create_memory` returns null — which
+    /// includes `LLM_ARCH_GEMMA_EMBEDDING2`, `src/llama-model.cpp:2825` — has none: `llama_context::decode` logs
+    /// "cannot decode batches with this context (calling encode() instead)" (`src/llama-context.cpp:1845-1847`) and
+    /// the encoder path answers 0 or negative, asserting on `n_ubatch >= n_tokens` (`:1631`) rather than reporting
+    /// fullness. So callers on such an artifact get a refusal or an abort, never a `1`.
+    ///
     /// Memory: allocates nothing for us to free. The results live in the context's own output buffer
     /// and stay valid until the next [`llama_decode`] or [`llama_free`] on that context.
     pub fn llama_decode(ctx: *mut llama_context, batch: llama_batch) -> i32;
 
-    /// Pooled embedding for one sequence: `n_embd` floats, or null when the context has
-    /// `pooling_type == NONE`.
+    /// Pooled embedding for one sequence — **width depends on the pooling type** (`include/llama.h:1165-1169`):
+    ///
+    /// * `pooling_type == NONE` → null, always;
+    /// * `pooling_type == RANK` → `float[n_cls_out]`, the sequence's rank(s), where `n_cls_out` is a header value
+    ///   that defaults to **1** (`src/llama-hparams.h:253`) — **not** `n_embd`;
+    /// * anything else (MEAN / CLS / LAST) → `float[n_embd]`, one-dimensional.
+    ///
+    /// Reading a RANK row at `n_embd` floats is an over-read of the context's buffer, which is why
+    /// [`crate::local_model::load`] refuses RANK instead of modelling it as another sentence vector.
     ///
     /// Memory: owned by `ctx`, invalidated by the next [`llama_decode`] on the same context. Copy what
     /// you need; never store the pointer and never free it.
