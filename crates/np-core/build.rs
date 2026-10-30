@@ -113,7 +113,7 @@ fn link_pinned_llama() -> Result<(), String> {
 
     let cmake = cmake_command()?;
     let build_dir = choose_build_dir(&source, &out_dir);
-    configure(&cmake, &source, &build_dir, &pin)?;
+    configure(&cmake, &source, &build_dir, &out_dir, &pin)?;
     compile(&cmake, &build_dir)?;
     emit_link_flags(&build_dir)
 }
@@ -222,7 +222,9 @@ fn version_of_tag(tag: &str) -> Result<(u8, u8, u8), String> {
 /// Value of `set(<name> <value>)` in a CMakeLists file, or None when absent.
 fn cmake_set_value(text: &str, name: &str) -> Option<String> {
     let prefix = format!("set({name}");
-    let line = text.lines().find(|line| line.trim_start().starts_with(&prefix))?;
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with(&prefix))?;
     let after = line[line.find(&prefix)? + prefix.len()..].trim_start();
     Some(after.split([')', ' ', '\t']).next()?.to_string())
 }
@@ -265,11 +267,59 @@ fn choose_build_dir(source: &Path, out_dir: &Path) -> PathBuf {
     out_dir.join(format!("llama-cpp-{}", TARGET))
 }
 
+/// Two paths name one directory when both exist and resolve the same — `/tmp` behind a symlink is ordinary on
+/// macOS, and a trailing separator is ordinary in an environment variable.
+fn same_directory(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Configure unless the cache already says what the pin asks for. A cache that disagrees is
 /// reconfigured rather than trusted: linking a tree built with different options (shared libs, or
 /// curl on) would put bytes in `np` that nothing in this repository chose.
-fn configure(cmake: &OsString, source: &Path, build_dir: &Path, pin: &Pin) -> Result<(), String> {
-    let cache = read_cache(&build_dir.join("CMakeCache.txt"));
+fn configure(
+    cmake: &OsString,
+    source: &Path,
+    build_dir: &Path,
+    out_dir: &Path,
+    pin: &Pin,
+) -> Result<(), String> {
+    let mut cache = read_cache(&build_dir.join("CMakeCache.txt"));
+
+    // **A cmake cache remembers which source tree it was generated from, and refuses another.** Pointed at a
+    // different `-S` it fails with "does not match the source … used to generate cache", so switching between
+    // `.vendor/llama.cpp-<tag>` and `NP_LLAMA_CPP_SRC` — the two ways this build is legitimately reached, and the
+    // difference between a CI cache and a developer's tree — would break the build with an error that names
+    // neither cause nor cure. Wipe the directory cargo owns and configure fresh; never touch someone else's build
+    // tree without saying so.
+    if let Some(found) = cache.get("CMAKE_HOME_DIRECTORY") {
+        let cached = Path::new(found);
+        if !same_directory(cached, source) {
+            if !build_dir.starts_with(out_dir) {
+                return Err(format!(
+                    "{} was configured for {} and is not inside cargo's OUT_DIR, so this build script \n  \
+                     will not delete it. Remove that directory (it is generated), or point NP_LLAMA_CPP_SRC \n  \
+                     back at {found}.",
+                    build_dir.display(),
+                    cached.display()
+                ));
+            }
+            eprintln!(
+                "np-core: {} holds a cache generated for {}; wiping it to configure {}",
+                build_dir.display(),
+                cached.display(),
+                source.display()
+            );
+            fs::remove_dir_all(build_dir)
+                .map_err(|e| format!("cannot wipe {}: {e}", build_dir.display()))?;
+            cache.clear();
+        }
+    }
     let stale: Vec<String> = pin
         .options
         .iter()
@@ -434,7 +484,7 @@ fn find_archive(build_dir: &Path, name: &str) -> Result<PathBuf, String> {
                 if file_name != "CMakeFiles" {
                     queue.push(path);
                 }
-            } else if names.iter().any(|wanted| *wanted == file_name) {
+            } else if names.contains(&file_name) {
                 found.push(path);
             }
         }
@@ -474,19 +524,29 @@ impl Pin {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some(name) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+            if let Some(name) = line
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
                 section = Some(name.to_string());
                 continue;
             }
-            let (key, value) = line
-                .split_once('=')
-                .ok_or_else(|| format!("{}:{number}: not a `key = \"value\"` line: {line}", path.display()))?;
+            let (key, value) = line.split_once('=').ok_or_else(|| {
+                format!(
+                    "{}:{number}: not a `key = \"value\"` line: {line}",
+                    path.display()
+                )
+            })?;
             let value = value.trim();
             let value = value
                 .strip_prefix('"')
                 .and_then(|rest| rest.strip_suffix('"'))
                 .ok_or_else(|| {
-                    format!("{}:{number}: {} must be a quoted string on one line: {line}", path.display(), key.trim())
+                    format!(
+                        "{}:{number}: {} must be a quoted string on one line: {line}",
+                        path.display(),
+                        key.trim()
+                    )
                 })?;
             match section.as_deref() {
                 None if key.trim() == "tag" => tag = Some(value.to_string()),

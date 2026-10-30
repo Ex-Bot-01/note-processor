@@ -213,7 +213,10 @@ extern "C" {
     ///
     /// Memory: owned by us; free with [`llama_free`]. `model` must outlive the context — llama.cpp
     /// stores the pointer and does not retain it.
-    pub fn llama_init_from_model(model: *mut llama_model, params: llama_context_params) -> *mut llama_context;
+    pub fn llama_init_from_model(
+        model: *mut llama_model,
+        params: llama_context_params,
+    ) -> *mut llama_context;
 
     /// Free a context from [`llama_init_from_model`] (and with it its KV cache and output buffers —
     /// every pointer handed out by [`llama_get_embeddings_seq`] dies here).
@@ -310,7 +313,11 @@ mod layout {
 
     #[test]
     fn batch_layout_matches_the_pinned_header() {
-        assert_eq!(size_of::<*mut u8>(), 8, "these constants are the 64-bit layout");
+        assert_eq!(
+            size_of::<*mut u8>(),
+            8,
+            "these constants are the 64-bit layout"
+        );
         assert_eq!(size_of::<llama_batch>(), 56);
         assert_eq!(align_of::<llama_batch>(), 8);
         // `n_tokens` is an i32 followed by pointers, so 4 bytes of padding must appear at offset 4.
@@ -325,7 +332,11 @@ mod layout {
 
     #[test]
     fn model_params_layout_matches_the_pinned_header() {
-        assert_eq!(size_of::<*mut u8>(), 8, "these constants are the 64-bit layout");
+        assert_eq!(
+            size_of::<*mut u8>(),
+            8,
+            "these constants are the 64-bit layout"
+        );
         assert_eq!(size_of::<llama_model_params>(), 80);
         assert_eq!(align_of::<llama_model_params>(), 8);
         assert_eq!(offset_of!(llama_model_params, devices), 0);
@@ -338,7 +349,10 @@ mod layout {
         assert_eq!(offset_of!(llama_model_params, main_gpu), 32);
         assert_eq!(offset_of!(llama_model_params, tensor_split), 40);
         assert_eq!(offset_of!(llama_model_params, progress_callback), 48);
-        assert_eq!(offset_of!(llama_model_params, progress_callback_user_data), 56);
+        assert_eq!(
+            offset_of!(llama_model_params, progress_callback_user_data),
+            56
+        );
         assert_eq!(offset_of!(llama_model_params, kv_overrides), 64);
         // The six bools are packed at the tail: 72..77, and the struct rounds up to 80.
         assert_eq!(offset_of!(llama_model_params, vocab_only), 72);
@@ -347,7 +361,11 @@ mod layout {
 
     #[test]
     fn context_params_layout_matches_the_pinned_header() {
-        assert_eq!(size_of::<*mut u8>(), 8, "these constants are the 64-bit layout");
+        assert_eq!(
+            size_of::<*mut u8>(),
+            8,
+            "these constants are the 64-bit layout"
+        );
         assert_eq!(size_of::<llama_context_params>(), 168);
         assert_eq!(align_of::<llama_context_params>(), 8);
         assert_eq!(offset_of!(llama_context_params, n_ctx), 0);
@@ -379,7 +397,10 @@ mod layout {
     /// C struct that is copy-by-value, every one of those calls would be a silent memory bug.
     #[test]
     fn batch_is_passed_by_value_as_a_plain_copied_struct() {
-        assert!(!std::mem::needs_drop::<llama_batch>(), "a by-value FFI struct cannot own anything");
+        assert!(
+            !std::mem::needs_drop::<llama_batch>(),
+            "a by-value FFI struct cannot own anything"
+        );
         let copied: llama_batch = llama_batch {
             n_tokens: 1,
             token: std::ptr::null_mut(),

@@ -55,3 +55,11 @@ LLAMA_BUILD_TOOLS = "OFF"
 LLAMA_BUILD_EXAMPLES = "OFF"
 LLAMA_BUILD_APP = "OFF"
 LLAMA_BUILD_UI = "OFF"
+
+# OpenMP off: the release artifact is one self-contained binary. Left at llama.cpp's default (ON) the
+# link line gains `-l dylib=gomp`, and a user on a machine without libgomp.so.1 gets a loader error at
+# exec time — which is a prototype-killer on a clean host, and silent until someone runs it there.
+# The cost is CPU tensor throughput on some ops; R6d measures it against the benchmark, and flipping
+# this one line back to ON (or shipping libgomp in the tarball) is that round's decision to make with
+# numbers rather than this one's guess. Measured here: build.rs no longer emits a gomp link line.
+GGML_OPENMP = "OFF"

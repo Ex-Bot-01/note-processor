@@ -4,16 +4,20 @@ version.workspace = true
 edition.workspace = true
 
 # `local-model` is the gate the local inference runtime lives behind
-# (`docs/design-m2-local-embeddings.md` §2, §6). It declares no dependency and gates no code **yet**,
-# which is the point of landing it in R6a: R6b0 adds the pinned `llama-cpp-2` binding under this name,
-# and a default `cargo test --workspace` must never grow a C++ build or a new required dependency
-# (§2's "Feature-gating (`np-core/local-model`) keeps default `cargo test --workspace` free of a C++
-# build"). The seam itself — `embed::LocalModelProvider` — compiles in the default build on purpose, so
-# CI and callers exercise the API while the runtime is still being chosen (§9 item 1).
+# (`docs/design-m2-local-embeddings.md` §2, §6, §14). It still declares no dependency crate — §14 chose
+# hand-written FFI over the pinned Rust binding precisely to avoid bindgen and its build-dependencies.
+# What it now gates is real: `build.rs` compiles the pinned llama.cpp (`third_party/llama-cpp.toml`) and
+# `src/llama_ffi.rs` mirrors that revision's C API. So the honest statement of the cost has changed:
+# with the feature off, nothing; with it on, a cmake + C++ toolchain and a source tree that
+# `scripts/vendor-llama-cpp.sh` fetched — neither of which the default build may ever need (§2's promise,
+# proven by the default gate list running with no cmake on PATH).
 #
-# `cargo check --locked -p np-core --features local-model` is therefore a per-OS compile fence today
-# (§6: "One CI step per OS row") and becomes the fence that *matters* the moment R6b0 puts weights code
-# behind it. Release builds keep it off until a Windows build of it has been recorded in CI once (§2).
+# The seam itself — `embed::LocalModelProvider` — still compiles in the default build on purpose, so
+# callers and CI exercise the API without paying for inference (§9 item 1).
+#
+# `cargo check --locked -p np-core --features local-model` is the fence that matters now, and it runs on
+# the Linux row only until someone has watched it go green elsewhere (§14's per-OS honesty). Release
+# builds keep the feature off until a Windows build of it is recorded in CI once (§2).
 [features]
 default = []
 local-model = []

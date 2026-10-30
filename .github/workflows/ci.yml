@@ -39,3 +39,47 @@ jobs:
       # regression in `items` or `links` cannot land unmeasured.
       - name: Release tests
         run: cargo test --locked --release -- --ignored
+
+  # The `local-model` row that design-m2-local-embeddings.md §2 promised, now that there is something
+  # behind the feature to rot. A feature nothing compiles is invisible in exactly three ways - clippy
+  # lints inside `cfg(feature)`, rustdoc warnings in gated docs, and tests whose early return looks like
+  # a pass - and this job is what makes each of those fail loudly instead.
+  #
+  # Linux only, on purpose. §14 measured the C++ build here (23 s for target `llama`) and has seen
+  # nothing on Windows or macOS, so adding those rows would put a claim in YAML that nobody has watched
+  # happen - F18's mistake with a different noun. The Windows feature row lands when someone has seen it
+  # green, and §2 keeps release binaries on the feature off until then.
+  #
+  # Honest caveat: GitHub Actions is currently down account-side (2026-10-29), so none of this has run
+  # in CI yet. It was written and executed locally, gate for gate; treat the first green run as evidence
+  # still owed, not as coverage already banked.
+  feature-local-model:
+    name: Feature local-model (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain components
+        run: rustup component add clippy rustfmt
+      # The one network step in this repository's build. Cached on the pin file itself, because that is
+      # where the sha256 lives: re-pinning changes the key by construction, so a tree fetched for one
+      # digest can never be reused as another. The script is idempotent, so a cache miss costs one 38.7 MB
+      # download rather than a stale-tree surprise - it verifies the digest before unpacking anything.
+      - name: Cache the pinned llama.cpp source
+        uses: actions/cache@v4
+        with:
+          path: .vendor
+          key: llama-cpp-${{ hashFiles('third_party/llama-cpp.toml') }}
+      - name: Vendor llama.cpp
+        run: ./scripts/vendor-llama-cpp.sh
+      # cmake is preinstalled on ubuntu-latest; `build.rs` honours a `CMAKE` override for hosts where it
+      # is not, and refuses with that name if it cannot find one at all.
+      - name: Check
+        run: cargo check --locked -p np-core --features local-model
+      - name: Clippy
+        run: cargo clippy --locked -p np-core --features local-model --all-targets -- -D warnings
+      # `--lib` alongside the link-proof test: the struct-layout pins in `src/llama_ffi.rs` only compile
+      # with the feature on, and a wrong field order is an unsound memory bug rather than a compile
+      # error. §2 step 4 wants skipped work printed as `NOT COVERAGE`; nothing here may skip - the link
+      # proof has no artifact gate and no env-var escape, so a green run means llama.cpp was called.
+      - name: Link proof
+        run: cargo test --locked -p np-core --features local-model --lib --test local_runtime
