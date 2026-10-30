@@ -2,7 +2,9 @@
 //!
 //! Design authority is `docs/design-m2-local-embeddings.md` **§6** (the command), **§7** (verification and the
 //! caveat line) and **§9.5**. This module holds every decision behind `np embed`; `np-cli` parses argv and
-//! prints, exactly as it does for [`crate::scan`].
+//! prints, exactly as it does for [`scan`](mod@crate::scan). *(The `mod@` is needed here and nowhere else in this
+//! crate: `lib.rs` re-exports the **function** `scan` at the root beside the module of the same name, so a bare
+//! `[`crate::scan`]` in a module header is ambiguous to rustdoc — which fails the `--deny warnings` doc gate.)*
 //!
 //! What it is, in one paragraph: read the chunks the scan already cut, decide which of them are *owed* a
 //! vector for the configured model, hand the owed ones to an [`Embedder`] in bounded batches, and store what
@@ -15,7 +17,7 @@
 //! - **Currency is per-row and liveness-fenced** ([`db::live_chunks`] joins `files.state = 'ok'`, backlog D3):
 //!   a stale note's chunks are never owed, so this command cannot be the thing that computes vectors for a
 //!   deleted file's text and reports them current.
-//! - **The stamp is the digest of the bytes handed to the model** (backlog D4). [`Owed::digest`] is taken over
+//! - **The stamp is the digest of the bytes handed to the model** (backlog D4). Each owed chunk carries the digest of
 //!   `prefix_doc + chunk text` — the same string passed to [`Embedder::embed`] — and [`db::vectors_for`] reads
 //!   that value back for the comparison. Changing `prefix_doc` therefore makes every stored vector stale, which
 //!   is the point: a vector made from different bytes is not the same fact.

@@ -2236,7 +2236,8 @@ pub fn live_chunks(db: &Db) -> Result<Vec<LiveChunk>, DbError> {
 pub struct LiveChunk {
     /// `chunks.id`, the key `embeddings.chunk_id` references.
     pub id: i64,
-    /// The stored BLOB. Still bytes, for the reason [`StoredChunk::text`] gives: this column holds note text
+    /// The stored BLOB. Still bytes, for the reason `Owed::input` in [`crate::embed_run`] gives for its copy of
+    /// these bytes: this column holds note text
     /// and makes no UTF-8 promise.
     pub text: Vec<u8>,
 }
