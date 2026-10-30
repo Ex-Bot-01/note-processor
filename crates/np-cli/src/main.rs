@@ -13,10 +13,14 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
+use np_core::catalog::size_human;
 use np_core::config::Config;
 use np_core::db::{orphan_total, Db};
 use np_core::hash::sha256_file;
-use np_core::models::{self, Install, ListedModel, Listing, ModelError, Unclaimed, UnclaimedKind};
+use np_core::models::{
+    self, FetchEntry, FetchState, Install, ListedModel, Listing, ModelError, Unclaimed,
+    UnclaimedKind,
+};
 use np_core::scan::{scan, ScanReport};
 use serde_json::{json, Value};
 
@@ -333,7 +337,12 @@ fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     match models::list(&db, &config, workspace) {
         Ok(listing) => {
             if json {
-                emit_json(&listing_json(&listing.models, &listing.unclaimed, None));
+                emit_json(&listing_json(
+                    &listing.models,
+                    &listing.fetching,
+                    &listing.unclaimed,
+                    None,
+                ));
             } else {
                 print_listing(&listing);
             }
@@ -341,7 +350,7 @@ fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
         }
         Err(err @ ModelError::ModelsDir { .. }) => {
             if json {
-                emit_json(&listing_json(&[], &[], Some(&err.to_string())));
+                emit_json(&listing_json(&[], &[], &[], Some(&err.to_string())));
             }
             Err(err.into())
         }
@@ -355,13 +364,22 @@ fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
 /// The three top-level names and the seven per-row names are §3's, pinned by a test that compares the whole
 /// set rather than looking one key up — `state` or `unclaimed` renamed must fail here, not in a reader written
 /// against the old spelling.
+///
+/// **`fetching` is a deliberate protocol change**, added by R7a under `design-m2-local-embeddings.md` §12 rule 3:
+/// a fetch is orthogonal to the four `ArtifactState` verdicts (first start has no row at all, and a present row
+/// can be re-fetching), so it gets a listing-level section beside `unclaimed` rather than a fifth arm. The key
+/// set is pinned precisely so that adding it had to fail a test — and did.
 fn listing_json(
     models: &[ListedModel],
+    fetching: &[FetchEntry],
     unclaimed: &[Unclaimed],
     models_dir_error: Option<&str>,
 ) -> Value {
     json!({
         "models": models.iter().map(model_json).collect::<Vec<Value>>(),
+        // One entry per marker file, ordered by id by `np_core::models::list`. Empty on every state where no
+        // marker was found — including the directory-level failure below, where nothing could be looked at.
+        "fetching": fetching.iter().map(fetch_json).collect::<Vec<Value>>(),
         "unclaimed": unclaimed
             .iter()
             .map(|entry| json!({ "name": entry.name, "kind": unclaimed_kind(entry.kind) }))
@@ -387,6 +405,36 @@ fn model_json(model: &ListedModel) -> Value {
     })
 }
 
+/// One fetch under `--json`, in **one shape for every state** — the `models_dir_error` precedent, applied one
+/// level down.
+///
+/// The four marker fields are present-and-null when the file would not parse, and `marker_error` carries why.
+/// Suppressing the field keys on that arm would cost every reader a missing-key branch to answer a question null
+/// already answers, and a reader branching on "is `nonce` there?" is a reader that guesses at why it is not.
+///
+/// `path` is here because §12 rule 4's advice — "if no fetch is running, delete this file and re-run" — cannot be
+/// followed from an id alone: the artifact directory's own name is a hash of the workspace path.
+fn fetch_json(entry: &FetchEntry) -> Value {
+    let (fields, marker_error) = match &entry.state {
+        FetchState::Present(fields) => (Some(fields), None),
+        FetchState::Unreadable { reason, .. } => (None, Some(reason.as_str())),
+        // `list` drops these entries (`np_core::models::FetchEntry::state` says why), so the null row below is
+        // unreachable from this command rather than a state a reader can see.
+        FetchState::Absent => (None, None),
+    };
+    json!({
+        "id": entry.id,
+        "path": entry.path.to_string_lossy(),
+        "nonce": fields.map(|fields| fields.nonce.as_str()),
+        "started_at": fields.map(|fields| fields.started_at),
+        "bytes_done": fields.map(|fields| fields.bytes_done),
+        // Null means "this fetch never announced a size" (§12 rule 12) — never zero, which would be a
+        // denominator this program invented.
+        "bytes_total": fields.map(|fields| fields.bytes_total),
+        "marker_error": marker_error,
+    })
+}
+
 /// The two words §3 needs from an unclaimed entry: a subdirectory has to be **reported as one**, which is why
 /// an entry is an object rather than a bare name in JSON and carries the word in text.
 fn unclaimed_kind(kind: UnclaimedKind) -> &'static str {
@@ -396,7 +444,8 @@ fn unclaimed_kind(kind: UnclaimedKind) -> &'static str {
     }
 }
 
-/// The human-readable listing: a count line, one line per model, then the unclaimed section.
+/// The human-readable listing: a count line and one line per model, any fetch-in-progress lines, then the
+/// unclaimed section.
 ///
 /// The shape follows `print_summary`'s — aligned label columns, then indented detail lines under a count — so
 /// the two commands read alike, and the counts arrive even when there is nothing to list ("looked and found
@@ -427,9 +476,57 @@ fn print_listing(listing: &Listing) {
             model.row.prefix_query,
         );
     }
+    // One line per fetch in progress, and **no section header**: `models` and `unclaimed` print their counts even
+    // when empty because "looked and found none" must not read as "printed nothing", while a fetch line is an
+    // event — R7a's brief asks for nothing extra when nothing is fetching, so an idle workspace prints exactly
+    // what it printed before this section existed.
+    let count = listing.fetching.len();
+    for entry in &listing.fetching {
+        let _ = writeln!(out, "{}", fetch_line(count, entry));
+    }
     let _ = writeln!(out, "unclaimed  {}", listing.unclaimed.len());
     for entry in &listing.unclaimed {
         let _ = writeln!(out, "  {}  {}", entry.name, unclaimed_kind(entry.kind));
+    }
+}
+
+/// One fetch's line: `{n} fetch in progress · {id} ({what the marker says})`.
+///
+/// The count rides on every line rather than heading a block because that is the shape R7a pins — one line per
+/// fetch, readable on its own when someone greps stdout for `fetch`. With two fetches running the number repeats
+/// and stays true; `tests/models_cli.rs` pins both the singular and the plural so this is a decision on the
+/// record rather than an accident of the one case that was written down.
+///
+/// Byte sizes come from [`size_human`], the catalog's one formatter. A second formatter here would be two answers
+/// to "how big is it" — the reason `CatalogEntry::size_human` is pre-formatted by its caller rather than rendered
+/// twice.
+fn fetch_line(count: usize, entry: &FetchEntry) -> String {
+    let plural = if count == 1 { "fetch" } else { "fetches" };
+    let head = format!("{count} {plural} in progress · ");
+    match &entry.state {
+        FetchState::Present(fields) => {
+            let done = size_human(fields.bytes_done);
+            // No denominator invented: an unknown total says so in words, which is §12 rule 12's whole point — a
+            // reader who sees `41.9 MB / 0.0 MB` would divide by it.
+            let progress = match fields.bytes_total {
+                Some(total) => format!("{done} / {}", size_human(total)),
+                None => format!("{done}, size unknown"),
+            };
+            format!(
+                "{head}{} (started {}, {progress})",
+                entry.id, fields.started_at
+            )
+        }
+        // The path belongs in this line and only this line: it is the file the human has to find, whereas a
+        // readable marker needs nothing done to it.
+        FetchState::Unreadable { reason, .. } => format!(
+            "{head}{} (unreadable marker {}: {reason})",
+            entry.id,
+            entry.path.display()
+        ),
+        // Unreachable through `list`, which drops a vanished marker rather than reporting it; the fields are
+        // printed as-is so that a future caller reaching here sees a line, not a panic.
+        FetchState::Absent => format!("{head}{} (marker gone)", entry.id),
     }
 }
 
