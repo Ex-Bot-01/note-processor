@@ -10,6 +10,11 @@ pub mod hash;
 pub mod index_names;
 pub mod items;
 pub mod links;
+// The FFI mirror of the pinned llama.cpp header, compiled only when something exists to link it to:
+// `build.rs` hands the linker four static archives under this feature and refuses to build a source
+// tree that is not the pin (`docs/design-m2-local-embeddings.md` §14).
+#[cfg(feature = "local-model")]
+pub mod llama_ffi;
 pub mod models;
 pub mod parse;
 pub mod path_keys;
