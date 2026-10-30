@@ -5,7 +5,7 @@
 //! and the numbers it answers with are the numbers in that file's header. Nothing here tokenizes, decodes,
 //! pools or produces a vector — that is R6b2, and until it lands
 //! [`LocalModelProvider`](crate::embed::LocalModelProvider) still answers
-//! [`EmbedError::RuntimeNotBuilt`](crate::embed::EmbedError::RuntimeNotBuilt). This loader sits **beside**
+//! [`EmbedError::RuntimeNotBuilt`]. This loader sits **beside**
 //! that provider on purpose: `embed` is a contract about vectors, and bolting a half-built forward pass onto
 //! it would either lie about the batch or turn the seam's one honest refusal into a partial one.
 //!

@@ -141,3 +141,14 @@ what fails is not a check, because removal makes tests pass.
   `LLM_ARCH_GEMMA_EMBEDDING` but **not** `GEMMA_EMBEDDING2`, `build.rs` has no source override (always cmake), and this host has no `cmake` and
   no root. Full evidence and the three shapes with prices: `docs/design-m2-local-embeddings.md` §13. **Waiting on the human**: prototype with
   EmbeddingGemma-300M today, or pay for a self-built llama.cpp to keep EmbeddingGemma-2.
+
+- **R6b1 shipped (`local-model`, loader only — no tokenizing, no decode, no vectors):** `crates/np-core/src/local_model.rs` loads a GGUF through our
+  own FFI into a `LoadedModel` (two handles, one `Drop` order: `llama_free` then `llama_model_free`) and reports what the artifact answers. The
+  largest unknown in the prototype is now dead: **v0.8.0 loads `embeddinggemma-2-Q8_0.gguf` on this host** — `n_embd_out 768`, `n_embd_inp 512`,
+  `n_ctx_train 262144`, `n_vocab 262144`, pooling MEAN read from metadata and not overridden, `add_bos` **and** `add_eos` both true (R6b2's token
+  count budgets two specials). Cost of opening it here: **0.35 s warm / 0.42 s after evicting the page cache, peak RSS ≈ 420 MB** in a bare C probe
+  against our archives (≈ 526 MB inside the Rust test binary), and three load-and-drop cycles in one process neither grow the peak nor crash.
+  The declared-vs-actual width debt is closed at the only place it can be: `load(path, configured_dim)` refuses against `llama_model_n_embd_out`, so
+  declaring 512 against this file names both numbers before a context exists. `tests/local_load.rs` is artifact-gated on `NP_TEST_MODEL_PATH` and
+  prints `NOT COVERAGE` without it — the CI feature row proves the refusals, not the 768. Still owed by R6b2: tokenize → batch → decode → pool,
+  `max_tokens` enforcement over two specials, and §5's open question about a 262,144-token trained window against an 8,192 ceiling.

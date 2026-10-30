@@ -138,6 +138,11 @@ worth keeping in plain sight, because it is why the number was ever contested:
   8,192 in R6b2 alongside the enforcement test, not silently left generous. (`max_position_embeddings = 262144` in
   `config.json` is a RoPE/train-length property, not a usable embedding window; §5's refusal posture does not depend on which
   of the two numbers you read.)
+  **Annotated by R6b1 (2026-10-30), because this sentence is stale and I would rather mark it than let the next round re-derive
+  it:** the tightening already landed — `crates/np-core/src/config.rs` declares `MAX_EMBEDDING_TOKENS: usize = 8_192`, which is
+  §9's pre-round row, not R6b2's. What R6b2 still owes is the enforcement test over prefix + text + specials, not the constant.
+  The R6b1 brief repeated this document's 32 768-era framing as "conflicts with `MAX_EMBEDDING_TOKENS = 8_192`"; the code half of
+  that was already true and the prose half was not.
 - **Whole model = two files, and they do carry both encoders — measured, not assumed.** The card describes 740M parameters:
   a 270M text backbone plus selectively loadable vision (170M) and audio (300M) encoders into one 768-d space. In GGUF that is
   `embeddinggemma-2-Q8_0.gguf` (309.9 MB) **plus** `mmproj-embeddinggemma-2-Q8_0.gguf` (554.8 MB) = **864.7 MB**. A design
@@ -179,6 +184,37 @@ posture stays refuse-loudly:
 
 Query-time prefixes belong to phase 2; `install`'s `--prefix-doc/--prefix-query` are stored now so the row is complete
 when that round needs them.
+
+### The artifact's own header, measured (R6b1, 2026-10-30)
+
+Until R6b1 every number above was a citation from a model card or a `config.json`. `crates/np-core/src/local_model.rs` now reads
+the shipped GGUF through the pinned runtime's own accessors, and both readings — parsing the file's KV section directly, and
+loading it through llama.cpp v0.8.0 — agree. Artifact: `/home/agent/models/embeddinggemma-2-Q8_0.gguf`, **309,855,456 bytes**,
+`sha256 = 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135`, GGUF v3, 413 tensors, `general.file_type = 7` (Q8_0),
+46 KV pairs.
+
+| Header key | Measured value | What it decides here |
+| --- | --- | --- |
+| `general.architecture` | `gemma-embedding2` | the reason v0.8.0 is the pin; the tree really does resolve it — the load succeeds |
+| `gemma-embedding2.embedding_length` | 512 | internal width, and what `llama_model_n_embd_inp` answers. **Not** the stored width |
+| `gemma-embedding2.embedding_length_out` | **768** | what `llama_model_n_embd_out` answers, and therefore what a declared width is compared against (§6's refusal) |
+| `gemma-embedding2.context_length` | **262,144** | `llama_model_n_ctx_train`. The open question below — it is *not* our ceiling |
+| `gemma-embedding2.pooling_type` | 1 (MEAN) | the context resolves `UNSPECIFIED` to this, so we read it and never override it; a context answering `NONE` is refused as "cannot produce a sentence vector" |
+| `gemma-embedding2.attention.causal` | `false` (BOOL) | bidirectional, as an embedding model needs |
+| `tokenizer.ggml.model` | `gemma4` | v0.8.0 knows the pre-tokenizer type; R6b2 gets tokens out of this vocabulary |
+| `tokenizer.ggml.add_bos_token` / `add_eos_token` | **true / true** | R6b2's token count must budget **two** specials, not one — the case §5's "prefix + chunk + special tokens" line keeps threatening to get wrong |
+| `tokenizer.ggml.tokens` | 262,144 entries | `llama_vocab_n_tokens`; valid ids are `0..262_144` |
+| `gemma-embedding2.block_count` | 24 | sanity only (`n_layer`) |
+| `general.size_label` | `271M` | the "300M" of older prose is the family, not this file (§13's price list) |
+
+**Open question, kept open — it is not this round's decision and no code changed because of it.** The artifact declares a trained
+window of **262,144 tokens** while `MAX_EMBEDDING_TOKENS` is **8,192** (itself taken from the model card's usable embedding window,
+above). So the ceiling we refuse at is ~32× below what the file claims it was trained for, and one of three things is true: the card
+is right and the GGUF's `context_length` is a RoPE train-length nobody can spend on an embedding; or the window really is usable
+and 8,192 leaves recall on the table for long notes; or the number is aspirational and llama.cpp would refuse or degrade long before
+it. Nothing measured today distinguishes these — R6b1 loads the file and never submits a token, so it has no evidence to trade, and
+`ModelFacts::n_ctx_train` deliberately reports the artifact's number next to (not instead of) our own bound. Whoever runs a long-note
+case in R6b2/R6d should record which of the three it was, and until then `max_tokens` stays inside 8,192.
 
 ## 6. `np embed <workspace>`: what it writes, and what it must never do
 
@@ -607,6 +643,32 @@ Three independent reasons, each verified rather than recalled:
 - **Per-OS honesty.** Linux is proven here (23 s build). Windows and macOS are *not* claimed: MSVC needs `LLAMA_STATIC_CRT` thought-through
   and the release matrix builds it; §2's four-step feature job runs on Linux first, and the Windows feature row lands when someone has seen it
   green — F18's rule, unchanged.
+
+### What it costs to open the model (R6b1, measured 2026-10-30)
+
+§13 priced the *package*; nobody had priced the *act of loading*, which is the number a laptop user actually feels. Measured on this
+host (7.4 GB total, ~6 GB available, no swap) against the artifact of §5's table, through the archives this section's build produces:
+
+| Fact | Value | How |
+| --- | --- | --- |
+| Load, warm page cache | **0.35 s** (0.30 s on repeat loads) | `llama_model_load_from_file` timed around one call |
+| Load, after evicting the artifact from the page cache | **0.42 s** | `posix_fadvise(POSIX_FADV_DONTNEED)` first, then the same call — so the disk read is ≈ 0.07 s of it |
+| Peak RSS, bare C loader probe | **429,504–431,760 kB (≈ 420 MB)**; 391 MB resident with the model open, 104 MB after both frees | `VmHWM` in `/proc/self/status`, and `/usr/bin/time -v` agreeing to within 256 kB |
+| Peak RSS, our own test process, loads serialized | **431,268 kB**; one load moves resident memory **130,832 → 417,124 kB** | the same field read by `tests/local_load.rs` and printed with `--nocapture --test-threads=1` — i.e. the Rust side costs nothing over the C probe |
+| The same suite on libtest's default threads | **538,560 kB**, ~107 MB higher | two artifact cases in flight share one process-wide `VmHWM`. Measured first, then fixed by holding a mutex across loads: an unattributed peak is a worse number than a serialized one |
+| Three load-and-drop cycles in one process | peak moves **+232 kB** total, no growth per round, no crash | `loading_and_dropping_three_times_costs_the_same_each_time`, serialized run |
+| Context on top of the model | **+1.8 MB** resident at `n_ctx = 4096` | same probe; the KV cache is not what dominates — the weights are |
+
+Two readings worth writing down. First, **~420 MB to open a model is a real prototype constraint** — it is not the 40 MB package ceiling
+this section argued about, and on an 8 GB laptop with a browser open it is the difference between "indexes in the background" and "swap
+begins". R6d's benchmark should treat peak RSS as a headline number beside tokens/sec, and §3's "one load per process, never per note"
+went from a tidiness rule to the thing keeping the host responsive. Second, resident memory moves *with* the open model rather than with
+the number of loads: it falls back to 104 MB after both frees — most of what the load touched is handed back, though not down to the ~5 MB
+the probe started with — and the second and third loads peak where the first did. So a process that loads once pays once, and one that
+loads repeatedly neither grows nor leaks, which is the behaviour §3's "one load per process" rule was written assuming.
+
+Not claimed: any of this on Windows or macOS (§14's per-OS rule — the feature does not build there), and no claim about what R6b2's
+decode will add on top. This round never calls `llama_decode`.
 
 ### What this decides about §5's amendments
 
