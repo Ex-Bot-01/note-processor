@@ -194,6 +194,11 @@ struct Fake {
     /// When non-zero, every call from this 1-based index on refuses with [`EmbedError::RuntimeNotBuilt`] —
     /// the interrupted run.
     fail_from: usize,
+    /// When set, a batch of N texts is answered with **N − 1** vectors: the shape mismatch `paired` refuses.
+    short_answer: bool,
+    /// When set, the fake still *declares* [`FAKE_DIM`] but produces vectors one component wider — a provider
+    /// lying about its own width, which only the per-vector check inside the writer can catch.
+    lies_about_dim: bool,
     calls: AtomicUsize,
 }
 
@@ -217,6 +222,24 @@ impl Fake {
     fn with_dim(dim: usize) -> Self {
         Self {
             dim,
+            ..Self::default()
+        }
+    }
+
+    /// A fake that answers a multi-text batch with one vector fewer than it was handed.
+    fn short_answer() -> Self {
+        Self {
+            dim: FAKE_DIM,
+            short_answer: true,
+            ..Self::default()
+        }
+    }
+
+    /// A fake that declares [`FAKE_DIM`] and hands back vectors one component wider.
+    fn lying_about_dim() -> Self {
+        Self {
+            dim: FAKE_DIM,
+            lies_about_dim: true,
             ..Self::default()
         }
     }
@@ -267,8 +290,20 @@ impl Embedder for Fake {
                 model_id: MODEL_ID.to_string(),
             });
         }
-        Ok((0..texts.len())
-            .map(|_| Vector::new(vec![0.5; self.dim]))
+        // `short_answer` and `lies_about_dim` exist so the two pairing refusals inside the writer loop have a
+        // provider shape that reaches them; every other fake answers one vector per text at its declared width.
+        let produced = if self.lies_about_dim {
+            self.dim + 1
+        } else {
+            self.dim
+        };
+        let count = if self.short_answer && texts.len() > 1 {
+            texts.len() - 1
+        } else {
+            texts.len()
+        };
+        Ok((0..count)
+            .map(|_| Vector::new(vec![0.5; produced]))
             .collect())
     }
 }
@@ -458,6 +493,76 @@ fn a_changed_prefix_makes_a_stored_vector_stale() {
     );
     assert_eq!(report.current, 0);
     assert_eq!(report.embedded, 1);
+}
+
+/// A provider that answers N texts with N−1 vectors must write **nothing at all**.
+///
+/// `paired`'s length arm is the only thing between a lying provider and a database where chunk B carries chunk
+/// A's vector: `zip` would otherwise pair the first N−1 silently, stamp them current, and no later run would
+/// re-embed them. The earlier width case cannot catch this — it refuses before the loop ever starts — so without
+/// this case that arm was untested (self-review mutant M4 survived every one of the other 19 cases).
+#[test]
+fn a_provider_answering_the_wrong_number_of_texts_writes_nothing() {
+    assert_recorder_works();
+    let setup = workspace_owned(&notes(2));
+    setup.install_model(FAKE_DIM as i64, "");
+    setup.touch_artifact();
+
+    let fake = Fake::short_answer();
+    let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+
+    assert!(
+        matches!(report.outcome, EmbedOutcome::NotProduced { .. }),
+        "a short answer is arm (iv), not a partial success: {:?}",
+        report.outcome
+    );
+    let detail = report.outcome.detail().unwrap_or_default();
+    assert!(
+        detail.contains("one-for-one"),
+        "the sentence has to name the pairing rule it refused: {detail}"
+    );
+    assert_eq!(report.embedded, 0, "a refused batch stamps nothing");
+    assert!(
+        setup.vectors().is_empty(),
+        "and nothing reaches the table: {:?}",
+        setup.vectors()
+    );
+    assert_eq!(fake.calls(), 1, "one batch, one refusal, no retry storm");
+}
+
+/// A provider whose vectors are wider than it declares is refused before any write.
+///
+/// The declared-width check upstream cannot see this: the fake answers with `dim()` intact while the vectors it
+/// returns are wider, which is what a provider that miscounts its own output looks like from here. The schema's
+/// `CHECK (length(vector) = 4 * dim)` would be the next line of defence, and §6 refuses mid-run CHECK failures in
+/// favour of naming both numbers first. Self-review mutant M5: deleting this width arm left all 19 other cases
+/// green, so before this case the sentence existed without a fence.
+#[test]
+fn a_vector_wider_than_the_provider_declares_is_refused_before_any_write() {
+    assert_recorder_works();
+    let setup = workspace_owned(&notes(2));
+    setup.install_model(FAKE_DIM as i64, "");
+    setup.touch_artifact();
+
+    let fake = Fake::lying_about_dim();
+    let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+
+    assert!(
+        matches!(report.outcome, EmbedOutcome::NotProduced { .. }),
+        "an over-wide vector is arm (iv): {:?}",
+        report.outcome
+    );
+    let detail = report.outcome.detail().unwrap_or_default();
+    assert!(
+        detail.contains("dimensions") && detail.contains("refused before any write"),
+        "the sentence names both widths and says nothing was written: {detail}"
+    );
+    assert_eq!(report.embedded, 0);
+    assert!(
+        setup.vectors().is_empty(),
+        "the CHECK constraint never sees these bytes: {:?}",
+        setup.vectors()
+    );
 }
 
 /// Budget refusal: an over-budget chunk is counted and writes nothing, while its batchmates still land.

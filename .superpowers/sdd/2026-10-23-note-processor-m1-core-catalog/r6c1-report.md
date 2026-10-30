@@ -132,3 +132,47 @@ non-empty `prefix_doc`).
 are paying for full-workspace gates (clippy `--all-targets`, `cargo test --workspace`, four doc builds) inside the same
 window as the code. Next round starts with the smallest falsifiable change committed first, and the gate sweep moves to the
 controller.
+
+---
+
+## 2026-10-31 — review of the round, performed by the controller (conflict disclosed)
+
+**Both scoped reviewers timed out at their 24-minute deadlines having written nothing** (`5f832231`, `65f20efe`; 72 and 65
+messages each, median inter-message gap 0 s but p95 ≈ 100 s and max ≈ 255 s — the deep-thinking turns are what the budget
+goes on, not the tool calls). That is five consecutive timeouts this round. Rather than spend a sixth window, I reviewed my
+own work — **disclosing that I authored or committed most of the range under review** — and compensated with the one thing
+a shell-less reviewer cannot do: run the mutations. Everything below is measured, nothing is asserted from reading.
+
+**Mutations run against `crates/np-core/src/embed_run.rs` / `db.rs`, restored with `cp`, verified with `cmp`:**
+
+| Mutant | Result | Killed by |
+| --- | --- | --- |
+| M1 — drop §6's liveness fence (`WHERE f.state = 'ok'` → `WHERE 1 = 1`) | killed, 18/1 | `a_stale_note_s_chunks_are_never_owed` |
+| M2 — stamp a prefix-free digest (hash the chunk text, not what the model is handed) | killed, 17/2 | `a_changed_prefix_makes_a_stored_vector_stale`, `every_text_in_a_batch_travels_with_its_own_prefix` |
+| M3 — count a `SQLITE_BUSY` batch as embedded (both call sites) | killed, 18/1 | `a_busy_batch_stamps_nothing_and_is_reported` |
+| **M4 — delete `paired`'s one-for-one length arm** | **survived all 19 cases** | new case below |
+| **M5 — delete `paired`'s per-vector width arm** | **survived all 19 cases** | new case below |
+
+M4 is the serious one: with that arm gone, a provider answering N texts with N−1 vectors lets `zip` pair the first N−1
+silently, stamp them current, and nothing ever re-embeds them. M5's sentence ("… produced X dimensions but this run stores Y;
+refused before any write") existed with no fence behind it — the existing wrong-width case refuses *earlier*, on declared
+width, so it never reaches the loop. Both arms are now covered by two new cases (`…answering_the_wrong_number_of_texts_writes_nothing`,
+`a_vector_wider_than_the_provider_declares_is_refused_before_any_write`), each verified to fail its mutant and pass clean
+code: **21 passed** in `tests/embed_run.rs`, default suite **463 passed / 0 failed**, goldens unchanged, fmt/clippy/rustdoc 0.
+
+**What I checked and found correct (static reading, corroborated where a mutation could reach it):** `vectors_for` filters
+on an explicit model id everywhere and has no un-filtered sibling; `live_chunks` joins through `notes.rel_bytes = files.rel_bytes`
+(the byte key, F13) rather than the display spelling; the digest written is the digest compared, and neither path reads
+`chunks.source_hash` or `files.hash`; arm (iii) is evaluated *after* the currency read on purpose (§6's exit state (i) owes
+nothing to a model that has nothing to do), and both routes into it share one report literal so the two halves cannot grow
+different sentences; `install_hint` names `np models install` with its real flags and says fetching is unimplemented; the
+over-budget path retries per item rather than truncating, and keeps the token numbers for the report.
+
+**Findings carried forward, unchanged from before:** D-4 (`prefix_doc` spelling lives in both `embed_run` and
+`LocalModelProvider::model_inputs` — M2 shows a drift here would be caught by two tests, but it is still one rule written
+twice), D-5 (budget refusals are inherited from the runtime's error; the module doc says so, and no code in this round
+prices tokens), plus README/§6/`todo.md` updates. **Not covered by anything:** §7's batch invariance and unit-norm checks
+against a real model — those need R6c2's artifact-gated path, and no amount of fake-provider coverage substitutes for them.
+
+**Independent review still outstanding.** If one is wanted, scope it to one question per child with a hard tool budget; the
+briefs that produced nothing asked each reviewer to cover five areas in 24 minutes.
