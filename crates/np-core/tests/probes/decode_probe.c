@@ -14,11 +14,18 @@
  *
  * Build (archives from a `--features local-model` build of np-core; see `model_load_probe.c` for the same line):
  *
- *   B=$(ls -dt target/debug/build/np-core-HASH/out/llama-cpp-HASH | head -1) && \
+ *   B=$(ls -dt target/debug/build/np-core-HASH/out/llama-cpp-llama | head -1) && \
  *   gcc -O2 -o /tmp/decode_probe crates/np-core/tests/probes/decode_probe.c \
  *     -I .vendor/llama.cpp-v0.8.0/include -I .vendor/llama.cpp-v0.8.0/ggml/include \
- *     "$B"/src/libllama.a "$B"/ggml/src/libggml.a "$B"/ggml/src/libggml-base.a "$B"/ggml/src/libggml-cpu.a \
- *     -lstdc++ -lm -lpthread -ldl
+ *     "$B"/src/libllama.a "$B"/ggml/src/libggml.a "$B"/ggml/src/libggml-cpu.a \
+ *     "$B"/ggml/src/libggml-base.a -lstdc++ -lm -lpthread -ldl
+ *
+ * The unit directory is `llama-cpp-llama`, not a hash, and with `NP_LLAMA_CPP_SRC` pointing at an already-configured
+ * tree the archives live in that tree's own `build/` instead (A2 review P2-6). Archives are listed dependents-first,
+ * matching `ARCHIVES` in build.rs.
+ *
+ * **What this probe does not measure:** wall-clock time. It prints token counts, return codes, pooled norms, thread
+ * counts and RSS — throughput figures anywhere in §14 come from the Rust test, not from here (A2 review P2-7).
  *
  * Run:
  *

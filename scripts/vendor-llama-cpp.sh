@@ -12,7 +12,9 @@
 #
 # Idempotence is proven by content, not by a note. An existing tree is accepted only if its
 # `include/llama.h` hashes to the pin's `header_sha256`; the tarball digest we fetched from is recorded in
-# `.vendor/.stamps/<tag>.sha256`, **outside** the tree, as provenance. It used to live inside the tree as
+# `.vendor/.stamps/<tag>.sha256`, **outside** the tree, as provenance; a tree that was already there and matches by
+# header digest gets `.vendor/.stamps/<tag>.header-match`, which claims that much and no more. It used to live inside
+# the tree as
 # `.vendor-stamp`, which meant `mkdir <dest> && printf 'sha256=…' > <dest>/.vendor-stamp` made this script
 # print "already vendored" and exit 0 over an empty directory — measured, R6b0 review P2-2. A tree cannot be
 # allowed to vouch for itself.
@@ -56,6 +58,23 @@ if [[ -d "$dest" ]]; then
     if [[ -f "$header" ]]; then
         have_header="$(sha256sum "$header" | cut -d' ' -f1)"
         if [[ "$have_header" == "$want_header" ]]; then
+            # Record the match **outside** the tree, next to the fresh-vendor stamp, so a tree that arrived here without
+            # one still leaves evidence of what was checked (A2 review P2-9: `.vendor/.stamps/` did not exist on this
+            # machine although this file's header comment claimed provenance lives there). Honest about its own scope: no
+            # tarball was fetched in this run, so the record claims a header match and nothing more.
+            if [[ ! -f "$stamp_dir/$tag.sha256" ]] &&
+                ! grep -qs "header_sha256=$have_header" "$stamp_dir/$tag.header-match"; then
+                # Write only when there is nothing to say, or the digest changed: a script that reprints "recorded" on
+                # every no-op run teaches whoever reads it to ignore the line.
+                mkdir -p -- "$stamp_dir"
+                {
+                    echo "header_sha256=$have_header"
+                    echo "matched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                    echo "how=include/llama.h re-hashed by scripts/vendor-llama-cpp.sh on the already-vendored path"
+                    echo "note=no tarball was fetched in this run; this record claims a header match, not a download"
+                } > "$stamp_dir/$tag.header-match"
+                echo "recorded: $stamp_dir/$tag.header-match (a fresh-vendor stamp would say more; none exists for $tag)"
+            fi
             echo "already vendored: $dest (include/llama.h hashes to the pinned header_sha256; nothing fetched)"
             exit 0
         fi
@@ -94,12 +113,13 @@ if [[ "$got_sha" != "$want_sha" ]]; then
     # costs another 38.7 MB download to re-diagnose (R6b0 review P2-4). `wc -c` rather than GNU `stat`, because
     # the size line has to work on macOS too.
     keep="$vendor/.downloads"
-    mkdir -- "$keep"
+    # `-p`, because this directory persists between runs and `set -euo pipefail` is in force: without it the *second*
+    # mismatch died at `mkdir` with "File exists" — cmake-free noise instead of the two digests, with the trap deleting
+    # the tarball anyway. That is precisely the cost this block was written to remove (A2 review P2-2). The message is
+    # printed once, not twice.
+    mkdir -p -- "$keep"
     moved="$keep/mismatch-$tag-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
     mv -- "$tarball" "$moved"
-    echo "vendor-llama-cpp: digest mismatch, refusing to unpack." >&2
-    echo "    pinned: $want_sha" >&2
-    echo "    got:    $got_sha" >&2
     echo "    kept:   $moved ($(wc -c < "$moved") bytes)" >&2
     exit 1
 fi

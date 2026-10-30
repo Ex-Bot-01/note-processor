@@ -668,6 +668,27 @@ You answered the §13 question: **use llama.cpp in the back and keep EmbeddingGe
 getting too big". That closes shape B — and the measurements below are why B turns out to be cheaper than §13 feared, and also why it is
 **not** the pinned Rust binding.
 
+### Identity of the vendored tree (A2 review P1-1, closed 2026-10-30)
+
+A2's conditional BLOCK was: *the `.vendor` tree on disk cannot be shown to be the tarball the pin names* — its in-tree
+`.vendor-stamp` predated `header_sha256`, `.vendor/.stamps/` did not exist although this script's comment said
+provenance lived there, and the tree carries options (LLAMA_BUILD_UI / LLAMA_BUILD_APP at
+`.vendor/llama.cpp-v0.8.0/CMakeLists.txt:136-139`) that a reviewer's memory of upstream v0.8.0 did not expect.
+What is measured here, on 2026-10-30, and what each fact reaches:
+
+| Check | Result | What it can and cannot certify |
+| --- | --- | --- |
+| `sha256sum .vendor/llama.cpp-v0.8.0/include/llama.h` | `c0854771d3760a41…` — equal to `third_party/llama-cpp.toml`'s `header_sha256` | Certifies the one file `src/llama_ffi.rs` mirrors. Says nothing about the other 20 MB of the tree |
+| Every pinned option is consumed by this tree | Added `LLAMA_BUILD_BOGUS_OPTION = "ON"` to the pin → build refused with *"cmake accepted these options … but filed them as UNINITIALIZED"* (exit 101); pin restored, `cmp` clean, rebuild green | This is the check that answers "options that upstream v0.8.0 does not have": **if** `LLAMA_BUILD_UI` were unknown to this tree, it would trip the same refusal, and every feature-on build would fail. It does not, so those options exist in the tree we build. Cannot say whether that tree matches some other checkout of the tag |
+| `./scripts/vendor-llama-cpp.sh` on the existing tree | prints *"already vendored … include/llama.h hashes to the pinned header_sha256; nothing fetched"*, exit 0, and now writes `.vendor/.stamps/v0.8.0.header-match` (contents: the digest, a timestamp, `note=no tarball was fetched in this run`) | The accept path leaves a record outside the tree that says exactly what was checked — A2 P2-9's missing `.stamps/` directory. Rewrites only when absent or holding a different digest, so a no-op run stays silent |
+| The stale in-tree stamp | `.vendor/llama.cpp-v0.8.0/.vendor-stamp` deleted (nothing read it: `grep -rn vendor-stamp` over tracked files hits only the script's own historical comment) | Removes an artifact that looked like provenance and certified nothing |
+
+What remains **unprovable on this host**: re-downloading the tarball and re-hashing it would need network egress, so the
+tarball digest `51b1e025…` is asserted by the pin and by the vendor-time check that ran when this tree was unpacked —
+not re-verified today. The honest summary is that build.rs's per-build header digest plus the option-understanding
+refusal identify what we compile against; "this byte-for-byte is GitHub's v0.8.0" is a claim about the machine that ran
+the vendor script, and CI on a fresh runner re-runs that path from scratch.
+
 ### Measured on this host, no root
 
 All figures re-measured on 2026-10-30 on this host and reproducible: the Rust side is
@@ -680,7 +701,7 @@ has a C number to be compared against; build line in that file's header). **Memo
 | --- | --- | --- |
 | Load, warm page cache | **0.35 s** first call, 0.30 s on repeats | C probe and the Rust test agree to ~0.05 s; `llama_model_load_from_file` timed around one call |
 | Load, artifact evicted from our page-cache view | **0.44 s** | the probe's `--drop-cache`: `posix_fadvise(POSIX_FADV_DONTNEED)` on the file first — no root needed to evict one file's pages, so this is "cold from our side"; the block layer may still hold them, and the honest reading is that the disk read costs ≈ 0.1 s |
-| Peak RSS, bare C loader probe (warm) | **419.4 MiB** (5.0 MiB before → 419.4 MiB with the model open) | `model_load_probe`, no Rust runtime in the process |
+| Peak RSS, bare C loader probe (warm) | **419.5 MiB** peak; **383.6 MiB** resident with the model open (5.0 MiB before) | `model_load_probe`, no Rust runtime in the process. This row read "5.0 MiB → 419.4 MiB with the model open" until 2026-10-30, which was a **peak** wearing a resident label: the probe printed `vmhwm_kb()` for both of its right-hand columns, so the two were always equal whatever happened (A2 review P1-3). Fixed to print `VmRSS` for "open" and `VmHWM` for "peak", and re-run against the artifact: resident 392,776 kB, peak 429,552 kB — a 36 MiB gap that had been invisible. The comparisons below are peak-against-peak and still stand; "resident with the model open" is the number to quote when asking what an idling `np embed` holds |
 | Peak RSS, our test process, loads serialized | **421.1 MiB**; one load moves resident memory 127.8 → 407.4 MiB (+**279.6 MiB**) | `--test-threads=1`, printed per round with `--nocapture` |
 | Rust over C, same artifact | **+1.7 MiB** | 421.1 − 419.4. Not "nothing": earlier prose here said the Rust side cost nothing, which was a rounding of an unattributed pair. It is ~0.4% of the load, and it is now a number rather than an adjective |
 | The same suite on libtest's default threads | **523.8 MiB** peak — *not attributable to one load* | concurrent artifact cases share one process-wide `VmHWM`. Loads are serialized by a mutex in the test so the headline figure means something; an unattributed peak is a worse number than a serialized one |

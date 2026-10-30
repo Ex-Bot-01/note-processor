@@ -121,18 +121,36 @@ jobs:
         # echoed so "compiled, never ran" is written on the record (§2 step 4) rather than implied - and the test exit
         # code, not the grep, is what fails the job.
         run: |
+          # `set +e` first, deliberately: the runner starts these blocks with errexit on, and under errexit a failing
+          # `cargo test` aborts the shell at that pipeline - which is exactly when the count matters most (A2 review
+          # P2-3). Capture the status, print the record, then exit with cargo's code so the test result stays what
+          # fails the job.
+          set +e
           set -uo pipefail
           cargo test --locked -p np-core --features local-model --lib --test local_runtime \
             --test local_load --test local_embed -- --nocapture 2>&1 | tee /tmp/feature-tests.log
           status=${PIPESTATUS[0]}
-          echo "NOT COVERAGE occurrences: $(grep -c 'NOT COVERAGE' /tmp/feature-tests.log || true)"
-          exit "${status}"
+          count=$(grep -c 'NOT COVERAGE' /tmp/feature-tests.log)
+          echo "NOT COVERAGE occurrences: $count"
+          if [ "$status" -ne 0 ]; then
+            echo "the feature test row failed (exit $status); the count above is context, not the verdict" >&2
+            exit "$status"
+          fi
+          # The step asserts something about the number it exists to print (A2 review P2-4). Twelve cases in
+          # local_embed plus four of seven in local_load print this line when no artifact is configured; a smaller
+          # total means the prints stopped reaching the log - `--nocapture` lost, or a case silently became a real pass
+          # with no artifact - and "compiled, never ran" would be back to being implied rather than stated.
+          if [ "$count" -lt 16 ]; then
+            echo "expected at least 16 NOT COVERAGE lines with no artifact, saw $count: §2 step 4 is not on the record" >&2
+            exit 1
+          fi
       # "A green run means llama.cpp was called" is only worth saying if the run can also say *which* llama.cpp.
       # `-l static=llama` is not an exclusive search path, so two cheap probes back it up: no shared llama in the
-      # test binary, and `llama_version` defined in it (i.e. it came from an archive we built, not from a
-      # libllama that happened to be installed on the runner). Neither is sufficient alone - the pinned header
-      # digest in build.rs is what actually identifies the tree - but together they turn "it linked" into
-      # "it linked something we compiled" (R6b0 review P2-5).
+      # test binary, and `llama_version` defined in it. Read what the two do and do not say (A2 review P2-5): together
+      # they show **static linkage from an archive this run produced**. A runner that happened to have llama.cpp
+      # installed statically would satisfy both just the same - every post-v0.8.0 revision reports `0.8.0-dev` as well
+      # (`LLAMA_BUILD_IS_DEV=ON`) - so the pinned header digest enforced in build.rs is what identifies the tree, and
+      # this step proves only which linkage we got (R6b0 review P2-5).
       - name: Link identity probes
         run: |
           set -euo pipefail
@@ -149,4 +167,4 @@ jobs:
             echo "FAIL: llama_version is not defined in the test binary; it did not come from our archive" >&2
             exit 1
           fi
-          echo "ok: llama_version defined locally (statically linked from the pinned build)"
+          echo "ok: llama_version defined locally (static linkage from an archive this build produced)"

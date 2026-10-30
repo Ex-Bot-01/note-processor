@@ -47,9 +47,16 @@ const PIN: &str = "third_party/llama-cpp.toml";
 /// would compile binaries `np` never contains.
 const TARGET: &str = "llama";
 
-/// Static archives, in the order GNU ld resolves them: `llama` needs `ggml`, which needs `ggml-cpu`,
-/// which needs `ggml-base`. Reversing this pair leaves `ggml_backend_*` undefined at link time.
-const ARCHIVES: [&str; 4] = ["llama", "ggml", "ggml-base", "ggml-cpu"];
+/// Static archives, in the order GNU ld resolves them — **dependents before dependencies**, left to right:
+/// `llama` → `ggml` → `ggml-cpu` → `ggml-base`.
+///
+/// The previous order (`llama, ggml, ggml-base, ggml-cpu`) put the pure dependency ahead of a dependent and linked
+/// anyway, which meant ld had already pulled the base objects `libggml-cpu.a` needs — symbol-overlap luck, not a
+/// property that survives a re-pin or a cmake layout change (A2 review P2-a). This order is measured, not reasoned
+/// about: it links from a wiped build directory with `local_runtime`'s link proofs green. `ggml` and `ggml-cpu` do
+/// reference each other (`libggml.a` names `ggml_backend_cpu_reg`; the reverse names `ggml_*`), so no ordering is
+/// airtight without a linker group — what this removes is the case where everything that needs `ggml-base` sits behind it.
+const ARCHIVES: [&str; 4] = ["llama", "ggml", "ggml-cpu", "ggml-base"];
 
 /// Libraries the archives need from outside themselves, measured rather than guessed:
 /// `nm --undefined-only` over the four archives left `__cxa_*`/`_Unwind_Resume` (libstdc++),
@@ -163,16 +170,20 @@ fn link_pinned_llama() -> Result<(), String> {
 /// The C++ source to build: `NP_LLAMA_CPP_SRC` if set (offline work, CI caches, and the case where a
 /// tree is already configured), else the directory `scripts/vendor-llama-cpp.sh` unpacks.
 fn resolve_source(root: &Path, pin: &Pin) -> Result<PathBuf, String> {
-    let override_dir = env::var("NP_LLAMA_CPP_SRC").unwrap_or_default();
-    let trimmed = override_dir.trim();
+    // `var_os`, not `var(...).unwrap_or_default()`: this file's rule is that it never silently disables itself, and the
+    // old form turned a value cargo cannot decode as UTF-8 into "unset" — quietly building the vendored tree when a
+    // different one was named (A2 review P2-8). A path does not need to be UTF-8 to be a path.
+    let override_dir = env::var_os("NP_LLAMA_CPP_SRC");
+    let trimmed = override_dir.as_deref().map(os_trim).unwrap_or_default();
     if !trimmed.is_empty() {
-        let path = PathBuf::from(trimmed);
+        let path = PathBuf::from(&trimmed);
         if path.is_dir() {
             return Ok(path);
         }
         return Err(format!(
-            "NP_LLAMA_CPP_SRC={trimmed} is not a directory.\n  \
+            "NP_LLAMA_CPP_SRC={} is not a directory.\n  \
              Unset it to use the vendored tree, or point it at llama.cpp {} unpacked from the pinned tarball.",
+            trimmed.to_string_lossy(),
             pin.tag
         ));
     }
@@ -298,11 +309,14 @@ fn cmake_set_value(text: &str, name: &str) -> Option<String> {
 /// failure we are trying to explain is "cmake is not installed", and cargo's own message for a failed
 /// `Command::spawn` is `No such file or directory (os error 2)`.
 fn cmake_command() -> Result<OsString, String> {
-    let configured = env::var("CMAKE").unwrap_or_default();
-    let binary: OsString = if configured.trim().is_empty() {
+    // Same rule as `resolve_source`: an undecodable `CMAKE` must not read as "not set" and fall through to whatever is
+    // on PATH (A2 review P2-8).
+    let configured = env::var_os("CMAKE");
+    let requested = configured.as_deref().map(os_trim).unwrap_or_default();
+    let binary: OsString = if requested.is_empty() {
         OsString::from("cmake")
     } else {
-        OsString::from(configured.trim())
+        requested
     };
 
     let probe = Command::new(&binary).arg("--version").output();
@@ -408,10 +422,31 @@ fn configure(
     // recorded next to the cache, and after configuring every pinned key must exist with a real type.
     let option_stamp = build_dir.join(OPTION_STAMP);
     let recorded = fs::read_to_string(&option_stamp).unwrap_or_default();
-    let wanted = pin.option_stamp();
+    // The stamp is the pin's option set **plus the digest of the `CMakeLists.txt` about to be configured** (A2 review
+    // P1-4). This script declares that file a rerun input, so editing it re-runs build.rs — but with a stamp made only
+    // of pinned options the warm path below finds every cached value still matching and returns without configuring,
+    // certifying a build directory for inputs cmake never saw. Naming the file in `rerun-if-changed` is worth doing
+    // only if something acts on it; this line is that something.
+    let wanted = format!(
+        "{}cmakelists-sha256={}\n",
+        pin.option_stamp(),
+        sha256_hex(
+            &fs::read(source.join("CMakeLists.txt")).map_err(|e| format!(
+                "cannot read {} to stamp the configure: {e}",
+                source.join("CMakeLists.txt").display()
+            ))?
+        )
+    );
     let set_changed = !recorded.is_empty() && recorded != wanted;
+    // A cache with no stamp is not "unchanged": it was configured before this file recorded anything, so nothing here
+    // can claim its values came from the pin. That is a change, and below it means a fresh directory.
+    let untracked_cache = recorded.is_empty() && !cache.is_empty();
 
-    if cache.contains_key("CMAKE_BUILD_TYPE") && stale.is_empty() && !set_changed {
+    if cache.contains_key("CMAKE_BUILD_TYPE")
+        && stale.is_empty()
+        && !set_changed
+        && !untracked_cache
+    {
         // Warm cache: still verify it understood our options. A cache that filed half of them as UNINITIALIZED
         // is exactly the state a reuse path must not certify as fresh.
         verify_options_understood(build_dir, pin)?;
@@ -422,13 +457,43 @@ fn configure(
         return Ok(());
     }
 
-    if set_changed {
-        eprintln!(
-            "np-core: the option set changed ({} -> {}), reconfiguring {}",
-            recorded.lines().count(),
-            wanted.lines().count(),
-            build_dir.display()
-        );
+    if set_changed || untracked_cache {
+        // **A reconfigure cannot undo a deletion.** cmake keeps a cache entry whose `-D` disappeared, so removing
+        // `GGML_OPENMP = "OFF"` from the pin would leave `GGML_OPENMP:BOOL=OFF` in charge while that file's own preamble
+        // promises unlisted options keep llama.cpp's default — and R6d's stated lever is flipping exactly that line, so
+        // this failure mode sits one edit away (A2 review P1-2). Only a fresh directory fixes it. Ours to wipe when it
+        // lives under `OUT_DIR`; a build directory inside someone's source checkout is not ours to delete, so that case
+        // refuses and names the command — refuse rather than repair, as everywhere else in this file.
+        let reason = if untracked_cache {
+            "that build directory carries no option stamp".to_string()
+        } else {
+            format!(
+                "the option set changed ({} -> {} stamped lines)",
+                recorded.lines().count(),
+                wanted.lines().count()
+            )
+        };
+        if build_dir.starts_with(out_dir) {
+            eprintln!(
+                "np-core: {}, and cmake keeps cache entries whose -D disappeared; wiping {} and configuring fresh",
+                reason,
+                build_dir.display()
+            );
+            fs::remove_dir_all(build_dir)
+                .map_err(|e| format!("cannot wipe {}: {e}", build_dir.display()))?;
+        } else {
+            return Err(format!(
+                "np-core needs a fresh cmake configure because {}, but {} sits inside the source tree {} and is not \
+                 ours to delete.\n  Remove it and rebuild:\n    rm -rf \"{}\"\n  A reconfigure in place would leave any \
+                 option removed from {} still in force, which contradicts that file's promise that unlisted options keep \
+                 llama.cpp's own default.",
+                reason,
+                build_dir.display(),
+                source.display(),
+                build_dir.display(),
+                PIN
+            ));
+        }
     }
     if !build_dir.starts_with(out_dir) && !cache.is_empty() {
         // Reconfiguring a tree that is not ours to own is defensible — linking a tree built with shared libs or
@@ -522,10 +587,15 @@ fn compile(cmake: &OsString, build_dir: &Path) -> Result<(), String> {
 
 /// `-j` for cmake: `NP_LLAMA_CPP_JOBS`, else cores capped at [`DEFAULT_JOB_CEILING`].
 fn jobs() -> usize {
-    let configured = env::var("NP_LLAMA_CPP_JOBS").unwrap_or_default();
-    if let Ok(parsed) = configured.trim().parse::<usize>() {
-        if parsed > 0 {
-            return parsed;
+    // A set-but-unusable value says so on the record instead of being silently replaced by the default — the rule
+    // `resolve_source` and `cmake_command` follow for their variables (A2 review P2-8).
+    if let Some(raw) = env::var_os("NP_LLAMA_CPP_JOBS") {
+        match raw.to_str().and_then(|s| s.trim().parse::<usize>().ok()) {
+            Some(parsed) if parsed > 0 => return parsed,
+            _ => println!(
+                "cargo::warning=NP_LLAMA_CPP_JOBS={} is not a positive integer; using the default job count",
+                raw.to_string_lossy()
+            ),
         }
     }
     let cores = fs::metadata("/proc/cpuinfo")
@@ -808,6 +878,32 @@ fn read_cache_types(path: &Path) -> std::collections::BTreeMap<String, String> {
 
 fn read(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// Trim ASCII whitespace from both ends of an `OsStr` **without requiring it to be UTF-8** — the reason
+/// `resolve_source` and `cmake_command` use `var_os` in the first place (A2 review P2-8). `OsStr::trim` is not stable
+/// on this toolchain, and `to_string_lossy().trim()` would put replacement characters into a path that was fine.
+fn os_trim(raw: &std::ffi::OsStr) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = raw.as_bytes();
+        let ws = |b: &u8| b.is_ascii_whitespace();
+        let first = bytes.iter().position(|b| !ws(b)).unwrap_or(bytes.len());
+        let last = bytes
+            .iter()
+            .rposition(|b| !ws(b))
+            .map(|i| i + 1)
+            .unwrap_or(first);
+        let range = first.min(last)..first.max(last);
+        OsString::from(std::ffi::OsStr::from_bytes(&bytes[range]))
+    }
+    #[cfg(not(unix))]
+    {
+        // The build refuses non-Linux targets before either caller runs, so this arm exists to keep the file
+        // compilable rather than to be right about exotic encodings.
+        OsString::from(raw.to_string_lossy().trim())
+    }
 }
 
 fn path_env(name: &str) -> Result<PathBuf, String> {

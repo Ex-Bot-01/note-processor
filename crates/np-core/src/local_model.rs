@@ -220,7 +220,8 @@ impl LoadedModel {
     /// rather than re-deriving it is what lets a refusal name the real limit when the model's trained window
     /// was the smaller number.
     ///
-    /// It is also this context's `n_ubatch`, which on an encoder-only artifact is the runtime's own hard limit —
+    /// It is `min(llama_n_ctx, llama_n_ubatch)` as the **built** context reports them (`include/llama.h:575-581`), not
+    /// the values we requested — and on an encoder-only artifact that `n_ubatch` is the runtime's own hard limit —
     /// `src/llama-context.cpp:1631` aborts above it rather than returning anything. The refusal exists so that
     /// line is never reached.
     pub fn window(&self) -> usize {
@@ -335,7 +336,7 @@ impl LoadedModel {
             0 => {}
             // 1 means "no memory slot for this batch" in a context that has a KV cache. This artifact has none
             // (`create_memory` returns null, so `decode` diverts to `encode`, which answers 0, `2` for an aborted
-            // run (`src/llama-context.cpp:1677`, `include/llama.h:1002`), or a negative), so
+            // run (`src/llama-context.cpp:1677`, `include/llama.h:1003`), or a negative), so
             // **this arm cannot fire on this model** — it stays because `llama_decode`'s contract promises it and
             // because a re-pin to a decoder architecture would make it real. Naming it separately is what turns
             // "our window arithmetic was wrong" into a distinguishable event if that day comes.
@@ -798,7 +799,7 @@ fn open_context(
     ctx_params.n_ctx = requested_ctx(numbers.n_ctx_train);
     ctx_params.n_batch = ctx_params.n_ctx;
     ctx_params.n_ubatch = ctx_params.n_ctx;
-    let window = ctx_params.n_ctx as usize;
+    let requested = ctx_params.n_ctx as usize;
 
     // SAFETY: `model` is non-null and outlives this call; `ctx_params` is copied by value.
     let ctx = unsafe { llama_ffi::llama_init_from_model(model.as_ptr(), ctx_params) };
@@ -807,6 +808,32 @@ fn open_context(
             "the runtime refused to build a context for this model".to_string(),
         ));
     };
+
+    // **The window is what the context reports, not what we asked for.** `include/llama.h:575-577` warns that requested
+    // context values "may differ from the actual values used by the context", and the value that keeps
+    // `src/llama-context.cpp:1631`'s abort out of reach is the built `n_ubatch`, not our request. Reading both back costs
+    // two calls at load time and converts "we set three fields equal and llama.cpp's arithmetic happens to preserve it"
+    // (`src/llama-context.cpp:342`, `:344`, `GGML_PAD` at `:387`) into a checked fact — A1 review P1-1, which is worth
+    // landing here rather than in R6c because R6c makes the budget config-derived and this is the bound it leans on.
+    //
+    // SAFETY: `ctx` is non-null (checked above) and these read its own parameters.
+    let built_ctx = unsafe { llama_ffi::llama_n_ctx(ctx.as_ptr()) } as usize;
+    let built_ubatch = unsafe { llama_ffi::llama_n_ubatch(ctx.as_ptr()) } as usize;
+    if built_ubatch < requested {
+        // A context that cannot hold a batch as wide as its own window would turn every long note into an assert. The
+        // mismatch is the runtime's answer, not the caller's fault, so this refuses rather than quietly embedding a
+        // shorter window than `ModelFacts` promised: cheaper than a SIGABRT, and it names the lever (a different build
+        // of llama.cpp, or a re-pinned `REQUESTED_CTX`).
+        //
+        // SAFETY: this context came from `llama_init_from_model` above and is not owned by any `LoadedModel` yet.
+        unsafe { llama_ffi::llama_free(ctx.as_ptr()) };
+        return Err(EmbedError::Unavailable(
+            "this context cannot hold a batch as wide as its own window".to_string(),
+        ));
+    }
+    // Both numbers, not just the smaller one: `n_ctx` is what may be attended to and `n_ubatch` is what may be decoded
+    // in one call, and the refusal in `embed_text` guards a single forward pass that must satisfy both.
+    let window = built_ctx.min(built_ubatch);
 
     // SAFETY: `ctx` is non-null (checked above) and owned by us; the call reads one field of its parameters.
     let pooling = unsafe { llama_ffi::llama_pooling_type(ctx.as_ptr()) };

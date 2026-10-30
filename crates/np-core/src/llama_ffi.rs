@@ -20,6 +20,14 @@
 //!   three matter more than a rename usually does: `llama_n_embd` answers with the model's **internal**
 //!   width, so a loader that used it would read 512 for a model whose vectors are 768 (§5's width decision
 //!   would be enforced against the wrong number and pass).
+//! * `llama_backend_init` is **not** declared here and `load` never calls it, which deviates from the header's
+//!   "call once at the start of the program" (`include/llama.h:489`). It is safe on this build for two reasons read out
+//!   of the pinned tree rather than assumed: the f16 tables that call initializes come from any `ggml_init`
+//!   (`src/llama.cpp:122-131`), and the load path performs several of those (`src/llama-graph.cpp:1436`,
+//!   `src/llama-context.cpp:3107`); and backend registration needs no `ggml_backend_load_all()` when the CPU backend is
+//!   compiled in, because the registry's own constructor registers it (`ggml/src/ggml-backend-reg.cpp:171-172` under
+//!   `GGML_USE_CPU`). Measured corroboration: every artifact-gated load and decode here returns rc 0 with a finite
+//!   pooled row. A future build that offloads to another device must revisit this (A1 review P2-4).
 //! * The `llama_batch_ext_*` family is also absent, on purpose: choosing it over
 //!   [`llama_batch_get_one`] plus the `logits` array of [`llama_batch`] is R6b1's design question (§14),
 //!   and declaring both would decide it by accident.
@@ -373,16 +381,42 @@ extern "C" {
     /// did not allocate — the reason that function's doc says "borrowed" twice.
     pub fn llama_batch_free(batch: llama_batch);
 
+    // ---- the built context's own numbers ---------------------------------------
+    //
+    // `include/llama.h:575-577` is explicit: "After creating a llama_context, it is recommended to query the actual
+    // values using these functions / In some cases the requested values via llama_context_params may differ from the
+    // actual values used by the context". Two are mirrored because our whole no-abort argument rests on one of them
+    // (`n_ubatch`), and the other because a window whose width is guessed is not a window.
+
+    /// The context's actual token capacity — what it will hold, not what was requested (`include/llama.h:578`).
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a live context from [`llama_init_from_model`].
+    pub fn llama_n_ctx(ctx: *const llama_context) -> u32;
+
+    /// The context's actual micro-batch width (`include/llama.h:581`). On an encoder-only artifact this is the number
+    /// `src/llama-context.cpp:1631`'s `GGML_ASSERT(n_ubatch >= n_tokens)` compares against, so it — not the requested
+    /// `n_ctx` — is the ceiling above which llama.cpp aborts instead of returning anything.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a live context from [`llama_init_from_model`].
+    pub fn llama_n_ubatch(ctx: *const llama_context) -> u32;
+
     // ---- inference ------------------------------------------------------------
 
-    /// Run the model over `batch`. Returns 0 on success, 1 when the KV cache is full, and negative on
-    /// error (header: on error the memory state is restored).
+    /// Run the model over `batch`. The header's own outcome list (`include/llama.h:1001-1005`) has **five** answers and
+    /// this mirror names all of them: `0` success, `1` no KV slot available, `2` aborted (processed ubatches stay in the
+    /// context's memory), `-1` invalid input batch, `< -1` fatal error. Positive values are warnings rather than
+    /// successes, and collapsing "non-zero" into one bucket loses the difference between "retry smaller" and "that run was
+    /// cancelled". On error the memory state is restored (`:1000`).
     ///
     /// **The `1` needs a context that has a KV cache.** An architecture whose `create_memory` returns null — which
     /// includes `LLM_ARCH_GEMMA_EMBEDDING2`, `src/llama-model.cpp:2825` — has none: `llama_context::decode` logs
     /// "cannot decode batches with this context (calling encode() instead)" (`src/llama-context.cpp:1845-1847`) and
     /// the encoder path answers 0, `2` (aborted — `src/llama-context.cpp:1677`, and the header's outcome list at
-    /// `include/llama.h:1002`) or negative, asserting on `n_ubatch >= n_tokens` (`:1631`) rather than reporting
+    /// `include/llama.h:1003`) or negative, asserting on `n_ubatch >= n_tokens` (`:1631`) rather than reporting
     /// fullness. So callers on such an artifact get a refusal or an abort, never a `1`.
     ///
     /// Memory: allocates nothing for us to free. The results live in the context's own output buffer
@@ -406,6 +440,12 @@ extern "C" {
     /// Per-token embedding for output slot `i`: `n_embd` floats, or null for an invalid index.
     ///
     /// Memory: as [`llama_get_embeddings_seq`] — context-owned, short-lived, never freed here.
+    ///
+    /// **Declared and not called** (A1 review P2-3). Production code reads only the pooled row; this accessor is mirrored
+    /// because §7's per-token verification is the next thing that will want it, and a half-mirrored API is how a later
+    /// round invents a signature under time pressure. Read [`llama_get_embeddings_seq`]'s width rule first: what exists at
+    /// all depends on the pooling type (`include/llama.h:1163-1169`), and this row belongs to the **token**, not the
+    /// sequence — copying `n_embd_out` floats out of it is the same class of over-read that RANK pooling was refused for.
     pub fn llama_get_embeddings_ith(ctx: *mut llama_context, i: i32) -> *mut f32;
 }
 

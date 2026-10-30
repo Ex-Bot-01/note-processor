@@ -158,12 +158,12 @@ pub enum EmbedError {
     /// the runtime's own diagnostic text — that text is exactly what this payload rule exists to keep out of logs,
     /// and [`EmbedError::ArtifactNotLoadable`] deliberately declines to be its carrier.
     ///
-    /// **Every label `local-model` emits, verbatim** — twenty-one, spelled out in full because this list is the only
+    /// **Every label `local-model` emits, verbatim** — twenty-two, spelled out in full because this list is the only
     /// place a reader can see what the runtime may answer, and a grep for any of them should find the string. It
     /// replaced an earlier version that listed six and described the rest as "planned, not yet reachable" for two
     /// rounds after the code could reach them.
     ///
-    /// From `local_model::load` (nine):
+    /// From `local_model::load` (ten):
     /// `"the model reported no output width"`, `"the model reported no input width"`,
     /// `"the model reported no training context"`, `"the model reported an empty vocabulary"` (one guard, four
     /// labels), `"the loaded model exposed no vocabulary"` (raised from two sites — reading the model's facts and
@@ -171,7 +171,11 @@ pub enum EmbedError {
     /// `"this artifact cannot produce a sentence vector: the context pools with NONE"`,
     /// `"this artifact produces a score, not a sentence vector"` (RANK pooling: its row is `n_cls_out` wide, not
     /// the stored width — see `crate::local_model::Pooling`), and
-    /// `"the runtime reported a pooling strategy this build does not know"`.
+    /// `"the runtime reported a pooling strategy this build does not know"`, and
+    /// `"this context cannot hold a batch as wide as its own window"` — raised when the built context reports an
+    /// `n_ubatch` narrower than the window we asked for, the fourth cheap refusal in `load`'s list (A1 review P1-1).
+    /// It cannot fire on the pinned artifact, where llama.cpp preserves the three equal values; it exists so a re-pin
+    /// that changes that arithmetic answers with a sentence instead of `src/llama-context.cpp:1631`.
     ///
     /// From `local_model::LoadedModel::embed_text` (twelve):
     /// `"the sequence produced no tokens for the model to read"`,
@@ -196,8 +200,8 @@ pub enum EmbedError {
     /// They exist because storing such a row is how a search silently returns nothing.
     ///
     /// Not one of them is llama.cpp's diagnostic text, which is §3's fifth class in the abstract and this payload
-    /// rule in practice. If a failure arrives that none of the twenty-one describes, the honest move is a
-    /// twenty-second label named for that class — not a wider payload here.
+    /// rule in practice. If a failure arrives that none of the twenty-two describes, the honest move is a
+    /// twenty-third label named for that class — not a wider payload here.
     #[error("embedding provider unavailable [{0}]")]
     Unavailable(String),
     /// A vector whose component count is not the declared one. `expected` is what was declared
