@@ -216,6 +216,31 @@ it. Nothing measured today distinguishes these — R6b1 loads the file and never
 `ModelFacts::n_ctx_train` deliberately reports the artifact's number next to (not instead of) our own bound. Whoever runs a long-note
 case in R6b2/R6d should record which of the three it was, and until then `max_tokens` stays inside 8,192.
 
+### R6b2 measured what a token costs (2026-10-30) — the ceiling is now priced, not cited
+
+R6b2 submits tokens, so the question above finally has evidence attached. On this host, `GGML_OPENMP = OFF`, one loaded model:
+
+| Input | Tokens | Decode |
+| --- | --- | --- |
+| ~500-token note | 543 | **3.85 s** (141 tok/s) |
+| ~2,000-token note | 2,163 | **18.0 s** (120 tok/s) |
+| over the context window | > 4,096 | refused before decoding — see below |
+
+Three things follow, and they are separate decisions:
+
+1. **The runtime's usable window is 4,096, not 8,192 and not 262,144.** `load` sets `n_ctx = n_batch = n_ubatch = 4096`, because this
+   artifact is non-causal and v0.8.0 *asserts* `n_ubatch >= n_tokens` for bidirectional attention (`GGML_ABORT`, live under `NDEBUG`:
+   a 600-token sequence exits 134 with llama.cpp's default 512). So today the honest ceiling is the window, and `embed_text` refuses
+   between the two numbers — `TokenBudgetExceeded` over `embeddings.max_tokens`, "the sequence is longer than this context can hold"
+   above the window. Raising `MAX_EMBEDDING_TOKENS` toward 262,144 would mean raising `REQUESTED_CTX` too, and §14's curve says what
+   that costs: **+458 MiB** of peak RSS at 4,085 tokens, growing from there.
+2. **Cost is linear and slow enough to matter.** At ~130 tok/s, 8,192 tokens is a **63-second** single chunk. A ceiling is a promise about
+   the worst note, and this prices it: `max_tokens = 2,048` (the default) means a 16-second worst case; 8,192 means a minute per chunk.
+   Nobody has yet chosen between them on that basis — which is §10's question with a number attached rather than an argument settled.
+3. **Throughput, not the window, is what a corpus feels.** 5,000 notes × 500 tokens ≈ 2.5 M tokens ≈ **5.3 hours** at this rate,
+   single-process. That is R6d's problem (OpenMP A/B, batching across texts in one decode — `embed_text` is deliberately one decode per
+   text today), and it is the number worth optimising, because no ceiling choice changes it by more than a factor of a few.
+
 ## 6. `np embed <workspace>`: what it writes, and what it must never do
 
 A new command, deliberately **not** part of `np scan`: the scan wraps its whole write pass in one transaction
@@ -344,7 +369,8 @@ Then a whole-branch review across the shipped rounds, and merge only on the huma
 | --- | --- | --- |
 | **pre-round (done in `b3f05d2`+)** | width residue cleanup; `MAX_EMBEDDING_TOKENS` 32 768 → **8,192** with its message and doc | one constant, no coupling; a bound above the model's window is a promise nobody can keep |
 | **R6b0** | dependency + link only, vendored-revision grep, **the four-step CI job §2 promises**, **the pin table as data** (`const PINNED`, no network), and the reserved-name rule for fetch files (§12) | all offline; nothing dials out; survives a C++ build inside one window |
-| **R6b1 / R6b2** | load → tokenize → forward; budget enforcement + verification | unchanged, since the ceiling fix already landed |
+| **R6b1** *(shipped `ac25c00`, fixes `4fc0aa9`)* | the pinned GGUF opens through our FFI and answers with its own header's numbers | width refusal, drop order, truncated-artifact refusal all tested |
+| **R6b2** *(shipped `344692f`+`d1e8fad`)* | tokenize → decode → pool → L2-normalise; budget enforcement over the **token** count; the window made wide enough that `llama_decode` returns a code instead of aborting | 12 artifact-gated cases, plus the three numbers §14 was missing: size +5.5 MiB, throughput ~130 tok/s, decode RSS curve |
 | **R6c** | `np embed <ws>` and §6's four labelled exit arms, reading a marker **read-only** ("artifact absent — run `np models fetch`") | the label exists before the writer does, so R6c never waits on the fetcher |
 | **R6d** | benchmark, including whether an mmap-first load reads all 865 MB (which decides §12's digest cost) | measurement round |
 | **R7a — marker only** *(shipped `ad9ed5a`)* | read/report the `.fetching.*` / `.part.*` names, `"fetching"` listing section, staleness *display* wording, tests that plant files. **No writer**: nothing can create a marker until R7b's first byte, which is why every test plants its own | fully offline-testable; this is the human-visible half of "tell me it is downloading" |
@@ -616,7 +642,10 @@ has a C number to be compared against; build line in that file's header). **Memo
 | Rust over C, same artifact | **+1.7 MiB** | 421.1 − 419.4. Not "nothing": earlier prose here said the Rust side cost nothing, which was a rounding of an unattributed pair. It is ~0.4% of the load, and it is now a number rather than an adjective |
 | The same suite on libtest's default threads | **523.8 MiB** peak — *not attributable to one load* | concurrent artifact cases share one process-wide `VmHWM`. Loads are serialized by a mutex in the test so the headline figure means something; an unattributed peak is a worse number than a serialized one |
 | Three load-and-drop cycles, serialized | open-state RSS 407.5 MiB on all three rounds (±28 KiB), peak moves +164 KiB total, no crash | `loading_and_dropping_three_times_costs_the_same_each_time`. This detects double-free/UAF by crashing; it does **not** detect leaks (see the test's own doc) |
-| Context on top of the model | **+1.8 MiB** resident at `n_ctx = 4096` | same probe; the KV cache is not what dominates — the weights are |
+| Context on top of the model, nothing decoded | **+1.8 MiB** resident at `n_ctx = 4096` | same probe; the KV cache is not what dominates — the weights are |
+| **Corrected in R6b2: that +1.8 MiB was the whole story only because nothing had decoded.** Peak RSS above the 419 MiB baseline, by longest sequence run (`n_ctx = n_batch = n_ubatch = 4096`) | 133 tok **+0 MiB** · 513 **+47** · 1,026 **+109** · 2,052 **+218** · 4,085 **+458** | `/tmp/decode_probe.c` (same build line as the committed probe, plus `llama_decode`); a compute buffer is *reserved* at context creation and *touched* per decode, so cost tracks the longest sequence actually run, not the ceiling asked for. This is why widening the window to 4,096 to escape the `n_ubatch` abort bought memory only for long notes, and it is the number R6d's peak-RSS headline should be read against |
+| **Package size, stripped** (`cargo build --release --bin np`, `strip`) | feature **off 5.5 MiB** (5,780,432 B) · feature **on 11.0 MiB** (11,554,872 B) · **+5.5 MiB**, against this section's ≤ **40 MB** ceiling | measured 2026-10-30 with `np-cli`'s `local-model` passthrough. Symbol counts come from the *unstripped* files (`nm --defined-only`: 252 `T llama_` and 1,276 `llama_`/`ggml_` total with the feature on, zero without) — a stripped binary has no symbol table, so counting on it says "0" either way and reads as "nothing was linked in" while 5.7 MB of C++ sits in the file |
+| Throughput, `GGML_OPENMP = OFF`, this host | **141 tok/s** at 543 tokens, **120 tok/s** at 2,163 tokens (3.85 s and 18.0 s per decode; first decode of a run is no slower than a warm one) | `tests/local_embed.rs`'s throughput case prints it on every artifact run. `/usr/bin/time -v` on a 2,052-token decode reports **392% CPU**, so OpenMP-off is *not* single-threaded — but the trade §14 made for self-containment has a price here, and R6d's A/B against `GGML_OPENMP=ON` is what settles it
 | Independent cross-check of the FFI mirror | C prints `n_embd_out 768, n_embd_inp 512, n_ctx_train 262144, vocab 262144, pooling 1`; Rust's `ModelFacts` prints the same five numbers | two programs, one artifact: a wrong struct field in our mirror shows up as a disagreement rather than as a green suite |
 
 
@@ -628,8 +657,10 @@ the number of loads: it falls back to 104 MB after both frees — most of what t
 the probe started with — and the second and third loads peak where the first did. So a process that loads once pays once, and one that
 loads repeatedly neither grows nor leaks, which is the behaviour §3's "one load per process" rule was written assuming.
 
-Not claimed: any of this on Windows or macOS (§14's per-OS rule — the feature does not build there), and no claim about what R6b2's
-decode will add on top. This round never calls `llama_decode`.
+Not claimed: any of this on Windows or macOS (§14's per-OS rule — the feature does not build there). The decode figures above are R6b2's,
+measured through our own FFI on this host; what is still unmeasured is a *corpus* — thousands of decodes in one process, where the
+per-sequence curve above meets §3's "one load per process" and becomes the number that decides whether `np embed` runs in `npd` or in a
+foreground command.
 
 ### What this decides about §5's amendments
 

@@ -8,7 +8,7 @@
 //!
 //! **R6b2:** text goes in and one unit-length [`Vector`] comes out — [`LoadedModel::embed_text`] tokenizes,
 //! runs a single forward pass, reads the pooled row and L2-normalises it, and [`LocalEmbedder`] is that path
-//! behind [`Embedder`](crate::embed::Embedder). What is still **not** here: nothing constructs a
+//! behind [`crate::embed::Embedder`]. What is still **not** here: nothing constructs a
 //! [`LocalEmbedder`] from a config, no caller embeds anything, and
 //! [`LocalModelProvider`](crate::embed::LocalModelProvider) therefore still answers
 //! [`EmbedError::RuntimeNotBuilt`] — R6c decides who holds a loaded model and when (§3's one load per
@@ -23,7 +23,7 @@
 //! llama.cpp's default `n_ubatch = 512`, a 600-token sequence **aborted the process** (measured: exit 134, no
 //! return code at all). Since `embeddings.max_tokens` accepts up to 8,192, that abort was reachable from an
 //! ordinary ~1,800-byte note. One window, asked for once, is what makes the assert unreachable; see
-//! [`REQUESTED_CTX`] for what it costs and [`LoadedModel::window`] for the refusal that guards it.
+//! `REQUESTED_CTX` for what it costs and [`LoadedModel::window`] for the refusal that guards it.
 //!
 //! What this module owns is therefore exactly the unsafe part: who holds the two C handles, in what order they
 //! die, and which refusals happen before anything is allocated. [`load`] is the only place in the crate that
@@ -483,7 +483,7 @@ impl LocalEmbedder {
         &self.model
     }
 
-    /// Embed one text under the prefix [`kind`] selects.
+    /// Embed one text under the prefix `kind` selects.
     pub fn embed_as(&self, text: &str, kind: TextKind) -> Result<Vector, EmbedError> {
         let prefix = match kind {
             TextKind::Document => &self.prefix_doc,

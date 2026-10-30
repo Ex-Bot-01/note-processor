@@ -152,5 +152,28 @@ what fails is not a check, because removal makes tests pass.
   Three load-and-drop cycles hold the same open-state RSS (±28 KiB) and do not crash — that is crash detection, **not** leak detection.
   The declared-vs-actual width debt is closed at the only place it can be: `load(path, configured_dim)` refuses against `llama_model_n_embd_out`, so
   declaring 512 against this file names both numbers before a context exists. `tests/local_load.rs` is artifact-gated on `NP_TEST_MODEL_PATH` and
-  prints `NOT COVERAGE` without it — the CI feature row proves the refusals, not the 768. Still owed by R6b2: tokenize → batch → decode → pool,
-  `max_tokens` enforcement over two specials, and §5's open question about a 262,144-token trained window against an 8,192 ceiling.
+  prints `NOT COVERAGE` without it — the CI feature row proves the refusals, not the 768.
+
+- **R6b2 shipped (text in, one unit-length 768-d vector out):** `LoadedModel::embed_text(prefix, text, budget)` tokenizes with
+  `add_special = true` and sizes its buffer from llama.cpp's own "you needed N slots" answer (`src/llama-vocab.cpp:4645-4647`, measured:
+  a 2-slot buffer for a 17-token sentence returns `-17`), refuses over the configured **token** budget — first production use of
+  `TokenBudgetExceeded`, and it reports tokens (a 23-byte sentence is **9**) — then refuses above the context window, decodes once with a
+  borrowed `llama_batch_get_one`, copies the pooled row out of the buffer the context rewrites next decode, and L2-normalises, refusing a
+  zero vector or a non-finite component instead of storing a row that silently scores 0.0 against everything. `LocalEmbedder`
+  (`LoadedModel` + a row's two prefixes + budget) implements `Embedder` on the document path; `LocalModelProvider` still answers
+  `RuntimeNotBuilt`, because R6c decides who holds ~420 MB and when.
+  **The abort that was found first:** this artifact is non-causal, so v0.8.0 asserts `n_ubatch >= n_tokens`
+  (`src/llama-context.cpp:1920`) and `GGML_ASSERT` → `GGML_ABORT` survives `NDEBUG`. At llama.cpp's default `n_ubatch = 512` a
+  **600-token sequence killed the process (exit 134)** — reachable from an ordinary ~1,800-byte note, since `max_tokens` accepts up to
+  8,192. `load` now sets `n_ctx = n_batch = n_ubatch = 4096`, and a 633-token decode returns rc=0 with ‖v‖ = 1.0 instead.
+  **Three numbers, all printed by the tests rather than asserted:** ~**130 tok/s** (543 tok in 3.85 s, 2,163 tok in 18.0 s; 392% CPU, so
+  OpenMP-off is not single-threaded — R6d owes the A/B), stripped release size **5.5 MiB → 11.0 MiB** with the feature (**+5.5 MiB** against
+  §14's ≤ 40 MB ceiling; symbol counts must be taken on the *unstripped* binary, since `strip` removes the table and then "0 llama symbols"
+  means nothing), and peak RSS **+0 / +47 / +109 / +218 / +458 MiB** above baseline at 133 / 513 / 1,026 / 2,052 / 4,085 tokens — the compute
+  buffer is reserved at init and touched per decode, so long notes cost memory and ordinary chunks cost nothing.
+  Semantic sanity is an ordering, not a score: `cos(cat, feline) = 0.8302` vs `cos(cat, revenue) = 0.5887`. Empty input is not an error —
+  it embeds BOS+EOS (2 tokens) into a real unit vector, which is what the artifact does rather than a rule we invented.
+  **§5's ceiling question now has a price attached and still needs the human:** at ~130 tok/s, `max_tokens = 8192` means a **63-second worst
+  case for one chunk**, while the default 2,048 means 16 s; and the runtime window is 4,096 today, so anything above that is refused until
+  `REQUESTED_CTX` moves — which §14's curve says costs +458 MiB by 4,085 tokens. Still owed: R6c wiring config → provider → `embeddings`
+  rows, and R6d's corpus-scale benchmark (batching across texts is deliberately not in this API yet).

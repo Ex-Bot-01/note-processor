@@ -23,7 +23,8 @@
 //!   artifact that exists, the row's document prefix, and a refusal where the forward pass goes. Nothing
 //!   constructs it from a config yet; R6c wires `[embeddings]` to a provider (§9's split), so today it is
 //!   reachable API only.
-//! - [`crate::local_model::LocalEmbedder`] — the same shape **with** the feature: one loaded model, the row's two
+//! - `local_model::LocalEmbedder` (feature `local-model`, so not a link: this module documents both builds) —
+//!   the same shape **with** the runtime inside: one loaded model, the row's two
 //!   prefixes, a token budget, and real vectors from R6b2 onward. The two types stay separate because the seam's
 //!   honest refusal is what a default build must keep answering, and a `Result` inside one provider would let
 //!   "this build has no runtime" quietly become "this call happened to fail".
@@ -160,14 +161,14 @@ pub enum EmbedError {
     /// see what the runtime can actually answer, and "planned, not yet reachable" prose once sat here for two
     /// rounds after the code could reach them.
     ///
-    /// From [`crate::local_model::load`] (eight):
+    /// From `local_model::load` (eight):
     /// `"the model reported no output width"`, `"... no input width"`, `"... no training context"`,
     /// `"... an empty vocabulary"` (one guard, four labels), `"the loaded model exposed no vocabulary"`,
     /// `"the runtime refused to build a context for this model"`,
     /// `"this artifact cannot produce a sentence vector: the context pools with NONE"`,
     /// `"the runtime reported a pooling strategy this build does not know"`.
     ///
-    /// From [`crate::local_model::LoadedModel::embed_text`] (nine):
+    /// From `local_model::LoadedModel::embed_text` (nine):
     /// `"the sequence is too long to hand to the tokenizer"`, `"the tokenizer refused to count this sequence"`,
     /// `"the tokenizer's count did not fit its own buffer"`, **`"the sequence is longer than this context can
     /// hold"`** (over the window; worded so the reader shortens a chunk instead of freeing RAM — it replaced the
@@ -247,7 +248,7 @@ pub enum EmbedError {
     /// — "a row claiming currency for bytes it never saw". The message carries both numbers and no text:
     /// the reader needs to know how far over, and must not need the note to say so.
     ///
-    /// Raised by [`crate::local_model::LoadedModel::embed_text`] (R6b2) over the count **llama.cpp's tokenizer
+    /// Raised by `local_model::LoadedModel::embed_text` (R6b2) over the count **llama.cpp's tokenizer
     /// returned**, never a byte length — `tokens` for a 23-byte sentence on this artifact is 9, and a
     /// byte-based check would refuse text that fits while accepting multibyte text that does not.
     #[error(

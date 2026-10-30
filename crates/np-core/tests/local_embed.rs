@@ -24,7 +24,7 @@
 /// The forward-pass claims. All of them are artifact-gated: there is no way to ask for a vector without a model.
 #[cfg(feature = "local-model")]
 mod embedding {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
     use std::time::Instant;
 
@@ -70,7 +70,7 @@ mod embedding {
     }
 
     /// Load for one case. `DIM` is what the artifact answers, so every case that wants a working model gets one.
-    fn load(path: &PathBuf) -> LoadedModel {
+    fn load(path: &Path) -> LoadedModel {
         local_model::load(path, DIM).unwrap_or_else(|problem| {
             panic!("loading {} should succeed: {problem}", path.display())
         })
