@@ -915,6 +915,39 @@ fn names_of(dir: &Path) -> Vec<String> {
 // and the reporting. Nothing here implies that progress is displayed anywhere in production.
 // ---------------------------------------------------------------------------
 
+/// §12 rule 3's re-fetch half, through the CLI: an installed model that is fetching again keeps its row line *and*
+/// gains a fetch line. Pinned at this level because the temptation to collapse the overlap lives in the printer.
+#[test]
+fn a_re_fetch_shows_the_installed_row_and_the_fetch_together() {
+    let ws = Scratch::new();
+    install_one(&ws);
+    plant_marker(&ws, ID, MARKER_BODY);
+
+    let listed = run(&mut ws.list(true));
+    listed.assert_success();
+    let report = listed.json();
+    assert_eq!(report["models"][0]["id"], ID, "{report}");
+    assert_eq!(report["models"][0]["state"], "present", "{report}");
+    assert_eq!(
+        report["fetching"].as_array().map(|v| v.len()),
+        Some(1),
+        "{report}"
+    );
+    assert_eq!(report["fetching"][0]["id"], ID, "{report}");
+    assert!(
+        report["unclaimed"].as_array().map(|v| v.is_empty()) == Some(true),
+        "a marker for an installed id is not junk: {report}"
+    );
+
+    let plain = run(&mut ws.list(false));
+    let text = plain.stdout();
+    assert!(text.contains(&format!("{ID}  present")), "{text}");
+    assert!(
+        text.contains(&format!("1 fetch in progress · {ID} (")),
+        "the row line and the fetch line both appear:\n{text}"
+    );
+}
+
 /// A fetch in progress gets its own section in both channels, and neither reserved name is announced as junk.
 #[test]
 fn a_fetch_in_progress_is_listed_in_both_channels_and_is_never_unclaimed() {

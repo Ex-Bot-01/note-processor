@@ -1252,6 +1252,12 @@ fn the_recogniser_refuses_every_near_miss_of_either_shape() {
         ".fetching.a/b.json",
         ".fetching.../../etc.json",
         ".part.a\\b.1-0",
+        // **The two cases where only the separator guard can refuse.** Above, a separator also breaks
+        // `validate_id`'s charset, so deleting that guard changes nothing observable — which is how an unpinned
+        // defence hides. Here the id is legal (`x`, `a`) and the separator sits in the **nonce**, which is
+        // deliberately not charset-checked: without the guard these read as fetches of `x` and `a`.
+        ".part.x.y/z",
+        ".part.a.b\\c",
         // The empty name and a plain dot.
         "",
         ".",
@@ -1457,9 +1463,10 @@ fn a_marker_that_cannot_be_read_at_all_is_unreadable_not_absent() {
     let fx = Fixture::new();
     fs::create_dir_all(fx.models_dir()).expect("test setup: the models dir");
 
-    // A directory at the marker path. Which OS-level error that produces is platform business — `fs::File::open`
-    // on Linux succeeds and the read fails, Windows refuses the open — so the claim pinned here is the one both
-    // platforms can keep: it is reported, with a reason, and not treated as absent.
+    // A directory at the marker path. Which OS-level error produces that is platform business and **not claimed
+    // here** (CI cannot start jobs, so no Windows behaviour is earned — roadmap §4's Windows note): the OS may
+    // refuse the open or refuse the read, and this program now refuses even to open it. Either way the one claim
+    // both platforms can keep is pinned: reported, with a reason, never treated as absent.
     let path = models::marker_path(&fx.models_dir(), "alpha");
     fs::create_dir(&path).expect("test setup: a directory at the marker path");
     let dir_as_marker = models::fetch_state(&fx.models_dir(), "alpha");
@@ -1532,6 +1539,95 @@ fn a_fetch_is_listed_for_an_id_with_no_row_and_never_reported_as_unclaimed() {
             .collect::<Vec<_>>(),
         ["notes-backup.txt"],
         "a fetch that was going to be announced as garbage is the defect §11's addendum records"
+    );
+}
+
+/// §12 rule 3's *other* half: a model that is already installed can be re-fetching. The row keeps its own verdict
+/// and the fetch appears beside it — which is exactly where a refactor is tempted to "resolve" the overlap by
+/// dropping one of them, so it is pinned rather than left to the module doc's sentence about orthogonality.
+#[test]
+fn a_re_fetch_of_an_installed_model_shows_the_row_and_the_fetch_together() {
+    let fx = Fixture::new();
+    let source = fx.source("weights-v1.bin", b"weights v1");
+    let digest = sha256_file(&source).expect("test setup: hash the source");
+    let db = fx.db();
+    install(&fx, &db, &request("alpha", &source, &digest, 8)).expect("first install");
+
+    plant_marker(&fx, "alpha", MARKER_BODY);
+
+    let listing =
+        models::list(&db, &fx.config, &fx.workspace).expect("a re-fetch never fails a listing");
+    assert_eq!(
+        states(&listing),
+        [("alpha", ArtifactState::Present)],
+        "the artifact keeps its own verdict while a newer copy is arriving"
+    );
+    assert_eq!(
+        listing
+            .fetching
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha"],
+        "and the fetch is reported beside it, not instead of it"
+    );
+    assert!(
+        listing.unclaimed.is_empty(),
+        "the marker is a recognised name: {:?}",
+        listing.unclaimed
+    );
+}
+
+/// The read bound is pinned at both edges: a marker of exactly `MARKER_MAX_BYTES` is read (it is a marker, and the
+/// bound exists to refuse *oversized* files), and one byte more is refused. Without the exact-size case, `>` and
+/// `>=` are indistinguishable — a 64 KiB marker would silently flip from `Present` to `Unreadable`.
+#[test]
+fn a_marker_of_exactly_the_read_bound_is_read_and_one_byte_more_is_not() {
+    let fx = Fixture::new();
+    // The nonce is opaque and unchecked, so it is the honest place to grow a marker to a chosen size.
+    let fixed = r#"{"nonce":"","started_at":1,"bytes_done":1}"#.len();
+    let bound = 64 * 1024;
+
+    let exact = format!(
+        r#"{{"nonce":"{}","started_at":1,"bytes_done":1}}"#,
+        "n".repeat(bound - fixed)
+    );
+    assert_eq!(exact.len(), bound, "test setup: exactly at the bound");
+    plant_marker(&fx, "alpha", exact.as_bytes());
+    let read = models::fetch_state(&fx.models_dir(), "alpha");
+    assert!(
+        matches!(read, models::FetchState::Present(_)),
+        "a marker of exactly the bound is a marker, got {read:?}"
+    );
+
+    let over = format!(
+        r#"{{"nonce":"{}","started_at":1,"bytes_done":1}}"#,
+        "n".repeat(bound - fixed + 1)
+    );
+    assert_eq!(over.len(), bound + 1, "test setup: one past the bound");
+    plant_marker(&fx, "alpha", over.as_bytes());
+    let read = models::fetch_state(&fx.models_dir(), "alpha");
+    assert!(
+        matches!(&read, models::FetchState::Unreadable { reason, .. } if reason.contains("larger than")),
+        "one byte past the bound is refused by name: {read:?}"
+    );
+}
+
+/// An empty nonce names no `.part` file — `fetch_name` refuses `.part.<id>.` outright — so a marker carrying one is
+/// unreadable rather than a link to nothing. Without this, R7b could write one spelling and read the other.
+#[test]
+fn an_empty_nonce_is_refused_because_it_names_no_partial_download() {
+    let fx = Fixture::new();
+    plant_marker(
+        &fx,
+        "alpha",
+        br#"{"nonce":"","started_at":1,"bytes_done":1}"#,
+    );
+    let read = models::fetch_state(&fx.models_dir(), "alpha");
+    assert!(
+        matches!(&read, models::FetchState::Unreadable { reason, .. }
+            if reason.contains("nonce") && reason.contains("empty")),
+        "an empty nonce is refused with a sentence naming the field: {read:?}"
     );
 }
 

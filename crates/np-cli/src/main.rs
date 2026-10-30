@@ -91,7 +91,8 @@ enum ModelsCommand {
     },
     /// List this workspace's installed models and what their artifacts look like on disk.
     List {
-        /// Workspace root to inspect.
+        /// Workspace root to inspect: its model rows, what their artifacts look like on disk, and any fetch in
+        /// progress.
         workspace: PathBuf,
         /// Print the listing as JSON instead of one line per model.
         #[arg(long)]
@@ -500,6 +501,11 @@ fn print_listing(listing: &Listing) {
 /// Byte sizes come from [`size_human`], the catalog's one formatter. A second formatter here would be two answers
 /// to "how big is it" — the reason `CatalogEntry::size_human` is pre-formatted by its caller rather than rendered
 /// twice.
+///
+/// **Fields are printed exactly as the marker wrote them, even when they contradict each other.** A marker saying
+/// `bytes_done = 1.4 GB, bytes_total = 100 MB` prints both, because "report what you found" is the whole duty here:
+/// clamping would hide a file this program cannot explain, and refusing it as unreadable would be this build
+/// deciding that §12 rule 6's pair is impossible when only R7b can say whether it happens.
 fn fetch_line(count: usize, entry: &FetchEntry) -> String {
     let plural = if count == 1 { "fetch" } else { "fetches" };
     let head = format!("{count} {plural} in progress · ");

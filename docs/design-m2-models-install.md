@@ -156,7 +156,10 @@ subdirectory is reported as one rather than recursed; unclaimed entries never ch
 
 **Machine-readable output is pinned here, not left to the implementer.** `--json` emits one object whose key set is
 identical for every state — per row `{ "id", "dim", "sha256", "prefix_doc", "prefix_query", "installed_at", "state" }`,
-plus `"unclaimed": [...]`, plus `"models_dir_error"` when listing fails. Install's three outcomes are the strings
+plus `"unclaimed": [...]`, plus `"models_dir_error"` when listing fails, plus — since R7a, on the authority of
+`design-m2-local-embeddings.md` §12 rule 3 — `"fetching": [...]`, one entry per recognised marker. **The key set is a
+sorted-set pin, not a byte-order pin**: `serde_json` is built without `preserve_order`, so a document prints its keys
+alphabetically and no consumer may read meaning in their order; the order that is real and pinned is the text channel's. Install's three outcomes are the strings
 `installed`, `already installed`, `restored`, in that same `state` field. `list --json` wraps those rows in a top-level `"models"` array;
 `install --json` is the object `{ "id", "state" }` and nothing else. Both names are frozen by tests, so they are
 pinned here too — otherwise a later rename breaks a consumer and no document says who decided it. **Exit codes

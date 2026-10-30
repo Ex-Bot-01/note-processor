@@ -2,7 +2,8 @@
 //!
 //! This is the whole of round 4a's behaviour, as core functions rather than as CLI code: `install` puts a
 //! file the human already holds under the workspace's artifact directory, verifies it against a digest the
-//! human declared, and records the row; `list` says what each row's artifact looks like. Both take `&Db` and
+//! human declared, and records the row; `list` says what each row's artifact looks like **and any fetch in
+//! progress beside the rows**. Both take `&Db` and
 //! `&Config` so np-cli stays a parser of text into [`Install`] plus a printer of [`InstallOutcome`] and
 //! [`Listing`] — the reason §6 names reads and writes in `db.rs` instead of letting a command hold SQL.
 //!
@@ -11,8 +12,9 @@
 //! exists to keep it that way. R7a keeps that sentence true: reading a fetch marker ([`fetch_state`]) opens one
 //! file in the workspace's own artifact directory, and nothing in this module can name a host or open a socket.
 //! The transfer itself belongs to a separate module behind its own feature (`design-m2-local-embeddings`
-//! §12 rule 1), which does not exist yet — **no code path here can create a marker**, so production cannot
-//! report a fetch in progress until that round lands; only tests plant these files today.
+//! §12 rule 1), which does not exist yet — so **no code path here can create a marker**, and R7a has nothing of
+//! *this program's own* to report. A marker any other hand placed is still reported: [`list`] reads names, not
+//! authorship, which is what makes the first-start case work before R7b writes its first byte.
 //!
 //! **`fetching` is not an [`ArtifactState`]** (§12 rule 3). The four arms above are mutually exclusive verdicts
 //! on one artifact, while a fetch is orthogonal to all of them: on a first start there is *no row at all*, and a
@@ -294,6 +296,10 @@ pub fn marker_path(models_dir: &Path, id: &str) -> PathBuf {
 pub struct FetchFields {
     /// The nonce naming the `.part.<id>.<nonce>` file this fetch writes — the human's link between the marker
     /// and the bytes on disk. Kept opaque: `list` prints it and decides nothing from it.
+    ///
+    /// **Never empty.** [`fetch_name`] refuses `.part.<id>.`, so a marker carrying `""` would point at a name this
+    /// program's own recogniser calls junk; the reader rejects it as unreadable rather than storing a link that
+    /// resolves to nothing.
     pub nonce: String,
     /// Whole seconds since the Unix epoch, as written. Displayed only.
     pub started_at: i64,
@@ -335,6 +341,35 @@ pub enum FetchState {
 /// and §12 rule 4 refuses that decision to any command but an explicit `--discard-marker` (R7b's, not here).
 pub fn fetch_state(models_dir: &Path, id: &str) -> FetchState {
     let path = marker_path(models_dir, id);
+    // **Look before opening.** A name alone does not promise a regular file, and one of the alternatives blocks:
+    // `fs::File::open` on a FIFO waits for a writer, so a stray `.fetching.<id>.json` pipe would hang
+    // `np models list` forever — the exact power [`MARKER_MAX_BYTES`] exists to deny a stray file. Artifacts are
+    // read the same way ([`artifact_state`] checks `is_file()` before hashing), and the answer is the one a
+    // directory already got: reported as unreadable, never deleted, never "absent".
+    //
+    // **This guard is defence-in-depth, not a covered branch, and it is written down rather than simulated.** No
+    // test distinguishes it: on Linux a *directory* at the marker path still reaches `Unreadable` through the read
+    // failing, so deleting the block changes nothing any unit test can see (verified — the mutant survived). What it
+    // actually buys was measured end to end instead: with a FIFO planted at `.fetching.gamma.json`, `np models list`
+    // blocked until `timeout` killed it (exit 124) before this guard and now completes, printing
+    // "it is not a regular file" for that id. A test would need `mkfifo`, i.e. a libc dependency or an external
+    // binary plus a skip path on Windows — the skipped-branch class this project refuses to write coverage about.
+    match fs::metadata(walk::to_open_path(&path)) {
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return FetchState::Absent,
+        Err(source) => {
+            return FetchState::Unreadable {
+                path,
+                reason: source.to_string(),
+            }
+        }
+        Ok(meta) if !meta.is_file() => {
+            return FetchState::Unreadable {
+                path,
+                reason: "it is not a regular file".to_string(),
+            }
+        }
+        Ok(_) => {}
+    }
     let opened = fs::File::open(walk::to_open_path(&access(&path)));
     let file = match opened {
         Err(source) if source.kind() == io::ErrorKind::NotFound => return FetchState::Absent,
@@ -433,7 +468,14 @@ fn parse_marker(bytes: &[u8]) -> Result<FetchFields, String> {
                 if nonce.is_some() {
                     return Err(duplicate("nonce"));
                 }
-                nonce = Some(value.text("nonce")?);
+                // Empty is refused, not stored: `.part.<id>.` is a name [`fetch_name`] rejects, so an empty nonce
+                // would be a link to nothing (§12 rule 2). Keeping the two spellings of "no nonce" in step here is
+                // cheaper than trusting R7b to write one and read the other.
+                let written = value.text("nonce")?;
+                if written.is_empty() {
+                    return Err(unparsable("nonce", "an empty string"));
+                }
+                nonce = Some(written);
             }
             "started_at" => {
                 if started_at.is_some() {
