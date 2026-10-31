@@ -1,0 +1,322 @@
+matrix start 2026-10-31T10:15:31+00:00 host_cpus=16
+=== cell tok=403 reps=8 variant=off mode=warm process=1
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.34 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5520 kB after=392592 kB delta=387072 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.60 s tok_s=156.5 per_repeat_ms min=2566.8 median=2574.4 max=2584.1
+DECODE RSS resident=392592 kB before=396560 kB after=463760 kB hwm(process-lifetime, includes load)=463760 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=warm tokens=403 repeats=8 tok_s=156.5 median_ms=2574.4 spread_pct=0.67 load_s=0.34 load_read_bytes=0 resident_after_load_kb=392592 hwm_kb=463760 threads_after=1 cpu_pct=400 total_s=20.96
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=warm process=1
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.34 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5892 kB after=392856 kB delta=386964 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.67 s tok_s=156.0 per_repeat_ms min=2576.0 median=2583.4 max=2591.5
+DECODE RSS resident=392856 kB before=396828 kB after=463820 kB hwm(process-lifetime, includes load)=463820 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=warm tokens=403 repeats=8 tok_s=156.0 median_ms=2583.4 spread_pct=0.60 load_s=0.34 load_read_bytes=0 resident_after_load_kb=392856 hwm_kb=463820 threads_after=4 cpu_pct=400 total_s=21.03
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=cold process=1
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.42 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5548 kB after=392632 kB delta=387084 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.69 s tok_s=155.8 per_repeat_ms min=2561.8 median=2588.4 max=2607.1
+DECODE RSS resident=392632 kB before=396600 kB after=463720 kB hwm(process-lifetime, includes load)=463720 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=cold tokens=403 repeats=8 tok_s=155.8 median_ms=2588.4 spread_pct=1.75 load_s=0.42 load_read_bytes=309858304 resident_after_load_kb=392632 hwm_kb=463720 threads_after=1 cpu_pct=400 total_s=21.14
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=cold process=1
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.43 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5976 kB after=393064 kB delta=387088 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.66 s tok_s=156.0 per_repeat_ms min=2562.7 median=2581.9 max=2605.0
+DECODE RSS resident=393064 kB before=397036 kB after=464044 kB hwm(process-lifetime, includes load)=464044 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=cold tokens=403 repeats=8 tok_s=156.0 median_ms=2581.9 spread_pct=1.64 load_s=0.43 load_read_bytes=309858304 resident_after_load_kb=393064 hwm_kb=464044 threads_after=4 cpu_pct=400 total_s=21.11
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=warm process=2
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.36 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5456 kB after=392612 kB delta=387156 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.70 s tok_s=155.8 per_repeat_ms min=2569.3 median=2590.5 max=2606.1
+DECODE RSS resident=392612 kB before=396580 kB after=463700 kB hwm(process-lifetime, includes load)=463700 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=warm tokens=403 repeats=8 tok_s=155.8 median_ms=2590.5 spread_pct=1.42 load_s=0.36 load_read_bytes=0 resident_after_load_kb=392612 hwm_kb=463700 threads_after=1 cpu_pct=400 total_s=21.08
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=warm process=2
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.35 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=6056 kB after=393092 kB delta=387036 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.77 s tok_s=155.2 per_repeat_ms min=2576.7 median=2599.5 max=2614.8
+DECODE RSS resident=393092 kB before=397064 kB after=463992 kB hwm(process-lifetime, includes load)=463992 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=warm tokens=403 repeats=8 tok_s=155.2 median_ms=2599.5 spread_pct=1.46 load_s=0.35 load_read_bytes=0 resident_after_load_kb=393092 hwm_kb=463992 threads_after=4 cpu_pct=400 total_s=21.13
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=cold process=2
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.44 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5588 kB after=392724 kB delta=387136 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.74 s tok_s=155.4 per_repeat_ms min=2585.4 median=2594.6 max=2597.2
+DECODE RSS resident=392724 kB before=396692 kB after=463828 kB hwm(process-lifetime, includes load)=463828 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=cold tokens=403 repeats=8 tok_s=155.4 median_ms=2594.6 spread_pct=0.46 load_s=0.44 load_read_bytes=309858304 resident_after_load_kb=392724 hwm_kb=463828 threads_after=1 cpu_pct=400 total_s=21.20
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=cold process=2
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.44 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5868 kB after=393072 kB delta=387204 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.71 s tok_s=155.6 per_repeat_ms min=2574.7 median=2589.5 max=2604.9
+DECODE RSS resident=393072 kB before=397044 kB after=463972 kB hwm(process-lifetime, includes load)=463972 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=cold tokens=403 repeats=8 tok_s=155.6 median_ms=2589.5 spread_pct=1.17 load_s=0.44 load_read_bytes=309858304 resident_after_load_kb=393072 hwm_kb=463972 threads_after=4 cpu_pct=400 total_s=21.18
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=warm process=3
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.35 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5572 kB after=392596 kB delta=387024 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.62 s tok_s=156.3 per_repeat_ms min=2569.8 median=2575.8 max=2590.3
+DECODE RSS resident=392596 kB before=396564 kB after=463684 kB hwm(process-lifetime, includes load)=463684 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=warm tokens=403 repeats=8 tok_s=156.3 median_ms=2575.8 spread_pct=0.80 load_s=0.35 load_read_bytes=0 resident_after_load_kb=392596 hwm_kb=463684 threads_after=1 cpu_pct=400 total_s=20.99
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=warm process=3
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.36 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5944 kB after=393036 kB delta=387092 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.70 s tok_s=155.7 per_repeat_ms min=2577.5 median=2588.3 max=2602.4
+DECODE RSS resident=393036 kB before=397008 kB after=463936 kB hwm(process-lifetime, includes load)=463936 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=warm tokens=403 repeats=8 tok_s=155.7 median_ms=2588.3 spread_pct=0.96 load_s=0.36 load_read_bytes=0 resident_after_load_kb=393036 hwm_kb=463936 threads_after=4 cpu_pct=400 total_s=21.09
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=cold process=3
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.44 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5448 kB after=392604 kB delta=387156 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.61 s tok_s=156.4 per_repeat_ms min=2563.4 median=2575.6 max=2590.5
+DECODE RSS resident=392604 kB before=396572 kB after=463628 kB hwm(process-lifetime, includes load)=463628 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=cold tokens=403 repeats=8 tok_s=156.4 median_ms=2575.6 spread_pct=1.05 load_s=0.44 load_read_bytes=309858304 resident_after_load_kb=392604 hwm_kb=463628 threads_after=1 cpu_pct=400 total_s=21.07
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=cold process=3
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.43 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5996 kB after=393080 kB delta=387084 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.68 s tok_s=155.9 per_repeat_ms min=2561.3 median=2590.7 max=2601.8
+DECODE RSS resident=393080 kB before=397052 kB after=464048 kB hwm(process-lifetime, includes load)=464048 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=cold tokens=403 repeats=8 tok_s=155.9 median_ms=2590.7 spread_pct=1.56 load_s=0.43 load_read_bytes=309858304 resident_after_load_kb=393080 hwm_kb=464048 threads_after=4 cpu_pct=400 total_s=21.13
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=warm process=4
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.34 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5576 kB after=392656 kB delta=387080 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.56 s tok_s=156.8 per_repeat_ms min=2558.1 median=2568.5 max=2582.6
+DECODE RSS resident=392656 kB before=396624 kB after=463816 kB hwm(process-lifetime, includes load)=463816 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=warm tokens=403 repeats=8 tok_s=156.8 median_ms=2568.5 spread_pct=0.95 load_s=0.34 load_read_bytes=0 resident_after_load_kb=392656 hwm_kb=463816 threads_after=1 cpu_pct=400 total_s=20.91
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=warm process=4
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.33 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5936 kB after=392964 kB delta=387028 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.58 s tok_s=156.6 per_repeat_ms min=2562.7 median=2573.6 max=2580.5
+DECODE RSS resident=392964 kB before=396936 kB after=463928 kB hwm(process-lifetime, includes load)=463928 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=warm tokens=403 repeats=8 tok_s=156.6 median_ms=2573.6 spread_pct=0.69 load_s=0.33 load_read_bytes=0 resident_after_load_kb=392964 hwm_kb=463928 threads_after=4 cpu_pct=400 total_s=20.93
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=cold process=4
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.43 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5488 kB after=392756 kB delta=387268 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.51 s tok_s=157.2 per_repeat_ms min=2557.3 median=2564.9 max=2567.7
+DECODE RSS resident=392756 kB before=396724 kB after=463860 kB hwm(process-lifetime, includes load)=463860 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=cold tokens=403 repeats=8 tok_s=157.2 median_ms=2564.9 spread_pct=0.40 load_s=0.43 load_read_bytes=309858304 resident_after_load_kb=392756 hwm_kb=463860 threads_after=1 cpu_pct=400 total_s=20.96
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=cold process=4
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.46 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=6012 kB after=392972 kB delta=386960 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.56 s tok_s=156.8 per_repeat_ms min=2563.0 median=2569.7 max=2575.0
+DECODE RSS resident=392972 kB before=396944 kB after=463936 kB hwm(process-lifetime, includes load)=463936 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=cold tokens=403 repeats=8 tok_s=156.8 median_ms=2569.7 spread_pct=0.47 load_s=0.46 load_read_bytes=309858304 resident_after_load_kb=392972 hwm_kb=463936 threads_after=4 cpu_pct=400 total_s=21.03
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=warm process=5
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.35 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5444 kB after=392644 kB delta=387200 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.64 s tok_s=156.2 per_repeat_ms min=2568.4 median=2580.5 max=2588.9
+DECODE RSS resident=392644 kB before=396612 kB after=463748 kB hwm(process-lifetime, includes load)=463748 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=warm tokens=403 repeats=8 tok_s=156.2 median_ms=2580.5 spread_pct=0.79 load_s=0.35 load_read_bytes=0 resident_after_load_kb=392644 hwm_kb=463748 threads_after=1 cpu_pct=400 total_s=21.00
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=warm process=5
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.33 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5880 kB after=392828 kB delta=386948 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.65 s tok_s=156.1 per_repeat_ms min=2573.7 median=2579.8 max=2600.1
+DECODE RSS resident=392828 kB before=396800 kB after=463888 kB hwm(process-lifetime, includes load)=463888 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=warm tokens=403 repeats=8 tok_s=156.1 median_ms=2579.8 spread_pct=1.02 load_s=0.33 load_read_bytes=0 resident_after_load_kb=392828 hwm_kb=463888 threads_after=4 cpu_pct=400 total_s=21.00
+    exit=0
+=== cell tok=403 reps=8 variant=off mode=cold process=5
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.44 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5476 kB after=392684 kB delta=387208 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.70 s tok_s=155.7 per_repeat_ms min=2577.8 median=2587.6 max=2596.8
+DECODE RSS resident=392684 kB before=396652 kB after=463784 kB hwm(process-lifetime, includes load)=463784 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=off mode=cold tokens=403 repeats=8 tok_s=155.7 median_ms=2587.6 spread_pct=0.74 load_s=0.44 load_read_bytes=309858304 resident_after_load_kb=392684 hwm_kb=463784 threads_after=1 cpu_pct=400 total_s=21.16
+    exit=0
+=== cell tok=403 reps=8 variant=on mode=cold process=5
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.44 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5916 kB after=392800 kB delta=386884 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=403 repeats=8/8 wall=20.58 s tok_s=156.6 per_repeat_ms min=2562.9 median=2574.8 max=2582.8
+DECODE RSS resident=392800 kB before=396772 kB after=463844 kB hwm(process-lifetime, includes load)=463844 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=400% of one core  clk_tck=100
+SUMMARY    variant=on mode=cold tokens=403 repeats=8 tok_s=156.6 median_ms=2574.8 spread_pct=0.77 load_s=0.44 load_read_bytes=309858304 resident_after_load_kb=392800 hwm_kb=463844 threads_after=4 cpu_pct=400 total_s=21.04
+    exit=0
+=== cell tok=7992 reps=1 variant=off mode=warm process=1
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.34 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5520 kB after=392416 kB delta=386896 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=98.45 s tok_s=81.2 per_repeat_ms min=98449.1 median=98449.1 max=98449.1
+DECODE RSS resident=392416 kB before=423980 kB after=1500660 kB hwm(process-lifetime, includes load)=1500660 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=399% of one core  clk_tck=100
+SUMMARY    variant=off mode=warm tokens=7992 repeats=1 tok_s=81.2 median_ms=98449.1 spread_pct=0.00 load_s=0.34 load_read_bytes=0 resident_after_load_kb=392416 hwm_kb=1500660 threads_after=1 cpu_pct=399 total_s=99.33
+    exit=0
+=== cell tok=7992 reps=1 variant=on mode=warm process=1
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.35 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5988 kB after=393088 kB delta=387100 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=98.58 s tok_s=81.1 per_repeat_ms min=98584.7 median=98584.7 max=98584.7
+DECODE RSS resident=393088 kB before=424656 kB after=1501160 kB hwm(process-lifetime, includes load)=1501160 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=398% of one core  clk_tck=100
+SUMMARY    variant=on mode=warm tokens=7992 repeats=1 tok_s=81.1 median_ms=98584.7 spread_pct=0.00 load_s=0.35 load_read_bytes=0 resident_after_load_kb=393088 hwm_kb=1501160 threads_after=4 cpu_pct=398 total_s=99.47
+    exit=0
+=== cell tok=7992 reps=1 variant=off mode=cold process=1
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.43 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5456 kB after=392608 kB delta=387152 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=98.24 s tok_s=81.4 per_repeat_ms min=98240.7 median=98240.7 max=98240.7
+DECODE RSS resident=392608 kB before=424172 kB after=1500724 kB hwm(process-lifetime, includes load)=1500724 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=399% of one core  clk_tck=100
+SUMMARY    variant=off mode=cold tokens=7992 repeats=1 tok_s=81.4 median_ms=98240.7 spread_pct=0.00 load_s=0.43 load_read_bytes=309858304 resident_after_load_kb=392608 hwm_kb=1500724 threads_after=1 cpu_pct=399 total_s=99.21
+    exit=0
+=== cell tok=7992 reps=1 variant=on mode=cold process=1
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.43 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5836 kB after=392908 kB delta=387072 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=99.06 s tok_s=80.7 per_repeat_ms min=99056.8 median=99056.8 max=99056.8
+DECODE RSS resident=392908 kB before=424476 kB after=1500996 kB hwm(process-lifetime, includes load)=1500996 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=396% of one core  clk_tck=100
+SUMMARY    variant=on mode=cold tokens=7992 repeats=1 tok_s=80.7 median_ms=99056.8 spread_pct=0.00 load_s=0.43 load_read_bytes=309858304 resident_after_load_kb=392908 hwm_kb=1500996 threads_after=4 cpu_pct=396 total_s=100.03
+    exit=0
+=== cell tok=7992 reps=1 variant=off mode=warm process=2
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.36 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5512 kB after=392716 kB delta=387204 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=98.10 s tok_s=81.5 per_repeat_ms min=98095.3 median=98095.3 max=98095.3
+DECODE RSS resident=392716 kB before=424280 kB after=1500912 kB hwm(process-lifetime, includes load)=1500912 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=399% of one core  clk_tck=100
+SUMMARY    variant=off mode=warm tokens=7992 repeats=1 tok_s=81.5 median_ms=98095.3 spread_pct=0.00 load_s=0.36 load_read_bytes=0 resident_after_load_kb=392716 hwm_kb=1500912 threads_after=1 cpu_pct=399 total_s=99.00
+    exit=0
+=== cell tok=7992 reps=1 variant=on mode=warm process=2
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.34 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5848 kB after=393116 kB delta=387268 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=98.54 s tok_s=81.1 per_repeat_ms min=98536.1 median=98536.1 max=98536.1
+DECODE RSS resident=393116 kB before=424684 kB after=1501204 kB hwm(process-lifetime, includes load)=1501204 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=398% of one core  clk_tck=100
+SUMMARY    variant=on mode=warm tokens=7992 repeats=1 tok_s=81.1 median_ms=98536.1 spread_pct=0.00 load_s=0.34 load_read_bytes=0 resident_after_load_kb=393116 hwm_kb=1501204 threads_after=4 cpu_pct=398 total_s=99.41
+    exit=0
+=== cell tok=7992 reps=1 variant=off mode=cold process=2
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.45 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5460 kB after=392612 kB delta=387152 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=98.38 s tok_s=81.2 per_repeat_ms min=98383.2 median=98383.2 max=98383.2
+DECODE RSS resident=392612 kB before=424176 kB after=1500792 kB hwm(process-lifetime, includes load)=1500792 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=399% of one core  clk_tck=100
+SUMMARY    variant=off mode=cold tokens=7992 repeats=1 tok_s=81.2 median_ms=98383.2 spread_pct=0.00 load_s=0.45 load_read_bytes=309858304 resident_after_load_kb=392612 hwm_kb=1500792 threads_after=1 cpu_pct=399 total_s=99.39
+    exit=0
+=== cell tok=7992 reps=1 variant=on mode=cold process=2
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.46 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5884 kB after=393036 kB delta=387152 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=98.81 s tok_s=80.9 per_repeat_ms min=98807.6 median=98807.6 max=98807.6
+DECODE RSS resident=393036 kB before=424604 kB after=1501060 kB hwm(process-lifetime, includes load)=1501060 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=398% of one core  clk_tck=100
+SUMMARY    variant=on mode=cold tokens=7992 repeats=1 tok_s=80.9 median_ms=98807.6 spread_pct=0.00 load_s=0.46 load_read_bytes=309858304 resident_after_load_kb=393036 hwm_kb=1501060 threads_after=4 cpu_pct=398 total_s=99.82
+    exit=0
+=== cell tok=7992 reps=1 variant=off mode=warm process=3
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.34 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5472 kB after=392680 kB delta=387208 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=98.01 s tok_s=81.5 per_repeat_ms min=98014.0 median=98014.0 max=98014.0
+DECODE RSS resident=392680 kB before=424244 kB after=1500868 kB hwm(process-lifetime, includes load)=1500868 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=399% of one core  clk_tck=100
+SUMMARY    variant=off mode=warm tokens=7992 repeats=1 tok_s=81.5 median_ms=98014.0 spread_pct=0.00 load_s=0.34 load_read_bytes=0 resident_after_load_kb=392680 hwm_kb=1500868 threads_after=1 cpu_pct=399 total_s=98.89
+    exit=0
+=== cell tok=7992 reps=1 variant=on mode=warm process=3
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.33 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5980 kB after=393068 kB delta=387088 kB
+LOAD IO    read_bytes_delta=0 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=97.79 s tok_s=81.7 per_repeat_ms min=97788.3 median=97788.3 max=97788.3
+DECODE RSS resident=393068 kB before=424636 kB after=1501140 kB hwm(process-lifetime, includes load)=1501140 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=398% of one core  clk_tck=100
+SUMMARY    variant=on mode=warm tokens=7992 repeats=1 tok_s=81.7 median_ms=97788.3 spread_pct=0.00 load_s=0.33 load_read_bytes=0 resident_after_load_kb=393068 hwm_kb=1501140 threads_after=4 cpu_pct=398 total_s=98.65
+    exit=0
+=== cell tok=7992 reps=1 variant=off mode=cold process=3
+BUILD      llama_version=0.8.0-dev gomp_mapped=no variant=off
+LOAD       0.44 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5568 kB after=392596 kB delta=387028 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=97.72 s tok_s=81.8 per_repeat_ms min=97719.5 median=97719.5 max=97719.5
+DECODE RSS resident=392596 kB before=424160 kB after=1500776 kB hwm(process-lifetime, includes load)=1500776 kB
+DECODE CPU threads_after_last_decode=1 (before any work: 1) cpu_utilisation=399% of one core  clk_tck=100
+SUMMARY    variant=off mode=cold tokens=7992 repeats=1 tok_s=81.8 median_ms=97719.5 spread_pct=0.00 load_s=0.44 load_read_bytes=309858304 resident_after_load_kb=392596 hwm_kb=1500776 threads_after=1 cpu_pct=399 total_s=98.69
+    exit=0
+=== cell tok=7992 reps=1 variant=on mode=cold process=3
+BUILD      llama_version=0.8.0-dev gomp_mapped=yes variant=on
+LOAD       0.43 s  n_ctx_requested=8192 built_n_ctx=8192 n_threads=4 n_threads_batch=4  (window includes context creation)
+LOAD RSS   before=5892 kB after=392928 kB delta=387036 kB
+LOAD IO    read_bytes_delta=309858304 bytes (page-granular; file on disk=309855456 bytes, llama_model_size=294064224 bytes)
+DECODE     rc=0 tokens=7992 repeats=1/1 wall=97.78 s tok_s=81.7 per_repeat_ms min=97779.0 median=97779.0 max=97779.0
+DECODE RSS resident=392928 kB before=424496 kB after=1501000 kB hwm(process-lifetime, includes load)=1501000 kB
+DECODE CPU threads_after_last_decode=4 (before any work: 1) cpu_utilisation=398% of one core  clk_tck=100
+SUMMARY    variant=on mode=cold tokens=7992 repeats=1 tok_s=81.7 median_ms=97779.0 spread_pct=0.00 load_s=0.43 load_read_bytes=309858304 resident_after_load_kb=392928 hwm_kb=1501000 threads_after=4 cpu_pct=398 total_s=98.75
+    exit=0
+MATRIX DONE 2026-10-31T10:42:25+00:00

@@ -57,9 +57,12 @@ build has nothing to load, so every batch is answered `runtime not built` and §
 produced. Neither writes a placeholder: an absent runtime, an absent artifact and an over-budget chunk are each reported
 as the specific thing they are.```
 
-CI is **configured** to build and test on Linux and Windows on every push, and **it does not run**: the account has no
-GitHub Actions budget, so GitHub refuses to start any job (since 2026-10-29, including the green runs this repo had
-before that date). Read the workflows as configuration, not evidence. Every measured claim in this repo therefore comes
+CI is **configured** to build and test on Linux and Windows on every push, and **it does not run**. Since 2026-10-29
+GitHub creates each run and then finishes it in about three seconds with **zero steps and no log** — `gh run view --log`
+answers `log not found`, and `GET /repos/…/actions/permissions` answers **404** — so no runner ever picks a job up. The
+account is reported to have no GitHub Actions budget; our token cannot tell that from Actions being switched off, and
+nothing here claims which it is (the green runs this repo had before that date are why we know the workflows themselves
+work). Read the workflows as configuration, not evidence. Every measured claim in this repo therefore comes
 from one Linux host, through the gate list in [`docs/plan-2026-10-28-state-and-roadmap.md`](docs/plan-2026-10-28-state-and-roadmap.md):
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, the no-`$HOME` config suite,
 rustdoc with `--deny warnings`, the two CFG fences, and the catalogue golden check. Release binaries are built for Linux, Windows and macOS; the

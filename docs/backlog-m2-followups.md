@@ -606,10 +606,11 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   "verify on every embed" is not free and should not be adopted by reflex; the options are verify-on-change (stat the
   file, re-hash when size or mtime moves), verify in `np models list` only, or hash lazily per tensor page.
   R6d's second round (2026-10-31, §14's A/B subsection) removed the last excuse for waiting: llama.cpp's mmap-first
-  load reads **every byte** of the artifact on first use — `read_bytes` moves by 309,858,304 — and it takes about
-  **0.1 s**. Reading is not the cost; our 26 MiB/s userspace hash loop is. So verify-on-change (stat, re-hash on size
-  or mtime) is now the option with no measured downside beyond a stale-mtime edge case, and this item needs a decision
-  rather than another measurement.
+  load pulls the **whole artifact** through the kernel on first use — `read_bytes` moves by 309,858,304 B, slightly
+  more than the file's 309,855,456 B because that counter is page-granular — and it does so inside a load window only
+  about **0.1 s** longer than a warm one (upper bound: that window also builds the context). Reading is not the cost;
+  our 26 MiB/s userspace hash loop is. So verify-on-change (stat, re-hash on size or mtime) is now the option with no
+  measured downside beyond a stale-mtime edge case, and this item needs a decision rather than another measurement.
 - **D13 — llama.cpp defaults to 4 threads on a 16-CPU host; nobody has measured what raising it buys.**
   R6d's OpenMP A/B (2026-10-31) found both build configurations printing `n_threads=4 n_threads_batch=4` from
   `llama_context_default_params()`, which is why the flag moved no throughput at all: ggml's own pthread pool and an

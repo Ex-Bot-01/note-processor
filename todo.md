@@ -171,7 +171,7 @@ what fails is not a check, because removal makes tests pass.
   **Three numbers, none of them asserted** — only throughput is printed by a test (`decode_throughput_is_printed_not_asserted`); size comes
   from `cargo build --release` plus `nm`, and the RSS curve from `crates/np-core/tests/probes/decode_probe.c`: ~**130 tok/s** (543 tok in
   3.85 s, 2,163 tok in 18.0 s; 392% CPU because ggml runs its own thread pool — `llama_n_threads_batch` = 4 — so OpenMP-off is not
-  single-threaded, and R6d still owes the A/B), stripped release size **5.5 MiB → 11.0 MiB** with the feature (**+5.5 MiB** against
+  single-threaded; R6d's A/B has since measured that OpenMP-on changes nothing at those four threads, §14), stripped release size **5.5 MiB → 11.0 MiB** with the feature (**+5.5 MiB** against
   §14's ≤ 40 MB ceiling; symbol counts must be taken on the *unstripped* binary, since `strip` removes the table and then "0 llama symbols"
   means nothing), and peak RSS **+0 / +47 / +109 / +218 / +458 MiB** above baseline at 133 / 513 / 1,026 / 2,052 / 4,085 tokens — the compute
   buffer is reserved at init and touched per decode, so long notes cost memory and ordinary chunks cost nothing.
@@ -233,12 +233,17 @@ what fails is not a check, because removal makes tests pass.
   its own rule, and dies in 1.5 s because a refusal never reaches the decode. Also measured for D12: verifying this
   artifact by digest costs **11.32 s** per pass (26 MiB/s), which is why "re-hash on every embed" needs a decision
   rather than a reflex. The second round built the pinned tree twice (`-DGGML_OPENMP=OFF` vs `ON`, production option set
-  otherwise, 36 s each at `-j8`) and ran eight alternating decodes through
-  `crates/np-core/tests/probes/openmp_ab_probe.c`: **OpenMP buys nothing** — 157.7 vs 157.4 tok/s at 403 tokens warm,
-  156.7 vs 157.6 cold, 81.8 vs 81.9 and 82.0 vs 82.0 at 7,992, peak RSS within 0.5 MiB — because **both** configurations
-  default to `n_threads=4 n_threads_batch=4` on this 16-CPU host. `GGML_OPENMP=OFF` therefore stays, and the thread count
-  is filed as D13. The same runs answered the mmap question: an evicted artifact moves `read_bytes` by **309,858,304 —
-  every byte**, for ≈ 0.1 s (0.43 s cold vs 0.34 s warm), which is what D12 needed to hear about its own 11.32 s hash.
+  otherwise, 36 s each at `-j8`) and A/B'd them through `crates/np-core/tests/probes/openmp_ab_probe.c` with **one process
+  per measurement** — 5 processes per cell at 403 tokens, 3 at 7,992, OFF-then-ON back-to-back; the raw log is committed as
+  `crates/np-core/tests/probes/openmp-ab-2026-10-31.log`. Medians taken across processes: **403 warm 156.3 vs 156.0 tok/s,
+  403 cold 155.8 vs 156.0, 7,992 cold 81.4 vs 80.9, 7,992 warm 81.5 vs 81.1** — every gap smaller than the spread between
+  two processes of the *same* build, on this one host with this one artifact, and `cpu_utilisation` measured at
+  **396–400 %** on both sides (four cores busy either way; `n_threads=4 n_threads_batch=4`). ON's only measurable cost is a
+  libgomp dependency plus **+180 to +292 kB** peak RSS. So `GGML_OPENMP=OFF` stays, and the thread count is filed as D13.
+  The same runs answered the mmap question: an evicted artifact moves `read_bytes` by **309,858,304 bytes — more than the
+  file's own 309,855,456, because that counter is page-granular** — inside a load window ≈ 0.09 s longer than a warm one
+  (an upper bound: that window also builds the context), which is what D12 needed to hear about its own 11.32 s hash:
+  reading is ~126× cheaper than our hash loop.
   Still open here: a *corpus* run (thousands of decodes in one process, §14's closing note) and batching across texts,
   which now waits on D13 rather than on OpenMP.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its
