@@ -601,5 +601,8 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   permissions — Linux-only evidence, and F18 says we do not ship a platform claim we have not run.
 - **D12 — `models.sha256` is not re-verified before a load (R6c2 review P2-3, same open decision as
   `LocalModelProvider::new`'s doc).** A same-width artifact swap is therefore embedded and stamped under the row's id.
-  Cost of closing it: one streaming SHA-256 over ~310 MB per `np embed` run, *if* §3's one-load-per-process holds — so
-  R6d's benchmark is where that price gets measured rather than assumed.
+  Cost of closing it: **measured on 2026-10-31** (`local_window.rs`) at **11.32 s** for this artifact's 309,855,456
+  bytes — 26 MiB/s, which is several times the cost of loading and embedding a small workspace's worth of notes. So
+  "verify on every embed" is not free and should not be adopted by reflex; the options are verify-on-change (stat the
+  file, re-hash when size or mtime moves), verify in `np models list` only, or hash lazily per tensor page. Deciding
+  needs the OpenMP/mmap half of R6d, because an mmap-first load changes what "read the whole file" even costs.
