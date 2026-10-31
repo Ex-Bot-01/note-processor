@@ -974,6 +974,12 @@ pub fn install(
                     found: on_disk,
                 });
             }
+            // This is the one install path that hashes the file already on disk, so it is the only place `install`
+            // *could* leave a D12 verification stamp — and it deliberately does not. §7 case 5 promises that repeating
+            // a declaration "rewrites nothing", tested by comparing the whole row before and after; writing a stamp
+            // here would trade that contract for saving one hash on the next embed. Verification belongs at use time,
+            // where the bytes are about to be trusted: `local_model::verify_artifact` does it on the first embed
+            // after an install and then skips while the stat holds.
             return Ok(InstallOutcome::AlreadyInstalled);
         }
         // The row attests this digest and the file is gone: re-materialise it, rewriting no column.
@@ -1433,7 +1439,7 @@ fn read_dir_entries(dir: &Path) -> Result<EntryList, io::Error> {
 
 /// [`hash::HashError`] carries the io failure and the path it failed on; this module reports paths in its own
 /// variants, so only the reason travels.
-fn hash_io(err: hash::HashError) -> io::Error {
+pub(crate) fn hash_io(err: hash::HashError) -> io::Error {
     match err {
         hash::HashError::Read { source, .. } => source,
     }

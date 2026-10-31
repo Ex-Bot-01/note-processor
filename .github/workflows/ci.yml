@@ -107,7 +107,7 @@ jobs:
       # the module's synthetic unit tests for pooling/positive-count refusals. Say it that plainly because
       # "every refusal" was false: every `Unavailable` arm and the width refusal need an artifact.
       #
-      # `--test local_embed` is R6b2's forward pass, and on GitHub it is **compilation plus twelve printed
+      # `--test local_embed` is R6b2's forward pass, and on GitHub it is **compilation plus thirteen printed
       # `NOT COVERAGE` lines and nothing else** - every case there asks a model for a vector (four of
       # local_load's seven, the same way). What runs locally
       # with the artifact (and is the actual deliverable) is the unit-length and determinism checks, the cosine
@@ -116,8 +116,9 @@ jobs:
       # header is caught on the row, which is where a re-pin first shows up.
       - name: Link proof
         # `--nocapture` is load-bearing, not cosmetics (Scope B review P1-3). libtest captures a passing test's stdout
-        # and throws it away, so the twelve `NOT COVERAGE` lines this job exists to print never reached the log: measured
-        # under the previous command with no artifact the count was **0**, and 12 only with the flag. The count is then
+        # and throws it away, so the `NOT COVERAGE` lines this job exists to print never reached the log: measured
+        # under the command of that day with no artifact the count was **0**, and 12 only with the flag - the same
+        # measurement today returns 20, because the files have grown since. The count is then
         # echoed so "compiled, never ran" is written on the record (§2 step 4) rather than implied - and the test exit
         # code, not the grep, is what fails the job.
         run: |
@@ -128,7 +129,8 @@ jobs:
           set +e
           set -uo pipefail
           cargo test --locked -p np-core --features local-model --lib --test local_runtime \
-            --test local_load --test local_embed --test local_window -- --nocapture 2>&1 \
+            --test local_load --test local_embed --test local_window --test artifact_verify \
+            -- --nocapture 2>&1 \
             | tee /tmp/feature-tests.log
           status=${PIPESTATUS[0]}
           count=$(grep -c 'NOT COVERAGE' /tmp/feature-tests.log)
@@ -140,7 +142,10 @@ jobs:
           # The step asserts something about the number it exists to print (A2 review P2-4). Measured on 2026-10-31
           # with no artifact configured, this command prints **20**: thirteen in local_embed (twelve since R6b2 plus
           # R6c2's provider-shape case), four of seven in local_load, three in local_window. `local_runtime` prints
-          # none because it cannot skip - it is the row that proves the seam refuses without a runtime. A smaller
+          # none because it cannot skip - it is the row that proves the seam refuses without a runtime.
+          # `artifact_verify` (D12) prints none either: its eight cases hash a few hundred fixture bytes rather than
+          # the pinned artifact, so they run for real on a runner with no model file. It is on this row because the
+          # function it tests lives behind `local-model`. A smaller
           # total means the prints stopped reaching the log - `--nocapture` lost, or a case silently became a real
           # pass with no artifact - and "compiled, never ran" would be implied rather than stated again.
           if [ "$count" -lt 20 ]; then

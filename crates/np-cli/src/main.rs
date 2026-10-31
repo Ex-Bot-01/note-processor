@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use np_core::catalog::size_human;
 use np_core::config::{Config, EmbeddingProvider};
 use np_core::db::{model_row, orphan_total, Db};
-use np_core::embed::{Embedder, NoEmbeddingProvider};
+use np_core::embed::{ArtifactCheck, Embedder, NoEmbeddingProvider};
 use np_core::embed_run::{self, EmbedOutcome, EmbedReport, Resolution};
 use np_core::hash::sha256_file;
 use np_core::models::{
@@ -266,7 +266,8 @@ fn print_summary(report: &ScanReport) {
 /// code is introduced — §6 says so, and clap keeps argv failures at 2.
 fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
-    let provider = embed_provider(&cfg, workspace)?;
+    let resolved = embed_provider(&cfg, workspace)?;
+    let provider = resolved.provider;
     // The reason a provider could not be built goes to `embed_run` as a value. Handing over a placeholder
     // instead is how R6c1 D-2 happened: an absent artifact became a provider that declares 0 dimensions, and the
     // run refused with a sentence about widths when the truth was a missing file (see [`Resolution`]).
@@ -274,7 +275,11 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
         Some(provider) => Resolution::Provider(provider.as_ref()),
         None => Resolution::ArtifactAbsent,
     };
-    let report = embed_run::embed_with_resolution(workspace, &cfg, resolution)?;
+    let mut report = embed_run::embed_with_resolution(workspace, &cfg, resolution)?;
+    // What was concluded about the model's bytes travels on the report rather than being printed here, so `--json`
+    // and the text summary cannot disagree about whether this run verified anything (the same reason §7's caveat is a
+    // field). `None` says no local artifact was involved — a `provider = "none"` run has nothing to claim.
+    report.artifact_check = resolved.artifact_check;
     if json {
         emit_json(&serde_json::to_value(&report)?);
     } else {
@@ -293,6 +298,27 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     .into())
 }
 
+/// What `[embeddings]` resolved to, and — on the one path that could — what it proved about the artifact's bytes.
+///
+/// The second field exists because the check happens *here* (this is where the `models` row and its artifact path are
+/// both at hand) while the report is written downstream. Carrying it in one value keeps `embed_provider` honest
+/// without an out-parameter, and keeps the alternative — verifying inside `embed_run`, which is handed a provider and
+/// cannot know how its bytes were produced — off the table.
+struct Resolved {
+    /// The provider for this run, or `None` for §6's arm (iii): see [`embed_provider`]'s rule about what `None` means.
+    provider: Option<Box<dyn Embedder>>,
+    /// D12's verify-on-change result, or `None` when no local artifact was read at all.
+    artifact_check: Option<ArtifactCheck>,
+}
+
+/// A resolution with nothing to report about artifact bytes.
+fn resolved(provider: Option<Box<dyn Embedder>>) -> Resolved {
+    Resolved {
+        provider,
+        artifact_check: None,
+    }
+}
+
 /// The provider `[embeddings]` names, or `None` when the installed row's artifact file is not there to load.
 ///
 /// `None` means **exactly that one thing**, and the call site turns it into [`Resolution::ArtifactAbsent`] so
@@ -306,14 +332,11 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
 /// The row is read through a connection that closes when this function returns, before `embed_run` opens its
 /// own: np-cli holds no SQL of its own, and one workspace's [`np_core::db::ModelRow`] is where a local provider's
 /// identity comes from (§3).
-fn embed_provider(
-    cfg: &Config,
-    workspace: &Path,
-) -> Result<Option<Box<dyn Embedder>>, Box<dyn Error>> {
+fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Error>> {
     match cfg.embeddings.provider {
         // The default. Nothing is built, nothing is contacted, and the report says *configuration disabled*
         // rather than a fault (§2, §6).
-        EmbeddingProvider::None => Ok(Some(Box::new(NoEmbeddingProvider))),
+        EmbeddingProvider::None => Ok(resolved(Some(Box::new(NoEmbeddingProvider)))),
         EmbeddingProvider::OpenAiCompatible => {
             // Unreachable through `Config::load`, which refuses this variant by name; kept as a refusal rather
             // than a fallthrough into the local branch, because dialling out is not what this build does.
@@ -321,11 +344,11 @@ fn embed_provider(
         }
         EmbeddingProvider::LocalModel => {
             let Some(id) = cfg.embeddings.model.as_deref() else {
-                return Ok(Some(Box::new(NoEmbeddingProvider)));
+                return Ok(resolved(Some(Box::new(NoEmbeddingProvider))));
             };
             let db = workspace_db(cfg, workspace)?;
             let Some(row) = model_row(&db, id)? else {
-                return Ok(Some(Box::new(NoEmbeddingProvider)));
+                return Ok(resolved(Some(Box::new(NoEmbeddingProvider))));
             };
             // The width this run needs: `[embeddings] dim`, or the row's own declaration when the config
             // declares none. `embed_run` applies the same rule and refuses a disagreement before any write, so
@@ -336,7 +359,7 @@ fn embed_provider(
                 .map(usize::from)
                 .or_else(|| usize::try_from(row.dim).ok())
             else {
-                return Ok(Some(Box::new(NoEmbeddingProvider)));
+                return Ok(resolved(Some(Box::new(NoEmbeddingProvider))));
             };
             let artifact = cfg.workspace_models_dir(workspace).join(id);
 
@@ -354,8 +377,22 @@ fn embed_provider(
                     configured,
                     cfg.embeddings.max_tokens,
                 ) {
-                    Ok(embedder) => Ok(Some(Box::new(embedder))),
-                    Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => Ok(None),
+                    // Built lazily, so nothing is resident yet — which is exactly where D12's check belongs: a
+                    // `verify_artifact` that finds the stamp intact costs one `stat`, so a run with nothing owed still
+                    // pays nothing. When it does hash (the first run under this build, or bytes that moved) it refuses
+                    // **before** `embed_run` reads a note, so a swapped artifact never earns a stamped vector.
+                    Ok(embedder) => {
+                        match np_core::local_model::verify_artifact(&db, &row, &artifact) {
+                            Ok(check) => Ok(Resolved {
+                                provider: Some(Box::new(embedder)),
+                                artifact_check: Some(check),
+                            }),
+                            Err(err) => Err(err.into()),
+                        }
+                    }
+                    Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => {
+                        Ok(resolved(None))
+                    }
                     Err(err) => Err(err.into()),
                 }
             }
@@ -366,12 +403,14 @@ fn embed_provider(
             // four arms identically and only the middle of the run differs.
             #[cfg(not(feature = "local-model"))]
             match np_core::embed::LocalModelProvider::new(&row, &artifact, configured) {
-                Ok(provider) => Ok(Some(Box::new(provider))),
+                // No digest check on this half: without the runtime nothing reads the artifact, so there is no claim
+                // about its bytes to make — and printing one would be the false report §7 refuses.
+                Ok(provider) => Ok(resolved(Some(Box::new(provider)))),
                 // The row is installed and its width is the run's; only the bytes are missing. That is a fact
                 // about the filesystem, not about configuration, so it cannot be recovered downstream — hence
                 // `None` here rather than a placeholder provider whose declared width would then be compared
                 // with the row's (R6c1 D-2).
-                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => Ok(None),
+                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => Ok(resolved(None)),
                 Err(err) => Err(err.into()),
             }
         }
@@ -403,6 +442,12 @@ fn print_embed_summary(report: &EmbedReport) {
     let _ = writeln!(out, "busy-gap   {}", report.busy_gap);
     let _ = writeln!(out, "errors     {}", report.errors);
     let _ = writeln!(out, "verify     {}", report.verification);
+    // Printed after §7's standing caveat because the two answer different questions: that one asks whether these
+    // *vectors* were checked against a reference implementation, this one asks whether the model's *bytes* were.
+    // Omitted entirely when no local artifact was involved — silence is the truthful report there, not "verified".
+    if let Some(check) = report.artifact_check {
+        let _ = writeln!(out, "digest     {}", check.label());
+    }
 }
 
 // ---------------------------------------------------------------------------

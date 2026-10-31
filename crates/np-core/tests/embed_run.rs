@@ -1076,6 +1076,13 @@ fn every_report_carries_the_caveat_line() {
         ..setup.cfg()
     };
     let disabled = embed(&setup.root, &cfg, &Fake::new()).expect("arm (ii)");
+    // The digest field is the caller's to fill (`local_model::verify_artifact`, called by `np embed`), so a run that
+    // went through none of that machinery must report nothing rather than something reassuring — on both arms, including
+    // the one that embedded vectors. An unstated check is an honest absence; `embed_run` cannot know one happened.
+    // What `--json` does with the field (the key must be present and null, not dropped) is pinned in np-cli's argv
+    // suite, where the JSON is actually emitted.
+    assert_eq!(report.artifact_check, None);
+    assert_eq!(disabled.artifact_check, None);
     assert_eq!(disabled.verification, "self-consistent, not verified");
 }
 

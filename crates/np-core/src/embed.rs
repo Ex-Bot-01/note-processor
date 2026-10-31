@@ -121,6 +121,59 @@ impl Vector {
     }
 }
 
+/// What this run concluded about the artifact's bytes **before** it wrote anything (D12, verify-on-change).
+///
+/// Carried on [`crate::embed_run::EmbedReport`] by whichever caller performed the check — today `np embed`, through
+/// `local_model::verify_artifact` (behind the `local-model` feature) — so that `--json` and the text summary answer the
+/// same question with the same fact. `None` on the report means no local artifact was involved: a run with
+/// `provider = "none"`, or one whose row names an endpoint, has nothing here to say.
+///
+/// **What a match proves, and what it does not.** [`Self::UnchangedSinceStamp`] means "this file has the same size and
+/// whole-second mtime as the bytes we last hashed". On a single-user laptop that is a cheap and useful corruption
+/// check — an interrupted copy, a partial restore, a disk returning different bytes. It is **not** a security control:
+/// anyone who can rewrite the artifact can also set its mtime, and a swap at identical size inside the same second is
+/// invisible to it. `np models install` is where a digest is first established against bytes it read; this is the cheap
+/// follow-up that notices change afterwards. Saying the weaker thing is the point of this type's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactCheck {
+    /// The file was hashed this run and matched its row; the stamp went with it.
+    VerifiedNow {
+        /// Bytes read while hashing.
+        bytes: u64,
+    },
+    /// Size and mtime match the stamp the last verification left, so no hash was computed.
+    UnchangedSinceStamp {
+        /// The file's size, which is also what matched.
+        bytes: u64,
+    },
+    /// `models.sha256` is NULL — a provider with no local weights — so there was nothing to verify and no stamp to
+    /// write. Reported rather than folded into [`Self::UnchangedSinceStamp`], which would claim a check that had an
+    /// answer instead of a check that had no question.
+    NothingToVerify,
+}
+
+impl ArtifactCheck {
+    /// The one-line sentence for `np embed`'s report and its `--json`.
+    ///
+    /// Sized to sit beside [`crate::embed_run::EmbedReport::verification`] without being confused with it: that field
+    /// answers "were these vectors checked against a reference implementation" (§7) and never changes; this answers
+    /// "were the model's bytes checked this run".
+    pub fn label(&self) -> String {
+        use crate::catalog::size_human;
+        match self {
+            Self::VerifiedNow { bytes } => {
+                format!("re-checked against models.sha256: ok ({})", size_human(*bytes))
+            }
+            Self::UnchangedSinceStamp { bytes } => format!(
+                "not re-read: same size and mtime as the last check ({}); detects changed bytes, not a crafted mtime",
+                size_human(*bytes)
+            ),
+            Self::NothingToVerify => "this model row declares no digest; nothing to verify".to_string(),
+        }
+    }
+}
+
 /// Why one call to [`Embedder::embed`] — or one attempt to build a provider — did not produce vectors.
 ///
 /// Every variant states a distinct fact, because the scan's report has to distinguish "nothing was
@@ -306,6 +359,29 @@ pub enum EmbedError {
         /// raises this before any row is consulted, so the sentence below says "the model declares", not
         /// "the row declares" (R6b1 review P2-3).
         provider: i64,
+    },
+    /// The artifact on disk does not hash to what its row says, so this run refused before reading a note or
+    /// writing a vector.
+    ///
+    /// Raised by `local_model::verify_artifact` (behind the `local-model` feature) — D12's verify-on-change, reached
+    /// only when the file's size or mtime moved since the last verified read. An unchanged file is not re-hashed, and
+    /// that skip is what makes the check cheap enough to run on every embed (§14: 11.32 s to hash this artifact against
+    /// ~0.09 s for llama.cpp's first pass over the same bytes).
+    ///
+    /// Both digests are spelled out because the reader's next action depends on which one is wrong: `expected` is
+    /// what `np models install` was told and what every stored vector was made from, `found` is what the file is
+    /// now. Naming the path is safe under §3's rule for the same reason [`EmbedError::ArtifactUnreadable`] gives —
+    /// a data-dir file this program wrote, never note text.
+    #[error(
+        "the model artifact {path} hashes to {found}, but its row says {expected}; refused before embedding anything, because a swapped artifact would stamp vectors as made by a model that never ran"
+    )]
+    ArtifactDigestMismatch {
+        /// The artifact this run was about to load.
+        path: PathBuf,
+        /// `models.sha256` — the digest the row attests.
+        expected: String,
+        /// What this file hashes to now.
+        found: String,
     },
 }
 

@@ -1781,6 +1781,7 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
     assert_eq!(
         json_keys(&report),
         vec![
+            "artifact_check",
             "busy_gap",
             "chunks_seen",
             "current",
@@ -1823,6 +1824,19 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
     assert_eq!(
         report["verification"],
         summary_field(&text.stdout(), "verify")
+    );
+    // D12's field, on the arm that read no artifact: **present and null**, not missing. A reader written against this
+    // shape has to be able to ask "were the model's bytes checked" and get "no artifact was involved" rather than
+    // inferring it from a key that appears only sometimes. The text summary says the same thing by silence.
+    assert!(
+        report["artifact_check"].is_null(),
+        "arm (iii) verified nothing, so JSON must not claim otherwise: {}",
+        report["artifact_check"]
+    );
+    assert!(
+        !text.stdout().contains("\ndigest "),
+        "and the summary prints no digest line when there was no check:\n{}",
+        text.stdout()
     );
     // The arm's sentence travels on stderr under `--json` too — two channels, one fact.
     assert!(
@@ -1957,6 +1971,59 @@ mod real_model {
             .sqrt()
     }
 
+    /// D12 through the real binary: an artifact that does not hash to its row is refused **before** anything is
+    /// embedded, nothing is written, and no stamp is left behind.
+    ///
+    /// This case needs no model load — the check runs where the row and the path are both at hand (`embed_provider`),
+    /// and the lazy provider means llama.cpp is never reached — so it costs one hash of a few dozen bytes while
+    /// pinning the whole point of D12: a same-id swap cannot quietly stamp vectors as made by a model that never ran.
+    #[test]
+    fn a_swapped_artifact_is_refused_before_anything_is_embedded() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        run(&mut ws.command(&["scan"])).assert_success();
+        link_artifact(&ws, &artifact, "task: search result | query: ");
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+        // Replace the artifact with something else. Different size **and** different bytes, which is the case the
+        // stamp notices; the equal-size-same-second swap it cannot see is pinned in np-core's `artifact_verify`.
+        let link = ws.models_dir().join(EMBED_MODEL);
+        fs::remove_file(&link).expect("test setup: drop the symlink");
+        fs::write(&link, b"an artifact of somebody else's").expect("test setup: write an impostor");
+
+        let refused = run(&mut ws.command(&["embed"]));
+        assert_ne!(
+            refused.code(),
+            0,
+            "a swapped artifact is not a successful embed"
+        );
+        let stderr = refused.stderr();
+        assert!(
+            stderr.contains("hashes to") && stderr.contains("its row says"),
+            "the refusal has to name both digests so the reader knows which side moved:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("task: search result"),
+            "and it must not quote model text or note content into an error:\n{stderr}"
+        );
+
+        // Nothing was written: no vectors, and no stamp for the bytes that failed. The second half matters — a stamp
+        // left by a refused run would be a reason for the next run to skip the check that just caught something.
+        let conn = rusqlite::Connection::open(ws.db_path()).expect("test: open the index");
+        let vectors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .expect("read the vector count");
+        assert_eq!(vectors, 0, "a refused run writes no vectors");
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM models WHERE id = ?1 AND verified_size IS NOT NULL",
+                rusqlite::params![EMBED_MODEL],
+                |row| row.get(0),
+            )
+            .expect("read the stamp");
+        assert_eq!(stamped, 0, "a refused verification leaves no stamp behind");
+    }
+
     #[test]
     fn a_real_model_writes_vectors_that_the_next_run_calls_current() {
         let artifact = artifact_or_not_coverage!();
@@ -1976,6 +2043,16 @@ mod real_model {
         );
         assert_eq!(summary_count(&first.stdout(), "errors"), 0);
         assert_eq!(summary_count(&first.stdout(), "refused"), 0);
+
+        // D12, first run: the row was written straight into the database by this test (no stamp anywhere), so the
+        // artifact had to be hashed before a single note was read. This is the ~11 s §14 prices, paid once per change.
+        let digest_line = summary_field(&first.stdout(), "digest");
+        assert!(
+            digest_line.contains("re-checked against models.sha256: ok"),
+            "the first embed of an unstamped artifact says it verified the bytes, not that it trusted them:\n{}\n{}",
+            digest_line,
+            first.stdout()
+        );
 
         let stored = stored_vectors(&ws.db_path());
         assert_eq!(
@@ -2006,6 +2083,14 @@ mod real_model {
             "a workspace that owes nothing must not load the model to re-derive vectors it already has"
         );
         assert_eq!(summary_count(&second.stdout(), "current"), embedded);
+
+        // ...and the second run says so without re-reading 295.5 MiB: same size, same mtime as the stamp the first
+        // run wrote. The wording is deliberately weaker than "verified" — see `ArtifactCheck`'s note on mtimes.
+        let second_digest = summary_field(&second.stdout(), "digest");
+        assert!(
+            second_digest.contains("not re-read") && second_digest.contains("same size and mtime"),
+            "a run that skipped the hash has to admit it skipped:\n{second_digest}"
+        );
 
         // §3's rule about prefixes turning into lies, measured on real numbers — and the measurement is what found
         // R6c2's P1, so read this block for what it *does not* prove as much as what it does.

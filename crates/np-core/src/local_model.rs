@@ -66,9 +66,11 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::time::SystemTime;
 
-use crate::db::ModelRow;
-use crate::embed::{EmbedError, Embedder, Vector};
+use crate::db::{self, Db, ModelRow};
+use crate::embed::{ArtifactCheck, EmbedError, Embedder, Vector};
+use crate::hash;
 use crate::llama_ffi::{self, llama_context, llama_model};
 use crate::models;
 use crate::walk;
@@ -781,6 +783,96 @@ impl LazyLocalEmbedder {
             .as_ref()
             .map_err(LoadFailure::to_error)
     }
+}
+
+/// Check the artifact against its row before a run writes a vector, and remember which bytes the answer covered
+/// (D12's verify-on-change).
+///
+/// **Why this exists at all.** [`crate::models::install`] verifies the digest once, when the human supplies the file.
+/// After that the row is trusted blindly: R6c2's review named the consequence — swap in a same-width artifact and this
+/// program embeds with it and stamps vectors as though the installed model produced them. Re-hashing every run closes
+/// that, and R6d measured what "every run" costs: **11.32 s** to hash the pinned artifact at 26 MiB/s (§9), against
+/// ~0.09 s for llama.cpp to page in every byte of it (§14). Hashing unconditionally would make verification the most
+/// expensive part of a small embed.
+///
+/// **The rule.** If `models.sha256` is NULL there is nothing to verify ([`ArtifactCheck::NothingToVerify`]). Otherwise
+/// compare the file's size and whole-second mtime with the stamp the last verification left: both present and equal
+/// means the bytes have not moved since we hashed them, so no hash is computed
+/// ([`ArtifactCheck::UnchangedSinceStamp`]); anything else — no stamp, either half different, a row from before this
+/// build — hashes the file. A match rewrites the stamp and returns [`ArtifactCheck::VerifiedNow`]; a mismatch is
+/// [`EmbedError::ArtifactDigestMismatch`] **before any note is read or any row written**.
+///
+/// **What it does not claim.** Size plus mtime is a corruption detector, not a security boundary: whoever can replace
+/// the artifact can set its mtime, and an identical-size swap inside one second passes. The digest itself is checked
+/// whenever either number moves, which is what makes the shortcut worth taking rather than pretending it is a proof.
+/// A filesystem that will not answer `metadata.modified()` never gets a stamp, so it verifies on every run — slower,
+/// never weaker.
+///
+/// Digest comparison is case-insensitive because `models.sha256` is written lowercase by install but is a plain TEXT
+/// column a human can edit; refusing to match `2A88…` against `2a88…` would be a refusal about typography.
+pub fn verify_artifact(db: &Db, row: &ModelRow, path: &Path) -> Result<ArtifactCheck, EmbedError> {
+    let unreadable = |source: io::Error| EmbedError::ArtifactUnreadable {
+        path: path.to_path_buf(),
+        source,
+    };
+    let Some(expected) = row.sha256.as_deref() else {
+        return Ok(ArtifactCheck::NothingToVerify);
+    };
+
+    let meta = fs::metadata(path).map_err(unreadable)?;
+    if !meta.is_file() {
+        // `embed::artifact_is_readable` already refuses this shape on the provider's path; checked again because
+        // `verify_artifact` is callable by anything holding a row, and a directory's digest would be an I/O error
+        // that reads like one.
+        return Err(unreadable(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "not a regular file",
+        )));
+    }
+    let size = i64::try_from(meta.len()).map_err(|_| {
+        unreadable(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "artifact size is not representable as SQLite's INTEGER",
+        ))
+    })?;
+    // No mtime is not a zero mtime. Reporting 0 would stamp a value the next run could match against, which turns an
+    // unreadable timestamp into a permanent reason to skip hashing.
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|when| when.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs() as i64);
+
+    if let (Some(mtime), Some(stamped_size), Some(stamped_mtime)) =
+        (mtime, row.verified_size, row.verified_mtime)
+    {
+        if size == stamped_size && mtime == stamped_mtime {
+            return Ok(ArtifactCheck::UnchangedSinceStamp { bytes: meta.len() });
+        }
+    }
+
+    let found = hash::sha256_file(path).map_err(|err| unreadable(models::hash_io(err)))?;
+    if !digests_agree(&found, expected) {
+        return Err(EmbedError::ArtifactDigestMismatch {
+            path: path.to_path_buf(),
+            expected: expected.to_string(),
+            found,
+        });
+    }
+    if let Some(mtime) = mtime {
+        // Written only now — after the bytes matched — so a stamp can never predate a verification.
+        db::record_artifact_stamp(db, &row.id, size, mtime).map_err(|err| {
+            unreadable(io::Error::other(format!(
+                "the artifact matched its row but its verification stamp could not be recorded: {err}"
+            )))
+        })?;
+    }
+    Ok(ArtifactCheck::VerifiedNow { bytes: meta.len() })
+}
+
+/// Compare two spellings of the same sha256, ignoring hex case only.
+fn digests_agree(found: &str, expected: &str) -> bool {
+    found.eq_ignore_ascii_case(expected.trim())
 }
 
 impl Embedder for LazyLocalEmbedder {

@@ -24,7 +24,7 @@ exist. That is the next round (see below).
 | `np models install <workspace> --id … --path … --dim … --sha256 …` | Put a model artifact under the workspace's model directory, verifying the digest before and after |
 | `np models hash <file>` | Print the SHA-256 of a file, in the format `install` expects |
 | `np models list <workspace>` | Show each model row and whether its artifact is actually present and matches |
-| `np embed <workspace>` | Embed what is owed for the configured model and write it to the database; `--json` reports the same four labelled outcomes this command exits with |
+| `np embed <workspace>` | Embed what is owed for the configured model and write it to the database, after checking the artifact against its recorded digest; `--json` reports the same four labelled outcomes this command exits with |
 
 Refusals are deliberate: an unreadable note is reported and left alone, never repaired; an install whose digest does not
 match is refused before a byte is copied; an artifact that disagrees with its own row is reported, not overwritten.
@@ -46,16 +46,20 @@ match is refused before a byte is copied; an artifact that disagrees with its ow
 ```sh
 cargo build --workspace
 cargo test --workspace
+```
 
 Default builds contain no C++ and no inference runtime. The `local-model` feature on `np-core` (and a matching passthrough
 on `np-cli`) builds llama.cpp from the sha256-pinned source under `third_party/`, is **Linux-only by refusal** in `build.rs`,
 and is off in releases; it needs `cmake` (set `CMAKE=/path/to/cmake`) and nothing else new.
 
-`np embed` works on both sides of that line, and the two answers differ on purpose. A `local-model` build loads the
-artifact on its **first batch** (not while it is deciding whether anything is owed) and writes real vectors; a default
-build has nothing to load, so every batch is answered `runtime not built` and §6's fourth arm reports that nothing was
-produced. Neither writes a placeholder: an absent runtime, an absent artifact and an over-budget chunk are each reported
-as the specific thing they are.```
+`np embed` works on both sides of that line, and the two answers differ on purpose. A `local-model` build checks the
+artifact against `models.sha256` before it reads a note — one `stat` when the file has not moved since the last check, a
+full hash when its size or mtime changed or no check has run yet — then loads the artifact on its **first batch** (not
+while it is deciding whether anything is owed) and writes real vectors. The report's `digest` line says which of those
+happened; "not re-read" means the bytes were not hashed this run, which detects changed files but not a crafted
+timestamp. A default build has nothing to load, so every batch is answered `runtime not built` and §6's fourth arm
+reports that nothing was produced. Neither writes a placeholder: an absent runtime, an absent artifact and an over-budget chunk are each reported
+as the specific thing they are.
 
 CI is **configured** to build and test on Linux and Windows on every push, and **it does not run**. Since 2026-10-29
 GitHub creates each run and then finishes it in about three seconds with **zero steps and no log** — `gh run view --log`

@@ -416,6 +416,50 @@ named variable would have bought a green run and no coverage: Scope B review P2-
 **never `#[ignore]`**. No credentials anywhere: `ggml-org/embeddinggemma-2-GGUF` is ungated, so setup is one file
 downloaded by a human and installed by path.
 
+### Verify-on-change: checking the artifact without paying for it twice (D12, closed 2026-10-31)
+
+§7's checks all assume the weights are the weights. D12 named the hole underneath them: `np models install` verifies a
+digest once, and after that the row is trusted blindly — replace the file with a same-width artifact and every later
+vector is stamped as though the installed model produced it. R6c2's review wrote it as an open decision because closing
+it looked expensive, and R6d measured the two prices that decide it: hashing this artifact costs **11.32 s** (§9),
+while llama.cpp reading every byte of it on first use costs about **0.09 s** (§14). So "re-hash before every embed" was
+not free, and "never re-hash" was not honest.
+
+**The rule `local_model::verify_artifact` implements.** `np embed` checks the artifact after resolving the row and
+before `embed_run` reads a note:
+
+- `models.sha256` is NULL → **nothing to verify**, said out loud rather than folded into a pass;
+- the file's size and whole-second mtime equal the stamp the last verification left → **no hash is read at all**;
+- otherwise (no stamp, either half moved, a row written before this build) → hash the file. A match rewrites the stamp;
+  a mismatch is `EmbedError::ArtifactDigestMismatch`, naming both digests and writing nothing.
+
+The stamp lives in two nullable columns on `models` (migration 8), **not backfilled**: an existing row pays one full
+hash on its next embed rather than being credited with a check it never ran. A filesystem that will not answer
+`metadata::modified()` never gets a stamp, so it verifies every run — slower, never weaker. Digest comparison ignores hex
+case, because `sha256` is a plain TEXT column a human can edit and refusing `2A88…` against `2a88…` would be a refusal
+about typography.
+
+**What that proves, and what it does not.** The skip is a *corruption detector*: an interrupted copy, a partial restore,
+a disk returning different bytes, a file swapped by someone who did not think about timestamps. It is **not** a security
+control — whoever can rewrite the artifact can set its mtime, and an equal-size swap inside the same second passes. The
+report says so rather than printing "verified": `np embed` now prints a `digest` line reading *"not re-read: same size
+and mtime as the last check (295.5 MiB); detects changed bytes, not a crafted mtime"*, and on a run that did hash,
+*"re-checked against models.sha256: ok (295.5 MiB)"*. `--json` carries the same fact as `artifact_check`, which is
+**present and null** when no artifact was involved (arm (iii), `provider = "none"`) so a reader can ask the question on
+every run instead of inferring from a key that appears only sometimes.
+
+**Why `np models install` does not stamp.** The `AlreadyInstalled` path is the one install path that hashes the file on
+disk, so it *could* leave a stamp and save the next embed one hash. It does not: §7 case 5 promises that repeating a
+declaration rewrites nothing, tested by comparing the whole row before and after. Trading that contract for 11 s saved
+once is a bad trade, and verification at use time is where the bytes are about to be trusted anyway.
+
+**Where it is pinned.** `crates/np-core/tests/artifact_verify.rs` (8 cases on a few hundred fixture bytes — no artifact
+needed, so they run for real on a CI runner with no model file), including the two cases that keep the prose honest: a
+same-size same-mtime rewrite **passing**, and an uppercase row digest still matching. Through the binary,
+`a_swapped_artifact_is_refused_before_anything_is_embedded` checks exit status, both digests in the sentence, no vectors
+written and no stamp left behind (mutation-checked: neutering the digest comparison fails it), and the real-model case
+asserts the first run says *re-checked* and the second says *not re-read*.
+
 ## 8. The benchmark, which is the point of the round
 
 ≥2 runs, report the spread, never a single lucky number. Measured on this host (16 cores, 8.9 GB free disk, ~2 GB of 7 GB

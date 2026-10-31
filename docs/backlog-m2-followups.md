@@ -599,18 +599,16 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   file they need to `chmod`. The fix is small: map only `ErrorKind::NotFound` to the absent arm and let other kinds
   surface as the OS failure they are. Deferred because proving it needs an argv case that manipulates directory
   permissions — Linux-only evidence, and F18 says we do not ship a platform claim we have not run.
-- **D12 — `models.sha256` is not re-verified before a load (R6c2 review P2-3, same open decision as
-  `LocalModelProvider::new`'s doc).** A same-width artifact swap is therefore embedded and stamped under the row's id.
-  Cost of closing it: **measured on 2026-10-31** (`local_window.rs`) at **11.32 s** for this artifact's 309,855,456
-  bytes — 26 MiB/s, which is several times the cost of loading and embedding a small workspace's worth of notes. So
-  "verify on every embed" is not free and should not be adopted by reflex; the options are verify-on-change (stat the
-  file, re-hash when size or mtime moves), verify in `np models list` only, or hash lazily per tensor page.
-  R6d's second round (2026-10-31, §14's A/B subsection) removed the last excuse for waiting: llama.cpp's mmap-first
-  load pulls the **whole artifact** through the kernel on first use — `read_bytes` moves by 309,858,304 B, slightly
-  more than the file's 309,855,456 B because that counter is page-granular — and it does so inside a load window only
-  about **0.1 s** longer than a warm one (upper bound: that window also builds the context). Reading is not the cost;
-  our 26 MiB/s userspace hash loop is. So verify-on-change (stat, re-hash on size or mtime) is now the option with no
-  measured downside beyond a stale-mtime edge case, and this item needs a decision rather than another measurement.
+- **D12 — CLOSED 2026-10-31: verify-on-change shipped (`local_model::verify_artifact`, migration 8).**
+  The decision taken was option 1 — stat the artifact and re-hash only when size or whole-second mtime moved — because
+  R6d priced both sides of it: 11.32 s to hash the pinned artifact, ~0.09 s for llama.cpp to page in every byte, so a
+  `stat` on the common path and one honest hash per change. What it catches is corruption (interrupted copy, partial
+  restore, replaced file); what it cannot catch is a rewrite by someone who also sets the mtime, and `np embed`'s new
+  `digest` line says "detects changed bytes, not a crafted mtime" instead of claiming verification. Two decisions inside
+  it are worth keeping near the closure: migration 8's columns are **not backfilled** (an old row pays one hash rather
+  than inheriting credit it never earned), and `np models install` deliberately does **not** stamp on its
+  `AlreadyInstalled` path, because §7 case 5 promises a repeated install rewrites no column. Full reasoning, the report
+  wording and where each rule is tested: `docs/design-m2-local-embeddings.md` §7's verify-on-change subsection.
 - **D13 — llama.cpp defaults to 4 threads on a 16-CPU host; nobody has measured what raising it buys.**
   R6d's OpenMP A/B (2026-10-31) found both build configurations printing `n_threads=4 n_threads_batch=4` from
   `llama_context_default_params()`, which is why the flag moved no throughput at all: ggml's own pthread pool and an

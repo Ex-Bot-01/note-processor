@@ -19,9 +19,9 @@ use np_core::chunk::Chunk;
 use np_core::config::Config;
 use np_core::db::{
     apply_move, chunk_digest, chunk_state, delete_vectors_for_chunk, mark_stale, model_row,
-    note_counts, record_artifact_stamp, upsert_file, upsert_vector,
-    write_chunks_for_note, ChunkWrite, Db, DbError, Migration, NoteCounts, FK_ORPHANS_KEY,
-    MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
+    note_counts, record_artifact_stamp, upsert_file, upsert_vector, write_chunks_for_note,
+    ChunkWrite, Db, DbError, Migration, NoteCounts, FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY,
+    PATHS_LOSSY_KEY,
 };
 use np_core::hash::{sha256_file, Snapshot};
 use np_core::path_keys::RelPath;
@@ -4916,5 +4916,6 @@ fn an_artifact_stamp_round_trips_and_a_half_stamp_stays_a_half_stamp() {
 
     // A stamp for a row that is gone is a no-op: the digest was already checked in this process, and the row
     // disappearing under us is `np models remove` racing, not a corrupt database.
-    record_artifact_stamp(&db, "absent-model", 1, 1).expect("stamping an absent row is not an error");
+    record_artifact_stamp(&db, "absent-model", 1, 1)
+        .expect("stamping an absent row is not an error");
 }

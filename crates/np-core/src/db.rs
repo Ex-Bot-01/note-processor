@@ -2288,7 +2288,7 @@ pub struct ModelRow {
     /// *when this id became known* does not change when its file comes back.
     pub installed_at: i64,
     /// Size in bytes of the artifact whose digest this row last verified, or `None` when no verification has run
-    /// since this build was installed. Paired with [`Self::verified_mtime`]; see [`crate::local_model`] for the rule
+    /// since this build was installed. Paired with [`Self::verified_mtime`]; see `local_model` (behind the `local-model` feature) for the rule
     /// that reads them and for what a match does and does not prove.
     pub verified_size: Option<i64>,
     /// Whole seconds since the Unix epoch of that same file's last modification. Read together with
@@ -2357,16 +2357,9 @@ fn read_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
 /// The row need not exist for this to be a no-op rather than an error: a model deleted between the verification and
 /// this write (a concurrent `np models remove`) is a fact about the world, not a corrupt database, and the digest was
 /// already checked in this process.
-pub fn record_artifact_stamp(
-    db: &Db,
-    id: &str,
-    size: i64,
-    mtime: i64,
-) -> Result<(), DbError> {
-    db.0.prepare_cached(
-        "UPDATE models SET verified_size = ?2, verified_mtime = ?3 WHERE id = ?1",
-    )?
-    .execute(params![id, size, mtime])?;
+pub fn record_artifact_stamp(db: &Db, id: &str, size: i64, mtime: i64) -> Result<(), DbError> {
+    db.0.prepare_cached("UPDATE models SET verified_size = ?2, verified_mtime = ?3 WHERE id = ?1")?
+        .execute(params![id, size, mtime])?;
     Ok(())
 }
 
