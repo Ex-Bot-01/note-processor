@@ -567,8 +567,12 @@ impl Embedder for LocalModelProvider {
         self.dim
     }
 
-    /// Always [`EmbedError::RuntimeNotBuilt`], naming the model, with the batch untouched: this build has no
-    /// way to turn text into numbers, and saying so is the only honest answer (§9 item 1).
+    /// Always [`EmbedError::RuntimeNotBuilt`], naming the model, with the batch untouched: this type is the seam's
+    /// default half, and a build that links no C++ has no way to turn text into numbers (§9 item 1).
+    ///
+    /// Not a statement about the program: in a `local-model` build `np-cli` resolves
+    /// `local_model::LazyLocalEmbedder` instead and vectors are computed, so this refusal is what a **default**
+    /// binary answers rather than something no binary can do.
     fn embed(&self, _texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
         Err(EmbedError::RuntimeNotBuilt {
             model_id: self.model_id.clone(),

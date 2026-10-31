@@ -55,9 +55,11 @@
 //! ## What is deliberately *not* here
 //!
 //! No model loader and no artifact reader: the provider arrives injected, so every case in
-//! `tests/embed_run.rs` runs against a fake with no feature flag and no 310 MB file. The `local-model` runtime
-//! behind [`crate::embed::LocalModelProvider::embed`] still answers
-//! [`crate::embed::EmbedError::RuntimeNotBuilt`], which reaches arm (iv) honestly until R6c2 builds it.
+//! `tests/embed_run.rs` runs against a fake with no feature flag and no 310 MB file. In a **default** build the
+//! provider `np-cli` resolves is [`crate::embed::LocalModelProvider`], which answers every batch with
+//! [`crate::embed::EmbedError::RuntimeNotBuilt`] — arm (iv), honestly, with nothing written. With `local-model` it
+//! resolves `local_model::LazyLocalEmbedder` instead, and that is the provider real vectors come from: the artifact
+//! is loaded on the first batch, after the currency query has said something is owed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

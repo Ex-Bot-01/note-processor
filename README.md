@@ -51,11 +51,11 @@ Default builds contain no C++ and no inference runtime. The `local-model` featur
 on `np-cli`) builds llama.cpp from the sha256-pinned source under `third_party/`, is **Linux-only by refusal** in `build.rs`,
 and is off in releases; it needs `cmake` (set `CMAKE=/path/to/cmake`) and nothing else new.
 
-`np embed` works on both sides of that line, and **no build in this repository writes a real vector yet**: even with
-`--features local-model`, `LocalModelProvider::embed` answers `runtime not built`, because the loader and forward pass
-that R6b2 measured inside `local_model` are not called from the provider until R6c2. What the command does today is resolve
-configuration, work out exactly which chunks are owed, and stop with one of four labelled outcomes — naming the feature or
-the missing artifact — instead of writing a placeholder.```
+`np embed` works on both sides of that line, and the two answers differ on purpose. A `local-model` build loads the
+artifact on its **first batch** (not while it is deciding whether anything is owed) and writes real vectors; a default
+build has nothing to load, so every batch is answered `runtime not built` and §6's fourth arm reports that nothing was
+produced. Neither writes a placeholder: an absent runtime, an absent artifact and an over-budget chunk are each reported
+as the specific thing they are.```
 
 CI is **configured** to build and test on Linux and Windows on every push, and **it does not run**: the account has no
 GitHub Actions budget, so GitHub refuses to start any job (since 2026-10-29, including the green runs this repo had
