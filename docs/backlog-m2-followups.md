@@ -619,3 +619,11 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   and in being a well-behaved background process next to someone's editor. Filed rather than done because it changes
   runtime behaviour for every user of the feature, needs an A/B of its own (thread counts 1/2/4/nproc at both lengths,
   RSS included), and no measurement so far says the current 81–157 tok/s is unacceptable.
+  **Addendum from R6d round 3 (2026-10-31): D13 is now the bigger lever by measurement.** The corpus run solved the cost
+  shape out of two cohorts in one process, twice over — **30.0–30.8 ms fixed per decode, 5.558–5.560 ms/token marginal**
+  (≈180 tok/s as token count grows) — so batching texts into one decode could recover at most ~14 % of a short-note
+  decode and ~2 % of a long one, while thread count multiplies the per-token term that dominates everything above ~50
+  tokens. Numbers and
+  scope: §14's corpus subsection and `crates/np-core/tests/probes/corpus-run-2026-10-31.log`. The authorisation question
+  is unchanged — this still changes runtime behaviour for every user, and the sweep (1/2/4/nproc × both lengths × RSS)
+  has not been run.

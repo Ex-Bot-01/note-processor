@@ -526,7 +526,7 @@ Then a whole-branch review across the shipped rounds, and merge only on the huma
 | **R6b1** *(shipped `ac25c00`, fixes `4fc0aa9`)* | the pinned GGUF opens through our FFI and answers with its own header's numbers | width refusal, drop order, truncated-artifact refusal all tested |
 | **R6b2** *(shipped `344692f`+`d1e8fad`+`2e15d33`, review fixes in `HEAD`)* | tokenize → forward pass → pool → L2-normalise; budget enforcement over the **token** count; the window made wide enough that the runtime returns a code instead of aborting | 12 artifact-gated cases, plus the three numbers §14 was missing: size +5.5 MiB, throughput ~130 tok/s, forward-pass RSS curve. Its review found two P0s — a dead buffer-resize path that decoded zeros on a short buffer, and RANK pooling read at the wrong width — both fixed; the window prose now cites the encoder assert that actually fires |
 | **R6c** | `np embed <ws>` and §6's four labelled exit arms, reading a marker **read-only** ("artifact absent — run `np models fetch`") | the label exists before the writer does, so R6c never waits on the fetcher |
-| **R6d** | benchmark, including whether an mmap-first load reads the whole artifact (which decides §12's digest cost) | **two rounds done 2026-10-31; the corpus run is still owed** (it is §14's closing note and the number M4 needs): `local_window.rs` measures the default-budget chunk (403 tokens, 2.61 s, 155 tok/s), a near-ceiling one (7,992 tokens, 98.6 s, 81 tok/s, peak RSS 1,525,500 KiB) and the exact window edge (8,192 accepted in 100.1 s; 8,193 refused before any decode), plus the per-run digest price (309,855,456 bytes in **11.32 s**, 26 MiB/s — D12's cost, now measured rather than assumed). The second round built the pinned tree twice and A/B'd it — separate processes per cell, raw log committed beside the probe — finding that `GGML_OPENMP=ON` moves throughput by a fraction of a percent here while costing a libgomp dependency, so the pinned `OFF` stays for a measured reason; §14's A/B subsection carries the table, the spread and the scope limits. The same runs answered the mmap question: **an mmap-first load pulls the whole artifact through the kernel**, `read_bytes` moving by 309,858,304 B — more than the file's own 309,855,456 B, because that counter is page-granular and reads ahead — inside a load window about 0.1 s longer than a warm one (an upper bound on the read itself: the window also creates the context). What is left of R6d is a *corpus* run (thousands of decodes in one process) and any batching decision, which now waits on D13's thread-count measurement rather than on OpenMP |
+| **R6d** | benchmark, including whether an mmap-first load reads the whole artifact (which decides §12's digest cost) | **three rounds done 2026-10-31 — the corpus run landed** (it is §14's closing note and the number M4 needs): `local_window.rs` measures the default-budget chunk (403 tokens, 2.61 s, 155 tok/s), a near-ceiling one (7,992 tokens, 98.6 s, 81 tok/s, peak RSS 1,525,500 KiB) and the exact window edge (8,192 accepted in 100.1 s; 8,193 refused before any decode), plus the per-run digest price (309,855,456 bytes in **11.32 s**, 26 MiB/s — D12's cost, now measured rather than assumed). The second round built the pinned tree twice and A/B'd it — separate processes per cell, raw log committed beside the probe — finding that `GGML_OPENMP=ON` moves throughput by a fraction of a percent here while costing a libgomp dependency, so the pinned `OFF` stays for a measured reason; §14's A/B subsection carries the table, the spread and the scope limits. The same runs answered the mmap question: **an mmap-first load pulls the whole artifact through the kernel**, `read_bytes` moving by 309,858,304 B — more than the file's own 309,855,456 B, because that counter is page-granular and reads ahead — inside a load window about 0.1 s longer than a warm one (an upper bound on the read itself: the window also creates the context). The third round ran 2,048 notes through the production API in one process: **153.8 tok/s and 16,090 chunks/hour** on short notes, RSS drift **+808 KiB across 2,048 decodes** (no leak; peak 447,204 KiB), the next run's currency query at **0.04 s** for 2,048 rows, and a derived **30.8 ms fixed per decode** against **5.558 ms/token** — which caps what cross-text batching could buy at ~14 % of a short decode and ~2 % of a long one. §14's corpus subsection carries the table and the evening-rule arithmetic (a 20,000-note pass fits an evening at short-note lengths, 1.24 h, and does not at near-ceiling lengths, 7.93 h). What is left of R6d is a *decision*, not a measurement: batching still waits on D13's thread-count sweep, which needs the human's authorisation because it changes runtime behaviour for every user |
 | **R7a — marker only** *(shipped `ad9ed5a`)* | read/report the `.fetching.*` / `.part.*` names, `"fetching"` listing section, staleness *display* wording, tests that plant files. **No writer**: nothing can create a marker until R7b's first byte, which is why every test plants its own | fully offline-testable; this is the human-visible half of "tell me it is downloading" |
 | **R7b — fetch** | HTTP GET → `.part` → streaming digest (incremental API in `hash.rs`) → pin compare → rename-if-absent → `db::insert_model`; two files, two digests; four named refusals; no resume, no retry, no marker reuse | the network round alone, after the marker exists |
 | **R7c — multimodal spike (conditional)** | prove or kill a pooled 768-d embedding over mixed text+image tokens for this architecture through the pinned binding | only then does image indexing enter a roadmap; §5's open question |
@@ -909,6 +909,46 @@ through the C probe; §9 and `todo.md` say **1,525,500 KiB** for the same length
 and they are not the same measurement: the Rust path dresses the text with its prefix, runs our pooling and L2
 normalisation, and carries a Rust runtime, so it peaks ~24 MiB higher. Quote the harness beside the number; the shape — roughly +1 GiB above the 387 MB the load alone touches, only for notes near the ceiling — is what
 both are telling you.
+
+### The corpus run: thousands of decodes, and what the evening rule actually survives (R6d round 3, 2026-10-31)
+
+§9 owed "a *corpus* run (thousands of decodes in one process)". `crates/np-core/tests/local_corpus.rs` is that run:
+2,048 notes, one chunk each, through the production path (`embed_run` + `LazyLocalEmbedder`, no C probe), RSS sampled
+between batches through the hook R6c1 added to prove a different point. Extracted numbers are committed beside the other
+probes in `crates/np-core/tests/probes/corpus-run-2026-10-31.log`; the harness prints them on every artifact run.
+
+| What | Measured | Notes |
+|---|---|---|
+| First pass, 2,048 short notes (mean **34.4** tokens with the row's prefix) | **458.23 s / 457.13 s** on two runs, 256 batches of 8 → **153.8 / 154.2 tok/s**, **16,090 / 16,129 chunks/hour** | §8 forbids a single lucky number, so the suite was run twice end to end; the two runs are 0.3 % apart on every throughput figure. Token count is sampled from 64 of 2,048 chunks and stated as a sample; every note is one chunk because the chunker merges while it fits 1,800 bytes |
+| Memory across those 2,048 decodes | `VmRSS` drift **+808 KiB** and **+1,124 KiB** (first→last mid-run sample); peak (`VmHWM`) **447,204 / 447,408 KiB** | the leak question one-decode-per-process runs cannot ask: nothing climbs. Round 1's 1.5 GB peak was a *length* effect (a 7,992-token note), not a *count* effect — this is ~437 MiB with 2,048 of them |
+| The next run over the same corpus | **0.04 s**, `current = 2048`, `embedded = 0`, no model load | the currency query at thousands of stamped rows costs hundredths of a second, which is what makes "run `np embed` on every save" survivable |
+| Fixed cost per decode | **30.8 / 30.0 ms**, with **5.558 / 5.560 ms/token** marginal (≈180 tok/s asymptotically) | solved from two cohorts in one process: 33.3 tokens at ~0.215 s and 251.2 tokens at ~1.427 s. The two-line model reproduces both cohorts to 0.2 ms on each run, so the split is not a fit to noise |
+
+**What that says about batching.** A perfect cross-text batch API could remove the fixed part: ~14 % of a 33-token
+decode, ~2 % of a 251-token one. That is the whole prize, and it is smaller than what D13 (four threads today on a
+sixteen-core host) plausibly moves — so the batching decision stays where §9 left it, behind the thread-count measurement,
+and now with an upper bound on what it could buy written down instead of assumed.
+
+**§8's threshold, applied rather than implied.** The spec's rule is "keep EmbeddingGemma 2 if a full first pass fits in
+one evening"; this round states an evening as **4 hours** of unattended wall time and prints the arithmetic:
+
+| Corpus | At the measured short-note rate (16,090–16,129 chunks/h) | At the measured 251-token rate (≈2,522 chunks/h) |
+|---|---|---|
+| 1,000 notes | 0.06 h ✓ | 0.40 h ✓ |
+| 5,000 notes | 0.31 h ✓ | 1.98 h ✓ |
+| 20,000 notes | **1.24 h** ✓ | **7.93 h ✗** |
+
+So the answer is not "it fits" — it is **"it fits a short-note corpus of any realistic size (break-even ≈ 64,000 notes),
+and a long-note corpus only to ≈ 10,000 notes."** A vault of near-ceiling notes breaks the rule at a size well inside what
+people have, which is the same finding §5's `max_tokens` discussion pointed at from the other direction: the lever that
+matters is how much text goes into a decode, not how many decodes are in the process.
+
+**Scope limits, stated.** One host (16-core x86_64 Linux, CPU-only, ~7.4 GB RAM), one artifact (Q8_0), `GGML_OPENMP=OFF`,
+four threads, `--test-threads=1`, llama.cpp logging left on (its own writes are in the wall time of nothing here — decode
+is timed inside the provider). The token figure is a 64-chunk sample, not a full count. The cohorts are synthetic notes
+of two shapes, not the user's corpus; they exist to separate fixed from per-token cost, which is what the batching number
+needs. Nothing in this round changes runtime behaviour: `EMBED_BATCH_CHUNKS`, `n_threads` and one-decode-per-text all stay
+as they were, and D13 remains the open decision.
 
 ### What this decides about §5's amendments
 

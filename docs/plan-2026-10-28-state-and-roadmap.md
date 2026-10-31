@@ -117,7 +117,7 @@ flowchart TD
     B["R6b0 — dependency + link<br/>vendored-revision grep for gemma-embedding2,<br/>the four-step CI job §2 promises but never ran,<br/>pin table as data, reserved fetch file names"]
     C["R6b1/R6b2 — load → tokenize → forward<br/>mean-pool → L2-norm at native 768,<br/>budget over real token counts,<br/>self-consistency vs an independent reference"]
     D["R6c — np embed<br/>provider loop, embeddings.source_hash currency,<br/>four labelled exit arms, scan report counts chunks owed"]
-    E["R6d — benchmark (two rounds done)<br/>mmap-first load pulls the whole 309,855,456-byte artifact;<br/>OpenMP A/B measured — corpus run still owed"]
+    E["R6d — benchmark (three rounds done)<br/>mmap-first load pulls the whole 309,855,456-byte artifact;<br/>OpenMP A/B measured; corpus run: 16,090 chunks/hour,<br/>+808 KiB drift over 2,048 decodes — only the batching decision is left"]
     F["R7a — marker only<br/>.fetching.&lt;id&gt;.json / .part.&lt;id&gt;.&lt;nonce&gt;,<br/>'fetching' listing section, offline-testable"]
     G["R7b — np models fetch<br/>GET → .part → streaming digest → pin compare → rename,<br/>two files two digests, four named refusals, no resume"]
     H["R7c — multimodal spike (conditional)<br/>pooled 768-d over mixed text+image tokens,<br/>or image search leaves the roadmap"]

@@ -1,0 +1,49 @@
+# R6d round 3 — the corpus run, extracted measurement lines (2026-10-31)
+
+Command (one process, `--test-threads=1`, ~9.4 min for all three cases each time):
+
+    NP_TEST_MODEL_PATH=/home/agent/models/embeddinggemma-2-Q8_0.gguf \
+      cargo test -p np-core --features local-model --test local_corpus -- --nocapture --test-threads=1
+
+Host: 16-core x86_64 Linux, CPU-only, ~7.4 GB RAM total, ~3.4 GB free disk at run time.
+Model: embeddinggemma-2-Q8_0.gguf (GGUF V3, 413 tensors, 309,855,456 B, sha256 2188ac1d…), llama.cpp pinned tag v0.8.0,
+GGML_OPENMP=OFF, `llama_n_threads = llama_n_threads_batch = 4`.
+
+**Two full runs, recorded because §8 asks for ≥2 and forbids quoting a lucky number.** They are 0.3 % apart on every
+throughput figure and agree on the shape of everything else; the spread is printed rather than averaged away:
+
+| Figure | Run 1 | Run 2 |
+|---|---|---|
+| tokens/s over 2,048 short notes | 153.8 | 154.2 |
+| chunks/hour | 16,090 | 16,129 |
+| wall time for the pass | 458.23 s | 457.13 s |
+| `VmRSS` drift across the pass (KiB) | +808 | +1,124 |
+| peak `VmHWM` (KiB) | 447,204 | 447,408 |
+| derived fixed ms per decode | 30.8 | 30.0 |
+| derived ms per token | 5.558 | 5.560 |
+
+**What this file is and is not.** It is the `SUMMARY`/`PROJECTION` lines copied out of each run's stdout; the ~2,250
+llama.cpp `decode:` / `init:` / `sched_reserve:` lines around them are omitted — they say nothing this file does not and
+would bury the numbers. Nothing here is rounded or recomputed by hand: every figure is what the harness printed.
+
+## Run 1
+
+SUMMARY corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=458.23 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=153.8 chunks_per_hour=16090 rss_first_kib=415936 rss_last_kib=416744 rss_samples=9 peak_kib=447204
+SUMMARY rss_drift_kib=808 samples=9
+PROJECTION threshold = one evening = 4 h of unattended wall time (measured rate: 16090 chunks/hour)
+PROJECTION notes=  1000 hours=  0.06 fits_evening=yes
+PROJECTION notes=  5000 hours=  0.31 fits_evening=yes
+PROJECTION notes= 20000 hours=  1.24 fits_evening=yes
+SUMMARY second_run wall_s=0.04 current=2048 batches=0
+SUMMARY cohort_short tokens=33.3 seconds_per_decode=0.2157 cohort_long tokens=251.2 seconds_per_decode=1.4273 derived_fixed_ms_per_decode=30.8 derived_ms_per_token=5.558
+
+## Run 2
+
+SUMMARY corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=457.13 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=154.2 chunks_per_hour=16129 rss_first_kib=416200 rss_last_kib=417324 rss_samples=9 peak_kib=447408
+SUMMARY rss_drift_kib=1124 samples=9
+PROJECTION threshold = one evening = 4 h of unattended wall time (measured rate: 16129 chunks/hour)
+PROJECTION notes=  1000 hours=  0.06 fits_evening=yes
+PROJECTION notes=  5000 hours=  0.31 fits_evening=yes
+PROJECTION notes= 20000 hours=  1.24 fits_evening=yes
+SUMMARY second_run wall_s=0.04 current=2048 batches=0
+SUMMARY cohort_short tokens=33.3 seconds_per_decode=0.2149 cohort_long tokens=251.2 seconds_per_decode=1.4268 derived_fixed_ms_per_decode=30.0 derived_ms_per_token=5.560

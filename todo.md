@@ -223,7 +223,7 @@ what fails is not a check, because removal makes tests pass.
   provider declares undressed inputs → staleness fails; the two declarations drift → new artifact-gated case in
   `local_embed.rs`). Real-artifact numbers after the fix: cos(same) 1.000000 vs cos(changed prefix) **0.895576**, one
   instruction applied, `local_embed` 13 passed (148 s). Next: R6d's corpus benchmark.
-* **R6d — benchmark round.** *two rounds, 2026-10-31 (`m16/corpus-benchmark` + `m17/openmp-ab`)*: `crates/np-core/tests/local_window.rs`
+* **R6d — benchmark round.** *three rounds, 2026-10-31 (`m16/corpus-benchmark` + `m17/openmp-ab` + `m20/corpus-run`)*: `crates/np-core/tests/local_window.rs`
   (3 artifact-gated cases, all printing `NOT COVERAGE` without the file). Measured on this host against the pinned Q8_0:
   a `MAX_CHUNK_BYTES` chunk is **403 tokens in 2.61 s** (**155 tok/s**, ~3× §5's interpolated figure, which was drawn
   between much longer probe points); one near-ceiling chunk of **7,992 tokens** takes **98.6 s** at peak RSS
@@ -244,8 +244,18 @@ what fails is not a check, because removal makes tests pass.
   file's own 309,855,456, because that counter is page-granular** — inside a load window ≈ 0.09 s longer than a warm one
   (an upper bound: that window also builds the context), which is what D12 needed to hear about its own 11.32 s hash:
   reading is ~126× cheaper than our hash loop.
-  Still open here: a *corpus* run (thousands of decodes in one process, §14's closing note) and batching across texts,
-  which now waits on D13 rather than on OpenMP.
+  The third round ran the corpus: `crates/np-core/tests/local_corpus.rs`, **2,048 notes / 2,048 chunks in one process**
+  through `embed_run` + `LazyLocalEmbedder` (no C probe), RSS sampled between batches, run **twice end to end** because
+  §8 forbids quoting a lucky number — the two runs land 0.3 % apart on every throughput figure: **153.8 / 154.2 tok/s**,
+  **16,090 / 16,129 chunks/hour**, wall **458.23 / 457.13 s**, mean **34.4 tokens** per chunk (sampled 64 of 2,048).
+  `VmRSS` drift across all 2,048 decodes **+808 / +1,124 KiB**, peak **447,204 / 447,408 KiB**: nothing leaks with count,
+  and round 1's 1.5 GB was a *length* effect. The next run over the same corpus costs **0.04 s** (`current = 2048`, no
+  model load). Two cohorts in one process separate the cost: **30.8 / 30.0 ms fixed per decode**, **5.558 / 5.560
+  ms/token** marginal (≈180 tok/s asymptotically; the two-line model reproduces both cohorts to 0.2 ms) — which caps what
+  batching across texts could buy at ~14 % of a short decode and ~2 % of a long one, so D13's thread count is now the bigger lever by measurement rather than by guess.
+  §8's evening rule, applied with the bound stated (4 h): 20,000 notes = **1.24 h ✓** at short-note length and
+  **7.93 h ✗** at 251 tokens — break-even ≈ 64,000 short notes, ≈ 10,000 long ones. Extracted numbers committed as
+  `crates/np-core/tests/probes/corpus-run-2026-10-31.log`. Still open in R6d: the batching **decision**, gated on D13.
 * **D12 — verify-on-change (shipped on `m19/digest-verify-on-change`, 2026-10-31).** `np embed` now checks the artifact
   against `models.sha256` before it reads a note: one `stat` when the stamp holds, a full hash when size or mtime moved
   or when no stamp exists yet (migration 8 adds the two nullable columns and backfills nothing). A disagreement refuses
