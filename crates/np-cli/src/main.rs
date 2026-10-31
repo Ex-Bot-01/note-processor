@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use np_core::catalog::size_human;
 use np_core::config::{Config, EmbeddingProvider};
 use np_core::db::{model_row, orphan_total, Db};
-use np_core::embed::{Embedder, LocalModelProvider, NoEmbeddingProvider};
+use np_core::embed::{Embedder, NoEmbeddingProvider};
 use np_core::embed_run::{self, EmbedOutcome, EmbedReport, Resolution};
 use np_core::hash::sha256_file;
 use np_core::models::{
@@ -339,7 +339,33 @@ fn embed_provider(
                 return Ok(Some(Box::new(NoEmbeddingProvider)));
             };
             let artifact = cfg.workspace_models_dir(workspace).join(id);
-            match LocalModelProvider::new(&row, &artifact, configured) {
+
+            // With the runtime compiled in, the provider is the one that loads llama.cpp **on first use**
+            // (`local_model::LazyLocalEmbedder`, §14): resolving a provider happens before anyone knows whether
+            // the workspace owes a chunk, and an eager load would spend ~420 MiB of resident weights plus load time
+            // on a run whose answer is "nothing changed". The two refusals that need no model — a row width that
+            // is not this run's, and an artifact that is not a file — are still taken here, so §6's *artifact
+            // absent* arm stays arm (iii) instead of arriving late as a failure.
+            #[cfg(feature = "local-model")]
+            {
+                match np_core::local_model::LazyLocalEmbedder::new(
+                    &row,
+                    &artifact,
+                    configured,
+                    cfg.embeddings.max_tokens,
+                ) {
+                    Ok(embedder) => Ok(Some(Box::new(embedder))),
+                    Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => Ok(None),
+                    Err(err) => Err(err.into()),
+                }
+            }
+
+            // Without the runtime there is nothing to load, and the seam's default half says so: every batch it is
+            // handed answers `runtime not built`, which `embed_run` reports as arm (iv) rather than writing a
+            // placeholder. Same two refusals and the same `None` for a missing artifact, so both builds resolve the
+            // four arms identically and only the middle of the run differs.
+            #[cfg(not(feature = "local-model"))]
+            match np_core::embed::LocalModelProvider::new(&row, &artifact, configured) {
                 Ok(provider) => Ok(Some(Box::new(provider))),
                 // The row is installed and its width is the run's; only the bytes are missing. That is a fact
                 // about the filesystem, not about configuration, so it cannot be recovered downstream — hence

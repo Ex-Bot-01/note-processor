@@ -325,7 +325,26 @@ pub trait Embedder {
     /// bug, and the mismatch is [`EmbedError::DimensionMismatch`] rather than a truncated row.
     fn dim(&self) -> usize;
 
+    /// The exact strings this provider would place in front of the model for `texts`, one per text, in order.
+    ///
+    /// **Why this is on the trait rather than spelled out by the caller.** A writer has to record what the model
+    /// read, and only the provider knows how it dresses a chunk — `prefix_doc` today, whatever a future provider
+    /// does. R6c2's P1 was that division going wrong: `embed_run` prepended `prefix_doc` itself while
+    /// `local_model::LocalEmbedder` (behind the `local-model` feature) prepended it again, so documents reached llama.cpp with the
+    /// instruction twice and the stored stamp covered one copy of a string the model saw twice. Both halves were
+    /// defensible alone; nothing asked the pair the same question. This method is that question, and it is
+    /// **required** rather than defaulted to identity so no provider can opt out by forgetting to implement it.
+    ///
+    /// The contract: [`Self::embed`] must read the model on exactly the bytes this returns, in the same order, with
+    /// nothing added or removed in between. A provider whose dressing changes — a re-installed row with a new
+    /// `prefix_doc`, say — therefore invalidates what it stored, which is §3's rule about prefixes turning into
+    /// lies enforced by a digest instead of by hope.
+    fn model_inputs(&self, texts: &[&str]) -> Vec<String>;
+
     /// Embed `texts`, returning one vector per text in the same order.
+    ///
+    /// The bytes the model reads are [`Self::model_inputs`] applied to `texts`: a provider that prefixes does it
+    /// here as well, from the same rule, and a caller that pre-applies anything is double-applying it.
     ///
     /// Implementations that cannot serve return an [`EmbedError`]; they never panic on absence of a
     /// model or an endpoint (§7: CI runs `--ignored`, so a panicking path poisons a green run).
@@ -346,6 +365,14 @@ pub trait Embedder {
 pub struct NoEmbeddingProvider;
 
 impl Embedder for NoEmbeddingProvider {
+    /// Identity — and it never matters, because this provider refuses every batch
+    /// ([`EmbedError::Disabled`]) so no bytes of its making reach a model. Implemented rather than defaulted
+    /// because the writer stamps whatever this returns, and a placeholder claiming "the model would read exactly
+    /// this" about a provider that embeds nothing is the sort of sentence §3 exists to stop.
+    fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|text| (*text).to_string()).collect()
+    }
+
     /// `"none"` — the same spelling as the config value, and usable only as a report label: this
     /// provider never produces a row, so no `models.id` is derived from it (§3).
     fn model_id(&self) -> &str {
@@ -380,7 +407,7 @@ impl Embedder for NoEmbeddingProvider {
 ///   identity exists (§3, §4). That is why construction takes a row rather than a bare path: a provider built
 ///   from a path alone would have to invent an id or let every caller supply its own.
 /// - **The prefix is the provider's job.** `embed(&[&str])` takes no prefix argument, so either the
-///   constructor carries `prefix_doc` and [`LocalModelProvider::model_inputs`] applies it, or the prefix gets
+///   constructor carries `prefix_doc` and [`Embedder::model_inputs`] applies it, or the prefix gets
 ///   applied nowhere — and "a provider that ignores prefixes is a bug" (parent §3).
 /// - **It refuses.** Until R6b1 there is no runtime, so [`Embedder::embed`] answers
 ///   [`EmbedError::RuntimeNotBuilt`] naming the model id: never an empty batch, never a zero vector, never a
@@ -405,13 +432,45 @@ pub struct LocalModelProvider {
     artifact: PathBuf,
 }
 
+/// The up-front fact about an artifact file: it is there, and it is a regular file.
+///
+/// Both local provider shapes ask it before any model work — `LocalModelProvider::new` because that is all it
+/// does, and `local_model::LazyLocalEmbedder::new` (behind the `local-model` feature, so named in prose rather
+/// than linked: this item has to resolve in a default build too) because §6's *artifact absent* arm must be settled
+/// **before** [`crate::embed_run`] is asked whether the workspace owes anything. One function is what keeps that
+/// arm one sentence in both builds, which is R6c1 D-2's rule: a missing file is a fact about the filesystem, never
+/// a configuration complaint.
+///
+/// The spelling rules are `models`' own — absolute, no symlink resolution, prefixed when long — so an artifact
+/// under a workspace that crosses the Windows threshold is still statable here instead of refused with a raw OS
+/// error. A directory is not a small unreadable artifact, and the platforms disagree about what reading one even
+/// means ([`crate::models::install`] learned this), so it keeps that wording and this module keeps one name for
+/// "that is not a file".
+pub fn artifact_is_readable(artifact: &Path) -> Result<(), EmbedError> {
+    let statable = walk::to_open_path(&models::access(artifact));
+    let meta = fs::metadata(&statable).map_err(|source| EmbedError::ArtifactUnreadable {
+        path: artifact.to_path_buf(),
+        source,
+    })?;
+    if !meta.is_file() {
+        return Err(EmbedError::ArtifactUnreadable {
+            path: artifact.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::NotADirectory, "not a regular file"),
+        });
+    }
+    Ok(())
+}
+
 /// The one spelling of "the bytes the model is handed": `prefix` then `text`, verbatim, nothing between.
 ///
-/// R6c1 review D-4: this rule used to be written twice — here and as a local `format!` in
-/// [`crate::embed_run`] — which is how a stamp rule quietly stops describing what the model read. Both callers go
-/// through this function now, so a change to the prefix rule is one edit and both the digest and the batch move
-/// together. Mutating the concatenation here fails `every_text_in_a_batch_travels_with_its_own_prefix` and
-/// `a_changed_prefix_makes_a_stored_vector_stale` (measured: 17 passed / 2 failed).
+/// **Every dressing of a chunk for a model goes through this one function.** R6c1's D-4 removed the copy in
+/// [`crate::embed_run`] (which now asks [`Embedder::model_inputs` instead of guessing); R6c2 review P2-1 removed the
+/// last one inside `local_model::LoadedModel::embed_text`, which had its own `format!`. That is how a stamp rule
+/// quietly stops describing what the model read: two spellings, one edit.
+///
+/// Mutating the concatenation here fails `every_text_in_a_batch_travels_with_its_own_prefix` and
+/// `a_changed_prefix_makes_a_stored_vector_stale` (measured: 17 passed / 2 failed), and the artifact-gated
+/// `both_provider_shapes_declare_the_same_bytes_for_the_model` keeps the two provider shapes agreeing.
 pub fn prefixed(prefix: &str, text: &str) -> String {
     format!("{prefix}{text}")
 }
@@ -462,23 +521,7 @@ impl LocalModelProvider {
             }
         };
 
-        // The same spelling rules `models` uses for this file: absolute, no symlink resolution, prefixed when
-        // long — so an artifact under a workspace that crosses the Windows threshold is still statable here
-        // instead of refused with a raw OS error.
-        let statable = walk::to_open_path(&models::access(artifact));
-        let meta = fs::metadata(&statable).map_err(|source| EmbedError::ArtifactUnreadable {
-            path: artifact.to_path_buf(),
-            source,
-        })?;
-        if !meta.is_file() {
-            // A directory is not a small unreadable artifact, and the platforms disagree about what reading
-            // one even means — `models::install` learned that in Windows CI, so its wording is reused here and
-            // one kind of "that is not a file" keeps one name.
-            return Err(EmbedError::ArtifactUnreadable {
-                path: artifact.to_path_buf(),
-                source: io::Error::new(io::ErrorKind::NotADirectory, "not a regular file"),
-            });
-        }
+        artifact_is_readable(artifact)?;
 
         Ok(Self {
             model_id: row.id.clone(),
@@ -493,29 +536,28 @@ impl LocalModelProvider {
     pub fn artifact(&self) -> &Path {
         &self.artifact
     }
+}
 
-    /// What the model will be asked to embed for these chunks: each text with the row's `prefix_doc` in
-    /// front, verbatim, with nothing added between the two.
+impl Embedder for LocalModelProvider {
+    /// Each text with this row's `prefix_doc` in front, verbatim, with nothing added between the two: the
+    /// [`Embedder::model_inputs`] contract, applied by the provider that owns the row.
     ///
     /// **This is the sequence [`crate::config::EmbeddingsConfig::max_tokens`] counts** (§5): prefix + text +
-    /// special tokens, not the chunk's bytes alone. R6b2 enforces the budget and must measure it over what this
-    /// returns — measuring the un-prefixed text would leave every existing test green while bounding something else.
+    /// special tokens, not the chunk's bytes alone. R6b2 enforces the budget and measures it over what this
+    /// returns — bounding the un-prefixed text would leave every existing test green while limiting something else.
     ///
-    /// This is the one place that prefix is applied, which is what makes parent §3's "a provider that ignores
-    /// prefixes is a bug" checkable *today* instead of in R6b1: `tests/embed.rs` hands the result to a
-    /// recording fake and asserts the stored prefix sits in front of text the caller never touched.
-    /// [`Embedder::embed`] refuses before reaching it — there is no runtime to receive it, and refusing does
-    /// not inspect the batch, the same posture as [`NoEmbeddingProvider::embed`] — so R6b1's forward pass is
-    /// this method's intended production caller.
-    pub fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
+    /// The prefix is applied in exactly one place per provider, which is what makes parent §3's "a provider that
+    /// ignores prefixes is a bug" checkable: `tests/embed.rs` hands the result to a recording fake and asserts the
+    /// stored prefix sits in front of text the caller never touched. In this build [`Self::embed`] refuses before
+    /// reaching the model, so the method's production callers are the writer's stamp and, behind the feature flag,
+    /// `local_model::LocalEmbedder` (behind the `local-model` feature).
+    fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
         texts
             .iter()
             .map(|text| prefixed(&self.prefix_doc, text))
             .collect()
     }
-}
 
-impl Embedder for LocalModelProvider {
     /// The installed row's `id`, verbatim: the provider adds and strips nothing, because `embeddings.model`
     /// is a foreign key to `models.id` and one spelling of an identity is the rule §4 exists to keep.
     fn model_id(&self) -> &str {
@@ -528,8 +570,12 @@ impl Embedder for LocalModelProvider {
         self.dim
     }
 
-    /// Always [`EmbedError::RuntimeNotBuilt`], naming the model, with the batch untouched: this build has no
-    /// way to turn text into numbers, and saying so is the only honest answer (§9 item 1).
+    /// Always [`EmbedError::RuntimeNotBuilt`], naming the model, with the batch untouched: this type is the seam's
+    /// default half, and a build that links no C++ has no way to turn text into numbers (§9 item 1).
+    ///
+    /// Not a statement about the program: in a `local-model` build `np-cli` resolves
+    /// `local_model::LazyLocalEmbedder` instead and vectors are computed, so this refusal is what a **default**
+    /// binary answers rather than something no binary can do.
     fn embed(&self, _texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
         Err(EmbedError::RuntimeNotBuilt {
             model_id: self.model_id.clone(),

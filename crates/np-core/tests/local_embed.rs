@@ -32,7 +32,7 @@ mod embedding {
 
     use np_core::db::ModelRow;
     use np_core::embed::{EmbedError, Embedder};
-    use np_core::local_model::{self, LoadedModel, LocalEmbedder, TextKind};
+    use np_core::local_model::{self, LazyLocalEmbedder, LoadedModel, LocalEmbedder, TextKind};
 
     /// The width `embeddinggemma-2-Q8_0.gguf` answers with — the same 768 `tests/local_load.rs` pins from the
     /// file's own header.
@@ -88,6 +88,45 @@ mod embedding {
             prefix_doc: prefix_doc.to_string(),
             prefix_query: prefix_query.to_string(),
             installed_at: 0,
+        }
+    }
+
+    /// The two provider shapes must declare the same bytes for the same row, or the currency stamp stops
+    /// describing what the model read.
+    ///
+    /// Why this needs the artifact: `LocalEmbedder` only exists once a model is loaded, and the claim is about the
+    /// pair — the lazy half answers before llama.cpp is running (that is what `embed_run` stamps), the loaded half
+    /// is what would be stamped if a caller embedded straight from a resident model. Mutating either declaration to
+    /// ignore `prefix_doc` fails this case; the argv-level case in np-cli catches only the lazy half, because that
+    /// is the one `np embed` wires up today.
+    #[test]
+    fn both_provider_shapes_declare_the_same_bytes_for_the_model() {
+        let path = artifact_or_not_coverage!();
+        let _guard = artifact_lock();
+
+        let prefix_doc = "task: search result | query: ";
+        let texts = [
+            "the cat sits on the warm mat",
+            "revenue rose because the pipeline stopped leaking",
+        ];
+
+        let loaded = LocalEmbedder::new(load(&path), &row(prefix_doc, "query: "), 1_024)
+            .expect("test setup: a loaded document embedder");
+        let lazy = LazyLocalEmbedder::new(&row(prefix_doc, "query: "), &path, DIM, 1_024)
+            .expect("test setup: a lazy provider over the same row and file");
+
+        let resident = loaded.model_inputs(&texts);
+        let not_yet_loaded = lazy.model_inputs(&texts);
+        assert_eq!(
+            resident, not_yet_loaded,
+            "the bytes stamped before a load must be the bytes a loaded model would read"
+        );
+        for (input, text) in resident.iter().zip(texts) {
+            assert_eq!(
+                input,
+                &format!("{prefix_doc}{text}"),
+                "and the dressing is this row's `prefix_doc`, verbatim and in front"
+            );
         }
     }
 

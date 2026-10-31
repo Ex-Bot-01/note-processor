@@ -592,3 +592,14 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
 - **D10 — migration 5's hand-written child-row lists are chunk-safe only by declaration order.** It deletes children by
   hand and does not list `chunks`/`embeddings`, which is correct solely because it runs before migration 7 creates them.
   Any future duplicate healing must add both tables or it will orphan rows on a legacy database.
+- **D11 — "cannot stat the artifact" is answered as §6's *artifact absent* (R6c2 review P2-2).**
+  `embed::artifact_is_readable` folds every `fs::metadata` failure into `EmbedError::ArtifactUnreadable`, and `np-cli`
+  maps that variant to the absent arm — whose advice is "install the artifact". For a file that exists but cannot be
+  stat'd (no search permission on the parent directory, a symlink loop) that sentence sends someone to re-install a
+  file they need to `chmod`. The fix is small: map only `ErrorKind::NotFound` to the absent arm and let other kinds
+  surface as the OS failure they are. Deferred because proving it needs an argv case that manipulates directory
+  permissions — Linux-only evidence, and F18 says we do not ship a platform claim we have not run.
+- **D12 — `models.sha256` is not re-verified before a load (R6c2 review P2-3, same open decision as
+  `LocalModelProvider::new`'s doc).** A same-width artifact swap is therefore embedded and stamped under the row's id.
+  Cost of closing it: one streaming SHA-256 over ~310 MB per `np embed` run, *if* §3's one-load-per-process holds — so
+  R6d's benchmark is where that price gets measured rather than assumed.

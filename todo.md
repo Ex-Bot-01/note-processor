@@ -208,6 +208,21 @@ what fails is not a check, because removal makes tests pass.
   §7 assertions that no fake can stand in for: batch invariance under a **non-empty** `prefix_doc` (§5 left that pairing
   untested on purpose), unit norms, and the accept-at-exactly-`window` boundary. Blocked on nothing but a window that can hold
   the work — the last five subagent rounds died at their deadlines.
+* **R6c2 — wire the runtime that already works into the provider that refuses.** ✅ *wired 2026-10-31, branch
+  `m15/runtime-wiring`* — `np-cli` resolves `local-model` to `local_model::LazyLocalEmbedder`, which loads llama.cpp on
+  the first batch (identity answers come from the row, so an up-to-date workspace pays nothing) and mirrors a failed
+  load so every batch refuses for the same typed reason. Measured against the real artifact through argv: 768 × float-32
+  per row, ‖v‖ = 1 within 1e-3, second run `embedded 0 / current N`, prefix edit re-embeds everything — **but** the
+  mutation that was supposed to prove the last claim refused to die, and the reason is a **P1**: `embed_run` prepends
+  `prefix_doc` before stamping and calling `embed`, and `LoadedModel::embed_text` prepends it again, so documents reach
+  llama.cpp prefixed twice and the token budget counts the doubled sequence. Both halves were right alone; nothing
+  tested the pair.
+  **Resolved the same day by A′**: `Embedder::model_inputs` is a required trait method — the provider answers what the
+  model will read, the writer stamps that and hands `embed` raw text — with both `local_model` shapes spelling the
+  dressing through one private function. Three mutations fenced (loaded embedder ignores prefix → argv fails; wired
+  provider declares undressed inputs → staleness fails; the two declarations drift → new artifact-gated case in
+  `local_embed.rs`). Real-artifact numbers after the fix: cos(same) 1.000000 vs cos(changed prefix) **0.895576**, one
+  instruction applied, `local_embed` 13 passed (148 s). Next: R6d's corpus benchmark.
 * **R6d — corpus-scale benchmark**, batching across texts (deliberately absent from this API), and the accept-at-exactly-
   `window` assertion, which belongs in artifact-gated coverage rather than in CI.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its

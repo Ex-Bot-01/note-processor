@@ -1511,8 +1511,10 @@ fn local_model_config(model: &str) -> String {
 /// Install [`EMBED_MODEL`] through the real command, so the row and the artifact are what `np models install`
 /// writes rather than a fixture shaped to look like one. Returns the artifact path it placed.
 ///
-/// The source bytes are not a model and nothing reads them: `install` verifies the declared digest against the
-/// file, and `embed` refuses before any load (there is no runtime in this build).
+/// The source bytes are not a model: `install` verifies the declared digest against the file and stores it, and
+/// `embed` never turns them into numbers — in a default build because there is no runtime to ask, in a
+/// `local-model` build because llama.cpp refuses bytes with the wrong magic. Both refusals are arm (iv), and
+/// [`embed_with_everything_present_reports_the_runtime_that_is_not_built`] pins that each build says its own.
 fn install_model(ws: &Workspace) -> PathBuf {
     let source = ws._tmp.path().join("artifact.bin");
     fs::write(&source, b"the bytes one model stands for\n")
@@ -1683,10 +1685,13 @@ fn embed_with_the_artifact_file_missing_names_installing_it() {
     );
 }
 
-/// Arm (iv) as the default build actually answers today: configured, installed, artifact present, work owed — and
-/// no inference runtime behind `local-model`. Not feature-gated, because it is the provider *type* that refuses
-/// ([`np_core::embed::LocalModelProvider::embed`] answers `RuntimeNotBuilt` unconditionally) and `np embed` reaches
-/// no other provider in any build.
+/// Arm (iv) as each build answers it: configured, installed, artifact present, work owed — and nothing behind the
+/// batch that can turn text into numbers. **What "nothing" means is what R6c2 split.** Without `local-model` the
+/// provider type refuses every batch unanswered (`RuntimeNotBuilt`); with it the provider *tries to load* the
+/// installed bytes and llama.cpp returns null for them, because what [`install_model`] put there is a sentence
+/// rather than a GGUF. Both are arm (iv), both exit 1, both write nothing — so everything below holds in either
+/// build, and each build's own sentence is pinned by its own arm of one `cfg!`, which is honest about being a
+/// different answer rather than pretending there is one.
 #[test]
 fn embed_with_everything_present_reports_the_runtime_that_is_not_built() {
     let ws = workspace();
@@ -1699,9 +1704,15 @@ fn embed_with_everything_present_reports_the_runtime_that_is_not_built() {
     assert_eq!(failed.code(), 1, "arm (iv) is exit 1:\n{}", failed.stdout());
     for channel in [failed.stdout(), failed.stderr()] {
         assert!(channel.contains("owed and not produced"), "{channel}");
+        let expected = if cfg!(feature = "local-model") {
+            "is not loadable as a model"
+        } else {
+            "the local embedding runtime is not built yet"
+        };
         assert!(
-            channel.contains("the local embedding runtime is not built yet"),
-            "the refusal has to say the runtime is missing, not that the corpus is empty: {channel}"
+            channel.contains(expected),
+            "arm (iv) has to name why nothing was produced ({expected:?} in a build with              local-model = {}), not that the corpus is empty: {channel}",
+            cfg!(feature = "local-model"),
         );
         assert!(
             channel.contains(EMBED_MODEL),
@@ -1819,4 +1830,296 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
         "{}",
         json.stderr()
     );
+}
+
+// ---------------------------------------------------------------------------
+// `np embed` against a real GGUF — the one thing R6c2 exists to prove.
+//
+// Everything above this line runs in a build with no runtime, which is exactly why it could never show a vector
+// arriving: the provider there answers `runtime not built` for every batch, and `crates/np-core/tests/embed_run.rs`
+// proves the writer loop against a fake. What is below drives the **feature build's** binary at the 310 MB artifact
+// and asserts the three things no fake can stand in for — that real float-32 vectors of the declared width land in
+// `embeddings`, that a second run calls them current instead of recomputing them, and that `prefix_doc` reaches
+// the model (different prefix, different bytes). §7's batch-invariance note asked for exactly this pairing.
+//
+//   NP_TEST_MODEL_PATH=/path/to/embeddinggemma-2-Q8_0.gguf \
+//     cargo test -p np-cli --features local-model --test cli -- --nocapture
+//
+// With the variable unset each case prints `NOT COVERAGE` and passes, for the reason `local_embed.rs` gives: an
+// absent 310 MB file must not look like a failure, and must not look like coverage either. The artifact is
+// **symlinked**, never copied — `models install` would spend 310 MB of disk per case in a suite that already runs
+// in parallel, and following the workspace's own path spelling is part of what is being tested.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "local-model")]
+mod real_model {
+    use super::*;
+
+    /// The width `embeddinggemma-2-Q8_0.gguf` answers with — the same 768 `np-core`'s artifact suites pin from
+    /// the file's own header. If this ever disagrees with the artifact, the run refuses rather than writing
+    /// garbage, which is the behaviour under test either way.
+    const REAL_DIM: i64 = 768;
+
+    fn artifact() -> Option<PathBuf> {
+        std::env::var_os("NP_TEST_MODEL_PATH").map(PathBuf::from)
+    }
+
+    macro_rules! artifact_or_not_coverage {
+        () => {
+            match artifact() {
+                Some(path) => path,
+                None => {
+                    println!(
+                        "NOT COVERAGE: NP_TEST_MODEL_PATH is unset, so no real vector was written by this case. \
+                         Re-run with it pointing at embeddinggemma-2-Q8_0.gguf (sha256 2188ac1d…)."
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
+    /// A two-note workspace, small on purpose: this case pays a real load plus one decode per chunk, and the
+    /// corpus's seventeen files would multiply that for no additional claim.
+    fn tiny_workspace() -> Workspace {
+        let tmp = TempDir::new().expect("test setup: tempdir");
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).expect("test setup: workspace root");
+        fs::create_dir_all(tmp.path().join("config")).expect("test setup: config dir");
+        fs::write(
+            root.join("a.md"),
+            "# Alpha\n\nThe cat sits on the warm mat while the rain falls outside.\n",
+        )
+        .expect("test setup: first note");
+        fs::write(
+            root.join("b.md"),
+            "# Beta\n\nRevenue for the quarter rose because the pipeline stopped leaking.\n",
+        )
+        .expect("test setup: second note");
+        Workspace { _tmp: tmp, root }
+    }
+
+    /// Record [`EMBED_MODEL`] as installed, with its bytes **linked** rather than copied into place.
+    ///
+    /// Written by hand because `np models install` copies, and the point of the link is that `embed` resolves the
+    /// workspace's own path to a file it did not write — which is also what a user who placed an artifact there
+    /// themselves gets. The digest is the real one so the row tells the truth even though nothing verifies it yet
+    /// (the open cost decision in `LocalModelProvider::new`'s doc).
+    fn link_artifact(ws: &Workspace, artifact: &Path, prefix_doc: &str) {
+        fs::create_dir_all(ws.models_dir()).expect("test setup: models dir");
+        let link = ws.models_dir().join(EMBED_MODEL);
+        std::os::unix::fs::symlink(artifact, &link).expect("test setup: link the artifact");
+
+        let digest = np_core::hash::sha256_file(artifact).expect("test setup: digest the artifact");
+        let conn = rusqlite::Connection::open(ws.db_path()).expect("test setup: open the index");
+        conn.execute(
+            "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                EMBED_MODEL,
+                REAL_DIM,
+                digest,
+                prefix_doc,
+                "query: ",
+                1_730_000_000_i64
+            ],
+        )
+        .expect("test setup: install the row");
+    }
+
+    /// Every vector this model has stored, in chunk order, with the width each row claims.
+    fn stored_vectors(db: &Path) -> Vec<(i64, Vec<u8>)> {
+        let conn = rusqlite::Connection::open(db).expect("test: open the index");
+        let mut statement = conn
+            .prepare("SELECT chunk_id, vector FROM embeddings WHERE model = ?1 ORDER BY chunk_id")
+            .expect("test: read the vectors");
+        statement
+            .query_map(rusqlite::params![EMBED_MODEL], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .expect("test: query the vectors")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("test: collect the vectors")
+    }
+
+    /// L2 norm of a little-endian float-32 vector — recomputed here rather than trusted from `np-core`, because
+    /// "what is in the database" is the claim and the reader must not share the writer's assumptions.
+    fn norm(bytes: &[u8]) -> f64 {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| {
+                let value = f32::from_le_bytes([word[0], word[1], word[2], word[3]]) as f64;
+                value * value
+            })
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    #[test]
+    fn a_real_model_writes_vectors_that_the_next_run_calls_current() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        run(&mut ws.command(&["scan"])).assert_success();
+        link_artifact(&ws, &artifact, "task: search result | query: ");
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+        let first = run(&mut ws.command(&["embed"]));
+        first.assert_success();
+        let embedded = summary_count(&first.stdout(), "embedded");
+        assert!(
+            embedded >= 2,
+            "two notes owe at least two chunks, got {} in:\n{}",
+            embedded,
+            first.stdout()
+        );
+        assert_eq!(summary_count(&first.stdout(), "errors"), 0);
+        assert_eq!(summary_count(&first.stdout(), "refused"), 0);
+
+        let stored = stored_vectors(&ws.db_path());
+        assert_eq!(
+            stored.len(),
+            embedded as usize,
+            "one row per embedded chunk"
+        );
+        for (chunk_id, bytes) in &stored {
+            assert_eq!(
+                bytes.len(),
+                REAL_DIM as usize * 4,
+                "chunk {chunk_id} has to hold {REAL_DIM} float-32 components"
+            );
+            let length = norm(bytes);
+            assert!(
+                (length - 1.0).abs() < 1e-3,
+                "chunk {chunk_id} was stored with ‖v‖ = {length}; §7 normalises, so 1.0 is the claim"
+            );
+        }
+
+        // The second run must not recompute: `current` is the currency query answering from the stamps, and this
+        // is the first time that claim has been made against a real model rather than a fake's digest arithmetic.
+        let second = run(&mut ws.command(&["embed"]));
+        second.assert_success();
+        assert_eq!(
+            summary_count(&second.stdout(), "embedded"),
+            0,
+            "a workspace that owes nothing must not load the model to re-derive vectors it already has"
+        );
+        assert_eq!(summary_count(&second.stdout(), "current"), embedded);
+
+        // §3's rule about prefixes turning into lies, measured on real numbers — and the measurement is what found
+        // R6c2's P1, so read this block for what it *does not* prove as much as what it does.
+        //
+        // An earlier draft compared raw bytes before and after a prefix change and **survived** a provider that
+        // ignores `prefix_doc` entirely: two processes over the same weights differ in low mantissa bits, so byte
+        // inequality is noise. The fix was to measure the floor — wipe the table, re-embed identical input under the
+        // unchanged prefix, take that cosine as "as close as the same computation gets" — and then assert something
+        // relative: a changed instruction moves the numbers further than recomputing does. Measured here:
+        // cos(same) = 1.000000 (to six places; the bytes still differ), cos(changed) = 0.867559.
+        //
+        // What it does NOT prove is that `LocalEmbedder` applies the prefix, because re-running the same mutant now
+        // still passes: cos(changed) = 0.895576 **with `TextKind::Document` ignoring its prefix**. The numbers move
+        // anyway, because `embed_run` prepends `prefix_doc` itself before stamping and calling `embed`, and
+        // `LoadedModel::embed_text` prepends it a second time. That double application is R6c2's P1 — recorded in
+        // `r6c2-findings.md`, with the seam decision it needs — and until it is fixed this assertion pins "the
+        // stored numbers depend on `prefix_doc`", which is true, rather than the stronger thing it was written to
+        // pin.
+        let first_vector = stored.first().expect("test: one stored vector").1.clone();
+        clear_embeddings(&ws.db_path());
+        run(&mut ws.command(&["embed"])).assert_success();
+        let repeat = stored_vectors(&ws.db_path());
+        let noise = cosine(
+            &first_vector,
+            &repeat.first().expect("test: repeated vector").1,
+        );
+
+        set_prefix(&ws.db_path(), "describe the note for retrieval | ");
+        let third = run(&mut ws.command(&["embed"]));
+        third.assert_success();
+        assert_eq!(
+            summary_count(&third.stdout(), "embedded"),
+            embedded,
+            "a changed prefix makes every stored vector stale"
+        );
+        let after = stored_vectors(&ws.db_path());
+        assert_eq!(after.len(), stored.len(), "the same chunks, re-embedded");
+
+        let moved = cosine(
+            &first_vector,
+            &after.first().expect("test: re-prefixed vector").1,
+        );
+        println!(
+            "prefix sensitivity: cos(same prefix, re-run) = {noise:.6}, \
+             cos(changed prefix) = {moved:.6} (n = {REAL_DIM})"
+        );
+        assert!(
+            moved < noise - 1e-3,
+            "changing `prefix_doc` has to move the numbers further than recomputing them does — \
+             same-prefix {noise:.6}, changed-prefix {moved:.6}. A provider that ignores the prefix makes these \
+             equal, which is §3's bug and this assertion's whole purpose"
+        );
+
+        // And the ordering that says the vectors mean something: a note is closer to itself under a new
+        // instruction than to a different note. An ordering, never a score, for the reason `local_embed.rs` gives.
+        let (a_id, a_new) = &after[0];
+        let b_new = &after
+            .iter()
+            .find(|(id, _)| id != a_id)
+            .expect("test: a second chunk")
+            .1;
+        let self_similarity = cosine(&first_vector, a_new);
+        let other_similarity = cosine(&first_vector, b_new);
+        assert!(
+            self_similarity > other_similarity,
+            "the same note under a new instruction ({self_similarity:.4}) has to stay closer to itself than a \
+             different note is ({other_similarity:.4})"
+        );
+    }
+
+    /// Forget every stored vector, so the next `np embed` recomputes from scratch.
+    ///
+    /// This is a test reaching into the database, which no command does — §6 keeps writing to `embeddings` the one
+    /// route with a currency check. It exists to produce a second measurement of an *identical* computation, which
+    /// is what turns "the bytes changed" into a claim about noise.
+    fn clear_embeddings(db: &Path) {
+        let conn = rusqlite::Connection::open(db).expect("test: open the index");
+        conn.execute("DELETE FROM embeddings", [])
+            .expect("test: drop the stored vectors");
+    }
+
+    /// Point this model's rows at a new document instruction, as someone editing `models` by hand would.
+    fn set_prefix(db: &Path, prefix_doc: &str) {
+        let conn = rusqlite::Connection::open(db).expect("test: open the index");
+        conn.execute(
+            "UPDATE models SET prefix_doc = ?1 WHERE id = ?2",
+            rusqlite::params![prefix_doc, EMBED_MODEL],
+        )
+        .expect("test: change the prefix");
+    }
+
+    /// Cosine similarity of two little-endian float-32 vectors.
+    fn cosine(a: &[u8], b: &[u8]) -> f64 {
+        let (a_words, _) = a.as_chunks::<4>();
+        let (b_words, _) = b.as_chunks::<4>();
+        assert_eq!(a_words.len(), b_words.len(), "two vectors of one width");
+        let dot: f64 = a_words
+            .iter()
+            .zip(b_words)
+            .map(|(x, y)| f32::from_le_bytes(*x) as f64 * f32::from_le_bytes(*y) as f64)
+            .sum();
+        // Both sides are unit-normalised on the way in (asserted above), so this is the cosine itself; dividing
+        // anyway keeps the helper honest if a future model stops normalising.
+        let norm = |v: &[u8]| -> f64 {
+            v.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| {
+                    let value = f32::from_le_bytes(*w) as f64;
+                    value * value
+                })
+                .sum::<f64>()
+                .sqrt()
+        };
+        dot / (norm(a) * norm(b))
+    }
 }

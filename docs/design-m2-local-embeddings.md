@@ -330,6 +330,16 @@ A new command, deliberately **not** part of `np scan`: the scan wraps its whole 
 >   needs the model's tokenizer, which lives behind `local-model`. The writer relays
 >   [`EmbedError::TokenBudgetExceeded`](../crates/np-core/src/embed.rs), retries an over-budget batch member by member so
 >   its batchmates still land, and counts what it refused. §5's "reported, never truncated" is unchanged; the check moved.
+>
+> **Amended 2026-10-31 (R6c2, A′) — who dresses a chunk.** The bullet above about the stamp covering "the exact bytes the
+> provider receives" was written while `embed_run` applied `prefix_doc` itself. Wiring the real runtime made that wrong:
+> [`LocalEmbedder`] applies the row's prefix too, so documents reached llama.cpp with the instruction **twice** and the
+> stamp covered one copy (R6c2's P1). The seam now asks the provider: [`Embedder::model_inputs`] is a required trait
+> method, `embed_run` stamps what it returns and hands [`Embedder::embed`] the raw chunk text. Consequences worth
+> recording: a provider that changes its dressing invalidates its own stored vectors by construction rather than by
+> convention; `prefix_query` stays out of it, because a query vector is not comparable with a stored one (§3) and is
+> reachable only through `embed_as(TextKind::Query)`; and the two provider shapes in `local_model` declare their inputs
+> through one private function, asserted equal against a real artifact so the rule cannot be spelled twice again.
 
 - **It reads chunking; it never writes it.** No `chunks` rows, no `EMBED_VERSION_KEY`. It is one reader of the scan's
   output, not a second path through it (the F19 ruling's shape).
