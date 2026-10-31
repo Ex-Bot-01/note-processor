@@ -604,5 +604,19 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   Cost of closing it: **measured on 2026-10-31** (`local_window.rs`) at **11.32 s** for this artifact's 309,855,456
   bytes — 26 MiB/s, which is several times the cost of loading and embedding a small workspace's worth of notes. So
   "verify on every embed" is not free and should not be adopted by reflex; the options are verify-on-change (stat the
-  file, re-hash when size or mtime moves), verify in `np models list` only, or hash lazily per tensor page. Deciding
-  needs the OpenMP/mmap half of R6d, because an mmap-first load changes what "read the whole file" even costs.
+  file, re-hash when size or mtime moves), verify in `np models list` only, or hash lazily per tensor page.
+  R6d's second round (2026-10-31, §14's A/B subsection) removed the last excuse for waiting: llama.cpp's mmap-first
+  load pulls the **whole artifact** through the kernel on first use — `read_bytes` moves by 309,858,304 B, slightly
+  more than the file's 309,855,456 B because that counter is page-granular — and it does so inside a load window only
+  about **0.1 s** longer than a warm one (upper bound: that window also builds the context). Reading is not the cost;
+  our 26 MiB/s userspace hash loop is. So verify-on-change (stat, re-hash on size or mtime) is now the option with no
+  measured downside beyond a stale-mtime edge case, and this item needs a decision rather than another measurement.
+- **D13 — llama.cpp defaults to 4 threads on a 16-CPU host; nobody has measured what raising it buys.**
+  R6d's OpenMP A/B (2026-10-31) found both build configurations printing `n_threads=4 n_threads_batch=4` from
+  `llama_context_default_params()`, which is why the flag moved no throughput at all: ggml's own pthread pool and an
+  OpenMP parallel-for were handed the same four workers. `local_model::load` accepts that default without comment.
+  The unmeasured question is whether `llama_context_params.n_threads` set from `std::thread::available_parallelism`
+  (or a config key) turns 157 tok/s into something worth waiting for on a big note — and what it costs in peak RSS
+  and in being a well-behaved background process next to someone's editor. Filed rather than done because it changes
+  runtime behaviour for every user of the feature, needs an A/B of its own (thread counts 1/2/4/nproc at both lengths,
+  RSS included), and no measurement so far says the current 81–157 tok/s is unacceptable.

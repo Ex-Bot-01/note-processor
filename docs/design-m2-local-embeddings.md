@@ -470,7 +470,7 @@ Then a whole-branch review across the shipped rounds, and merge only on the huma
 | **R6b1** *(shipped `ac25c00`, fixes `4fc0aa9`)* | the pinned GGUF opens through our FFI and answers with its own header's numbers | width refusal, drop order, truncated-artifact refusal all tested |
 | **R6b2** *(shipped `344692f`+`d1e8fad`+`2e15d33`, review fixes in `HEAD`)* | tokenize → forward pass → pool → L2-normalise; budget enforcement over the **token** count; the window made wide enough that the runtime returns a code instead of aborting | 12 artifact-gated cases, plus the three numbers §14 was missing: size +5.5 MiB, throughput ~130 tok/s, forward-pass RSS curve. Its review found two P0s — a dead buffer-resize path that decoded zeros on a short buffer, and RANK pooling read at the wrong width — both fixed; the window prose now cites the encoder assert that actually fires |
 | **R6c** | `np embed <ws>` and §6's four labelled exit arms, reading a marker **read-only** ("artifact absent — run `np models fetch`") | the label exists before the writer does, so R6c never waits on the fetcher |
-| **R6d** | benchmark, including whether an mmap-first load reads all 865 MB (which decides §12's digest cost) | **partly done 2026-10-31**: `local_window.rs` measures the default-budget chunk (403 tokens, 2.61 s, 155 tok/s), a near-ceiling one (7,992 tokens, 98.6 s, 81 tok/s, peak RSS 1,525,500 KiB) and the exact window edge (8,192 accepted in 100.1 s; 8,193 refused before any decode), plus the per-run digest price (309,855,456 bytes in **11.32 s**, 26 MiB/s — D12's cost, now measured rather than assumed). Still open: the OpenMP A/B, and whether an mmap-first load reads the whole file |
+| **R6d** | benchmark, including whether an mmap-first load reads the whole artifact (which decides §12's digest cost) | **two rounds done 2026-10-31; the corpus run is still owed** (it is §14's closing note and the number M4 needs): `local_window.rs` measures the default-budget chunk (403 tokens, 2.61 s, 155 tok/s), a near-ceiling one (7,992 tokens, 98.6 s, 81 tok/s, peak RSS 1,525,500 KiB) and the exact window edge (8,192 accepted in 100.1 s; 8,193 refused before any decode), plus the per-run digest price (309,855,456 bytes in **11.32 s**, 26 MiB/s — D12's cost, now measured rather than assumed). The second round built the pinned tree twice and A/B'd it — separate processes per cell, raw log committed beside the probe — finding that `GGML_OPENMP=ON` moves throughput by a fraction of a percent here while costing a libgomp dependency, so the pinned `OFF` stays for a measured reason; §14's A/B subsection carries the table, the spread and the scope limits. The same runs answered the mmap question: **an mmap-first load pulls the whole artifact through the kernel**, `read_bytes` moving by 309,858,304 B — more than the file's own 309,855,456 B, because that counter is page-granular and reads ahead — inside a load window about 0.1 s longer than a warm one (an upper bound on the read itself: the window also creates the context). What is left of R6d is a *corpus* run (thousands of decodes in one process) and any batching decision, which now waits on D13's thread-count measurement rather than on OpenMP |
 | **R7a — marker only** *(shipped `ad9ed5a`)* | read/report the `.fetching.*` / `.part.*` names, `"fetching"` listing section, staleness *display* wording, tests that plant files. **No writer**: nothing can create a marker until R7b's first byte, which is why every test plants its own | fully offline-testable; this is the human-visible half of "tell me it is downloading" |
 | **R7b — fetch** | HTTP GET → `.part` → streaming digest (incremental API in `hash.rs`) → pin compare → rename-if-absent → `db::insert_model`; two files, two digests; four named refusals; no resume, no retry, no marker reuse | the network round alone, after the marker exists |
 | **R7c — multimodal spike (conditional)** | prove or kill a pooled 768-d embedding over mixed text+image tokens for this architecture through the pinned binding | only then does image indexing enter a roadmap; §5's open question |
@@ -767,7 +767,7 @@ has a C number to be compared against; build line in that file's header). **Memo
 | Context on top of the model, nothing decoded | **+1.8 MiB** resident at `n_ctx = 4096` | same probe. The weights dominate, not the context — and this artifact has no KV cache to dominate anything (`create_memory` returns null), so what that 1.8 MiB buys is a compute buffer and a window number |
 | **Corrected in R6b2: that +1.8 MiB was the whole story only because nothing had decoded.** Peak RSS above the C probe's own 419.4 MiB with the model open, by longest sequence run (`n_ctx = n_batch = n_ubatch = 4096`) | 133 tok **+0 MiB** · 513 **+47** · 1,026 **+109** · 2,052 **+218** · 4,085 **+458** | `crates/np-core/tests/probes/decode_probe.c` (committed, build line in its header — it also prints `memory=(nil)` and `n_threads=4`, the two facts behind the encoder-path and CPU-utilisation claims above); a compute buffer is *reserved* at context creation and *touched* per forward pass, so cost tracks the longest sequence actually run, not the ceiling asked for. This is why widening the window to escape the `n_ubatch` abort bought memory only for long notes, and it is the number R6d's peak-RSS headline should be read against. The 8,192 row above extends this curve: the shape holds at the wider window (+0 MiB at rest, ~+1 GiB near the ceiling) |
 | **Package size, stripped** (`cargo build --release --bin np`, `strip`) | feature **off 5.5 MiB** (5,780,432 B) · feature **on 11.0 MiB** (11,554,872 B) · **+5.5 MiB**, against this section's ≤ **40 MB** ceiling | measured 2026-10-30 with `np-cli`'s `local-model` passthrough. **Why the C++ is retained is not that `np` calls it** — nothing in `np-cli` reaches `local_model`; retention follows from np-core's own public code referencing those symbols while `build.rs` emits a plain `-l static=llama` with no `--whole-archive`, so the linker pulls what the references name. That makes +5.5 MiB today's figure rather than a floor: an LTO or `codegen-units` change could reclaim part of it, and R6d re-measures on the release profile before this section's headroom is quoted again. Symbol counts come from the *unstripped* files (`nm --defined-only`: 252 `T llama_` and 1,276 `llama_`/`ggml_` total with the feature on, zero without) — a stripped binary has no symbol table, so counting on it says "0" either way and reads as "nothing was linked in" while 5.7 MB of C++ sits in the file |
-| Throughput, `GGML_OPENMP = OFF`, this host | **141 tok/s** at 543 tokens, **120 tok/s** at 2,163 tokens (3.85 s and 18.0 s per decode; first decode of a run is no slower than a warm one) | `tests/local_embed.rs`'s throughput case prints it on every artifact run — the only one of R6b2's three numbers a test prints. `/usr/bin/time -v` on a 2,052-token pass reports **392% CPU**: with OpenMP off, ggml runs its own pthread pool (`ggml/src/ggml-cpu/ggml-cpu.c` — `ggml_threadpool_new_impl` at `:3324`, created per graph plan at `:3418`, with non-OpenMP worker state under `#ifndef GGML_USE_OPENMP` at `:509` and its barrier at `:2756`) and `llama_n_threads_batch` answers **4**. So "OpenMP off" is not "one core"; R6d's A/B against `GGML_OPENMP=ON` settles whether the self-containment trade is worth its price
+| Throughput, `GGML_OPENMP = OFF`, this host | **141 tok/s** at 543 tokens, **120 tok/s** at 2,163 tokens (3.85 s and 18.0 s per decode; first decode of a run is no slower than a warm one) | `tests/local_embed.rs`'s throughput case prints it on every artifact run — the only one of R6b2's three numbers a test prints. `/usr/bin/time -v` on a 2,052-token pass reports **392% CPU**: with OpenMP off, ggml runs its own pthread pool (`ggml/src/ggml-cpu/ggml-cpu.c` — `ggml_threadpool_new_impl` at `:3324`, created per graph plan at `:3418`, with non-OpenMP worker state under `#ifndef GGML_USE_OPENMP` at `:509` and its barrier at `:2756`) and `llama_n_threads_batch` answers **4**. So "OpenMP off" is not "one core" — and R6d's A/B (below) found that turning OpenMP *on* changes nothing measurable either, at those same four threads
 | Independent cross-check of the FFI mirror | C prints `n_embd_out 768, n_embd_inp 512, n_ctx_train 262144, vocab 262144, pooling 1`; Rust's `ModelFacts` prints the same five numbers | two programs, one artifact: a wrong struct field in our mirror shows up as a disagreement rather than as a green suite |
 
 
@@ -783,6 +783,76 @@ Not claimed: any of this on Windows or macOS (§14's per-OS rule — the feature
 measured through our own FFI on this host; what is still unmeasured is a *corpus* — thousands of decodes in one process, where the
 per-sequence curve above meets §3's "one load per process" and becomes the number that decides whether `np embed` runs in `npd` or in a
 foreground command.
+
+### The OpenMP A/B, and what an mmap-first load reads (R6d, 2026-10-31)
+
+The row above ended with "R6d's A/B settles whether the self-containment trade is worth its price". It does, on this
+host: **turning OpenMP on changes throughput by at most 0.61 %, never by more than the difference between two processes
+running the *same* build, and it adds a runtime dependency**, so `GGML_OPENMP=OFF` stays — kept because it buys nothing measurable here rather than because the question seemed too
+expensive to ask.
+
+**How the numbers were produced.** The pinned tree (`third_party/llama-cpp.toml`, tarball `51b1e025…`) was configured
+twice with the option set `build.rs` passes and one difference, `-DGGML_OPENMP=OFF` (what we ship) vs `ON`, and built in
+36 s each at `-j8`. Then **one process per measurement**: each run loads the artifact, decodes, prints and exits, so the
+spread below is between processes rather than inside one warm cache. Eight repeats inside a single process — which is
+what the first version of this round reported — is one measurement, not eight, and saying "inside run-to-run noise"
+about it was a defect this round's review caught. Cells were run OFF-then-ON back-to-back so host drift hits both sides
+equally: **5 processes per cell** at the production chunk length, **3** at the near-ceiling length (the long cells are
+~100 s each). Raw evidence is committed beside the probe as
+`crates/np-core/tests/probes/openmp-ab-2026-10-31.log` — the probe's own `SUMMARY` lines, 32 of them. If you
+change the probe, re-run the matrix in its header and commit the log again before quoting a number from this section.
+
+| cell | samples | `GGML_OPENMP=OFF` | `GGML_OPENMP=ON` | difference in throughput | peak memory (process-lifetime high-water) |
+| --- | --- | --- | --- | --- | --- |
+| 403 tokens, warm page cache | 5 processes each | **156.3** tok/s (155.8–156.8) | 156.0 tok/s (155.2–156.6) | -0.19 % — inside the process-to-process spread | high-water 463,684–463,816 vs 463,820–463,992 kB (disjoint ranges, median +180 kB) |
+| 403 tokens, cold page cache | 5 processes each | **155.8** tok/s (155.4–157.2) | 156.0 tok/s (155.6–156.8) | +0.13 % — inside the process-to-process spread | high-water 463,628–463,860 vs 463,844–464,048 kB (overlapping ranges, median +188 kB) |
+| 7,992 tokens, cold page cache | 3 processes each | **81.4** tok/s (81.2–81.8) | 80.9 tok/s (80.7–81.7) | -0.61 % — inside the process-to-process spread | high-water 1,500,724–1,500,792 vs 1,500,996–1,501,060 kB (disjoint ranges, median +224 kB) |
+| 7,992 tokens, warm page cache | 3 processes each | **81.5** tok/s (81.2–81.5) | 81.1 tok/s (81.1–81.7) | -0.49 % — inside the process-to-process spread | high-water 1,500,660–1,500,912 vs 1,501,140–1,501,204 kB (disjoint ranges, median +292 kB) |
+
+**Why they look alike, measured rather than inferred.** In every one of the 32 processes this probe's own
+`utime + stime` says **396–400 % of one core** during the decode window — four cores' worth of work in flight, whichever
+build ran — and llama.cpp reports `n_threads=4 n_threads_batch=4` in both configurations. The kernel's thread count *does*
+differ (1 vs 4 threads sampled after the last decode), because libgomp keeps its team alive between parallel regions
+while ggml builds a pool per graph plan and tears it down; that is scheduling bookkeeping, not
+extra work. So the flag decides *who owns* the threads, not how many cores turn — which is why §14's older 392 % CPU
+figure never moved.
+
+**What this does not say.** One Linux host (16 CPUs, 7,419 MB), one Q8_0 artifact, and llama.cpp's default thread count.
+It cannot say OpenMP is worthless on a many-core or NUMA machine, on another quantisation or architecture, or on Windows
+— where the feature does not build at all (F18). It also compares two *build configurations*, not "the flag in
+isolation": the ON side differs in compiler flags, in link dependencies (`-fopenmp`, libgomp mapped at runtime) and in
+wait strategy. **What would change the decision:** the same A/B at `n_threads` ∈ {1, 2, 4, nproc} showing >≈10 % at both
+lengths with tolerable RSS; CPU or latency evidence that ggml's pool loses to libgomp on many-core/NUMA/Windows; a corpus
+run showing per-decode drift or spin-burn; or a llama.cpp upgrade tying `n_threads_batch` to the OpenMP path.
+
+**The one thing ON does cost, measurably.** Peak memory. At 403 tokens the ON high-water mark sits **+180 to +188 kB**
+above OFF's median in both page-cache states, and at 7,992 tokens **+224 to +292 kB**; the two builds' ranges do not
+overlap in three of the four cells. Small, but it is a real cost sitting next to no measurable gain — which is the honest
+form of "the price is zero": ON buys nothing here and charges a dependency plus a few hundred kB.
+
+**An mmap-first load pulls the whole artifact through the kernel.** The same runs compare `posix_fadvise(DONTNEED)` on
+the artifact against a warm page cache, reading `/proc/self/io`'s `read_bytes` across the load:
+
+```
+LOAD IO    read_bytes_delta = 0 bytes (warm)
+LOAD IO    read_bytes_delta = 309,858,304 bytes (evicted) — the same figure in every cold process
+           file on disk = 309,855,456 bytes; llama_model_size = 294,064,224 bytes of tensors
+LOAD       0.35 s OFF / 0.34 s ON warm, 0.44 s / 0.44 s cold   — the same in both build configurations
+```
+
+So `use_mmap` (llama.cpp's default) does not spare us the file: first use takes every byte of it and then some —
+309,858,304 exceeds the file by 2,848 B because that counter is page-granular and reads ahead. The cost is the
+cold-minus-warm load difference, **≈ 0.09 s**, and it is an *upper bound* on the read alone: the measured window also
+builds the context. Against the **11.32 s** our own `sha256_file` spends over the same bytes (R6d, §9) that is about
+**126× — two orders of magnitude**, not three, which an earlier draft of this section got wrong. Either way the
+conclusion for D12 stands and is now unblocked: reading the artifact is cheap, hashing it in a userspace loop at 26 MiB/s
+is what costs, so verify-on-change has no measured downside left to wait for.
+
+**Reconciling the two peak-RSS figures at the ceiling.** This section says 1,500,660–1,501,204 kB for a 7,992-token decode
+through the C probe; §9 and `todo.md` say **1,525,500 KiB** for the same length through `local_window.rs`. Both are right
+and they are not the same measurement: the Rust path dresses the text with its prefix, runs our pooling and L2
+normalisation, and carries a Rust runtime, so it peaks ~24 MiB higher. Quote the harness beside the number; the shape — roughly +1 GiB above the 387 MB the load alone touches, only for notes near the ceiling — is what
+both are telling you.
 
 ### What this decides about §5's amendments
 
