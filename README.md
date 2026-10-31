@@ -24,7 +24,7 @@ exist. That is the next round (see below).
 | `np models install <workspace> --id … --path … --dim … --sha256 …` | Put a model artifact under the workspace's model directory, verifying the digest before and after |
 | `np models hash <file>` | Print the SHA-256 of a file, in the format `install` expects |
 | `np models list <workspace>` | Show each model row and whether its artifact is actually present and matches |
-| `np embed <workspace>` | Embed what is owed for the configured model and write it to the database, after checking the artifact against its recorded digest; `--json` reports the same four labelled outcomes this command exits with |
+| `np embed <workspace>` | Embed what is owed for the configured model and write it to the database — a `local-model` build first checks the artifact against its recorded digest; `--json` reports the same four labelled outcomes this command exits with |
 
 Refusals are deliberate: an unreadable note is reported and left alone, never repaired; an install whose digest does not
 match is refused before a byte is copied; an artifact that disagrees with its own row is reported, not overwritten.

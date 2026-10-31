@@ -267,15 +267,16 @@ fn a_row_without_a_digest_verifies_nothing_and_stamps_nothing() {
         verify_artifact(&db, &row, &path).expect("nothing to verify is not a failure"),
         ArtifactCheck::NothingToVerify
     );
-    assert_eq!(
-        (row.verified_size, row.verified_mtime),
-        (None, None),
-        "and the run that verified nothing writes no stamp"
-    );
+    // Read the row back rather than trusting `row`: the value handed to `verify_artifact` is a snapshot from before
+    // the call and would read (None, None) no matter what this run wrote.
     let reread = db::model_row(&db, "endpoint-ish")
         .expect("read")
         .expect("present");
-    assert_eq!((reread.verified_size, reread.verified_mtime), (None, None));
+    assert_eq!(
+        (reread.verified_size, reread.verified_mtime),
+        (None, None),
+        "the run that verified nothing writes no stamp"
+    );
 }
 
 /// `sha256` is a plain TEXT column a human can edit; `2A88…` and `2a88…` are the same digest. Refusing on case would
@@ -324,6 +325,89 @@ fn a_half_stamp_reads_as_no_stamp_and_forces_a_hash() {
     assert!(
         fx.row().verified_mtime.is_some(),
         "and the run re-writes the pair it found incomplete"
+    );
+}
+
+/// A stamp write can fail — another process holds the index past the busy timeout, or the row was removed under us by
+/// `np models remove`. The bytes matched, so the embed must go ahead; what it may **not** do is report `VerifiedNow`,
+/// which promises the next run gets to skip the hash. It also may not arrive as `ArtifactUnreadable`: this file was
+/// just read and proved.
+#[test]
+fn a_matched_artifact_that_cannot_be_stamped_reports_the_hash_without_the_stamp() {
+    let bytes = b"verified bytes, unwritable index".to_vec();
+    let digest = sha256_bytes(&bytes);
+    let fx = Fixture::new("artifact", &bytes, &digest);
+
+    // The blunt way to make the write fail without touching production code: delete the table the stamp goes into.
+    // `verify_artifact` has already read its row by this point, so only the write can notice.
+    let check = {
+        let db = &fx.db;
+        let row = fx.row();
+        db.0.execute("DROP TABLE models", [])
+            .expect("test setup: remove the stamp's table");
+        verify_artifact(db, &row, &fx.path).expect("a matched artifact is still embeddable")
+    };
+
+    match check {
+        ArtifactCheck::VerifiedUnstampable {
+            bytes: n,
+            ref reason,
+        } => {
+            assert_eq!(n, bytes.len() as u64);
+            assert!(
+                reason.contains("could not be written"),
+                "the reason has to name the stamp, not the file: {reason}"
+            );
+        }
+        other => panic!("a run that recorded nothing may not claim otherwise: {other:?}"),
+    }
+    assert!(
+        check.label().contains("no stamp recorded"),
+        "and the report says so where the reader will see why the next run is slow again: {}",
+        check.label()
+    );
+}
+
+/// A file whose mtime cannot be turned into a whole second since the epoch has nothing to stamp, so this run hashes and
+/// says the stamp did not travel. Reporting `VerifiedNow` here would be the exact failure mode the type exists to
+/// avoid: the next run would have no stamp to compare, hash again anyway, and every report along the way would have
+/// claimed the bytes were freshly checked *and recorded*.
+#[test]
+fn an_artifact_with_no_representable_mtime_verifies_without_stamping() {
+    let bytes = b"restored from a 1960s backup".to_vec();
+    let digest = sha256_bytes(&bytes);
+    let fx = Fixture::new("artifact", &bytes, &digest);
+
+    // Before the epoch: `metadata::modified()` answers, `duration_since(UNIX_EPOCH)` does not. Whether a filesystem
+    // accepts such an mtime is a fact about this host, so the case reports rather than assumes: if `set_modified`
+    // refuses it, the test says which half could not be built here.
+    let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(86_400);
+    match File::open(&fx.path)
+        .expect("open")
+        .set_modified(before_epoch)
+    {
+        Ok(()) => {}
+        Err(err) => panic!(
+            "this filesystem refuses a pre-epoch mtime ({err}); the guard it would exercise is \
+             `verify_artifact`'s `mtime: None` arm, which then has no coverage here"
+        ),
+    }
+
+    let check = verify(&fx).expect("the bytes still match their row");
+    match check {
+        ArtifactCheck::VerifiedUnstampable {
+            bytes: n,
+            ref reason,
+        } => {
+            assert_eq!(n, bytes.len() as u64);
+            assert!(reason.contains("modification time"), "{reason}");
+        }
+        other => panic!("no stamp was possible, so none may be claimed: {other:?}"),
+    }
+    assert_eq!(
+        fx.stamp(),
+        (None, None),
+        "and the database really does not hold a stamp this run could not have written"
     );
 }
 

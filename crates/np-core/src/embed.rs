@@ -134,13 +134,26 @@ impl Vector {
 /// anyone who can rewrite the artifact can also set its mtime, and a swap at identical size inside the same second is
 /// invisible to it. `np models install` is where a digest is first established against bytes it read; this is the cheap
 /// follow-up that notices change afterwards. Saying the weaker thing is the point of this type's name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactCheck {
-    /// The file was hashed this run and matched its row; the stamp went with it.
+    /// The file was hashed this run, matched its row, **and** the stamp was rewritten to describe those bytes — so the
+    /// next run can skip the hash. A match without a stamp is [`Self::VerifiedUnstampable`], never this arm.
     VerifiedNow {
         /// Bytes read while hashing.
         bytes: u64,
+    },
+    /// Hashed and matched, but this run could not record which bytes it covered, so the next run will read the file
+    /// again. Two ways to get here, both named in `reason`: a filesystem that will not answer `modified()` (nothing
+    /// to compare next time), or a stamp write that failed — the database being busy, typically. Neither is a reason
+    /// to refuse an embed whose bytes just proved themselves correct, and neither may be reported as a stamp: a run
+    /// that recorded nothing must not give the next run a reason to skip hashing.
+    VerifiedUnstampable {
+        /// Bytes read while hashing.
+        bytes: u64,
+        /// Why no stamp was written, in the OS's or SQLite's own words. Safe to print: it names a filesystem or
+        /// database condition, never note content.
+        reason: String,
     },
     /// Size and mtime match the stamp the last verification left, so no hash was computed.
     UnchangedSinceStamp {
@@ -165,6 +178,10 @@ impl ArtifactCheck {
             Self::VerifiedNow { bytes } => {
                 format!("re-checked against models.sha256: ok ({})", size_human(*bytes))
             }
+            Self::VerifiedUnstampable { bytes, reason } => format!(
+                "re-checked against models.sha256: ok ({}); no stamp recorded ({reason}), so the next run reads it again",
+                size_human(*bytes)
+            ),
             Self::UnchangedSinceStamp { bytes } => format!(
                 "not re-read: same size and mtime as the last check ({}); detects changed bytes, not a crafted mtime",
                 size_human(*bytes)
@@ -291,8 +308,11 @@ pub enum EmbedError {
     ///
     /// Not folded into [`crate::models::ModelError::Artifact`], which is the reuse §3's "existing
     /// `ModelError`" line invites: that variant's message says the artifact could not be read **to compare
-    /// it with its row**, and this provider compares nothing *today* — see [`LocalModelProvider::new`] for the
-    /// digest check that is R6b0/R6b1's to take, and which would make this the right variant to reuse. Claiming
+    /// it with its row**, and the two callers of *this* variant only stat the file — [`LocalModelProvider::new`] and
+    /// [`crate::embed::artifact_is_readable`] never hash. The comparison exists now, in
+    /// `local_model::verify_artifact` (behind `local-model`, D12), and it raises
+    /// [`EmbedError::ArtifactDigestMismatch`] rather than borrowing this variant: an unreadable file and a file that
+    /// disagrees are different facts and the remedies differ. Claiming
     /// an operation that did not happen is the defect `models.rs` refuses on its own
     /// [`crate::models::ArtifactState::Mismatch`]. Naming the path is safe: a data-dir file, never note
     /// text and never a vault path.
@@ -364,7 +384,8 @@ pub enum EmbedError {
     /// writing a vector.
     ///
     /// Raised by `local_model::verify_artifact` (behind the `local-model` feature) — D12's verify-on-change, reached
-    /// only when the file's size or mtime moved since the last verified read. An unchanged file is not re-hashed, and
+    /// whenever a hash is taken and disagrees: bytes that moved since the last verified read, or a row with no stamp
+    /// yet (one written before this build existed, or a half stamp). An unchanged, stamped file is not re-hashed, and
     /// that skip is what makes the check cheap enough to run on every embed (§14: 11.32 s to hash this artifact against
     /// ~0.09 s for llama.cpp's first pass over the same bytes).
     ///
@@ -568,24 +589,29 @@ impl LocalModelProvider {
     /// disagreement would spend an operation learning what the row already said — the same ordering argument
     /// that makes [`crate::models::install`] validate the digest *format* before hashing anything.
     ///
-    /// **Digest verification is an open, costed decision and this constructor does not make it.** Nothing here
-    /// compares the file against `models.sha256`: construction stats one path. The case for hashing is strong —
-    /// `docs/design-m2-models-install.md` states as a safety property that "nothing embeds against a mismatching
-    /// row", and no code path currently enforces that — and the cost is smaller than it looks *if* §3's "one load
-    /// per process, never per note" holds, because then it is one streaming SHA-256 pass over ~310 MB per `np embed`
-    /// run, which [`crate::hash::sha256_file`] already does for `np models list`. It stays unmade in R6a because the
-    /// install design assigned it ("re-verifying on every embed is 4b's cost decision") and because whether an
-    /// mmap-first runtime even reads the whole file is a measurement (R6d), not an assumption. **R6b0/R6b1 owns it**,
-    /// and when it lands it refuses with both digests in [`crate::models::ModelError::ArtifactDisagrees`]'s shape —
-    /// never repairing, and never treating the check as the only thing standing between a row and a write.
+    /// **Digest verification was an open, costed decision; this constructor still does not make it.** Nothing here
+    /// compares the file against `models.sha256`: construction stats one path. The case for hashing was always strong —
+    /// `docs/design-m2-models-install.md` states as a safety property that "nothing embeds against a mismatching row",
+    /// which install alone does not enforce, since it proves the bytes once and never again — and R6d measured the cost
+    /// of closing it the obvious way: one streaming SHA-256 pass over this artifact is **11.32 s** (§9), against ~0.09 s
+    /// for llama.cpp to page in every byte (§14). D12 closed the decision on those numbers, in
+    /// `local_model::verify_artifact` (behind `local-model`): verify on change, stamp what you hashed, refuse with both
+    /// digests when they disagree.
+    ///
+    /// It is not here because construction is the wrong place for it twice over. A provider is resolved before anyone
+    /// knows whether the workspace owes a single chunk (R6c2's laziness argument, §14), so hashing at construction
+    /// would spend 11 s on runs that write nothing; and this constructor serves both provider shapes and a default
+    /// build, while the digest rule belongs to the runtime that will read the bytes. What stays true in every build is
+    /// the ordering: stat first, refuse cheaply, never repair.
     ///
     /// Related reality, recorded rather than papered over: a row whose `sha256` is `NULL`
     /// ([`crate::models::ArtifactState::NoArtifactExpected`], "a provider with no local weights") has **no digest to
-    /// verify against ever**, so it can never be attested by that check either. Construction today does not look at
-    /// `sha256` at all, so such a row builds a provider whenever some file happens to sit where the caller pointed —
-    /// unattested bytes, accepted because a path resolved. That is a caller error, not a serviceable state: a model
-    /// with no weights is spelled `provider = "none"`, and the NULL-sha fixture in `tests/embed.rs` pins the
-    /// behaviour so the future digest check cannot quietly become the only fence.
+    /// verify against ever**, so it can never be attested by that check either: `verify_artifact` answers
+    /// [`ArtifactCheck::NothingToVerify`] and says so in the report rather than inventing a pass. Construction does not
+    /// look at `sha256` at all, so such a row builds a provider whenever some file happens to sit where the caller
+    /// pointed — unattested bytes, accepted because a path resolved. That is a caller error, not a serviceable state: a
+    /// model with no weights is spelled `provider = "none"`, and the NULL-sha fixture in `tests/embed.rs` pins the
+    /// behaviour so the digest check cannot quietly become the only fence.
     pub fn new(row: &ModelRow, artifact: &Path, configured: usize) -> Result<Self, EmbedError> {
         let dim = match usize::try_from(row.dim) {
             Ok(dim) if dim == configured => dim,

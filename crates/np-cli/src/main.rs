@@ -445,7 +445,7 @@ fn print_embed_summary(report: &EmbedReport) {
     // Printed after §7's standing caveat because the two answer different questions: that one asks whether these
     // *vectors* were checked against a reference implementation, this one asks whether the model's *bytes* were.
     // Omitted entirely when no local artifact was involved — silence is the truthful report there, not "verified".
-    if let Some(check) = report.artifact_check {
+    if let Some(check) = &report.artifact_check {
         let _ = writeln!(out, "digest     {}", check.label());
     }
 }

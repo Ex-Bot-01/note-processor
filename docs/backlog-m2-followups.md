@@ -608,7 +608,8 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   it are worth keeping near the closure: migration 8's columns are **not backfilled** (an old row pays one hash rather
   than inheriting credit it never earned), and `np models install` deliberately does **not** stamp on its
   `AlreadyInstalled` path, because §7 case 5 promises a repeated install rewrites no column. Full reasoning, the report
-  wording and where each rule is tested: `docs/design-m2-local-embeddings.md` §7's verify-on-change subsection.
+  wording, the fourth report arm (`VerifiedUnstampable`, so a run that recorded nothing never claims it did) and where
+  each rule is tested: `docs/design-m2-local-embeddings.md` §7's verify-on-change subsection.
 - **D13 — llama.cpp defaults to 4 threads on a 16-CPU host; nobody has measured what raising it buys.**
   R6d's OpenMP A/B (2026-10-31) found both build configurations printing `n_threads=4 n_threads_batch=4` from
   `llama_context_default_params()`, which is why the flag moved no throughput at all: ggml's own pthread pool and an

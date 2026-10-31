@@ -429,9 +429,14 @@ not free, and "never re-hash" was not honest.
 before `embed_run` reads a note:
 
 - `models.sha256` is NULL → **nothing to verify**, said out loud rather than folded into a pass;
-- the file's size and whole-second mtime equal the stamp the last verification left → **no hash is read at all**;
-- otherwise (no stamp, either half moved, a row written before this build) → hash the file. A match rewrites the stamp;
-  a mismatch is `EmbedError::ArtifactDigestMismatch`, naming both digests and writing nothing.
+- the file's size and whole-second mtime equal the stamp the last verification left → **no hash is read at all**
+  (`UnchangedSinceStamp`);
+- otherwise (no stamp, either half moved, a row written before this build) → hash the file. A match rewrites the stamp
+  (`VerifiedNow`) — or says plainly that it could not (`VerifiedUnstampable`: no readable mtime, or the index refused
+  the write), because a run that recorded nothing must not hand the next run a reason to skip hashing, and a stamp
+  write that failed is not a claim that the file "could not be read". Neither fails an embed whose bytes just matched;
+  if the index really is unwritable, `embed_run` reports that at the write it could not do. A digest mismatch is
+  `EmbedError::ArtifactDigestMismatch`, naming both digests and writing nothing.
 
 The stamp lives in two nullable columns on `models` (migration 8), **not backfilled**: an existing row pays one full
 hash on its next embed rather than being credited with a check it never ran. A filesystem that will not answer
@@ -453,12 +458,19 @@ disk, so it *could* leave a stamp and save the next embed one hash. It does not:
 declaration rewrites nothing, tested by comparing the whole row before and after. Trading that contract for 11 s saved
 once is a bad trade, and verification at use time is where the bytes are about to be trusted anyway.
 
-**Where it is pinned.** `crates/np-core/tests/artifact_verify.rs` (8 cases on a few hundred fixture bytes — no artifact
-needed, so they run for real on a CI runner with no model file), including the two cases that keep the prose honest: a
-same-size same-mtime rewrite **passing**, and an uppercase row digest still matching. Through the binary,
+**Where it is pinned.** `crates/np-core/tests/artifact_verify.rs` — ten cases on a few hundred fixture bytes, no
+artifact needed, so all ten run for real on a CI runner with no model file and print no `NOT COVERAGE`; the set includes
+the two that keep the prose honest (a same-size same-mtime rewrite **passing**, an uppercase row digest still matching)
+and the two unstampable arms (dropped table, pre-epoch mtime). Through the binary,
 `a_swapped_artifact_is_refused_before_anything_is_embedded` checks exit status, both digests in the sentence, no vectors
 written and no stamp left behind (mutation-checked: neutering the digest comparison fails it), and the real-model case
-asserts the first run says *re-checked* and the second says *not re-read*.
+asserts the first run says *re-checked*, the second says *not re-read*, and `--json` carries the skip as a populated
+`unchanged-since-stamp` object with the file's size.
+
+**What CI can and cannot show for those two binary cases.** Both need `NP_TEST_MODEL_PATH` and GitHub has no artifact,
+so on a runner each prints its `NOT COVERAGE` line and passes having done nothing — the same honest gap §7 has always
+had about real-model work, recorded here rather than left to be discovered. What CI *does* run for D12 is all ten
+`artifact_verify` cases, which is why they were written against fixture bytes instead of the 309.9 MB artifact.
 
 ## 8. The benchmark, which is the point of the round
 

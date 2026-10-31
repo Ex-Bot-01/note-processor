@@ -1917,8 +1917,9 @@ mod real_model {
     ///
     /// Written by hand because `np models install` copies, and the point of the link is that `embed` resolves the
     /// workspace's own path to a file it did not write — which is also what a user who placed an artifact there
-    /// themselves gets. The digest is the real one so the row tells the truth even though nothing verifies it yet
-    /// (the open cost decision in `LocalModelProvider::new`'s doc).
+    /// themselves gets. The digest is the real one because `np embed` now checks it: D12's verify-on-change hashes the
+    /// artifact on the first run after install and refuses if it disagrees, so a row that lied here would fail the very
+    /// case it belongs to.
     fn link_artifact(ws: &Workspace, artifact: &Path, prefix_doc: &str) {
         fs::create_dir_all(ws.models_dir()).expect("test setup: models dir");
         let link = ws.models_dir().join(EMBED_MODEL);
@@ -2090,6 +2091,23 @@ mod real_model {
         assert!(
             second_digest.contains("not re-read") && second_digest.contains("same size and mtime"),
             "a run that skipped the hash has to admit it skipped:\n{second_digest}"
+        );
+
+        // The same fact in `--json`, as a **populated** object. Every other case in this file can only show the key
+        // null or absent, which serde reports identically through `Value::is_null`; here the tag and its field are
+        // pinned against the artifact's own size, so a renamed arm or a dropped `bytes` fails somewhere real.
+        let third = run(&mut ws.command(&["embed", "--json"]));
+        third.assert_success();
+        let report: serde_json::Value =
+            serde_json::from_str(&third.stdout()).expect("`--json` must print one JSON object");
+        let on_disk = fs::metadata(&artifact)
+            .expect("the artifact is still there")
+            .len();
+        assert_eq!(
+            report["artifact_check"]["unchanged-since-stamp"]["bytes"].as_u64(),
+            Some(on_disk),
+            "`--json` has to carry the skip with the file's size:\n{}",
+            third.stdout()
         );
 
         // §3's rule about prefixes turning into lies, measured on real numbers — and the measurement is what found
