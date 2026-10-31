@@ -293,7 +293,10 @@ impl LoadedModel {
         text: &str,
         budget: usize,
     ) -> Result<Vector, EmbedError> {
-        let joined = format!("{prefix}{text}");
+        // One spelling of the dressing rule for the whole crate (R6c2 review P2-1): `model_inputs` declares these
+        // bytes to the writer, which stamps them, so the string the model is *read on* has to come from the same
+        // function rather than a second `format!` that can drift.
+        let joined = crate::embed::prefixed(prefix, text);
         // The budget goes to `tokenize` as well as being checked here: llama.cpp names the exact buffer it needs,
         // so an over-budget note is refused before a single token slot is allocated rather than after.
         let mut tokens = self.tokenize(&joined, budget)?;

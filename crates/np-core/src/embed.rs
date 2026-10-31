@@ -463,11 +463,14 @@ pub fn artifact_is_readable(artifact: &Path) -> Result<(), EmbedError> {
 
 /// The one spelling of "the bytes the model is handed": `prefix` then `text`, verbatim, nothing between.
 ///
-/// R6c1 review D-4: this rule used to be written twice — here and as a local `format!` in
-/// [`crate::embed_run`] — which is how a stamp rule quietly stops describing what the model read. Both callers go
-/// through this function now, so a change to the prefix rule is one edit and both the digest and the batch move
-/// together. Mutating the concatenation here fails `every_text_in_a_batch_travels_with_its_own_prefix` and
-/// `a_changed_prefix_makes_a_stored_vector_stale` (measured: 17 passed / 2 failed).
+/// **Every dressing of a chunk for a model goes through this one function.** R6c1's D-4 removed the copy in
+/// [`crate::embed_run`] (which now asks [`Embedder::model_inputs` instead of guessing); R6c2 review P2-1 removed the
+/// last one inside `local_model::LoadedModel::embed_text`, which had its own `format!`. That is how a stamp rule
+/// quietly stops describing what the model read: two spellings, one edit.
+///
+/// Mutating the concatenation here fails `every_text_in_a_batch_travels_with_its_own_prefix` and
+/// `a_changed_prefix_makes_a_stored_vector_stale` (measured: 17 passed / 2 failed), and the artifact-gated
+/// `both_provider_shapes_declare_the_same_bytes_for_the_model` keeps the two provider shapes agreeing.
 pub fn prefixed(prefix: &str, text: &str) -> String {
     format!("{prefix}{text}")
 }
