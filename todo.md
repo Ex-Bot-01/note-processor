@@ -208,6 +208,18 @@ what fails is not a check, because removal makes tests pass.
   §7 assertions that no fake can stand in for: batch invariance under a **non-empty** `prefix_doc` (§5 left that pairing
   untested on purpose), unit norms, and the accept-at-exactly-`window` boundary. Blocked on nothing but a window that can hold
   the work — the last five subagent rounds died at their deadlines.
+* **R6c2 — wire the runtime that already works into the provider that refuses.** ✅ *wired 2026-10-31, branch
+  `m15/runtime-wiring`* — `np-cli` resolves `local-model` to `local_model::LazyLocalEmbedder`, which loads llama.cpp on
+  the first batch (identity answers come from the row, so an up-to-date workspace pays nothing) and mirrors a failed
+  load so every batch refuses for the same typed reason. Measured against the real artifact through argv: 768 × float-32
+  per row, ‖v‖ = 1 within 1e-3, second run `embedded 0 / current N`, prefix edit re-embeds everything — **but** the
+  mutation that was supposed to prove the last claim refused to die, and the reason is a **P1**: `embed_run` prepends
+  `prefix_doc` before stamping and calling `embed`, and `LoadedModel::embed_text` prepends it again, so documents reach
+  llama.cpp prefixed twice and the token budget counts the doubled sequence. Both halves were right alone; nothing
+  tested the pair. Written up with the two ways out in
+  `.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/r6c2-findings.md`. **Do not index a corpus until it is
+  settled.** Next: the seam decision (`Embedder::model_inputs` so the provider answers what the model will read —
+  recommended — or the caller owns prefixing outright), then R6d.
 * **R6d — corpus-scale benchmark**, batching across texts (deliberately absent from this API), and the accept-at-exactly-
   `window` assertion, which belongs in artifact-gated coverage rather than in CI.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its
