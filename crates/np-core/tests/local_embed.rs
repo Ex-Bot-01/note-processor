@@ -451,10 +451,11 @@ mod embedding {
     /// *accepted*. The refusal side is pinned to one token above; the accepting side at the boundary would cost a
     /// ~90-second decode of a synthetic window-length note (8,192 tokens measured 2026-10-30: 7,999 tokens in 101 s)
     /// on every run of this file, so it is left to R6d's benchmark,
-    /// which decodes at those lengths anyway. A `>=` mutant on the window arm therefore survives today — and since the
-    /// ceiling now equals the window, it would refuse a chunk no chunker produces (`MAX_CHUNK_BYTES = 1800` is roughly
-    /// 500 tokens), which is why this is recorded rather than paid for. What it does prove is that the refusal exists, fires at the right threshold, and
-    /// names the window rather than the budget.
+    /// which decodes at those lengths anyway. **R6d paid it**: `tests/local_window.rs` accepts exactly `window` tokens and
+    /// refuses `window + 1`, so both `>` comparisons in `embed_text` now die on a mutation (`n >= budget` and
+    /// `n >= window` each turn the acceptance into a refusal naming its own rule, measured in 1.5 s because a refusal
+    /// never reaches the decode). What this case still owns is the *over*-window side: that a refusal exists above the
+    /// edge, fires before `llama_decode`, and names the window rather than the budget.
     #[test]
     fn over_the_window_is_refused_before_the_runtime_decides() {
         let path = artifact_or_not_coverage!();

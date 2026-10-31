@@ -128,7 +128,8 @@ jobs:
           set +e
           set -uo pipefail
           cargo test --locked -p np-core --features local-model --lib --test local_runtime \
-            --test local_load --test local_embed -- --nocapture 2>&1 | tee /tmp/feature-tests.log
+            --test local_load --test local_embed --test local_window -- --nocapture 2>&1 \
+            | tee /tmp/feature-tests.log
           status=${PIPESTATUS[0]}
           count=$(grep -c 'NOT COVERAGE' /tmp/feature-tests.log)
           echo "NOT COVERAGE occurrences: $count"
@@ -136,12 +137,14 @@ jobs:
             echo "the feature test row failed (exit $status); the count above is context, not the verdict" >&2
             exit "$status"
           fi
-          # The step asserts something about the number it exists to print (A2 review P2-4). Twelve cases in
-          # local_embed plus four of seven in local_load print this line when no artifact is configured; a smaller
-          # total means the prints stopped reaching the log - `--nocapture` lost, or a case silently became a real pass
-          # with no artifact - and "compiled, never ran" would be back to being implied rather than stated.
-          if [ "$count" -lt 16 ]; then
-            echo "expected at least 16 NOT COVERAGE lines with no artifact, saw $count: §2 step 4 is not on the record" >&2
+          # The step asserts something about the number it exists to print (A2 review P2-4). Measured on 2026-10-31
+          # with no artifact configured, this command prints **20**: thirteen in local_embed (twelve since R6b2 plus
+          # R6c2's provider-shape case), four of seven in local_load, three in local_window. `local_runtime` prints
+          # none because it cannot skip - it is the row that proves the seam refuses without a runtime. A smaller
+          # total means the prints stopped reaching the log - `--nocapture` lost, or a case silently became a real
+          # pass with no artifact - and "compiled, never ran" would be implied rather than stated again.
+          if [ "$count" -lt 20 ]; then
+            echo "expected at least 20 NOT COVERAGE lines with no artifact, saw $count: §2 step 4 is not on the record" >&2
             exit 1
           fi
       # "A green run means llama.cpp was called" is only worth saying if the run can also say *which* llama.cpp.

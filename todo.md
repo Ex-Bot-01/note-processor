@@ -223,7 +223,17 @@ what fails is not a check, because removal makes tests pass.
   provider declares undressed inputs → staleness fails; the two declarations drift → new artifact-gated case in
   `local_embed.rs`). Real-artifact numbers after the fix: cos(same) 1.000000 vs cos(changed prefix) **0.895576**, one
   instruction applied, `local_embed` 13 passed (148 s). Next: R6d's corpus benchmark.
-* **R6d — corpus-scale benchmark**, batching across texts (deliberately absent from this API), and the accept-at-exactly-
-  `window` assertion, which belongs in artifact-gated coverage rather than in CI.
+* **R6d — benchmark round.** *partly done 2026-10-31, branch `m16/corpus-benchmark`*: `crates/np-core/tests/local_window.rs`
+  (3 artifact-gated cases, all printing `NOT COVERAGE` without the file). Measured on this host against the pinned Q8_0:
+  a `MAX_CHUNK_BYTES` chunk is **403 tokens in 2.61 s** (**155 tok/s**, ~3× §5's interpolated figure, which was drawn
+  between much longer probe points); one near-ceiling chunk of **7,992 tokens** takes **98.6 s** at peak RSS
+  **1,525,500 KiB**; the exact window edge is real — **8,192 tokens accepted in 100.1 s**, **8,193 refused before any
+  decode**. That last one closes Scope B's P2-12, the surviving mutant `local_embed.rs` had recorded rather than paid
+  for: mutating either `>` in `embed_text` (`n >= budget`, `n >= window`) now turns the acceptance into a refusal naming
+  its own rule, and dies in 1.5 s because a refusal never reaches the decode. Also measured for D12: verifying this
+  artifact by digest costs **11.32 s** per pass (26 MiB/s), which is why "re-hash on every embed" needs a decision
+  rather than a reflex. Still open in R6d: the **OpenMP A/B** (`GGML_OPENMP=ON` vs the pinned `OFF`, at default and
+  near-ceiling lengths, RSS included) and whether an mmap-first load reads all 865 MB — both need two llama.cpp builds,
+  so they are their own round. Batching across texts stays out of the API until that A/B says what a batch is worth.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its
   exit codes are the evidence; nothing here is claimed on CI's behalf.
