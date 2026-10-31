@@ -190,6 +190,16 @@ pub struct EmbedReport {
     /// [`CAVEAT`], carried on the report so `--json` and the text summary cannot disagree about whether this
     /// run verified anything.
     pub verification: &'static str,
+    /// What was concluded about the **model artifact's bytes** before this run wrote anything, or `None` when no
+    /// local artifact was involved.
+    ///
+    /// Set by the caller that performed the check — `local_model::verify_artifact` (feature `local-model`) today, called from
+    /// `np embed` — rather than discovered here: `embed_run` is handed a provider and cannot know whether its bytes
+    /// were hashed a moment ago. Every constructor leaves it `None`, which is the truthful default: a run that never
+    /// verified has no verification to report, and a caller that checked and left this unset is understating itself
+    /// rather than overstating. It is a field and not a parameter for the same reason the report is one object: the
+    /// text summary and `--json` must not be able to disagree about it.
+    pub artifact_check: Option<crate::embed::ArtifactCheck>,
 }
 
 impl EmbedReport {
@@ -210,6 +220,7 @@ impl EmbedReport {
             busy_gap: 0,
             errors: 0,
             verification: CAVEAT,
+            artifact_check: None,
         }
     }
 }
@@ -490,6 +501,7 @@ fn run(
             busy_gap: 0,
             errors,
             verification: CAVEAT,
+            artifact_check: None,
         });
     }
 
@@ -519,6 +531,7 @@ fn run(
                 busy_gap: 0,
                 errors,
                 verification: CAVEAT,
+                artifact_check: None,
             });
         }
     };
@@ -634,6 +647,7 @@ fn run(
         busy_gap,
         errors,
         verification: CAVEAT,
+        artifact_check: None,
     })
 }
 

@@ -88,6 +88,9 @@ mod embedding {
             prefix_doc: prefix_doc.to_string(),
             prefix_query: prefix_query.to_string(),
             installed_at: 0,
+            // No verification has run in this fixture, which is what `None` means on both columns.
+            verified_size: None,
+            verified_mtime: None,
         }
     }
 

@@ -18,9 +18,10 @@ use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_
 use np_core::chunk::Chunk;
 use np_core::config::Config;
 use np_core::db::{
-    apply_move, chunk_digest, chunk_state, delete_vectors_for_chunk, mark_stale, note_counts,
-    upsert_file, upsert_vector, write_chunks_for_note, ChunkWrite, Db, DbError, Migration,
-    NoteCounts, FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY, PATHS_LOSSY_KEY,
+    apply_move, chunk_digest, chunk_state, delete_vectors_for_chunk, mark_stale, model_row,
+    note_counts, record_artifact_stamp, upsert_file, upsert_vector, write_chunks_for_note,
+    ChunkWrite, Db, DbError, Migration, NoteCounts, FK_ORPHANS_KEY, MIGRATIONS, NOTE_MERGE_KEY,
+    PATHS_LOSSY_KEY,
 };
 use np_core::hash::{sha256_file, Snapshot};
 use np_core::path_keys::RelPath;
@@ -249,8 +250,11 @@ fn the_schema_is_what_the_plan_mandates() {
         // Migration 7's three tables, pinned by the same argument as the rest: the chunker writes them and the
         // provider reads them column by column, so a rename here has to break that code rather than merely differ.
         (
+            // Migration 8 appended the two verification-stamp columns at the end, which is where `ALTER TABLE
+            // ADD COLUMN` can put them without a rebuild; the six install-time columns keep their order, because
+            // `MODEL_COLUMNS` binds readers by position.
             "models",
-            "id dim sha256 prefix_doc prefix_query installed_at",
+            "id dim sha256 prefix_doc prefix_query installed_at verified_size verified_mtime",
         ),
         (
             "chunks",
@@ -4794,4 +4798,124 @@ fn insert_note_err(db: &Db, rel: &str) -> rusqlite::Error {
         rusqlite::params![rel.as_bytes(), rel],
     )
     .expect_err("an orphan note must fail")
+}
+
+/// A version-seven database — the schema as it stood before migration 8 — written by **replaying** the first seven
+/// [`MIGRATIONS`] entries rather than copying their SQL out. That is a deliberate departure from [`VERSION_TWO`],
+/// which is history and must not move: migrations 3, 4 and 5 are `Code` steps whose work (a table rebuild, a merge
+/// with a receipt) has no SQL spelling to copy, so the only faithful way to reach "the file an older build left
+/// behind" is to run the same steps that did. What this fixture cannot catch is a reordering of `MIGRATIONS` — and
+/// the version-two fixtures above are what pin that history.
+fn seed_version_seven(path: &Path) -> Result<(), DbError> {
+    let conn = rusqlite::Connection::open(path).expect("test setup: open the new file");
+    // The `Code` steps refuse to run with enforcement on, which is exactly how `migrate` hands them over.
+    conn.execute_batch("PRAGMA foreign_keys = OFF")
+        .expect("test setup: enforcement off");
+    conn.execute_batch("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+        .expect("test setup: version table");
+    for (index, step) in MIGRATIONS.iter().enumerate() {
+        match step {
+            Migration::Sql(script) => conn
+                .execute_batch(script)
+                .unwrap_or_else(|e| panic!("migration {} failed: {e}", index + 1)),
+            Migration::Code(func) => func(&conn)?,
+        }
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            rusqlite::params![index as i64 + 1],
+        )
+        .expect("test setup: record the version");
+    }
+    // One installed model row and one note, so the upgrade has something to leave alone.
+    conn.execute_batch(
+        "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+            VALUES (x'612e6d64', x'612e6d64', 'a.md', 'a.md', '/ws/a.md', 'ha', 1, 1, 'ok', 1);
+         INSERT INTO notes (rel_bytes, rel, title) VALUES (x'612e6d64', 'a.md', 'A');
+         INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+            VALUES ('embeddinggemma-2', 768, 'ab', 'doc|', 'query|', 1730000000);",
+    )
+    .expect("test setup: seed a model row");
+    conn.close().expect("test setup: close the fixture");
+    Ok(())
+}
+
+/// Migration 8 upgrades a version-seven file without touching what it finds, and the stamp columns arrive empty.
+///
+/// The NULL is the point: an installed-but-never-reverified row must read as "not yet verified by this build", which
+/// costs its next embed one full digest pass. An upgrade that silently claimed a stamp would let old databases skip a
+/// check they never performed.
+#[test]
+fn a_version_seven_database_upgrades_with_its_model_row_unverified() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = tmp.path().join("ws.sqlite");
+    seed_version_seven(&path).expect("test setup: version-seven file");
+
+    let db = Db::open(&path).expect("opening a version-seven file applies migration 8");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM schema_version"),
+        MIGRATIONS.len() as i64,
+        "no migration is recorded twice"
+    );
+
+    let row = model_row(&db, "embeddinggemma-2")
+        .expect("read the seeded model")
+        .expect("the seeded model survived the upgrade");
+    assert_eq!(row.dim, 768);
+    assert_eq!(row.sha256.as_deref(), Some("ab"));
+    assert_eq!(row.prefix_doc, "doc|");
+    assert_eq!(row.installed_at, 1_730_000_000);
+    assert_eq!(
+        (row.verified_size, row.verified_mtime),
+        (None, None),
+        "an upgrade may not invent a verification stamp"
+    );
+    // And the rest of the file is still there: the migration is two `ADD COLUMN`s, not a rebuild.
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM notes"), 1);
+}
+
+/// The stamp round-trips through the reader, and a half-written pair reads as the two halves it is.
+///
+/// `local_model` treats only a *complete* pair as a reason to skip hashing; that rule lives there and is tested
+/// there. What this pins is the narrower thing the writer promises: both columns move together, an absent row is a
+/// no-op rather than an error, and re-stamping replaces rather than appends.
+#[test]
+fn an_artifact_stamp_round_trips_and_a_half_stamp_stays_a_half_stamp() {
+    // Written out rather than through this file's `insert_model` helper, which stamps a row with `sha256` NULL:
+    // the pair only ever gets recorded for a row that has a digest to be a stamp about.
+    let db = Db::in_memory().expect("in-memory database");
+    db.0.execute(
+        "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+         VALUES ('m', 4, 'aa', 'd|', 'q|', 1)",
+        rusqlite::params![],
+    )
+    .expect("test setup: install a model");
+
+    // Nothing stamped yet.
+    let fresh = model_row(&db, "m").expect("read").expect("present");
+    assert_eq!((fresh.verified_size, fresh.verified_mtime), (None, None));
+
+    record_artifact_stamp(&db, "m", 309_855_456, 1_730_000_500).expect("record the stamp");
+    let stamped = model_row(&db, "m").expect("read").expect("present");
+    assert_eq!(stamped.verified_size, Some(309_855_456));
+    assert_eq!(stamped.verified_mtime, Some(1_730_000_500));
+
+    // Re-verifying replaces the pair; it does not accumulate history nobody reads.
+    record_artifact_stamp(&db, "m", 309_855_456, 1_730_000_900).expect("re-stamp");
+    let restamped = model_row(&db, "m").expect("read").expect("present");
+    assert_eq!(restamped.verified_mtime, Some(1_730_000_900));
+
+    // A half pair is reachable only by someone editing the file by hand; the reader must report what is there
+    // rather than coerce it into a stamp or an error.
+    db.0.prepare("UPDATE models SET verified_mtime = NULL WHERE id = 'm'")
+        .expect("half-stamp the row")
+        .execute(rusqlite::params![])
+        .expect("half-stamp the row");
+    let half = model_row(&db, "m").expect("read").expect("present");
+    assert_eq!(half.verified_size, Some(309_855_456));
+    assert_eq!(half.verified_mtime, None);
+
+    // A stamp for a row that is gone is a no-op: the digest was already checked in this process, and the row
+    // disappearing under us is `np models remove` racing, not a corrupt database.
+    record_artifact_stamp(&db, "absent-model", 1, 1)
+        .expect("stamping an absent row is not an error");
 }

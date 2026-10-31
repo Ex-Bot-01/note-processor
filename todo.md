@@ -246,5 +246,16 @@ what fails is not a check, because removal makes tests pass.
   reading is ~126× cheaper than our hash loop.
   Still open here: a *corpus* run (thousands of decodes in one process, §14's closing note) and batching across texts,
   which now waits on D13 rather than on OpenMP.
+* **D12 — verify-on-change (shipped on `m19/digest-verify-on-change`, 2026-10-31).** `np embed` now checks the artifact
+  against `models.sha256` before it reads a note: one `stat` when the stamp holds, a full hash when size or mtime moved
+  or when no stamp exists yet (migration 8 adds the two nullable columns and backfills nothing). A disagreement refuses
+  with both digests and writes neither vectors nor a stamp. The report says what happened — `digest` re-checked and
+  stamped / re-checked but unstampable (no readable mtime, or the index refused the write; the embed still proceeds, but
+  nothing claims a stamp exists) / not re-read / nothing to verify — in text and in `--json` (`artifact_check`, present
+  and null when no artifact was involved). Deliberately weaker than it sounds: size+mtime detects changed bytes, not a
+  crafted mtime, and the printed sentence says so. Tests: `crates/np-core/tests/artifact_verify.rs` (10 cases, no
+  artifact needed, so CI runs all of them), an argv refusal case mutation-checked against a neutered comparison, and the
+  real-model argv case asserting the wordings across consecutive runs plus the populated `--json` shape. Reasoning: §7's
+  verify-on-change subsection.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its
   exit codes are the evidence; nothing here is claimed on CI's behalf.
