@@ -59,11 +59,11 @@ pub(crate) const BUSY_TIMEOUT_MS: u32 = 1800;
 /// ahead of this list is refused rather than trusted — a newer file read by an older binary
 /// would otherwise be written to a schema this code does not know.
 ///
-/// Seven entries rather than one, split along the lines that matter (`files` + `notes` are the
+/// Eight entries rather than one, split along the lines that matter (`files` + `notes` are the
 /// registry and the note's identity; everything after them is derived from a note's contents
 /// and can be rebuilt from the file; the third adds the keys between those two groups; the fourth
 /// re-keys the registry's own pair onto bytes; the fifth folds the duplicate note rows that key may
-/// have inherited), so the
+/// have inherited; the eighth remembers, per model, which artifact bytes had their digest checked), so the
 /// version bookkeeping has more than one row to prove itself with. Later milestones append an
 /// entry here; they do not edit one — migration 3 exists precisely because a database on disk has
 /// already applied the first two, and SQLite cannot add a constraint to a table that is there.
@@ -234,6 +234,25 @@ pub const MIGRATIONS: &[Migration] = &[
         -- Re-embedding under a second model must not destroy the first, so the pair is the key.
         PRIMARY KEY (chunk_id, model)
     );
+    "#,
+    ),
+    // **Verify-on-change (D12, closed 2026-10-31).** Two nullable columns remembering which artifact bytes this row's
+    // `sha256` was last checked against: the size and whole-second mtime of the file at that moment. Their only job is
+    // to make re-verification cheap — R6d measured a full pass over the pinned artifact at **11.32 s** (26 MiB/s, our
+    // own `hash::sha256_file`) against **~0.09 s** for llama.cpp's first read of every byte (§14), so hashing before
+    // every embed would cost more than embedding a small workspace. A matching stat therefore skips the hash; a
+    // different one, or no stamp at all, re-hashes and refuses on mismatch.
+    //
+    // Nullable and **not backfilled**, exactly like migration 6's `file_id`: a row installed by an older build carries
+    // NULL and pays one full verification on its next embed, which is the honest cost of upgrading into a check rather
+    // than a silent claim that it had always held. Both columns must be present to skip — a half-written stamp is read
+    // as "unverified", never as "verified at size 0". No CHECK constraint: `sha256 IS NULL` (a provider with no
+    // weights) legitimately has nothing to stamp, so the pair's meaning is enforced by [`record_artifact_stamp`]'s
+    // caller rather than by SQL.
+    Migration::Sql(
+        r#"
+    ALTER TABLE models ADD COLUMN verified_size INTEGER;
+    ALTER TABLE models ADD COLUMN verified_mtime INTEGER;
     "#,
     ),
 ];
@@ -2268,11 +2287,19 @@ pub struct ModelRow {
     /// re-materialised artifact ([`crate::models::InstallOutcome::Restored]), because the row's claim about
     /// *when this id became known* does not change when its file comes back.
     pub installed_at: i64,
+    /// Size in bytes of the artifact whose digest this row last verified, or `None` when no verification has run
+    /// since this build was installed. Paired with [`Self::verified_mtime`]; see [`crate::local_model`] for the rule
+    /// that reads them and for what a match does and does not prove.
+    pub verified_size: Option<i64>,
+    /// Whole seconds since the Unix epoch of that same file's last modification. Read together with
+    /// [`Self::verified_size`] — one of the two is treated as no stamp at all.
+    pub verified_mtime: Option<i64>,
 }
 
 /// The `SELECT` column order every reader of `models` uses, so a row and a binder cannot disagree about
 /// which column is which by spelling the list twice.
-const MODEL_COLUMNS: &str = "id, dim, sha256, prefix_doc, prefix_query, installed_at";
+const MODEL_COLUMNS: &str =
+    "id, dim, sha256, prefix_doc, prefix_query, installed_at, verified_size, verified_mtime";
 
 /// Read the one row naming `id`, or `None` when no model of that identity has been installed.
 ///
@@ -2307,7 +2334,7 @@ pub fn model_rows(db: &Db) -> Result<Vec<ModelRow>, DbError> {
     Ok(rows_out)
 }
 
-/// One row of `models`, bound from the six columns of [`MODEL_COLUMNS`].
+/// One row of `models`, bound from the eight columns of [`MODEL_COLUMNS`].
 fn read_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
     Ok(ModelRow {
         id: row.get(0)?,
@@ -2316,7 +2343,31 @@ fn read_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
         prefix_doc: row.get(3)?,
         prefix_query: row.get(4)?,
         installed_at: row.get(5)?,
+        verified_size: row.get(6)?,
+        verified_mtime: row.get(7)?,
     })
+}
+
+/// Record which artifact bytes [`ModelRow::sha256`] was just checked against.
+///
+/// Written **only after a digest matched**, never before: a stamp that predates verification would let the next run
+/// skip the hash it has not yet earned. Both halves arrive together because a reader treats a half stamp as no stamp,
+/// and both are `NULL`-able in the schema only because an older row has neither.
+///
+/// The row need not exist for this to be a no-op rather than an error: a model deleted between the verification and
+/// this write (a concurrent `np models remove`) is a fact about the world, not a corrupt database, and the digest was
+/// already checked in this process.
+pub fn record_artifact_stamp(
+    db: &Db,
+    id: &str,
+    size: i64,
+    mtime: i64,
+) -> Result<(), DbError> {
+    db.0.prepare_cached(
+        "UPDATE models SET verified_size = ?2, verified_mtime = ?3 WHERE id = ?1",
+    )?
+    .execute(params![id, size, mtime])?;
+    Ok(())
 }
 
 /// Insert an installed model, reporting whether this call was the one that wrote it.

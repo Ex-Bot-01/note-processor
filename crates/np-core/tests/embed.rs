@@ -302,6 +302,9 @@ fn installed_row(id: &str, dim: i64, prefix_doc: &str) -> ModelRow {
         prefix_doc: prefix_doc.to_string(),
         prefix_query: "task: search_query|".to_string(),
         installed_at: 1_730_000_000,
+        // The seam under test never reads these; a row straight out of `install` has neither stamped.
+        verified_size: None,
+        verified_mtime: None,
     }
 }
 

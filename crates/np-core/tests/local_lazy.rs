@@ -40,6 +40,8 @@ mod lazy {
             prefix_doc: "task: search result | query: ".to_string(),
             prefix_query: "query: ".to_string(),
             installed_at: 1_730_000_000,
+            verified_size: None,
+            verified_mtime: None,
         }
     }
 
