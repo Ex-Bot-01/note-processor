@@ -405,6 +405,35 @@ pub struct LocalModelProvider {
     artifact: PathBuf,
 }
 
+/// The up-front fact about an artifact file: it is there, and it is a regular file.
+///
+/// Both local provider shapes ask it before any model work — `LocalModelProvider::new` because that is all it
+/// does, and `local_model::LazyLocalEmbedder::new` (behind the `local-model` feature, so named in prose rather
+/// than linked: this item has to resolve in a default build too) because §6's *artifact absent* arm must be settled
+/// **before** [`crate::embed_run`] is asked whether the workspace owes anything. One function is what keeps that
+/// arm one sentence in both builds, which is R6c1 D-2's rule: a missing file is a fact about the filesystem, never
+/// a configuration complaint.
+///
+/// The spelling rules are `models`' own — absolute, no symlink resolution, prefixed when long — so an artifact
+/// under a workspace that crosses the Windows threshold is still statable here instead of refused with a raw OS
+/// error. A directory is not a small unreadable artifact, and the platforms disagree about what reading one even
+/// means ([`crate::models::install`] learned this), so it keeps that wording and this module keeps one name for
+/// "that is not a file".
+pub fn artifact_is_readable(artifact: &Path) -> Result<(), EmbedError> {
+    let statable = walk::to_open_path(&models::access(artifact));
+    let meta = fs::metadata(&statable).map_err(|source| EmbedError::ArtifactUnreadable {
+        path: artifact.to_path_buf(),
+        source,
+    })?;
+    if !meta.is_file() {
+        return Err(EmbedError::ArtifactUnreadable {
+            path: artifact.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::NotADirectory, "not a regular file"),
+        });
+    }
+    Ok(())
+}
+
 /// The one spelling of "the bytes the model is handed": `prefix` then `text`, verbatim, nothing between.
 ///
 /// R6c1 review D-4: this rule used to be written twice — here and as a local `format!` in
@@ -462,23 +491,7 @@ impl LocalModelProvider {
             }
         };
 
-        // The same spelling rules `models` uses for this file: absolute, no symlink resolution, prefixed when
-        // long — so an artifact under a workspace that crosses the Windows threshold is still statable here
-        // instead of refused with a raw OS error.
-        let statable = walk::to_open_path(&models::access(artifact));
-        let meta = fs::metadata(&statable).map_err(|source| EmbedError::ArtifactUnreadable {
-            path: artifact.to_path_buf(),
-            source,
-        })?;
-        if !meta.is_file() {
-            // A directory is not a small unreadable artifact, and the platforms disagree about what reading
-            // one even means — `models::install` learned that in Windows CI, so its wording is reused here and
-            // one kind of "that is not a file" keeps one name.
-            return Err(EmbedError::ArtifactUnreadable {
-                path: artifact.to_path_buf(),
-                source: io::Error::new(io::ErrorKind::NotADirectory, "not a regular file"),
-            });
-        }
+        artifact_is_readable(artifact)?;
 
         Ok(Self {
             model_id: row.id.clone(),

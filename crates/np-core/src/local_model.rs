@@ -64,7 +64,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
 use crate::db::ModelRow;
@@ -631,6 +631,156 @@ impl LocalEmbedder {
             TextKind::Query => &self.prefix_query,
         };
         self.model.embed_text(prefix, text, self.max_tokens)
+    }
+}
+
+/// A load failure kept in a form that can be handed out more than once.
+///
+/// A lazy provider must refuse the second batch for the same reason as the first, and [`EmbedError`] is not
+/// `Clone` — its OS-failure payload carries a [`std::io::Error`], which is not either. Rather than make every
+/// provider's error type cloneable for one caller, the failure is mirrored here at capture time and rebuilt into
+/// the typed variant by [`LoadFailure::to_error`]. Three shapes cover everything `load` can refuse for a file
+/// that already stat'd fine — not-a-file (it went away), unloadable bytes, a width disagreement — and anything
+/// else keeps its sentence under [`EmbedError::Unavailable`] rather than being dropped.
+#[derive(Debug, Clone)]
+enum LoadFailure {
+    NotAFile { path: PathBuf, message: String },
+    NotLoadable { path: PathBuf },
+    DimMismatch { configured: usize, provider: i64 },
+    Other(String),
+}
+
+impl LoadFailure {
+    fn capture(err: &EmbedError) -> Self {
+        match err {
+            EmbedError::ArtifactUnreadable { path, source } => Self::NotAFile {
+                path: path.clone(),
+                message: source.to_string(),
+            },
+            EmbedError::ArtifactNotLoadable { path } => Self::NotLoadable { path: path.clone() },
+            EmbedError::ProviderDimMismatch {
+                configured,
+                provider,
+            } => Self::DimMismatch {
+                configured: *configured,
+                provider: *provider,
+            },
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn to_error(&self) -> EmbedError {
+        match self {
+            Self::NotAFile { path, message } => EmbedError::ArtifactUnreadable {
+                path: path.clone(),
+                source: std::io::Error::other(message.clone()),
+            },
+            Self::NotLoadable { path } => EmbedError::ArtifactNotLoadable { path: path.clone() },
+            Self::DimMismatch {
+                configured,
+                provider,
+            } => EmbedError::ProviderDimMismatch {
+                configured: *configured,
+                provider: *provider,
+            },
+            Self::Other(message) => EmbedError::Unavailable(message.clone()),
+        }
+    }
+}
+
+/// The provider `[embeddings] provider = "local-model"` resolves to in a build that has the runtime.
+///
+/// **Why it exists at all.** `np embed` has to name a provider before it knows whether the workspace owes
+/// anything — §6's exit state (i) is a success with no model work behind it — and one loaded model is ~420 MiB
+/// resident for the life of the process (§14). Loading eagerly would make every up-to-date run pay that and the
+/// load time on top, for a command whose common case is "nothing changed". So this type answers `model_id` and
+/// `dim` from the row, which is all [`crate::embed_run`] needs to work out what is owed, and touches llama.cpp
+/// the first time it is actually handed text.
+///
+/// **What that trades away.** A disagreement the eager path would have caught up front — bytes that will not
+/// load, a row whose width is not the artifact's — surfaces on the first batch instead, as arm (iv) with the same
+/// typed reason and the same sentence. Nothing is written either way, and §6's ordering ("refused before any
+/// write") still holds: the refusal happens inside the first `embed` call, before the writer's transaction opens.
+/// The two refusals that need no model — a width the row cannot answer, and an artifact that is not a file — are
+/// taken in [`LazyLocalEmbedder::new`] exactly as [`crate::embed::LocalModelProvider::new`] takes them, so §6's
+/// *artifact absent* arm stays arm (iii) rather than arriving late as a failure.
+#[derive(Debug)]
+pub struct LazyLocalEmbedder {
+    row: ModelRow,
+    artifact: PathBuf,
+    /// The width this run stores at: `[embeddings] dim` or the row's own declaration, resolved by the caller.
+    dim: usize,
+    max_tokens: usize,
+    loaded: std::cell::OnceCell<Result<LocalEmbedder, LoadFailure>>,
+}
+
+impl LazyLocalEmbedder {
+    /// Check what can be checked without a model, and remember everything a later load needs.
+    pub fn new(
+        row: &ModelRow,
+        artifact: &Path,
+        dim: usize,
+        max_tokens: usize,
+    ) -> Result<Self, EmbedError> {
+        // Same two refusals, same order, as `LocalModelProvider::new`: the row's width first (no filesystem),
+        // then the artifact (`embed_run`'s arm (iii) depends on this being settled before any currency question).
+        match usize::try_from(row.dim) {
+            Ok(row_dim) if row_dim == dim => {}
+            _ => {
+                return Err(EmbedError::ProviderDimMismatch {
+                    configured: dim,
+                    provider: row.dim,
+                })
+            }
+        }
+        crate::embed::artifact_is_readable(artifact)?;
+        Ok(Self {
+            row: row.clone(),
+            artifact: artifact.to_path_buf(),
+            dim,
+            max_tokens,
+            loaded: std::cell::OnceCell::new(),
+        })
+    }
+
+    /// Whether the model is resident in this process. False until the first batch; §14's whole argument, as an
+    /// assertion a test can make rather than a sentence in a comment.
+    pub fn loaded(&self) -> bool {
+        self.loaded.get().is_some_and(|result| result.is_ok())
+    }
+
+    /// The path a load would read — the file arm (iii) and arm (iv) name.
+    pub fn artifact(&self) -> &Path {
+        &self.artifact
+    }
+
+    fn model(&self) -> Result<&LocalEmbedder, EmbedError> {
+        self.loaded
+            .get_or_init(|| match load(&self.artifact, self.dim) {
+                Ok(model) => LocalEmbedder::new(model, &self.row, self.max_tokens)
+                    .map(Ok)
+                    .map_err(|err| LoadFailure::capture(&err))?,
+                Err(err) => Err(LoadFailure::capture(&err)),
+            })
+            .as_ref()
+            .map_err(LoadFailure::to_error)
+    }
+}
+
+impl Embedder for LazyLocalEmbedder {
+    fn model_id(&self) -> &str {
+        &self.row.id
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Load on first use, then reuse: §3's "one load per process, never per note", enforced by a cell rather than
+    /// by discipline. A failed load is remembered, so a run that cannot load does not spend 310 MB of reading per
+    /// batch on its way to arm (iv).
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
+        self.model()?.embed(texts)
     }
 }
 
