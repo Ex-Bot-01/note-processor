@@ -223,7 +223,7 @@ what fails is not a check, because removal makes tests pass.
   provider declares undressed inputs → staleness fails; the two declarations drift → new artifact-gated case in
   `local_embed.rs`). Real-artifact numbers after the fix: cos(same) 1.000000 vs cos(changed prefix) **0.895576**, one
   instruction applied, `local_embed` 13 passed (148 s). Next: R6d's corpus benchmark.
-* **R6d — benchmark round.** *partly done 2026-10-31, branch `m16/corpus-benchmark`*: `crates/np-core/tests/local_window.rs`
+* **R6d — benchmark round.** *two rounds, 2026-10-31 (`m16/corpus-benchmark` + `m17/openmp-ab`)*: `crates/np-core/tests/local_window.rs`
   (3 artifact-gated cases, all printing `NOT COVERAGE` without the file). Measured on this host against the pinned Q8_0:
   a `MAX_CHUNK_BYTES` chunk is **403 tokens in 2.61 s** (**155 tok/s**, ~3× §5's interpolated figure, which was drawn
   between much longer probe points); one near-ceiling chunk of **7,992 tokens** takes **98.6 s** at peak RSS
@@ -232,8 +232,14 @@ what fails is not a check, because removal makes tests pass.
   for: mutating either `>` in `embed_text` (`n >= budget`, `n >= window`) now turns the acceptance into a refusal naming
   its own rule, and dies in 1.5 s because a refusal never reaches the decode. Also measured for D12: verifying this
   artifact by digest costs **11.32 s** per pass (26 MiB/s), which is why "re-hash on every embed" needs a decision
-  rather than a reflex. Still open in R6d: the **OpenMP A/B** (`GGML_OPENMP=ON` vs the pinned `OFF`, at default and
-  near-ceiling lengths, RSS included) and whether an mmap-first load reads all 865 MB — both need two llama.cpp builds,
-  so they are their own round. Batching across texts stays out of the API until that A/B says what a batch is worth.
+  rather than a reflex. The second round built the pinned tree twice (`-DGGML_OPENMP=OFF` vs `ON`, production option set
+  otherwise, 36 s each at `-j8`) and ran eight alternating decodes through
+  `crates/np-core/tests/probes/openmp_ab_probe.c`: **OpenMP buys nothing** — 157.7 vs 157.4 tok/s at 403 tokens warm,
+  156.7 vs 157.6 cold, 81.8 vs 81.9 and 82.0 vs 82.0 at 7,992, peak RSS within 0.5 MiB — because **both** configurations
+  default to `n_threads=4 n_threads_batch=4` on this 16-CPU host. `GGML_OPENMP=OFF` therefore stays, and the thread count
+  is filed as D13. The same runs answered the mmap question: an evicted artifact moves `read_bytes` by **309,858,304 —
+  every byte**, for ≈ 0.1 s (0.43 s cold vs 0.34 s warm), which is what D12 needed to hear about its own 11.32 s hash.
+  Still open here: a *corpus* run (thousands of decodes in one process, §14's closing note) and batching across texts,
+  which now waits on D13 rather than on OpenMP.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its
   exit codes are the evidence; nothing here is claimed on CI's behalf.
