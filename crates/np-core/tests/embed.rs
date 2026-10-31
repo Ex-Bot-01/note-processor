@@ -67,6 +67,12 @@ impl CountingEmbedder {
 }
 
 impl Embedder for CountingEmbedder {
+    /// Identity: this fake stands in for a provider with no prefix rule, and its `embed` adds nothing either, so
+    /// the two agree — which is the only contract [`Embedder::model_inputs`] has.
+    fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|text| (*text).to_string()).collect()
+    }
+
     fn model_id(&self) -> &str {
         "counting@test"
     }

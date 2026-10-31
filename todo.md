@@ -216,10 +216,13 @@ what fails is not a check, because removal makes tests pass.
   mutation that was supposed to prove the last claim refused to die, and the reason is a **P1**: `embed_run` prepends
   `prefix_doc` before stamping and calling `embed`, and `LoadedModel::embed_text` prepends it again, so documents reach
   llama.cpp prefixed twice and the token budget counts the doubled sequence. Both halves were right alone; nothing
-  tested the pair. Written up with the two ways out in
-  `.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/r6c2-findings.md`. **Do not index a corpus until it is
-  settled.** Next: the seam decision (`Embedder::model_inputs` so the provider answers what the model will read —
-  recommended — or the caller owns prefixing outright), then R6d.
+  tested the pair.
+  **Resolved the same day by A′**: `Embedder::model_inputs` is a required trait method — the provider answers what the
+  model will read, the writer stamps that and hands `embed` raw text — with both `local_model` shapes spelling the
+  dressing through one private function. Three mutations fenced (loaded embedder ignores prefix → argv fails; wired
+  provider declares undressed inputs → staleness fails; the two declarations drift → new artifact-gated case in
+  `local_embed.rs`). Real-artifact numbers after the fix: cos(same) 1.000000 vs cos(changed prefix) **0.895576**, one
+  instruction applied, `local_embed` 13 passed (148 s). Next: R6d's corpus benchmark.
 * **R6d — corpus-scale benchmark**, batching across texts (deliberately absent from this API), and the accept-at-exactly-
   `window` assertion, which belongs in artifact-gated coverage rather than in CI.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its

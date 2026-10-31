@@ -17,10 +17,13 @@
 //! - **Currency is per-row and liveness-fenced** ([`db::live_chunks`] joins `files.state = 'ok'`, backlog D3):
 //!   a stale note's chunks are never owed, so this command cannot be the thing that computes vectors for a
 //!   deleted file's text and reports them current.
-//! - **The stamp is the digest of the bytes handed to the model** (backlog D4). Each owed chunk carries the digest of
-//!   `prefix_doc + chunk text` — the same string passed to [`Embedder::embed`] — and [`db::vectors_for`] reads
-//!   that value back for the comparison. Changing `prefix_doc` therefore makes every stored vector stale, which
-//!   is the point: a vector made from different bytes is not the same fact.
+//! - **The stamp is the digest of the bytes the model will read** (backlog D4). For each owed chunk the provider
+//!   is asked [`Embedder::model_inputs`] and the digest covers *that* string, while [`Embedder::embed`] receives the
+//!   raw chunk text: the provider owns how a chunk is dressed, so it is the only witness that can say what was read.
+//!   Spelling the rule here as well is R6c2's P1 — `prefix_doc` applied twice, once by this module and once by
+//!   `local_model::LocalEmbedder` (behind the `local-model` feature) — which left the stamp covering one copy of a string the model saw twice.
+//!   Changing `prefix_doc` still makes every stored vector stale, which is the point: a vector made from different
+//!   bytes is not the same fact.
 //! - **`SQLITE_BUSY` is a reported gap** ([`EmbedReport::busy_gap`], non-zero exit), never a silent skip; the
 //!   batch that met the lock stamps nothing, and [`embed_with_inject`]'s hook is what lets a test prove an
 //!   embed holds no write lock *between* batches.
@@ -66,7 +69,7 @@ use thiserror::Error;
 
 use crate::config::{abs_path, Config, ConfigError, EmbeddingProvider};
 use crate::db::{self, Db, DbError};
-use crate::embed::{prefixed, EmbedError, Embedder, Vector};
+use crate::embed::{EmbedError, Embedder, Vector};
 use crate::hash::sha256_bytes;
 use crate::models;
 use crate::walk;
@@ -237,14 +240,15 @@ pub enum EmbedRunError {
     },
 }
 
-/// One owed chunk: the row to stamp, the exact bytes to hand the model, and the digest of those bytes.
+/// One owed chunk: the row to stamp, the text to hand the model, and the digest of what the model will read.
 struct Owed {
     /// `chunks.id`, which `embeddings.chunk_id` references.
     id: i64,
-    /// `prefix_doc + chunk text`: what [`Embedder::embed`] is called with, verbatim.
-    input: String,
-    /// [`sha256_bytes`] of [`Owed::input`] — the value §6 makes `embeddings.source_hash` (§5's stamp rule,
-    /// backlog D4), and the same comparison [`db::vectors_for`] answers.
+    /// The chunk's own bytes, undressed: exactly what [`Embedder::embed`] is called with. Prefixing is the
+    /// provider's business ([`Embedder::model_inputs`]); pre-applying it here would apply it twice.
+    text: String,
+    /// [`sha256_bytes`] of the provider's declared input for [`Owed::text`] — the value §6 makes
+    /// `embeddings.source_hash` (§5's stamp rule, backlog D4), and the comparison [`db::vectors_for`] answers.
     digest: String,
 }
 
@@ -402,10 +406,22 @@ fn run(
         .into_iter()
         .map(|stamp| (stamp.chunk_id, stamp.source_hash))
         .collect::<HashMap<i64, String>>();
+    // Who can say what the model would read. `None` means §6's arm (iii) is waiting downstream: with no provider
+    // there is no witness for [`Embedder::model_inputs`], so nothing may be called *current* and every live chunk
+    // counts as owed. That costs no work — the run returns before the writer loop either way — but it keeps
+    // `current` from claiming a match against bytes nobody produced, which is the difference between "up to date"
+    // and "we could not tell" in a report a person acts on.
+    let witness: Option<&dyn Embedder> = match &resolution {
+        Resolution::Provider(provider) => Some(*provider),
+        Resolution::ArtifactAbsent => None,
+    };
+
     let mut owed = Vec::new();
     let mut seen = 0usize;
     let mut current = 0usize;
     let mut errors = 0usize;
+    // Set when a provider breaks the `model_inputs` shape contract while the run was still classifying chunks.
+    let mut input_shape: Option<String> = None;
     // A chunk this run could not classify or could not embed: owed, and not produced. It keeps the run out of
     // arm (i) without being anyone's fault message.
     let mut unfinished = false;
@@ -419,9 +435,35 @@ fn run(
             unfinished = true;
             continue;
         };
-        // The same function `LocalModelProvider::model_inputs` uses (D-4): the digest below is only a record of
-        // what the model read if both callers spell that string identically.
-        let input = prefixed(&row.prefix_doc, &text);
+        // Ask the provider what the model would read for this chunk (A′). The stamp has to answer a question about
+        // the model, not about this module's habits, and R6c2's P1 is what happens when the caller answers it by
+        // guessing: `prefix_doc` applied here *and* inside the provider, with a digest covering one copy.
+        //
+        // A provider that answers with nothing, or with more than one string per text, has broken the
+        // [`Embedder::model_inputs`] contract; this cannot embed it honestly, so it reports and moves on rather
+        // than stamping a guess. `paired` applies the same rule to vectors after the fact; here there is no write
+        // at risk, only the run's classification, which becomes arm (iv)'s gap.
+        let Some(witness) = witness else {
+            owed.push(Owed {
+                id: chunk.id,
+                text,
+                digest: String::new(),
+            });
+            continue;
+        };
+        let declared = witness.model_inputs(std::slice::from_ref(&text.as_str()));
+        let input = match declared.as_slice() {
+            [only] => only.clone(),
+            _ => {
+                errors += 1;
+                unfinished = true;
+                input_shape = Some(format!(
+                    "the provider declared {} inputs for a chunk it was asked about once",
+                    declared.len()
+                ));
+                continue;
+            }
+        };
         let digest = sha256_bytes(input.as_bytes());
         match stamps.get(&chunk.id) {
             Some(stored) if stored == &digest => current += 1,
@@ -429,7 +471,7 @@ fn run(
             // cares about, where only `prefix_doc` moved.
             _ => owed.push(Owed {
                 id: chunk.id,
-                input,
+                text,
                 digest,
             }),
         }
@@ -490,8 +532,10 @@ fn run(
     let mut reason: Option<String> = None;
 
     'batches: for batch in owed.chunks(EMBED_BATCH_CHUNKS) {
-        let inputs: Vec<&str> = batch.iter().map(|item| item.input.as_str()).collect();
-        match provider.embed(&inputs) {
+        // Raw chunk text, undressed: whatever the model is given is the provider's doing, and it is the same
+        // dressing [`Embedder::model_inputs`] described when this run decided the chunk was owed.
+        let texts: Vec<&str> = batch.iter().map(|item| item.text.as_str()).collect();
+        match provider.embed(&texts) {
             Ok(vectors) => match paired(batch, &vectors, provider.dim()) {
                 Ok(rows) => match write_batch(&db, &model_id, &rows)? {
                     BatchWrite::Written => embedded += rows.len(),
@@ -507,7 +551,7 @@ fn run(
             // either, so its batch is retried one text at a time to find which ones are over (§5).
             Err(EmbedError::TokenBudgetExceeded { .. }) => {
                 for item in batch {
-                    match provider.embed(&[item.input.as_str()]) {
+                    match provider.embed(&[item.text.as_str()]) {
                         Ok(vectors) => {
                             match paired(std::slice::from_ref(item), &vectors, provider.dim()) {
                                 Ok(rows) => match write_batch(&db, &model_id, &rows)? {
@@ -559,6 +603,11 @@ fn run(
             .unwrap_or_default();
         gaps.push(format!(
             "{refused_budget} chunk(s) were over the token budget and were refused rather than truncated{detail}"
+        ));
+    }
+    if let Some(detail) = input_shape {
+        gaps.push(format!(
+            "{detail}, so nothing it produced could be stamped and the run cannot claim currency"
         ));
     }
     if errors > 0 {

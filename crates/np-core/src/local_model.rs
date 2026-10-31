@@ -634,6 +634,19 @@ impl LocalEmbedder {
     }
 }
 
+/// The document dressing both provider shapes declare: `prefix` then text, one output per input.
+///
+/// One function because there is one rule, and the two callers are two types: [`LazyLocalEmbedder`] answers before
+/// anything is loaded (the writer stamps its answer), [`LocalEmbedder`] answers once a model is resident. If those
+/// ever disagree, the stamp stops describing what the model read — R6c2's P1 in a subtler dress — so the pair is
+/// asserted equal against a real artifact in `tests/local_embed.rs`.
+fn document_inputs(prefix: &str, texts: &[&str]) -> Vec<String> {
+    texts
+        .iter()
+        .map(|text| crate::embed::prefixed(prefix, text))
+        .collect()
+}
+
 /// A load failure kept in a form that can be handed out more than once.
 ///
 /// A lazy provider must refuse the second batch for the same reason as the first, and [`EmbedError`] is not
@@ -772,6 +785,14 @@ impl Embedder for LazyLocalEmbedder {
         &self.row.id
     }
 
+    /// From the row, without loading anything — and it has to agree with what [`LocalEmbedder::model_inputs`]
+    /// will answer once the load happens, because the writer stamps these bytes before llama.cpp is running.
+    /// Both spellings come from [`crate::embed::prefixed`] applied to `row.prefix_doc`, which is the same field
+    /// [`LocalEmbedder::new`] copies out of that row, so there is one rule and not two schedules for it.
+    fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
+        document_inputs(&self.row.prefix_doc, texts)
+    }
+
     fn dim(&self) -> usize {
         self.dim
     }
@@ -787,6 +808,14 @@ impl Embedder for LazyLocalEmbedder {
 impl Embedder for LocalEmbedder {
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// `prefix_doc` then the text — the document kind's dressing, which is what [`Embedder::embed`] applies and
+    /// therefore the only answer that can be stamped. The query prefix is deliberately absent: a vector written
+    /// under `prefix_query` is not comparable with a stored one (§3), so it is reachable only through
+    /// [`LocalEmbedder::embed_as`] with [`TextKind::Query`] spelled out.
+    fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
+        document_inputs(&self.prefix_doc, texts)
     }
 
     fn dim(&self) -> usize {

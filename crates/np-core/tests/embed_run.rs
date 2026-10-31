@@ -199,6 +199,12 @@ struct Fake {
     /// When set, the fake still *declares* [`FAKE_DIM`] but produces vectors one component wider — a provider
     /// lying about its own width, which only the per-vector check inside the writer can catch.
     lies_about_dim: bool,
+    /// What this fake puts in front of a chunk when asked [`Embedder::model_inputs`] — the seam A′ put on the
+    /// trait. Empty by default, because most cases are about batching rather than prefixes; a case that installs a
+    /// row with a `prefix_doc` **must** build its fake with the same prefix, since that is what a provider does
+    /// with its own row. Getting that wrong is not a silent pass: the stamps then cover undressed text and the
+    /// prefix-staleness case fails loudly.
+    prefix: String,
     calls: AtomicUsize,
 }
 
@@ -215,6 +221,16 @@ impl Fake {
         Self {
             dim: FAKE_DIM,
             over_budget: Some(marker.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// A fake that dresses chunks the way a provider whose row carries `prefix` does, so the run's stamps
+    /// describe what that provider says the model will read.
+    fn prefixing(prefix: &str) -> Self {
+        Self {
+            dim: FAKE_DIM,
+            prefix: prefix.to_string(),
             ..Self::default()
         }
     }
@@ -263,6 +279,16 @@ impl Fake {
 impl Embedder for Fake {
     fn model_id(&self) -> &str {
         MODEL_ID
+    }
+
+    /// `prefix` then text — the rule [`crate::embed::prefixed`] spells for the real providers. Deliberately *not*
+    /// applied inside [`Embedder::embed`]: after A′ the writer hands over raw chunk text and the provider dresses
+    /// it, so a fake that prefixed in both places would be reproducing R6c2's P1 instead of catching it.
+    fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
+        texts
+            .iter()
+            .map(|text| np_core::embed::prefixed(&self.prefix, text))
+            .collect()
     }
 
     fn dim(&self) -> usize {
@@ -375,11 +401,13 @@ fn chunks_reach_the_provider_in_chunk_order_and_are_stamped_with_what_it_read() 
     }
 }
 
-/// Per-item prefix pairing (Scope B's carried gap): with a non-empty `prefix_doc`, **each** text in a batch of
-/// two must arrive with its own prefix, not another's and not a shared one.
+/// Who dresses what: with a non-empty `prefix_doc` the writer hands [`Embedder::embed`] the **raw** chunk texts and
+/// stamps the digests of the **dressed** strings the provider declared. That split is A′, and it is the whole
+/// answer to R6c2's P1 — before it, this module prefixed while `LocalEmbedder` prefixed again, so the model read
+/// the instruction twice while the stamp covered it once.
 ///
-/// Mutation that fails it: building the batch as `format!("{prefix}{}", inputs[0])`, or applying the prefix to
-/// only the first element.
+/// Two mutations fail it: pre-applying the prefix in `embed_run` (the raw-text assertion below fails and the stamps
+/// cover a doubled instruction), or dropping it from `model_inputs` (the stamps then cover undressed text).
 #[test]
 fn every_text_in_a_batch_travels_with_its_own_prefix() {
     assert_recorder_works();
@@ -387,9 +415,26 @@ fn every_text_in_a_batch_travels_with_its_own_prefix() {
     setup.install_model(FAKE_DIM as i64, "doc: ");
     setup.touch_artifact();
 
-    let fake = Fake::new();
+    // The fake carries the row's prefix because a provider is built from its own row. `Fake::new()` here would be
+    // a provider that ignores prefixes — §3's bug, and it now fails this case rather than passing it quietly.
+    let fake = Fake::prefixing("doc: ");
     let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
     assert!(report.succeeded(), "{:?}", report.outcome);
+
+    // What the model was *handed* is the raw chunk text: dressing is the provider's doing, and R6c2's P1 was this
+    // module doing it as well.
+    let mut expected_raw: Vec<String> = setup
+        .live_chunks()
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect();
+    expected_raw.sort();
+    let mut received = fake.texts();
+    received.sort();
+    assert_eq!(
+        received, expected_raw,
+        "the batch is undressed chunk text; the provider applies its own prefix"
+    );
 
     let mut pairs: Vec<(String, String)> = setup
         .live_chunks()
@@ -409,14 +454,8 @@ fn every_text_in_a_batch_travels_with_its_own_prefix() {
         .collect();
     expected.sort();
     assert_eq!(expected.len(), 2, "two notes, two chunks");
-    let mut received = fake.texts();
-    received.sort();
-    assert_eq!(
-        received, expected,
-        "each text arrives prefixed with the row's own prefix_doc, verbatim and in front of its own body"
-    );
 
-    // And the stamp is the digest of the *prefixed* string, so a prefix change makes it stale (tested next).
+    // The stamp is the digest of the *declared* string, so a prefix change makes it stale (tested next).
     let stored: HashMap<i64, String> = setup.vectors().into_iter().collect();
     assert_eq!(stored.len(), 2);
     for (_, digest) in &pairs {
@@ -464,14 +503,18 @@ fn an_unchanged_corpus_never_reaches_the_provider() {
 
 /// Changing only `prefix_doc` makes every stored vector stale, because the stamp is of the prefixed bytes.
 ///
-/// Mutation that fails it: stamping `chunks.source_hash` or `files.hash`, which no prefix change moves.
+/// Mutation that fails it: stamping `chunks.source_hash` or `files.hash`, which no prefix change moves — or a
+/// provider whose [`Embedder::model_inputs`] ignores `prefix_doc`, which is why each run below carries the prefix
+/// its own row carries rather than an identity fake.
 #[test]
 fn a_changed_prefix_makes_a_stored_vector_stale() {
     assert_recorder_works();
     let setup = workspace_owned(&notes(1));
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
-    embed(&setup.root, &setup.cfg(), &Fake::new()).expect("first run");
+    // Run one dresses chunks with the row's empty prefix; run two, after the UPDATE below, with the new one. A
+    // provider is built from its row, so each fake has to say what its own run's row says.
+    embed(&setup.root, &setup.cfg(), &Fake::prefixing("")).expect("first run");
 
     // Re-install the same id with a different document prefix. `insert_model` is idempotent, so the row is
     // replaced by hand — the point is the row's `prefix_doc`, not the install path.
@@ -484,7 +527,7 @@ fn a_changed_prefix_makes_a_stored_vector_stale() {
         .expect("test: move the prefix");
     }
 
-    let fake = Fake::new();
+    let fake = Fake::prefixing("query-side: ");
     let report = embed(&setup.root, &setup.cfg(), &fake).expect("second run");
     assert_eq!(
         fake.calls(),
