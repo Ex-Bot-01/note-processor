@@ -619,11 +619,15 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   and in being a well-behaved background process next to someone's editor. Filed rather than done because it changes
   runtime behaviour for every user of the feature, needs an A/B of its own (thread counts 1/2/4/nproc at both lengths,
   RSS included), and no measurement so far says the current 81–157 tok/s is unacceptable.
-  **Addendum from R6d round 3 (2026-10-31): D13 is now the bigger lever by measurement.** The corpus run solved the cost
-  shape out of two cohorts in one process, twice over — **30.0–30.8 ms fixed per decode, 5.558–5.560 ms/token marginal**
-  (≈180 tok/s as token count grows) — so batching texts into one decode could recover at most ~14 % of a short-note
-  decode and ~2 % of a long one, while thread count multiplies the per-token term that dominates everything above ~50
-  tokens. Numbers and
-  scope: §14's corpus subsection and `crates/np-core/tests/probes/corpus-run-2026-10-31.log`. The authorisation question
+  **Addendum from R6d round 3 (2026-10-31): batching has a measured ceiling; D13 does not.** Two cohorts in one
+  process, run twice, put the cost shape at **29.0–31.1 ms fixed per decode** and **5.531–5.548 ms/token marginal**
+  (≈180 tok/s as token count grows), so batching texts into a single decode could recover at most ~14 % of a short-note
+  decode and ~2 % of a long one — measured at the current four threads. The stronger-sounding version of that sentence,
+  "thread count is therefore the bigger lever", is *not* something this measured: raising `n_threads` has never been
+  swept here, and the one threading intervention actually tested (OpenMP on/off) moved throughput by nothing, both
+  configurations handing ggml four workers. What the cohorts license is narrower and still worth writing down — at four
+  threads, decodes between 33 and 251 tokens fit ~30 ms fixed plus ~5.6 ms/token, so batching's ceiling is small and the
+  thread sweep is the next measurement worth taking. Numbers and scope: §14's corpus subsection and
+  `crates/np-core/tests/probes/corpus-run-2026-10-31.log`. The authorisation question
   is unchanged — this still changes runtime behaviour for every user, and the sweep (1/2/4/nproc × both lengths × RSS)
   has not been run.

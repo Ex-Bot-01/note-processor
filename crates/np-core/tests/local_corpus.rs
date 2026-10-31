@@ -32,6 +32,7 @@ mod corpus {
 
     use np_core::config::{Config, EmbeddingProvider, EmbeddingsConfig};
     use np_core::db::{self, Db};
+    use np_core::embed::Embedder;
     use np_core::embed_run::{self, EmbedOutcome, EMBED_BATCH_CHUNKS};
     use np_core::local_model;
     use np_core::scan;
@@ -91,7 +92,9 @@ mod corpus {
             .unwrap_or(DEFAULT_NOTES)
     }
 
-    /// One loaded model in the process at a time: ~420 MiB resident each on a host with ~7.4 GB total. Poison is taken
+    /// One loaded model in the process at a time. The budget is larger than the ~420 MiB of weights: a context reserves
+    /// ~1.1 GiB of compute buffer (§14), so two residents at once would put nearly 3 GiB on a host with ~7.4 GB — and
+    /// this lock is process-local, so running the suite twice in parallel gets no protection from it. Poison is taken
     /// through, so one red case cannot become a wall of missing coverage.
     fn model_lock() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
@@ -263,6 +266,23 @@ mod corpus {
             .unwrap_or_else(|| panic!("test: {field} is present in /proc/self/status"))
     }
 
+    /// `MemTotal` / `MemAvailable`, so a peak-RSS figure is read against the machine that produced it.
+    fn meminfo() -> String {
+        let text = fs::read_to_string("/proc/meminfo").expect("test: /proc/meminfo");
+        let want = ["MemTotal:", "MemAvailable:"];
+        let found: Vec<String> = text
+            .lines()
+            .filter(|line| want.iter().any(|field| line.starts_with(field)))
+            .map(|line| line.trim().replace("  ", " "))
+            .collect();
+        assert_eq!(
+            found.len(),
+            2,
+            "both memory fields are present in /proc/meminfo"
+        );
+        found.join(" ")
+    }
+
     fn norm(vector: &[f32]) -> f64 {
         vector
             .iter()
@@ -296,6 +316,12 @@ mod corpus {
     /// Run one pass and return its report with the numbers a report cannot carry: wall time, batches observed, and RSS
     /// sampled between batches.
     struct Pass {
+        /// Load + one decode, measured **outside** `wall`. The provider is lazy by design (§14), so a timer that starts
+        /// before the first batch charges the model load to whatever decodes it happened to wrap: spread over 128
+        /// decodes that is ~16 ms each, over 2,048 it is ~1 ms. Round 3's review caught exactly that (P1), and the
+        /// per-decode cost split below is the number it contaminated.
+        cold_start: Duration,
+        /// Steady-state wall time of the pass itself, with the runtime already resident.
         wall: Duration,
         batches: usize,
         /// `VmRSS` at every [`SAMPLE_EVERY_BATCHES`]-th hook call, KiB.
@@ -316,6 +342,12 @@ mod corpus {
         )
         .expect("test setup: a lazy provider for the linked artifact");
 
+        let warm_started = Instant::now();
+        provider
+            .embed(&["warm up the runtime"])
+            .expect("test setup: warming the lazy provider");
+        let cold_start = warm_started.elapsed();
+
         let mut batches = 0usize;
         let mut rss_samples: Vec<u64> = Vec::new();
         let started = Instant::now();
@@ -332,6 +364,7 @@ mod corpus {
         let wall = started.elapsed();
 
         Pass {
+            cold_start,
             wall,
             batches,
             rss_samples,
@@ -355,6 +388,12 @@ mod corpus {
                     .expect("a fixture note is far under the ceiling"),
             );
         }
+        // A zero-length sample would divide to NaN, and every throughput figure downstream would print `NaN` while
+        // still failing its fence quietly — louder than a panic is not what a benchmark needs.
+        assert!(
+            !counts.is_empty(),
+            "the token sample was empty, so there is no mean to report"
+        );
         let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
         (mean, counts.len())
     }
@@ -393,10 +432,18 @@ mod corpus {
 
         let stored = setup.stored();
         assert_eq!(stored.len(), notes, "one row per embedded chunk");
-        // Sampled width and unit norm: the same claim as checking all of them, at a bounded cost. A stride that hits
-        // every 251st row also proves the *first* and *last* rows, which is where truncation shows up.
+        // Sampled width and unit norm: the same claim as checking all of them, at a bounded cost. The two ends are added
+        // explicitly because `step_by` only reaches the last row when the stride divides the count — measured on 2,048
+        // rows with stride 52 the walk stops at 2,028, and the tail is exactly where truncation would show up.
         let stride = stored.len().div_ceil(40).max(1);
-        for (chunk_id, dim, bytes) in stored.iter().step_by(stride) {
+        let mut checked: Vec<usize> = (0..stored.len()).step_by(stride).collect();
+        for end in [0usize, stored.len() - 1] {
+            if !checked.contains(&end) {
+                checked.push(end);
+            }
+        }
+        for index in checked {
+            let (chunk_id, dim, bytes) = &stored[index];
             assert_eq!(*dim, DIM, "chunk {chunk_id}");
             assert_eq!(bytes.len(), DIM as usize * 4, "chunk {chunk_id}");
             let length = norm(stored_vector(bytes).components());
@@ -416,7 +463,7 @@ mod corpus {
             "SUMMARY corpus notes={} chunks_embedded={} batches={} batch_chunks={} \
              wall_s={:.2} tokens_per_chunk_mean={:.1} (sampled {} of {}) tokens_total~={:.0} \
              tokens_per_second={:.1} chunks_per_hour={:.0} rss_first_kib={} rss_last_kib={} \
-             rss_samples={} peak_kib={}",
+             rss_samples={} peak_kib={} cold_start_s={:.2}",
             notes,
             pass.report.embedded,
             pass.batches,
@@ -434,7 +481,11 @@ mod corpus {
             pass.rss_samples.last().copied().unwrap_or(0),
             pass.rss_samples.len(),
             rss_kib("VmHWM:"),
+            pass.cold_start.as_secs_f64(),
         );
+        // A context reserves ~1.1 GiB of compute buffer on top of the ~420 MiB of weights (§14), so "peak 437 MiB" only
+        // means something against the machine that produced it: print what the host had, not just what we used.
+        println!("SUMMARY host {}", meminfo());
 
         // The regression fence, deliberately wide. §8 asks for the spread and this host runs other work; a tight band
         // would fail on a noisy afternoon and train everyone to ignore this file. 40 tok/s is roughly a quarter of the
@@ -447,10 +498,23 @@ mod corpus {
             pass.report.embedded
         );
 
-        // Memory: the question a one-decode-per-process harness cannot ask. The fence is on the *drift* between the
-        // first and last mid-run samples, not on the absolute figure — the model's ~420 MiB and a warm compute buffer
-        // are supposed to be there. Re-measure this band on the host before changing it; see §9's R6d row for the run
-        // that set it.
+        // Memory: the question a one-decode-per-process harness cannot ask — and stated for what it is, because the
+        // arithmetic of this fence is honest only if you do the division. Nine samples over 256 batches, ceiling
+        // 262,144 KiB: it fails on retention above ~128 KiB per chunk. A leak of 2 KiB per decode (+4 MiB across the
+        // whole pass) walks straight through it. That is a smoke test for "something is inflating without bound", not a
+        // leak detector; two recorded runs drifted +1,436 and +1,552 KiB (~0.7 KiB per decode), which is allocator
+        // territory. Re-measure the band before changing it — §9's R6d row names the runs that set it.
+        // A single sample would make the drift below identically zero and the check silently vacuous — which is what a
+        // raised `SAMPLE_EVERY_BATCHES` would do to a smaller corpus. So: whenever there were enough batches to expect
+        // more than one, insist that we got them.
+        if pass.batches >= SAMPLE_EVERY_BATCHES {
+            assert!(
+                pass.rss_samples.len() >= 2,
+                "{} batches produced {} RSS sample(s); sampling is broken, not the memory behaviour",
+                pass.batches,
+                pass.rss_samples.len()
+            );
+        }
         if pass.rss_samples.len() >= 2 {
             let first = pass.rss_samples[0];
             let last = *pass.rss_samples.last().expect("checked non-empty");
@@ -478,11 +542,10 @@ mod corpus {
                 "PROJECTION notes={size:>6} hours={hours:>6.2} fits_evening={}",
                 if hours <= EVENING_HOURS { "yes" } else { "no" }
             );
-            // The projection must be arithmetic about the measurement above it, not a second number that can drift.
-            assert!(
-                (hours * chunks_per_hour - size as f64).abs() < 1.0,
-                "the printed hours do not follow from the printed rate"
-            );
+            // No assertion about the arithmetic on purpose: `hours` is computed from `chunks_per_hour` two lines above,
+            // so any check re-deriving one from the other can never fail (round 3's review named this). What is worth a
+            // fence is that the rate is a real number at all — the throughput fence above and this guard both do that.
+            assert!(chunks_per_hour > 0.0);
         }
 
         // The second run: nothing owed, so nothing loaded and nothing written — and the currency query measured at
@@ -519,6 +582,10 @@ mod corpus {
             let setup = Setup::new(128);
             setup.link_artifact(&artifact);
             let pass = run_pass(&setup);
+            assert!(
+                pass.report.embedded > 0,
+                "a cohort that embedded nothing has no per-decode cost to divide by"
+            );
             let mean = mean_tokens_per_chunk(&artifact, &setup.chunk_texts()).0;
             (pass.wall.as_secs_f64() / pass.report.embedded as f64, mean)
         };

@@ -5,22 +5,42 @@ Command (one process, `--test-threads=1`, ~9.4 min for all three cases each time
     NP_TEST_MODEL_PATH=/home/agent/models/embeddinggemma-2-Q8_0.gguf \
       cargo test -p np-core --features local-model --test local_corpus -- --nocapture --test-threads=1
 
-Host: 16-core x86_64 Linux, CPU-only, ~7.4 GB RAM total, ~3.4 GB free disk at run time.
+Host: 16-core x86_64 Linux, CPU-only. `MemTotal: 7597988 kB`, `MemAvailable: ~5,750,000 kB` at run time (printed by the
+harness itself, so a peak-RSS number is read against the machine that produced it). Disk `/home` at 76 %.
 Model: embeddinggemma-2-Q8_0.gguf (GGUF V3, 413 tensors, 309,855,456 B, sha256 2188ac1d…), llama.cpp pinned tag v0.8.0,
 GGML_OPENMP=OFF, `llama_n_threads = llama_n_threads_batch = 4`.
 
-**Two full runs, recorded because §8 asks for ≥2 and forbids quoting a lucky number.** They are 0.3 % apart on every
-throughput figure and agree on the shape of everything else; the spread is printed rather than averaged away:
+**Two full runs, recorded because §8 asks for ≥2 and forbids quoting a lucky number.** Both are pasted verbatim below;
+the table is the pair side by side, not an average:
 
-| Figure | Run 1 | Run 2 |
-|---|---|---|
-| tokens/s over 2,048 short notes | 153.8 | 154.2 |
-| chunks/hour | 16,090 | 16,129 |
-| wall time for the pass | 458.23 s | 457.13 s |
-| `VmRSS` drift across the pass (KiB) | +808 | +1,124 |
-| peak `VmHWM` (KiB) | 447,204 | 447,408 |
-| derived fixed ms per decode | 30.8 | 30.0 |
-| derived ms per token | 5.558 | 5.560 |
+| Figure | Run 1 | Run 2 | Spread |
+|---|---|---|---|
+| steady wall time for 2,048 chunks | 456.20 s | 456.16 s | 0.01 % |
+| tokens/s (sample-derived, see note) | 154.5 | 154.5 | — |
+| chunks/hour (exact counts) | 16,161 | 16,163 | 0.01 % |
+| cold start: load + one decode, excluded from the above | 0.44 s | 0.46 s | 0.02 s |
+| `VmRSS` drift across the pass (KiB) | +1,436 | +1,552 | 8 % of each other |
+| peak `VmHWM` (KiB) | 446,896 | 447,180 | 0.06 % |
+| derived fixed ms per decode | 31.1 | 29.0 | 2.1 ms |
+| derived ms per token | 5.531 | 5.548 | 0.3 % |
+
+**Note on `tokens_per_second`.** It is *derived*: mean tokens/chunk comes from a 64-of-2,048 sample (3 %) multiplied by
+the exact chunk count. `chunks_per_hour` uses only exact counts and is the figure to quote; the token rate agrees with it
+to within the sampling error of a corpus whose notes differ only in wording.
+
+**Note on the fixed/per-token split.** It is solved from two points (33.3 and 251.2 tokens) for two unknowns, so it
+reproduces those two cohorts by construction — that is algebra, not evidence. What carries any weight is the third,
+independent measurement: the corpus run's own aggregate. Run 1's fit predicts a 34.4-token decode at 221.4 ms → 155.4
+tok/s against 154.5 measured (0.6 %); run 2 gives 219.8 ms → 156.5 against 154.5 (1.3 %). The caveat is that the short
+cohort and the corpus are nearly the same note shape, so this checks consistency between two measurements rather than
+extrapolating outside 33–251 tokens.
+
+**Superseded figures, kept where they belong.** The first two runs of this harness (same day, before review) charged the
+model load to the timed window, because a lazy provider loads inside the first batch it is asked to serve. That was a
+reporting defect: a load spread over 128 decodes inflates a per-decode cost more than over 48. Fixing it — warm the
+provider, time `cold_start` separately — moved the derived fixed cost from 30.8 / 30.0 ms to 31.1 / 29.0 ms, i.e. by less
+than the run-to-run spread, because this artifact loads in ~0.45 s warm rather than seconds. The throughputs moved by the
+same trivial amount (16,090/16,129 → 16,161/16,163 chunks/hour).
 
 **What this file is and is not.** It is the `SUMMARY`/`PROJECTION` lines copied out of each run's stdout; the ~2,250
 llama.cpp `decode:` / `init:` / `sched_reserve:` lines around them are omitted — they say nothing this file does not and
@@ -28,22 +48,42 @@ would bury the numbers. Nothing here is rounded or recomputed by hand: every fig
 
 ## Run 1
 
-SUMMARY corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=458.23 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=153.8 chunks_per_hour=16090 rss_first_kib=415936 rss_last_kib=416744 rss_samples=9 peak_kib=447204
-SUMMARY rss_drift_kib=808 samples=9
-PROJECTION threshold = one evening = 4 h of unattended wall time (measured rate: 16090 chunks/hour)
+SUMMARY corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=456.20 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=154.5 chunks_per_hour=16161 rss_first_kib=416384 rss_last_kib=417820 rss_samples=9 peak_kib=446896 cold_start_s=0.44
+
+SUMMARY host MemTotal:    7597988 kB MemAvailable:  5753864 kB
+
+SUMMARY rss_drift_kib=1436 samples=9
+
+PROJECTION threshold = one evening = 4 h of unattended wall time (measured rate: 16161 chunks/hour)
+
 PROJECTION notes=  1000 hours=  0.06 fits_evening=yes
+
 PROJECTION notes=  5000 hours=  0.31 fits_evening=yes
+
 PROJECTION notes= 20000 hours=  1.24 fits_evening=yes
+
 SUMMARY second_run wall_s=0.04 current=2048 batches=0
-SUMMARY cohort_short tokens=33.3 seconds_per_decode=0.2157 cohort_long tokens=251.2 seconds_per_decode=1.4273 derived_fixed_ms_per_decode=30.8 derived_ms_per_token=5.558
+
+SUMMARY cohort_short tokens=33.3 seconds_per_decode=0.2151 cohort_long tokens=251.2 seconds_per_decode=1.4209 derived_fixed_ms_per_decode=31.1 derived_ms_per_token=5.531
+
 
 ## Run 2
 
-SUMMARY corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=457.13 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=154.2 chunks_per_hour=16129 rss_first_kib=416200 rss_last_kib=417324 rss_samples=9 peak_kib=447408
-SUMMARY rss_drift_kib=1124 samples=9
-PROJECTION threshold = one evening = 4 h of unattended wall time (measured rate: 16129 chunks/hour)
+SUMMARY corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=456.16 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=154.5 chunks_per_hour=16163 rss_first_kib=417100 rss_last_kib=418652 rss_samples=9 peak_kib=447180 cold_start_s=0.46
+
+SUMMARY host MemTotal:    7597988 kB MemAvailable:  5749012 kB
+
+SUMMARY rss_drift_kib=1552 samples=9
+
+PROJECTION threshold = one evening = 4 h of unattended wall time (measured rate: 16163 chunks/hour)
+
 PROJECTION notes=  1000 hours=  0.06 fits_evening=yes
+
 PROJECTION notes=  5000 hours=  0.31 fits_evening=yes
+
 PROJECTION notes= 20000 hours=  1.24 fits_evening=yes
+
 SUMMARY second_run wall_s=0.04 current=2048 batches=0
-SUMMARY cohort_short tokens=33.3 seconds_per_decode=0.2149 cohort_long tokens=251.2 seconds_per_decode=1.4268 derived_fixed_ms_per_decode=30.0 derived_ms_per_token=5.560
+
+SUMMARY cohort_short tokens=33.3 seconds_per_decode=0.2136 cohort_long tokens=251.2 seconds_per_decode=1.4229 derived_fixed_ms_per_decode=29.0 derived_ms_per_token=5.548
+
