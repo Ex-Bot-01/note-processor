@@ -47,13 +47,25 @@ impl Workspace {
     /// variables entirely (see `np_core::config::config_file_path`), so without redirecting it a
     /// developer's own `config.toml` would change what these assertions see.
     fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = self.command_without_operand(args);
+        cmd.arg(&self.root);
+        cmd
+    }
+
+    /// The same hermetic `np` with **nothing appended**, for the cases that are about argv itself.
+    ///
+    /// A case asserting `np embed` with no operand fails would still be hermetic without these five variables —
+    /// clap refuses before configuration is read — but it would then depend on that ordering staying true, and a
+    /// developer's own `config.toml` becoming part of an argv test is exactly the coupling [`Workspace::command`]
+    /// exists to remove.
+    fn command_without_operand(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_np"));
         cmd.env("XDG_DATA_HOME", self.data_dir())
             .env("LOCALAPPDATA", self.data_dir())
             .env("HOME", self._tmp.path())
             .env("XDG_CONFIG_HOME", self.config_dir())
             .env("APPDATA", self.config_dir());
-        cmd.args(args).arg(&self.root);
+        cmd.args(args);
         cmd
     }
 
@@ -90,6 +102,17 @@ impl Workspace {
             ..Config::default()
         }
         .workspace_db(&self.root)
+    }
+
+    /// This workspace's artifact directory, **derived** the way the binary derives it rather than spelled out —
+    /// the reason `crates/np-cli/tests/models_cli.rs` gives for the same rule, and what makes an assertion about
+    /// the path `np embed` names mean something.
+    fn models_dir(&self) -> PathBuf {
+        Config {
+            data_dir: self.data_dir(),
+            ..Config::default()
+        }
+        .workspace_models_dir(&self.root)
     }
 }
 
@@ -1455,5 +1478,345 @@ fn an_indent_at_the_ceiling_still_renders_the_catalog() {
     assert!(
         index.lines().any(|line| line.starts_with(&" ".repeat(16))),
         "indent 16 has to reach the rendered bytes, not merely exit 0:\n{index}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `np embed` — §6's four arms, driven through argv.
+//
+// R6c1's defect D-2 is why this section exists. All nineteen embed cases lived in
+// `crates/np-core/tests/embed_run.rs`, and one of them (`an_absent_artifact_names_a_command_that_exists`) drove
+// `embed_run` directly — so np-cli answering a missing artifact file with a placeholder provider whose declared
+// width is 0, and the run then refusing with §6's wrong-dim sentence about a row that declares 768, survived a
+// green suite. That placeholder is built in `np-cli` and the false sentence is assembled there, so only argv can
+// see it. What is pinned below is what this file alone can pin: the exit codes (1 for every runtime refusal, clap's
+// 2 for argv), §6's two-channel rule for one fact, the `--json` key set, and that both channels carry the same
+// numbers.
+// ---------------------------------------------------------------------------
+
+/// The model id every case here configures. Legal under `models::validate_id`, which
+/// [`np_core::config::Config::load`] applies to `embeddings.model` before a run starts.
+const EMBED_MODEL: &str = "tiny-model@1";
+
+/// The width `install_model` declares and the row therefore holds. Configured nowhere else: `[embeddings] dim`
+/// stays unset so the row's own declaration is the width this run needs, which leaves a missing artifact file as
+/// the only thing left to refuse.
+const EMBED_DIM: &str = "768";
+
+/// `[embeddings]` naming `model` under `provider = "local-model"`.
+fn local_model_config(model: &str) -> String {
+    format!("[embeddings]\nprovider = \"local-model\"\nmodel = \"{model}\"\n")
+}
+
+/// Install [`EMBED_MODEL`] through the real command, so the row and the artifact are what `np models install`
+/// writes rather than a fixture shaped to look like one. Returns the artifact path it placed.
+///
+/// The source bytes are not a model and nothing reads them: `install` verifies the declared digest against the
+/// file, and `embed` refuses before any load (there is no runtime in this build).
+fn install_model(ws: &Workspace) -> PathBuf {
+    let source = ws._tmp.path().join("artifact.bin");
+    fs::write(&source, b"the bytes one model stands for\n")
+        .expect("test setup: write the artifact source");
+    // The digest comes from `np_core::hash::sha256_file` — the same function `np models hash` calls, and the only
+    // SHA-256 in the program (`crates/np-cli/tests/models_cli.rs` pins that equality).
+    let digest =
+        np_core::hash::sha256_file(&source).expect("test setup: digest the artifact source");
+
+    let installed = run(&mut ws.command(&[
+        "models",
+        "install",
+        "--id",
+        EMBED_MODEL,
+        "--path",
+        source.to_str().expect("test setup: utf-8 tempdir path"),
+        "--dim",
+        EMBED_DIM,
+        "--sha256",
+        &digest,
+    ]));
+    installed.assert_success();
+    ws.models_dir().join(EMBED_MODEL)
+}
+
+/// One aligned field of a text summary — the value after the label, trimmed.
+///
+/// Panics when the label is absent, because a missing line is exactly what `assert_eq!` against `None` would catch
+/// while a `.contains("seen")` on the whole stdout would not: the report's own text mentions nothing else, but a
+/// helper that cannot fail loudly is not evidence.
+fn summary_field(text: &str, label: &str) -> String {
+    text.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(char::is_whitespace)?;
+            (name == label).then(|| value.trim().to_string())
+        })
+        .unwrap_or_else(|| panic!("`{label}` has to carry a value in:\n{text}"))
+}
+
+/// One count of a text summary, by its aligned label.
+fn summary_count(text: &str, label: &str) -> u64 {
+    let value = summary_field(text, label);
+    value
+        .parse()
+        .unwrap_or_else(|err| panic!("`{label} = {value}` is not a count: {err}"))
+}
+
+/// The sorted key names of a JSON object, the way `crates/np-cli/tests/models_cli.rs` pins key sets.
+fn json_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("expected a JSON object: {value}"))
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Arm (ii), first half: no `[embeddings]` section means `provider = "none"`, which §2 documents as the default
+/// state of a fresh install — so it leaves as exit 1 with *configuration disabled* on **both** channels, and reads
+/// nothing. The scan above the run is what makes `seen 0` evidence rather than an empty workspace.
+#[test]
+fn embed_without_an_embeddings_section_is_configuration_disabled_on_both_channels() {
+    let ws = workspace();
+    // A config file that exists and parses and holds no `[embeddings]` section at all.
+    ws.write_user_config("# deliberately no [embeddings] section\n");
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let failed = run(&mut ws.command(&["embed"]));
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "arm (ii) is exit 1 and adds no new code:\n{}",
+        failed.stdout()
+    );
+    for channel in [failed.stdout(), failed.stderr()] {
+        assert!(
+            channel.contains("configuration disabled")
+                && channel.contains("embeddings.provider = \"none\""),
+            "both channels have to name the arm and the key: {channel}"
+        );
+    }
+    let stdout = failed.stdout();
+    assert_eq!(summary_count(&stdout, "seen"), 0, "nothing was read");
+    assert_eq!(summary_count(&stdout, "embedded"), 0);
+    assert_eq!(
+        summary_field(&stdout, "model"),
+        "-",
+        "no model id was named"
+    );
+}
+
+/// Arm (ii), second half: `provider = "local-model"` with a model id that names no installed row. The refusal has
+/// to name the id — "configuration disabled" alone would not say what to install.
+#[test]
+fn embed_naming_a_model_that_is_not_installed_names_the_id() {
+    let ws = workspace();
+    // No `np models install` run: the row does not exist.
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let failed = run(&mut ws.command(&["embed"]));
+
+    assert_eq!(failed.code(), 1, "arm (ii) is exit 1:\n{}", failed.stdout());
+    for channel in [failed.stdout(), failed.stderr()] {
+        assert!(
+            channel.contains("configuration disabled")
+                && channel.contains(&format!("embeddings.model = \"{EMBED_MODEL}\"")),
+            "the refusal has to name the key and the id it could not find: {channel}"
+        );
+    }
+    assert_eq!(summary_count(&failed.stdout(), "seen"), 0);
+}
+
+/// Arm (iii), reached from argv: the row is installed, its artifact file is not there, and the run owes work. This
+/// is D-2's regression test — the case `crates/np-core/tests/embed_run.rs` could not see because it injected a
+/// provider instead of resolving one.
+#[test]
+fn embed_with_the_artifact_file_missing_names_installing_it() {
+    let ws = workspace();
+    let artifact = install_model(&ws);
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+    run(&mut ws.command(&["scan"])).assert_success();
+    fs::remove_file(&artifact).expect("test setup: remove the installed artifact file");
+
+    let failed = run(&mut ws.command(&["embed"]));
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "arm (iii) is exit 1 (§6):\n{}",
+        failed.stdout()
+    );
+    for channel in [failed.stdout(), failed.stderr()] {
+        assert!(channel.contains("artifact absent"), "{channel}");
+        // §6's remedy, naming a command this build has.
+        assert!(channel.contains("np models install"), "{channel}");
+        assert!(
+            !channel.contains("np models fetch"),
+            "`fetch` does not exist: {channel}"
+        );
+    }
+    // The defect itself. The row declares 768 and the truth is a missing file, so no width may appear in the
+    // answer; this fails the moment np-cli answers an unreadable artifact with a placeholder provider again,
+    // because that placeholder's `dim()` is 0 and §6's wrong-dim refusal quotes it. (Verified by mutation: see the
+    // round report's r6c1-fix section.)
+    assert!(
+        !failed.stdout().contains("dimensions") && !failed.stderr().contains("dimensions"),
+        "a missing file is not a width disagreement:\n{}\n{}",
+        failed.stdout(),
+        failed.stderr()
+    );
+    // The path arm (iii) looked at, spelled where the artifact would live — derived, not guessed.
+    assert!(
+        failed.stdout().contains(&artifact.display().to_string()),
+        "the report has to name the file a person can install: {}",
+        failed.stdout()
+    );
+    // The corpus was read (so `seen` is real) and nothing was written before the arm fired.
+    let stdout = failed.stdout();
+    assert!(summary_count(&stdout, "seen") > 0, "{stdout}");
+    assert_eq!(summary_count(&stdout, "embedded"), 0);
+    assert_eq!(
+        summary_field(&stdout, "verify"),
+        "self-consistent, not verified"
+    );
+}
+
+/// Arm (iv) as the default build actually answers today: configured, installed, artifact present, work owed — and
+/// no inference runtime behind `local-model`. Not feature-gated, because it is the provider *type* that refuses
+/// ([`np_core::embed::LocalModelProvider::embed`] answers `RuntimeNotBuilt` unconditionally) and `np embed` reaches
+/// no other provider in any build.
+#[test]
+fn embed_with_everything_present_reports_the_runtime_that_is_not_built() {
+    let ws = workspace();
+    install_model(&ws); // the artifact stays where `install` put it
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let failed = run(&mut ws.command(&["embed"]));
+
+    assert_eq!(failed.code(), 1, "arm (iv) is exit 1:\n{}", failed.stdout());
+    for channel in [failed.stdout(), failed.stderr()] {
+        assert!(channel.contains("owed and not produced"), "{channel}");
+        assert!(
+            channel.contains("the local embedding runtime is not built yet"),
+            "the refusal has to say the runtime is missing, not that the corpus is empty: {channel}"
+        );
+        assert!(
+            channel.contains(EMBED_MODEL),
+            "and name what stayed owed: {channel}"
+        );
+    }
+    let stdout = failed.stdout();
+    assert!(summary_count(&stdout, "seen") > 0, "{stdout}");
+    assert_eq!(summary_count(&stdout, "embedded"), 0);
+    assert_eq!(summary_count(&stdout, "errors"), 1, "one batch refused");
+}
+
+/// §6 adds no exit code: a missing operand stays clap's problem, and clap's 2 has to survive the trip from
+/// `main`'s own `ExitCode::SUCCESS`/`FAILURE` handling.
+#[test]
+fn embed_without_a_workspace_operand_stays_claps_exit_two() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+    let failed = run(&mut ws.command_without_operand(&["embed"]));
+
+    assert_eq!(
+        failed.code(),
+        2,
+        "argv is clap's to refuse, with clap's code:\n{}",
+        failed.stderr()
+    );
+    assert!(
+        failed.stdout().is_empty(),
+        "a refused argv prints no report: {}",
+        failed.stdout()
+    );
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("WORKSPACE"),
+        "clap has to name the operand that is missing: {stderr}"
+    );
+}
+
+/// One `--json` case, on arm (iii): the outcome object's shape pinned as key sets, and every count equal to the
+/// number the text summary printed for the same state. The label spellings differ on purpose (`seen` /
+/// `chunks_seen`, `refused` / `refused_budget`, `busy-gap` / `busy_gap`), so that mapping is part of what this pins.
+#[test]
+fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
+    let ws = workspace();
+    let artifact = install_model(&ws);
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+    run(&mut ws.command(&["scan"])).assert_success();
+    fs::remove_file(&artifact).expect("test setup: remove the installed artifact file");
+
+    let text = run(&mut ws.command(&["embed"]));
+    let json = run(&mut ws.command(&["embed", "--json"]));
+
+    assert_eq!(text.code(), 1);
+    assert_eq!(
+        json.code(),
+        text.code(),
+        "one fact, one exit code, whatever the channel:\n{}",
+        json.stderr()
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&json.stdout()).expect("`--json` must print one JSON object");
+
+    // The whole top-level key set, so renaming `verification` or giving one arm an extra field fails here rather
+    // than in a reader written against this shape.
+    assert_eq!(
+        json_keys(&report),
+        vec![
+            "busy_gap",
+            "chunks_seen",
+            "current",
+            "embedded",
+            "errors",
+            "model",
+            "outcome",
+            "refused_budget",
+            "verification"
+        ]
+    );
+    // The outcome object is externally tagged: exactly one arm key holding exactly the three fields §6 names.
+    assert_eq!(json_keys(&report["outcome"]), vec!["artifact-absent"]);
+    let absent = &report["outcome"]["artifact-absent"];
+    assert_eq!(json_keys(absent), vec!["artifact", "hint", "model"]);
+    assert_eq!(absent["model"], EMBED_MODEL);
+    assert_eq!(report["model"], EMBED_MODEL);
+    assert_eq!(absent["artifact"], artifact.display().to_string());
+    let hint = absent["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("np models install") && !hint.contains("np models fetch"),
+        "the JSON remedy is the text remedy: {hint}"
+    );
+
+    for (label, field) in [
+        ("seen", "chunks_seen"),
+        ("current", "current"),
+        ("embedded", "embedded"),
+        ("refused", "refused_budget"),
+        ("busy-gap", "busy_gap"),
+        ("errors", "errors"),
+    ] {
+        assert_eq!(
+            report[field].as_u64(),
+            Some(summary_count(&text.stdout(), label)),
+            "`{field}` has to be the number the summary printed for `{label}`:\n{}",
+            text.stdout()
+        );
+    }
+    assert_eq!(
+        report["verification"],
+        summary_field(&text.stdout(), "verify")
+    );
+    // The arm's sentence travels on stderr under `--json` too — two channels, one fact.
+    assert!(
+        json.stderr().contains("artifact absent"),
+        "{}",
+        json.stderr()
     );
 }

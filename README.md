@@ -24,6 +24,7 @@ exist. That is the next round (see below).
 | `np models install <workspace> --id … --path … --dim … --sha256 …` | Put a model artifact under the workspace's model directory, verifying the digest before and after |
 | `np models hash <file>` | Print the SHA-256 of a file, in the format `install` expects |
 | `np models list <workspace>` | Show each model row and whether its artifact is actually present and matches |
+| `np embed <workspace>` | Embed what is owed for the configured model and write it to the database; `--json` reports the same four labelled outcomes this command exits with |
 
 Refusals are deliberate: an unreadable note is reported and left alone, never repaired; an install whose digest does not
 match is refused before a byte is copied; an artifact that disagrees with its own row is reported, not overwritten.
@@ -48,10 +49,18 @@ cargo test --workspace
 
 Default builds contain no C++ and no inference runtime. The `local-model` feature on `np-core` (and a matching passthrough
 on `np-cli`) builds llama.cpp from the sha256-pinned source under `third_party/`, is **Linux-only by refusal** in `build.rs`,
-and is off in releases; it needs `cmake` (set `CMAKE=/path/to/cmake`) and nothing else new. Nothing embeds yet: no command
-writes a vector, which is what the next round is for.```
+and is off in releases; it needs `cmake` (set `CMAKE=/path/to/cmake`) and nothing else new.
 
-CI is **configured** to build and test on Linux and Windows on every push. Read that as configuration rather than
-evidence: no job has started since 2026-10-29 (an account-side Actions problem), so today every measured claim in this
-repo comes from one Linux host, and anything else is a written refusal rather than a tested platform. Release binaries are built for Linux, Windows and macOS; the
+`np embed` works on both sides of that line, and **no build in this repository writes a real vector yet**: even with
+`--features local-model`, `LocalModelProvider::embed` answers `runtime not built`, because the loader and forward pass
+that R6b2 measured inside `local_model` are not called from the provider until R6c2. What the command does today is resolve
+configuration, work out exactly which chunks are owed, and stop with one of four labelled outcomes — naming the feature or
+the missing artifact — instead of writing a placeholder.```
+
+CI is **configured** to build and test on Linux and Windows on every push, and **it does not run**: the account has no
+GitHub Actions budget, so GitHub refuses to start any job (since 2026-10-29, including the green runs this repo had
+before that date). Read the workflows as configuration, not evidence. Every measured claim in this repo therefore comes
+from one Linux host, through the gate list in [`docs/plan-2026-10-28-state-and-roadmap.md`](docs/plan-2026-10-28-state-and-roadmap.md):
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, the no-`$HOME` config suite,
+rustdoc with `--deny warnings`, the two CFG fences, and the catalogue golden check. Release binaries are built for Linux, Windows and macOS; the
 macOS artefact is compiled, not run, so treat its behaviour as unverified until someone runs it.

@@ -405,6 +405,17 @@ pub struct LocalModelProvider {
     artifact: PathBuf,
 }
 
+/// The one spelling of "the bytes the model is handed": `prefix` then `text`, verbatim, nothing between.
+///
+/// R6c1 review D-4: this rule used to be written twice — here and as a local `format!` in
+/// [`crate::embed_run`] — which is how a stamp rule quietly stops describing what the model read. Both callers go
+/// through this function now, so a change to the prefix rule is one edit and both the digest and the batch move
+/// together. Mutating the concatenation here fails `every_text_in_a_batch_travels_with_its_own_prefix` and
+/// `a_changed_prefix_makes_a_stored_vector_stale` (measured: 17 passed / 2 failed).
+pub fn prefixed(prefix: &str, text: &str) -> String {
+    format!("{prefix}{text}")
+}
+
 impl LocalModelProvider {
     /// Build the provider for an installed row.
     ///
@@ -499,7 +510,7 @@ impl LocalModelProvider {
     pub fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
         texts
             .iter()
-            .map(|text| format!("{}{text}", self.prefix_doc))
+            .map(|text| prefixed(&self.prefix_doc, text))
             .collect()
     }
 }
