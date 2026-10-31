@@ -26,6 +26,11 @@
 //!   embed holds no write lock *between* batches.
 //! - **Over-budget text is reported, never truncated** ([`EmbedReport::refused_budget`]): a truncated chunk
 //!   would stamp a whole chunk's digest onto a vector that read part of it (§5).
+//! - **Counting tokens is not this module's job.** Nothing here measures a sequence against
+//!   [`Config::embeddings`](crate::config::EmbeddingsConfig)::`max_tokens`; the number comes from the provider's own
+//!   [`EmbedError::TokenBudgetExceeded`], because pricing a sequence needs the model's tokenizer and that lives behind
+//!   `local-model`. A fake provider therefore cannot make this module *disagree* with §5's budget — it can only relay
+//!   one (R6c1 review D-5, stated here rather than left to inference).
 //!
 //! ## The four exit arms, and one refusal that rides with the last of them
 //!
@@ -61,7 +66,7 @@ use thiserror::Error;
 
 use crate::config::{abs_path, Config, ConfigError, EmbeddingProvider};
 use crate::db::{self, Db, DbError};
-use crate::embed::{EmbedError, Embedder, Vector};
+use crate::embed::{prefixed, EmbedError, Embedder, Vector};
 use crate::hash::sha256_bytes;
 use crate::models;
 use crate::walk;
@@ -414,7 +419,9 @@ fn run(
             unfinished = true;
             continue;
         };
-        let input = format!("{}{text}", row.prefix_doc);
+        // The same function `LocalModelProvider::model_inputs` uses (D-4): the digest below is only a record of
+        // what the model read if both callers spell that string identically.
+        let input = prefixed(&row.prefix_doc, &text);
         let digest = sha256_bytes(input.as_bytes());
         match stamps.get(&chunk.id) {
             Some(stored) if stored == &digest => current += 1,

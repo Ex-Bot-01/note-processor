@@ -316,6 +316,21 @@ A new command, deliberately **not** part of `np scan`: the scan wraps its whole 
 (`unchecked_transaction()` … `tx.commit()`), so unbounded model work inside it would leave a concurrent `np` waiting out
 `busy_timeout` — which is what the parent design §5 forbids.
 
+> **Shipped as (R6c1, 2026-10-31, `crates/np-core/src/embed_run.rs`).** Three things differ from the plan text above, and
+> each is a decision rather than an oversight:
+>
+> * arm (iii) says **`np models install …`, not `np models fetch`**. §14's division of labour stands — fetching is R7b's
+>   job and still does not exist — so naming the fetcher would send a reader to a command this build has never had. The
+>   sentence names the one path that works (`models install` with its real flags) and says plainly that fetching is not
+>   implemented here. When R7b lands, it renames nothing; it adds the missing option.
+> * arm (iii) is evaluated **after** the currency read, so a workspace with nothing owed exits 0 whether or not the
+>   artifact exists. That is exit state (i) as written above ("nothing owed → success") taking precedence over a complaint
+>   about a file no work was waiting on; `np scan`'s warnings are unaffected either way.
+> * **the token budget is enforced in §4's runtime, not here.** Nothing in `embed_run` counts tokens: pricing a sequence
+>   needs the model's tokenizer, which lives behind `local-model`. The writer relays
+>   [`EmbedError::TokenBudgetExceeded`](../crates/np-core/src/embed.rs), retries an over-budget batch member by member so
+>   its batchmates still land, and counts what it refused. §5's "reported, never truncated" is unchanged; the check moved.
+
 - **It reads chunking; it never writes it.** No `chunks` rows, no `EMBED_VERSION_KEY`. It is one reader of the scan's
   output, not a second path through it (the F19 ruling's shape).
 - **Owed = per-row currency, liveness-fenced.** A chunk is owed when its text digest has no matching vector for the

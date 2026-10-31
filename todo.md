@@ -186,5 +186,29 @@ what fails is not a check, because removal makes tests pass.
   before asking for the wider window (`decode_probe nctx=8192`): +0 MiB at rest (133 tokens), and 7,999 tokens in **101 s** at peak
   **1,478 MiB (+1,058 MiB)** — so `DEFAULT_EMBEDDING_TOKENS` stays 1,024 and the interpolated "~63 s per 8k chunk" is replaced by that
   measurement (~79 tok/s). Still unmeasured: whether long-note *recall* improves above the window; we refuse there because one decode cannot
-  hold more in this build, not because the model cannot represent it. Long-note retrieval is bounded by chunking either way. Still owed: R6c wiring config → provider → `embeddings`
-  rows, and R6d's corpus-scale benchmark (batching across texts is deliberately not in this API yet).
+  hold more in this build, not because the model cannot represent it. Long-note retrieval is bounded by chunking either way.
+
+* **R6c1 — `np embed <workspace>`, §6's four arms** ✅ *done 2026-10-31, branch `m14/embed-write`*
+  (`crates/np-core/src/embed_run.rs` + argv coverage in `np-cli`). Currency is one chunk-level query fenced on
+  `files.state = 'ok'`, and a vector counts as current only when it was written against **this** model id with a
+  `source_hash` equal to SHA-256 of the prefixed text the provider receives — so changing `prefix_doc` in the database
+  makes every stored vector stale, which §3's note about prefixes turning into lies needed for its first production
+  reader. Over-budget chunks are refused and counted, never truncated; a `SQLITE_BUSY` batch stamps nothing and is
+  reported as the gap it is. The writer takes an injected `&dyn Embedder`, so all of this is measured against a fake in
+  the default suite (21 cases) and none of it waits on a 310 MB artifact.
+  Review: both scoped reviewers timed out with nothing written, so the controller reviewed its own round under a stated
+  conflict of interest and leaned on mutation testing instead — which found two surviving mutants worth naming: deleting
+  `paired`'s **one-for-one length** arm left every case green (a provider answering N texts with N−1 vectors would pair
+  silently, stamp the wrong vector onto chunks, and mark them current forever), and deleting its **per-vector width** arm
+  likewise. Both are fenced now. Still owed: an independent read of this range by someone without that conflict.
+* **R6c2 — wire the runtime that already works into the provider that refuses.** Verified by reading the call graph: no
+  production path calls `local_model::load` or `LoadedModel::embed_text`, so `LocalModelProvider::embed` answers
+  [`EmbedError::RuntimeNotBuilt`] in **every** build, feature flag or not — the working loader and forward pass sit behind a
+  door nothing opens yet. R6c2 opens it (lifecycle: who holds ~420 MB at rest and for how long), then adds the artifact-gated
+  §7 assertions that no fake can stand in for: batch invariance under a **non-empty** `prefix_doc` (§5 left that pairing
+  untested on purpose), unit norms, and the accept-at-exactly-`window` boundary. Blocked on nothing but a window that can hold
+  the work — the last five subagent rounds died at their deadlines.
+* **R6d — corpus-scale benchmark**, batching across texts (deliberately absent from this API), and the accept-at-exactly-
+  `window` assertion, which belongs in artifact-gated coverage rather than in CI.
+* **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its
+  exit codes are the evidence; nothing here is claimed on CI's behalf.
