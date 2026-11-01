@@ -21,8 +21,8 @@ mod common;
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
     config_file_path, CatalogConfig, Config, ConfigError, EmbeddingProvider, EmbeddingsConfig,
-    MarkerConfig, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS, MAX_CONTINUATION_INDENT,
-    MAX_EMBEDDING_TOKENS,
+    MarkerConfig, ModelsConfig, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS,
+    MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -47,14 +47,34 @@ fn config_with_data_dir(dir: &Path) -> Config {
     Config::load(Some(&path)).expect("test setup: load config")
 }
 
-/// Every variable `config_file_path` and `default_data_dir` consult, on either platform.
-const ENV_KEYS: [&str; 5] = [
+/// Every variable a case can be affected by: the five `config_file_path` and `default_data_dir` consult, on either
+/// platform, plus the two `[models]` overrides of §12 rule 7.
+const ENV_KEYS: [&str; 7] = [
     "HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "APPDATA",
     "LOCALAPPDATA",
+    "NP_MODELS_BASE_URL",
+    "NP_MODELS_SHA256",
 ];
+
+/// The last two of [`ENV_KEYS`]: overrides rather than directories, so the isolated state is *unset* — there is no
+/// temp-dir value they should point at. [`TestEnv::install`] clears them for exactly that reason; a case that wants
+/// one asks through [`TestEnv::set_var`].
+const OVERRIDE_ENV_KEYS: [&str; 2] = [ENV_KEYS[5], ENV_KEYS[6]];
+
+/// Take [`ENV_LOCK`] without installing a temp environment.
+///
+/// Since `[models]` reads `NP_MODELS_BASE_URL` / `NP_MODELS_SHA256` on **every** `Config::load`, a case that loads a
+/// config file is now affected by another thread's installed override even when it never touches the environment
+/// itself — which is what a valueless `data_dir`-in-a-temp-dir fixture used to be immune to. Holding the lock is the
+/// whole isolation here: nothing is set, nothing is restored, and the case still runs against its own explicit path.
+fn hold_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Serialises the cases that rewrite the process environment.
 ///
@@ -74,8 +94,9 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// The same isolation the CLI integration tests get from `Command::env`
 /// (`crates/np-cli/tests/cli.rs:38`) comes from `env::set_var` here, guarded by [`ENV_LOCK`]; the
-/// previous values go back on drop. No other case in this file reads the environment — each passes
-/// an explicit config path or a `data_dir` inside its own `TempDir`.
+/// previous values go back on drop. Most cases need none of this — each passes an explicit config path or a
+/// `data_dir` inside its own `TempDir` — but every `[models]` case holds one, because those two keys are read out of
+/// the environment by `Config::load` whether or not the fixture asked ([`OVERRIDE_ENV_KEYS`] clears them).
 struct TestEnv {
     /// Held until the values are restored, so no second case installs over ours. A poisoned lock can
     /// only come from a case that already failed, so its contents are taken regardless.
@@ -104,10 +125,30 @@ impl TestEnv {
         env::set_var("XDG_DATA_HOME", Self::data_dir_of(&tmp));
         env::set_var("APPDATA", tmp.path().join("config"));
         env::set_var("LOCALAPPDATA", Self::data_dir_of(&tmp));
+        // A developer's own mirror or digest override is the same leak as a stray `$HOME`: it would decide what an
+        // unrelated case loads, and — since `[models]` refuses bad values — could fail a case for a key it never set.
+        for key in OVERRIDE_ENV_KEYS {
+            env::remove_var(key);
+        }
         Self {
             _guard: guard,
             _tmp: tmp,
             previous,
+        }
+    }
+
+    /// Set or clear one of the variables this fixture snapshots, for the rest of the case.
+    ///
+    /// Restoring it is [`Drop`]'s job, which is why the key has to be one of [`ENV_KEYS`] — a variable outside that
+    /// list would be set with nothing to put back, and would leak into every later case in this binary.
+    fn set_var(&mut self, key: &'static str, value: Option<&str>) {
+        assert!(
+            ENV_KEYS.contains(&key),
+            "test fixture: {key} is not snapshotted, so setting it here could not be undone"
+        );
+        match value {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
         }
     }
 
@@ -210,6 +251,7 @@ fn empty_config_file_keeps_defaults() {
 
 #[test]
 fn unparsable_config_file_is_a_parse_error() {
+    let _env = hold_env();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = write_config(tmp.path(), "catalog.max_entries_per_file = \"many\"\n");
 
@@ -229,6 +271,7 @@ fn unparsable_config_file_is_a_parse_error() {
 
 #[test]
 fn explicit_missing_config_file_is_an_io_error() {
+    let _env = hold_env();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let missing = tmp.path().join("typo.toml");
 
@@ -283,6 +326,7 @@ fn config_file_path_points_at_note_processor_config() {
 
 #[test]
 fn workspace_db_is_stable_and_unique() {
+    let _env = hold_env();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let cfg = config_with_data_dir(tmp.path());
 
@@ -311,6 +355,7 @@ fn workspace_db_is_stable_and_unique() {
 
 #[test]
 fn workspace_db_name_is_lowercase_hex() {
+    let _env = hold_env();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let cfg = config_with_data_dir(tmp.path());
 
@@ -331,6 +376,7 @@ fn workspace_db_name_is_lowercase_hex() {
 
 #[test]
 fn relative_workspace_path_is_resolved_against_the_cwd() {
+    let _env = hold_env();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let cfg = config_with_data_dir(tmp.path());
     let cwd = std::env::current_dir().expect("test: current dir");
@@ -572,6 +618,7 @@ fn non_utf8_workspace() -> PathBuf {
 #[cfg(unix)]
 #[test]
 fn workspace_db_separates_a_non_utf8_path_from_its_lossy_spelling() {
+    let _env = hold_env();
     // Lossy decoding maps `0xFF` and a literal replacement character to the same text, so hashing
     // the decoded string would hand two different workspaces one database — and each scan of one
     // would mark the other's notes stale.
@@ -608,6 +655,7 @@ fn write_config_with_data_dir(dir: &Path, body: &str) -> PathBuf {
 
 #[test]
 fn an_oversized_continuation_indent_is_refused_naming_key_value_and_ceiling() {
+    let _env = hold_env();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = write_config_with_data_dir(tmp.path(), "[catalog]\ncontinuation_indent = 17\n");
 
@@ -641,6 +689,7 @@ fn an_oversized_continuation_indent_is_refused_naming_key_value_and_ceiling() {
 
 #[test]
 fn the_ceiling_itself_is_accepted_and_zero_means_no_indent() {
+    let _env = hold_env();
     // The boundary, because a check that refuses 17 but also refuses 16 has off-by-one-drifted into breaking the
     // documented range; and 0, which is a legal layout choice (flush continuation lines) rather than an absurdity.
     for indent in [0usize, MAX_CONTINUATION_INDENT] {
@@ -657,6 +706,7 @@ fn the_ceiling_itself_is_accepted_and_zero_means_no_indent() {
 
 #[test]
 fn refusing_an_oversized_indent_leaves_the_default_alone() {
+    let _env = hold_env();
     // The default path is what every golden byte was rendered with, so this item must not nudge it. Absent key ⇒ 2,
     // exactly as before the check existed.
     let tmp = TempDir::new().expect("test setup: tempdir");
@@ -734,6 +784,7 @@ fn an_unrecognised_embeddings_key_is_refused_even_beside_a_valid_one() {
 
 #[test]
 fn omitting_the_embeddings_section_means_no_provider() {
+    let _env = hold_env();
     // §2's shipping default, asserted on a file that says nothing about embeddings at all: no section,
     // no download, no contact. This is also the half of the story the refusal above cannot tell — a
     // reader who only saw the strict struct could not tell an omitted section from a refused one.
@@ -758,6 +809,7 @@ fn omitting_the_embeddings_section_means_no_provider() {
 
 #[test]
 fn every_provider_spelling_parses_and_a_partial_section_keeps_its_defaults() {
+    let _env = hold_env();
     // The three kebab-case spellings §2 uses, pinned from a file rather than from the enum. R6a changed what
     // each spelling *earns*, not what it parses to: `none` and `local-model` load (`local-model` only beside
     // a model — §4 refuses a local provider with no identity), and `openai-compatible` is refused by **us**.
@@ -824,6 +876,7 @@ fn every_provider_spelling_parses_and_a_partial_section_keeps_its_defaults() {
 
 #[test]
 fn an_unknown_key_outside_embeddings_still_loads() {
+    let _env = hold_env();
     // The strictness is scoped, and this is the half that proves it: `[catalog]` and the top level keep
     // the lenient posture every existing config file relies on. Without this case, a reader of the test
     // above could not tell "one section refuses typos" from "the whole file does" — and flipping the
@@ -864,6 +917,7 @@ const LOCAL_ID: &str = "embeddinggemma-2-text-q8_0@1";
 /// asserts the message does *not* claim the model cannot attend to that many tokens.
 #[test]
 fn the_token_ceiling_carries_the_builds_window_into_its_refusal() {
+    let _env = hold_env();
     let (_path, err) = embeddings_refusal(&format!(
         "[embeddings]\nmax_tokens = {}\n",
         MAX_EMBEDDING_TOKENS + 1
@@ -901,6 +955,7 @@ fn the_token_ceiling_carries_the_builds_window_into_its_refusal() {
 
 #[test]
 fn an_absent_max_tokens_takes_the_default_and_changes_nothing_else() {
+    let _env = hold_env();
     // R6a adds a key to a section that used to *refuse* it by name, so the property that matters is what an
     // existing file still means: two fixtures written before this round — one silent about embeddings, one
     // naming provider/model/dim — must parse to exactly the values they parsed to then, plus the default budget. A
@@ -953,6 +1008,7 @@ fn an_absent_max_tokens_takes_the_default_and_changes_nothing_else() {
 
 #[test]
 fn an_explicit_max_tokens_is_taken_verbatim_up_to_the_ceiling() {
+    let _env = hold_env();
     // The boundaries of the accepted range: 1 is a legal if brutal budget, and `MAX_EMBEDDING_TOKENS` itself
     // must load — a check that refuses its own ceiling has off-by-one-drifted into breaking documented range,
     // which is the reason `the_ceiling_itself_is_accepted_and_zero_means_no_indent` exists for the indent.
@@ -1007,6 +1063,7 @@ fn a_max_tokens_outside_its_bounds_is_refused_naming_key_value_and_both_bounds()
 /// `CHECK (length(vector) = 4 * dim)` admits a zero-byte vector at `dim = 0`, so both doors refuse.
 #[test]
 fn a_zero_width_is_refused_because_it_names_no_vector() {
+    let _env = hold_env();
     let (_path, err) = embeddings_refusal(
         "[embeddings]\nprovider = \"local-model\"\nmodel = \"gemma-2-text-q8_0@1\"\ndim = 0\n",
     );
@@ -1049,6 +1106,7 @@ fn local_model_without_a_model_is_refused_naming_the_key_it_needs() {
 
 #[test]
 fn local_model_with_an_uninstallable_id_is_refused_naming_the_id_and_the_rule() {
+    let _env = hold_env();
     // "a `model` naming an installed row", the half that needs no database: whether an id *can* name a row is
     // `models::validate_id`'s rule, reused here rather than restated — and the id itself goes in the message,
     // because the reader has to know which of their keys to edit.
@@ -1125,4 +1183,384 @@ fn the_new_refusals_are_scoped_to_the_provider_that_needs_them() {
 
     // Mutation this catches: running `validate_id` on `model` regardless of provider, which turns every
     // existing file holding a placeholder string into a refusal.
+}
+
+// ---------------------------------------------------------------------------
+// R7b C1: `[models] base_url` and `[models] sha256`
+// (`docs/design-m2-local-embeddings.md` §12 rule 7).
+//
+// The section's two keys are the only place this program can be told *where* artifacts come from and *which digest*
+// to accept instead of the pin, so the cases below are mostly about refusals — a value that silently means "unset"
+// is §12 rule 7's forbidden outcome ("Silent fallback stays impossible"). Precedence is asserted in
+// `the_file_wins_and_the_environment_fills_only_an_unset_key`, and it mirrors `data_dir` in `Config::load`: the file
+// wins, the environment fills a key the file left unset. `[embeddings]` has no env rule to mirror because it has
+// none, so nothing here copies one from it.
+// ---------------------------------------------------------------------------
+
+/// A digest of the shape both doors accept, spelled in uppercase so the normalisation is visible: sha256 of the
+/// empty input, which is published (`tests/hash.rs` asserts the lowercase spelling), so this fixture invents nothing.
+const UPPER_DIGEST: &str = "A3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
+const LOWER_DIGEST: &str = "a3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// Write `body` as a config file, load it expecting refusal, and return the file with the error.
+///
+/// The `[models]` twin of [`embeddings_refusal`], including why the path comes back: "names the file" has to be
+/// asserted against the error's **own** text. It also holds a [`TestEnv`] for the duration of the load, so the
+/// refusal being examined cannot have been produced by an override sitting in the developer's shell.
+fn models_refusal(body: &str) -> (PathBuf, ConfigError) {
+    let _env = TestEnv::install();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), body);
+    let err = match Config::load(Some(&path)) {
+        Ok(cfg) => panic!(
+            "the file must be refused, loaded base_url = {:?} sha256 = {:?}",
+            cfg.models.base_url, cfg.models.sha256
+        ),
+        Err(err) => err,
+    };
+    (path, err)
+}
+
+#[test]
+fn an_absent_models_section_names_neither_a_source_nor_an_override() {
+    // The shipped state, and the one every existing config file is in: no fetch source, and the pin stands. Under
+    // `TestEnv` because "absent" has to mean absent from the environment as well as from the file.
+    let _env = TestEnv::install();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 400\n");
+
+    let cfg = Config::load(Some(&path)).expect("a file with no [models] section is a valid config");
+
+    assert_eq!(cfg.models.base_url, None);
+    assert_eq!(cfg.models.sha256, None);
+    assert_eq!(
+        cfg.models,
+        ModelsConfig::default(),
+        "and that is the same state `Config::default()` describes for a fresh install"
+    );
+    assert_eq!(
+        cfg.models.unpinned_digest_override(),
+        None,
+        "no override means nothing unpinned can be accepted"
+    );
+
+    // Mutation this catches: defaulting `base_url` to some host — the file above would then carry an origin nobody
+    // chose, which is the compile-time-secret shape §12 rule 7 refuses.
+}
+
+#[test]
+fn a_models_section_arrives_apart_from_the_two_normalisations() {
+    // Exactly two things may change a value on its way in: one trailing `/` off an origin, and case off a digest.
+    // Everything else is the operator's spelling, kept.
+    let _env = TestEnv::install();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        &format!(
+            "[models]\nbase_url = \"https://mirror.example/models/\"\nsha256 = \"{UPPER_DIGEST}\"\n"
+        ),
+    );
+
+    let cfg = Config::load(Some(&path)).expect("a valid [models] section loads");
+
+    assert_eq!(
+        cfg.models.base_url.as_deref(),
+        Some("https://mirror.example/models"),
+        "one trailing slash is the same origin twice, and storing it would make every later join ambiguous"
+    );
+    assert_eq!(
+        cfg.models.sha256.as_deref(),
+        Some(LOWER_DIGEST),
+        "a digest is compared against lowercase hex, so it is stored that way"
+    );
+    assert_eq!(
+        cfg.models.unpinned_digest_override(),
+        Some(LOWER_DIGEST),
+        "the accessor reports the same lowered value the field holds, not the input spelling"
+    );
+
+    // The other normalisation edge: only **one** slash comes off. `…/base//` is not a typo this code can read minds
+    // about, and a later join will show it rather than hide it.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        "[models]\nbase_url = \"https://mirror.example/base//\"\n",
+    );
+    let cfg = Config::load(Some(&path)).expect("a doubled slash is odd, not invalid");
+    assert_eq!(
+        cfg.models.base_url.as_deref(),
+        Some("https://mirror.example/base/")
+    );
+
+    // And a port survives untouched — the shape C2's loopback fixture will use.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        "[models]\nbase_url = \"http://127.0.0.1:8099\"\n",
+    );
+    let cfg = Config::load(Some(&path)).expect("a loopback origin with a port is an origin");
+    assert_eq!(
+        cfg.models.base_url.as_deref(),
+        Some("http://127.0.0.1:8099")
+    );
+}
+
+#[test]
+fn the_file_wins_and_the_environment_fills_only_an_unset_key() {
+    // `data_dir`'s precedence, reused: a file that names a value is not overruled by the environment, and a file
+    // that omits one takes the environment's. Both halves are asserted because a one-directional rule would pass a
+    // test written for the other half — and only one of the two directions is what an operator debugging a mirror
+    // expects.
+    let mut env = TestEnv::install();
+    env.set_var(
+        "NP_MODELS_BASE_URL",
+        Some("https://from-the-environment.example"),
+    );
+    env.set_var("NP_MODELS_SHA256", Some(LOWER_DIGEST));
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        "[models]\nbase_url = \"https://from-the-file.example\"\n",
+    );
+    let cfg = Config::load(Some(&path)).expect("both values are legal");
+    assert_eq!(
+        cfg.models.base_url.as_deref(),
+        Some("https://from-the-file.example"),
+        "an explicit file value is not overridden by the environment"
+    );
+    assert_eq!(
+        cfg.models.sha256.as_deref(),
+        Some(LOWER_DIGEST),
+        "a key the file left unset comes from the environment"
+    );
+
+    // With neither key in the file, both come from the environment — and the env value is normalised and validated
+    // on the way in like any other (see `an_env_supplied_value_is_validated_and_named_by_variable`).
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 400\n");
+    let cfg =
+        Config::load(Some(&path)).expect("an environment-only [models] section is a valid config");
+    assert_eq!(
+        cfg.models.base_url.as_deref(),
+        Some("https://from-the-environment.example")
+    );
+    assert_eq!(cfg.models.sha256.as_deref(), Some(LOWER_DIGEST));
+
+    // Mutation this catches: inverting the precedence (the first assertion fails), or never reading the environment
+    // (the second does).
+}
+
+#[test]
+fn an_empty_models_variable_counts_as_unset() {
+    // `env_path`'s rule for a path — "an empty value counts as unset, as the XDG base directory spec requires" —
+    // extended to these two keys, because `NP_MODELS_SHA256=` in a CI shell means "not set", not "the empty digest
+    // is acceptable". The second reading would be a refusal at best and an override at worst.
+    let mut env = TestEnv::install();
+    env.set_var("NP_MODELS_BASE_URL", Some(""));
+    env.set_var("NP_MODELS_SHA256", Some(""));
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 400\n");
+    let cfg = Config::load(Some(&path)).expect("an empty variable is unset, and unset is valid");
+
+    assert_eq!(cfg.models.base_url, None, "empty is not an origin");
+    assert_eq!(cfg.models.sha256, None, "empty is not a digest");
+}
+
+#[test]
+fn a_models_origin_that_is_not_http_or_https_is_refused_naming_key_and_value() {
+    // Five shapes that are not a fetch source. Each refusal has to name the key and carry the value, because the
+    // reader is looking at a file with two similar keys and needs to know which line to edit.
+    for value in [
+        "mirror.example/models",
+        "ftp://mirror.example",
+        "https://",
+        "https://user@mirror.example",
+        "https://mir ror.example",
+    ] {
+        let (_path, err) = models_refusal(&format!("[models]\nbase_url = \"{value}\"\n"));
+        let message = err.to_string();
+        assert!(
+            message.contains("models.base_url"),
+            "the refusal must name the key: {message}"
+        );
+        assert!(
+            message.contains(value),
+            "and carry the value it refused: {message}"
+        );
+        let ConfigError::Io(io_err) = &err else {
+            panic!("valid TOML holding an unservable origin must not be reported as a parse error: {err:?}");
+        };
+        assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // Mutation this catches: accepting anything non-empty, which lets `ftp://` or a bare host reach a transport and
+    // turn a configuration typo into a runtime refusal three hundred megabytes later.
+}
+
+#[test]
+fn a_models_digest_that_is_not_64_hex_is_refused_naming_the_key() {
+    // The same posture as `install --sha256`, which refuses the **format** before hashing anything: a truncated
+    // paste and a different artifact are different problems, and only one of them is fixed by re-running
+    // `np models hash`. The 8-character case is not arbitrary — it is the length of the prefix design §12 quotes,
+    // which is exactly what an operator would paste from a chat message.
+    for value in ["c4a8a526", &"0".repeat(63), &"z".repeat(64)] {
+        let (_path, err) = models_refusal(&format!("[models]\nsha256 = \"{value}\"\n"));
+        let message = err.to_string();
+        assert!(
+            message.contains("models.sha256"),
+            "the refusal must name the key: {message}"
+        );
+        assert!(
+            message.contains("64 hexadecimal characters"),
+            "and the rule it broke, in the shape `install --sha256` already uses: {message}"
+        );
+        let ConfigError::Io(io_err) = &err else {
+            panic!("a bad digest is data being rejected, not a broken file: {err:?}");
+        };
+        assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // The value itself stays out of the message — 64 characters of noise in a sentence that has to stay readable,
+    // and the operator can read their own file.
+    let (_path, err) = models_refusal(&format!("[models]\nsha256 = \"{}\"\n", "z".repeat(64)));
+    assert!(
+        !err.to_string().contains(&"z".repeat(16)),
+        "the refused digest must not be echoed: {err}"
+    );
+}
+
+#[test]
+fn an_env_supplied_value_is_validated_and_named_by_variable() {
+    // A rule that watched only the file would let the environment route around it, which is why validation runs on
+    // the merged value. The message then has to name the **variable**: telling someone to edit a `models.base_url`
+    // line their file does not contain wastes the one thing a refusal is for.
+    let mut env = TestEnv::install();
+    env.set_var("NP_MODELS_BASE_URL", Some("mirror.example"));
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 400\n");
+    let err = match Config::load(Some(&path)) {
+        Ok(cfg) => panic!(
+            "an environment origin with no scheme must be refused, got {:?}",
+            cfg.models.base_url
+        ),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("NP_MODELS_BASE_URL"),
+        "the refusal has to point at the variable: {err}"
+    );
+
+    // Same for the digest, and the same lowercase normalisation on the way in — otherwise the override would be
+    // compared against a pin in a different case and refuse a byte-perfect download.
+    env.set_var("NP_MODELS_BASE_URL", None);
+    env.set_var("NP_MODELS_SHA256", Some("c4a8a526"));
+    let err = match Config::load(Some(&path)) {
+        Ok(cfg) => panic!(
+            "an 8-character digest must be refused, got {:?}",
+            cfg.models.sha256
+        ),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("NP_MODELS_SHA256") && message.contains("64 hexadecimal characters"),
+        "the variable and the rule, both in one sentence: {message}"
+    );
+
+    env.set_var("NP_MODELS_SHA256", Some(UPPER_DIGEST));
+    let cfg =
+        Config::load(Some(&path)).expect("a valid uppercase digest from the environment loads");
+    assert_eq!(
+        cfg.models.unpinned_digest_override(),
+        Some(LOWER_DIGEST),
+        "and is stored lowered, exactly like the file's"
+    );
+}
+
+#[test]
+fn an_unrecognised_models_key_is_refused_naming_key_and_file() {
+    // §12 rule 7's "silent fallback stays impossible", applied to a typo: `baseurl` would otherwise load as *no
+    // source configured*, and the operator would believe their mirror was set while every fetch refused for want of
+    // an origin. Same reasoning, and same refusal shape, as `a_misspelled_embeddings_key_is_refused_naming_key_and_file`.
+    let (_path, err) = models_refusal("[models]\nbaseurl = \"https://mirror.example\"\n");
+    let message = err.to_string();
+
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "an unknown key must travel as the typed parse refusal, got {err:?}"
+    );
+    // Quoted, for the reason that test gives: toml lists the legal fields too, so a bare word would match the
+    // suggestion list. "`baseurl`" is not a substring of "`base_url`".
+    assert!(
+        message.contains("`baseurl`"),
+        "the refusal must name the misspelled key as written: {message}"
+    );
+
+    // Mutation this catches: dropping `deny_unknown_fields` from `ModelsConfig`, which loads this file with
+    // `base_url = None` — the panic inside `models_refusal` reports that, loaded value and all.
+}
+
+#[test]
+fn the_models_strictness_is_scoped_to_the_models_section() {
+    // The other half of the rule, and the half one refusal test cannot show: strictness stops at the section's
+    // boundary, so an existing config file with a stray key beside it keeps loading (`an_unknown_key_outside_embeddings_still_loads`
+    // is the same argument for `[embeddings]`).
+    let _env = TestEnv::install();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        "stray_top_level = 1\n[catalog]\nmax_entries_per_file = 400\nstray = \"x\"\n[models]\nbase_url = \"https://mirror.example\"\n",
+    );
+
+    let cfg = Config::load(Some(&path)).expect("unknown keys outside [models] stay accepted");
+    assert_eq!(cfg.catalog.max_entries_per_file, 400);
+    assert_eq!(
+        cfg.models.base_url.as_deref(),
+        Some("https://mirror.example")
+    );
+
+    // Mutation this catches: adding `deny_unknown_fields` to `Config` or `CatalogConfig`, which would refuse config
+    // files that work today.
+}
+
+/// A variable whose bytes are not valid UTF-8, so no `String` can hold it — the same construction
+/// [`non_utf8_workspace`] uses for a path.
+#[cfg(unix)]
+fn non_utf8_value() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    // `0xFF` is not a UTF-8 sequence.
+    std::ffi::OsString::from_vec(vec![b'h', b't', b't', b'p', b':', 0xff])
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_text_models_variable_is_refused_rather_than_ignored() {
+    // Both keys are ASCII by rule (an origin, a hex digest), so a value the OS cannot hand us as text is a mistake
+    // in the environment someone could fix. Skipping it would report "unset" to a person who believes they set an
+    // override — which is the silent fallback this section exists to forbid.
+    //
+    // Gated on unix because building non-UTF-8 bytes is platform-specific (F18: no claim about a platform this case
+    // does not run on). Windows gets the same code path through `OsString`, untested here, and this file says so
+    // rather than implying otherwise.
+    // `TestEnv` captured this key at install, so its `Drop` puts the variable back — which is why the raw
+    // `env::set_var` below (the typed helper takes `&str`, and the point here is a value that is not text) cannot
+    // leak into another case. The binding itself is what holds [`ENV_LOCK`].
+    let _env = TestEnv::install();
+    env::set_var("NP_MODELS_BASE_URL", non_utf8_value());
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 400\n");
+    let err = match Config::load(Some(&path)) {
+        Ok(cfg) => panic!(
+            "a non-text origin must be refused, got {:?}",
+            cfg.models.base_url
+        ),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("NP_MODELS_BASE_URL"),
+        "the refusal has to name the variable nobody can read: {err}"
+    );
 }

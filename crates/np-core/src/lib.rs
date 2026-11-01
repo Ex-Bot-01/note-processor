@@ -22,6 +22,9 @@ pub mod local_model;
 pub mod models;
 pub mod parse;
 pub mod path_keys;
+// The pin table is data with no dependency and no I/O, so it carries no feature gate: the fetch engine behind it
+// arrives later (§12 rule 7), and a pin a build could compile out would pin nothing.
+pub mod pins;
 pub mod scan;
 pub mod walk;
 

@@ -54,7 +54,10 @@ const ID_MAX_CHARS: usize = 64;
 
 /// Length of a sha256 spelled as hex, which is what `--sha256` has to be (§3 step 4) and what
 /// [`crate::hash::sha256_file`] returns.
-const DIGEST_HEX_CHARS: usize = 64;
+///
+/// `pub(crate)` because `[models] sha256` is the same fact about the same kind of value: `config` validates that key
+/// against this number rather than declaring a second 64 that could drift from the one a digest is checked against.
+pub(crate) const DIGEST_HEX_CHARS: usize = 64;
 
 /// Suffix of the temporary artifact name, before its `rename` — the same publish discipline as
 /// `crate::scan`'s catalog writes ("no reader ever sees half an artifact"), kept separate because a
@@ -751,7 +754,7 @@ pub enum ModelError {
         /// The rule it broke.
         rule: &'static str,
     },
-    /// `--sha256` is not exactly `DIGEST_HEX_CHARS` (private) hex characters (§3 step 4). Refused rather than
+    /// `--sha256` is not exactly `DIGEST_HEX_CHARS` (crate-private) hex characters (§3 step 4). Refused rather than
     /// treated as "does not match": a truncated paste and a different artifact are different problems, and
     /// only one of them is fixed by re-running `np models hash`.
     #[error("`--sha256` must be exactly {DIGEST_HEX_CHARS} hexadecimal characters; this argument holds {chars}")]
@@ -1195,8 +1198,10 @@ fn windows_device_name(id: &str) -> Option<&'static str> {
         .copied()
 }
 
-/// Validate a declared digest as exactly `DIGEST_HEX_CHARS` (private) hex characters and return it lowered (§3 step 4).
-fn normalize_digest(declared: &str) -> Result<String, ModelError> {
+/// Validate a declared digest as exactly `DIGEST_HEX_CHARS` (crate-private) hex characters and return it lowered
+/// (§3 step 4). `config` reuses this for `[models] sha256`, so the format rule has one home; only the sentence each
+/// caller prints differs, because each names a different place to go and fix.
+pub(crate) fn normalize_digest(declared: &str) -> Result<String, ModelError> {
     // Characters on both sides. `len()` is bytes, so a pasted argument holding one non-ASCII character (a stray
     // non-breaking space from a web page is the ordinary cause) was refused with "this argument holds 64" — a
     // message contradicting itself exactly when it was most needed.

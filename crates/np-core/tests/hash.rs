@@ -3,11 +3,17 @@
 //! `tests/change.rs` stays filesystem-free; this file is where `sha256_file` gets its
 //! coverage, because reading in chunks is exactly the kind of loop that passes on a
 //! one-line fixture and breaks on a real note.
+//!
+//! [`Sha256Stream`] is covered here too, and the two sets of cases are the same claim from two sides: the stream is
+//! the program's one digest definition (§12 rule 9) and the file/bytes helpers are its callers, so "the caller and
+//! the stream agree" is what keeps that from being a slogan. If they ever disagree, one of them grew a second
+//! hasher.
 
 use std::fs;
+use std::io::{self, Cursor, Write};
 use std::path::Path;
 
-use np_core::hash::{sha256_bytes, sha256_file};
+use np_core::hash::{sha256_bytes, sha256_file, Sha256Stream};
 use tempfile::TempDir;
 
 #[test]
@@ -42,6 +48,62 @@ fn sha256_file_matches_sha256_bytes_over_many_chunks() {
             "{size} bytes must hash the same as the same bytes in memory"
         );
     }
+}
+
+#[test]
+fn a_stream_split_at_any_point_digests_like_one_call() {
+    // The property the fetcher depends on: bytes arriving in pieces hash to what the same bytes hash to whole,
+    // or a streamed download could never be checked against a pin computed from a file.
+    let body: Vec<u8> = (0..200_000usize).map(|byte| (byte % 251) as u8).collect();
+    for split in [1usize, 7, 4096, 65_536, 64 * 1024, body.len()] {
+        let mut stream = Sha256Stream::new();
+        for piece in body.chunks(split) {
+            stream.update(piece);
+        }
+        assert_eq!(
+            stream.finish_hex(),
+            sha256_bytes(&body),
+            "chunks of {split} bytes must digest as one"
+        );
+    }
+
+    // Mutation this catches: `sha256_file` or `sha256_bytes` growing their own hasher again and drifting from the
+    // stream — e.g. hex uppercased in one path, which fails here and in the file case above.
+}
+
+#[test]
+fn writing_to_the_stream_hashes_every_byte_it_is_given() {
+    // `impl Write` exists so a transfer can hash inside `io::copy` and count in the same pass, so what is asserted
+    // is both halves: the digest matches, **and** the byte count `copy` reports is the length that was hashed.
+    let body: Vec<u8> = (0..100_000usize).map(|byte| (byte % 97) as u8).collect();
+    let mut stream = Sha256Stream::new();
+    let copied =
+        io::copy(&mut Cursor::new(&body), &mut stream).expect("writing to a digest cannot fail");
+
+    assert_eq!(
+        copied as usize,
+        body.len(),
+        "the count is the same pass's other answer"
+    );
+    assert_eq!(stream.finish_hex(), sha256_bytes(&body));
+
+    // `write_all` reaches the same place through the same trait, which is what a caller with one buffer in hand uses.
+    let mut again = Sha256Stream::new();
+    again
+        .write_all(&body)
+        .expect("writing to a digest cannot fail");
+    assert_eq!(again.finish_hex(), sha256_bytes(&body));
+}
+
+#[test]
+fn an_empty_stream_digests_like_empty_bytes() {
+    // "Nothing fed yet" is a real state with a published digest, and the fetcher's zero-length response has to be
+    // distinguishable from a pin rather than reported as one.
+    assert_eq!(Sha256Stream::new().finish_hex(), sha256_bytes(b""));
+    assert_eq!(
+        Sha256Stream::new().finish_hex(),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
 }
 
 #[test]
