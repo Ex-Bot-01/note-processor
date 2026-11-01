@@ -130,7 +130,7 @@ jobs:
           set -uo pipefail
           cargo test --locked -p np-core --features local-model --lib --test local_runtime \
             --test local_load --test local_embed --test local_window --test artifact_verify \
-            -- --nocapture 2>&1 \
+            --test local_corpus -- --nocapture 2>&1 \
             | tee /tmp/feature-tests.log
           status=${PIPESTATUS[0]}
           count=$(grep -c 'NOT COVERAGE' /tmp/feature-tests.log)
@@ -143,12 +143,15 @@ jobs:
           # with no artifact configured, this command prints **20**: thirteen in local_embed (twelve since R6b2 plus
           # R6c2's provider-shape case), four of seven in local_load, three in local_window. `local_runtime` prints
           # none because it cannot skip - it is the row that proves the seam refuses without a runtime.
-          # `artifact_verify` (D12) prints none either: its eight cases hash a few hundred fixture bytes rather than
+          # `artifact_verify` (D12) prints none either: its ten cases hash a few hundred fixture bytes rather than
           # the pinned artifact, so they run for real on a runner with no model file. It is on this row because the
-          # function it tests lives behind `local-model`. A smaller
-          # total means the prints stopped reaching the log - `--nocapture` lost, or a case silently became a real
-          # pass with no artifact - and "compiled, never ran" would be implied rather than stated again.
-          if [ "$count" -lt 20 ]; then
+          # function it tests lives behind `local-model`.
+          # `local_corpus` (R6d round 3) adds three: every case there needs the weights, so on GitHub it is compilation
+          # plus three printed skips - the honest state of a corpus benchmark on a runner with no model and no budget
+          # for ten minutes of CPU. Total with no artifact, re-measured 2026-10-31: **23**. A smaller total means the
+          # prints stopped reaching the log - `--nocapture` lost, or a case silently became a real pass with no
+          # artifact - and "compiled, never ran" would be implied rather than stated again.
+          if [ "$count" -lt 23 ]; then
             echo "expected at least 20 NOT COVERAGE lines with no artifact, saw $count: §2 step 4 is not on the record" >&2
             exit 1
           fi
