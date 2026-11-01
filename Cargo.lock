@@ -354,6 +354,7 @@ dependencies = [
 name = "np-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "regex",
  "rusqlite",
  "serde",

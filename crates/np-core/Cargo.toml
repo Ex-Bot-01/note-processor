@@ -34,3 +34,8 @@ walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# `fetch`'s disk preflight asks the filesystem how much room it has. Only unix exposes `statvfs`, so only unix gets
+# the dependency: elsewhere `available_bytes` answers None and the report says free space was not checked (F18).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

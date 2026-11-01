@@ -1127,6 +1127,7 @@ fn seed_duplicate_pair_at_version_four(ws: &Workspace) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE model_files;
          DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
@@ -1280,6 +1281,7 @@ fn rewind_to_version_four_without_a_pair(ws: &Workspace) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE model_files;
          DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");

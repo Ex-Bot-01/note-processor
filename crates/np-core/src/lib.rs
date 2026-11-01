@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod embed;
 pub mod embed_run;
+pub mod fetch;
 pub mod hash;
 pub mod index_names;
 pub mod items;

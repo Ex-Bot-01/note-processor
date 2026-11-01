@@ -59,6 +59,11 @@ const ID_MAX_CHARS: usize = 64;
 /// against this number rather than declaring a second 64 that could drift from the one a digest is checked against.
 pub(crate) const DIGEST_HEX_CHARS: usize = 64;
 
+/// The member name of a model's **primary** artifact — the file at `<models_dir>/<id>` whose digest also stands in
+/// `models.sha256` (migration 9, §12 rule 10). One spelling shared by `install`, the fetcher and every reader, because
+/// two spellings of "the main file" is how a pair ends up with two halves nobody can name.
+pub const MAIN_FILE: &str = "main";
+
 /// Suffix of the temporary artifact name, before its `rename` — the same publish discipline as
 /// `crate::scan`'s catalog writes ("no reader ever sees half an artifact"), kept separate because a
 /// `<generated>.INDEX.md.tmp` corpse and a `<id>.<nonce>.tmp` one are cleaned up by different rules: the
@@ -230,6 +235,13 @@ pub enum FetchName<'a> {
     Marker(&'a str),
     /// `.part.<id>.<nonce>` — bytes of `id`'s artifact that are still arriving.
     Part(&'a str),
+    /// `.fetching.<id>.json.tmp<nonce>` — the temporary file an **atomic marker rewrite** passes through (§12 rule 2).
+    ///
+    /// It exists for microseconds and it must still be recognised, which is the sentence §12 rule 2 insists on: a
+    /// listing's `unclaimed` list keeps meaning "nothing this program recognises", so the transient name of a marker
+    /// mid-rename cannot be allowed to appear in it. A fetch that dies between write and rename leaves one behind,
+    /// where it sits quietly rather than being reported as junk someone should delete.
+    MarkerTemp(&'a str),
 }
 
 /// §12 rule 2's **single** recogniser: what fetch name (if any) a directory entry spells, byte-exact and
@@ -258,12 +270,21 @@ pub fn fetch_name(name: &OsStr) -> Option<FetchName<'_>> {
         return None;
     }
     if let Some(rest) = text.strip_prefix(FETCH_MARKER_PREFIX) {
-        let id = rest.strip_suffix(FETCH_MARKER_SUFFIX)?;
-        if validate_id(id).is_ok() {
-            Some(FetchName::Marker(id))
-        } else {
-            None
+        if let Some(id) = rest.strip_suffix(FETCH_MARKER_SUFFIX) {
+            return if validate_id(id).is_ok() {
+                Some(FetchName::Marker(id))
+            } else {
+                None
+            };
         }
+        // Not the marker itself: a marker **mid-rewrite**, whose temp name is `.json.tmp<nonce>` behind the id.
+        // Split at the *last* `.json.` because ids may contain dots — `.fetching.a.json.b.json.tmp1` is id `a.json.b`
+        // with a temp suffix, exactly as the marker rule reads it.
+        let (id, temp) = rest.rsplit_once(".json.")?;
+        if temp.is_empty() || !temp.starts_with("tmp") || validate_id(id).is_err() {
+            return None;
+        }
+        Some(FetchName::MarkerTemp(id))
     } else if let Some(rest) = text.strip_prefix(PART_PREFIX) {
         // `<id>.<nonce>`, split at the **last** dot because ids contain dots: `.part.a.b.4242-1-0` is id `a.b`
         // with nonce `4242-1-0`. The nonce itself is not charset-checked — only `fetch_name` and the listing
@@ -987,6 +1008,16 @@ pub fn install(
         }
         // The row attests this digest and the file is gone: re-materialise it, rewriting no column.
         publish_artifact(&models_dir, &request.id, &request.source)?;
+        // Re-recording `main` is not a column rewrite: migration 9's child table is where *which files a model has*
+        // lives, and a row written before that migration has no member rows at all. Writing the fact here is what
+        // teaches an upgraded workspace which artifact its existing digest describes.
+        db::record_model_file(
+            db,
+            &request.id,
+            MAIN_FILE,
+            &declared,
+            i64::try_from(meta.len()).unwrap_or(i64::MAX),
+        )?;
         return Ok(InstallOutcome::Restored);
     }
 
@@ -1003,6 +1034,17 @@ pub fn install(
         now,
     )?;
     if inserted {
+        // The primary member's name, recorded beside the row that carries its digest (§12 rule 10). A failure here is
+        // a database failure like any other in this function: the artifact is on disk and the row exists, which is
+        // exactly the crash state `list` reports as a model with no recorded files — never a reason to pretend the
+        // install did not happen.
+        db::record_model_file(
+            db,
+            &request.id,
+            MAIN_FILE,
+            &declared,
+            i64::try_from(meta.len()).unwrap_or(i64::MAX),
+        )?;
         return Ok(InstallOutcome::Installed);
     }
 
@@ -1328,7 +1370,7 @@ static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// processes started in the same nanosecond share a timestamp, and two calls in one process can share a
 /// coarse clock. A clock that cannot be read contributes zeroes, which leaves the pid and the counter — enough
 /// for the one guarantee this name needs, which is that it does not collide with itself.
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     let (secs, subsecs) = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(since) => (since.as_secs(), since.subsec_nanos()),
         Err(_) => (0, 0),
@@ -1407,7 +1449,9 @@ impl EntryList {
         for (name, kind) in self.0 {
             match fetch_name(&name) {
                 Some(FetchName::Marker(id)) => markers.push(id.to_owned()),
-                Some(FetchName::Part(_)) => {}
+                // Recognised, so not `unclaimed`; and a marker rewrite in flight says nothing about whether a fetch
+                // is running, which is the only thing the `fetching` section is allowed to assert (§12 rule 3).
+                Some(FetchName::Part(_) | FetchName::MarkerTemp(_)) => {}
                 None => {
                     if !claimed.contains(&name) {
                         unclaimed.push(Unclaimed {
