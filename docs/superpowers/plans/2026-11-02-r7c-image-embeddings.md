@@ -41,12 +41,12 @@ Throwaway measurement, no product code (spec §9). Its output becomes constants 
 
 **Files:**
 - Create: `crates/np-core/tests/probes/vision_probe.c`
-- Create: `crates/np-core/tests/probes/vision-spike-2026-11-03.md` (the note later tasks read)
+- Create: `crates/np-core/tests/probes/vision-spike-2026-11-02.md` (the note later tasks read)
 - Modify: `docs/design-m2-image-embeddings.md` (§9 pointer to the note; status line → "spike measured")
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `vision-spike-2026-11-03.md` recording — the exact `mtmd_*`/`llama_*` call sequence that produced a pooled vector; patch/token cost for one 1024×768 PNG and one 512×384 PNG; whether `mtmd_support_vision` is true for the pinned `mmproj`; the pooled width read back; and the caption-vs-image cosine table against captions and unrelated text.
+- Produces: `vision-spike-2026-11-02.md` recording — the exact `mtmd_*`/`llama_*` call sequence that produced a pooled vector; patch/token cost for one 1024×768 PNG and one 512×384 PNG; whether `mtmd_support_vision` is true for the pinned `mmproj`; the pooled width read back; and the caption-vs-image cosine table against captions and unrelated text.
 
 - [ ] **Step 1: Build `libmtmd` from the vendored tree into a scratch directory** — configure the existing pinned source with `-DLLAMA_BUILD_MTMD=ON -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF`, build target `llama` plus `mtmd`, and record the cmake command line verbatim in the note.
 - [ ] **Step 2: Write `vision_probe.c`** that opens the primary GGUF and the `mmproj` (`mtmd_init_from_file`), prints `mtmd_support_vision`, `mtmd_get_marker`, then for a generated PNG runs the tokenize → encode → decode path and prints chunk count, image token count, pooled width, and the first three floats of the pooled row.
@@ -178,7 +178,7 @@ Behind `vision`; the call sequence comes from Task 1's note.
 ### Task 8: Documentation, CI floor, and the honest claims
 
 **Files:**
-- Modify: `README.md`, `docs/design-m2-thread-policy.md` (untouched unless a number moved), `docs/backlog-m2-followups.md`, `todo.md`, `.github/workflows/ci.yml`, `crates/np-core/tests/probes/vision-spike-2026-11-03.md`
+- Modify: `README.md`, `docs/design-m2-thread-policy.md` (untouched unless a number moved), `docs/backlog-m2-followups.md`, `todo.md`, `.github/workflows/ci.yml`, `crates/np-core/tests/probes/vision-spike-2026-11-02.md`
 - Test: none (documentation), plus the CI count
 
 - [ ] **Step 1: Re-measure the `NOT COVERAGE` floor** with the exact CI command extended by `--test local_vision`, and set the threshold to the measured number with a comment naming which cases print and why.
