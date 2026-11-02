@@ -21,7 +21,7 @@ mod common;
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
     config_file_path, CatalogConfig, Config, ConfigError, EmbeddingProvider, EmbeddingsConfig,
-    MarkerConfig, ModelsConfig, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS,
+    MarkerConfig, ModelsConfig, ThreadCount, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS,
     MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS,
 };
 use rusqlite::Connection;
@@ -1562,5 +1562,216 @@ fn a_non_text_models_variable_is_refused_rather_than_ignored() {
     assert!(
         err.to_string().contains("NP_MODELS_BASE_URL"),
         "the refusal has to name the variable nobody can read: {err}"
+    );
+}
+
+// --- `[embeddings] threads` (`docs/design-m2-thread-policy.md`) ---------------------------------------------
+
+/// The rule, as arithmetic rather than as prose: what count does `auto` choose on a machine of size N?
+///
+/// Pinned because every value here is a refusal of something simpler, and each refusal has a measurement behind it
+/// (§14's D13 rows): the ceiling exists because 32 workers on 16 CPUs ran at *worse than four*; the floor exists because
+/// a bare 80 % of a two-core laptop is one worker at a third of today's throughput. A change to either bound has to
+/// change this table, which is the point — the numbers are not folklore about "most machines".
+#[test]
+fn auto_workers_follow_the_machine_within_measured_bounds() {
+    let expected: [(usize, usize); 14] = [
+        // Degenerate input first: `available_parallelism()` answers a non-zero count, so 0 cannot arrive from the
+        // platform — and it still must not produce zero workers, because zero is not something C can be told.
+        (0, 1),
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (4, 4),
+        // The fraction only bites once there is something to leave behind: on 5 and 6 CPUs, "leave 20 %" would mean
+        // leaving one whole CPU, so the floor of four holds.
+        (5, 4),
+        (6, 4),
+        (7, 5),
+        (8, 6),
+        (12, 9),
+        // The development host, whose row is measured rather than derived: 12 workers = 395.1 tok/s against the
+        // default four's 158.7 and all sixteen's 459.6.
+        (16, 12),
+        (20, 16),
+        (32, 25),
+        (64, 51),
+    ];
+    for (available, wanted) in expected {
+        assert_eq!(
+            ThreadCount::Auto.resolve(available),
+            wanted,
+            "auto on {available} CPUs must choose {wanted} workers"
+        );
+        // **Never more workers than CPUs.** The property the whole ceiling exists for; asserted for every row rather
+        // than stated once, because it is the one a future "just use nproc" simplification would break.
+        assert!(
+            ThreadCount::Auto.resolve(available) <= available.max(1),
+            "auto oversubscribed a {available}-CPU machine"
+        );
+    }
+
+    // An explicit count is honoured exactly, including the counts the rule would refuse. §5 of the policy: an operator
+    // may know something this program cannot see; what is refused is only a value the runtime cannot be told, and that
+    // refusal happens at load (`an_impossible_worker_count_is_refused_naming_the_key`).
+    // An absurd denominator, because `resolve` is public and the multiplication inside it used to be a plain `*`: what
+    // matters is that it returns rather than panicking in a debug build.
+    let absurd = ThreadCount::Auto.resolve(usize::MAX);
+    assert!(absurd > 0, "the rule must never answer zero workers");
+
+    let three = std::num::NonZeroU32::new(3).expect("test setup: 3 is non-zero");
+    let ninety = std::num::NonZeroU32::new(90).expect("test setup: 90 is non-zero");
+    assert_eq!(ThreadCount::Workers(three).resolve(16), 3);
+    assert_eq!(ThreadCount::Workers(ninety).resolve(16), 90);
+    // The label the report prints distinguishes the two, so "12 because auto" is not reported as "12 because you said
+    // twelve".
+    assert!(ThreadCount::Auto.is_auto());
+    assert!(!ThreadCount::Workers(three).is_auto());
+}
+
+/// Both accepted spellings load, and absence means `auto` rather than "unset, so four".
+#[test]
+fn threads_defaults_to_auto_and_takes_both_spellings() {
+    let tmp = tempfile::tempdir().expect("test setup: tempdir");
+    let data = toml_str(&tmp.path().display().to_string());
+
+    for (body, wanted) in [
+        ("", ThreadCount::Auto),
+        ("threads = \"auto\"", ThreadCount::Auto),
+        (
+            "threads = 3",
+            ThreadCount::Workers(std::num::NonZeroU32::new(3).unwrap()),
+        ),
+    ] {
+        let path = write_config(
+            tmp.path(),
+            &format!("data_dir = {data}\n[embeddings]\n{body}\n"),
+        );
+        let cfg =
+            Config::load(Some(&path)).unwrap_or_else(|err| panic!("`{body}` must load: {err}"));
+        assert_eq!(cfg.embeddings.threads, wanted, "`{body}`");
+    }
+}
+
+/// The refusals, each naming the key so a person edits the right line.
+///
+/// These are deserializer failures rather than post-load validation on purpose: the message arrives with the file, line
+/// and column serde already knows, and a value that cannot exist must not reach a struct where some later caller has to
+/// remember to re-check it. The 3,000,000,000 case is not hypothetical — an earlier version of this seam *clamped* such a
+/// count and llama.cpp then aborted the process (`SIGABRT`, uncatchable in Rust), which is why any ceiling is enforced at
+/// the boundary rather than at load.
+///
+/// The rows are not all one kind of mistake, and they do not fail alike: `-1` and `0` are counts that do not exist,
+/// `4097`/`100000000` are integers the field could hold and this program still will not ask for, `"most"`/`"AUTO"` are
+/// strings outside the two accepted spellings — all four produce our own sentence naming `embeddings.threads`. A float, a
+/// bool and an integer wider than `u64` are refused by serde before our visitor sees them, and name the key through the
+/// rendered source line instead; that difference is pinned in its own loop below rather than smoothed over. The ceiling
+/// rows are here because the first version of this bound was `i32::MAX`, which review found to be a sentence about the C
+/// field rather than about the machine — `threads = 100000000` parsed, resolved verbatim and reached `n_threads`
+/// (`config.rs`'s `MAX_REQUESTED_WORKERS` for the reasoning).
+#[test]
+fn an_impossible_worker_count_is_refused_naming_the_key() {
+    let tmp = tempfile::tempdir().expect("test setup: tempdir");
+    let data = toml_str(&tmp.path().display().to_string());
+
+    for (body, fragment) in [
+        ("threads = 0", "embeddings.threads"),
+        ("threads = -1", "embeddings.threads"),
+        ("threads = 3000000000", "embeddings.threads"),
+        ("threads = \"most\"", "embeddings.threads"),
+        ("threads = \"AUTO\"", "embeddings.threads"),
+        // Integers past the policy ceiling, including one that `i32_t` could hold and that used to load.
+        ("threads = 4097", "embeddings.threads"),
+        ("threads = 100000000", "embeddings.threads"),
+    ] {
+        let path = write_config(
+            tmp.path(),
+            &format!("data_dir = {data}\n[embeddings]\n{body}\n"),
+        );
+        let err = Config::load(Some(&path)).expect_err("`{body}` must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains(fragment),
+            "`{body}` must name {fragment:?}: {text}"
+        );
+        // And it has to say which file, like every other parse failure in this file.
+        assert!(
+            text.contains(&tmp.path().display().to_string()),
+            "`{body}` must name the config file: {text}"
+        );
+    }
+
+    // **Wrong types are a second class of refusal, and the message differs.** Measured rather than assumed: a float, a
+    // bool and an integer too large for `u64` (toml hands that to serde as an `i128`, which this visitor does not
+    // implement) never reach our code, so they come back as serde's `invalid type … expected "\"auto\"" or a positive
+    // integer of worker threads`. They still name the key — through the rendered source line and column, e.g.
+    // `2 | threads = 4.0` with a caret under the value — but not through the dotted path our own messages print, because
+    // "which key" is toml's sentence to say and "what I wanted" is ours. Asserting `embeddings.threads` here would be a
+    // test written against the prose rather than the output.
+    for body in [
+        "threads = 4.0",
+        "threads = true",
+        "threads = 99999999999999999999",
+    ] {
+        let path = write_config(
+            tmp.path(),
+            &format!("data_dir = {data}\n[embeddings]\n{body}\n"),
+        );
+        let text = Config::load(Some(&path))
+            .expect_err("`{body}` must be refused")
+            .to_string();
+        assert!(
+            text.contains("expected `\"auto\"` or a positive integer of worker threads"),
+            "`{body}` must say what was expected: {text}"
+        );
+        assert!(
+            text.contains("threads"),
+            "`{body}` must point at the key it refused: {text}"
+        );
+        assert!(
+            text.contains(&tmp.path().display().to_string()),
+            "`{body}` must name the config file: {text}"
+        );
+    }
+
+    // The typo case, refused by the section's existing strictness rather than by anything added here: `thread = 8` must
+    // not load as "auto" in silence.
+    let path = write_config(
+        tmp.path(),
+        &format!("data_dir = {data}\n[embeddings]\nthread = 8\n"),
+    );
+    let err = Config::load(Some(&path)).expect_err("a misspelled key must not be ignored");
+    assert!(
+        err.to_string().contains("thread"),
+        "the refusal must name the misspelled key: {err}"
+    );
+}
+
+/// **A boundary, not a clamp.** 4,096 loads as 4,096; 4,097 is refused. The distinction matters because the failure mode
+/// this whole seam has been revised around twice is a value being quietly *changed* on the way in — first by clamping at
+/// load (which produced an uncatchable `SIGABRT`), and before that by a ceiling so high it accepted anything.
+#[test]
+fn the_worker_ceiling_is_a_boundary_and_never_a_clamp() {
+    let tmp = tempfile::tempdir().expect("test setup: tempdir");
+    let data = toml_str(&tmp.path().display().to_string());
+
+    let path = write_config(
+        tmp.path(),
+        &format!("data_dir = {data}\n[embeddings]\nthreads = 4096\n"),
+    );
+    let cfg = Config::load(Some(&path)).expect("the largest accepted count must load");
+    assert_eq!(
+        cfg.embeddings.threads,
+        ThreadCount::Workers(std::num::NonZeroU32::new(4096).unwrap()),
+        "and load as itself, not as a smaller number"
+    );
+
+    let path = write_config(
+        tmp.path(),
+        &format!("data_dir = {data}\n[embeddings]\nthreads = 4097\n"),
+    );
+    assert!(
+        Config::load(Some(&path)).is_err(),
+        "one past the ceiling must be refused, not rounded down"
     );
 }

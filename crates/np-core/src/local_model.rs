@@ -754,16 +754,28 @@ pub struct LazyLocalEmbedder {
     /// The width this run stores at: `[embeddings] dim` or the row's own declaration, resolved by the caller.
     dim: usize,
     max_tokens: usize,
+    /// What `[embeddings] threads` said, kept as written so the report can say whether the count came from the rule or
+    /// from an operator (`docs/design-m2-thread-policy.md` §4).
+    threads: crate::config::ThreadCount,
+    /// The CPU allowance this process may use, read once at construction. Kept rather than re-read per load because a
+    /// changing answer mid-run would make the reported number belong to a different machine than the run.
+    available: usize,
     loaded: std::cell::OnceCell<Result<LocalEmbedder, LoadFailure>>,
 }
 
 impl LazyLocalEmbedder {
     /// Check what can be checked without a model, and remember everything a later load needs.
+    ///
+    /// `threads` is the configuration value rather than a resolved count: resolving it needs this process's CPU
+    /// allowance, which is read here (`available_parallelism()`, affinity-aware — see §14's affinity log) so that the
+    /// number in `np embed`'s report and the number handed to llama.cpp come from one reading instead of two that could
+    /// disagree.
     pub fn new(
         row: &ModelRow,
         artifact: &Path,
         dim: usize,
         max_tokens: usize,
+        threads: crate::config::ThreadCount,
     ) -> Result<Self, EmbedError> {
         // Same two refusals, same order, as `LocalModelProvider::new`: the row's width first (no filesystem),
         // then the artifact (`embed_run`'s arm (iii) depends on this being settled before any currency question).
@@ -782,8 +794,44 @@ impl LazyLocalEmbedder {
             artifact: artifact.to_path_buf(),
             dim,
             max_tokens,
+            threads,
+            available: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
             loaded: std::cell::OnceCell::new(),
         })
+    }
+
+    /// How many batch workers the **loaded** model answered with, or `None` while nothing is resident.
+    ///
+    /// This exists to make one promise checkable: that the count `worker_plan` reports is the count llama.cpp was
+    /// handed. Without it a break between the two — the provider reporting twelve and loading with four — would be
+    /// invisible to every test, because the report and the loader read the same field and only a real load can show they
+    /// diverged. It reads back what the context reported (see [`LoadedModel::threads`] for what that does and does not
+    /// prove), so this is a plumbing fence rather than a throughput measurement.
+    #[must_use]
+    pub fn loaded_worker_count(&self) -> Option<usize> {
+        self.loaded
+            .get()
+            .and_then(|result| result.as_ref().ok())
+            .map(|embedder| embedder.model().threads().1)
+    }
+
+    /// The worker plan this provider will use when it loads — the value `np embed` reports.
+    ///
+    /// Derived on demand rather than stored so there is one place that turns a `ThreadCount` into a count; the report and
+    /// the loader both call [`crate::config::ThreadCount::resolve`] on the same `available` this value recorded.
+    #[must_use]
+    pub fn worker_plan(&self) -> crate::embed_run::WorkerPlan {
+        crate::embed_run::WorkerPlan {
+            count: self.threads.resolve(self.available),
+            available: self.available,
+            configured: if self.threads.is_auto() {
+                "auto"
+            } else {
+                "explicit"
+            },
+        }
     }
 
     /// Whether the model is resident in this process. False until the first batch; §14's whole argument, as an
@@ -799,11 +847,20 @@ impl LazyLocalEmbedder {
 
     fn model(&self) -> Result<&LocalEmbedder, EmbedError> {
         self.loaded
-            .get_or_init(|| match load(&self.artifact, self.dim) {
-                Ok(model) => LocalEmbedder::new(model, &self.row, self.max_tokens)
-                    .map(Ok)
-                    .map_err(|err| LoadFailure::capture(&err))?,
-                Err(err) => Err(LoadFailure::capture(&err)),
+            .get_or_init(|| {
+                // Resolved here, at the one call site that loads, so `worker_plan` reports the same decision the runtime
+                // receives. A count too wide for the runtime's `i32` field is passed through for `load_with_options` to
+                // refuse by name — it never clamps (that clamp is what aborted a process in an earlier revision).
+                let wanted = self.threads.resolve(self.available);
+                let options = LoadOptions {
+                    threads: std::num::NonZeroU32::new(u32::try_from(wanted).unwrap_or(u32::MAX)),
+                };
+                match load_with_options(&self.artifact, self.dim, options) {
+                    Ok(model) => LocalEmbedder::new(model, &self.row, self.max_tokens)
+                        .map(Ok)
+                        .map_err(|err| LoadFailure::capture(&err))?,
+                    Err(err) => Err(LoadFailure::capture(&err)),
+                }
             })
             .as_ref()
             .map_err(LoadFailure::to_error)

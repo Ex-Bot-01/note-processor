@@ -160,6 +160,37 @@ impl EmbedOutcome {
     }
 }
 
+/// What this run decided about worker threads for the local model, carried on the report so a slow run can be
+/// diagnosed from its own output.
+///
+/// The field exists because of a measurement, not a feature request: llama.cpp's default worker count is a compile-time
+/// literal (`GGML_DEFAULT_N_THREADS`, `ggml/include/ggml.h:232`), and using all of this host's CPUs instead of it is
+/// 2.49×–3.60× faster (`docs/design-m2-local-embeddings.md` §14's D13 rows). Once the count is derived from the machine,
+/// "how many did that run get" stops being guessable from the source — so it is reported. `available` is the denominator
+/// `available_parallelism()` answered (the CPU allowance this process may use, which follows an affinity mask), and
+/// `configured` says whether the number came from the rule or from `[embeddings] threads = <n>`, because "12" printed on
+/// its own would credit the operator with a choice they did not make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WorkerPlan {
+    /// Workers this run asks the runtime for.
+    pub count: usize,
+    /// The CPU allowance the rule was applied to.
+    pub available: usize,
+    /// `"auto"` when the rule chose [`WorkerPlan::count`], `"explicit"` when configuration named it.
+    pub configured: &'static str,
+}
+
+impl WorkerPlan {
+    /// The one-line spelling for the text report: `12 of 16 available (auto)`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "{} of {} available ({})",
+            self.count, self.available, self.configured
+        )
+    }
+}
+
 /// What one `np embed` run saw and did.
 ///
 /// Six counts, in §6's order, plus the model they were counted against, the arm and §7's caveat. Every field
@@ -200,6 +231,13 @@ pub struct EmbedReport {
     /// rather than overstating. It is a field and not a parameter for the same reason the report is one object: the
     /// text summary and `--json` must not be able to disagree about it.
     pub artifact_check: Option<crate::embed::ArtifactCheck>,
+    /// What this run decided about worker threads, or `None` when no local model was involved.
+    ///
+    /// Same shape as [`EmbedReport::artifact_check`] and for the same reason: the decision is made where the provider is
+    /// built (np-cli's `embed_provider`, which holds both the config and the machine's CPU allowance) while the report is
+    /// written downstream, and every constructor leaves it `None`. That default is the truthful one — a run with
+    /// `provider = "none"` has no worker count to report, and printing one would be a number about nothing.
+    pub workers: Option<WorkerPlan>,
 }
 
 impl EmbedReport {
@@ -221,6 +259,7 @@ impl EmbedReport {
             errors: 0,
             verification: CAVEAT,
             artifact_check: None,
+            workers: None,
         }
     }
 }
@@ -502,6 +541,7 @@ fn run(
             errors,
             verification: CAVEAT,
             artifact_check: None,
+            workers: None,
         });
     }
 
@@ -532,6 +572,7 @@ fn run(
                 errors,
                 verification: CAVEAT,
                 artifact_check: None,
+                workers: None,
             });
         }
     };
@@ -648,6 +689,7 @@ fn run(
         errors,
         verification: CAVEAT,
         artifact_check: None,
+        workers: None,
     })
 }
 

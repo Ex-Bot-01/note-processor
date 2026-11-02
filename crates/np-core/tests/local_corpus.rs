@@ -162,6 +162,9 @@ mod corpus {
                     model: Some(MODEL_ID.to_string()),
                     dim: None,
                     max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
+                    // The policy default, spelled out: these fixtures must not inherit a worker count by
+                    // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+                    threads: np_core::config::ThreadCount::Auto,
                 },
                 ..Config::default()
             }
@@ -339,6 +342,13 @@ mod corpus {
             &setup.cfg().workspace_models_dir(&setup.root).join(MODEL_ID),
             usize::try_from(DIM).expect("dim fits usize"),
             np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            // **Four workers, spelled out.** §14's corpus figures (16,161 chunks/hour, the drift over 2,048 decodes) are
+            // a four-worker measurement, and `docs/design-m2-thread-policy.md` §6 says so; letting this fixture follow
+            // the new `auto` default would silently re-define what those committed numbers mean. Re-running the corpus at
+            // the auto count is its own measurement event, not a side effect of a config change.
+            np_core::config::ThreadCount::Workers(
+                std::num::NonZeroU32::new(4).expect("test setup: 4 is non-zero"),
+            ),
         )
         .expect("test setup: a lazy provider for the linked artifact");
 

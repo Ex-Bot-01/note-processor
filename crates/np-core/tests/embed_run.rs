@@ -55,6 +55,9 @@ impl Setup {
                 model: Some(MODEL_ID.to_string()),
                 dim: None,
                 max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
+                // The policy default, spelled out: these fixtures must not inherit a worker count by
+                // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+                threads: np_core::config::ThreadCount::Auto,
             },
             ..Config::default()
         }
@@ -844,6 +847,9 @@ fn provider_none_is_configuration_disabled_and_reads_nothing() {
             model: None,
             dim: None,
             max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            // The policy default, spelled out: these fixtures must not inherit a worker count by
+            // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+            threads: np_core::config::ThreadCount::Auto,
         },
         ..setup.cfg()
     };
@@ -1072,6 +1078,9 @@ fn every_report_carries_the_caveat_line() {
             model: None,
             dim: None,
             max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            // The policy default, spelled out: these fixtures must not inherit a worker count by
+            // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+            threads: np_core::config::ThreadCount::Auto,
         },
         ..setup.cfg()
     };
@@ -1099,5 +1108,31 @@ fn an_empty_data_dir_is_refused() {
     assert!(
         error.to_string().contains("data_dir"),
         "the refusal names the missing value: {error}"
+    );
+}
+
+/// The text report's one-line spelling of the worker count, pinned without a model.
+///
+/// `describe()` is the only place the `threads 12 of 16 available (auto)` shape is assembled, and until now the only
+/// thing that checked it against `--json` needed a 310 MB artifact — so a format change would pass every gate row that
+/// runs without one. The string *is* the product here: a person comparing two runs reads it.
+#[test]
+fn the_worker_plan_describes_itself_in_one_line() {
+    let auto = np_core::embed_run::WorkerPlan {
+        count: 12,
+        available: 16,
+        configured: "auto",
+    };
+    assert_eq!(auto.describe(), "12 of 16 available (auto)");
+
+    let explicit = np_core::embed_run::WorkerPlan {
+        count: 4,
+        available: 2,
+        configured: "explicit",
+    };
+    assert_eq!(
+        explicit.describe(),
+        "4 of 2 available (explicit)",
+        "an oversubscribed explicit count has to read as what it is — a choice, not a bug in the rule"
     );
 }
