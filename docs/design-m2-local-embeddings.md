@@ -690,7 +690,20 @@ rather than letting a round discover it:
    and size — nothing else — and never says "your download is corrupted" when the size matched.
 7. **What may not survive the amendment is trust-by-URL.** The pin lives in the binary: `const PINNED: &[PinnedModel]` keyed by model
    id, holding `{id, member name, filename, size_bytes, sha256, read_on}` — what to accept, no host. Both files are pinned (text
-   `2188ac1d…`, mmproj `c4a8a526…`, from public LFS metadata 2026-10-29). The **host is config**: `[models] base_url` with a documented
+   `2188ac1d…`, mmproj `c4a8a526…`, from public LFS metadata 2026-10-29).
+
+   **Corrected by measurement on 2026-11-02, before any fetch shipped.** That mmproj prefix matches **no file in the
+   repository**: `mmproj-embeddinggemma-2-Q8_0.gguf` is 554,821,056 bytes with sha256
+   `0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8`, read by downloading the file into a tmpfs and
+   hashing it here (`sha256sum`, 3.3 s), with the host's own LFS metadata reporting the same `oid` in the same minute.
+   The BF16 sibling is neither value either, so `c4a8a526…` is not a truncation of something correct — it is a wrong
+   number, and shipping it would have made every first start refuse a good artifact forever while pointing at the human
+   for an answer they could not give. The same metadata call returned `2188ac1d…` for the primary artifact, which is the
+   digest this project computed from bytes it holds: the method agrees with the host where both can see the file.
+   Lesson kept on record rather than smoothed over — an eight-character prefix copied from a metadata screen is not a
+   pin, and a pin nobody can reproduce is a refusal with someone else's name on it.
+
+   The **host is config**: `[models] base_url` with a documented
    default and an env override, so a mirror works and the origin is not a compile-time secret. One sentence to keep a future reader
    from "fixing" this: a public artifact host is **not** parent §9's secret class, which protects the self-hosted chat server's URL and
    key. Pin rot is real — nobody notices an upstream re-upload until first start refuses — so `[models] sha256 = "…"` overrides the pin
@@ -710,7 +723,19 @@ rather than letting a round discover it:
     API `Install::file(name, path, sha256)`; CLI keeps `--path F --sha256 H` as `main` and adds `--path NAME=F --sha256 NAME=H`, refusing an
     unequal name set rather than zipping by order. **The asymmetry the first draft had backwards:** digests are cheap to retrofit (an
     additive child table), file *names* are not (bytes already on disk under `<dir>/<id>`). So R6b0 reserves the name space and the leading-dot
-    rule; migration 8 lands with R7b when there is a second digest to store. If this round seems to want a migration, install design §6 says
+    rule; migration 8 lands with R7b when there is a second digest to store.
+
+    **As landed, two amendments.** The child table arrived as **migration 9**, not 8: migration 8 was taken on
+    2026-10-31 by D12's verify-on-change stamp (`models.verified_size`, `models.verified_mtime`), and renumbering a
+    published migration is how two builds end up meaning different numbers. And R7b found the paragraph did not go far
+    enough: writing bytes is not enough to make a model, because `models.dim`, `prefix_doc` and `prefix_query` are
+    *declared* facts that §2 of the install design refuses to probe from a header. A fetch has to produce a row, so the
+    declaration joins the pin tables as `pins::PINNED_IDENTITIES` — compiled in, reviewed beside the digests, and
+    **not** guessed at runtime: an id with pinned bytes but no declared identity refuses to fetch. For
+    `embeddinggemma-2` that is dim **768** (measured from the artifact's header, §3) with **both prefixes empty**, which
+    is a statement about evidence: every embedding run recorded in this repository used no prefix, and because a prefix
+    changes vector bytes, adopting an instruction convention later means a **new id** (`@n`), not an edit to these two
+    strings. If this round seems to want a migration, install design §6 says
     report the design gap — which is what this paragraph is.
 11. **Per-workspace cost becomes automatic.** Install design §4 accepted "N copies for N workspaces" as a deliberate deviation because a
     human ran each `install`. First-start fetching makes it automatic: state in R7b that fetch is **per-workspace on demand** (the workspace
