@@ -534,7 +534,7 @@ scale* — the fence would miss a slow one), the next run's currency query at **
 could buy at ~14 % of a short decode and ~2 % of a long one, measured at four threads; the split is a two-point solution
 validated only against the corpus run's own aggregate (0.6–1.3 %). §14's corpus subsection carries both runs, the
 evening-rule arithmetic (a 20,000-note pass fits an evening at short-note lengths, 1.24 h, and does not at near-ceiling
-lengths, 7.89–7.91 h), and what each figure is worth. What is left of R6d is a *decision*, not a measurement: batching still waits on D13's thread-count sweep, which needs the human's authorisation because it changes runtime behaviour for every user |
+lengths, 7.89–7.91 h), and what each figure is worth. What is left of R6d is a *decision*, not a measurement: batching was gated on D13's thread-count sweep, which ran on 2026-11-02 (below) and came back larger than batching — 2.90×/3.60× against ≤14 % — so both now wait on the same thing, a word about whether any user's default should change |
 | **R7a — marker only** *(shipped `ad9ed5a`)* | read/report the `.fetching.*` / `.part.*` names, `"fetching"` listing section, staleness *display* wording, tests that plant files. **No writer**: nothing can create a marker until R7b's first byte, which is why every test plants its own | fully offline-testable; this is the human-visible half of "tell me it is downloading" |
 | **R7b — fetch** | HTTP GET → `.part` → streaming digest (incremental API in `hash.rs`) → pin compare → rename-if-absent → `db::insert_model`; two files, two digests; four named refusals; no resume, no retry, no marker reuse | the network round alone, after the marker exists |
 | **R7c — multimodal spike (conditional)** | prove or kill a pooled 768-d embedding over mixed text+image tokens for this architecture through the pinned binding | only then does image indexing enter a roadmap; §5's open question |
@@ -1025,8 +1025,8 @@ matters is how much text goes into a decode, not how many decodes are in the pro
 artifact (Q8_0), `GGML_OPENMP=OFF`, four threads, `--test-threads=1`, llama.cpp logging left on. The token figure is a
 64-chunk sample multiplied by an exact count. The cohorts are synthetic notes of two shapes, not the user's corpus; they
 exist to separate fixed from per-token cost, which is what the batching number needs. Nothing in this round changes
-runtime behaviour: `EMBED_BATCH_CHUNKS`, `n_threads` and one-decode-per-text all stay as they were, and D13 remains the
-open decision.
+runtime behaviour: `EMBED_BATCH_CHUNKS`, `n_threads` and one-decode-per-text all stayed as they were. D13 has since been
+measured (next subsection); what is still open there is a decision, not a number.
 
 ### D13: the worker count, measured (2026-11-02)
 
@@ -1038,57 +1038,72 @@ compared one configuration of four workers against another.
 
 **Harness.** `crates/np-core/tests/local_threads.rs` measures one cell per process (a threadpool is process-wide state
 and `VmHWM` is a process-lifetime high-water mark: R6d round 2's lesson, and separate processes are also what `np embed`
-does). It loads through this program's own loader with the new `local_model::LoadOptions { threads }`, so the numbers
-belong to `np embed`'s forward pass rather than to a C probe beside it. Driver:
-`crates/np-core/tests/probes/thread_sweep.sh`; vector comparison: `thread_vectors_compare.py`. Rows:
-`thread-sweep-short-2026-11-02.log`, `thread-sweep-long-2026-11-02.log`. Host as ever: 16 CPUs, 7,419 MB, this artifact.
+does), loading through this program's own loader with `local_model::LoadOptions { threads }`, so the numbers belong to
+`np embed`'s forward pass rather than to a C probe beside it. Driver: `crates/np-core/tests/probes/thread_sweep.sh`.
+Every figure below is a `SUMMARY` row in one of three committed logs — `thread-sweep-short-2026-11-02.log`,
+`thread-sweep-long-2026-11-02.log`, `thread-sweep-affinity-2026-11-02.log` — each run **twice**, and the vector
+comparison is appended to the log that produced the vectors (`DETERMINISM`/`PAIR` rows, computed by
+`thread_vectors_compare.py`). The first version of this section quoted a 32-worker number measured in an ad-hoc loop and
+a determinism table that existed only in a terminal; both are now evidence, and the driver puts them there on every run.
 
-| workers | 375-token chunk tok/s | × the default | peak RSS | 7,970-token chunk tok/s | × the default | peak RSS |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | 49.0 | 0.31× | 450 MiB | — | | |
-| 2 | 93.7 | 0.59× | 451 MiB | 43.7 / 43.6 | 0.54× | 1,479 MiB |
-| **4 (today)** | **159.8** | 1.00× | 452 MiB | **80.1 / 80.5** | 1.00× | 1,479 MiB |
-| 6 | 247.5 | 1.55× | 453 MiB | — | | |
-| 8 | 303.4 | 1.90× | 454 MiB | 153.9 / 153.8 | 1.92× | 1,479 MiB |
-| 12 | 394.9 | 2.47× | 457 MiB | — | | |
-| **16 = all of them** | **462.1 / 463.9** | **2.89×** | 459 MiB | **288.7 / 289.9** | **3.60×** | 1,479 MiB |
-| 32 (oversubscribed) | **96.1** | 0.60× | 467 MiB | — | | |
+Host: 16 CPUs (`Thread(s) per core: 1`, so no hyperthreading to discount), 7,419 MB, this artifact.
 
-Each pair is two separate processes; the pass-to-pass gap is 0.2–0.4 % and the within-process spread is ≤ 0.8 % for
-every cell except 16-worker short (2.0 %). The default row cross-checks §14's earlier figures rather than contradicting
-them: 159.8 tok/s here against 156 there, 80.1 against 81.
+| workers | 375-token chunk tok/s | × the default | peak RSS | CPU (whole process) | 7,970-token chunk tok/s | × the default | peak RSS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 49.1 | 0.31× | 449.9 MiB | 99 % | — | | |
+| 2 | 93.0 | 0.59× | 451.2 MiB | 196 % | 43.6 / 43.6 | 0.54× | 1,479.3 MiB |
+| **4 (today)** | **158.7** | 1.00× | 452.2 MiB | 384 % | **80.1 / 80.1** | 1.00× | 1,479.3 MiB |
+| 6 | 246.9 | 1.56× | 453.4 MiB | 559 % | — | | |
+| 8 | 302.7 | 1.91× | 454.5 MiB | 731 % | 153.2 / 153.3 | 1.91× | 1,479.4 MiB |
+| 12 | 395.1 | 2.49× | 456.5 MiB | 1,065 % | — | | |
+| **16 = all of them** | **459.6** | **2.90×** | 458.8 MiB | 1,391 % | **288.6 / 288.8** | **3.60×** | 1,479.4 MiB |
+| 32 (twice the machine) | **91.4** | 0.58× | 467.4 MiB | **1,553 %** | — | | |
 
-**Four things the numbers say.**
+Each pair is a separate process; pass-to-pass agreement is ≤ 0.7 % everywhere except the two noisiest cells
+(16 workers short: 1.1 %, and 32 workers: 11.6 %). The default row reproduces §14's earlier figures rather than
+contradicting them — 158.7 against 156 tok/s, 80.1 against 81 — which is the cross-check that says the harness measures
+the same thing the old probes did.
 
-* **~3× is sitting in a compile-time constant.** On this host, all sixteen workers versus four is +189 % on a realistic
-  chunk and +260 % on a near-window one, for **+9 MiB** of peak RSS at the short length and **+0.4 MiB** at the long one.
-* **More is not monotonically better.** Thirty-two workers on a sixteen-CPU host run at **96 tok/s — worse than four**.
-  The ceiling is exactly `available_parallelism()`, and past it the price is barriers and context switches, not memory.
-  Any policy that can exceed the machine's own count is wrong by measurement, not taste.
-* **The vectors do not move.** Same 768 float-32 coordinates at 1/2/4/6/8/12/16 workers (short) and 2/4/8/16 (long):
-  `max |Δ| = 0.000e+00`, cosine `1.000000000000`, both lengths, both passes — **bit-identical**. The reproducibility
-  objection D13 was filed with is therefore not real *here*, and raising the count would not rewrite stored vectors or
-  reorder search results. Its scope is stated because it is not a theorem: one artifact, one host, these two lengths.
-  Nothing in ggml promises it — `ggml/src/ggml-cpu/ggml-cpu.c:2410` sizes work as `MIN(n_threads, nrows)`, so the split
-  genuinely depends on the count and today's splits happen to sum onto identical float-32. A llama.cpp re-pin re-runs
-  `thread_vectors_compare.py` before anyone quotes this row.
-* **Short chunks scale worse than long ones (2.89× against 3.60×) for a visible reason.** That same `MIN(n_threads,
-  nrows)` line leaves workers idle when a node has fewer rows than workers, and a 375-token sequence has less of
-  everything to divide. Mechanism from source plus the two columns' shapes; not measured per operator.
+**What the numbers say.**
 
-**Two facts about the number itself.** `std::thread::available_parallelism()` is affinity-aware on this host: **16**
-unrestricted, **4** under `taskset -c 0-3`, **8** under `-c 0-7` — so a derived default would follow a cpuset instead of
-counting the physical box. Its cgroup-quota behaviour is Rust's documented promise and is **untested here**, since this
-host has no container to try it in, so it is not claimed. And `llama_n_threads()` only echoes what the context was
-*told*: no cell log contains ggml's `more threads than available` warning, but the evidence that workers actually ran is
-the 9.4× from one worker to sixteen, not the readback.
+* **~3× is sitting in a compile-time constant.** Sixteen workers versus four is **+190 %** on a realistic chunk and
+  **+260 %** on a near-window one, for **+6.6 MiB** of peak RSS at the short length and **no measurable difference** at
+  the long one (1,479.3 → 1,479.4 MiB, inside pass-to-pass noise). That is the whole cost on this host's memory.
+* **More stops being better at or before the machine's own count.** Thirty-two workers — twice `available_parallelism()`
+  — ran at **91.4 tok/s, worse than four**, while burning **1,553 % CPU**: more cores asked for, less work done, more of
+  the machine consumed doing it. It was also the noisiest cell by a wide margin (24 % within-process spread), which is
+  what contention looks like from the inside. The measured claim is therefore "the best count tried was 16 = available,
+  and doubling it is worse than the default", not "the optimum is exactly `available_parallelism()`" — nothing between
+  16 and 32 was probed, and going above the CPU count is not a design option any policy should offer anyway.
+* **The vectors do not move.** Every worker count compared against the default is **bit-identical** —
+  `max |Δ| = 0.000e+00`, cosine `1.000000000000` — at 1/2/4/6/8/12/16/**32** workers on the short chunk and 2/4/8/16 on
+  the long one, in both logs' `PAIR` rows. The reproducibility objection D13 was filed with is not real *here*, so
+  raising the count would not rewrite stored vectors or reorder search results. Its scope is stated because it is not a
+  theorem: nothing in ggml promises it — `ggml/src/ggml-cpu/ggml-cpu.c:2410` sizes work as `MIN(n_threads, nrows)`, so
+  the split genuinely depends on the count and today's splits happen to sum onto identical float-32. A llama.cpp re-pin
+  re-runs the driver (which now appends this table by itself) before anyone quotes the row.
+* **Short chunks scale worse than long ones (2.90× against 3.60× at 16 workers), and that same line is the likely
+  mechanism** — `MIN(n_threads, nrows)` leaves workers idle when a node has fewer rows than workers, and a 375-token
+  sequence has less of everything to divide. Source plus the shape of the two columns; not measured per operator.
+
+**Two facts about the number itself.** `std::thread::available_parallelism()` follows the CPU affinity mask, and the
+affinity log carries the rows: the same 4-worker cell reports `available=16` unrestricted, **`available=4`** under
+`taskset -c 0-3` and **`available=8`** under `-c 0-7`, at 157.5 / 157.6 / 158.8 tok/s — a cpuset that already fits the
+worker count costs nothing, which is what makes a derived default sane inside a container. Rust documents that it also
+respects cgroup quotas; this host has no container to try that in, so it is not claimed here. And `llama_n_threads()`
+**echoes what the context was told** rather than measuring what ran (`src/llama-context.cpp:204-205` copies the field,
+`:954-960` returns it): no cell log contains ggml's `more threads than available` warning — the driver now copies any
+warning line into the log rather than grepping in a way that could never match — but the evidence that workers actually
+ran is the 9.4× between one worker and sixteen, not the readback.
 
 **What this does not decide.** Whether the default changes — that is a decision about other people's machines, and it
-stays open in `docs/backlog-m2-followups.md`. What the sweep removes is the excuse for not looking: the options, with
-numbers, are (a) leave it at four; (b) use all of `available_parallelism()` — +189 % / +260 % here, whole machine busy;
-(c) a fraction of it. On a percentage: 80 % of 16 is 12 workers, which buys 394.9 of the available 462 tok/s (85 % of
-the gain) and leaves four CPUs — but **on a two-core laptop the same 80 % is one worker at 49 tok/s, a third of today**.
-A fraction without a floor is a regression on exactly the machines that can least afford it.
+stays open in `docs/backlog-m2-followups.md`. What the sweep removes is the excuse for not looking. The options, with
+numbers from the table: (a) leave it at four; (b) use all of `available_parallelism()` — +190 % / +260 % here, ~14 cores
+busy; (c) a fraction of it. On percentages: 80 % of 16 is 12 workers, which buys 395.1 of the available 459.6 tok/s
+(86 % of the gain) and leaves four CPUs — but **on a two-core laptop the same 80 % is one worker at 49.1 tok/s, a third
+of today**, so a fraction without a floor is a regression aimed at exactly the machines that can least afford it. What
+was *not* measured: anything above 16 workers on any host, and the whole command (`np embed`'s chunking and database
+writes) rather than the forward pass — §14's corpus rows remain a four-worker measurement.
 
 ### What this decides about §5's amendments
 

@@ -255,11 +255,13 @@ what fails is not a check, because removal makes tests pass.
   separate the cost: **31.1 / 29.0 ms fixed per decode**, **5.531 / 5.548 ms/token** marginal — a two-point solution whose
   own residual proves nothing, validated instead against the corpus run's aggregate (predicts it to 0.6–1.3 %). That fixed
   part caps batching across texts at ~14 % of a short decode and ~2 % of a long one, measured at four threads; whether
-  thread count is the bigger lever remains unmeasured, which is D13's whole point. §8's evening rule, applied with the
+  thread count turned out to be the bigger lever: measured on 2026-11-02 at **2.90× (short) / 3.60× (near-ceiling)** for
+  sixteen workers against four — see §14's D13 subsection. §8's evening rule, applied with the
   bound stated (4 h): 20,000 notes = **1.24 h ✓** at short-note length and **7.89–7.91 h ✗** at 251 tokens — break-even
   ≈ 64,600 short notes, ≈ 10,100 long ones, both columns single-rate extrapolations good to ~1 %. Both runs' output is
   committed as `crates/np-core/tests/probes/corpus-run-2026-10-31.log`, with the spreads and the caveats beside the
-  numbers. Still open in R6d: the batching **decision**, gated on D13.
+  numbers. Still open in R6d: the batching **decision**, and now the worker-count one too — D13 is measured
+  (`m22/thread-sweep`), so what waits on the human is whether any default changes, not whether to look.
 * **D12 — verify-on-change (shipped on `m19/digest-verify-on-change`, 2026-10-31).** `np embed` now checks the artifact
   against `models.sha256` before it reads a note: one `stat` when the stamp holds, a full hash when size or mtime moved
   or when no stamp exists yet (migration 8 adds the two nullable columns and backfills nothing). A disagreement refuses
