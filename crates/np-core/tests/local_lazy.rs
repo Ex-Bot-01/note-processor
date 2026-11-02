@@ -193,10 +193,17 @@ mod lazy {
         )
         .expect("the eager checks pass");
         let plan = auto.worker_plan();
+        // The expected count is the rule written out **here** rather than read back from `resolve`, so this case fails
+        // when the rule moves. Comparing the provider against the same function it calls could only ever catch a field
+        // being wired to the wrong source — useful, but not what the message claims.
+        let expected = if available == 0 {
+            1
+        } else {
+            available.min(available.min(4).max(available * 4 / 5))
+        };
         assert_eq!(
-            plan.count,
-            np_core::config::ThreadCount::Auto.resolve(available),
-            "the report must state the rule's answer, not a number remembered from elsewhere"
+            plan.count, expected,
+            "the report must state the rule's answer for this machine ({available} CPUs), not a number              remembered from elsewhere"
         );
         assert_eq!(
             plan.available, available,

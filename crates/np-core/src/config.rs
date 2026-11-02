@@ -228,32 +228,35 @@ impl ModelsConfig {
 /// The deserializer refuses three things by name, because a silently-ignored worker count is the shape of lie this
 /// project's F-series exists to prevent: `threads = 0` (no such request exists), a value above what C can be told
 /// (`i32::MAX`; the first version of this seam *clamped* such a number and llama.cpp then aborted the process — the
-/// refusal now lives in `local_model::load_with_options`, behind the `local-model` feature), and anything that is neither
-/// `"auto"` nor an integer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// refusal now lives in `local_model::load_with_options`, behind the `local-model` feature), any count above
+/// `MAX_REQUESTED_WORKERS`, and anything that is neither `"auto"` nor an integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThreadCount {
     /// Leave it to the rule in [`ThreadCount::resolve`] — **the default**, so a config that says nothing gets a count
     /// derived from the machine rather than from a header file.
+    #[default]
     Auto,
     /// An explicit count the operator chose. Honoured as given, including values above `available_parallelism()` — §5 of
-    /// the policy design: an operator may know something this program cannot see. What is *not* honoured is a value C
-    /// cannot be told, and that refusal lives in the deserializer so it arrives as a key name rather than as a runtime
-    /// failure.
+    /// the policy design: an operator may know something this program cannot see. What is *not* honoured is a count past
+    /// `MAX_REQUESTED_WORKERS`, and that refusal lives in the deserializer so it arrives as a key name rather than as a
+    /// runtime failure or, as it did the first time, an uncatchable abort.
     Workers(std::num::NonZeroU32),
 }
 
-/// The default is [`ThreadCount::Auto`]: this change alters behaviour on purpose, and `[embeddings] threads = 4` is the
-/// one-line way back to what every run did before it.
-impl Default for ThreadCount {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-/// The largest worker count llama.cpp's `int32_t` field can be told. Refused at load rather than clamped: measured on
-/// this pin, a request of 3,000,000,000 became `2147483647`, the readback echoed it, and llama.cpp died in a C++
-/// exception (`SIGABRT`) — nothing in Rust catches that, so the only safe place for the check is before the value exists.
-const MAX_THREAD_COUNT: u64 = i32::MAX as u64;
+/// **Refused rather than clamped, and at a bound well below what C can be told.** The first version of this seam accepted
+/// anything up to `i32::MAX` and clamped above it; measured on this pin, a request of 3,000,000,000 became `2147483647`,
+/// the readback echoed that number back, and llama.cpp died in a C++ exception (`SIGABRT`) which nothing in Rust catches.
+/// So the check has to happen before the value exists — but "before the value exists" is not the same as "the largest
+/// number a field can hold", and the review of this change found that the first bound was exactly that: `threads =
+/// 100000000` parsed, resolved verbatim, and reached `n_threads`. A host with a hundred million CPUs is not a thing this
+/// program can see, let alone schedule across, so accepting it buys an operator nothing they could use.
+///
+/// 4,096 is therefore a **policy** bound, not a measured cliff: it is 128× the largest worker count in
+/// `docs/design-m2-thread-policy.md` §2's table (32, the point past which this host got *slower*), and an operator who
+/// genuinely wants more than four thousand workers on one process has a machine this program's evidence does not cover.
+/// The `i32_t` ceiling stays as a second fence at load time (`local_model::load_with_options`, behind the feature), so a
+/// value that somehow arrives by another route is still refused rather than aborting.
+const MAX_REQUESTED_WORKERS: u64 = 4_096;
 
 impl ThreadCount {
     /// The count to ask for on a machine where `available_parallelism()` answered `available`.
@@ -273,13 +276,18 @@ impl ThreadCount {
     #[must_use]
     pub fn resolve(self, available: usize) -> usize {
         match self {
-            Self::Workers(n) => usize::try_from(n.get()).unwrap_or(usize::MAX),
+            // `Workers` is a `NonZeroU32` that the deserializer bounded by `MAX_REQUESTED_WORKERS`, so the conversion
+            // cannot fail here; the fallback is the ceiling rather than `usize::MAX` so an unreachable path cannot be the
+            // worst possible count.
+            Self::Workers(n) => usize::try_from(n.get()).unwrap_or(MAX_REQUESTED_WORKERS as usize),
             Self::Auto => {
                 if available == 0 {
                     return 1;
                 }
                 let floor = available.min(4);
-                let fraction = available * 4 / 5;
+                // `saturating` because `resolve` is public: a caller that invents `available = usize::MAX` gets
+                // the ceiling behaviour of the rule, not a debug-build overflow panic.
+                let fraction = available.saturating_mul(4) / 5;
                 available.min(floor.max(fraction))
             }
         }
@@ -321,10 +329,10 @@ impl<'de> serde::Deserialize<'de> for ThreadCount {
                          least 1 (zero workers is not something the runtime can be asked for)",
                     ));
                 }
-                if value > MAX_THREAD_COUNT {
+                if value > MAX_REQUESTED_WORKERS {
                     return Err(E::custom(format!(
-                        "embeddings.threads = {value} is larger than the runtime can be told \
-                         (max {MAX_THREAD_COUNT})"
+                        "embeddings.threads = {value} is more worker threads than this program will ask for \
+                         (max {MAX_REQUESTED_WORKERS}); write `\"auto\"` or a count near your CPU count"
                     )));
                 }
                 // `value` is ≥ 1 and fits a `u32`; both were checked above, so neither fallback can run.
@@ -480,7 +488,7 @@ impl Default for EmbeddingsConfig {
             model: None,
             dim: None,
             max_tokens: DEFAULT_EMBEDDING_TOKENS,
-            threads: ThreadCount::Auto,
+            threads: ThreadCount::default(),
         }
     }
 }

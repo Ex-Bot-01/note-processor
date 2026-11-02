@@ -120,7 +120,22 @@ that cell. What it does instead:
 * **The loader refuses what C cannot be told.** A count above `i32::MAX` is an `EmbedError::Unavailable` naming the
   number, before a context exists. That is not hypothetical: the first version of this seam clamped such a value to
   `i32::MAX`, llama.cpp echoed it back, and the process died in a C++ exception (`SIGABRT`) — see `m22/thread-sweep`.
-* **Config refuses what would overflow at load**, so the common case fails with a key name instead of a runtime error.
+* **Config refuses what this program will not ask for**, so the common case fails with a key name instead of a runtime
+  error. The bound is `MAX_REQUESTED_WORKERS = 4_096`, and it went through one correction to get there: the first version
+  refused only above `i32::MAX`, which review pointed out is a sentence about the width of a C field, not about a machine.
+  `threads = 100000000` parsed, resolved verbatim and was written to `n_threads` — measured, since "the ceiling is too
+  high" is the kind of claim that has to be run rather than argued. 4,096 is a **policy** bound, not a measured cliff: it
+  is 128× the largest count in §2's table (32, where this host was already slower than four), and no evidence in this
+  repository covers a process with more workers than that. It is also a boundary and never a clamp — `threads = 4096`
+  loads as 4,096 and `4097` is refused (`the_worker_ceiling_is_a_boundary_and_never_a_clamp`), because quietly changing the
+  operator's number is the defect this seam has been revised around twice.
+
+**The two classes of refusal message, since they differ.** Our own checks print the dotted path — `embeddings.threads =
+4097 is more worker threads than this program will ask for (max 4096)`. A value of the wrong *type* never reaches them: a
+float, a bool and an integer wider than `u64` (toml hands that to serde as an `i128`) come back as serde's
+`invalid type … expected "\"auto\"" or a positive integer of worker threads`, which names the key through the rendered
+source line and caret rather than through the path. Both name the file. Pinning `embeddings.threads` for every row would
+have been a test written against this document instead of against the output, so the cases are split by class.
 
 ## 6. What this rule does not claim
 

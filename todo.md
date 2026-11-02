@@ -29,8 +29,9 @@ unresolved.
 * `np embed` stopped inheriting llama.cpp's compile-time four. `[embeddings] threads = "auto"` (default) resolves to
   `min(cpus, max(min(cpus, 4), floor(0.8 × cpus)))`: **twelve workers on this host**, two on a two-core laptop, never more
   than exist. `threads = 4` restores the old behaviour exactly; `threads = 0`, a negative, and anything above what C can be
-  told are refused naming the key — the last because an earlier revision *clamped* such a value and llama.cpp aborted
-  (`SIGABRT`). Design: `docs/design-m2-thread-policy.md`; measurement: §14's D13 subsection of the local-embeddings design.
+  told are refused — by name, and now at a policy ceiling of 4,096 rather than at `i32::MAX`, because review found
+  `threads = 100000000` parsing and reaching `n_threads`; the earlier revision also *clamped* such a value and llama.cpp
+  aborted (`SIGABRT`). Design: `docs/design-m2-thread-policy.md`; measurement: §14's D13 subsection of the local-embeddings design.
 * The run reports what it used — `threads 12 of 16 available (auto)`, `"workers"` in `--json`, `null` when no local model
   ran — and an artifact-gated case asserts the count reaching the context equals the count the report states, so "the
   report says twelve while the loader used four" is a test failure rather than a plausible-looking run.

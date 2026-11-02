@@ -317,8 +317,9 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     // and the text summary cannot disagree about whether this run verified anything (the same reason §7's caveat is a
     // field). `None` says no local artifact was involved — a `provider = "none"` run has nothing to claim.
     report.artifact_check = resolved.artifact_check;
-    // Likewise the worker count: decided where the provider was built, printed here, and `None` when no local model ran
-    // — a run that embeds nothing has no thread count to state.
+    // Likewise the worker count: decided where the provider was built, printed here. `None` means **no local-model
+    // provider was constructed** — which is not the same sentence as "nothing was embedded": a `local-model` run whose
+    // notes were all current still built a provider, and its report states the count it would have used.
     report.workers = resolved.workers;
     if json {
         emit_json(&serde_json::to_value(&report)?);
@@ -498,8 +499,8 @@ fn print_embed_summary(report: &EmbedReport) {
         let _ = writeln!(out, "digest     {}", check.label());
     }
     // Last, for the same reason `digest` is: it answers a question about this run's machine rather than about the
-    // vectors. Omitted entirely when no local model was involved — printing `threads 4 of 16` for a run that embedded
-    // nothing would be a number about nothing.
+    // vectors. Omitted when no local-model provider was built — printing `threads 4 of 16` for a `provider = "none"` run
+    // would be a number about nothing.
     if let Some(plan) = &report.workers {
         let _ = writeln!(out, "threads    {}", plan.describe());
     }

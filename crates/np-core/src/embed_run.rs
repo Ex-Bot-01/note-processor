@@ -160,10 +160,6 @@ impl EmbedOutcome {
     }
 }
 
-/// What one `np embed` run saw and did.
-///
-/// Six counts, in §6's order, plus the model they were counted against, the arm and §7's caveat. Every field
-/// is a count of **chunks** except [`EmbedReport::busy_gap`], which counts **batches** — the transaction, not
 /// What this run decided about worker threads for the local model, carried on the report so a slow run can be
 /// diagnosed from its own output.
 ///
@@ -195,6 +191,10 @@ impl WorkerPlan {
     }
 }
 
+/// What one `np embed` run saw and did.
+///
+/// Six counts, in §6's order, plus the model they were counted against, the arm and §7's caveat. Every field
+/// is a count of **chunks** except [`EmbedReport::busy_gap`], which counts **batches** — the transaction, not
 /// the text, is the thing that met the lock, and one batch may hold several chunks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmbedReport {

@@ -1110,3 +1110,29 @@ fn an_empty_data_dir_is_refused() {
         "the refusal names the missing value: {error}"
     );
 }
+
+/// The text report's one-line spelling of the worker count, pinned without a model.
+///
+/// `describe()` is the only place the `threads 12 of 16 available (auto)` shape is assembled, and until now the only
+/// thing that checked it against `--json` needed a 310 MB artifact — so a format change would pass every gate row that
+/// runs without one. The string *is* the product here: a person comparing two runs reads it.
+#[test]
+fn the_worker_plan_describes_itself_in_one_line() {
+    let auto = np_core::embed_run::WorkerPlan {
+        count: 12,
+        available: 16,
+        configured: "auto",
+    };
+    assert_eq!(auto.describe(), "12 of 16 available (auto)");
+
+    let explicit = np_core::embed_run::WorkerPlan {
+        count: 4,
+        available: 2,
+        configured: "explicit",
+    };
+    assert_eq!(
+        explicit.describe(),
+        "4 of 2 available (explicit)",
+        "an oversubscribed explicit count has to read as what it is — a choice, not a bug in the rule"
+    );
+}

@@ -2138,9 +2138,13 @@ mod real_model {
         let available = workers["available"]
             .as_u64()
             .expect("and the CPU allowance it derived from");
-        assert!(
-            count >= 1,
-            "a run with zero workers cannot decode: {workers}"
+        // Not `count >= 1`: the type makes zero unrepresentable and the rule cannot return it, so that check could never
+        // fire. This one can — it recomputes the rule from the reported denominator, so a report built from a stale or
+        // differently-sourced count fails.
+        assert_eq!(
+            count as usize,
+            np_core::config::ThreadCount::Auto.resolve(available as usize),
+            "the run configured `auto`, so its worker count must be the rule applied to the machine it reported"
         );
         assert!(
             count <= available,
