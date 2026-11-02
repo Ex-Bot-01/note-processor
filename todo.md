@@ -24,7 +24,7 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
-## In progress — R8 worker-thread policy (branch `m23/threads-default`, 2026-11-02)
+## Shipped (main) — R8 worker-thread policy (merged 2026-11-02: `e238aa1` measurement, `67cbe14` policy)
 
 * `np embed` stopped inheriting llama.cpp's compile-time four. `[embeddings] threads = "auto"` (default) resolves to
   `min(cpus, max(min(cpus, 4), floor(0.8 × cpus)))`: **twelve workers on this host**, two on a two-core laptop, never more
@@ -35,6 +35,9 @@ unresolved.
 * The run reports what it used — `threads 12 of 16 available (auto)`, `"workers"` in `--json`, `null` when no local model
   ran — and an artifact-gated case asserts the count reaching the context equals the count the report states, so "the
   report says twelve while the loader used four" is a test failure rather than a plausible-looking run.
+* Also on main from the same pair of merges: the D13 measurement seam (`LoadOptions { threads }`, one process per cell in
+  `crates/np-core/tests/probes/thread_sweep.sh`) and three committed sweep logs, so every worker-count number quoted in a
+  design document traces to a row someone else can re-check.
 * **Owed by this change:** re-run `local_corpus` under the auto count. Its committed figures (16,161 chunks/hour) and §8's
   evening-rule arithmetic are four-worker measurements; that fixture now pins four explicitly so those rows keep meaning
   what they say until someone re-measures.
@@ -60,7 +63,7 @@ dead-code script; `verify_catalog_goldens.py` printing `GOLDEN CHECK: pass`; CI 
 windows-latest. **Goldens are never regenerated** — a diff under `tests/golden*` stops the work and gets
 reported.
 
-## In progress — M2a (branch `m12/embeddings`)
+## Historical: M2a (branch `m12/embeddings`, merged 2026-10-30 at `9193732`)
 
 Chunking and vector storage, deliberately without clustering: the spec gates the model on throughput ("measured
 before we commit", §13 step 2), so M2 is cut into **M2a** (storage + chunker + provider seam + benchmark) and
