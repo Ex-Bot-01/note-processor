@@ -17,10 +17,13 @@
 //! re-upload instead of following it. §12 rule 8 keeps the other half of the boundary (a *refusal* names a class,
 //! never a URL), and `tests/pins.rs` turns both halves into assertions so a future edit has to be deliberate.
 //!
-//! ## What is not here yet
+//! ## Where the second member's number came from, and why the design's number is not used
 //!
-//! Only one member of the `embeddinggemma-2` pair is pinned. See [`MMPROJ_DIGEST_PREFIX_ONLY`] for why the
-//! second one is absent rather than guessed, and what that costs [`total_size`].
+//! §12 rule 7 records the mmproj digest as `c4a8a526…`, "from public LFS metadata 2026-10-29". **That prefix belongs
+//! to no file in that repository.** On 2026-11-02 the artifact was downloaded and hashed here, and its own metadata
+//! agreed byte for byte — see [`PINNED`]'s second row for the value and its provenance. The design's eight characters
+//! are kept out of this table on purpose: a digest nobody can reproduce is not an expectation, it is a permanent
+//! refusal waiting to fire against good bytes. `docs/design-m2-local-embeddings.md` §12 carries the correction.
 
 /// One accepted file, named by its member role inside a model id's set of files.
 ///
@@ -57,7 +60,7 @@ pub struct PinnedModel {
 /// here is the only way to teach this build a new artifact, and `tests/pins.rs` refuses rows whose digest is not
 /// 64 lowercase hex characters or whose size is zero — a truncated paste and an unknown length are both refusals
 /// waiting to be misread as "the download was corrupted".
-pub const PINNED: &[PinnedModel] = &[PinnedModel {
+const MAIN: PinnedModel = PinnedModel {
     id: "embeddinggemma-2",
     member: "main",
     filename: "embeddinggemma-2-Q8_0.gguf",
@@ -69,26 +72,73 @@ pub const PINNED: &[PinnedModel] = &[PinnedModel {
     size_bytes: 309_855_456,
     sha256: "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135",
     read_on: "design-m2-local-embeddings.md §3, measured 2026-10-30",
+};
+
+/// The second member of the pair: the projector that carries the image and audio encoders.
+///
+/// **Measured here, not claimed.** On 2026-11-02 this file was fetched from `ggml-org/embeddinggemma-2-GGUF` into a
+/// tmpfs, hashed with GNU coreutils `sha256sum`, and the length read from the file: **554,821,056 bytes**, digest
+/// below. The host's own LFS metadata (`GET /api/models/ggml-org/embeddinggemma-2-GGUF/tree/main`) reported the same
+/// `oid` in the same minute, which is the cross-check that makes the number usable as a pin rather than as one
+/// machine's reading — and it is also how this round discovered that §12's recorded prefix (`c4a8a526…`) matches
+/// neither this file nor the BF16 sibling.
+///
+/// What that leaves honestly unstated: nobody has embedded a note with these bytes. R7c's spike owns whether the
+/// encoders do anything, and §5 says so; pinning a file is not a claim about its use.
+const MMPROJ: PinnedModel = PinnedModel {
+    id: "embeddinggemma-2",
+    member: "mmproj",
+    filename: "mmproj-embeddinggemma-2-Q8_0.gguf",
+    size_bytes: 554_821_056,
+    sha256: "0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8",
+    read_on: "downloaded and hashed on this host 2026-11-02; matches the host's LFS metadata the same day",
+};
+
+/// Every artifact this build will accept, in id order.
+///
+/// One entry per member, so an id with two files appears twice with the same [`PinnedModel::id`]. Adding a row here
+/// is the only way to teach this build a new artifact, and `tests/pins.rs` refuses rows whose digest is not 64
+/// lowercase hex characters or whose size is zero — a truncated paste and an unknown length are both refusals waiting
+/// to be misread as "the download was corrupted".
+pub const PINNED: &[PinnedModel] = &[MAIN, MMPROJ];
+
+/// What a model **declares**, independently of how its bytes arrive (§12 rule 10's identity half).
+///
+/// `models.dim`, `prefix_doc` and `prefix_query` are the facts that decide whether two vectors are comparable at
+/// all, and install design §2 insists they are *declared* rather than probed from a header. A fetch has to produce a
+/// row, so it needs the same facts from somewhere, and the only honest source is this table: authored by whoever
+/// built the pin, reviewed beside the digests, compiled in so no runtime path can vary it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedIdentity {
+    /// The model id these declarations belong to.
+    pub id: &'static str,
+    /// Vector width — the number `embeddings`' `CHECK (length(vector) = 4 * dim)` measures in bytes.
+    pub dim: u16,
+    /// Text prepended to documents before they reach the model.
+    pub prefix_doc: &'static str,
+    /// Text prepended to queries. Never used to compare against a stored vector (§3).
+    pub prefix_query: &'static str,
+}
+
+/// One row per fetchable id. `dim` is measured from the artifact's own header (§3, R6b1); **both prefixes are empty**,
+/// and that is a statement about evidence rather than an oversight: no instruction convention has been measured for
+/// this model in this repository, and every embedding run recorded here — R6b2's enforcement test through R6d's corpus
+/// run — used none. Prefixes change vector bytes, so they are part of an id's identity (`@n`), which means a later
+/// round that *measures* a convention must ship it as a **new id** rather than as an edit to these strings.
+pub const PINNED_IDENTITIES: &[PinnedIdentity] = &[PinnedIdentity {
+    id: "embeddinggemma-2",
+    dim: 768,
+    prefix_doc: "",
+    prefix_query: "",
 }];
 
-/// TODO(R7b): the mmproj half of the `embeddinggemma-2` pair is **not pinned**, and this is the gap on record.
+/// The declared identity of `id`, if this build declares one.
 ///
-/// §12 rule 7 names its digest as `c4a8a526…` — eight characters, "from public LFS metadata 2026-10-29" — and §5
-/// gives its name as `mmproj-embeddinggemma-2-Q8_0.gguf` at "554.8 MB". Nothing in this repository or on this host
-/// holds the remaining 56 hex digits or the exact byte length: the file itself is not here (`/home/agent/models`
-/// carries the text artifact alone), and no fetch has ever run. Writing a plausible 64-character value would be
-/// the worst available outcome — a digest nobody can check is indistinguishable from a real one, and it is compared
-/// against 310 MB of bytes as though it were provenance. So this constant carries **only the prefix §12 records**,
-/// labelled as unverified, and `PINNED` carries no `mmproj` member: a fetch that cannot pin a member must refuse it,
-/// not improvise one.
-///
-/// **This is not a digest and must never be compared as one.** Landing the real number means replacing this
-/// constant with a second [`PinnedModel`] row — and `tests/pins.rs`'s gap test fails when the member arrives, which
-/// is what forces whoever adds it to delete the fence on purpose rather than by accident.
-///
-/// Until then [`total_size`] understates §12 rule 6's preflight for this id, and that is the cost of the gap: see
-/// its doc.
-pub const MMPROJ_DIGEST_PREFIX_ONLY: &str = "c4a8a526";
+/// `None` means a fetch must refuse: bytes with no width to record are not a model, and guessing 768 because it is
+/// the only width seen so far is exactly the un-declared identity install design §2 refuses.
+pub fn identity(id: &str) -> Option<&'static PinnedIdentity> {
+    PINNED_IDENTITIES.iter().find(|entry| entry.id == id)
+}
 
 /// Every pinned member of `id`, in [`PINNED`] order.
 ///
@@ -103,7 +153,7 @@ pub fn pinned(id: &str) -> impl Iterator<Item = &'static PinnedModel> + use<'_> 
 /// The pinned member `member` of `id`, if this build pins it at all.
 ///
 /// `None` means "refuse", not "unknown": an unpinned member has no digest to check, and §12 rule 7's guarantee is
-/// that nothing without one is accepted — which is exactly the state [`MMPROJ_DIGEST_PREFIX_ONLY`] records.
+/// that nothing without one is accepted. This is the arm a fetch reaches for a member name nobody read a digest for.
 pub fn pinned_member(id: &str, member: &str) -> Option<&'static PinnedModel> {
     pinned(id).find(|entry| entry.member == member)
 }
@@ -111,14 +161,15 @@ pub fn pinned_member(id: &str, member: &str) -> Option<&'static PinnedModel> {
 /// What a fetch of `id` must have room for: the sum of [`PinnedModel::size_bytes`] over every pinned member of that
 /// id, which is §12 rule 6's disk preflight ("summed over **both** files — a factor of 2.8 against guessing one").
 ///
-/// **Today this table carries one member for `embeddinggemma-2`, so the sum covers only the primary artifact.**
-/// That is [`MMPROJ_DIGEST_PREFIX_ONLY`]'s cost, stated where a caller will read it: the real transfer needs room for
-/// both files, so a preflight built on this number alone admits a fetch that cannot finish. The honest fix is the
-/// missing digest, not a magic constant added here — an invented size would make the sum look authoritative while
-/// being exactly as unknown as the digest it would have to travel with.
+/// For `embeddinggemma-2` this is both files of the pair — **864,676,512 bytes**, which is §5's "864.7 MB" seen from
+/// the other end, and the reason rule 6's preflight insists on summing members rather than trusting one: guessing a
+/// single file understates the transfer by a factor of 2.8.
 ///
 /// An unknown id sums to `0`, which is correct arithmetic for "nothing is pinned" and must not be read as "no disk
 /// needed": a caller that has already resolved an id checks [`pinned`] is non-empty before asking this.
+///
+/// (`tests/pins.rs` pins the 864,676,512 figure by name, so adding or removing a member has to be a decision made
+/// twice — here and in the test that quotes §5.)
 pub fn total_size(id: &str) -> u64 {
     pinned(id).map(|entry| entry.size_bytes).sum()
 }

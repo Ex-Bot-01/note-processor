@@ -183,6 +183,35 @@ pub enum FetchError {
         /// What was wrong with it.
         reason: String,
     },
+    /// The id has pinned bytes but no declared identity. Refused before any request: 865 MB that cannot be recorded
+    /// as a model is a download with no purpose, and inventing a `dim` at the end of one would be an identity
+    /// declared by nobody (install design §2).
+    #[error("`{id}` has pinned artifacts but no declared dim or prefixes in this build, so a fetch could not record it")]
+    NoIdentity {
+        /// The id asked for.
+        id: String,
+    },
+    /// A row for this id already exists and declares something else. **Both sides named, nothing written** — the
+    /// same shape `install` uses for a disagreeing declaration, because "your workspace said 1024 and this build
+    /// pins 768" is a fact the human has to resolve, not one this command may overwrite.
+    #[error("`{id}` is already declared as {stored}; this build pins {pinned}")]
+    IdentityDisagrees {
+        /// The id whose row disagrees.
+        id: String,
+        /// The workspace's declaration, spelled by this module's private `declare`: width plus both prefixes, with
+        /// an empty one shown as `""` rather than vanishing from the sentence.
+        stored: String,
+        /// What this build pins, in the same spelling, so the two read side by side.
+        pinned: String,
+    },
+    /// The workspace database refused the row or the member rows. The artifact may already be published at this
+    /// point, which is the same crash state `install`'s rename-then-insert gap leaves and `list` reports as a model
+    /// with no recorded files — reported here rather than hidden behind a success.
+    #[error("cannot record the fetched model in this workspace: {source}")]
+    Db {
+        /// The database's own failure.
+        source: crate::db::DbError,
+    },
     /// Free space is below the pinned total plus [`PREFLIGHT_MARGIN_BYTES`] (rule 6). Both numbers, no advice about
     /// what to delete.
     #[error(
@@ -299,7 +328,44 @@ impl FetchReport {
     }
 }
 
-/// Fetch every pinned member of `id` into `models_dir`.
+/// Spell one model's declaration the same way on both sides of a disagreement.
+///
+/// Six fields became two strings here because the `Err` variant of this module's result was growing into something
+/// clippy reasonably objects to moving, and the *sentence* is what a human reads: pre-formatting it loses nothing and
+/// keeps an empty prefix visible (`""`) where six separate fields would have let it disappear.
+fn declare(dim: i64, prefix_doc: &str, prefix_query: &str) -> String {
+    format!("dim {dim} with prefixes {prefix_doc:?} / {prefix_query:?}")
+}
+
+/// Everything a fetch must accept and record, as one value.
+///
+/// Grouped because the eight separate parameters this function would otherwise take tripped its own argument-count
+/// fence — and grouping is the honest fix rather than an `#[allow]`: the pin table and the declaration are **one
+/// decision** (which bytes, and what model they make), and passing them apart invites a caller to pair one id's
+/// digests with another id's width.
+pub struct Expectation<'a, T> {
+    /// The members this call may accept, and what each must hash to.
+    pub table: &'a [T],
+    /// The identity the row records when the bytes land.
+    pub declaration: &'a Declaration,
+}
+
+/// What a completed fetch records in `models`: width and both prefixes.
+///
+/// Production builds this from [`crate::pins::identity`] — the same reviewed table that pins the bytes, so an id's
+/// identity travels with its digests instead of being re-typed per call. A test builds its own, which is what lets
+/// the row-creation path be exercised without downloading 865 MB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    /// Vector width to record.
+    pub dim: u16,
+    /// Document prefix to record.
+    pub prefix_doc: String,
+    /// Query prefix to record.
+    pub prefix_query: String,
+}
+
+/// Fetch every pinned member of `id` into `models_dir` and record the model.
 ///
 /// **Order matters and is the point:** the marker exists before byte one (so a listing during the transfer can say
 /// so), the `.part` lives in the destination directory (so publishing is a rename, rule 5), length is checked before
@@ -309,20 +375,25 @@ impl FetchReport {
 /// [`FetchError::MemberUnpinned`] reachable rather than decorative: the CLI asks for the whole pair by default, and a
 /// build that pins only `main` refuses out loud instead of quietly downloading half of it.
 pub fn fetch(
+    db: &crate::db::Db,
     models_dir: &Path,
     id: &str,
     requested: &[&str],
     transport: &dyn Transport,
     now: i64,
 ) -> Result<FetchReport, FetchError> {
-    fetch_with_table(
-        models_dir,
-        id,
-        requested,
-        transport,
-        now,
-        crate::pins::PINNED,
-    )
+    let pinned =
+        crate::pins::identity(id).ok_or_else(|| FetchError::NoIdentity { id: id.into() })?;
+    let declaration = Declaration {
+        dim: pinned.dim,
+        prefix_doc: pinned.prefix_doc.to_string(),
+        prefix_query: pinned.prefix_query.to_string(),
+    };
+    let plan = Expectation {
+        table: crate::pins::PINNED,
+        declaration: &declaration,
+    };
+    fetch_with_table(db, models_dir, id, requested, transport, now, &plan)
 }
 
 /// [`fetch`] against an explicit pin table.
@@ -335,13 +406,15 @@ pub fn fetch(
 /// interruption cases reachable at all. `T` is generic rather than `dyn` so the production call keeps the concrete
 /// `PinnedModel` slice it already has.
 pub fn fetch_with_table<T: MemberPin>(
+    db: &crate::db::Db,
     models_dir: &Path,
     id: &str,
     requested: &[&str],
     transport: &dyn Transport,
     now: i64,
-    table: &[T],
+    plan: &Expectation<'_, T>,
 ) -> Result<FetchReport, FetchError> {
+    let Expectation { table, declaration } = plan;
     // An id that names nothing cannot be fetched, and naming it wrongly is an argv fact — not a file fact, which is
     // why this does not travel through `Io`.
     if let Err(err) = models::validate_id(id) {
@@ -374,6 +447,37 @@ pub fn fetch_with_table<T: MemberPin>(
                     member: (*name).into(),
                 })
             }
+        }
+    }
+
+    // **The row's declared identity is checked before byte one**, like the target-exists rule: it is a fact this
+    // command can learn without transferring anything, and a workspace that declared 1,024 dimensions must not have
+    // 865 MB arrive and then be told its model disagrees.
+    if let Some(row) = crate::db::model_row(db, id).map_err(|source| FetchError::Db { source })? {
+        let primary = members
+            .iter()
+            .find(|member| member.member() == PRIMARY_MEMBER)
+            .copied()
+            .unwrap_or(members[0]);
+        let stored_prefixes_differ = row.prefix_doc != declaration.prefix_doc
+            || row.prefix_query != declaration.prefix_query;
+        let width_differs = row.dim != i64::from(declaration.dim);
+        // The digest is compared only when the workspace actually recorded one: `models.sha256` is NULL for a
+        // provider with no weights, and "no digest on file" is not evidence of disagreement.
+        let digest_differs = match row.sha256.as_deref() {
+            Some(stored) => stored != primary.sha256(),
+            None => false,
+        };
+        if width_differs || stored_prefixes_differ || digest_differs {
+            return Err(FetchError::IdentityDisagrees {
+                id: id.into(),
+                stored: declare(row.dim, &row.prefix_doc, &row.prefix_query),
+                pinned: declare(
+                    i64::from(declaration.dim),
+                    &declaration.prefix_doc,
+                    &declaration.prefix_query,
+                ),
+            });
         }
     }
 
@@ -478,6 +582,27 @@ pub fn fetch_with_table<T: MemberPin>(
             sha256: published.sha256,
         });
     }
+
+    // Durable artifact first, then the rows that name it — `install`'s order, for the same reason (F21: a record
+    // before the echo). A crash between the rename and here is the state `list` already reports as an artifact with
+    // no row, and re-running resolves it: the target-exists rule refuses until the human says otherwise, which is
+    // why the row insert happens last rather than first.
+    let primary = members
+        .iter()
+        .find(|member| member.member() == PRIMARY_MEMBER)
+        .copied()
+        .unwrap_or(members[0]);
+    crate::db::insert_model(
+        db,
+        id,
+        i64::from(declaration.dim),
+        Some(primary.sha256()),
+        &declaration.prefix_doc,
+        &declaration.prefix_query,
+        now,
+    )
+    .map_err(|source| FetchError::Db { source })?;
+    record_members(db, &report).map_err(|source| FetchError::Db { source })?;
 
     let _ = fs::remove_file(models::marker_path(models_dir, id));
     Ok(report)

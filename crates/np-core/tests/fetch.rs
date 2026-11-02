@@ -13,8 +13,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
+use np_core::db::{self, Db};
 use np_core::fetch::MemberPin;
-use np_core::fetch::{self, Body, FetchError, Transport};
+use np_core::fetch::{self, Body, Declaration, Expectation, FetchError, Transport};
 use np_core::hash::sha256_bytes;
 use np_core::models::{self, FetchState};
 use tempfile::TempDir;
@@ -183,12 +184,29 @@ fn dir() -> TempDir {
     TempDir::new().expect("test setup: tempdir")
 }
 
+/// A workspace database, in memory — the row a successful fetch writes is part of what these cases verify, so the
+/// engine cannot be tested without one.
+fn db() -> Db {
+    Db::in_memory().expect("test setup: in-memory database")
+}
+
+/// The identity every fixture records: a width nothing else in this file uses, and prefixes that are **not** both
+/// empty, so an assertion that the row carries them cannot pass by defaulting.
+fn declaration() -> Declaration {
+    Declaration {
+        dim: 4,
+        prefix_doc: "doc: ".into(),
+        prefix_query: "q: ".into(),
+    }
+}
+
 const MAIN: &[u8] = b"the primary artifact, in words, not 310 MB of them";
 const EXTRA: &[u8] = b"and its second member, also small on purpose";
 
 #[test]
 fn a_verified_pair_is_published_and_no_fetch_name_survives() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     let table = table(MAIN, EXTRA);
     let fake = Fake::new();
@@ -196,12 +214,16 @@ fn a_verified_pair_is_published_and_no_fetch_name_survives() {
     fake.serve("extra", Serve::Full(EXTRA.to_vec()));
 
     let report = fetch::fetch_with_table(
+        &db,
         &models,
         "test-model",
         &["main", "extra"],
         &fake,
         1_730_000_000,
-        &table,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
     )
     .expect("both members verify");
 
@@ -244,6 +266,7 @@ fn a_verified_pair_is_published_and_no_fetch_name_survives() {
 #[test]
 fn the_marker_exists_while_bytes_are_arriving() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     fs::create_dir_all(&models).expect("test setup: models dir");
     let table = table(MAIN, EXTRA);
@@ -259,12 +282,16 @@ fn the_marker_exists_while_bytes_are_arriving() {
     );
 
     fetch::fetch_with_table(
+        &db,
         &models,
         "test-model",
         &["main"],
         &fake,
         1_730_000_001,
-        &table,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
     )
     .expect("the observed fetch completes");
     assert_eq!(
@@ -276,6 +303,7 @@ fn the_marker_exists_while_bytes_are_arriving() {
 #[test]
 fn a_second_fetch_refuses_while_a_marker_exists_and_names_the_way_out() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     fs::create_dir_all(&models).expect("test setup: models dir");
     // A marker as some *other* process wrote it — the case §12 rule 4 is about, since liveness is consent.
@@ -289,12 +317,16 @@ fn a_second_fetch_refuses_while_a_marker_exists_and_names_the_way_out() {
     let fake = Fake::new();
     fake.serve("main", Serve::Full(MAIN.to_vec()));
     let err = fetch::fetch_with_table(
+        &db,
         &models,
         "test-model",
         &["main"],
         &fake,
         1_730_000_002,
-        &table,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
     )
     .expect_err("an existing marker is consent already given");
 
@@ -324,6 +356,7 @@ fn a_second_fetch_refuses_while_a_marker_exists_and_names_the_way_out() {
 #[test]
 fn an_unreadable_marker_is_reported_and_left_in_place() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     fs::create_dir_all(&models).expect("test setup: models dir");
     write_marker_raw(&models, "test-model", "{ truncated");
@@ -332,12 +365,16 @@ fn an_unreadable_marker_is_reported_and_left_in_place() {
     let fake = Fake::new();
     fake.serve("main", Serve::Full(MAIN.to_vec()));
     let err = fetch::fetch_with_table(
+        &db,
         &models,
         "test-model",
         &["main"],
         &fake,
         1_730_000_003,
-        &table,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
     )
     .expect_err("a marker this build cannot read is not an absent marker");
 
@@ -354,18 +391,23 @@ fn an_unreadable_marker_is_reported_and_left_in_place() {
 #[test]
 fn a_short_stream_refuses_and_leaves_nothing_behind() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     let table = table(MAIN, EXTRA);
     let fake = Fake::new();
     fake.serve("main", Serve::Truncated(MAIN.to_vec()));
 
     let err = fetch::fetch_with_table(
+        &db,
         &models,
         "test-model",
         &["main"],
         &fake,
         1_730_000_004,
-        &table,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
     )
     .expect_err("a truncated transfer is not a verified artifact");
 
@@ -385,6 +427,7 @@ fn a_short_stream_refuses_and_leaves_nothing_behind() {
 #[test]
 fn right_length_wrong_digest_names_both_numbers_and_never_blames_the_human() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     let table = table(MAIN, EXTRA);
     // Same length as pinned, different bytes: the digest is the only thing that can catch this, which is the point
@@ -400,6 +443,7 @@ fn right_length_wrong_digest_names_both_numbers_and_never_blames_the_human() {
     fake.serve("main", Serve::Full(altered.to_vec()));
 
     let err = refusal(
+        &db,
         &models,
         "test-model",
         &["main"],
@@ -431,6 +475,7 @@ fn right_length_wrong_digest_names_both_numbers_and_never_blames_the_human() {
 #[test]
 fn an_announced_length_that_does_not_arrive_is_interruption_not_mismatch() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     // Pinned at 64 bytes, announced at 64, delivered 10: rule 6's two sentences stay distinct even when the transfer
     // lied about its size.
@@ -444,6 +489,7 @@ fn an_announced_length_that_does_not_arrive_is_interruption_not_mismatch() {
     fake.serve("main", Serve::Full(b"short".to_vec()));
 
     let err = refusal(
+        &db,
         &models,
         "test-model",
         &["main"],
@@ -458,6 +504,7 @@ fn an_announced_length_that_does_not_arrive_is_interruption_not_mismatch() {
 #[test]
 fn an_unknown_transfer_size_still_verifies_against_the_pin() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     let table = table(MAIN, EXTRA);
     let fake = Fake::new();
@@ -465,6 +512,7 @@ fn an_unknown_transfer_size_still_verifies_against_the_pin() {
     fake.serve("main", Serve::UnknownLen(MAIN.to_vec()));
 
     fetch_ok(
+        &db,
         &models,
         "test-model",
         &["main"],
@@ -481,6 +529,7 @@ fn an_unknown_transfer_size_still_verifies_against_the_pin() {
 #[test]
 fn an_existing_artifact_is_never_overwritten_and_is_not_even_requested() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     fs::create_dir_all(&models).expect("test setup: models dir");
     // Verified bytes that belong to this id already. Rule 5 publishes into an **absent** target; a fetch is not the
@@ -494,6 +543,7 @@ fn an_existing_artifact_is_never_overwritten_and_is_not_even_requested() {
     let fake = Fake::new();
     fake.serve("main", Serve::Full(MAIN.to_vec()));
     let err = refusal(
+        &db,
         &models,
         "test-model",
         &["main"],
@@ -514,6 +564,7 @@ fn an_existing_artifact_is_never_overwritten_and_is_not_even_requested() {
 #[test]
 fn a_transport_failure_names_a_class_and_never_the_origin() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     let table = table(MAIN, EXTRA);
     let fake = Fake::new();
@@ -524,6 +575,7 @@ fn a_transport_failure_names_a_class_and_never_the_origin() {
     );
 
     let err = refusal(
+        &db,
         &models,
         "test-model",
         &["main"],
@@ -574,12 +626,14 @@ fn failure_class_summarises_without_echoing() {
 #[test]
 fn an_unknown_id_refuses_before_any_request() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     let table = table(MAIN, EXTRA);
     let fake = Fake::new();
     fake.serve("main", Serve::Full(MAIN.to_vec()));
 
     let err = refusal(
+        &db,
         &models,
         "other-model",
         &["main"],
@@ -600,6 +654,7 @@ fn an_unknown_id_refuses_before_any_request() {
 #[test]
 fn a_member_with_no_recorded_digest_is_refused_by_name_and_the_pair_stays_unwritten() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     // Only `main` is pinned — exactly the production state of the mmproj half (§12 rule 7's second digest).
     let table = vec![table(MAIN, EXTRA).into_iter().next().expect("main row")];
@@ -607,6 +662,7 @@ fn a_member_with_no_recorded_digest_is_refused_by_name_and_the_pair_stays_unwrit
     fake.serve("main", Serve::Full(MAIN.to_vec()));
 
     let err = refusal(
+        &db,
         &models,
         "test-model",
         &["main", "extra"],
@@ -626,10 +682,19 @@ fn a_member_with_no_recorded_digest_is_refused_by_name_and_the_pair_stays_unwrit
 #[test]
 fn an_illegal_id_refuses_as_an_id_problem_not_a_file_problem() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     let table = table(MAIN, EXTRA);
     let fake = Fake::new();
-    let err = refusal(&models, ".hidden", &["main"], &fake, &table, 1_730_000_012);
+    let err = refusal(
+        &db,
+        &models,
+        ".hidden",
+        &["main"],
+        &fake,
+        &table,
+        1_730_000_012,
+    );
     // `.hidden` breaks `validate_id`'s first-character rule (§12 rule 2's forgery defence), so this is the arm that
     // keeps a fetch from writing a name the listing cannot attribute to any id.
     assert!(matches!(err, FetchError::BadId { .. }), "{err}");
@@ -639,6 +704,7 @@ fn an_illegal_id_refuses_as_an_id_problem_not_a_file_problem() {
 #[test]
 fn preflight_refuses_before_byte_one_when_the_disk_cannot_hold_the_pair() {
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     // A pinned size no host could hold: `saturating_add` keeps the arithmetic honest instead of wrapping past zero,
     // which is the failure mode a naive `+ margin` has here.
@@ -652,6 +718,7 @@ fn preflight_refuses_before_byte_one_when_the_disk_cannot_hold_the_pair() {
     fake.serve("main", Serve::Full(MAIN.to_vec()));
 
     let err = refusal(
+        &db,
         &models,
         "test-model",
         &["main"],
@@ -680,6 +747,7 @@ fn every_refusal_message_is_free_of_the_origin() {
     // One case per refusal, all checked against the same string: the loopback origin this test's transport would use.
     // §12 rule 8 is about *every* message, so the fence is written as a sweep rather than attached to one arm.
     let tmp = dir();
+    let db = db();
     let models = tmp.path().join("models");
     fs::create_dir_all(&models).expect("test setup: models dir");
 
@@ -688,6 +756,7 @@ fn every_refusal_message_is_free_of_the_origin() {
     let table = table(MAIN, EXTRA);
     let refusals = vec![
         refusal(
+            &db,
             &models,
             "test-model",
             &["main"],
@@ -703,6 +772,7 @@ fn every_refusal_message_is_free_of_the_origin() {
                 r#"{"nonce":"1-1-1","started_at":5,"bytes_done":6,"bytes_total":null}"#,
             );
             let err = refusal(
+                &db,
                 &models,
                 "test-model",
                 &["main"],
@@ -725,6 +795,7 @@ fn every_refusal_message_is_free_of_the_origin() {
 
 /// Fetch and expect success.
 fn fetch_ok<T: MemberPin>(
+    db: &Db,
     models: &Path,
     id: &str,
     requested: &[&str],
@@ -732,12 +803,17 @@ fn fetch_ok<T: MemberPin>(
     table: &[T],
     now: i64,
 ) {
-    fetch::fetch_with_table(models, id, requested, transport, now, table)
+    let plan = Expectation {
+        table,
+        declaration: &declaration(),
+    };
+    fetch::fetch_with_table(db, models, id, requested, transport, now, &plan)
         .unwrap_or_else(|err| panic!("the fetch of `{id}` should succeed: {err}"));
 }
 
 /// Fetch and keep the error, panicking on success with what was published.
 fn refusal<T: MemberPin>(
+    db: &Db,
     models: &Path,
     id: &str,
     requested: &[&str],
@@ -745,7 +821,11 @@ fn refusal<T: MemberPin>(
     table: &[T],
     now: i64,
 ) -> FetchError {
-    match fetch::fetch_with_table(models, id, requested, transport, now, table) {
+    let plan = Expectation {
+        table,
+        declaration: &declaration(),
+    };
+    match fetch::fetch_with_table(db, models, id, requested, transport, now, &plan) {
         Ok(report) => panic!("expected a refusal for `{id}`, got {report:?}"),
         Err(err) => err,
     }
@@ -802,4 +882,180 @@ fn assert_no_url_pieces(text: &str) {
             "a refusal named {forbidden:?} — §12 rule 8 says a class, never a URL: {text}"
         );
     }
+}
+
+#[test]
+fn a_successful_fetch_records_the_row_and_every_member_it_published() {
+    // The half of §12 rule 10 that only shows up when the bytes arrive: `models.sha256` carries the **primary**
+    // member's digest (so every existing reader keeps its meaning) while `model_files` names both halves. An id whose
+    // pair is recorded under one digest would later refuse its own projector.
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Full(MAIN.to_vec()));
+    fake.serve("extra", Serve::Full(EXTRA.to_vec()));
+
+    fetch_ok(
+        &db,
+        &models,
+        "test-model",
+        &["main", "extra"],
+        &fake,
+        &table,
+        1_730_000_020,
+    );
+
+    let row = db::model_row(&db, "test-model")
+        .expect("the row exists")
+        .expect("fetch created it");
+    assert_eq!(row.dim, 4);
+    assert_eq!(row.sha256.as_deref(), Some(sha256_bytes(MAIN).as_str()));
+    assert_eq!(row.prefix_doc, "doc: ");
+    assert_eq!(row.prefix_query, "q: ");
+    assert_eq!(row.installed_at, 1_730_000_020);
+
+    let files = db::model_files(&db, "test-model").expect("members recorded");
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| (file.name.as_str(), file.size))
+            .collect::<Vec<_>>(),
+        vec![("extra", EXTRA.len() as i64), ("main", MAIN.len() as i64)],
+        "both members, by name, in name order"
+    );
+}
+
+#[test]
+fn a_row_that_declares_something_else_refuses_before_byte_one() {
+    // The workspace said 1,024 dimensions; this build pins 4. That is resolvable only by the human who wrote the
+    // first number, so nothing transfers and both sides are named — `install`'s shape for the same problem.
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    np_core::db::insert_model(
+        &db,
+        "test-model",
+        1024,
+        Some(&sha256_bytes(MAIN)),
+        "",
+        "",
+        7,
+    )
+    .expect("row");
+
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Full(MAIN.to_vec()));
+    let err = refusal(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        &table,
+        1_730_000_021,
+    );
+
+    assert!(matches!(err, FetchError::IdentityDisagrees { .. }), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("1024") && text.contains("4"),
+        "both widths named: {text}"
+    );
+    assert_eq!(
+        fake.opens(),
+        0,
+        "a declared fact needs no transfer to check: {text}"
+    );
+    assert!(!models.join("test-model.gguf").exists());
+    // The row is untouched — a refusal that rewrote the declaration would have decided the disagreement.
+    assert_eq!(
+        db::model_row(&db, "test-model")
+            .expect("row")
+            .expect("still there")
+            .dim,
+        1024
+    );
+}
+
+#[test]
+fn a_row_with_no_digest_of_its_own_does_not_disagree_about_one() {
+    // `models.sha256` is NULL for a provider with no weights (§2 of the embeddings design). "Nothing recorded" is not
+    // evidence of a mismatch, and treating it as such would make a fetch refuse the one workspace shape that has no
+    // opinion to contradict.
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    np_core::db::insert_model(&db, "test-model", 4, None, "doc: ", "q: ", 7).expect("row");
+
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Full(MAIN.to_vec()));
+    fetch_ok(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        &table,
+        1_730_000_022,
+    );
+
+    // The row keeps its NULL digest: recording the fetched bytes there is `install`'s declaration contract, not a
+    // fetch's quiet side effect. What a fetch does write is `model_files`, where the digest does belong.
+    let row = db::model_row(&db, "test-model")
+        .expect("row")
+        .expect("still there");
+    assert_eq!(row.sha256, None);
+    let files = db::model_files(&db, "test-model").expect("members");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].sha256, sha256_bytes(MAIN));
+}
+
+#[test]
+fn a_database_that_refuses_the_record_reports_it_rather_than_a_success() {
+    // The durable-record gap `install` documents between rename and insert, reached on the fetch side: the bytes are
+    // verified and published, and then `model_files` refuses them. What must **not** happen is a success report — the
+    // caller has to learn that this workspace cannot yet use what it just downloaded.
+    let tmp = dir();
+    let models = tmp.path().join("models");
+    let path = tmp.path().join("ws.sqlite");
+
+    // Open once through `Db` so the schema is the current one, close it, then remove *one* of migration 9's tables
+    // out from under it. Reopening cannot re-create the table (the version already says migration 9 ran), which is
+    // exactly the half-applied schema a real interruption can leave.
+    {
+        let opened = Db::open(&path).expect("test setup: current schema");
+        drop(opened);
+    }
+    {
+        let raw = rusqlite::Connection::open(&path).expect("test setup: open raw");
+        raw.execute_batch("DROP TABLE model_files")
+            .expect("test setup: drop the member table");
+    }
+    let db = Db::open(&path).expect("reopening a version-9 file must not fail");
+
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Full(MAIN.to_vec()));
+    let err = refusal(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        &table,
+        1_730_000_030,
+    );
+
+    assert!(matches!(err, FetchError::Db { .. }), "{err}");
+    // The artifact itself is on disk — published before the record failed. That is `list`'s "an artifact with no row"
+    // shape (or here, a row with no members), reported rather than quietly rolled back: deleting bytes a human may
+    // want to keep is not this command's call.
+    assert_eq!(
+        fs::read(models.join("test-model.gguf")).expect("published"),
+        MAIN
+    );
 }

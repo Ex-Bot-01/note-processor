@@ -18,7 +18,8 @@ use std::path::PathBuf;
 
 use np_core::hash::sha256_file;
 use np_core::pins::{
-    pinned, pinned_member, total_size, PinnedModel, MMPROJ_DIGEST_PREFIX_ONLY, PINNED,
+    identity, pinned, pinned_member, total_size, PinnedIdentity, PinnedModel, PINNED,
+    PINNED_IDENTITIES,
 };
 
 /// Substrings that would mean a field names a place rather than a thing.
@@ -142,15 +143,9 @@ fn no_pinned_field_names_a_host_or_a_url() {
         "the loop above has to have looked at something"
     );
 
-    // The gap constant is scanned too: it lives in this module, and a reader copying it into a row must not be
-    // handed a host by accident.
-    let lowered = MMPROJ_DIGEST_PREFIX_ONLY.to_ascii_lowercase();
-    for needle in HOST_SHAPED {
-        assert!(
-            !lowered.contains(needle),
-            "the recorded mmproj prefix holds {needle:?}: {MMPROJ_DIGEST_PREFIX_ONLY:?}"
-        );
-    }
+    // Provenance strings are part of the sweep above (`fields()` covers `read_on`), which matters now that they
+    // describe where a value was read: "downloaded from <host>" would be a URL smuggled into the table that exists
+    // to hold none.
 }
 
 #[test]
@@ -175,53 +170,99 @@ fn lookup_answers_by_id_and_member_and_refuses_what_is_not_pinned() {
     // The two accessors a fetch calls, including the `None` that means "refuse this member" rather than "unknown".
     let main = pinned_member("embeddinggemma-2", "main").expect("the primary artifact is pinned");
     assert_eq!(main.filename, "embeddinggemma-2-Q8_0.gguf");
-    assert_eq!(pinned("embeddinggemma-2").count(), 1);
+    assert_eq!(
+        pinned("embeddinggemma-2").count(),
+        2,
+        "the pair, not two models"
+    );
 
     // A member this build does not pin answers `None`, and that is a refusal rather than a shrug: an unpinned member
     // has no digest to check. This is also the arm §12 rule 7's guarantee rests on, which is why it is asserted for
-    // the id that exists rather than only for one that does not.
-    assert!(pinned_member("embeddinggemma-2", "mmproj").is_none());
+    // the id that exists (a name inside a pinned id) rather than only for one that does not.
+    assert!(pinned_member("embeddinggemma-2", "audio").is_none());
     assert!(pinned_member("some-other-model", "main").is_none());
 }
 
 #[test]
-fn the_mmproj_half_of_the_pair_is_a_recorded_gap_and_not_a_pin() {
-    // This is the fence that fails when the missing row arrives, which is the point: whoever lands the real digest
-    // has to delete this case on purpose instead of watching it pass while `total_size` quietly doubles.
-    assert!(
-        pinned_member("embeddinggemma-2", "mmproj").is_none(),
-        "the mmproj digest is not in this repository (design §12 rule 7 records eight characters only), so \
-         pinning it here would mean inventing 56 of them — delete this test only when the full value has a source"
-    );
+fn both_members_of_the_pair_are_pinned_and_their_total_is_the_number_the_design_quotes() {
+    // The pair, not two models: same id, two members. This is the case that used to fence the *absence* of the
+    // mmproj row; it now fences its presence, because the reason to add that row was a digest somebody could
+    // reproduce — and §12's recorded prefix turned out to match no file in the repository at all. If a member goes
+    // missing again, `total_size` quietly drops below what rule 6's preflight must reserve, and this is what says so.
+    let members: Vec<&str> = pinned("embeddinggemma-2")
+        .map(|entry| entry.member)
+        .collect();
+    assert_eq!(members, ["main", "mmproj"]);
+    let main = pinned_member("embeddinggemma-2", "main").expect("main is pinned");
+    let mmproj = pinned_member("embeddinggemma-2", "mmproj").expect("mmproj is pinned");
+    assert_eq!(main.filename, "embeddinggemma-2-Q8_0.gguf");
+    assert_eq!(mmproj.filename, "mmproj-embeddinggemma-2-Q8_0.gguf");
+    // Distinct files, distinct digests: two members with one digest would mean the table accepts either half for
+    // both slots.
+    assert_ne!(main.sha256, mmproj.sha256);
+    assert_eq!(mmproj.size_bytes, 554_821_056);
+
+    // §5's "864.7 MB", quoted in bytes and by name: guessing one file understates the transfer by a factor of 2.8,
+    // which is exactly what rule 6 exists to prevent.
+    assert_eq!(total_size("embeddinggemma-2"), 864_676_512);
     assert_eq!(
-        MMPROJ_DIGEST_PREFIX_ONLY.chars().count(),
-        8,
-        "the constant carries §12's eight-character prefix and nothing more — reaching 64 would make it a digest, \
-         which belongs in `PINNED` with a source, not here"
+        total_size("embeddinggemma-2"),
+        main.size_bytes + mmproj.size_bytes,
+        "the sum must be the members, not a constant someone typed"
     );
+
+    // Every pinned member has to carry provenance: pin rot is invisible until first start refuses, so a refusal has
+    // to be able to say where and when the expectation was read.
     for entry in PINNED {
-        assert_ne!(
-            entry.sha256, MMPROJ_DIGEST_PREFIX_ONLY,
-            "a prefix was compared as a digest somewhere"
+        assert!(
+            !entry.read_on.is_empty(),
+            "{} has no provenance",
+            entry.member
+        );
+    }
+}
+
+#[test]
+fn every_fetchable_id_declares_an_identity_and_every_pinned_id_has_one() {
+    // A fetch writes a `models` row, and the row needs `dim` plus both prefixes. The table that pins bytes therefore
+    // has to cover every id it can transfer — an id with members but no identity would download 865 MB and then be
+    // unable to say what it is.
+    for entry in PINNED {
+        let found =
+            identity(entry.id).unwrap_or_else(|| panic!("{} has no pinned identity", entry.id));
+        assert_eq!(found.id, entry.id);
+        assert!(
+            found.dim > 0,
+            "a zero width admits a vector of nothing (migration 7's CHECK)"
+        );
+    }
+    // And no identity without members: an id in the identity table that pins no bytes is a fetch that would refuse
+    // with `NothingPinned` after a caller had already promised work.
+    for decl in PINNED_IDENTITIES {
+        assert!(
+            pinned(decl.id).next().is_some(),
+            "{} declares an identity but pins no artifact",
+            decl.id
         );
     }
 
-    // The cost of the gap, stated as an assertion so it cannot be missed: `total_size` for this id covers the primary
-    // artifact alone, which is less than §12 rule 6 wants a preflight to reserve.
-    let both = pinned("embeddinggemma-2").count();
+    let gemma = identity("embeddinggemma-2").expect("the shipped id");
+    assert_eq!(gemma.dim, 768);
+    // Empty prefixes are a claim about evidence: every embedding run recorded in this repository used none, and a
+    // prefix changes vector bytes, so adopting a convention later means a **new id** (`@n`), not an edit here.
     assert_eq!(
-        both, 1,
-        "one member is pinned today; when the second lands, re-read `total_size`'s doc and this test"
+        gemma,
+        &PinnedIdentity {
+            id: "embeddinggemma-2",
+            dim: 768,
+            prefix_doc: "",
+            prefix_query: "",
+        }
     );
-    assert_eq!(total_size("embeddinggemma-2"), PINNED[0].size_bytes);
+    // An id nobody declared answers `None` rather than a plausible default.
+    assert!(identity("some-other-model").is_none());
 }
 
-/// The artifact-gated half: **the pinned digest against the bytes themselves.**
-///
-/// Gated on `NP_TEST_MODEL_PATH` like `tests/local_load.rs`, and for the same F18 reason — an absent 310 MB file
-/// must not read as a failure, and must not read as coverage either. Unset (the ordinary CI state, and the state of
-/// every gate run in this round) it prints `NOT COVERAGE` and passes; set, it hashes the real file with the same
-/// [`np_core::hash`] path a fetch would use.
 #[test]
 fn the_pinned_digest_is_the_real_artifacts_digest_when_the_runner_has_one() {
     let Some(path) = std::env::var_os("NP_TEST_MODEL_PATH").map(PathBuf::from) else {
