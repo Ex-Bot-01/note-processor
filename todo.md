@@ -35,9 +35,12 @@ unresolved.
 * The run reports what it used — `threads 12 of 16 available (auto)`, `"workers"` in `--json`, `null` when no local model
   ran — and an artifact-gated case asserts the count reaching the context equals the count the report states, so "the
   report says twelve while the loader used four" is a test failure rather than a plausible-looking run.
-* **Owed by this change:** re-run `local_corpus` under the auto count. Its committed figures (16,161 chunks/hour) and §8's
-  evening-rule arithmetic are four-worker measurements; that fixture now pins four explicitly so those rows keep meaning
-  what they say until someone re-measures.
+* **Re-measured the same day** (`m25/corpus-auto`): the corpus pass under `auto` took **181.41 s / 180.97 s** against a
+  same-day four-worker control of 456.43 s — **2.52×**, 40,642 / 40,741 chunks/hour, peak RSS unchanged at ~446 MiB and the
+  same +1,556 KiB drift. The speedup is therefore not confined to the forward pass, and §8's evening rule keeps its verdicts
+  (the 20,000-note cohort was already inside the threshold at 1.24 h; it is 0.49 h now). Log:
+  `crates/np-core/tests/probes/corpus-auto-2026-11-02.log`. Still four-worker on purpose: §14's cohort solve, which measures
+  per-decode overhead rather than thread scaling.
 
 ## Shipped (main)
 

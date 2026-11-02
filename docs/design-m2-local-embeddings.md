@@ -1103,15 +1103,51 @@ throughput rows in this design document — §5's token costs, §9's package tab
 above — describe a four-worker run. They are kept as what they are: measurements of the configuration they were taken in,
 with `threads = 4` restoring that configuration exactly.
 
-**What remains undecided.** Nothing about the default (it is chosen); whether the corpus and evening-rule figures get
-re-measured under it, which is a separate measurement event and is listed as such in
-`docs/backlog-m2-followups.md`. What the sweep removes is the excuse for not looking. The options, with
+**What remained undecided, and then did not.** The corpus re-measurement under the new default was filed as its own
+measurement event; it ran the same day (`### The corpus at twelve workers` below, with its committed log), so §14's
+end-to-end figures now exist in both configurations instead of one being extrapolated from a forward-pass ratio. The options, with
 numbers from the table: (a) leave it at four; (b) use all of `available_parallelism()` — +190 % / +260 % here, ~14 cores
 busy; (c) a fraction of it. On percentages: 80 % of 16 is 12 workers, which buys 395.1 of the available 459.6 tok/s
 (86 % of the gain) and leaves four CPUs — but **on a two-core laptop the same 80 % is one worker at 49.1 tok/s, a third
 of today**, so a fraction without a floor is a regression aimed at exactly the machines that can least afford it. What
 was *not* measured: anything above 16 workers on any host, and the whole command (`np embed`'s chunking and database
 writes) rather than the forward pass — §14's corpus rows remain a four-worker measurement.
+
+### The corpus at twelve workers (R8 follow-up, 2026-11-02)
+
+The D13 numbers above are forward-pass throughput. Whether they survive `np embed`'s chunking, hashing and SQLite writes —
+the part of the pipeline that does not scale with threads at all — was a ratio waiting to be measured, not a result. It ran
+as its own case (`local_corpus.rs`'s `the_corpus_pass_under_the_auto_worker_count_is_measured`) while `run_pass` keeps
+pinning four, so nothing above this subsection silently changes meaning. Log:
+`crates/np-core/tests/probes/corpus-auto-2026-11-02.log`.
+
+| 2,048 chunks (one corpus pass) | four workers (control, same day) | auto = twelve, run 1 | auto = twelve, run 2 |
+|---|---|---|---|
+| steady wall time | 456.43 s | **181.41 s** | **180.97 s** |
+| chunks/hour | 16,153 | **40,642** | **40,741** |
+| tokens/s (sample-derived) | 154.5 | 388.6 | 389.6 |
+| `VmRSS` drift across the pass | +1,556 KiB | +1,556 KiB | +1,556 KiB |
+| peak `VmHWM` | 447,288 KiB | 446,392 KiB | 446,440 KiB |
+| cold start (load + one decode) | 0.42 s | 0.40 s | 0.39 s |
+
+**2.516× / 2.522× end to end**, within a rounding error of the forward-pass ratio D13 predicted (2.49× at twelve workers) —
+so the database and chunking cost is not what was limiting the corpus, and it does not become the bottleneck at twelve
+workers either. Two runs are quoted side by side rather than averaged (§8), and a **four-worker control was re-run the same
+day** because a ratio taken across two days is also a claim about the host: today's four-worker pass reproduces the
+2026-10-31 pair to within 0.06 %, so this machine did not simply get faster.
+
+What it does **not** buy, stated because the projection table makes it easy to over-read:
+
+* **The evening rule's verdicts do not flip.** At four workers the largest projected cohort (20,000 notes) already fitted
+  inside the 4 h threshold at 1.24 h; at twelve it takes 0.49 h. The gain is headroom — roughly 64,600 chunks per evening
+  becoming ~162,900 — not a cohort that previously failed now passing.
+* **Memory behaviour is unchanged within measurement.** Drift was +1,556 KiB in all three passes (allocator territory, as
+  round 3 concluded), and peak `VmHWM` moved −0.2 %, which at this granularity is "no change". That is not a contradiction
+  of D13's "+6.6 MiB for twelve workers": that was mid-run `VmRSS` between two single-chunk probes, while the whole-process
+  peak here is dominated by the 1,104 MiB compute reservation.
+* **The cohort solve (31.1 ms fixed + 5.53 ms/token) is still four-worker.** It measures per-decode overhead, which is what
+  batching would amortise; re-running it at twelve workers would answer a different question and this case deliberately
+  does not.
 
 ### What this decides about §5's amendments
 

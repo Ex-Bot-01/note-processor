@@ -1169,6 +1169,13 @@ fn openai_compatible_still_parses_and_refuses_at_load_naming_what_changed() {
 
 #[test]
 fn the_new_refusals_are_scoped_to_the_provider_that_needs_them() {
+    // **Holds the environment lock, and did not used to.** This case loads a config file, and `Config::load` reads
+    // `NP_MODELS_BASE_URL` whether or not the fixture asked — so while another case had that key installed as
+    // `mirror.example`, this load refused on the origin instead of reaching the assertion below. It survived years of
+    // green runs because the window is a thread race, and R8's three new cases moved the timing just enough to lose it:
+    // measured failing (`Io(InvalidData, "invalid NP_MODELS_BASE_URL = …")`) on one run of four and passing on three.
+    // `every_case_that_loads_a_config_holds_the_environment_lock` is the fence that stops this happening again.
+    let _env = hold_env();
     // The other half of "refuse loudly", and the half a single fixture cannot see: an id that would be refused
     // beside `local-model` is ordinary text beside `none`, because nothing will embed. Refusing it there would
     // break config files that work today — the same scoping argument as
@@ -1632,6 +1639,7 @@ fn auto_workers_follow_the_machine_within_measured_bounds() {
 /// Both accepted spellings load, and absence means `auto` rather than "unset, so four".
 #[test]
 fn threads_defaults_to_auto_and_takes_both_spellings() {
+    let _env = hold_env();
     let tmp = tempfile::tempdir().expect("test setup: tempdir");
     let data = toml_str(&tmp.path().display().to_string());
 
@@ -1671,6 +1679,7 @@ fn threads_defaults_to_auto_and_takes_both_spellings() {
 /// (`config.rs`'s `MAX_REQUESTED_WORKERS` for the reasoning).
 #[test]
 fn an_impossible_worker_count_is_refused_naming_the_key() {
+    let _env = hold_env();
     let tmp = tempfile::tempdir().expect("test setup: tempdir");
     let data = toml_str(&tmp.path().display().to_string());
 
@@ -1752,6 +1761,7 @@ fn an_impossible_worker_count_is_refused_naming_the_key() {
 /// load (which produced an uncatchable `SIGABRT`), and before that by a ceiling so high it accepted anything.
 #[test]
 fn the_worker_ceiling_is_a_boundary_and_never_a_clamp() {
+    let _env = hold_env();
     let tmp = tempfile::tempdir().expect("test setup: tempdir");
     let data = toml_str(&tmp.path().display().to_string());
 
@@ -1774,4 +1784,91 @@ fn the_worker_ceiling_is_a_boundary_and_never_a_clamp() {
         Config::load(Some(&path)).is_err(),
         "one past the ceiling must be refused, not rounded down"
     );
+}
+
+/// **Every case in this file that calls `Config::load` holds [`ENV_LOCK`].**
+///
+/// The rule is stated at [`hold_env`] and the reason is not obvious: `[models]` reads `NP_MODELS_BASE_URL` /
+/// `NP_MODELS_SHA256` on **every** load, so a case that never touches the environment is still reading another thread's
+/// installed override. Cargo runs these cases on parallel threads; env vars belong to the process. That makes the failure
+/// a race rather than a bug — it shows up as one run in four refusing with `invalid NP_MODELS_BASE_URL = "mirror.example"`
+/// in a case about something else entirely, which is exactly what `the_new_refusals_are_scoped_to_the_provider_that_needs_them`
+/// did (unprotected since `ef8a382`, exposed 2026-11-02 when R8 added three cases and shifted the timing).
+///
+/// The fence reads this file's own text at run time rather than trusting a comment, because the class of defect is a
+/// *later* case forgetting the guard — the mistake is invisible to any check that only looks at what is there now. A test
+/// that mutates the environment must take it through [`TestEnv`] (which owns and restores the values) or hold the lock by
+/// hand; a test that merely loads a config must hold the lock too. Scope: this file only. Other test binaries are separate
+/// processes, and `crates/np-cli/tests/cli.rs` gives each command an explicit environment.
+#[test]
+fn every_case_that_loads_a_config_holds_the_environment_lock() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/config.rs"),
+    )
+    .expect("the test file is readable from its own manifest dir");
+
+    let mut offenders: Vec<&str> = Vec::new();
+    for (name, body) in annotated_test_bodies(&source) {
+        // This fence is not itself a config loader, and it must not have to hold the lock it exists to require.
+        if name == "every_case_that_loads_a_config_holds_the_environment_lock" {
+            continue;
+        }
+        if body.contains("Config::load")
+            && !body.contains("hold_env()")
+            && !body.contains("TestEnv::install")
+        {
+            offenders.push(name);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these cases call `Config::load` while another thread may have `NP_MODELS_*` installed: {offenders:?}\n\
+         add `let _env = hold_env();` at the top of each (see [`hold_env`])."
+    );
+}
+/// Split a Rust source file into `(fn name, body)` for every function annotated `#[test]`.
+///
+/// The attribute is part of the match on purpose: an earlier draft scanned every top-level function and reported
+/// `config_with_data_dir` and `embeddings_refusal`, which are helpers that load a config *inside* a case that already holds
+/// the lock. A fence with two false positives is a fence someone silences, so it asks the same question Rust does: is this
+/// an annotated test? Brace counting rather than line matching, because a body containing `}` inside a string or a nested
+/// closure would end a naive scan early and report the wrong span — which in a fence means a false pass.
+fn annotated_test_bodies(source: &str) -> Vec<(&str, &str)> {
+    const MARKER: &str = "#[test]";
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(found) = rest.find(MARKER) {
+        let after_attr = &rest[found + MARKER.len()..];
+        // Attribute and signature are separated by whitespace only; anything else between them is not this pattern.
+        let gap = after_attr.len() - after_attr.trim_start().len();
+        let Some(head) = after_attr[gap..].strip_prefix("fn ") else {
+            rest = after_attr;
+            continue;
+        };
+        let Some(paren) = head.find('(') else { break };
+        let name = &head[..paren];
+        let Some(open) = head.find('{') else { break };
+        let mut depth = 0usize;
+        let mut end = None;
+        for (index, ch) in head.char_indices() {
+            if index < open {
+                continue;
+            }
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        out.push((name, &head[..end]));
+        rest = &head[end..];
+    }
+    out
 }
