@@ -204,6 +204,9 @@ fn the_schema_is_what_the_plan_mandates() {
             "headings",
             "items",
             "links",
+            "media",
+            "media_embeddings",
+            "media_path",
             "meta",
             "model_files",
             "models",
@@ -264,6 +267,24 @@ fn the_schema_is_what_the_plan_mandates() {
         (
             "embeddings",
             "chunk_id model dim vector source_hash embedded_at",
+        ),
+        // Migration 10's three tables, pinned for the same reason as `embeddings`: `crate::media` writes them row by
+        // row and `np search` reads them by name, so a rename has to break that code rather than merely differ.
+        // The two stamp columns sit at the end of `media` because that is where `ADD COLUMN` can put them without a
+        // rebuild — the same reason `models` and `model_files` carry theirs last.
+        (
+            "media",
+            "id hash size mime verified_size verified_mtime",
+        ),
+        ("media_path", "rel_bytes case_key abs media_id"),
+        (
+            "media_embeddings",
+            "media_id model dim vector source_hash embedded_at",
+        ),
+        // Migration 9's two columns keep their order and migration 10 appends the stamp pair, again by `ADD COLUMN`.
+        (
+            "model_files",
+            "model name sha256 size verified_size verified_mtime",
         ),
     ] {
         assert_eq!(
@@ -3351,6 +3372,7 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
     ))
@@ -3453,6 +3475,7 @@ fn seed_two_duplicate_groups_at_version_four(path: &Path) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
     ))
@@ -3501,6 +3524,7 @@ fn seed_nine_duplicate_groups_at_version_four(path: &Path) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
     ))
@@ -3537,6 +3561,7 @@ fn seed_keyless_display_pair_at_version_four(path: &Path) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
     ))
@@ -4211,6 +4236,7 @@ fn the_merge_gate_refuses_damage_that_no_merge_could_have_caused() {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
         ))

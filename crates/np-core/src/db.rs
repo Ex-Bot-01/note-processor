@@ -287,6 +287,67 @@ pub const MIGRATIONS: &[Migration] = &[
     );
     "#,
     ),
+    // 10. Media as a vector source of its own (`docs/design-m2-image-embeddings.md` §6): an image linked from a note
+    // is not a chunk of prose, so it gets tables that can state what it actually is instead of a `chunks` row whose
+    // `ordinal`, byte offsets and `source_hash` would have to lie about bytes no chunker ever read.
+    //
+    // **Content is the identity.** `media.hash` is unique, so one diagram copied to three paths embeds once and answers
+    // once; `media_path` says where those bytes were seen, and re-pointing a path (a rename, or a file replaced in
+    // place) changes no vector. Keying by path instead — the first draft — embedded the same figure per copy and gave
+    // `np search` three hits for one thing.
+    //
+    // The CHECK families are borrowed, not invented: `length(hash) = 64` is migration 9's rule for `model_files.sha256`
+    // (a truncated paste must not become content identity and then refuse the real file forever), `typeof(rel_bytes) =
+    // 'blob'` beside declared affinity is migration 4's F13 lesson (affinity alone accepts a TEXT bind, and `length()`
+    // would then count characters), and `typeof(vector) = 'blob' AND length(vector) = 4 * dim` is migration 7's fence on
+    // `embeddings` — eight characters satisfy `length(vector) = 8` at dim 2 and reach a cosine as garbage.
+    //
+    // **The stamp columns are D12 carried to two more places.** `media.verified_size` / `verified_mtime` decide whether
+    // the next run re-hashes an image or trusts one `stat`; adding them to `model_files` is what stops every image pass
+    // from hashing all 554,821,056 projector bytes (§6's third change, ~21 s at D12's measured rate). Both pairs are
+    // nullable and **not backfilled**: an older row reads as "never checked", which is the honest cost of upgrading into
+    // a check, and a half pair reads as no pair at all (`media_stamp`, `member_stamp`) for the migration-8 reason.
+    //
+    // Same coupling as migration 9 warned about, now pointing forward: the eight rewind fixtures
+    // (`tests/db.rs`, `tests/scan.rs`, `np-cli/tests/cli.rs`) delete version numbers and must undo what later entries
+    // created, so each one drops these three tables — child first — beside `model_files`.
+    Migration::Sql(
+        r#"
+    CREATE TABLE media (
+        id             INTEGER PRIMARY KEY,
+        -- Content identity: the same SHA-256 is one figure wherever it sits, however often it is copied (§7).
+        hash           TEXT    NOT NULL UNIQUE CHECK (length(hash) = 64),
+        size           INTEGER NOT NULL CHECK (size >= 0),
+        mime           TEXT    NOT NULL,
+        -- D12's stamp pair: one `stat` while the bytes have not moved, a full hash when they have.
+        verified_size  INTEGER,
+        verified_mtime INTEGER
+    );
+
+    -- Every workspace path those bytes were seen at. The last row going takes the media row with it (§6's lifecycle),
+    -- which is what stops a deleted figure answering `np search` forever.
+    CREATE TABLE media_path (
+        rel_bytes   BLOB    NOT NULL CHECK (typeof(rel_bytes) = 'blob'),
+        case_key    TEXT    NOT NULL,
+        abs         TEXT    NOT NULL,
+        media_id    INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+        PRIMARY KEY (rel_bytes)
+    );
+
+    CREATE TABLE media_embeddings (
+        media_id      INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+        model         TEXT    NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        dim           INTEGER NOT NULL,
+        vector        BLOB    NOT NULL CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim),
+        source_hash   TEXT    NOT NULL,
+        embedded_at   INTEGER NOT NULL,
+        PRIMARY KEY (media_id, model)
+    );
+
+    ALTER TABLE model_files ADD COLUMN verified_size INTEGER;
+    ALTER TABLE model_files ADD COLUMN verified_mtime INTEGER;
+    "#,
+    ),
 ];
 
 /// One step of the schema, as one entry of [`MIGRATIONS`].
@@ -2657,5 +2718,222 @@ mod tests {
         assert_eq!(rebase_abs("/elsewhere/a.md", "notes/a.md", "b.md"), None);
         // The same trap in the Windows spelling.
         assert_eq!(rebase_abs("C:\\ws\\xa.md", "a.md", "b.md"), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Media: content identity, the paths that hold it, and its vectors (migration 10).
+//
+// These read and write the three media tables and the two stamp pairs. Nothing here decides what an image *is* —
+// resolution lives in `crate::media`, encoding in `crate::vision` — so each function states only the row-level promise
+// its caller can rely on.
+// ---------------------------------------------------------------------------
+
+/// One media row: content identity plus what was last seen about those bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaRow {
+    /// Rowid, which is also the order [`media_embeddings`] returns in.
+    pub id: i64,
+    /// Lowercase hex sha256 of the bytes — the identity, so two paths holding one file share this row.
+    pub hash: String,
+    /// Exact byte length as last recorded.
+    pub size: i64,
+    /// A mime type guessed from the extension (`image/png`, `image/jpeg`), stored for the report line and nothing else.
+    pub mime: String,
+}
+
+/// Record these bytes, or read back the row that already holds them.
+///
+/// Insert-or-get rather than a plain insert, because one diagram linked from two notes is one ordinary next run, not a
+/// constraint violation: `ON CONFLICT (hash) DO NOTHING` and a read-back make the second call return the first row's id.
+/// The conflicting call's `size`/`mime` are deliberately **not** written over what is stored — the hash says these are
+/// the same bytes, so a differing size would be a contradiction to report, not a field to refresh, and quietly
+/// overwriting it would make the row describe bytes it may never have held.
+pub fn record_media(db: &Db, hash: &str, size: i64, mime: &str) -> Result<MediaRow, DbError> {
+    db.0.prepare_cached(
+        "INSERT INTO media (hash, size, mime) VALUES (?1, ?2, ?3)
+         ON CONFLICT (hash) DO NOTHING",
+    )?
+    .execute(params![hash, size, mime])?;
+    read_media_by_hash(db, hash)
+}
+
+/// The media row for one hash, which [`record_media`] reads back after either arm of its upsert.
+fn read_media_by_hash(db: &Db, hash: &str) -> Result<MediaRow, DbError> {
+    db.0.prepare_cached("SELECT id, hash, size, mime FROM media WHERE hash = ?1")?
+        .query_row(params![hash], |row| {
+            Ok(MediaRow {
+                id: row.get(0)?,
+                hash: row.get(1)?,
+                size: row.get(2)?,
+                mime: row.get(3)?,
+            })
+        })
+        .map_err(DbError::from)
+}
+
+/// Point one workspace path at one media row, re-pointing it if the path was already linked.
+///
+/// An upsert because a diagram replaced in place, or moved and re-added under the same name, is the normal case; a
+/// `SQLITE_CONSTRAINT_PRIMARYKEY` out of the write pass would roll the whole embed pass back over one re-pointed row.
+/// `rel_bytes` is bound as bytes and nothing else — the column's `typeof` CHECK is what keeps a lossy decode from
+/// becoming the stored spelling (F13), which is why this takes `&[u8]` where a `&str` would have compiled.
+pub fn link_media_path(
+    db: &Db,
+    rel: &[u8],
+    case_key: &str,
+    abs: &Path,
+    media_id: i64,
+) -> Result<(), DbError> {
+    db.0.prepare_cached(
+        "INSERT INTO media_path (rel_bytes, case_key, abs, media_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (rel_bytes) DO UPDATE
+            SET case_key = excluded.case_key, abs = excluded.abs, media_id = excluded.media_id",
+    )?
+    .execute(params![rel, case_key, abs.to_string_lossy(), media_id])?;
+    Ok(())
+}
+
+/// Remove one path, reporting how many media rows went with it.
+///
+/// The count is the lifecycle rule made observable (§6): a media row lives while at least one path holds those bytes,
+/// so the last unlink deletes the media row and `ON DELETE CASCADE` takes its vectors. Returning the number rather than
+/// a bool lets the embed report say "1 figure removed" without a second query, and says `0` for both "one of two paths
+/// went" and "this path was never linked" — a deleted file is a fact about the world, not a corrupt database.
+pub fn unlink_media_path(db: &Db, rel: &[u8]) -> Result<usize, DbError> {
+    let holder =
+        db.0.prepare_cached("SELECT media_id FROM media_path WHERE rel_bytes = ?1")?
+            .query_row(params![rel], |row| row.get::<_, i64>(0))
+            .ok();
+    let removed_path =
+        db.0.prepare_cached("DELETE FROM media_path WHERE rel_bytes = ?1")?
+            .execute(params![rel])?;
+    let Some(media_id) = holder else {
+        debug_assert_eq!(removed_path, 0, "no holder means no row to delete");
+        return Ok(0);
+    };
+    // `NOT EXISTS` rather than a count compare so the check and the delete are one statement: a second process linking
+    // the same bytes between two queries must not leave an unreferenced media row standing.
+    let removed_media =
+        db.0.prepare_cached(
+            "DELETE FROM media WHERE id = ?1
+              AND NOT EXISTS (SELECT 1 FROM media_path WHERE media_id = media.id)",
+        )?
+        .execute(params![media_id])?;
+    Ok(removed_media)
+}
+
+/// Store (or correct) the vector one model computed for one media row.
+///
+/// An upsert on `(media_id, model)` for migration 7's reason restated: re-embedding must replace a row rather than
+/// append history nobody reads, and two models must be able to hold a vector for one figure at the same time.
+/// `embedded_at` is the caller's clock, like every other timestamp this module writes — there is no SQL-side clock in
+/// this crate, and a reader that cannot say when a row went stale is a reader an operator cannot audit.
+pub fn record_media_embedding(
+    db: &Db,
+    media_id: i64,
+    model: &str,
+    dim: i64,
+    vector: &[u8],
+    source_hash: &str,
+    now: i64,
+) -> Result<(), DbError> {
+    db.0.prepare_cached(
+        "INSERT INTO media_embeddings (media_id, model, dim, vector, source_hash, embedded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (media_id, model) DO UPDATE
+            SET dim = excluded.dim, vector = excluded.vector,
+                source_hash = excluded.source_hash, embedded_at = excluded.embedded_at",
+    )?
+    .execute(params![media_id, model, dim, vector, source_hash, now])?;
+    Ok(())
+}
+
+/// Every media vector stored under one model id, ascending by media id.
+///
+/// [`vectors_for`]'s sibling, and the same rule applies: the `model` filter is not optional, because
+/// `PRIMARY KEY (media_id, model)` lets two models answer for one figure and mixing them is how one model's query
+/// ranks another's answer. Ordered by media id so a resumed run produces the same ranking as an uninterrupted one.
+pub fn media_embeddings(db: &Db, model: &str) -> Result<Vec<(i64, Vec<u8>)>, DbError> {
+    let mut statement = db.0.prepare_cached(
+        "SELECT media_id, vector FROM media_embeddings WHERE model = ?1 ORDER BY media_id",
+    )?;
+    let rows = statement.query_map(params![model], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Record the stamp that justified skipping a re-hash of one media row's bytes.
+///
+/// Written only **after** a digest matched, exactly like [`record_artifact_stamp`], and a no-op for a row that is gone:
+/// a figure unlinked between verification and this write is a fact about the world, not a corrupt database.
+pub fn set_media_stamp(db: &Db, media_id: i64, size: i64, mtime: i64) -> Result<(), DbError> {
+    db.0.prepare_cached("UPDATE media SET verified_size = ?2, verified_mtime = ?3 WHERE id = ?1")?
+        .execute(params![media_id, size, mtime])?;
+    Ok(())
+}
+
+/// The stamp for one media row, or `None` when it has never been verified.
+///
+/// A half pair reads as no stamp at all — migration 8's rule, and the reason this returns a pair instead of two
+/// columns: trusting one present column would let an embed skip hashing bytes it never checked.
+pub fn media_stamp(db: &Db, media_id: i64) -> Result<Option<(i64, i64)>, DbError> {
+    read_stamp_pair(
+        db,
+        "SELECT verified_size, verified_mtime FROM media WHERE id = ?1",
+        params![media_id],
+    )
+}
+
+/// Record the stamp that justified skipping a re-hash of one recorded model file.
+///
+/// The projector's half of §6's third change: without it, verifying the 554,821,056-byte `mmproj` costs a full read on
+/// every image run. No-op for an unrecorded member, like [`record_artifact_stamp`] is for a missing model.
+pub fn record_member_stamp(
+    db: &Db,
+    model: &str,
+    name: &str,
+    size: i64,
+    mtime: i64,
+) -> Result<(), DbError> {
+    db.0.prepare_cached(
+        "UPDATE model_files SET verified_size = ?3, verified_mtime = ?4
+              WHERE model = ?1 AND name = ?2",
+    )?
+    .execute(params![model, name, size, mtime])?;
+    Ok(())
+}
+
+/// The stamp for one recorded member, or `None` when it has never been verified.
+///
+/// Three states collapse here on purpose and one does not: "no member row" and "member with no stamp" both read `None`
+/// because both mean *hash it*, while a stamp of `(0, 0)` reads `Some` because zeros are a size and an mtime that were
+/// actually observed. Callers that need the first distinction ask [`model_files`] whether the member is recorded at all
+/// — which is precisely what migration 9 could not express for an `install --path` model and this entry adds.
+pub fn member_stamp(db: &Db, model: &str, name: &str) -> Result<Option<(i64, i64)>, DbError> {
+    read_stamp_pair(
+        db,
+        "SELECT verified_size, verified_mtime FROM model_files WHERE model = ?1 AND name = ?2",
+        params![model, name],
+    )
+}
+
+/// One stamp pair, with the half-pair rule in a single place so `media` and `model_files` cannot drift apart.
+fn read_stamp_pair(
+    db: &Db,
+    sql: &str,
+    args: impl rusqlite::Params,
+) -> Result<Option<(i64, i64)>, DbError> {
+    let pair = db.0.prepare_cached(sql)?.query_row(args, |row| {
+        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
+    });
+    match pair {
+        Ok((Some(size), Some(mtime))) => Ok(Some((size, mtime))),
+        Ok(_) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => Err(DbError::from(err)),
     }
 }

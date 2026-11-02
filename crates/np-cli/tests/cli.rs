@@ -1127,6 +1127,7 @@ fn seed_duplicate_pair_at_version_four(ws: &Workspace) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
     ))
@@ -1281,6 +1282,7 @@ fn rewind_to_version_four_without_a_pair(ws: &Workspace) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
     ))

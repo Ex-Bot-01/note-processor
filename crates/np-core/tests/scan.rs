@@ -4958,6 +4958,7 @@ fn rewind_past_the_merge(open: &Db) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;",
             db::NOTE_MERGE_KEY
