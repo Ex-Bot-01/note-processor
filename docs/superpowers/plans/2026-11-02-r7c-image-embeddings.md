@@ -48,12 +48,12 @@ Throwaway measurement, no product code (spec §9). Its output becomes constants 
 - Consumes: nothing.
 - Produces: `vision-spike-2026-11-02.md` recording — the exact `mtmd_*`/`llama_*` call sequence that produced a pooled vector; patch/token cost for one 1024×768 PNG and one 512×384 PNG; whether `mtmd_support_vision` is true for the pinned `mmproj`; the pooled width read back; and the caption-vs-image cosine table against captions and unrelated text.
 
-- [ ] **Step 1: Build `libmtmd` from the vendored tree into a scratch directory** — configure the existing pinned source with `-DLLAMA_BUILD_MTMD=ON -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF`, build target `llama` plus `mtmd`, and record the cmake command line verbatim in the note.
-- [ ] **Step 2: Write `vision_probe.c`** that opens the primary GGUF and the `mmproj` (`mtmd_init_from_file`), prints `mtmd_support_vision`, `mtmd_get_marker`, then for a generated PNG runs the tokenize → encode → decode path and prints chunk count, image token count, pooled width, and the first three floats of the pooled row.
-- [ ] **Step 3: Generate the inputs** — two solid-shape PNGs plus one PNG containing rendered text ("KAFKA → INGEST"), and a captions file. Keep the generator inline in the note so the run is reproducible; Python + Pillow is fine here (throwaway).
-- [ ] **Step 4: Run it with the pinned artifacts** and copy the raw output into the note verbatim, including any llama.cpp warning lines.
-- [ ] **Step 5: Score comparability** — print cosine for (caption, its image), (caption, other image), (caption, unrelated sentence). Record the table; state in one line whether captions beat unrelated text on their own images.
-- [ ] **Step 6: Decide and write it down** — either "recognised, use this call sequence" with the numbers, or "not recognised" with the exact refusal from C. Commit: `git commit -m "spike(r7c): what llama.cpp v0.8.0 does with embeddinggemma-2's gemma4v projector"`.
+- [x] **Step 1: Build `libmtmd` from the vendored tree into a scratch directory** — configure the existing pinned source with `-DLLAMA_BUILD_MTMD=ON -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF`, build target `llama` plus `mtmd`, and record the cmake command line verbatim in the note.
+- [x] **Step 2: Write `vision_probe.c`** that opens the primary GGUF and the `mmproj` (`mtmd_init_from_file`), prints `mtmd_support_vision`, `mtmd_get_marker`, then for a generated PNG runs the tokenize → encode → decode path and prints chunk count, image token count, pooled width, and the first three floats of the pooled row.
+- [x] **Step 3: Generate the inputs** — two solid-shape PNGs plus one PNG containing rendered text ("KAFKA → INGEST"), and a captions file. Keep the generator inline in the note so the run is reproducible; Python + Pillow is fine here (throwaway).
+- [x] **Step 4: Run it with the pinned artifacts** and copy the raw output into the note verbatim, including any llama.cpp warning lines.
+- [x] **Step 5: Score comparability** — print cosine for (caption, its image), (caption, other image), (caption, unrelated sentence). Record the table; state in one line whether captions beat unrelated text on their own images.
+- [x] **Step 6: Decide and write it down** — either "recognised, use this call sequence" with the numbers, or "not recognised" with the exact refusal from C. Commit: `git commit -m "spike(r7c): what llama.cpp v0.8.0 does with embeddinggemma-2's gemma4v projector"`.
 
 **Gate:** none beyond compiling — this task ships a note and a probe, not product code. If Step 6 lands on "not recognised", stop here and bring the two exits (re-pin vs OCR) back to the human; do not start Task 2.
 

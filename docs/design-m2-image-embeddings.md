@@ -1,8 +1,11 @@
 # R7c — image embeddings as a second vector source, and a minimal read-only `np search`
 
-Status: **design for approval (2026-11-02)**. Approach chosen by the human in conversation: option **A** below, plus a
-minimal read-only query command "for our proof of concept". Nothing here is implemented; §9 lists the plan's first task,
-which can invalidate one assumption before any of the rest is worth building.
+Status: **approved; step 0 measured 2026-11-02** (`crates/np-core/tests/probes/vision-spike-2026-11-02.md`). Approach chosen
+by the human in conversation: option **A** below, plus a minimal read-only query command "for our proof of concept". The
+runtime answered before any schema was written against it: `mtmd_support_vision` is true for this pair, one 1024×768 image
+costs **336 tokens** (512×384 costs 88 — the cost follows the patch grid, not the card's flat default), the pooled row is
+768 floats arriving un-normalised, and captions beat unrelated sentences against their own images. §9's "not recognised" exit
+is therefore closed; §10's seam and §8's budget rule are confirmed rather than assumed.
 
 ## 1. Intent, and why
 
@@ -264,6 +267,13 @@ count for one generated test image. Two outcomes, both useful:
 
 This is deliberately first: R7b's live fetch found a naming defect that no test could see because every test asserted its own
 chosen paths, and the lesson carried forward is to let the runtime answer before writing the thing that depends on its answer.
+
+**Measured 2026-11-02 — see `crates/np-core/tests/probes/vision-spike-2026-11-02.md`.** Both outcomes above were settled by a
+run, and three details came back that no document predicted: vision links **six** archives, not five (`libmtmd` needs
+`hash_sha256_hex` from `vendor/hash/libvendor-hash.a`, so Task 4's build change is two archives); images decode with
+`llama_set_causal_attn(false)` and must restore it afterwards, or later text vectors in the same process go wrong while every
+image vector looks fine; and the soft-token budget (70–1120) *is* honoured by this builder even though R7c has no reason to
+use it.
 
 ## 10. The encoder seam
 
