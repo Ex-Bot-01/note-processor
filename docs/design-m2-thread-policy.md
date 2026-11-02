@@ -7,7 +7,10 @@ log (`docs/design-m2-local-embeddings.md` §14's "D13: the worker count, measure
 As shipped: `[embeddings] threads` is `config::ThreadCount` with the rule in `ThreadCount::resolve`;
 `LazyLocalEmbedder` resolves it once against `available_parallelism()` and hands the result to `load_with_options`;
 `np embed` reports it as `threads 12 of 16 available (auto)` and `"workers": {"count", "available", "configured"}` in
-JSON, `null` when no local model ran. The cases that hold it up are `auto_workers_follow_the_machine_within_measured_bounds`
+JSON, `null` when no local model ran. **Measured end to end the same day**, not extrapolated: a 2,048-chunk corpus pass
+went from 456.43 s (four workers, control re-run alongside) to **181.41 s / 180.97 s** at twelve — **2.52×**, matching the
+2.49× forward-pass ratio D13 predicted, with peak RSS unchanged (−0.2 %) and drift identical at +1,556 KiB
+(`crates/np-core/tests/probes/corpus-auto-2026-11-02.log`, §14's "The corpus at twelve workers"). The cases that hold it up are `auto_workers_follow_the_machine_within_measured_bounds`
 (the §2 table, including `available = 0`), `an_impossible_worker_count_is_refused_naming_the_key`,
 `the_worker_plan_is_the_config_resolved_against_the_machine_once`, and — artifact-gated —
 `the_configured_count_is_the_count_the_context_runs_with`, which is the one that catches a report saying twelve while the

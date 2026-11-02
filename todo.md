@@ -24,7 +24,7 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
-## Shipped (main) — R8 worker-thread policy (merged 2026-11-02: `e238aa1` measurement, `67cbe14` policy)
+## Shipped (main) — R8 worker-thread policy (merged 2026-11-02: `e238aa1` measurement, `67cbe14` policy, `457f443` re-measurement)
 
 * `np embed` stopped inheriting llama.cpp's compile-time four. `[embeddings] threads = "auto"` (default) resolves to
   `min(cpus, max(min(cpus, 4), floor(0.8 × cpus)))`: **twelve workers on this host**, two on a two-core laptop, never more
@@ -38,9 +38,14 @@ unresolved.
 * Also on main from the same pair of merges: the D13 measurement seam (`LoadOptions { threads }`, one process per cell in
   `crates/np-core/tests/probes/thread_sweep.sh`) and three committed sweep logs, so every worker-count number quoted in a
   design document traces to a row someone else can re-check.
-* **Owed by this change:** re-run `local_corpus` under the auto count. Its committed figures (16,161 chunks/hour) and §8's
-  evening-rule arithmetic are four-worker measurements; that fixture now pins four explicitly so those rows keep meaning
-  what they say until someone re-measures.
+* **Re-measured the same day** (`457f443`): the corpus pass under `auto` took **181.41 s / 180.97 s** against a same-day
+  four-worker control of 456.43 s — **2.52×**, 40,642 / 40,741 chunks/hour, peak RSS unchanged at ~446 MiB and the same
+  +1,556 KiB drift. So the speedup is not confined to the forward pass, and §8's evening rule keeps its verdicts (the
+  20,000-note cohort was already inside the threshold at 1.24 h; it is 0.49 h now — headroom, not a new pass). Log:
+  `crates/np-core/tests/probes/corpus-auto-2026-11-02.log`. Still four-worker on purpose: §14's cohort solve measures
+  per-decode overhead rather than thread scaling, and `run_pass` pins four so the older rows keep meaning what they say.
+  Gating that measurement also removed a pre-existing test-isolation race (`Config::load` without `ENV_LOCK`, since
+  `ef8a382`), now fenced by `every_case_that_loads_a_config_holds_the_environment_lock`.
 
 ## Shipped (main)
 

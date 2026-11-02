@@ -644,17 +644,12 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   what — see the floor argument in that section: a bare 80 % is one worker on a two-core laptop), and a re-pin caveat,
   since bit-identity is an observation about this llama.cpp and must be re-checked with
   `crates/np-core/tests/probes/thread_vectors_compare.py` after one.
-  **Decided 2026-11-02 (option (c)).** `[embeddings] threads = "auto"` now resolves to
+  **Decided 2026-11-02 (option (c)), and the follow-up ran the same day.** `[embeddings] threads = "auto"` resolves to
   `min(cpus, max(min(cpus, 4), floor(0.8 × cpus)))` — twelve workers on this host, never more than exist, never fewer than
   four where four exist — with an explicit count honoured as written and reported by `np embed`. Design:
-  `docs/design-m2-thread-policy.md`. **Follow-up this creates:** §14's corpus figures (16,161 chunks/hour) and §8's
-  evening-rule arithmetic are four-worker measurements; re-running the corpus case under the auto count is its own
-  measurement event, not a number to be restated. The `local_corpus` fixture now pins four explicitly so those committed
-  rows keep meaning what they say.
-  **Decided 2026-11-02 (option (c)).** `[embeddings] threads = "auto"` now resolves to
-  `min(cpus, max(min(cpus, 4), floor(0.8 × cpus)))` — twelve workers on this host, never more than exist, never fewer
-  than four where four exist — with an explicit count honoured as written and reported by `np embed`. Design:
-  `docs/design-m2-thread-policy.md`. **Follow-up this creates:** §14's corpus figures (16,161 chunks/hour) and §8's
-  evening-rule arithmetic are four-worker measurements; re-running the corpus case under the auto count is its own
-  measurement event, not a number to be restated. The `local_corpus` fixture pins four explicitly so those committed rows
-  keep meaning what they say.
+  `docs/design-m2-thread-policy.md`. The corpus was re-measured under it with a same-day four-worker control: 456.43 s →
+  **181.41 / 180.97 s**, 16,153 → **40,642 / 40,741 chunks/hour** (**2.52×**), peak RSS unchanged (−0.2 %) and the same
+  +1,556 KiB drift, so the speedup is not confined to the forward pass. Log:
+  `crates/np-core/tests/probes/corpus-auto-2026-11-02.log`; the older four-worker rows above stay quoted as what they were
+  taken at, because `local_corpus.rs`'s `run_pass` still pins four. §14's cohort solve (31.1 ms fixed + 5.53 ms/token) is
+  deliberately **still four-worker** — it measures per-decode overhead, which is a different question from thread scaling.

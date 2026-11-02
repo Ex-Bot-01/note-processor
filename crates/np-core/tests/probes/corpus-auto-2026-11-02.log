@@ -1,0 +1,82 @@
+# R8 follow-up — the corpus run at the shipped `auto` worker count (2026-11-02)
+
+R8 (`docs/design-m2-thread-policy.md`) changed the default from llama.cpp's compile-time four to
+`min(cpus, max(min(cpus, 4), floor(0.8 × cpus)))`, which is **twelve** on this host. §14's corpus rows
+(16,161 chunks/hour) were taken at four and stay that way: `crates/np-core/tests/local_corpus.rs` pins four in
+`run_pass`, and the auto count runs as its own case, `the_corpus_pass_under_the_auto_worker_count_is_measured`.
+
+Commands (one process per configuration, `--test-threads=1`; the two configurations are separate invocations so neither
+one's page cache or CPU state contaminates the other):
+
+    NP_TEST_MODEL_PATH=/home/agent/models/embeddinggemma-2-Q8_0.gguf \
+      cargo test --locked -p np-core --features local-model --test local_corpus \
+        the_corpus_pass_under_the_auto_worker_count -- --nocapture --test-threads=1      # run twice
+
+    … --test local_corpus a_first_pass_over_a_corpus_is_measured_and_projected …          # four-worker control, same day
+
+Host: 16-core x86_64 Linux, CPU-only, `MemTotal: 7597988 kB`. Artifact:
+`/home/agent/models/embeddinggemma-2-Q8_0.gguf`, 309,855,456 B, sha256
+`2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135`. llama.cpp pinned tag v0.8.0, `GGML_OPENMP=OFF`.
+Worker counts below are printed by the harness (`workers=` on every row), not asserted from the config file.
+
+**Three runs, in the order they were taken.** §8 asks for ≥2 and forbids quoting a lucky number; the four-worker control
+is here because a ratio between two days is a claim about the host as much as about the threads — and it holds: today's
+four-worker pass (456.43 s, 16,153 chunks/hour) reproduces the 2026-10-31 pair (456.20 / 456.16 s, 16,161 / 16,163) to
+within 0.06 %, so this machine did not simply get faster.
+
+| Figure | four workers (control, today) | auto = 12, run 1 | auto = 12, run 2 | ratio 12/4 |
+|---|---|---|---|---|
+| steady wall time for 2,048 chunks | 456.43 s | 181.41 s | 180.97 s | **2.516× / 2.522×** |
+| tokens/s (sample-derived) | 154.5 | 388.6 | 389.6 | 2.515× / 2.522× |
+| chunks/hour (exact counts) | 16,153 | 40,642 | 40,741 | 2.516× / 2.522× |
+| `VmRSS` drift across the pass (KiB) | +1,556 | +1,556 | +1,556 | — |
+| peak `VmHWM` (KiB) | 447,288 | 446,392 | 446,440 | −0.2 % (indistinguishable) |
+| cold start: load + one decode (s) | 0.42 | 0.40 | 0.39 | — |
+| notes fitting one 4 h evening | ~64,600 | ~162,500 | ~162,900 | — |
+
+**What this does not change.** The `fits_evening` verdicts: at four workers the projection's largest cohort (20,000 notes)
+already fitted in 1.24 h of the 4 h threshold, so the answer was "yes" before and is "yes" now — what the threads buy is
+headroom (0.49 h instead of 1.24 h), not a threshold that previously failed. The cohort solve (§14's fixed-cost split,
+31.1 ms + 5.53 ms/token) is still a four-worker measurement: it is about per-decode overhead and SQLite, and this case
+deliberately does not re-run it. Peak RSS moving ~0.2 % is not a contradiction of D13's "+6.6 MiB for twelve workers" —
+that was mid-run `VmRSS` on a single-chunk probe against the same probe at four; this is whole-process `VmHWM` dominated by
+the 1,104 MiB compute reservation, and the honest statement is "no measurable change at this granularity".
+
+## Verbatim measurement lines
+
+### auto (twelve workers), run 1
+
+SUMMARY-AUTO workers=12 of 16 available (auto) corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=181.41 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=388.6 chunks_per_hour=40642 rss_first_kib=414868 rss_last_kib=416424 rss_samples=9 peak_kib=446392 cold_start_s=0.40
+SUMMARY-AUTO host MemTotal:    7597988 kB MemAvailable:  5781600 kB
+SUMMARY-AUTO rss_drift_kib=1556 samples=9
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 183.22s
+wall 183.62 s
+PROJECTION-AUTO threshold = one evening = 4 h of unattended wall time (measured rate: 40642 chunks/hour)
+PROJECTION-AUTO notes=  1000 hours=  0.02 fits_evening=yes
+PROJECTION-AUTO notes=  5000 hours=  0.12 fits_evening=yes
+PROJECTION-AUTO notes= 20000 hours=  0.49 fits_evening=yes
+
+### auto (twelve workers), run 2
+
+SUMMARY-AUTO workers=12 of 16 available (auto) corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=180.97 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=389.6 chunks_per_hour=40741 rss_first_kib=417164 rss_last_kib=418720 rss_samples=9 peak_kib=446440 cold_start_s=0.39
+SUMMARY-AUTO host MemTotal:    7597988 kB MemAvailable:  5781004 kB
+SUMMARY-AUTO rss_drift_kib=1556 samples=9
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 182.80s
+wall 182.85 s
+PROJECTION-AUTO threshold = one evening = 4 h of unattended wall time (measured rate: 40741 chunks/hour)
+PROJECTION-AUTO notes=  1000 hours=  0.02 fits_evening=yes
+PROJECTION-AUTO notes=  5000 hours=  0.12 fits_evening=yes
+PROJECTION-AUTO notes= 20000 hours=  0.49 fits_evening=yes
+
+### four workers, control run on the same day
+
+SUMMARY corpus notes=2048 chunks_embedded=2048 batches=256 batch_chunks=8 wall_s=456.43 tokens_per_chunk_mean=34.4 (sampled 64 of 2048) tokens_total~=70496 tokens_per_second=154.5 chunks_per_hour=16153 rss_first_kib=416548 rss_last_kib=418104 rss_samples=9 peak_kib=447288 cold_start_s=0.42
+SUMMARY host MemTotal:    7597988 kB MemAvailable:  5788404 kB
+SUMMARY rss_drift_kib=1556 samples=9
+PROJECTION threshold = one evening = 4 h of unattended wall time (measured rate: 16153 chunks/hour)
+PROJECTION notes=  1000 hours=  0.06 fits_evening=yes
+PROJECTION notes=  5000 hours=  0.31 fits_evening=yes
+PROJECTION notes= 20000 hours=  1.24 fits_evening=yes
+SUMMARY second_run wall_s=0.04 current=2048 batches=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 458.72s
+wall 458.80 s

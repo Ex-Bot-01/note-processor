@@ -330,11 +330,33 @@ mod corpus {
         /// `VmRSS` at every [`SAMPLE_EVERY_BATCHES`]-th hook call, KiB.
         rss_samples: Vec<u64>,
         report: embed_run::EmbedReport,
+        /// The worker count this pass ran with, as the provider resolved it — printed with every row so a log cannot be
+        /// read without its configuration. `np embed`'s own report carries this; a benchmark that drops it is how §14
+        /// nearly ended up quoting four-worker numbers as if they were the shipped default's.
+        workers: np_core::embed_run::WorkerPlan,
     }
 
     const SAMPLE_EVERY_BATCHES: usize = 32;
 
+    /// The worker count §14's corpus rows were taken at, spelled out rather than inherited.
+    fn four_workers() -> np_core::config::ThreadCount {
+        np_core::config::ThreadCount::Workers(
+            std::num::NonZeroU32::new(4).expect("test setup: 4 is non-zero"),
+        )
+    }
+
+    /// One corpus pass at llama.cpp's historical four workers.
+    ///
+    /// **Four, spelled out.** §14's corpus figures (16,161 chunks/hour, the drift over 2,048 decodes) and the cohort
+    /// split below are four-worker measurements, and `docs/design-m2-thread-policy.md` §6 says so. Letting this fixture
+    /// follow R8's new `auto` default would silently redefine what those committed numbers mean; the auto count gets its
+    /// own case (`the_corpus_pass_under_the_auto_worker_count_is_measured`) instead of a config change re-defining
+    /// history as a side effect.
     fn run_pass(setup: &Setup) -> Pass {
+        run_pass_with(setup, four_workers())
+    }
+
+    fn run_pass_with(setup: &Setup, threads: np_core::config::ThreadCount) -> Pass {
         let provider = np_core::local_model::LazyLocalEmbedder::new(
             &db::model_row(&setup.db(), MODEL_ID)
                 .expect("row readable")
@@ -342,13 +364,7 @@ mod corpus {
             &setup.cfg().workspace_models_dir(&setup.root).join(MODEL_ID),
             usize::try_from(DIM).expect("dim fits usize"),
             np_core::config::DEFAULT_EMBEDDING_TOKENS,
-            // **Four workers, spelled out.** §14's corpus figures (16,161 chunks/hour, the drift over 2,048 decodes) are
-            // a four-worker measurement, and `docs/design-m2-thread-policy.md` §6 says so; letting this fixture follow
-            // the new `auto` default would silently re-define what those committed numbers mean. Re-running the corpus at
-            // the auto count is its own measurement event, not a side effect of a config change.
-            np_core::config::ThreadCount::Workers(
-                std::num::NonZeroU32::new(4).expect("test setup: 4 is non-zero"),
-            ),
+            threads,
         )
         .expect("test setup: a lazy provider for the linked artifact");
 
@@ -379,6 +395,7 @@ mod corpus {
             batches,
             rss_samples,
             report,
+            workers: provider.worker_plan(),
         }
     }
 
@@ -572,6 +589,135 @@ mod corpus {
             second.report.current,
             second.batches
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // the same pass at the shipped default worker count (R8)
+    // ---------------------------------------------------------------------------
+
+    /// The corpus pass again, this time at whatever `auto` resolves to on this machine.
+    ///
+    /// R8 changed the default from llama.cpp's compile-time four to `min(cpus, max(min(cpus, 4), floor(0.8 × cpus)))`,
+    /// which is twelve here — and §14's corpus rows (16,161 chunks/hour) were measured at four. Those rows stay what they
+    /// are: the fixture above pins four on purpose. This case is the measurement that decision owed, run as its own event
+    /// in its own process so neither configuration contaminates the other's page cache or CPU state.
+    ///
+    /// It deliberately does **not** re-run the cohort solve or the currency query: those numbers are about per-decode
+    /// fixed cost and SQLite, not about worker count, and repeating them here would imply a measurement I have not made.
+    #[test]
+    fn the_corpus_pass_under_the_auto_worker_count_is_measured() {
+        let artifact = artifact_or_not_coverage!();
+        let notes = corpus_notes();
+        let _guard = model_lock();
+
+        let setup = Setup::new(notes);
+        setup.link_artifact(&artifact);
+        let pass = run_pass_with(&setup, np_core::config::ThreadCount::Auto);
+
+        // The same correctness fences as the four-worker case, because a faster wrong answer is still wrong: everything
+        // embedded, nothing refused, and unit-norm vectors in the database.
+        assert_eq!(pass.report.chunks_seen, notes);
+        assert_eq!(pass.report.embedded, notes, "auto must not lose work");
+        assert_eq!(pass.report.errors, 0);
+        assert_eq!(pass.report.refused_budget, 0);
+        assert!(matches!(pass.report.outcome, EmbedOutcome::Current));
+        let stride = {
+            let stored = setup.stored();
+            assert_eq!(stored.len(), notes);
+            stored.len().div_ceil(40).max(1)
+        };
+        let stored = setup.stored();
+        for index in (0..stored.len()).step_by(stride) {
+            let (chunk_id, dim, bytes) = &stored[index];
+            assert_eq!(*dim, DIM, "chunk {chunk_id}");
+            let length = norm(stored_vector(bytes).components());
+            assert!(
+                (length - 1.0).abs() < 1e-3,
+                "chunk {chunk_id} stored with ‖v‖ = {length}; §7 normalises"
+            );
+        }
+
+        let tokens_per_chunk = mean_tokens_per_chunk(&artifact, &setup.chunk_texts());
+        let estimated_tokens = tokens_per_chunk.0 * pass.report.embedded as f64;
+        let seconds = pass.wall.as_secs_f64();
+        let tokens_per_second = estimated_tokens / seconds;
+        let chunks_per_hour = pass.report.embedded as f64 / seconds * 3_600.0;
+
+        // `workers=` travels on every row: a throughput number whose worker count is not printed is the exact ambiguity
+        // this case exists to remove, and a log that separates the two runs by heading alone would be read wrong.
+        println!(
+            "SUMMARY-AUTO workers={} corpus notes={} chunks_embedded={} batches={} batch_chunks={} \
+             wall_s={:.2} tokens_per_chunk_mean={:.1} (sampled {} of {}) tokens_total~={:.0} \
+             tokens_per_second={:.1} chunks_per_hour={:.0} rss_first_kib={} rss_last_kib={} \
+             rss_samples={} peak_kib={} cold_start_s={:.2}",
+            pass.workers.describe(),
+            notes,
+            pass.report.embedded,
+            pass.batches,
+            EMBED_BATCH_CHUNKS,
+            seconds,
+            tokens_per_chunk.0,
+            tokens_per_chunk.1,
+            pass.report.chunks_seen,
+            estimated_tokens,
+            tokens_per_second,
+            chunks_per_hour,
+            pass.rss_samples.first().copied().unwrap_or(0),
+            pass.rss_samples.last().copied().unwrap_or(0),
+            pass.rss_samples.len(),
+            rss_kib("VmHWM:"),
+            pass.cold_start.as_secs_f64(),
+        );
+        println!("SUMMARY-AUTO host {}", meminfo());
+
+        // Same floor as the four-worker case (≈¼ of the ~150 tok/s R6d round 1 measured through this API). It is not
+        // raised to a twelve-worker figure on purpose: this fence catches a broken pipeline, and a band tuned to today's
+        // worker count would also fail harmlessly on a two-core laptop where `auto` resolves to 2.
+        assert!(
+            tokens_per_second > 40.0,
+            "aggregate throughput fell to {tokens_per_second:.1} tok/s at {} workers; something is wrong well before \
+             it is merely slow",
+            pass.workers.count,
+        );
+
+        if pass.batches >= SAMPLE_EVERY_BATCHES {
+            assert!(
+                pass.rss_samples.len() >= 2,
+                "{} batches produced {} RSS sample(s); sampling is broken, not the memory behaviour",
+                pass.batches,
+                pass.rss_samples.len()
+            );
+        }
+        if pass.rss_samples.len() >= 2 {
+            let first = pass.rss_samples[0];
+            let last = *pass.rss_samples.last().expect("checked non-empty");
+            let drift_kib = last.abs_diff(first);
+            println!(
+                "SUMMARY-AUTO rss_drift_kib={drift_kib} samples={}",
+                pass.rss_samples.len()
+            );
+            // The same 256 MiB ceiling as the four-worker case. Worker threads add stacks and per-thread arenas, so this
+            // is where a twelve-worker regression in memory behaviour would show up first.
+            assert!(
+                drift_kib < 262_144,
+                "VmRSS moved {drift_kib} KiB across {} batches at {} workers",
+                pass.batches,
+                pass.workers.count,
+            );
+        }
+
+        println!(
+            "PROJECTION-AUTO threshold = one evening = {EVENING_HOURS:.0} h of unattended wall time \
+             (measured rate: {chunks_per_hour:.0} chunks/hour)"
+        );
+        for size in PROJECTION_NOTES {
+            let hours = size as f64 / chunks_per_hour;
+            println!(
+                "PROJECTION-AUTO notes={size:>6} hours={hours:>6.2} fits_evening={}",
+                if hours <= EVENING_HOURS { "yes" } else { "no" }
+            );
+            assert!(chunks_per_hour > 0.0);
+        }
     }
 
     // ---------------------------------------------------------------------------
