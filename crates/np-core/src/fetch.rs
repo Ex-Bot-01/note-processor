@@ -328,6 +328,26 @@ impl FetchReport {
     }
 }
 
+/// The name a fetched member gets **on this disk**, which is not its name on the origin.
+///
+/// `install` publishes the primary artifact at `<models_dir>/<id>`, and every existing reader assumes exactly that —
+/// `list`'s state, D12's verify-on-change, and the loader that turns a row into weights. So a fetch may not invent its
+/// own spelling: publishing under the upstream file name leaves the row pointing at nothing (`state: missing`) while the
+/// real bytes sit beside it as `unclaimed` junk. That is not a cosmetic disagreement — an artifact the program cannot
+/// find is an artifact that will be re-downloaded, or deleted as clutter, by whoever notices first.
+///
+/// The primary member therefore takes the id, matching install byte for byte, and any later member takes
+/// `<id>.<member>`: a name `validate_id` could never produce on its own (ids cannot contain a leading dot, and this one
+/// has none) so it cannot collide with another model's artifact, and it still carries no host or directory.
+///
+/// **The pin's `filename` is the remote name only** — what [`HttpTransport`] asks the origin for. Two names for two
+/// places, each decided in exactly one function: [`crate::models::member_artifact_name`] here, and the URL there.
+/// This wrapper exists so a fetch reads as naming a *fetch* target; the rule itself lives with the other artifact
+/// naming, where `list` and the loader can see it too.
+pub fn local_name(id: &str, member: &str) -> String {
+    models::member_artifact_name(id, member)
+}
+
 /// Spell one model's declaration the same way on both sides of a disagreement.
 ///
 /// Six fields became two strings here because the `Err` variant of this module's result was growing into something
@@ -541,7 +561,7 @@ pub fn fetch_with_table<T: MemberPin>(
     };
 
     for member in &members {
-        let target = models_dir.join(member.filename());
+        let target = models_dir.join(local_name(id, member.member()));
         // Rule 5's other half: never publish over existing bytes. Checked before the transfer so a human is not made
         // to watch 310 MB arrive before "refusing to overwrite".
         if fs::symlink_metadata(&target).is_ok() {

@@ -59,6 +59,24 @@ const ID_MAX_CHARS: usize = 64;
 /// against this number rather than declaring a second 64 that could drift from the one a digest is checked against.
 pub(crate) const DIGEST_HEX_CHARS: usize = 64;
 
+/// The file name one member of `id` gets inside the models directory.
+///
+/// **This is the program's own naming, not the origin's.** The primary member takes the id, because that is where
+/// every reader has always looked — `list`'s state, D12's verify-on-change, and the loader that turns a row into
+/// weights all resolve `<models_dir>/<id>`. A later member takes `<id>.<member>`: a name no other id can have (ids
+/// cannot contain a leading dot, and this has none, so it cannot shadow another model's artifact), while still being
+/// one flat file name with no directory and no host in it.
+///
+/// `install` publishes only the primary today; a fetch writes every member it verified. Both call this, which is what
+/// keeps `list` from reporting a fetched pair as one artifact plus junk.
+pub fn member_artifact_name(id: &str, member: &str) -> String {
+    if member == MAIN_FILE {
+        id.to_string()
+    } else {
+        format!("{id}.{member}")
+    }
+}
+
 /// The member name of a model's **primary** artifact — the file at `<models_dir>/<id>` whose digest also stands in
 /// `models.sha256` (migration 9, §12 rule 10). One spelling shared by `install`, the fetcher and every reader, because
 /// two spellings of "the main file" is how a pair ends up with two halves nobody can name.
@@ -1100,7 +1118,16 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
     // Claimed means "some row names this exact file name". Row ids are validated ASCII (§2), so comparing
     // the OS spelling against them needs no lossy round trip — a name UTF-8 cannot hold is by construction
     // not an id and lands in `unclaimed`, rendered with replacements.
-    let claimed: HashSet<OsString> = rows.iter().map(|row| OsString::from(&row.id)).collect();
+    let mut claimed: HashSet<OsString> = rows.iter().map(|row| OsString::from(&row.id)).collect();
+    // **A fetched pair is one model, not an artifact plus junk.** Every member recorded in migration 9's child table
+    // claims the file name [`member_artifact_name`] gives it, so `np models fetch` of the text encoder and its
+    // projector leaves nothing in `unclaimed`. Members are read from the rows rather than guessed by prefix: a stray
+    // `something.random` is still somebody else's file, and "recorded as a member" is the fact that makes a name ours.
+    for row in &rows {
+        for file in db::model_files(db, &row.id)? {
+            claimed.insert(OsString::from(member_artifact_name(&row.id, &file.name)));
+        }
+    }
     let (unclaimed, marker_ids) = entries.split(&claimed);
 
     let mut models = Vec::with_capacity(rows.len());

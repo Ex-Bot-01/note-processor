@@ -231,11 +231,13 @@ fn a_verified_pair_is_published_and_no_fetch_name_survives() {
     assert_eq!(report.total_bytes, (MAIN.len() + EXTRA.len()) as u64);
     assert!(report.wrote_anything());
     assert_eq!(
-        fs::read(models.join("test-model.gguf")).expect("main published"),
+        fs::read(models.join("test-model"))
+            .expect("main published at the id, where install puts it"),
         MAIN
     );
     assert_eq!(
-        fs::read(models.join("test-model-mmproj.gguf")).expect("second member published"),
+        fs::read(models.join("test-model.extra"))
+            .expect("second member published as <id>.<member>"),
         EXTRA
     );
 
@@ -250,7 +252,7 @@ fn a_verified_pair_is_published_and_no_fetch_name_survives() {
                 .to_string_lossy()
                 .into_owned()
         })
-        .filter(|name| name != "test-model.gguf" && name != "test-model-mmproj.gguf")
+        .filter(|name| name != "test-model" && name != "test-model.extra")
         .collect();
     assert_eq!(
         left,
@@ -521,7 +523,7 @@ fn an_unknown_transfer_size_still_verifies_against_the_pin() {
         1_730_000_007,
     );
     assert_eq!(
-        fs::read(models.join("test-model.gguf")).expect("published"),
+        fs::read(models.join("test-model")).expect("published"),
         MAIN
     );
 }
@@ -537,7 +539,9 @@ fn an_existing_artifact_is_never_overwritten_and_is_not_even_requested() {
     // Same length by construction, different bytes: only a digest can tell these apart, which is the state rule 5
     // refuses to overwrite rather than argue about.
     let existing: Vec<u8> = vec![b'q'; MAIN.len()];
-    fs::write(models.join("test-model.gguf"), &existing).expect("test setup: existing artifact");
+    // The primary artifact lives at the id, exactly where `install` publishes it — which is what makes this refusal
+    // about *the program's own* file rather than about a name only the origin would recognise.
+    fs::write(models.join("test-model"), &existing).expect("test setup: existing artifact");
 
     let table = table(MAIN, EXTRA);
     let fake = Fake::new();
@@ -555,7 +559,7 @@ fn an_existing_artifact_is_never_overwritten_and_is_not_even_requested() {
     assert!(matches!(err, FetchError::TargetExists { .. }), "{err}");
     assert_eq!(fake.opens(), 0, "the check runs before the transfer: {err}");
     assert_eq!(
-        fs::read(models.join("test-model.gguf")).expect("still there"),
+        fs::read(models.join("test-model")).expect("still there"),
         existing,
         "an existing artifact's bytes must not change"
     );
@@ -676,7 +680,7 @@ fn a_member_with_no_recorded_digest_is_refused_by_name_and_the_pair_stays_unwrit
     }
     // Half a pair is worse than none: the refusal resolves every name before byte one.
     assert_eq!(fake.opens(), 0);
-    assert!(!models.join("test-model.gguf").exists());
+    assert!(!models.join("test-model").exists());
 }
 
 #[test]
@@ -969,7 +973,7 @@ fn a_row_that_declares_something_else_refuses_before_byte_one() {
         0,
         "a declared fact needs no transfer to check: {text}"
     );
-    assert!(!models.join("test-model.gguf").exists());
+    assert!(!models.join("test-model").exists());
     // The row is untouched — a refusal that rewrote the declaration would have decided the disagreement.
     assert_eq!(
         db::model_row(&db, "test-model")
@@ -1055,7 +1059,60 @@ fn a_database_that_refuses_the_record_reports_it_rather_than_a_success() {
     // shape (or here, a row with no members), reported rather than quietly rolled back: deleting bytes a human may
     // want to keep is not this command's call.
     assert_eq!(
-        fs::read(models.join("test-model.gguf")).expect("published"),
+        fs::read(models.join("test-model")).expect("published"),
         MAIN
+    );
+}
+
+#[test]
+fn a_fetched_model_is_the_artifact_list_already_looks_for() {
+    // **The integration fence this file did not have, and the live run caught.** A fetch that publishes under the
+    // origin's file name leaves `models.sha256` pointing at nothing: `list` answers `missing` for a row whose bytes
+    // are on disk, and reports those bytes as `unclaimed` — an artifact the program cannot find is one a person will
+    // re-download or delete as clutter. So the check is not "a file exists somewhere" but what the *listing* says
+    // about this workspace: state present, nothing unclaimed, no fetch in progress.
+    let tmp = dir();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).expect("test setup: data dir");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&workspace).expect("test setup: workspace dir");
+    let config = np_core::config::Config {
+        data_dir: data_dir.clone(),
+        ..Default::default()
+    };
+    let db = Db::open(&config.workspace_db(&workspace)).expect("test setup: workspace db");
+
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Full(MAIN.to_vec()));
+    fake.serve("extra", Serve::Full(EXTRA.to_vec()));
+    let models = config.workspace_models_dir(&workspace);
+    fetch_ok(
+        &db,
+        &models,
+        "test-model",
+        &["main", "extra"],
+        &fake,
+        &table,
+        1_730_000_040,
+    );
+
+    let listing = models::list(&db, &config, &workspace).expect("listing");
+    assert_eq!(listing.models.len(), 1, "one row: {:?}", listing.models);
+    let row = &listing.models[0];
+    assert_eq!(row.row.id, "test-model");
+    assert_eq!(
+        row.state,
+        models::ArtifactState::Present,
+        "the fetched bytes are where the row says they are: {row:?}"
+    );
+    assert!(
+        listing.unclaimed.is_empty(),
+        "no fetched byte is junk to the listing: {:?}",
+        listing.unclaimed
+    );
+    assert!(
+        listing.fetching.is_empty(),
+        "the marker went with completion"
     );
 }

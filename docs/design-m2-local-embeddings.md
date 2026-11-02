@@ -760,9 +760,21 @@ Rules 1–8 and 12 are implemented and tested; the deviations a reader should no
 * **The transport follows redirects**, which rule 8 does not mention: the digest decides acceptance, so a hop that
   changes host cannot substitute accepted bytes — it can only waste bandwidth. Refusing hops would break the ordinary
   upstream layout (`/resolve/main/<file>` answers 302 pointing at a CDN).
-* **Still owed:** nothing has fetched the real pair end to end from the real origin on this project's side — the
-  transport is tested against a loopback server, and the pinned digests are checked against the file we hold for
-  `main` only. The first real `np models fetch` of the pair is its own evidence event and belongs in §14 when it runs.
+* **The local file name is ours, not the origin's** — and that was found by running it, not by reading the code. The
+  first live fetch published under the upstream names (`embeddinggemma-2-Q8_0.gguf`, `mmproj-…`) and `np models list`
+  then answered `state: missing` for a row whose bytes were on disk, with both files reported as `unclaimed`. Nothing
+  in any test could see it: the engine verified its digests, the CLI printed success, and every path it asserted was
+  the one it had written. Two rules came out of it — [`crate::models::member_artifact_name`] is the single spelling
+  (`<id>` for the primary member, exactly where `install` has always put it; `<id>.<member>` afterwards), and a name is
+  claimed by a listing if a **recorded member** names it, so a fetched pair is one model rather than an artifact plus
+  junk. The fence is `a_fetched_model_is_the_artifact_list_already_looks_for`, which asserts what the *listing* says;
+  deleting the member-claiming loop fails it.
+* **Live evidence (2026-11-02, this host)**: `np models fetch <ws> --id embeddinggemma-2` against
+  `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main` moved **864,676,512 bytes in 52.4 s** (then
+  53.3 s on a clean repeat), both members hashing to the pins — including `mmproj`, whose digest had only ever been
+  checked against an API response — and following the upstream redirect through TLS without the client being told
+  about it. A second run refused (`refusing to overwrite the existing artifact …`), no marker was left behind, and
+  `list` reported `present` / `unclaimed 0`. Free space printed before the transfer (6.3 GB) rather than being assumed.
 
 ### What this buys, and what it does not claim
 

@@ -621,7 +621,9 @@ fn models_fetch(
     } else {
         for member in &report.members {
             emit(&format!(
-                "fetched     {} ({} bytes, sha256 {})",
+                // `size_human` spells the unit itself, so the word must not be repeated here: "295.5 MB bytes" is the
+                // kind of line that makes a reader distrust the number next to it.
+                "fetched     {} ({}, sha256 {})",
                 member.member,
                 size_human(member.bytes),
                 member.sha256

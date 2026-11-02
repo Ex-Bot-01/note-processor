@@ -180,7 +180,7 @@ fn the_real_client_streams_verifies_and_publishes() {
     worker.join().expect("test server: the exchange finished");
 
     assert_eq!(
-        fs::read(models.join("test-model.gguf")).expect("published"),
+        fs::read(models.join("test-model")).expect("published"),
         BODY
     );
     let row = np_core::db::model_row(&db, "test-model")
@@ -263,7 +263,7 @@ fn a_chunked_transfer_fetches_with_the_size_left_unknown() {
     fetch_from(&origin, &models, &db).expect("a chunked transfer still verifies");
     worker.join().expect("test server: the exchange finished");
     assert_eq!(
-        fs::read(models.join("test-model.gguf")).expect("published"),
+        fs::read(models.join("test-model")).expect("published"),
         BODY
     );
 }
