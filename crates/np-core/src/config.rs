@@ -25,8 +25,9 @@ pub enum ConfigError {
     #[error("config io: {0}")]
     Io(#[from] io::Error),
     /// The config file exists but is not valid TOML for [`Config`] — including a key it does not
-    /// recognise under `[embeddings]`, which that section refuses (`EmbeddingsConfig`'s
-    /// `deny_unknown_fields`, `docs/design-m2-embeddings.md` §7).
+    /// recognise under `[embeddings]` or `[models]`, both of which refuse one (`EmbeddingsConfig`'s and
+    /// [`ModelsConfig`]'s `deny_unknown_fields`; `docs/design-m2-embeddings.md` §7 for the first, and the same
+    /// argument one section later for the second).
     ///
     /// The path travels with the failure because a parse error that cannot say *which file* is broken
     /// is not actionable: this program reads one user file and takes another from the command line,
@@ -144,6 +145,73 @@ impl Default for CatalogConfig {
             max_entries_per_file: 600,
             continuation_indent: 2,
         }
+    }
+}
+
+/// The `[models]` section: where artifacts may be fetched from, and the one door around the pin table
+/// (`docs/design-m2-local-embeddings.md` §12 rule 7).
+///
+/// Both keys are `Option`, and **absent is the shipped state** — not a degraded one. With no `base_url` this build
+/// has nowhere to fetch from, which is what keeps an unconfigured machine quiet; with no `sha256` it accepts nothing
+/// that disagrees with [`crate::pins`].
+///
+/// **Nothing reads either key as a destination yet.** The fetch command is a later stage of R7b (design §12 rule 1:
+/// the automatic trigger is M4's daemon, not a command), so this round makes the keys legal, defaulted, validated
+/// and retrievable — and stops there. It is also why there is no documented default origin to name here: §12 rule 7
+/// promises one, and inventing a host would be exactly the compile-time secret that rule refuses to hold.
+///
+/// `deny_unknown_fields`, like [`EmbeddingsConfig`] and for the same reason (§7 there): a misspelled key here would
+/// load as *no value at all*, in silence — a mistyped `baseurl` meaning "nowhere to fetch from", a mistyped
+/// `sha256` meaning "the pin stands". §12 rule 7's closing sentence is that **silent fallback stays impossible**, so
+/// the file is refused instead. The strictness stops at this section's boundary, as it does there: unknown keys
+/// elsewhere keep loading as they always have.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelsConfig {
+    /// Where to fetch from: an `http` or `https` origin, optionally with a path prefix — validated at load (see
+    /// `resolve_models`, private hence a code span) and stored with one trailing `/` removed.
+    ///
+    /// A **path is allowed** because that is what a mirror usually looks like (`https://mirror.internal/mirror/` is
+    /// §12 rule 7's use case: "so a mirror works"); what is refused is a value with no scheme or no host, which is
+    /// not an origin at all, and credentials in the authority, because this file is not where a secret lives — the
+    /// parent design's §9 protects the self-hosted server's URL and key, and `[models]` holds neither.
+    ///
+    /// The pin table decides *what* is accepted; nothing here changes that ([`crate::pins`] carries no host, on
+    /// purpose). No default: see this section's header note.
+    pub base_url: Option<String>,
+    /// A digest the operator accepts **instead of the pin** — the escape hatch for pin rot (§12 rule 7: an upstream
+    /// re-upload nobody noticed until first start refused), and no weaker than today, where any human may pass
+    /// `install --sha256`.
+    ///
+    /// Input is case-insensitive and stored lowercase, exactly like `install --sha256`; anything that is not 64 hex
+    /// characters is refused naming the key. Read it through [`ModelsConfig::unpinned_digest_override`], which
+    /// carries the obligation that comes with using it.
+    pub sha256: Option<String>,
+}
+
+/// Hand-written so that both keys default to *unset* in one place — the state §12 rule 7 calls "the pin stands, and
+/// there is nowhere to fetch from", which two independent `Option`s must not be able to disagree about.
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            sha256: None,
+        }
+    }
+}
+
+impl ModelsConfig {
+    /// The digest this run was told to accept instead of the pin, lowered at load (see `resolve_models`, private
+    /// hence a code span).
+    ///
+    /// **Using it is a deliberate act and has to look like one.** §12 rule 7 permits an unpinned digest only because
+    /// a human named it (`[models] sha256`, or `NP_MODELS_SHA256`), and requires that accepting it **prints a line
+    /// saying an unpinned digest was accepted** — the override is loud, or it is indistinguishable from a pin nobody
+    /// checked. This round makes the fact retrievable and tested; nothing prints it yet, because no code path can
+    /// fetch yet (see [`ModelsConfig`]'s header note), so a caller that starts using this accessor owes that line in
+    /// the same change.
+    pub fn unpinned_digest_override(&self) -> Option<&str> {
+        self.sha256.as_deref()
     }
 }
 
@@ -313,6 +381,9 @@ pub struct Config {
     /// Embedding provider choice. An absent `[embeddings]` section is `provider = "none"`, which is
     /// the default and not a degraded state (§2).
     pub embeddings: EmbeddingsConfig,
+    /// Fetch source and the digest override (§12 rule 7). An absent `[models]` section names neither, which is the
+    /// shipped state: nothing to fetch from, and the pin stands.
+    pub models: ModelsConfig,
 }
 
 impl Default for Config {
@@ -322,6 +393,7 @@ impl Default for Config {
             catalog: CatalogConfig::default(),
             markers: MarkerConfig::default(),
             embeddings: EmbeddingsConfig::default(),
+            models: ModelsConfig::default(),
         }
     }
 }
@@ -336,8 +408,8 @@ impl Config {
     /// only changes the keys it spells out; unparsable content is
     /// [`ConfigError::Parse`], which names the file it refused.
     ///
-    /// Unknown keys are allowed everywhere except `[embeddings]`, which refuses them
-    /// ([`EmbeddingsConfig`], §7 of the M2a design).
+    /// Unknown keys are allowed everywhere except `[embeddings]` and `[models]`, which refuse them
+    /// ([`EmbeddingsConfig`], §7 of the M2a design; [`ModelsConfig`], §12 rule 7 of the fetch design).
     /// A `data_dir` neither the file nor the environment supplied is a failure, not a default:
     /// every path this program derives from it would go relative — a `workspaces/` directory next
     /// to whatever directory the command happened to run in. The CLI reports it and exits 1.
@@ -375,6 +447,7 @@ impl Config {
             )));
         }
         validate_embeddings(&cfg)?;
+        resolve_models(&mut cfg)?;
         Ok(cfg)
     }
 
@@ -502,6 +575,130 @@ fn validate_embeddings(cfg: &Config) -> Result<(), ConfigError> {
 /// A config *value* refused as data, the way F17 refuses an oversized indent — see [`validate_embeddings`].
 fn invalid_data(message: String) -> ConfigError {
     ConfigError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+/// Take any `[models]` value the file left unset from the environment, normalise both spellings, and refuse what
+/// cannot be honoured ([`ModelsConfig`], `docs/design-m2-local-embeddings.md` §12 rule 7).
+///
+/// **Precedence follows `data_dir` in [`Config::load`]**, this file's only existing config-versus-environment rule:
+/// a value the file spelled out wins, and the environment (`NP_MODELS_BASE_URL`, `NP_MODELS_SHA256`) supplies a key
+/// the file left unset — never an override of a file that names one. `[embeddings]` had no env rule to copy because
+/// it has none at all, so borrowing its shape would have meant inventing one.
+///
+/// Validation runs on the merged value for the reason F17's ceiling gives at the indent check above: a key can
+/// arrive from either place, and a rule watching only the file would let the environment route around it. Each
+/// refusal names both the config key and the variable the value came from, because telling someone to edit a file
+/// that does not hold the value wastes the one thing a refusal is for.
+fn resolve_models(cfg: &mut Config) -> Result<(), ConfigError> {
+    // Where each present value came from, so the message can point at the place to edit. The file's own spelling
+    // needs no marker beyond the key itself; only the environment arm changes it.
+    let mut base_origin = "models.base_url";
+    if cfg.models.base_url.is_none() {
+        if let Some(value) = env_text("NP_MODELS_BASE_URL")? {
+            cfg.models.base_url = Some(value);
+            base_origin = "NP_MODELS_BASE_URL";
+        }
+    }
+    let mut digest_origin = "models.sha256";
+    if cfg.models.sha256.is_none() {
+        if let Some(value) = env_text("NP_MODELS_SHA256")? {
+            cfg.models.sha256 = Some(value);
+            digest_origin = "NP_MODELS_SHA256";
+        }
+    }
+
+    // One trailing `/` is the same origin spelled twice, and leaving it in means every caller has to know which of
+    // `origin` + `/name` to write. Exactly one comes off: `…/base//` is not a typo this function can read minds
+    // about, and a later join will show it rather than hide it.
+    if let Some(url) = cfg.models.base_url.clone() {
+        let trimmed = url.strip_suffix('/').unwrap_or(&url).to_string();
+        validate_base_url(&trimmed, base_origin)?;
+        cfg.models.base_url = Some(trimmed);
+    }
+    if let Some(digest) = cfg.models.sha256.clone() {
+        let lowered = validate_digest(&digest, digest_origin)?;
+        cfg.models.sha256 = Some(lowered);
+    }
+    Ok(())
+}
+
+/// Refuse a `[models] base_url` that names no origin, and say which of the two places held it.
+///
+/// The rule is what this file can check without an HTTP dependency (C1 adds none): a scheme of `http` or `https`,
+/// then a non-empty authority with no credentials and no whitespace in it. A path after the authority is legal and
+/// untouched — [`ModelsConfig::base_url`] says why a mirror usually has one.
+fn validate_base_url(url: &str, origin: &str) -> Result<(), ConfigError> {
+    let refuse = |reason: String| {
+        Err(invalid_data(format!(
+            "invalid {origin} = {url:?}: {reason} — expected an http(s) origin such as \
+             `https://mirror.example/models` (no credentials, no spaces)"
+        )))
+    };
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return refuse("missing `://`, so there is no scheme to fetch over".to_string());
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        // Only these two: a fetch carries 310 MB, and anything else would do it without transport security while
+        // the pin table's refusal is the only check left.
+        return refuse(format!(
+            "scheme `{}` cannot carry a fetch; use http or https",
+            scheme.to_ascii_lowercase()
+        ));
+    }
+    // The authority runs to the first path/query/fragment separator, whatever the rest of the URL holds.
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if authority.is_empty() {
+        return refuse("no host follows the scheme".to_string());
+    }
+    if authority.contains('@') {
+        // Credentials here would be a secret in an ordinary config file, which is not §9's class — and a base URL
+        // that needs them is a mirror configured in the wrong place.
+        return refuse(
+            "carries credentials; a fetch source authenticates some other way".to_string(),
+        );
+    }
+    if authority.chars().any(char::is_whitespace) {
+        return refuse("the host contains whitespace".to_string());
+    }
+    Ok(())
+}
+
+/// Validate a `[models] sha256` and return it lowered, in the shape `install --sha256` already refuses bad input —
+/// [`crate::models::ModelError::InvalidDigest`] is the sentence this one copies: the key, the rule, how many
+/// characters arrived, and never the value itself, which is 64 characters of noise in a message that has to stay
+/// readable.
+fn validate_digest(digest: &str, origin: &str) -> Result<String, ConfigError> {
+    // The *rule* is `models`' own digest normalisation (crate-private, hence a code span), reused for the same reason
+    // [`validate_embeddings`] reuses `models::validate_id`: 64 hex characters is one fact about one kind of value, and
+    // a second implementation of it is a second place where "what a digest looks like" could drift. Only the message
+    // is ours, because only we know which key or variable the reader has to go and edit.
+    match crate::models::normalize_digest(digest) {
+        Ok(lowered) => Ok(lowered),
+        Err(crate::models::ModelError::InvalidDigest { chars }) => Err(invalid_data(format!(
+            "invalid {origin}: a sha256 must be exactly {} hexadecimal characters; this value holds {chars}",
+            crate::models::DIGEST_HEX_CHARS
+        ))),
+        // `normalize_digest` has one failure mode today; naming what came back beats asserting about a rule that was
+        // not broken, which is the same arm [`validate_embeddings`] keeps around `validate_id`.
+        Err(other) => Err(invalid_data(other.to_string())),
+    }
+}
+
+/// Non-empty environment variable as text; an empty value counts as unset, the rule [`env_path`] applies to paths.
+///
+/// A value that is not valid UTF-8 is **refused**, not skipped: both `[models]` keys are ASCII by rule (an origin,
+/// a hex digest), so such a value is a mistake in the environment someone can fix — and ignoring it would report
+/// "unset" to a person who believes they set an override.
+fn env_text(key: &str) -> Result<Option<String>, ConfigError> {
+    let Some(raw) = env::var_os(key) else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.into_string()
+        .map(Some)
+        .map_err(|_| invalid_data(format!("invalid {key}: the value is not valid text")))
 }
 
 /// The per-workspace name: the leading `DB_HASH_BYTES` bytes of the workspace path digest, as lowercase

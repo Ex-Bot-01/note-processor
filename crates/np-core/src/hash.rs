@@ -4,9 +4,19 @@
 //! trigger the look, the hash decides what happened), so its spelling has to be stable —
 //! lowercase hex, 64 characters, no separators — and reading a file must not depend on how
 //! big that file happens to be.
+//!
+//! **[`Sha256Stream`] is the program's one SHA-256 definition** (`docs/design-m2-local-embeddings.md`
+//! §12 rule 9), and [`sha256_file`] / [`sha256_bytes`] are its two callers rather than two more
+//! implementations. That ordering exists because a third caller is coming and it cannot be served by
+//! either helper: a fetcher hashes **while it counts bytes**, so the digest has to be fed piecewise,
+//! from whatever buffer the transfer happens to hand over, and neither `sha256_file` (which owns its
+//! read loop) nor `sha256_bytes` (which needs the whole artifact in memory — 310 MB of it) can take
+//! part in that. Exposing the stream is therefore the reason this module still has one digest path:
+//! a second home for `sha2` would be a second place where the hex spelling could drift, and install
+//! design §3 refuses exactly that dependency spread.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -77,6 +87,59 @@ impl Snapshot {
     }
 }
 
+/// One sha256, fed in pieces: the program's single SHA-256 definition (§12 rule 9).
+///
+/// It exists for the caller that cannot produce its input all at once — a fetch hashes each buffer as
+/// it arrives, because the byte count and the digest are read off the same pass (§12 rule 5). Both
+/// [`sha256_file`] and [`sha256_bytes`] are written on top of it so that "what a digest looks like"
+/// (lowercase hex, 64 characters, spelled by the module's private `hex`) is decided once: delegating costs them one
+/// extra `update` call and buys the guarantee that no later caller can spell the same bytes' digest
+/// differently.
+///
+/// [`finish_hex`](Self::finish_hex) consumes `self`, so "digest it twice" is not expressible — a
+/// stream that has been finalised has nothing left to feed, and a second digest of a half-fed stream
+/// is exactly the wrong number a caller could reach for.
+#[derive(Debug, Default)]
+pub struct Sha256Stream {
+    hasher: Sha256,
+}
+
+impl Sha256Stream {
+    /// A stream that has digested nothing yet — which is a real state with a published digest, not an
+    /// error (see [`sha256_bytes`] on an empty slice).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `bytes` to what this stream has seen. Feeding it the same bytes in one call or in ten
+    /// gives the same digest, which is the property that makes a chunked transfer and a whole file
+    /// comparable — `tests/hash.rs` pins it across split points.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    /// The digest of everything fed so far, as lowercase hex — the same spelling [`sha256_file`]
+    /// returns for the same bytes.
+    pub fn finish_hex(self) -> String {
+        hex(&self.hasher.finalize())
+    }
+}
+
+/// So a transfer can hash with [`io::copy`] and count in the same statement: `copy` reports the byte
+/// total while this writes every byte into the digest, which keeps the two numbers from being two
+/// different readings of one stream.
+impl Write for Sha256Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    /// A digest has nothing buffered below `update`, so there is nothing to flush.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// What can fail while hashing a file.
 #[derive(Debug, Error)]
 pub enum HashError {
@@ -100,6 +163,9 @@ pub enum HashError {
 /// A failure is reported, never swallowed: an empty string here would be read downstream
 /// as a real digest, so callers that want to keep going must record the path as unreadable
 /// (an empty `Snapshot::hash`) instead of hashing on.
+///
+/// The loop feeds [`Sha256Stream`]; it owns nothing about the digest itself. That is the shape §12
+/// rule 9 asks for — one definition, and this is one of its callers.
 pub fn sha256_file(p: &Path) -> Result<String, HashError> {
     let open_path = walk::to_open_path(p);
     let fail = |source: io::Error| HashError::Read {
@@ -108,21 +174,24 @@ pub fn sha256_file(p: &Path) -> Result<String, HashError> {
     };
     let mut file = File::open(&open_path).map_err(fail)?;
 
-    let mut hasher = Sha256::new();
+    let mut stream = Sha256Stream::new();
     let mut chunk = vec![0u8; READ_CHUNK_BYTES];
     loop {
         let read = file.read(&mut chunk).map_err(fail)?;
         if read == 0 {
             break;
         }
-        hasher.update(&chunk[..read]);
+        stream.update(&chunk[..read]);
     }
-    Ok(hex(&hasher.finalize()))
+    Ok(stream.finish_hex())
 }
 
-/// sha256 of bytes already in memory, formatted exactly like [`sha256_file`].
+/// sha256 of bytes already in memory, formatted exactly like [`sha256_file`] — because it is the same
+/// stream with one `update` call. Two formatters would be two chances for the spelling to drift.
 pub fn sha256_bytes(b: &[u8]) -> String {
-    hex(&Sha256::digest(b))
+    let mut stream = Sha256Stream::new();
+    stream.update(b);
+    stream.finish_hex()
 }
 
 /// Lowercase hex, the one place this module formats a digest.

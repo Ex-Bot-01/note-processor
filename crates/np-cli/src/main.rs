@@ -18,6 +18,8 @@ use np_core::config::{Config, EmbeddingProvider};
 use np_core::db::{model_row, orphan_total, Db};
 use np_core::embed::{ArtifactCheck, Embedder, NoEmbeddingProvider};
 use np_core::embed_run::{self, EmbedOutcome, EmbedReport, Resolution};
+#[cfg(feature = "fetch")]
+use np_core::fetch;
 use np_core::hash::sha256_file;
 use np_core::models::{
     self, FetchEntry, FetchState, Install, ListedModel, Listing, ModelError, Unclaimed,
@@ -94,6 +96,33 @@ enum ModelsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Fetch a pinned model's artifacts and record them in this workspace.
+    ///
+    /// The only command in this program that dials out (§12 rule 1), and it dials only where `[models] base_url` (or
+    /// `NP_MODELS_BASE_URL`) says. Nothing else does: `np scan` never fetches, and `np embed` keeps refusing with
+    /// §6's *artifact absent* arm rather than starting a nine-hundred-megabyte download inside a command that then
+    /// writes rows. The automatic trigger belongs to the daemon (M4), not to a command line.
+    #[cfg(feature = "fetch")]
+    Fetch {
+        /// Workspace root to fetch into. Its models directory receives the artifacts.
+        workspace: PathBuf,
+        /// Model identity to fetch: it must be one this build pins bytes **and** an identity for.
+        #[arg(long)]
+        id: String,
+        /// Which member to fetch, repeatable (`main`, `mmproj`). Default: every member pinned for the id — which is
+        /// why a build that pins only half a pair refuses instead of quietly transferring half of it.
+        #[arg(long = "member")]
+        members: Vec<String>,
+        /// Discard this id's fetch marker (and the partial download it names) and then fetch.
+        ///
+        /// §12 rule 4's explicit door: a marker means some process claimed this download, and liveness is consent, so
+        /// no clock may expire it. If you know no fetch is running, this is how you say so.
+        #[arg(long)]
+        discard_marker: bool,
+        /// Print the outcome as JSON instead of one line per member.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a file's sha256, the way `install --sha256` wants it.
     Hash {
         /// File to digest.
@@ -136,6 +165,14 @@ fn main() -> ExitCode {
                 };
                 models_install(&workspace, &request, json)
             }
+            #[cfg(feature = "fetch")]
+            ModelsCommand::Fetch {
+                workspace,
+                id,
+                members,
+                discard_marker,
+                json,
+            } => models_fetch(&workspace, &id, &members, discard_marker, json),
             ModelsCommand::Hash { file } => models_hash(&file),
             ModelsCommand::List { workspace, json } => models_list(&workspace, json),
         },
@@ -504,6 +541,103 @@ fn workspace_db(config: &Config, workspace: &Path) -> Result<Db, Box<dyn Error>>
 ///
 /// Nothing is printed before [`models::install`] returns: §3 step 7 and F21 both say the durable record comes
 /// first and the echo second, so a refusal cannot leave a success line behind on stdout.
+/// Fetch `id`'s pinned members into `workspace` and record the model.
+///
+/// **The origin is read, never printed.** §12 rule 8 bounds what a report may say about where bytes came from, and a
+/// success line lands in CI logs as readily as a refusal does — so the report says an origin was configured and names
+/// the members, sizes and digests, which is everything a person can act on. The one thing that must not appear is the
+/// URL, because a mirror's hostname is someone's infrastructure detail and this program has no business publishing it
+/// in a build log.
+#[cfg(feature = "fetch")]
+fn models_fetch(
+    workspace: &Path,
+    id: &str,
+    members: &[String],
+    discard_marker: bool,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let config = load_config()?;
+    let db = workspace_db(&config, workspace)?;
+    let models_dir = config.workspace_models_dir(workspace);
+
+    // **The discard happens before the origin is required.** `--discard-marker` is a filesystem action a human takes
+    // because they know no fetch is running (§12 rule 4's only door), and refusing to perform it on a machine that
+    // has no mirror configured would leave them unable to clean up the very state the flag exists for. Dialing out is
+    // the part that needs configuring, so that check comes second.
+    if discard_marker {
+        let discarded = fetch::discard_marker(&models_dir, id)?;
+        if !json {
+            emit(&if discarded.marker_removed {
+                format!(
+                    "discarded   marker for {id} ({} partial file(s) removed)",
+                    discarded.parts_removed.len()
+                )
+            } else {
+                format!("no marker   for {id} — nothing to discard")
+            });
+        }
+    }
+
+    // Refuse before any transfer when no origin is configured. The message names both places that could supply one and
+    // never guesses a host: §12 rule 7 keeps the origin out of the binary, so an unconfigured build has nowhere to
+    // dial — which is what keeps a fresh machine quiet instead of starting a download nobody asked for.
+    let origin = config.models.base_url.clone().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no fetch origin configured: set `base_url` under `[models]` or the environment \
+             variable NP_MODELS_BASE_URL (offline? use `np models install --path`)",
+        )
+    })?;
+
+    // Default to the whole pinned pair, so a build that pins one member refuses loudly rather than transferring half
+    // a model and calling it installed.
+    let requested_owned: Vec<String> = if members.is_empty() {
+        fetch::pinned_member_names(id)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    } else {
+        members.to_vec()
+    };
+    let requested: Vec<&str> = requested_owned.iter().map(String::as_str).collect();
+
+    let transport = fetch::HttpTransport::new(origin);
+    let report = fetch::fetch(&db, &models_dir, id, &requested, &transport, now_secs())?;
+
+    if json {
+        emit_json(&json!({
+            "id": report.id,
+            // Present-and-null when the platform could not say, so a reader never has to guess whether an absent key
+            // meant "no room problem" or "no statvfs" (the `models_dir_error` posture).
+            "free_bytes": report.free_bytes,
+            "total_bytes": report.total_bytes,
+            "members": report.members.iter().map(|member| json!({
+                "member": member.member,
+                "path": member.path.to_string_lossy(),
+                "bytes": member.bytes,
+                "sha256": member.sha256,
+            })).collect::<Vec<_>>(),
+        }));
+    } else {
+        for member in &report.members {
+            emit(&format!(
+                // `size_human` spells the unit itself, so the word must not be repeated here: "295.5 MB bytes" is the
+                // kind of line that makes a reader distrust the number next to it.
+                "fetched     {} ({}, sha256 {})",
+                member.member,
+                size_human(member.bytes),
+                member.sha256
+            ));
+        }
+        emit(&match report.free_bytes {
+            Some(free) => format!("free before  {}", size_human(free)),
+            // Stated, never implied: a check that could not run is not a check that passed.
+            None => "free before  not checked on this platform".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(), Box<dyn Error>> {
     let config = load_config()?;
     let db = workspace_db(&config, workspace)?;

@@ -690,7 +690,20 @@ rather than letting a round discover it:
    and size — nothing else — and never says "your download is corrupted" when the size matched.
 7. **What may not survive the amendment is trust-by-URL.** The pin lives in the binary: `const PINNED: &[PinnedModel]` keyed by model
    id, holding `{id, member name, filename, size_bytes, sha256, read_on}` — what to accept, no host. Both files are pinned (text
-   `2188ac1d…`, mmproj `c4a8a526…`, from public LFS metadata 2026-10-29). The **host is config**: `[models] base_url` with a documented
+   `2188ac1d…`, mmproj `c4a8a526…`, from public LFS metadata 2026-10-29).
+
+   **Corrected by measurement on 2026-11-02, before any fetch shipped.** That mmproj prefix matches **no file in the
+   repository**: `mmproj-embeddinggemma-2-Q8_0.gguf` is 554,821,056 bytes with sha256
+   `0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8`, read by downloading the file into a tmpfs and
+   hashing it here (`sha256sum`, 3.3 s), with the host's own LFS metadata reporting the same `oid` in the same minute.
+   The BF16 sibling is neither value either, so `c4a8a526…` is not a truncation of something correct — it is a wrong
+   number, and shipping it would have made every first start refuse a good artifact forever while pointing at the human
+   for an answer they could not give. The same metadata call returned `2188ac1d…` for the primary artifact, which is the
+   digest this project computed from bytes it holds: the method agrees with the host where both can see the file.
+   Lesson kept on record rather than smoothed over — an eight-character prefix copied from a metadata screen is not a
+   pin, and a pin nobody can reproduce is a refusal with someone else's name on it.
+
+   The **host is config**: `[models] base_url` with a documented
    default and an env override, so a mirror works and the origin is not a compile-time secret. One sentence to keep a future reader
    from "fixing" this: a public artifact host is **not** parent §9's secret class, which protects the self-hosted chat server's URL and
    key. Pin rot is real — nobody notices an upstream re-upload until first start refuses — so `[models] sha256 = "…"` overrides the pin
@@ -710,13 +723,58 @@ rather than letting a round discover it:
     API `Install::file(name, path, sha256)`; CLI keeps `--path F --sha256 H` as `main` and adds `--path NAME=F --sha256 NAME=H`, refusing an
     unequal name set rather than zipping by order. **The asymmetry the first draft had backwards:** digests are cheap to retrofit (an
     additive child table), file *names* are not (bytes already on disk under `<dir>/<id>`). So R6b0 reserves the name space and the leading-dot
-    rule; migration 8 lands with R7b when there is a second digest to store. If this round seems to want a migration, install design §6 says
+    rule; migration 8 lands with R7b when there is a second digest to store.
+
+    **As landed, two amendments.** The child table arrived as **migration 9**, not 8: migration 8 was taken on
+    2026-10-31 by D12's verify-on-change stamp (`models.verified_size`, `models.verified_mtime`), and renumbering a
+    published migration is how two builds end up meaning different numbers. And R7b found the paragraph did not go far
+    enough: writing bytes is not enough to make a model, because `models.dim`, `prefix_doc` and `prefix_query` are
+    *declared* facts that §2 of the install design refuses to probe from a header. A fetch has to produce a row, so the
+    declaration joins the pin tables as `pins::PINNED_IDENTITIES` — compiled in, reviewed beside the digests, and
+    **not** guessed at runtime: an id with pinned bytes but no declared identity refuses to fetch. For
+    `embeddinggemma-2` that is dim **768** (measured from the artifact's header, §3) with **both prefixes empty**, which
+    is a statement about evidence: every embedding run recorded in this repository used no prefix, and because a prefix
+    changes vector bytes, adopting an instruction convention later means a **new id** (`@n`), not an edit to these two
+    strings. If this round seems to want a migration, install design §6 says
     report the design gap — which is what this paragraph is.
 11. **Per-workspace cost becomes automatic.** Install design §4 accepted "N copies for N workspaces" as a deliberate deviation because a
     human ran each `install`. First-start fetching makes it automatic: state in R7b that fetch is **per-workspace on demand** (the workspace
     that needs vectors fetches; nothing loops over configured workspaces dialing out), and the preflight runs per workspace.
 12. **`bytes_total` may be unknown.** Chunked transfer or a missing `Content-Length` leaves it undefined: the field is optional, and
     `list` prints "size unknown" rather than inventing a denominator.
+
+### As shipped (R7b, 2026-11-02): what landed, in what order, and one thing still owed
+
+Rules 1–8 and 12 are implemented and tested; the deviations a reader should not have to rediscover:
+
+* **Migration 9, not 8** (rule 10), because D12 took 8 on 2026-10-31 — see the correction inside rule 10.
+* **The identity is pinned too.** Rule 7 listed what a pin holds and stopped at bytes; writing a `models` row also needs
+  `dim` and both prefixes, so `pins::PINNED_IDENTITIES` carries them (768 / empty / empty for `embeddinggemma-2`) and an
+  id with pinned bytes but no declared identity **refuses to fetch** rather than guessing. Rule 10's "names are not
+  retrofittable" argument extends to this: a width chosen at download time is a declaration by nobody.
+* **`fetch` is default-on in both crates**, as the premises require, and `--no-default-features` removes the subcommand
+  from argv entirely rather than leaving a command that refuses at runtime.
+* **A marker is removed when the fetch that wrote it returns** — success or refusal. Rule 4 governs *someone else's*
+  marker; claiming one and then leaving it behind after dying would make `list` report a download nobody is running.
+  `--discard-marker` runs before the origin is required, so a machine with no mirror configured can still clean up.
+* **The transport follows redirects**, which rule 8 does not mention: the digest decides acceptance, so a hop that
+  changes host cannot substitute accepted bytes — it can only waste bandwidth. Refusing hops would break the ordinary
+  upstream layout (`/resolve/main/<file>` answers 302 pointing at a CDN).
+* **The local file name is ours, not the origin's** — and that was found by running it, not by reading the code. The
+  first live fetch published under the upstream names (`embeddinggemma-2-Q8_0.gguf`, `mmproj-…`) and `np models list`
+  then answered `state: missing` for a row whose bytes were on disk, with both files reported as `unclaimed`. Nothing
+  in any test could see it: the engine verified its digests, the CLI printed success, and every path it asserted was
+  the one it had written. Two rules came out of it — [`crate::models::member_artifact_name`] is the single spelling
+  (`<id>` for the primary member, exactly where `install` has always put it; `<id>.<member>` afterwards), and a name is
+  claimed by a listing if a **recorded member** names it, so a fetched pair is one model rather than an artifact plus
+  junk. The fence is `a_fetched_model_is_the_artifact_list_already_looks_for`, which asserts what the *listing* says;
+  deleting the member-claiming loop fails it.
+* **Live evidence (2026-11-02, this host)**: `np models fetch <ws> --id embeddinggemma-2` against
+  `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main` moved **864,676,512 bytes in 52.4 s** (then
+  53.3 s on a clean repeat), both members hashing to the pins — including `mmproj`, whose digest had only ever been
+  checked against an API response — and following the upstream redirect through TLS without the client being told
+  about it. A second run refused (`refusing to overwrite the existing artifact …`), no marker was left behind, and
+  `list` reported `present` / `unclaimed 0`. Free space printed before the transfer (6.3 GB) rather than being assumed.
 
 ### What this buys, and what it does not claim
 
@@ -830,7 +888,7 @@ has a C number to be compared against; build line in that file's header). **Memo
 | **A near-ceiling chunk, measured (decision C's price)** | 7,999 tokens: rc 0, finite pooled row, peak **1,478 MiB** (**+1,058 MiB** over baseline), **101 s** ≈ **79 tok/s** | same probe at `nctx=8192`. The falling rate continues (141 → 120 → 79 tok/s), so §5's interpolated "~63 s for an 8,192-token chunk" was optimistic by ~60% and the measurement supersedes it |
 | Context on top of the model, nothing decoded | **+1.8 MiB** resident at `n_ctx = 4096` | same probe. The weights dominate, not the context — and this artifact has no KV cache to dominate anything (`create_memory` returns null), so what that 1.8 MiB buys is a compute buffer and a window number |
 | **Corrected in R6b2: that +1.8 MiB was the whole story only because nothing had decoded.** Peak RSS above the C probe's own 419.4 MiB with the model open, by longest sequence run (`n_ctx = n_batch = n_ubatch = 4096`) | 133 tok **+0 MiB** · 513 **+47** · 1,026 **+109** · 2,052 **+218** · 4,085 **+458** | `crates/np-core/tests/probes/decode_probe.c` (committed, build line in its header — it also prints `memory=(nil)` and `n_threads=4`, the two facts behind the encoder-path and CPU-utilisation claims above); a compute buffer is *reserved* at context creation and *touched* per forward pass, so cost tracks the longest sequence actually run, not the ceiling asked for. This is why widening the window to escape the `n_ubatch` abort bought memory only for long notes, and it is the number R6d's peak-RSS headline should be read against. The 8,192 row above extends this curve: the shape holds at the wider window (+0 MiB at rest, ~+1 GiB near the ceiling) |
-| **Package size, stripped** (`cargo build --release --bin np`, `strip`) | feature **off 5.5 MiB** (5,780,432 B) · feature **on 11.0 MiB** (11,554,872 B) · **+5.5 MiB**, against this section's ≤ **40 MB** ceiling | measured 2026-10-30 with `np-cli`'s `local-model` passthrough. **Why the C++ is retained is not that `np` calls it** — nothing in `np-cli` reaches `local_model`; retention follows from np-core's own public code referencing those symbols while `build.rs` emits a plain `-l static=llama` with no `--whole-archive`, so the linker pulls what the references name. That makes +5.5 MiB today's figure rather than a floor: an LTO or `codegen-units` change could reclaim part of it, and R6d re-measures on the release profile before this section's headroom is quoted again. Symbol counts come from the *unstripped* files (`nm --defined-only`: 252 `T llama_` and 1,276 `llama_`/`ggml_` total with the feature on, zero without) — a stripped binary has no symbol table, so counting on it says "0" either way and reads as "nothing was linked in" while 5.7 MB of C++ sits in the file |
+| **Package size, stripped — re-measured 2026-11-02 after `fetch` became default-on** (`cargo build --release --bin np`, `strip`) | no features **5.7 MiB** (5,931,152 B) · default (`fetch` on) **7.7 MiB** (8,024,912 B) · `fetch` + `local-model` **13.2 MiB** (13,820,984 B). So **`fetch` costs +2.0 MiB** (2,093,760 B: a blocking HTTP client plus rustls and its crypto) and the C++ still costs **+5.5 MiB** on top; all three sit under this section's ≤ **40 MB** ceiling | **superseded figures**, measured 2026-10-30 with `np-cli`'s `local-model` passthrough: feature off 5,780,432 B, on 11,554,872 B — kept because the +5.5 MiB C++ attribution below was derived from them and still holds; the growth since is `fetch`, not the C++. This row is the re-measurement R6d promised before quoting headroom again. **Why the C++ is retained is not that `np` calls it** — nothing in `np-cli` reaches `local_model`; retention follows from np-core's own public code referencing those symbols while `build.rs` emits a plain `-l static=llama` with no `--whole-archive`, so the linker pulls what the references name. That makes +5.5 MiB today's figure rather than a floor: an LTO or `codegen-units` change could reclaim part of it, and R6d re-measures on the release profile before this section's headroom is quoted again. Symbol counts come from the *unstripped* files (`nm --defined-only`: 252 `T llama_` and 1,276 `llama_`/`ggml_` total with the feature on, zero without) — a stripped binary has no symbol table, so counting on it says "0" either way and reads as "nothing was linked in" while 5.7 MB of C++ sits in the file |
 | Throughput, `GGML_OPENMP = OFF`, this host | **141 tok/s** at 543 tokens, **120 tok/s** at 2,163 tokens (3.85 s and 18.0 s per decode; first decode of a run is no slower than a warm one) | `tests/local_embed.rs`'s throughput case prints it on every artifact run — the only one of R6b2's three numbers a test prints. `/usr/bin/time -v` on a 2,052-token pass reports **392% CPU**: with OpenMP off, ggml runs its own pthread pool (`ggml/src/ggml-cpu/ggml-cpu.c` — `ggml_threadpool_new_impl` at `:3324`, created per graph plan at `:3418`, with non-OpenMP worker state under `#ifndef GGML_USE_OPENMP` at `:509` and its barrier at `:2756`) and `llama_n_threads_batch` answers **4**. So "OpenMP off" is not "one core" — and R6d's A/B (below) found that turning OpenMP *on* changes nothing measurable either, at those same four threads
 | Independent cross-check of the FFI mirror | C prints `n_embd_out 768, n_embd_inp 512, n_ctx_train 262144, vocab 262144, pooling 1`; Rust's `ModelFacts` prints the same five numbers | two programs, one artifact: a wrong struct field in our mirror shows up as a disagreement rather than as a green suite |
 

@@ -205,6 +205,7 @@ fn the_schema_is_what_the_plan_mandates() {
             "items",
             "links",
             "meta",
+            "model_files",
             "models",
             "notes",
             "schema_version",
@@ -3336,7 +3337,8 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
     // Rewind past migration 5 — and past the receipt its step wrote while this file was still empty. A
     //
     // The rewind deletes a version number, so it has to undo what every later entry **created** as well: the
-    // `file_id` column (migration 6) and migration 7's three tables. Leave those standing and the next open
+    // `file_id` column (migration 6), migration 7's three tables and migration 9's `model_files`. Leave those
+    // standing and the next open
     // re-applies migration 7 onto a schema that already has them — `table models already exists`, and an upgrade
     // path nobody tested. Child table first, which matters once rows exist (with empty tables either order works) — with rows present an implicit DELETE would be
     // refused by `embeddings`' two foreign keys; here the tables are still empty, so it is defence, not necessity.
@@ -3349,6 +3351,7 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE model_files;
          DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
@@ -3450,6 +3453,7 @@ fn seed_two_duplicate_groups_at_version_four(path: &Path) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE model_files;
          DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
@@ -3497,6 +3501,7 @@ fn seed_nine_duplicate_groups_at_version_four(path: &Path) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE model_files;
          DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
@@ -3532,6 +3537,7 @@ fn seed_keyless_display_pair_at_version_four(path: &Path) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE model_files;
          DROP TABLE models;"
     ))
     .expect("test setup: rewind the file to version four");
@@ -4205,6 +4211,7 @@ fn the_merge_gate_refuses_damage_that_no_merge_could_have_caused() {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE model_files;
          DROP TABLE models;"
         ))
         .expect("test setup: rewind the file to version four");
@@ -4918,4 +4925,58 @@ fn an_artifact_stamp_round_trips_and_a_half_stamp_stays_a_half_stamp() {
     // disappearing under us is `np models remove` racing, not a corrupt database.
     record_artifact_stamp(&db, "absent-model", 1, 1)
         .expect("stamping an absent row is not an error");
+}
+
+#[test]
+fn model_files_records_each_member_once_and_an_upsert_replaces_the_fact() {
+    // Migration 9's contract in one case: a model can hold more than one named digest, the pair `(model, name)` is
+    // the key, and re-recording the same name **corrects** rather than duplicates. The upsert matters because both
+    // `install` and a fetch can legitimately re-record `main` after re-publishing the same bytes; an insert that
+    // failed on conflict would surface as a database error the caller cannot tell from a real clash.
+    let db = Db::in_memory().expect("in-memory database");
+    np_core::db::insert_model(&db, "alpha", 4, Some(&"a".repeat(64)), "", "", 1).expect("row");
+
+    np_core::db::record_model_file(&db, "alpha", "main", &"b".repeat(64), 10)
+        .expect("main recorded");
+    np_core::db::record_model_file(&db, "alpha", "mmproj", &"c".repeat(64), 20)
+        .expect("second member recorded");
+    np_core::db::record_model_file(&db, "alpha", "main", &"d".repeat(64), 30).expect("re-recorded");
+
+    let files = np_core::db::model_files(&db, "alpha").expect("read back");
+    assert_eq!(
+        files,
+        [
+            np_core::db::ModelFile {
+                name: "main".into(),
+                sha256: "d".repeat(64),
+                size: 30,
+            },
+            np_core::db::ModelFile {
+                name: "mmproj".into(),
+                sha256: "c".repeat(64),
+                size: 20,
+            },
+        ],
+        "members come back ordered by name, with the later fact winning"
+    );
+
+    // **No rows means unknown, not "no files"** — a model installed before migration 9 carries its primary digest in
+    // `models.sha256` alone, and a reader that treated an empty list as "this model has no artifact" would report a
+    // perfectly good installation as missing.
+    np_core::db::insert_model(&db, "beta", 4, Some(&"e".repeat(64)), "", "", 1).expect("row");
+    assert_eq!(
+        np_core::db::model_files(&db, "beta").expect("read back"),
+        []
+    );
+}
+
+#[test]
+fn a_model_file_digest_that_is_not_64_characters_is_refused_by_the_schema() {
+    // The CHECK is the last line of defence for a column whose whole job is identity: a truncated paste stored as a
+    // digest would later refuse a good artifact forever, with no record of when it went wrong.
+    let db = Db::in_memory().expect("in-memory database");
+    np_core::db::insert_model(&db, "alpha", 4, Some(&"a".repeat(64)), "", "", 1).expect("row");
+    let err = np_core::db::record_model_file(&db, "alpha", "main", &"b".repeat(63), 10)
+        .expect_err("63 characters is not a sha256");
+    assert!(err.to_string().contains("CHECK"), "{err}");
 }

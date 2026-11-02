@@ -54,7 +54,33 @@ const ID_MAX_CHARS: usize = 64;
 
 /// Length of a sha256 spelled as hex, which is what `--sha256` has to be (§3 step 4) and what
 /// [`crate::hash::sha256_file`] returns.
-const DIGEST_HEX_CHARS: usize = 64;
+///
+/// `pub(crate)` because `[models] sha256` is the same fact about the same kind of value: `config` validates that key
+/// against this number rather than declaring a second 64 that could drift from the one a digest is checked against.
+pub(crate) const DIGEST_HEX_CHARS: usize = 64;
+
+/// The file name one member of `id` gets inside the models directory.
+///
+/// **This is the program's own naming, not the origin's.** The primary member takes the id, because that is where
+/// every reader has always looked — `list`'s state, D12's verify-on-change, and the loader that turns a row into
+/// weights all resolve `<models_dir>/<id>`. A later member takes `<id>.<member>`: a name no other id can have (ids
+/// cannot contain a leading dot, and this has none, so it cannot shadow another model's artifact), while still being
+/// one flat file name with no directory and no host in it.
+///
+/// `install` publishes only the primary today; a fetch writes every member it verified. Both call this, which is what
+/// keeps `list` from reporting a fetched pair as one artifact plus junk.
+pub fn member_artifact_name(id: &str, member: &str) -> String {
+    if member == MAIN_FILE {
+        id.to_string()
+    } else {
+        format!("{id}.{member}")
+    }
+}
+
+/// The member name of a model's **primary** artifact — the file at `<models_dir>/<id>` whose digest also stands in
+/// `models.sha256` (migration 9, §12 rule 10). One spelling shared by `install`, the fetcher and every reader, because
+/// two spellings of "the main file" is how a pair ends up with two halves nobody can name.
+pub const MAIN_FILE: &str = "main";
 
 /// Suffix of the temporary artifact name, before its `rename` — the same publish discipline as
 /// `crate::scan`'s catalog writes ("no reader ever sees half an artifact"), kept separate because a
@@ -227,6 +253,13 @@ pub enum FetchName<'a> {
     Marker(&'a str),
     /// `.part.<id>.<nonce>` — bytes of `id`'s artifact that are still arriving.
     Part(&'a str),
+    /// `.fetching.<id>.json.tmp<nonce>` — the temporary file an **atomic marker rewrite** passes through (§12 rule 2).
+    ///
+    /// It exists for microseconds and it must still be recognised, which is the sentence §12 rule 2 insists on: a
+    /// listing's `unclaimed` list keeps meaning "nothing this program recognises", so the transient name of a marker
+    /// mid-rename cannot be allowed to appear in it. A fetch that dies between write and rename leaves one behind,
+    /// where it sits quietly rather than being reported as junk someone should delete.
+    MarkerTemp(&'a str),
 }
 
 /// §12 rule 2's **single** recogniser: what fetch name (if any) a directory entry spells, byte-exact and
@@ -255,12 +288,21 @@ pub fn fetch_name(name: &OsStr) -> Option<FetchName<'_>> {
         return None;
     }
     if let Some(rest) = text.strip_prefix(FETCH_MARKER_PREFIX) {
-        let id = rest.strip_suffix(FETCH_MARKER_SUFFIX)?;
-        if validate_id(id).is_ok() {
-            Some(FetchName::Marker(id))
-        } else {
-            None
+        if let Some(id) = rest.strip_suffix(FETCH_MARKER_SUFFIX) {
+            return if validate_id(id).is_ok() {
+                Some(FetchName::Marker(id))
+            } else {
+                None
+            };
         }
+        // Not the marker itself: a marker **mid-rewrite**, whose temp name is `.json.tmp<nonce>` behind the id.
+        // Split at the *last* `.json.` because ids may contain dots — `.fetching.a.json.b.json.tmp1` is id `a.json.b`
+        // with a temp suffix, exactly as the marker rule reads it.
+        let (id, temp) = rest.rsplit_once(".json.")?;
+        if temp.is_empty() || !temp.starts_with("tmp") || validate_id(id).is_err() {
+            return None;
+        }
+        Some(FetchName::MarkerTemp(id))
     } else if let Some(rest) = text.strip_prefix(PART_PREFIX) {
         // `<id>.<nonce>`, split at the **last** dot because ids contain dots: `.part.a.b.4242-1-0` is id `a.b`
         // with nonce `4242-1-0`. The nonce itself is not charset-checked — only `fetch_name` and the listing
@@ -751,7 +793,7 @@ pub enum ModelError {
         /// The rule it broke.
         rule: &'static str,
     },
-    /// `--sha256` is not exactly `DIGEST_HEX_CHARS` (private) hex characters (§3 step 4). Refused rather than
+    /// `--sha256` is not exactly `DIGEST_HEX_CHARS` (crate-private) hex characters (§3 step 4). Refused rather than
     /// treated as "does not match": a truncated paste and a different artifact are different problems, and
     /// only one of them is fixed by re-running `np models hash`.
     #[error("`--sha256` must be exactly {DIGEST_HEX_CHARS} hexadecimal characters; this argument holds {chars}")]
@@ -984,6 +1026,16 @@ pub fn install(
         }
         // The row attests this digest and the file is gone: re-materialise it, rewriting no column.
         publish_artifact(&models_dir, &request.id, &request.source)?;
+        // Re-recording `main` is not a column rewrite: migration 9's child table is where *which files a model has*
+        // lives, and a row written before that migration has no member rows at all. Writing the fact here is what
+        // teaches an upgraded workspace which artifact its existing digest describes.
+        db::record_model_file(
+            db,
+            &request.id,
+            MAIN_FILE,
+            &declared,
+            i64::try_from(meta.len()).unwrap_or(i64::MAX),
+        )?;
         return Ok(InstallOutcome::Restored);
     }
 
@@ -1000,6 +1052,17 @@ pub fn install(
         now,
     )?;
     if inserted {
+        // The primary member's name, recorded beside the row that carries its digest (§12 rule 10). A failure here is
+        // a database failure like any other in this function: the artifact is on disk and the row exists, which is
+        // exactly the crash state `list` reports as a model with no recorded files — never a reason to pretend the
+        // install did not happen.
+        db::record_model_file(
+            db,
+            &request.id,
+            MAIN_FILE,
+            &declared,
+            i64::try_from(meta.len()).unwrap_or(i64::MAX),
+        )?;
         return Ok(InstallOutcome::Installed);
     }
 
@@ -1055,7 +1118,16 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
     // Claimed means "some row names this exact file name". Row ids are validated ASCII (§2), so comparing
     // the OS spelling against them needs no lossy round trip — a name UTF-8 cannot hold is by construction
     // not an id and lands in `unclaimed`, rendered with replacements.
-    let claimed: HashSet<OsString> = rows.iter().map(|row| OsString::from(&row.id)).collect();
+    let mut claimed: HashSet<OsString> = rows.iter().map(|row| OsString::from(&row.id)).collect();
+    // **A fetched pair is one model, not an artifact plus junk.** Every member recorded in migration 9's child table
+    // claims the file name [`member_artifact_name`] gives it, so `np models fetch` of the text encoder and its
+    // projector leaves nothing in `unclaimed`. Members are read from the rows rather than guessed by prefix: a stray
+    // `something.random` is still somebody else's file, and "recorded as a member" is the fact that makes a name ours.
+    for row in &rows {
+        for file in db::model_files(db, &row.id)? {
+            claimed.insert(OsString::from(member_artifact_name(&row.id, &file.name)));
+        }
+    }
     let (unclaimed, marker_ids) = entries.split(&claimed);
 
     let mut models = Vec::with_capacity(rows.len());
@@ -1195,8 +1267,10 @@ fn windows_device_name(id: &str) -> Option<&'static str> {
         .copied()
 }
 
-/// Validate a declared digest as exactly `DIGEST_HEX_CHARS` (private) hex characters and return it lowered (§3 step 4).
-fn normalize_digest(declared: &str) -> Result<String, ModelError> {
+/// Validate a declared digest as exactly `DIGEST_HEX_CHARS` (crate-private) hex characters and return it lowered
+/// (§3 step 4). `config` reuses this for `[models] sha256`, so the format rule has one home; only the sentence each
+/// caller prints differs, because each names a different place to go and fix.
+pub(crate) fn normalize_digest(declared: &str) -> Result<String, ModelError> {
     // Characters on both sides. `len()` is bytes, so a pasted argument holding one non-ASCII character (a stray
     // non-breaking space from a web page is the ordinary cause) was refused with "this argument holds 64" — a
     // message contradicting itself exactly when it was most needed.
@@ -1323,7 +1397,7 @@ static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// processes started in the same nanosecond share a timestamp, and two calls in one process can share a
 /// coarse clock. A clock that cannot be read contributes zeroes, which leaves the pid and the counter — enough
 /// for the one guarantee this name needs, which is that it does not collide with itself.
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     let (secs, subsecs) = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(since) => (since.as_secs(), since.subsec_nanos()),
         Err(_) => (0, 0),
@@ -1402,7 +1476,9 @@ impl EntryList {
         for (name, kind) in self.0 {
             match fetch_name(&name) {
                 Some(FetchName::Marker(id)) => markers.push(id.to_owned()),
-                Some(FetchName::Part(_)) => {}
+                // Recognised, so not `unclaimed`; and a marker rewrite in flight says nothing about whether a fetch
+                // is running, which is the only thing the `fetching` section is allowed to assert (§12 rule 3).
+                Some(FetchName::Part(_) | FetchName::MarkerTemp(_)) => {}
                 None => {
                     if !claimed.contains(&name) {
                         unclaimed.push(Unclaimed {

@@ -1204,3 +1204,197 @@ fn nothing_fetching_prints_no_extra_line() {
         "the key is present and empty, never suppressed"
     );
 }
+
+// --- `np models fetch` (§12) ---------------------------------------------------------------
+//
+// These cases own argv, the two channels and the exit code. What the transfer itself does — streaming, hashing while
+// counting, length-before-digest, publishing by rename — is pinned in `crates/np-core/tests/fetch.rs` (rules against a
+// fake transport) and `fetch_http.rs` (the real client against a loopback origin), because driving 865 MB of pinned
+// bytes through a child process would test the OS's page cache rather than this program.
+
+/// Write a user-level `config.toml` where the binary looks, so a case can configure `[models]`.
+impl Scratch {
+    fn write_user_config(&self, body: &str) {
+        let dir = self.config_dir().join("note-processor");
+        fs::create_dir_all(&dir).expect("test setup: config package dir");
+        fs::write(dir.join("config.toml"), body).expect("test setup: write user config");
+    }
+
+    /// `np models fetch --id <id> [extra flags]`.
+    fn fetch(&self, id: &str, extra: &[&str]) -> Command {
+        let mut cmd = self.models(&["fetch", "--id", id]);
+        cmd.args(extra);
+        cmd
+    }
+}
+
+#[test]
+fn fetch_without_an_origin_refuses_and_names_both_places_that_could_supply_one() {
+    // §12 rule 7: the origin is config, never a compile-time default. So an unconfigured build has nowhere to dial,
+    // and the refusal has to say which two places could change that — plus the offline door, because a human on an
+    // air-gapped machine should not be told to configure a URL they cannot use.
+    let scratch = Scratch::new();
+    let mut cmd = scratch.fetch("embeddinggemma-2", &[]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}", run.stderr());
+    let text = run.stderr();
+    for wanted in ["[models]", "NP_MODELS_BASE_URL", "np models install --path"] {
+        assert!(
+            text.contains(wanted),
+            "refusal must name {wanted:?}: {text}"
+        );
+    }
+    // Nothing was created: a refusal that left a models directory behind would look like a partial install to `list`.
+    assert!(
+        !scratch.models_dir().exists(),
+        "an unconfigured fetch creates no state"
+    );
+    // And the host is nowhere in the message — there is no host to name.
+    for forbidden in ["http://", "https://", "://"] {
+        assert!(!text.contains(forbidden), "{forbidden:?} in: {text}");
+    }
+}
+
+#[test]
+fn fetch_refuses_a_member_this_build_does_not_pin_and_names_it() {
+    // argv reaches the pin table, and a name that is not pinned is a refusal by name rather than a shrug. The origin
+    // is configured here so the refusal that arrives is provably about the **member**, not about a missing URL.
+    let scratch = Scratch::new();
+    scratch.write_user_config("[models]\nbase_url = \"https://mirror.invalid/resolve/main\"\n");
+    let mut cmd = scratch.fetch("embeddinggemma-2", &["--member", "audio"]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}", run.stderr());
+    let text = run.stderr();
+    assert!(text.contains("audio"), "the member is named: {text}");
+    assert!(
+        text.contains("no recorded digest"),
+        "the reason is that nothing pins it: {text}"
+    );
+    // §12 rule 8 in the CLI's own output: the configured origin does not appear.
+    for forbidden in ["mirror.invalid", "https://", "://"] {
+        assert!(
+            !text.contains(forbidden),
+            "{forbidden:?} leaked into a refusal: {text}"
+        );
+    }
+    assert!(
+        !scratch.models_dir().exists(),
+        "a member refusal creates no state"
+    );
+}
+
+#[test]
+fn fetch_names_an_id_this_build_cannot_fetch() {
+    // The id is argv's whole subject here, and an id with no pin is a different refusal from an id with no origin:
+    // one is "this build has no expectation", the other is "nothing was configured".
+    let scratch = Scratch::new();
+    scratch.write_user_config("[models]\nbase_url = \"https://mirror.invalid/resolve/main\"\n");
+    let mut cmd = scratch.fetch("some-model", &[]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}", run.stderr());
+    let text = run.stderr();
+    assert!(text.contains("some-model"), "the id is named: {text}");
+    assert!(
+        text.contains("no artifact is pinned"),
+        "the reason is the pin table, not the origin: {text}"
+    );
+    assert!(!text.contains("mirror.invalid"), "{text}");
+}
+
+#[test]
+fn discard_marker_reports_the_absence_it_found_and_still_refuses_without_an_origin() {
+    // Two facts, one run, on two channels: `--discard-marker` prints what it did (here: nothing to discard), and the
+    // missing origin still refuses. The order matters — discarding is a filesystem action the human asked for
+    // explicitly, while dialing out is the thing that needs configuring — and a case that only checked the exit code
+    // could not tell those two lines apart.
+    let scratch = Scratch::new();
+    let mut cmd = scratch.fetch("embeddinggemma-2", &["--discard-marker"]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}", run.stderr());
+    assert!(
+        run.stdout().contains("nothing to discard"),
+        "the discard line is printed on stdout: {:?}",
+        run.stdout()
+    );
+    assert!(
+        run.stderr().contains("NP_MODELS_BASE_URL"),
+        "{}",
+        run.stderr()
+    );
+}
+
+#[test]
+fn fetch_is_a_subcommand_of_models_and_not_of_scan() {
+    // §12 rule 1's boundary, asserted where argv lives: `fetch` exists under `models`, and `np scan` grows no flag that
+    // could reach it. A future "auto-fetch on scan" flag would have to be added here, and this case is where its
+    // absence is noticed.
+    let scratch = Scratch::new();
+    let mut help_cmd = scratch.command(&["models", "--help"]);
+    let help = run(&mut help_cmd);
+    assert_eq!(help.code(), 0, "{}", help.stderr());
+    assert!(help.stdout().contains("fetch"), "{}", help.stdout());
+
+    let mut scan_cmd = scratch.command(&["scan", "--help"]);
+    let scan_help = run(&mut scan_cmd);
+    assert_eq!(scan_help.code(), 0, "{}", scan_help.stderr());
+    for forbidden in ["fetch", "member", "base_url"] {
+        assert!(
+            !scan_help.stdout().contains(forbidden),
+            "`np scan` must offer no path to a fetch: {forbidden:?} in its help"
+        );
+    }
+}
+
+#[test]
+fn discard_marker_removes_the_marker_and_the_partial_it_names() {
+    // The other branch of the same flag, and the one that matters: a marker left by a dead process, plus the
+    // `.part.<id>.<nonce>` **that marker names**. Both go; a partial download belonging to some other nonce stays,
+    // because nothing in this run can tell whether it belongs to a fetch that is still going.
+    let scratch = Scratch::new();
+    let models_dir = scratch.models_dir();
+    fs::create_dir_all(&models_dir).expect("test setup: models dir");
+    fs::write(
+        models_dir.join(".fetching.embeddinggemma-2.json"),
+        r#"{"nonce":"4242-1-0","started_at":1730000000,"bytes_done":999,"bytes_total":null}"#,
+    )
+    .expect("test setup: plant a marker from a dead fetch");
+    let named_part = models_dir.join(".part.embeddinggemma-2.4242-1-0");
+    fs::write(&named_part, b"half a model").expect("test setup: plant the partial it names");
+    let other_part = models_dir.join(".part.embeddinggemma-2.7777-9-9");
+    fs::write(&other_part, b"someone else's bytes")
+        .expect("test setup: plant an unclaimed partial");
+
+    // No origin configured: the discard is a filesystem action and runs first, so it happens even here.
+    let mut cmd = scratch.fetch("embeddinggemma-2", &["--discard-marker"]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}", run.stderr());
+    assert!(
+        run.stdout().contains("discarded") && run.stdout().contains("1 partial file(s) removed"),
+        "the report says what went: {:?}",
+        run.stdout()
+    );
+    assert!(
+        !models::marker_path(&models_dir, "embeddinggemma-2").exists(),
+        "the marker is gone"
+    );
+    assert!(!named_part.exists(), "the partial the marker named is gone");
+    assert!(
+        other_part.exists(),
+        "a partial no marker claims is left for `list` to report, not deleted on a guess"
+    );
+}
+
+/// The marker path comes from the library rather than a literal, so a rename in `np_core::models` moves this case
+/// instead of leaving it asserting against a file nothing reads.
+mod models {
+    use std::path::{Path, PathBuf};
+
+    pub fn marker_path(models_dir: &Path, id: &str) -> PathBuf {
+        np_core::models::marker_path(models_dir, id)
+    }
+}

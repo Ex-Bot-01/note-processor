@@ -1673,3 +1673,92 @@ fn a_workspace_with_no_models_directory_lists_no_fetch() {
     assert!(listing.fetching.is_empty());
     assert!(listing.unclaimed.is_empty());
 }
+
+#[test]
+fn installing_records_the_primary_member_by_name() {
+    // Migration 9's writer. `models.sha256` keeps meaning "the **primary** artifact's digest" (§12 rule 10), and this
+    // is where a reader learns that the same bytes are also `model_files(name = 'main')` — the name a fetch will use
+    // for the same file, so install-then-fetch cannot record one artifact twice under two spellings.
+    let fx = Fixture::new();
+    let db = fx.db();
+    let bytes = b"an artifact small enough to test with".to_vec();
+    let source = fx.source("artifact.gguf", &bytes);
+    let digest = sha256_bytes(&bytes);
+
+    install(&fx, &db, &request("alpha", &source, &digest, 4)).expect("install");
+
+    assert_eq!(
+        db::model_files(&db, "alpha").expect("read the members back"),
+        [db::ModelFile {
+            name: models::MAIN_FILE.to_string(),
+            sha256: digest.clone(),
+            size: bytes.len() as i64,
+        }],
+        "`main` is recorded with the same digest the row carries"
+    );
+}
+
+#[test]
+fn a_repeated_install_records_the_member_once_and_still_writes_no_columns() {
+    // §7 case 5's contract ("repeating a declaration rewrites nothing") holds for the child table too: the Already
+    // Installed arm hashes nothing and records nothing, so the member row is whatever the first install wrote. A
+    // second row, or a refreshed `size`, would mean this command's answer to "nothing changed" was a lie.
+    let fx = Fixture::new();
+    let db = fx.db();
+    let bytes = b"an artifact small enough to test with".to_vec();
+    let source = fx.source("artifact.gguf", &bytes);
+    let digest = sha256_bytes(&bytes);
+
+    install(&fx, &db, &request("alpha", &source, &digest, 4)).expect("first install");
+    let first = db::model_files(&db, "alpha").expect("members after the first install");
+    match install(&fx, &db, &request("alpha", &source, &digest, 4)) {
+        Ok(InstallOutcome::AlreadyInstalled) => {}
+        other => panic!("the second call must change nothing, got {other:?}"),
+    }
+    assert_eq!(
+        db::model_files(&db, "alpha").expect("members after the second install"),
+        first
+    );
+}
+
+#[test]
+fn a_marker_mid_rewrite_is_recognised_and_never_called_unclaimed() {
+    // §12 rule 2's last sentence, made executable: the atomic marker rewrite passes through
+    // `.fetching.<id>.json.tmp<nonce>`, and `unclaimed` has to keep meaning "nothing this program recognises".
+    // Without this arm a fetch would show its own bookkeeping as junk someone ought to delete.
+    for (name, expected) in [
+        (".fetching.alpha.json.tmp1-2-3", Some("alpha")),
+        // Ids contain dots, so the split happens at the **last** `.json.` — same rule the marker itself reads by.
+        (".fetching.a.b.json.tmp9", Some("a.b")),
+        (".fetching.alpha.json.backup", None),
+        (".fetching..json.tmp1", None),
+        // No `tmp` prefix, or no id at all, is not a temp name this program writes. The marker itself
+        // (`.fetching.alpha.json`) is pinned as [`FetchName::Marker`] by the case above — it must keep answering as
+        // that, and this loop says nothing about it either way.
+    ] {
+        let found = models::fetch_name(std::ffi::OsStr::new(name));
+        let wanted = expected.map(models::FetchName::MarkerTemp);
+        assert_eq!(found, wanted, "{name}");
+    }
+
+    // And the listing agrees: a directory holding only a marker mid-rewrite has nothing to report — no fetch (the
+    // real marker is absent) and nothing unclaimed.
+    let fx = Fixture::new();
+    let db = fx.db();
+    let models_dir = fx.models_dir();
+    fs::create_dir_all(&models_dir).expect("test setup: models dir");
+    fs::write(models_dir.join(".fetching.alpha.json.tmp1-2-3"), b"{}")
+        .expect("test setup: marker temp");
+
+    let listing = models::list(&db, &fx.config, &fx.workspace).expect("listing");
+    assert!(listing.models.is_empty());
+    assert!(
+        listing.fetching.is_empty(),
+        "a marker mid-rewrite says nothing about whether a fetch runs (§12 rule 3)"
+    );
+    assert!(
+        listing.unclaimed.is_empty(),
+        "a recognised transient name must not reach `unclaimed`: {:?}",
+        listing.unclaimed
+    );
+}

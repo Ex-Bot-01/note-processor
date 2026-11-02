@@ -255,6 +255,38 @@ pub const MIGRATIONS: &[Migration] = &[
     ALTER TABLE models ADD COLUMN verified_mtime INTEGER;
     "#,
     ),
+    // **A model can be more than one file (R7b, `docs/design-m2-local-embeddings.md` §12 rule 10).** The
+    // `embeddinggemma-2` pair is a text encoder plus an `mmproj` vision/audio projector, and `models.sha256` holds
+    // exactly one digest — the **primary** artifact's, which is what every existing reader (`verify_artifact`,
+    // `install`'s comparison, `local_model`'s identity check) has always meant by it. Keeping that column meaning
+    // *main* is the deliberate half of this migration: the alternative, re-pointing it at a pair, would silently
+    // change what "the digest matches" asserts in code that cannot express "which file".
+    //
+    // §12 rule 10's asymmetry is why this is a child table and not more columns on `models`: **digests are cheap to
+    // retrofit, names are not** — bytes already on disk live under `<models_dir>/<id>` with no room for a second
+    // name. So the pair gets names here (`name = 'main'` is the primary, matching the artifact path) and any later
+    // member arrives as a row rather than as a schema change.
+    //
+    // **One coupling to know before adding migration 10:** three test fixtures rewind a database to version four to
+    // exercise the upgrade path (`tests/db.rs`, `tests/scan.rs`, `np-cli/tests/cli.rs`), and each undoes what later
+    // entries created. A new table that they leave standing makes the next open fail with "table already exists" —
+    // which is the fixture being right, not the migration being wrong.
+    //
+    // Not backfilled, like migration 6's `file_id` and migration 8's stamp: a model installed by an older build has
+    // no recorded members until it is installed or fetched again, and readers treat "no rows" as *unknown*, never as
+    // "this model has no files". No foreign key either — `models` has no delete path today, and adding an FK whose
+    // cascade this migration cannot test on three OSes would be a claim, not a constraint (F18).
+    Migration::Sql(
+        r#"
+    CREATE TABLE model_files (
+        model       TEXT    NOT NULL,
+        name        TEXT    NOT NULL,
+        sha256      TEXT    NOT NULL CHECK (length(sha256) = 64),
+        size        INTEGER NOT NULL CHECK (size >= 0),
+        PRIMARY KEY (model, name)
+    );
+    "#,
+    ),
 ];
 
 /// One step of the schema, as one entry of [`MIGRATIONS`].
@@ -2393,6 +2425,57 @@ pub fn insert_model(
         )?
         .execute(params![id, dim, sha256, prefix_doc, prefix_query, now])?;
     Ok(written == 1)
+}
+
+/// One recorded member of a model's set of files (migration 9, §12 rule 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFile {
+    /// Which file of the id this is: `main` is the primary artifact whose digest also stands in `models.sha256`.
+    pub name: String,
+    /// Lowercase hex sha256 of those bytes, as recorded when they were written.
+    pub sha256: String,
+    /// Exact byte length.
+    pub size: i64,
+}
+
+/// Record (or correct) one member of a model's file set.
+///
+/// An upsert rather than an insert because both `install` and a fetch can legitimately re-record the same name after
+/// re-publishing the same bytes, and "the digest we hold for `main`" is one fact that must not fork into two rows or
+/// fail with a constraint violation the caller cannot distinguish from a real conflict.
+pub fn record_model_file(
+    db: &Db,
+    model: &str,
+    name: &str,
+    sha256: &str,
+    size: i64,
+) -> Result<(), DbError> {
+    db.0.prepare_cached(
+        "INSERT INTO model_files (model, name, sha256, size)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (model, name) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size",
+    )?
+    .execute(params![model, name, sha256, size])?;
+    Ok(())
+}
+
+/// Every recorded member of `model`, ordered by name.
+///
+/// **An empty vector means nothing was recorded, not that the model has no files** — a row installed before migration
+/// 9 carries its primary digest in `models.sha256` alone. Callers that need the primary digest must fall back to that
+/// column rather than reading "no rows" as "no artifact".
+pub fn model_files(db: &Db, model: &str) -> Result<Vec<ModelFile>, DbError> {
+    let mut stmt = db.0.prepare_cached(
+        "SELECT name, sha256, size FROM model_files WHERE model = ?1 ORDER BY name",
+    )?;
+    let rows = stmt.query_map(params![model], |row| {
+        Ok(ModelFile {
+            name: row.get(0)?,
+            sha256: row.get(1)?,
+            size: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 #[cfg(test)]

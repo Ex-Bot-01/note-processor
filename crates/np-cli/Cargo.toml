@@ -18,6 +18,12 @@ path = "src/main.rs"
 # (iv) reports that nothing was produced. The default CI row must keep proving exactly that — a default build that
 # wrote a vector would mean the flag stopped meaning anything.
 local-model = ["np-core/local-model"]
+# The fetch path is default-**on** here, mirroring `np-core`'s own default (§12's premises: a fetch command release
+# builds compile out would defeat the human's amendment of 2026-10-29). Opting out is explicit and visible in argv:
+# `--no-default-features` leaves `np models fetch` out of the subcommand table entirely, so a build cannot advertise a
+# command it cannot run. The cost is the same one §12 accepts — an HTTP+TLS client in the shipped binary.
+default = ["fetch"]
+fetch = ["np-core/fetch"]
 
 [dependencies]
 clap = { workspace = true }

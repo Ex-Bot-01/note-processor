@@ -19,8 +19,12 @@ edition.workspace = true
 # the Linux row only until someone has watched it go green elsewhere (§14's per-OS honesty). Release
 # builds keep the feature off until a Windows build of it is recorded in CI once (§2).
 [features]
-default = []
+# **`fetch` is default-ON, unlike `local-model`** (`docs/design-m2-local-embeddings.md` §12's premises): a fetch path
+# that release builds compile out would defeat the human's amendment of 2026-10-29, so opting out has to be an explicit
+# `--no-default-features`. The cost is stated where it is paid — an HTTP+TLS client in three release OSes' binaries.
+default = ["fetch"]
 local-model = []
+fetch = ["dep:ureq"]
 
 [dependencies]
 regex = { workspace = true }
@@ -30,7 +34,15 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 unicode-width = { workspace = true }
+# The only network client in the workspace, and it is reachable from one module (`fetch::http`). `scan` has no
+# path to it, which `tests/embed.rs`'s zero-sized-provider fence and the CLI's command table both keep true.
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# `fetch`'s disk preflight asks the filesystem how much room it has. Only unix exposes `statvfs`, so only unix gets
+# the dependency: elsewhere `available_bytes` answers None and the report says free space was not checked (F18).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

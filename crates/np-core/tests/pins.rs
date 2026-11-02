@@ -1,0 +1,304 @@
+//! The pin table's two promises, made executable (`docs/design-m2-local-embeddings.md` §12 rule 7).
+//!
+//! First: **a pin is a digest, not a hint.** A row whose `sha256` is short, uppercase or blank would let a fetch
+//! "verify" bytes against something nobody can check, so the shape of every entry is asserted here rather than left
+//! to the reviewer reading a `const`.
+//!
+//! Second: **a pin says what to accept and never where from.** That half of rule 7 is the one a well-meaning reader
+//! is most likely to "improve" — adding a host would make the table self-contained and break the mirror case, plus
+//! §12 rule 8's guarantee that no refusal text can carry a URL. So it is a test, not only a doc comment: every field
+//! of every row is scanned for scheme- and host-shaped substrings.
+//!
+//! The gap in the table gets the same treatment as the data ([`MMPROJ_DIGEST_PREFIX_ONLY`]'s own words explain why
+//! the second member of the pair is absent), so the missing row stays a decision instead of becoming a forgotten one.
+
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+
+use np_core::hash::sha256_file;
+use np_core::pins::{
+    identity, pinned, pinned_member, total_size, PinnedIdentity, PinnedModel, PINNED,
+    PINNED_IDENTITIES,
+};
+
+/// Substrings that would mean a field names a place rather than a thing.
+///
+/// `.com`/`.org`/`.net`/`.io`/`.dev` are here because a host has to end in something like them, while the one
+/// extension this table genuinely carries — `.gguf`, on a filename — is not among them. That asymmetry is what makes
+/// the test say something: it passes on names and fails on origins, rather than firing on every legal row.
+///
+/// A bare dot is deliberately **not** on the list — `models::validate_id` allows dots in an id, so "no dots anywhere"
+/// would refuse a legal future row. If a genuinely legal value ever trips one of these endings, the fix is to narrow
+/// the needle (say `.com/`, which no filename holds), not to delete the rule.
+const HOST_SHAPED: [&str; 7] = ["http", "://", ".com", ".org", ".net", ".io", ".dev"];
+
+/// Every field a row can hide a host in, in declaration order.
+fn fields(entry: &PinnedModel) -> [(&str, &str); 5] {
+    [
+        ("id", entry.id),
+        ("member", entry.member),
+        ("filename", entry.filename),
+        ("sha256", entry.sha256),
+        ("read_on", entry.read_on),
+    ]
+}
+
+#[test]
+fn every_pinned_digest_is_lowercase_hex_of_exactly_64_characters() {
+    // An empty table would satisfy the loop below, so the premise is asserted first: this build must pin something,
+    // or "nothing unpinned is accepted" has no content.
+    assert!(
+        !PINNED.is_empty(),
+        "an empty pin table fetches nothing and tests nothing"
+    );
+
+    for entry in PINNED {
+        let chars: Vec<char> = entry.sha256.chars().collect();
+        assert_eq!(
+            chars.len(),
+            64,
+            "{} / {}: a sha256 is 64 hex characters, got {:?}",
+            entry.id,
+            entry.member,
+            entry.sha256
+        );
+        assert!(
+            chars
+                .iter()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(c)),
+            "{} / {}: a pin is compared against lowercase hex, so it has to be spelled that way: {:?}",
+            entry.id,
+            entry.member,
+            entry.sha256
+        );
+
+        // Mutation this catches: pasting an uppercase digest (every comparison against `hash::Sha256Stream` output
+        // would then fail on a byte-perfect download), or truncating one to the short prefix design §12 quotes.
+    }
+}
+
+#[test]
+fn every_pinned_size_is_a_real_length() {
+    for entry in PINNED {
+        assert!(
+            entry.size_bytes > 0,
+            "{} / {}: a zero size makes §12 rule 6's preflight admit a fetch of nothing",
+            entry.id,
+            entry.member
+        );
+    }
+}
+
+#[test]
+fn member_names_are_unique_within_an_id() {
+    // `pinned_member` answers one row, and the child table §12 rule 10 sketches keys on `(model, name)`. Two rows
+    // sharing a member would make "which digest does `main` mean" unanswerable — and the first duplicate is exactly
+    // the edit a careless second commit makes, by copying a row to add a file.
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    for entry in PINNED {
+        let key = (entry.id, entry.member);
+        assert!(
+            !seen.contains(&key),
+            "duplicate member `{}` for id `{}`: a fetch could not pick one digest",
+            entry.member,
+            entry.id
+        );
+        seen.push(key);
+    }
+}
+
+#[test]
+fn no_pinned_field_names_a_host_or_a_url() {
+    // §12 rule 7's boundary in one loop: the host is config (`[models] base_url`), and a table that grew one would
+    // silently end the mirror case and start making refusal text carry origins.
+    let mut checked = 0usize;
+    for entry in PINNED {
+        for (name, value) in fields(entry) {
+            let lowered = value.to_ascii_lowercase();
+            for needle in HOST_SHAPED {
+                assert!(
+                    !lowered.contains(needle),
+                    "{} / {}: `{}` holds {needle:?}, which names a place; the pin table says what to accept \
+                     and `[models] base_url` says where from — field value: {value:?}",
+                    entry.id,
+                    entry.member,
+                    name
+                );
+            }
+            // A separator would be a *path* smuggled into a filename, which is the same category error one level
+            // down: `what to accept` must stay joinable onto whatever directory the caller chose.
+            assert!(
+                !value.contains('/') && !value.contains('\\'),
+                "{} / {}: `{}` holds a path separator: {value:?}",
+                entry.id,
+                entry.member,
+                name
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "the loop above has to have looked at something"
+    );
+
+    // Provenance strings are part of the sweep above (`fields()` covers `read_on`), which matters now that they
+    // describe where a value was read: "downloaded from <host>" would be a URL smuggled into the table that exists
+    // to hold none.
+}
+
+#[test]
+fn total_size_is_the_sum_of_that_ids_members() {
+    for entry in PINNED {
+        let sum: u64 = pinned(entry.id).map(|member| member.size_bytes).sum();
+        assert_eq!(
+            total_size(entry.id),
+            sum,
+            "the preflight number has to be the members themselves, not a constant beside them"
+        );
+    }
+
+    // An id this build does not pin sums to zero — correct arithmetic for "nothing is pinned", and asserted so a
+    // later reader cannot quietly turn it into a default size.
+    assert_eq!(total_size("no-such-model"), 0);
+    assert_eq!(pinned("no-such-model").count(), 0);
+}
+
+#[test]
+fn lookup_answers_by_id_and_member_and_refuses_what_is_not_pinned() {
+    // The two accessors a fetch calls, including the `None` that means "refuse this member" rather than "unknown".
+    let main = pinned_member("embeddinggemma-2", "main").expect("the primary artifact is pinned");
+    assert_eq!(main.filename, "embeddinggemma-2-Q8_0.gguf");
+    assert_eq!(
+        pinned("embeddinggemma-2").count(),
+        2,
+        "the pair, not two models"
+    );
+
+    // A member this build does not pin answers `None`, and that is a refusal rather than a shrug: an unpinned member
+    // has no digest to check. This is also the arm §12 rule 7's guarantee rests on, which is why it is asserted for
+    // the id that exists (a name inside a pinned id) rather than only for one that does not.
+    assert!(pinned_member("embeddinggemma-2", "audio").is_none());
+    assert!(pinned_member("some-other-model", "main").is_none());
+}
+
+#[test]
+fn both_members_of_the_pair_are_pinned_and_their_total_is_the_number_the_design_quotes() {
+    // The pair, not two models: same id, two members. This is the case that used to fence the *absence* of the
+    // mmproj row; it now fences its presence, because the reason to add that row was a digest somebody could
+    // reproduce — and §12's recorded prefix turned out to match no file in the repository at all. If a member goes
+    // missing again, `total_size` quietly drops below what rule 6's preflight must reserve, and this is what says so.
+    let members: Vec<&str> = pinned("embeddinggemma-2")
+        .map(|entry| entry.member)
+        .collect();
+    assert_eq!(members, ["main", "mmproj"]);
+    let main = pinned_member("embeddinggemma-2", "main").expect("main is pinned");
+    let mmproj = pinned_member("embeddinggemma-2", "mmproj").expect("mmproj is pinned");
+    assert_eq!(main.filename, "embeddinggemma-2-Q8_0.gguf");
+    assert_eq!(mmproj.filename, "mmproj-embeddinggemma-2-Q8_0.gguf");
+    // Distinct files, distinct digests: two members with one digest would mean the table accepts either half for
+    // both slots.
+    assert_ne!(main.sha256, mmproj.sha256);
+    assert_eq!(mmproj.size_bytes, 554_821_056);
+
+    // §5's "864.7 MB", quoted in bytes and by name: guessing one file understates the transfer by a factor of 2.8,
+    // which is exactly what rule 6 exists to prevent.
+    assert_eq!(total_size("embeddinggemma-2"), 864_676_512);
+    assert_eq!(
+        total_size("embeddinggemma-2"),
+        main.size_bytes + mmproj.size_bytes,
+        "the sum must be the members, not a constant someone typed"
+    );
+
+    // Every pinned member has to carry provenance: pin rot is invisible until first start refuses, so a refusal has
+    // to be able to say where and when the expectation was read.
+    for entry in PINNED {
+        assert!(
+            !entry.read_on.is_empty(),
+            "{} has no provenance",
+            entry.member
+        );
+    }
+}
+
+#[test]
+fn every_fetchable_id_declares_an_identity_and_every_pinned_id_has_one() {
+    // A fetch writes a `models` row, and the row needs `dim` plus both prefixes. The table that pins bytes therefore
+    // has to cover every id it can transfer — an id with members but no identity would download 865 MB and then be
+    // unable to say what it is.
+    for entry in PINNED {
+        let found =
+            identity(entry.id).unwrap_or_else(|| panic!("{} has no pinned identity", entry.id));
+        assert_eq!(found.id, entry.id);
+        assert!(
+            found.dim > 0,
+            "a zero width admits a vector of nothing (migration 7's CHECK)"
+        );
+    }
+    // And no identity without members: an id in the identity table that pins no bytes is a fetch that would refuse
+    // with `NothingPinned` after a caller had already promised work.
+    for decl in PINNED_IDENTITIES {
+        assert!(
+            pinned(decl.id).next().is_some(),
+            "{} declares an identity but pins no artifact",
+            decl.id
+        );
+    }
+
+    let gemma = identity("embeddinggemma-2").expect("the shipped id");
+    assert_eq!(gemma.dim, 768);
+    // Empty prefixes are a claim about evidence: every embedding run recorded in this repository used none, and a
+    // prefix changes vector bytes, so adopting a convention later means a **new id** (`@n`), not an edit here.
+    assert_eq!(
+        gemma,
+        &PinnedIdentity {
+            id: "embeddinggemma-2",
+            dim: 768,
+            prefix_doc: "",
+            prefix_query: "",
+        }
+    );
+    // An id nobody declared answers `None` rather than a plausible default.
+    assert!(identity("some-other-model").is_none());
+}
+
+#[test]
+fn the_pinned_digest_is_the_real_artifacts_digest_when_the_runner_has_one() {
+    let Some(path) = std::env::var_os("NP_TEST_MODEL_PATH").map(PathBuf::from) else {
+        println!(
+            "NOT COVERAGE: NP_TEST_MODEL_PATH is unset, so no real artifact was hashed against the pin. \
+             Re-run with it pointing at embeddinggemma-2-Q8_0.gguf (sha256 2188ac1d…) to check the pin's bytes."
+        );
+        return;
+    };
+
+    let main = pinned_member("embeddinggemma-2", "main").expect("the primary artifact is pinned");
+    let found = sha256_file(&path).expect("test setup: the named artifact must be readable");
+    assert_eq!(
+        found,
+        main.sha256,
+        "{} hashes to {found}, which is not what this build pins",
+        path.display()
+    );
+
+    // The size travels with the digest in the same row, so it is checked in the same pass: a pin whose length is
+    // wrong would refuse a complete download at §12 rule 6's preflight.
+    let bytes = fs::metadata(&path)
+        .expect("test setup: stat the named artifact")
+        .len();
+    assert_eq!(
+        bytes,
+        main.size_bytes,
+        "{} has another length",
+        path.display()
+    );
+
+    // And the digest is reachable through the streaming API byte by byte, which is how a fetch feeds it: same
+    // number, one `update` per chunk.
+    let mut stream = np_core::hash::Sha256Stream::new();
+    stream
+        .write_all(&fs::read(&path).expect("test setup: read the named artifact"))
+        .expect("writing to a digest cannot fail");
+    assert_eq!(stream.finish_hex(), main.sha256);
+}
