@@ -59,8 +59,14 @@ mod lazy {
         let dir = tempfile::tempdir().expect("a temp dir to look for an artifact in");
         let absent = dir.path().join("models").join("embeddinggemma-2");
 
-        let problem = LazyLocalEmbedder::new(&row(DIM as i64), &absent, DIM, 1_024)
-            .expect_err("a row whose bytes are not there cannot produce a provider");
+        let problem = LazyLocalEmbedder::new(
+            &row(DIM as i64),
+            &absent,
+            DIM,
+            1_024,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect_err("a row whose bytes are not there cannot produce a provider");
 
         // This variant is what `np-cli` turns into §6's arm (iii). Were it raised later — inside the first
         // `embed`, as every other load failure now is — a workspace with no artifact would report a *failure*
@@ -81,8 +87,14 @@ mod lazy {
         // the row already said.
         let absent = dir.path().join("embeddinggemma-2");
 
-        let problem = LazyLocalEmbedder::new(&row(512), &absent, DIM, 1_024)
-            .expect_err("a row half the width of this run is a mismatch");
+        let problem = LazyLocalEmbedder::new(
+            &row(512),
+            &absent,
+            DIM,
+            1_024,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect_err("a row half the width of this run is a mismatch");
         match problem {
             EmbedError::ProviderDimMismatch {
                 configured,
@@ -99,8 +111,14 @@ mod lazy {
     fn identity_answers_from_the_row_while_nothing_is_resident() {
         let dir = tempfile::tempdir().expect("a temp dir to hold the impostor");
         let artifact = impostor_artifact(dir.path());
-        let embedder = LazyLocalEmbedder::new(&row(DIM as i64), &artifact, DIM, 1_024)
-            .expect("the two eager checks pass: right width, real file");
+        let embedder = LazyLocalEmbedder::new(
+            &row(DIM as i64),
+            &artifact,
+            DIM,
+            1_024,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect("the two eager checks pass: right width, real file");
 
         // What `embed_run` needs in order to work out what is owed. Both answers come from the row and the
         // config, so a workspace that owes nothing never asks llama.cpp for anything — §14's whole argument, as
@@ -117,8 +135,14 @@ mod lazy {
     fn a_failed_load_is_remembered_and_stays_typed() {
         let dir = tempfile::tempdir().expect("a temp dir to hold the impostor");
         let artifact = impostor_artifact(dir.path());
-        let embedder = LazyLocalEmbedder::new(&row(DIM as i64), &artifact, DIM, 1_024)
-            .expect("the eager checks pass; only llama.cpp gets to object now");
+        let embedder = LazyLocalEmbedder::new(
+            &row(DIM as i64),
+            &artifact,
+            DIM,
+            1_024,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect("the eager checks pass; only llama.cpp gets to object now");
 
         let first = embedder
             .embed(&["anything at all"])
@@ -144,5 +168,113 @@ mod lazy {
             EmbedError::ArtifactNotLoadable { path } => assert_eq!(path, artifact),
             other => panic!("the mirrored refusal lost its type: {other:?}"),
         }
+    }
+    /// The worker plan a lazy provider reports: the config value resolved against this process's CPU allowance, and
+    /// nothing loaded to work it out.
+    ///
+    /// This is the fence behind `np embed`'s `threads` line (`docs/design-m2-thread-policy.md` §4): the number a user
+    /// reads has to be the number that provider will hand llama.cpp, decided once, from one reading of the machine. It
+    /// runs without the artifact on purpose — resolving a count must not cost 310 MB of weights, and a case that needed
+    /// the model would not be able to say so.
+    #[test]
+    fn the_worker_plan_is_the_config_resolved_against_the_machine_once() {
+        let dir = tempfile::tempdir().expect("a temp dir to hold the impostor");
+        let artifact = impostor_artifact(dir.path());
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        let auto = LazyLocalEmbedder::new(
+            &row(DIM as i64),
+            &artifact,
+            DIM,
+            1_024,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect("the eager checks pass");
+        let plan = auto.worker_plan();
+        assert_eq!(
+            plan.count,
+            np_core::config::ThreadCount::Auto.resolve(available),
+            "the report must state the rule's answer, not a number remembered from elsewhere"
+        );
+        assert_eq!(
+            plan.available, available,
+            "and the denominator it was derived from"
+        );
+        assert_eq!(plan.configured, "auto");
+        assert!(
+            plan.count >= 1 && plan.count <= available.max(1),
+            "a plan that oversubscribes or starves this machine: {plan:?}"
+        );
+        assert!(
+            !auto.loaded(),
+            "working out a worker count must not have loaded the model"
+        );
+
+        // An explicit count survives the trip unchanged, and says it came from the operator rather than the rule —
+        // including counts the rule would never choose, which is §5's point.
+        let three = std::num::NonZeroU32::new(3).expect("test setup: 3 is non-zero");
+        let explicit = LazyLocalEmbedder::new(
+            &row(DIM as i64),
+            &artifact,
+            DIM,
+            1_024,
+            np_core::config::ThreadCount::Workers(three),
+        )
+        .expect("the eager checks pass");
+        let plan = explicit.worker_plan();
+        assert_eq!(plan.count, 3, "an explicit count is honoured exactly");
+        assert_eq!(plan.configured, "explicit");
+
+        // **Nothing is resident yet, so there is no answer to give.** The accessor reports the loaded model's reality,
+        // not the plan — a `Some(3)` here would be the report quoting itself.
+        assert_eq!(
+            explicit.loaded_worker_count(),
+            None,
+            "a provider that has not loaded cannot report what the context answered"
+        );
+    }
+
+    /// The artifact a real load can read, or `None` when the environment says it is absent.
+    ///
+    /// The standing gate (F18): a case that needs 310 MB of weights prints `NOT COVERAGE` and passes rather than failing
+    /// a machine that legitimately does not have them — "skipped" and "measured nothing" are the same sentence here, and
+    /// CI counts these prints (`docs/CI.md`, and the feature row's floor).
+    fn artifact_path() -> Option<std::path::PathBuf> {
+        std::env::var_os("NP_TEST_MODEL_PATH").map(std::path::PathBuf::from)
+    }
+
+    /// The configured count reaches llama.cpp **through this provider**, not just through the raw loader.
+    ///
+    /// The plan and the load read the same field, so a break between them is invisible to anything that never loads: the
+    /// report would say twelve while the context ran four, and every number in `np embed`'s output would still look
+    /// plausible. Artifact-gated for the standing reason (F18) — this needs real weights to have a context to ask.
+    // The whole file is `#![cfg(feature = "local-model")]`, so no per-case gate is needed on top of it.
+    #[test]
+    fn the_configured_count_is_the_count_the_context_runs_with() {
+        let Some(path) = artifact_path() else {
+            println!("NOT COVERAGE: NP_TEST_MODEL_PATH is unset, so nothing was loaded and the count went unverified.");
+            return;
+        };
+        let two = std::num::NonZeroU32::new(2).expect("test setup: 2 is non-zero");
+        let embedder = LazyLocalEmbedder::new(
+            &row(DIM as i64),
+            &path,
+            DIM,
+            1_024,
+            np_core::config::ThreadCount::Workers(two),
+        )
+        .expect("a real artifact and a matching width pass the eager checks");
+        assert_eq!(embedder.loaded_worker_count(), None, "nothing loaded yet");
+
+        embedder
+            .embed(&["a sentence the model can read"])
+            .expect("the artifact loads and answers");
+        assert_eq!(
+            embedder.loaded_worker_count(),
+            Some(2),
+            "the provider was told two workers and the context answered otherwise"
+        );
     }
 }

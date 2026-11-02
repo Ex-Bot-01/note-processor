@@ -317,6 +317,9 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     // and the text summary cannot disagree about whether this run verified anything (the same reason §7's caveat is a
     // field). `None` says no local artifact was involved — a `provider = "none"` run has nothing to claim.
     report.artifact_check = resolved.artifact_check;
+    // Likewise the worker count: decided where the provider was built, printed here, and `None` when no local model ran
+    // — a run that embeds nothing has no thread count to state.
+    report.workers = resolved.workers;
     if json {
         emit_json(&serde_json::to_value(&report)?);
     } else {
@@ -346,6 +349,9 @@ struct Resolved {
     provider: Option<Box<dyn Embedder>>,
     /// D12's verify-on-change result, or `None` when no local artifact was read at all.
     artifact_check: Option<ArtifactCheck>,
+    /// The worker-thread plan for this run, or `None` when no local-model provider was built (§6's arms and
+    /// `provider = "none"` have no worker count to report).
+    workers: Option<np_core::embed_run::WorkerPlan>,
 }
 
 /// A resolution with nothing to report about artifact bytes.
@@ -353,6 +359,7 @@ fn resolved(provider: Option<Box<dyn Embedder>>) -> Resolved {
     Resolved {
         provider,
         artifact_check: None,
+        workers: None,
     }
 }
 
@@ -413,16 +420,21 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
                     &artifact,
                     configured,
                     cfg.embeddings.max_tokens,
+                    cfg.embeddings.threads,
                 ) {
                     // Built lazily, so nothing is resident yet — which is exactly where D12's check belongs: a
                     // `verify_artifact` that finds the stamp intact costs one `stat`, so a run with nothing owed still
                     // pays nothing. When it does hash (the first run under this build, or bytes that moved) it refuses
                     // **before** `embed_run` reads a note, so a swapped artifact never earns a stamped vector.
                     Ok(embedder) => {
+                        // Read before the embedder is boxed into a trait object: `worker_plan` is a method on the
+                        // concrete type, and the plan belongs to the provider that was just built.
+                        let plan = embedder.worker_plan();
                         match np_core::local_model::verify_artifact(&db, &row, &artifact) {
                             Ok(check) => Ok(Resolved {
                                 provider: Some(Box::new(embedder)),
                                 artifact_check: Some(check),
+                                workers: Some(plan),
                             }),
                             Err(err) => Err(err.into()),
                         }
@@ -484,6 +496,12 @@ fn print_embed_summary(report: &EmbedReport) {
     // Omitted entirely when no local artifact was involved — silence is the truthful report there, not "verified".
     if let Some(check) = &report.artifact_check {
         let _ = writeln!(out, "digest     {}", check.label());
+    }
+    // Last, for the same reason `digest` is: it answers a question about this run's machine rather than about the
+    // vectors. Omitted entirely when no local model was involved — printing `threads 4 of 16` for a run that embedded
+    // nothing would be a number about nothing.
+    if let Some(plan) = &report.workers {
+        let _ = writeln!(out, "threads    {}", plan.describe());
     }
 }
 

@@ -115,8 +115,14 @@ mod embedding {
 
         let loaded = LocalEmbedder::new(load(&path), &row(prefix_doc, "query: "), 1_024)
             .expect("test setup: a loaded document embedder");
-        let lazy = LazyLocalEmbedder::new(&row(prefix_doc, "query: "), &path, DIM, 1_024)
-            .expect("test setup: a lazy provider over the same row and file");
+        let lazy = LazyLocalEmbedder::new(
+            &row(prefix_doc, "query: "),
+            &path,
+            DIM,
+            1_024,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect("test setup: a lazy provider over the same row and file");
 
         let resident = loaded.model_inputs(&texts);
         let not_yet_loaded = lazy.model_inputs(&texts);

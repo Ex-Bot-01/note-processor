@@ -53,6 +53,13 @@ Default builds contain no C++ and no inference runtime. The `local-model` featur
 on `np-cli`) builds llama.cpp from the sha256-pinned source under `third_party/`, is **Linux-only by refusal** in `build.rs`,
 and is off in releases; it needs `cmake` (set `CMAKE=/path/to/cmake`) and nothing else new.
 
+Embedding runs ask llama.cpp for worker threads by a rule rather than by its built-in default (which is a compile-time
+`4`, whatever the machine has): `[embeddings] threads = "auto"` — the default — chooses `min(cpus, max(min(cpus, 4),
+80 %))`, so a 16-CPU host gets 12 and a 2-core laptop gets 2 instead of being asked to run four. An explicit
+`threads = 4` restores the old behaviour exactly. The measured basis, the ceiling (32 workers on 16 CPUs is *slower* than
+four) and what has not been measured are in `docs/design-m2-thread-policy.md`; `np embed` prints the count it used
+(`threads 12 of 16 available (auto)`, `"workers"` under `--json`).
+
 `np embed` works on both sides of that line, and the two answers differ on purpose. A `local-model` build checks the
 artifact against `models.sha256` before it reads a note — one `stat` when the file has not moved since the last check, a
 full hash when its size or mtime changed or no check has run yet — then loads the artifact on its **first batch** (not

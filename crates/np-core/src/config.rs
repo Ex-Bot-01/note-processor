@@ -215,6 +215,155 @@ impl ModelsConfig {
     }
 }
 
+/// How many worker threads the local embedder may ask llama.cpp for.
+///
+/// **Why a type rather than an `Option<usize>`:** llama.cpp's default worker count is `GGML_DEFAULT_N_THREADS`, a literal
+/// `4` (`ggml/include/ggml.h:232`, annotated upstream `// TODO: better default`), so "unset" would not mean "no opinion"
+/// — it would mean four, on a machine that may have thirty-two cores idle. Measured on the development host, using all of
+/// them instead is +190 % on a realistic chunk and +260 % on a near-window one for +6.6 MiB of peak RSS; using *twice*
+/// the machine's count runs at **worse than four** while burning 1,553 % CPU. Both halves of that are why this is a rule
+/// with a floor and a ceiling rather than a number: `docs/design-m2-thread-policy.md` §1–§2 for the arithmetic, and
+/// §14's D13 subsection in `docs/design-m2-local-embeddings.md` for the rows it comes from.
+///
+/// The deserializer refuses three things by name, because a silently-ignored worker count is the shape of lie this
+/// project's F-series exists to prevent: `threads = 0` (no such request exists), a value above what C can be told
+/// (`i32::MAX`; the first version of this seam *clamped* such a number and llama.cpp then aborted the process — the
+/// refusal now lives in `local_model::load_with_options`, behind the `local-model` feature), and anything that is neither
+/// `"auto"` nor an integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadCount {
+    /// Leave it to the rule in [`ThreadCount::resolve`] — **the default**, so a config that says nothing gets a count
+    /// derived from the machine rather than from a header file.
+    Auto,
+    /// An explicit count the operator chose. Honoured as given, including values above `available_parallelism()` — §5 of
+    /// the policy design: an operator may know something this program cannot see. What is *not* honoured is a value C
+    /// cannot be told, and that refusal lives in the deserializer so it arrives as a key name rather than as a runtime
+    /// failure.
+    Workers(std::num::NonZeroU32),
+}
+
+/// The default is [`ThreadCount::Auto`]: this change alters behaviour on purpose, and `[embeddings] threads = 4` is the
+/// one-line way back to what every run did before it.
+impl Default for ThreadCount {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// The largest worker count llama.cpp's `int32_t` field can be told. Refused at load rather than clamped: measured on
+/// this pin, a request of 3,000,000,000 became `2147483647`, the readback echoed it, and llama.cpp died in a C++
+/// exception (`SIGABRT`) — nothing in Rust catches that, so the only safe place for the check is before the value exists.
+const MAX_THREAD_COUNT: u64 = i32::MAX as u64;
+
+impl ThreadCount {
+    /// The count to ask for on a machine where `available_parallelism()` answered `available`.
+    ///
+    /// ```text
+    /// auto  →  min(available, max(min(available, 4), floor(0.8 × available)))
+    /// n     →  n
+    /// ```
+    ///
+    /// Each bound is a measurement rather than a preference (`docs/design-m2-thread-policy.md` §2):
+    ///
+    /// * **never more workers than CPUs** — 32 on a 16-CPU host measured 91.4 tok/s against the default four's 158.7;
+    /// * **never fewer than four where four exist** — a bare 80 % of a two-core laptop is one worker at 49.1 tok/s, a
+    ///   third of today, so the fraction must not bite on small hardware;
+    /// * **`available = 0` cannot happen** (`available_parallelism()` returns a non-zero count), and is answered 1 anyway
+    ///   rather than by handing zero to C.
+    #[must_use]
+    pub fn resolve(self, available: usize) -> usize {
+        match self {
+            Self::Workers(n) => usize::try_from(n.get()).unwrap_or(usize::MAX),
+            Self::Auto => {
+                if available == 0 {
+                    return 1;
+                }
+                let floor = available.min(4);
+                let fraction = available * 4 / 5;
+                available.min(floor.max(fraction))
+            }
+        }
+    }
+
+    /// Whether the count came from the rule or from an operator. `np embed`'s report prints both either way; this keeps
+    /// "12 because auto" from being reported as "12 because you said twelve".
+    #[must_use]
+    pub const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Hand-written so the two accepted spellings produce a message that names `embeddings.threads`. Serde's derived
+/// untagged-enum failure says "data did not match any variant", which is a sentence about the implementation; this file's
+/// refusals have to be sentences a user can act on, and `[embeddings]` already refuses unknown keys for the same reason
+/// (§7 of the M2a design).
+impl<'de> serde::Deserialize<'de> for ThreadCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = ThreadCount;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("`\"auto\"` or a positive integer of worker threads")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value == 0 {
+                    return Err(E::custom(
+                        "embeddings.threads = 0 is not a worker count — write `\"auto\"`, or an integer of at \
+                         least 1 (zero workers is not something the runtime can be asked for)",
+                    ));
+                }
+                if value > MAX_THREAD_COUNT {
+                    return Err(E::custom(format!(
+                        "embeddings.threads = {value} is larger than the runtime can be told \
+                         (max {MAX_THREAD_COUNT})"
+                    )));
+                }
+                // `value` is ≥ 1 and fits a `u32`; both were checked above, so neither fallback can run.
+                Ok(ThreadCount::Workers(
+                    std::num::NonZeroU32::new(value as u32)
+                        .unwrap_or_else(|| unreachable!("checked non-zero above")),
+                ))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let positive = u64::try_from(value).map_err(|_| {
+                    E::custom(format!(
+                        "embeddings.threads = {value} is negative; write `\"auto\"` or a positive count"
+                    ))
+                })?;
+                self.visit_u64(positive)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "auto" => Ok(ThreadCount::Auto),
+                    other => Err(E::custom(format!(
+                        "embeddings.threads must be `\"auto\"` or a positive integer of worker threads, not \
+                         {other:?}"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// Which embedding provider to ask for work from (`docs/design-m2-embeddings.md` §2).
 ///
 /// An **enum**, not a `String`, and that choice is the whole of §7's argument. Every other config
@@ -313,6 +462,13 @@ pub struct EmbeddingsConfig {
     /// R6b2; what R6a does is make the key legal, defaulted and bounded, since `deny_unknown_fields` means
     /// this section refused it by name before this round.
     pub max_tokens: usize,
+    /// Worker threads the local embedder may use — **default [`ThreadCount::Auto`]**, the rule in
+    /// [`ThreadCount::resolve`] rather than llama.cpp's compile-time four.
+    ///
+    /// Read only when `provider = "local-model"` (`dim` and `model` are likewise unread by the other providers, so this
+    /// is not a new looseness — `docs/design-m2-thread-policy.md` §3 records the choice, including why there is no
+    /// `[local_model]` section and no environment override). Accepted spellings and refusals: [`ThreadCount`].
+    pub threads: ThreadCount,
 }
 
 /// Hand-written rather than derived, so the default `max_tokens` is one number in one place — and so a later
@@ -324,6 +480,7 @@ impl Default for EmbeddingsConfig {
             model: None,
             dim: None,
             max_tokens: DEFAULT_EMBEDDING_TOKENS,
+            threads: ThreadCount::Auto,
         }
     }
 }

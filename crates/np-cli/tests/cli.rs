@@ -1792,7 +1792,8 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             "model",
             "outcome",
             "refused_budget",
-            "verification"
+            "verification",
+            "workers"
         ]
     );
     // The outcome object is externally tagged: exactly one arm key holding exactly the three fields §6 names.
@@ -1838,6 +1839,19 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
     assert!(
         !text.stdout().contains("\ndigest "),
         "and the summary prints no digest line when there was no check:\n{}",
+        text.stdout()
+    );
+    // The worker count follows the same rule as `digest`: **no local model, nothing to report**. Present and null in
+    // JSON (a reader must be able to ask the question), absent from the summary (a line reading `threads 4 of 16` for a
+    // run that embedded nothing would be a number about nothing).
+    assert!(
+        report["workers"].is_null(),
+        "arm (iii) built no local provider, so JSON must not state a worker count: {}",
+        report["workers"]
+    );
+    assert!(
+        !text.stdout().contains("\nthreads "),
+        "and the summary prints no threads line when no model was involved:\n{}",
         text.stdout()
     );
     // The arm's sentence travels on stderr under `--json` too — two channels, one fact.
@@ -2110,6 +2124,41 @@ mod real_model {
             Some(on_disk),
             "`--json` has to carry the skip with the file's size:\n{}",
             third.stdout()
+        );
+
+        // **The worker count this run used**, reported rather than left guessable. `docs/design-m2-thread-policy.md` §4's
+        // reason for the field: llama.cpp's own default is a compile-time literal, so once the count is derived from the
+        // machine, "how many CPUs did that run get" cannot be read off the source. Pinned in JSON (the shape a reader
+        // consumes) and cross-checked against the text summary, because those two channels disagreeing is this project's
+        // recurring defect rather than a hypothetical one.
+        let workers = &report["workers"];
+        let count = workers["count"]
+            .as_u64()
+            .expect("a local run states its worker count");
+        let available = workers["available"]
+            .as_u64()
+            .expect("and the CPU allowance it derived from");
+        assert!(
+            count >= 1,
+            "a run with zero workers cannot decode: {workers}"
+        );
+        assert!(
+            count <= available,
+            "the auto rule must not oversubscribe the machine ({count} workers on {available} CPUs)"
+        );
+        assert_eq!(
+            workers["configured"].as_str(),
+            Some("auto"),
+            "this run configured no thread count, so the report must not imply it did: {workers}"
+        );
+        let plain = run(&mut ws.command(&["embed"]));
+        // `summary_field` answers the value after the label, so the label is this case's own formatting.
+        let expected_value = format!("{count} of {available} available (auto)");
+        assert_eq!(
+            summary_field(&plain.stdout(), "threads"),
+            expected_value,
+            "the summary and `--json` must agree about the worker count:\n{}",
+            plain.stdout()
         );
 
         // §3's rule about prefixes turning into lies, measured on real numbers — and the measurement is what found

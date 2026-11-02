@@ -1096,8 +1096,16 @@ respects cgroup quotas; this host has no container to try that in, so it is not 
 warning line into the log rather than grepping in a way that could never match — but the evidence that workers actually
 ran is the 9.4× between one worker and sixteen, not the readback.
 
-**What this does not decide.** Whether the default changes — that is a decision about other people's machines, and it
-stays open in `docs/backlog-m2-followups.md`. What the sweep removes is the excuse for not looking. The options, with
+**What this did decide (same day, after this section was first written).** The human chose option (c) below, and
+`docs/design-m2-thread-policy.md` implements it: `[embeddings] threads = "auto"` resolves to
+`min(cpus, max(min(cpus, 4), floor(0.8 × cpus)))`, so **this host now runs twelve workers instead of four** and the
+throughput rows in this design document — §5's token costs, §9's package table, and every corpus figure in the subsections
+above — describe a four-worker run. They are kept as what they are: measurements of the configuration they were taken in,
+with `threads = 4` restoring that configuration exactly.
+
+**What remains undecided.** Nothing about the default (it is chosen); whether the corpus and evening-rule figures get
+re-measured under it, which is a separate measurement event and is listed as such in
+`docs/backlog-m2-followups.md`. What the sweep removes is the excuse for not looking. The options, with
 numbers from the table: (a) leave it at four; (b) use all of `available_parallelism()` — +190 % / +260 % here, ~14 cores
 busy; (c) a fraction of it. On percentages: 80 % of 16 is 12 workers, which buys 395.1 of the available 459.6 tok/s
 (86 % of the gain) and leaves four CPUs — but **on a two-core laptop the same 80 % is one worker at 49.1 tok/s, a third

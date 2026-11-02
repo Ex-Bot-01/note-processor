@@ -55,6 +55,9 @@ impl Setup {
                 model: Some(MODEL_ID.to_string()),
                 dim: None,
                 max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
+                // The policy default, spelled out: these fixtures must not inherit a worker count by
+                // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+                threads: np_core::config::ThreadCount::Auto,
             },
             ..Config::default()
         }
@@ -844,6 +847,9 @@ fn provider_none_is_configuration_disabled_and_reads_nothing() {
             model: None,
             dim: None,
             max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            // The policy default, spelled out: these fixtures must not inherit a worker count by
+            // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+            threads: np_core::config::ThreadCount::Auto,
         },
         ..setup.cfg()
     };
@@ -1072,6 +1078,9 @@ fn every_report_carries_the_caveat_line() {
             model: None,
             dim: None,
             max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            // The policy default, spelled out: these fixtures must not inherit a worker count by
+            // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+            threads: np_core::config::ThreadCount::Auto,
         },
         ..setup.cfg()
     };
