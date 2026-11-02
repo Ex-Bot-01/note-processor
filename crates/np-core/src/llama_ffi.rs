@@ -404,6 +404,28 @@ extern "C" {
     /// `ctx` must be a live context from [`llama_init_from_model`].
     pub fn llama_n_ubatch(ctx: *const llama_context) -> u32;
 
+    /// The worker count this context will use for a single-token pass (`include/llama.h:1103`).
+    ///
+    /// Mirrored for one reason: `llama_context_default_params()` takes `n_threads` from `GGML_DEFAULT_N_THREADS`, a
+    /// compile-time literal in `ggml/include/ggml.h:232` that upstream labels `// TODO: better default`. So "how many
+    /// cores is this embedding run using" is not answerable from our source, and a measurement that changes the number
+    /// has to read it back rather than trust what it asked for — the same discipline as [`llama_n_ubatch`].
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a live context from [`llama_init_from_model`].
+    pub fn llama_n_threads(ctx: *const llama_context) -> i32;
+
+    /// The worker count this context will use for a batch/prompt pass (`include/llama.h:1106`).
+    ///
+    /// A separate number from [`llama_n_threads`] in llama.cpp's API, which is why both are read back: an embedding run
+    /// takes the batch path, so a change that set only the generation count would look applied and do nothing.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a live context from [`llama_init_from_model`].
+    pub fn llama_n_threads_batch(ctx: *const llama_context) -> i32;
+
     // ---- inference ------------------------------------------------------------
 
     /// Run the model over `batch`. The header's own outcome list (`include/llama.h:1001-1005`) has **five** answers and

@@ -1,0 +1,97 @@
+# D13 thread sweep, LONG profile (~7,992 tokens, near-window chunks) — host pi, started 2026-11-02T07:03:24Z
+# artifact: /home/agent/models/embeddinggemma-2-Q8_0.gguf (309855456 bytes, sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb80b09135)
+# two passes: the row spread is within a process (repeats=2), the pass-to-pass gap is the cross-process check (§8).
+SWEEP      profile=short tokens_target=403 repeats=3 threads='16' dumps=/home/agent/tmp/thread-sweep-0eGAQC
+CELL_BEGIN threads=16 tokens_target=403 profile=short rc=0
+CELL       threads_requested=16 readback_generation=16 readback_batch=16 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430336
+DECODE     tokens=375 repeats=3 per_repeat_ms min=804.4 median=808.3 max=811.1 tok_s=463.9
+RSS        peak_kib=469556 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=16 readback=16 tokens=375 median_ms=808.3 tok_s=463.9 spread_pct=0.82 load_s=0.36 peak_rss_kib=469556 os_threads=2 available=16
+CELL_END   threads=16
+DUMPS      dir=/home/agent/tmp/thread-sweep-0eGAQC (one raw little-endian float-32 row per thread count, 1 files)
+DUMPS      kept for comparison; the determinism table below is computed from them
+/home/agent/tmp/thread-sweep-0eGAQC/vec-16.f32
+--- PASS 2 (short, threads=16 only, cross-process check) ---
+=== PASS 1 long ===
+SWEEP      profile=long tokens_target=7992 repeats=2 threads='2 4 8 16' dumps=/home/agent/tmp/thread-sweep-xBKeGD
+CELL_BEGIN threads=2 tokens_target=7992 profile=long rc=0
+CELL       threads_requested=2 readback_generation=2 readback_batch=2 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430340
+DECODE     tokens=7970 repeats=2 per_repeat_ms min=182160.9 median=182182.4 max=182203.9 tok_s=43.7
+RSS        peak_kib=1514732 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=2 readback=2 tokens=7970 median_ms=182182.4 tok_s=43.7 spread_pct=0.02 load_s=0.36 peak_rss_kib=1514732 os_threads=2 available=16
+CELL_END   threads=2
+CELL_BEGIN threads=4 tokens_target=7992 profile=long rc=0
+CELL       threads_requested=4 readback_generation=4 readback_batch=4 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430380
+DECODE     tokens=7970 repeats=2 per_repeat_ms min=99305.1 median=99473.7 max=99642.4 tok_s=80.1
+RSS        peak_kib=1514736 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=4 readback=4 tokens=7970 median_ms=99473.7 tok_s=80.1 spread_pct=0.34 load_s=0.36 peak_rss_kib=1514736 os_threads=2 available=16
+CELL_END   threads=4
+CELL_BEGIN threads=8 tokens_target=7992 profile=long rc=0
+CELL       threads_requested=8 readback_generation=8 readback_batch=8 available_parallelism=16 os_threads_after_load=2
+LOAD       0.39 s  window=8192 KiB_peak_rss=430336
+DECODE     tokens=7970 repeats=2 per_repeat_ms min=51763.5 median=51802.6 max=51841.8 tok_s=153.9
+RSS        peak_kib=1514828 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=8 readback=8 tokens=7970 median_ms=51802.6 tok_s=153.9 spread_pct=0.15 load_s=0.39 peak_rss_kib=1514828 os_threads=2 available=16
+CELL_END   threads=8
+CELL_BEGIN threads=16 tokens_target=7992 profile=long rc=0
+CELL       threads_requested=16 readback_generation=16 readback_batch=16 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430456
+DECODE     tokens=7970 repeats=2 per_repeat_ms min=27573.7 median=27602.0 max=27630.3 tok_s=288.7
+RSS        peak_kib=1514804 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=16 readback=16 tokens=7970 median_ms=27602.0 tok_s=288.7 spread_pct=0.20 load_s=0.36 peak_rss_kib=1514804 os_threads=2 available=16
+CELL_END   threads=16
+DUMPS      dir=/home/agent/tmp/thread-sweep-xBKeGD (one raw little-endian float-32 row per thread count, 4 files)
+DUMPS      kept for comparison; the determinism table below is computed from them
+/home/agent/tmp/thread-sweep-xBKeGD/vec-16.f32
+/home/agent/tmp/thread-sweep-xBKeGD/vec-2.f32
+/home/agent/tmp/thread-sweep-xBKeGD/vec-4.f32
+/home/agent/tmp/thread-sweep-xBKeGD/vec-8.f32
+=== PASS 2 long ===
+SWEEP      profile=long tokens_target=7992 repeats=2 threads='2 4 8 16' dumps=/home/agent/tmp/thread-sweep-bYN7si
+CELL_BEGIN threads=2 tokens_target=7992 profile=long rc=0
+CELL       threads_requested=2 readback_generation=2 readback_batch=2 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430588
+DECODE     tokens=7970 repeats=2 per_repeat_ms min=182074.6 median=182593.3 max=183112.0 tok_s=43.6
+RSS        peak_kib=1514844 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=2 readback=2 tokens=7970 median_ms=182593.3 tok_s=43.6 spread_pct=0.57 load_s=0.36 peak_rss_kib=1514844 os_threads=2 available=16
+CELL_END   threads=2
+CELL_BEGIN threads=4 tokens_target=7992 profile=long rc=0
+CELL       threads_requested=4 readback_generation=4 readback_batch=4 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430424
+DECODE     tokens=7970 repeats=2 per_repeat_ms min=98904.1 median=98976.8 max=99049.6 tok_s=80.5
+RSS        peak_kib=1514892 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=4 readback=4 tokens=7970 median_ms=98976.8 tok_s=80.5 spread_pct=0.15 load_s=0.36 peak_rss_kib=1514892 os_threads=2 available=16
+CELL_END   threads=4
+CELL_BEGIN threads=8 tokens_target=7992 profile=long rc=0
+CELL       threads_requested=8 readback_generation=8 readback_batch=8 available_parallelism=16 os_threads_after_load=2
+LOAD       0.35 s  window=8192 KiB_peak_rss=430672
+DECODE     tokens=7970 repeats=2 per_repeat_ms min=51773.7 median=51809.7 max=51845.7 tok_s=153.8
+RSS        peak_kib=1515152 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=8 readback=8 tokens=7970 median_ms=51809.7 tok_s=153.8 spread_pct=0.14 load_s=0.35 peak_rss_kib=1515152 os_threads=2 available=16
+CELL_END   threads=8
+CELL_BEGIN threads=16 tokens_target=7992 profile=long rc=0
+CELL       threads_requested=16 readback_generation=16 readback_batch=16 available_parallelism=16 os_threads_after_load=2
+LOAD       0.37 s  window=8192 KiB_peak_rss=430572
+DECODE     tokens=7970 repeats=2 per_repeat_ms min=27387.4 median=27493.9 max=27600.4 tok_s=289.9
+RSS        peak_kib=1514788 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=16 readback=16 tokens=7970 median_ms=27493.9 tok_s=289.9 spread_pct=0.77 load_s=0.37 peak_rss_kib=1514788 os_threads=2 available=16
+CELL_END   threads=16
+DUMPS      dir=/home/agent/tmp/thread-sweep-bYN7si (one raw little-endian float-32 row per thread count, 4 files)
+DUMPS      kept for comparison; the determinism table below is computed from them
+/home/agent/tmp/thread-sweep-bYN7si/vec-16.f32
+/home/agent/tmp/thread-sweep-bYN7si/vec-2.f32
+/home/agent/tmp/thread-sweep-bYN7si/vec-4.f32
+/home/agent/tmp/thread-sweep-bYN7si/vec-8.f32
+DONE

@@ -631,3 +631,13 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   `crates/np-core/tests/probes/corpus-run-2026-10-31.log`. The authorisation question
   is unchanged — this still changes runtime behaviour for every user, and the sweep (1/2/4/nproc × both lengths × RSS)
   has not been run.
+  **Closed as a measurement, open as a decision (2026-11-02).** The sweep ran — 1/2/4/6/8/12/16 workers on a
+  375-token chunk and 2/4/8/16 on a 7,970-token one, two processes per cell, plus a 32-worker oversubscription probe.
+  **All sixteen workers on this host are 2.89× the default at a realistic chunk and 3.60× at a near-window one, for
+  +9 MiB of peak RSS**; thirty-two workers collapse to 96 tok/s, worse than four, so the ceiling is exactly
+  `available_parallelism()`; and the vectors are **bit-identical across every worker count tried** (`max |Δ| = 0`), which
+  retires the reproducibility objection this entry was written around. Numbers, harness and scope: §14's "D13: the
+  worker count, measured". What remains is not a measurement: whether any user's default should change (and if so to
+  what — see the floor argument in that section: a bare 80 % is one worker on a two-core laptop), and a re-pin caveat,
+  since bit-identity is an observation about this llama.cpp and must be re-checked with
+  `crates/np-core/tests/probes/thread_vectors_compare.py` after one.

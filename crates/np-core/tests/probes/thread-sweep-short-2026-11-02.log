@@ -1,0 +1,68 @@
+# D13 thread sweep, pass 1 of 2 — host pi, 2026-11-02T07:00:34Z
+# artifact: /home/agent/models/embeddinggemma-2-Q8_0.gguf (309855456 bytes, sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb80b09135)
+SWEEP      profile=short tokens_target=403 repeats=3 threads='1 2 4 6 8 12 16' dumps=/home/agent/tmp/thread-sweep-AySXG7
+CELL_BEGIN threads=1 tokens_target=403 profile=short rc=0
+CELL       threads_requested=1 readback_generation=1 readback_batch=1 available_parallelism=16 os_threads_after_load=2
+LOAD       0.35 s  window=8192 KiB_peak_rss=430440
+DECODE     tokens=375 repeats=3 per_repeat_ms min=7620.1 median=7656.6 max=7658.2 tok_s=49.0
+RSS        peak_kib=460668 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=1 readback=1 tokens=375 median_ms=7656.6 tok_s=49.0 spread_pct=0.50 load_s=0.35 peak_rss_kib=460668 os_threads=2 available=16
+CELL_END   threads=1
+CELL_BEGIN threads=2 tokens_target=403 profile=short rc=0
+CELL       threads_requested=2 readback_generation=2 readback_batch=2 available_parallelism=16 os_threads_after_load=2
+LOAD       0.37 s  window=8192 KiB_peak_rss=430448
+DECODE     tokens=375 repeats=3 per_repeat_ms min=3995.4 median=4000.4 max=4011.2 tok_s=93.7
+RSS        peak_kib=461900 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=2 readback=2 tokens=375 median_ms=4000.4 tok_s=93.7 spread_pct=0.40 load_s=0.37 peak_rss_kib=461900 os_threads=2 available=16
+CELL_END   threads=2
+CELL_BEGIN threads=4 tokens_target=403 profile=short rc=0
+CELL       threads_requested=4 readback_generation=4 readback_batch=4 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430456
+DECODE     tokens=375 repeats=3 per_repeat_ms min=2346.1 median=2347.0 max=2351.4 tok_s=159.8
+RSS        peak_kib=463076 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=4 readback=4 tokens=375 median_ms=2347.0 tok_s=159.8 spread_pct=0.22 load_s=0.36 peak_rss_kib=463076 os_threads=2 available=16
+CELL_END   threads=4
+CELL_BEGIN threads=6 tokens_target=403 profile=short rc=0
+CELL       threads_requested=6 readback_generation=6 readback_batch=6 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430400
+DECODE     tokens=375 repeats=3 per_repeat_ms min=1511.9 median=1515.1 max=1517.0 tok_s=247.5
+RSS        peak_kib=464116 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=6 readback=6 tokens=375 median_ms=1515.1 tok_s=247.5 spread_pct=0.34 load_s=0.36 peak_rss_kib=464116 os_threads=2 available=16
+CELL_END   threads=6
+CELL_BEGIN threads=8 tokens_target=403 profile=short rc=0
+CELL       threads_requested=8 readback_generation=8 readback_batch=8 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430324
+DECODE     tokens=375 repeats=3 per_repeat_ms min=1234.3 median=1235.9 max=1241.5 tok_s=303.4
+RSS        peak_kib=465192 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=8 readback=8 tokens=375 median_ms=1235.9 tok_s=303.4 spread_pct=0.58 load_s=0.36 peak_rss_kib=465192 os_threads=2 available=16
+CELL_END   threads=8
+CELL_BEGIN threads=12 tokens_target=403 profile=short rc=0
+CELL       threads_requested=12 readback_generation=12 readback_batch=12 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430572
+DECODE     tokens=375 repeats=3 per_repeat_ms min=949.5 median=949.6 max=955.5 tok_s=394.9
+RSS        peak_kib=467424 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=12 readback=12 tokens=375 median_ms=949.6 tok_s=394.9 spread_pct=0.63 load_s=0.36 peak_rss_kib=467424 os_threads=2 available=16
+CELL_END   threads=12
+CELL_BEGIN threads=16 tokens_target=403 profile=short rc=0
+CELL       threads_requested=16 readback_generation=16 readback_batch=16 available_parallelism=16 os_threads_after_load=2
+LOAD       0.37 s  window=8192 KiB_peak_rss=430448
+DECODE     tokens=375 repeats=3 per_repeat_ms min=807.0 median=811.5 max=823.1 tok_s=462.1
+RSS        peak_kib=469540 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=16 readback=16 tokens=375 median_ms=811.5 tok_s=462.1 spread_pct=1.99 load_s=0.37 peak_rss_kib=469540 os_threads=2 available=16
+CELL_END   threads=16
+DUMPS      dir=/home/agent/tmp/thread-sweep-AySXG7 (one raw little-endian float-32 row per thread count, 7 files)
+DUMPS      kept for comparison; the determinism table below is computed from them
+/home/agent/tmp/thread-sweep-AySXG7/vec-1.f32
+/home/agent/tmp/thread-sweep-AySXG7/vec-12.f32
+/home/agent/tmp/thread-sweep-AySXG7/vec-16.f32
+/home/agent/tmp/thread-sweep-AySXG7/vec-2.f32
+/home/agent/tmp/thread-sweep-AySXG7/vec-4.f32
+/home/agent/tmp/thread-sweep-AySXG7/vec-6.f32
+/home/agent/tmp/thread-sweep-AySXG7/vec-8.f32
