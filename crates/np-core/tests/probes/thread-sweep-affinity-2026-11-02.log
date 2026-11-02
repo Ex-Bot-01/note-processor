@@ -1,0 +1,50 @@
+# D13 — restricted cpusets: does the derived denominator follow affinity? started 2026-11-02T08:19:35Z
+# host: nproc=16, threads_per_core=1, MemTotal=7597988 kB
+# artifact: /home/agent/models/embeddinggemma-2-Q8_0.gguf (309855456 bytes, sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135)
+# produced by probes/thread_sweep.sh (one process per cell; /usr/bin/time -v wraps each cell; determinism table appended)
+### unrestricted (all 16 visible) then restricted cpusets, one cell each
+SWEEP      profile=short tokens_target=403 repeats=3 threads='4' prefix='none' dumps=/home/agent/tmp/thread-sweep-FLhytd
+CELLCPU    threads=4 wall_s=10.0 user_s=38.4 sys_s=0.1 cpu_pct_whole_process=383%
+CELL_BEGIN threads=4 tokens_target=403 profile=short rc=0
+CELL       threads_requested=4 readback_generation=4 readback_batch=4 available_parallelism=16 os_threads_after_load=2
+LOAD       0.36 s  window=8192 KiB_peak_rss=430468
+DECODE     tokens=375 repeats=3 per_repeat_ms min=2370.1 median=2381.0 max=2386.0 tok_s=157.5
+RSS        peak_kib=463304 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=4 readback=4 tokens=375 median_ms=2381.0 tok_s=157.5 spread_pct=0.67 load_s=0.36 peak_rss_kib=463304 os_threads=2 available=16
+CELL_END   threads=4
+DETERMINISM baseline=vec-4.f32 (the default worker count) computed by probes/thread_vectors_compare.py
+PAIR       cosine            max_abs_diff    verdict
+PAIR       vec-4.f32 vs vec-4.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
+DUMPS      dir=/home/agent/tmp/thread-sweep-FLhytd (one raw little-endian float-32 row per worker count)
+/home/agent/tmp/thread-sweep-FLhytd/vec-4.f32
+SWEEP      profile=short tokens_target=403 repeats=3 threads='4' prefix='taskset -c 0-3' dumps=/home/agent/tmp/thread-sweep-WIRcAR
+CELLCPU    threads=4 wall_s=10.0 user_s=38.2 sys_s=0.1 cpu_pct_whole_process=384%
+CELL_BEGIN threads=4 tokens_target=403 profile=short rc=0
+CELL       threads_requested=4 readback_generation=4 readback_batch=4 available_parallelism=4 os_threads_after_load=2
+LOAD       0.35 s  window=8192 KiB_peak_rss=430464
+DECODE     tokens=375 repeats=3 per_repeat_ms min=2355.3 median=2380.1 max=2388.4 tok_s=157.6
+RSS        peak_kib=463024 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=4 readback=4 tokens=375 median_ms=2380.1 tok_s=157.6 spread_pct=1.39 load_s=0.35 peak_rss_kib=463024 os_threads=2 available=4
+CELL_END   threads=4
+DETERMINISM baseline=vec-4.f32 (the default worker count) computed by probes/thread_vectors_compare.py
+PAIR       cosine            max_abs_diff    verdict
+PAIR       vec-4.f32 vs vec-4.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
+DUMPS      dir=/home/agent/tmp/thread-sweep-WIRcAR (one raw little-endian float-32 row per worker count)
+/home/agent/tmp/thread-sweep-WIRcAR/vec-4.f32
+SWEEP      profile=short tokens_target=403 repeats=3 threads='4' prefix='taskset -c 0-7' dumps=/home/agent/tmp/thread-sweep-iXZDlx
+CELLCPU    threads=4 wall_s=9.9 user_s=38.1 sys_s=0.1 cpu_pct_whole_process=384%
+CELL_BEGIN threads=4 tokens_target=403 profile=short rc=0
+CELL       threads_requested=4 readback_generation=4 readback_batch=4 available_parallelism=8 os_threads_after_load=2
+LOAD       0.35 s  window=8192 KiB_peak_rss=430412
+DECODE     tokens=375 repeats=3 per_repeat_ms min=2359.6 median=2361.0 max=2363.9 tok_s=158.8
+RSS        peak_kib=463116 os_threads_after_decode=2
+SELF       cosine=1.000000000 max_abs_diff=0.000e0 (same process, same thread count)
+SUMMARY    threads=4 readback=4 tokens=375 median_ms=2361.0 tok_s=158.8 spread_pct=0.18 load_s=0.35 peak_rss_kib=463116 os_threads=2 available=8
+CELL_END   threads=4
+DETERMINISM baseline=vec-4.f32 (the default worker count) computed by probes/thread_vectors_compare.py
+PAIR       cosine            max_abs_diff    verdict
+PAIR       vec-4.f32 vs vec-4.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
+DUMPS      dir=/home/agent/tmp/thread-sweep-iXZDlx (one raw little-endian float-32 row per worker count)
+/home/agent/tmp/thread-sweep-iXZDlx/vec-4.f32

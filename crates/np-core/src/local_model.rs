@@ -237,6 +237,31 @@ impl LoadedModel {
         self.window
     }
 
+    /// The worker counts this context answered with, as `(single-token pass, batch pass)`.
+    ///
+    /// A fact about **this run and this machine**, like [`window`](Self::window): left alone it answers
+    /// `GGML_DEFAULT_N_THREADS` — a compile-time literal, not a reading of the hardware.
+    ///
+    /// **What it is evidence of is narrower than it looks.** llama.cpp stores what it was told and returns it verbatim
+    /// (`src/llama-context.cpp:204-205` copies `cparams.n_threads`; `:954-960` returns it), so this reports *what the
+    /// context was asked to use*, not what ran — unlike [`window`](Self::window), where llama.cpp's own header warns the
+    /// built value may differ and the readback is therefore load-bearing. Measured proof that a count took effect is a
+    /// rate: on this host one worker runs at 49 tok/s and sixteen at 462 (`docs/design-m2-local-embeddings.md` §14's D13
+    /// subsection). It still earns its place, because the failure it catches is the honest one — a caller asked for N
+    /// and llama.cpp reported back something else, which is what happened above with 3,000,000,000 → 2147483647.
+    pub fn threads(&self) -> (usize, usize) {
+        // SAFETY: `self.ctx` is a live context — this method holds `&self`, so `Drop` (which needs `&mut self` and
+        // frees the context before the model) cannot have run. Nothing in this file moves out of or forgets `ctx`, so
+        // no path reaches a freed handle from here.
+        let generation = unsafe { llama_ffi::llama_n_threads(self.ctx.as_ptr()) };
+        // SAFETY: as above; this reads the sibling field of the same parameter struct.
+        let batch = unsafe { llama_ffi::llama_n_threads_batch(self.ctx.as_ptr()) };
+        (
+            usize::try_from(generation).unwrap_or(0),
+            usize::try_from(batch).unwrap_or(0),
+        )
+    }
+
     /// How many tokens the model would see for **`prefix + text`** with its special tokens, without running a
     /// forward pass.
     ///
@@ -971,6 +996,31 @@ impl Drop for LoadedModel {
     }
 }
 
+/// How to build a context, for the few callers that need to say more than "use the runtime's defaults".
+///
+/// **The default is today's behaviour in every field**, and it is the only thing production passes: the one production
+/// caller of [`load`] is `LazyLocalEmbedder::model`, which uses `LoadOptions::default()`. (`embed.rs`'s unbuilt
+/// `LocalModelProvider` never reaches a loader at all — it answers `RuntimeNotBuilt` first, so naming it here would
+/// credit a caller that does not exist.) The type exists because D13 (the
+/// thread-count sweep, `docs/backlog-m2-followups.md`) has to ask a context for a specific worker count to measure it,
+/// and the alternative was a measurement path that bypassed our loader — which would have measured llama.cpp rather
+/// than this program, and could not have answered the question the sweep actually asks: do *the vectors `np embed`
+/// writes* change when the thread count does.
+///
+/// Keeping the seam narrow is also a decision about behaviour: **capability is not a default.** Nothing here changes how
+/// many threads a normal run uses, and §14's measurement decides whether a follow-up should. A config key would land on
+/// top of this type rather than replacing it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// Worker threads for both the batch pass and a single-token pass, which is how llama.cpp's own CLI sets them
+    /// (`common/arg.cpp:1533`, `:1543` — both from `hardware_concurrency()`).
+    ///
+    /// `None` leaves both fields at `GGML_DEFAULT_N_THREADS` (`ggml/include/ggml.h:232`, a literal `4` upstream
+    /// annotates `// TODO: better default`). `Some(n)` is a `NonZeroU32` rather than an `usize` because "0 threads" has
+    /// no meaning to pass to C and the type makes that unrepresentable instead of a runtime refusal.
+    pub threads: Option<std::num::NonZeroU32>,
+}
+
 /// Load `path` and open one context over it, refusing before allocating anything that cannot be described.
 ///
 /// `configured_dim` is the width this run needs vectors to be — `[embeddings] dim`, or the width already stored
@@ -998,7 +1048,22 @@ impl Drop for LoadedModel {
 ///
 /// Every error path frees what it allocated. The model is freed in exactly one place — the `Err` arm below —
 /// and the context in exactly two: this function's pooling refusal, and `LoadedModel`'s `Drop`.
+/// With [`LoadOptions::default()`]: the runtime's own worker counts, and the only entry point production uses.
 pub fn load(path: &Path, configured_dim: usize) -> Result<LoadedModel, EmbedError> {
+    load_with_options(path, configured_dim, LoadOptions::default())
+}
+
+/// [`load`] with the context's worker count chosen by the caller — see [`LoadOptions`] for why that is a measurement
+/// need rather than a user-facing knob today.
+///
+/// The thread count is applied to the same `ctx_params` the window is written into, so there is one place where a
+/// context gets its numbers and no path where a caller can set workers without also going through the width check,
+/// the window readback and the pooling refusal that live below.
+pub fn load_with_options(
+    path: &Path,
+    configured_dim: usize,
+    options: LoadOptions,
+) -> Result<LoadedModel, EmbedError> {
     // The same spelling `models` and `LocalModelProvider::new` use for this file: absolute, no symlink
     // resolution, prefixed when long — so the path C receives and the path an error names differ only by a
     // prefix a platform needs.
@@ -1042,7 +1107,7 @@ pub fn load(path: &Path, configured_dim: usize) -> Result<LoadedModel, EmbedErro
     // From here the model is ours, and every failure below must hand it back. One arm does that, so a new
     // refusal inside `open_context` cannot leak it — which is why the fallible work lives in a function whose
     // only success value is "the context is now owned too".
-    match open_context(model, configured_dim) {
+    match open_context(model, configured_dim, options) {
         Ok((ctx, facts, window)) => Ok(LoadedModel {
             model,
             ctx,
@@ -1068,6 +1133,7 @@ pub fn load(path: &Path, configured_dim: usize) -> Result<LoadedModel, EmbedErro
 fn open_context(
     model: NonNull<llama_model>,
     configured_dim: usize,
+    options: LoadOptions,
 ) -> Result<(NonNull<llama_context>, ModelFacts, usize), EmbedError> {
     let numbers = read_numbers(model)?;
 
@@ -1096,6 +1162,26 @@ fn open_context(
     ctx_params.n_ctx = requested_ctx(numbers.n_ctx_train);
     ctx_params.n_batch = ctx_params.n_ctx;
     ctx_params.n_ubatch = ctx_params.n_ctx;
+    // Both worker counts, or neither. llama.cpp keeps them separate (generation vs batch) and an embedding run takes the
+    // batch path, so setting only `n_threads` would report success while changing nothing that matters; `LoadedModel::
+    // threads()` reads both back for exactly that reason.
+    if let Some(threads) = options.threads {
+        // **Refuse, never clamp.** `n_threads` is an `i32` in llama.cpp's struct and the value goes straight into C:
+        // measured on this pin, a request of 3,000,000,000 became `2147483647`, the readback cheerfully echoed it
+        // back, and the process then died in llama.cpp with a C++ exception (`SIGABRT` — "Rust cannot catch foreign
+        // exceptions"). The raw number also sizes ggml's work buffer in `int` arithmetic
+        // (`ggml/src/ggml-cpu/ggml-cpu.c:3061`: `work_size += CACHE_LINE_SIZE * n_threads`), so a clamped giant is an
+        // overflow waiting to be allocated. This file's rule is that nonsense is refused before anything is allocated,
+        // and a label of our own keeps llama.cpp's diagnostic text out of the report — same posture as every other
+        // `Unavailable` here.
+        let n = i32::try_from(threads.get()).map_err(|_| {
+            EmbedError::Unavailable(format!(
+                "the requested worker count {threads} is larger than the runtime can be told"
+            ))
+        })?;
+        ctx_params.n_threads = n;
+        ctx_params.n_threads_batch = n;
+    }
     let requested = ctx_params.n_ctx as usize;
 
     // SAFETY: `model` is non-null and outlives this call; `ctx_params` is copied by value.
