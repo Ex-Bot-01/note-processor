@@ -239,12 +239,20 @@ impl LoadedModel {
 
     /// The worker counts this context answered with, as `(single-token pass, batch pass)`.
     ///
-    /// A fact about **this run and this machine**, like [`window`](Self::window): left alone it is
-    /// `GGML_DEFAULT_N_THREADS` — a compile-time literal, not a reading of the hardware — and a caller that asked for a
-    /// count needs to know whether it got one. Read back rather than remembered because llama.cpp may adjust what it was
-    /// told, and because "I set two fields" is not the same claim as "the runtime used that many workers".
+    /// A fact about **this run and this machine**, like [`window`](Self::window): left alone it answers
+    /// `GGML_DEFAULT_N_THREADS` — a compile-time literal, not a reading of the hardware.
+    ///
+    /// **What it is evidence of is narrower than it looks.** llama.cpp stores what it was told and returns it verbatim
+    /// (`src/llama-context.cpp:204-205` copies `cparams.n_threads`; `:954-960` returns it), so this reports *what the
+    /// context was asked to use*, not what ran — unlike [`window`](Self::window), where llama.cpp's own header warns the
+    /// built value may differ and the readback is therefore load-bearing. Measured proof that a count took effect is a
+    /// rate: on this host one worker runs at 49 tok/s and sixteen at 462 (`docs/design-m2-local-embeddings.md` §14's D13
+    /// subsection). It still earns its place, because the failure it catches is the honest one — a caller asked for N
+    /// and llama.cpp reported back something else, which is what happened above with 3,000,000,000 → 2147483647.
     pub fn threads(&self) -> (usize, usize) {
-        // SAFETY: `ctx` is a live context owned by this value until `Drop`, which frees it after every method returns.
+        // SAFETY: `self.ctx` is a live context — this method holds `&self`, so `Drop` (which needs `&mut self` and
+        // frees the context before the model) cannot have run. Nothing in this file moves out of or forgets `ctx`, so
+        // no path reaches a freed handle from here.
         let generation = unsafe { llama_ffi::llama_n_threads(self.ctx.as_ptr()) };
         // SAFETY: as above; this reads the sibling field of the same parameter struct.
         let batch = unsafe { llama_ffi::llama_n_threads_batch(self.ctx.as_ptr()) };
@@ -990,8 +998,10 @@ impl Drop for LoadedModel {
 
 /// How to build a context, for the few callers that need to say more than "use the runtime's defaults".
 ///
-/// **The default is today's behaviour in every field**, and it is the only thing production passes: `LazyLocalEmbedder`
-/// and `LocalModelProvider` both call [`load`], which uses `LoadOptions::default()`. The type exists because D13 (the
+/// **The default is today's behaviour in every field**, and it is the only thing production passes: the one production
+/// caller of [`load`] is `LazyLocalEmbedder::model`, which uses `LoadOptions::default()`. (`embed.rs`'s unbuilt
+/// `LocalModelProvider` never reaches a loader at all — it answers `RuntimeNotBuilt` first, so naming it here would
+/// credit a caller that does not exist.) The type exists because D13 (the
 /// thread-count sweep, `docs/backlog-m2-followups.md`) has to ask a context for a specific worker count to measure it,
 /// and the alternative was a measurement path that bypassed our loader — which would have measured llama.cpp rather
 /// than this program, and could not have answered the question the sweep actually asks: do *the vectors `np embed`
@@ -1156,7 +1166,19 @@ fn open_context(
     // batch path, so setting only `n_threads` would report success while changing nothing that matters; `LoadedModel::
     // threads()` reads both back for exactly that reason.
     if let Some(threads) = options.threads {
-        let n = i32::try_from(threads.get()).unwrap_or(i32::MAX);
+        // **Refuse, never clamp.** `n_threads` is an `i32` in llama.cpp's struct and the value goes straight into C:
+        // measured on this pin, a request of 3,000,000,000 became `2147483647`, the readback cheerfully echoed it
+        // back, and the process then died in llama.cpp with a C++ exception (`SIGABRT` — "Rust cannot catch foreign
+        // exceptions"). The raw number also sizes ggml's work buffer in `int` arithmetic
+        // (`ggml/src/ggml-cpu/ggml-cpu.c:3061`: `work_size += CACHE_LINE_SIZE * n_threads`), so a clamped giant is an
+        // overflow waiting to be allocated. This file's rule is that nonsense is refused before anything is allocated,
+        // and a label of our own keeps llama.cpp's diagnostic text out of the report — same posture as every other
+        // `Unavailable` here.
+        let n = i32::try_from(threads.get()).map_err(|_| {
+            EmbedError::Unavailable(format!(
+                "the requested worker count {threads} is larger than the runtime can be told"
+            ))
+        })?;
         ctx_params.n_threads = n;
         ctx_params.n_threads_batch = n;
     }

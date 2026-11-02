@@ -407,9 +407,14 @@ extern "C" {
     /// The worker count this context will use for a single-token pass (`include/llama.h:1103`).
     ///
     /// Mirrored for one reason: `llama_context_default_params()` takes `n_threads` from `GGML_DEFAULT_N_THREADS`, a
-    /// compile-time literal in `ggml/include/ggml.h:232` that upstream labels `// TODO: better default`. So "how many
-    /// cores is this embedding run using" is not answerable from our source, and a measurement that changes the number
-    /// has to read it back rather than trust what it asked for — the same discipline as [`llama_n_ubatch`].
+    /// compile-time literal in `ggml/include/ggml.h:232` that upstream labels `// TODO: better default`, so "how many
+    /// workers is this run using" is not answerable from our source.
+    ///
+    /// **Unlike [`llama_n_ubatch`], this one is an echo.** `include/llama.h:575-577` warns that *context* values may
+    /// differ from what was requested, and `llama_n_ubatch` is the built answer; here llama.cpp copies the field
+    /// (`src/llama-context.cpp:204-205`) and returns it unchanged (`:954-960`). So this proves what the context was
+    /// told — useful for catching a caller that never applied its option, or a value that arrived truncated — while
+    /// proof that workers actually ran is throughput.
     ///
     /// # Safety
     ///

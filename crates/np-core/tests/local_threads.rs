@@ -96,7 +96,12 @@ fn peak_rss_kib() -> u64 {
         .expect("test: VmHWM is present in /proc/self/status")
 }
 
-/// Kernel threads this process has right now — the check that a requested worker count actually became threads.
+/// Kernel threads this process has at the moment of sampling.
+///
+/// **Read it as context, not as evidence.** It is `2` in every row of both committed logs no matter how many workers
+/// were asked for, because ggml builds its pool per graph plan and releases it before this line runs — the same effect
+/// R6d round 2 recorded when it compared OpenMP configurations. Nothing asserts on it; the proof a count took effect is
+/// throughput.
 fn os_threads() -> u64 {
     let status =
         fs::read_to_string("/proc/self/status").expect("test: /proc/self/status is readable");
@@ -248,8 +253,9 @@ fn one_cell_of_the_thread_sweep() {
         });
     let load_s = t_load.elapsed().as_secs_f64();
 
-    // **The readback is the cell's first fact.** If llama.cpp clamps or ignores what it was told, the row says so and
-    // the sweep measures what actually ran; a policy built on "we asked for 12" would be fiction.
+    // **The readback is what the context was told**, copied verbatim by llama.cpp rather than measured — so it catches
+    // an option that never applied or a value that arrived truncated, and nothing more. Whether workers actually ran is
+    // answered by the rate below (49 tok/s at one worker against 462 at sixteen on this host).
     let (built_generation, built_batch) = model.threads();
     println!(
         "CELL       threads_requested={threads} readback_generation={built_generation} \
@@ -324,11 +330,15 @@ fn one_cell_of_the_thread_sweep() {
         os_threads()
     );
 
-    // A cell that could not ask for its worker count is not a measurement of that count. Kept as an assertion rather
-    // than prose so a clamped runtime fails the row instead of quietly producing one.
-    assert!(
-        built_batch >= 1,
-        "the context answered {built_batch} batch workers, which cannot be timed meaningfully"
+    // **A row whose label does not match what ran is not a row.** `>= 1` was the first version of this line and it was
+    // vacuous — no real context answers zero, so every cell passed it whether or not the request took effect. Equality
+    // is the assertion that can fail: llama.cpp copies what it is told and echoes it back (see
+    // `LoadedModel::threads`), which is exactly how an absurd request shows up — 3,000,000,000 came back as
+    // 2147483647 before the runtime aborted. That echo also means this cannot prove workers ran; only the rate can,
+    // and the sweep's whole point is that one worker and sixteen are 9× apart.
+    assert_eq!(
+        built_batch, threads,
+        "asked for {threads} batch workers and the context reports {built_batch}: this row measures something else"
     );
 }
 
@@ -378,4 +388,33 @@ fn asking_for_a_worker_count_is_answered_with_that_count() {
         generation >= 1 && batch >= 1,
         "a default context has no workers?"
     );
+
+    // **A count the runtime cannot be told is refused, not clamped.** A fence rather than a note, because the first
+    // version clamped: `u32::MAX` became `i32::MAX`, the readback echoed it back, and llama.cpp then died on a C++
+    // exception — `SIGABRT`, which no Rust test can catch and no user deserves. So the assertion worth making here is
+    // that this call returns an error the process is alive to print, and that the error names what it refused.
+    let absurd = np_core::local_model::load_with_options(
+        &path,
+        768,
+        np_core::local_model::LoadOptions {
+            threads: std::num::NonZeroU32::new(u32::MAX),
+        },
+    );
+    match absurd {
+        Err(np_core::embed::EmbedError::Unavailable(label)) => {
+            println!(
+                "REFUSAL    requested={} label={label:?} — still running, which is the point",
+                u32::MAX
+            );
+            assert!(
+                label.contains("worker count"),
+                "the refusal must name what it refused, not just fail: {label}"
+            );
+        }
+        Err(other) => panic!("an absurd worker count was refused for the wrong reason: {other:?}"),
+        Ok(model) => panic!(
+            "an absurd worker count was accepted; the context answered {:?}",
+            model.threads()
+        ),
+    }
 }
