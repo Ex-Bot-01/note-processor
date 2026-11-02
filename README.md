@@ -24,6 +24,7 @@ exist. That is the next round (see below).
 | `np models install <workspace> --id … --path … --dim … --sha256 …` | Put a model artifact under the workspace's model directory, verifying the digest before and after |
 | `np models hash <file>` | Print the SHA-256 of a file, in the format `install` expects |
 | `np models list <workspace>` | Show each model row and whether its artifact is actually present and matches |
+| `np models fetch <workspace> --id … [--member …] [--discard-marker]` | Download a **pinned** model's artifacts from the configured origin and record them — `fetch` is the only command that dials out, it accepts only bytes that hash to what this build pins, and `[models] base_url` (or `NP_MODELS_BASE_URL`) says where to ask. Offline? `install --path` still works |
 | `np embed <workspace>` | Embed what is owed for the configured model and write it to the database — a `local-model` build first checks the artifact against its recorded digest; `--json` reports the same four labelled outcomes this command exits with |
 
 Refusals are deliberate: an unreadable note is reported and left alone, never repaired; an install whose digest does not

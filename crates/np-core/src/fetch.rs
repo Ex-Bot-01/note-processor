@@ -382,6 +382,13 @@ pub fn fetch(
     transport: &dyn Transport,
     now: i64,
 ) -> Result<FetchReport, FetchError> {
+    // **The pin table answers first.** An id with no members is a typo or an unsupported model, and the answer it
+    // needs is "this build pins nothing for that"; asking about identity first would tell someone who mistyped an id
+    // that it has "pinned artifacts but no declared dim" — a sentence about a different problem, and the kind of
+    // message that sends a human to edit the wrong file.
+    if crate::pins::pinned(id).next().is_none() {
+        return Err(FetchError::NothingPinned { id: id.into() });
+    }
     let pinned =
         crate::pins::identity(id).ok_or_else(|| FetchError::NoIdentity { id: id.into() })?;
     let declaration = Declaration {
@@ -961,3 +968,147 @@ pub fn fetchable_ids() -> Vec<&'static str> {
 /// The primary member's name, spelled once ([`MAIN_FILE`]) so a fetch and an install cannot record the same artifact
 /// under two names.
 pub const PRIMARY_MEMBER: &str = MAIN_FILE;
+
+/// The production transport: plain HTTP GETs against an origin the operator configured.
+///
+/// **Lives behind cargo feature `fetch`, which is default-on** (§12's premises: a fetch path release builds compile
+/// out would defeat the amendment; opting out is an explicit `--no-default-features`). It is also the only place in
+/// the workspace that names a network client, and it holds one string — the origin — which arrives from
+/// `[models] base_url` / `NP_MODELS_BASE_URL`. Nothing here knows or cares which host that is; §12 rule 7 keeps the
+/// accepted bytes in the binary and the origin in config so a mirror is an edit, not a rebuild.
+///
+/// # The URL shape, and why the model id is not in it
+///
+/// `{base_url}/{filename}`, one path segment per member. The id is deliberately absent: [`crate::pins`] already names
+/// each member's file (`embeddinggemma-2-Q8_0.gguf`, `mmproj-embeddinggemma-2-Q8_0.gguf`), so a mirror lays files out
+/// however it likes — including under a path like `/ggml-org/embeddinggemma-2-GGUF/resolve/main`, which is what an
+/// origin has to look like for the upstream layout — and this module never assembles a repository path from an id,
+/// which would be one more way for a name from argv to reach a request line.
+#[cfg(feature = "fetch")]
+pub struct HttpTransport {
+    agent: ureq::Agent,
+    base_url: String,
+}
+
+#[cfg(feature = "fetch")]
+impl HttpTransport {
+    /// Dial the origin `config.models.base_url` resolved to.
+    ///
+    /// The value is assumed already validated by [`crate::config`] (scheme, authority, no credentials, one trailing
+    /// `/` removed). This does not re-validate: a second parser would be a second opinion about what a valid origin
+    /// is, and the config layer's refusal is the one the human sees.
+    pub fn new(base_url: impl Into<String>) -> Self {
+        HttpTransport {
+            // Timeouts exist because a fetch runs in front of a person. `timeout_read` bounds **one read**, not the
+            // transfer, so a nine-hundred-megabyte download over a slow link is not cut off — while a server that
+            // accepts the connection and then stops answering is reported instead of hanging until the terminal is
+            // closed. These two numbers are an operator-UX choice, not a measurement.
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(15))
+                .timeout_read(std::time::Duration::from_secs(60))
+                .build(),
+            base_url: base_url.into(),
+        }
+    }
+
+    /// Where a member's bytes are asked for. Public so a report can say *which file* was requested without printing
+    /// the origin — the caller composes `filename` and this module keeps the host to itself.
+    pub fn url_for(&self, member: &dyn MemberPin) -> String {
+        format!("{}/{}", self.base_url, member.filename())
+    }
+}
+
+#[cfg(feature = "fetch")]
+impl Transport for HttpTransport {
+    fn open(&self, member: &dyn MemberPin) -> Result<Body, FetchError> {
+        let url = self.url_for(member);
+        match self.agent.get(&url).call() {
+            Ok(response) => {
+                // `Content-Length` is the only size hint that means anything here. A chunked transfer omits it and
+                // §12 rule 12 wants "size unknown", never an invented denominator — and a `transfer-encoding: chunked`
+                // response decoded by the client would otherwise tempt us to report the decoded length as if the
+                // server had announced it.
+                let bytes_total = response
+                    .header("content-length")
+                    .and_then(|value| value.trim().parse::<u64>().ok());
+                Ok(Body {
+                    reader: Box::new(response.into_reader()),
+                    bytes_total,
+                })
+            }
+            // The class is the only thing that leaves this function. `ureq`'s own text names the URL and sometimes
+            // the resolved address; §12 rule 8 keeps both out of a report that lands in CI logs.
+            Err(err) => Err(FetchError::Transport {
+                id: member.id().to_string(),
+                member: member.member().to_string(),
+                class: http_class(&err),
+            }),
+        }
+    }
+}
+
+/// Map a client error onto one of [`failure_class`]'s classes.
+///
+/// Redirects are **followed** (`ureq`'s default, up to five hops) and that is safe here for a reason worth writing
+/// down: the digest pin decides acceptance, so a hop that changes host cannot substitute bytes this build would
+/// accept — it can only waste bandwidth. Refusing every redirect instead would break the ordinary upstream layout,
+/// where `/resolve/main/<file>` answers 302 pointing at a CDN. The `"redirect refused"` class in
+/// [`failure_class`] therefore stays defensive (a client that surfaces a hop as an error still gets a class), and no
+/// test claims it fires on this path, because on this path it does not.
+#[cfg(feature = "fetch")]
+fn http_class(err: &ureq::Error) -> String {
+    match err {
+        ureq::Error::Status(code, _) => failure_class(&format!("status code {code}")),
+        ureq::Error::Transport(transport) => failure_class(&transport.to_string()),
+    }
+}
+
+/// What `--discard-marker` did (§12 rule 4: the explicit door, and the only one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discarded {
+    /// Whether a marker file was removed. `false` means there was nothing to discard, which is a fact worth printing
+    /// rather than a silent success — the human ran the flag because they believed a fetch was stuck.
+    pub marker_removed: bool,
+    /// The `.part` files removed alongside it, named so a report can say what disappeared. Only the part **this**
+    /// marker names is touched: another id's partial download, or a part whose nonce no marker claims, is left for
+    /// the listing to report rather than deleted on a guess.
+    pub parts_removed: Vec<PathBuf>,
+}
+
+/// Remove this workspace's fetch marker for `id`, and the partial download it names.
+///
+/// **An unreadable marker is still removed.** §12 rule 4's advice is "if no fetch is running, delete this file and
+/// re-run", and a marker truncated mid-write is exactly the case where the human knows best whether a fetch is
+/// running — refusing to help because *this build* cannot parse the file would make the door unusable in the one
+/// situation it exists for. The part file, by contrast, can only be named if the marker could be read, so an
+/// unreadable marker discards the marker alone and leaves its bytes for `list` to report.
+pub fn discard_marker(models_dir: &Path, id: &str) -> Result<Discarded, FetchError> {
+    let path = models::marker_path(models_dir, id);
+    // Read the nonce **before** removing anything: after the unlink there is nothing left to ask.
+    let nonce = match models::fetch_state(models_dir, id) {
+        FetchState::Present(fields) => Some(fields.nonce),
+        _ => None,
+    };
+    let mut parts_removed = Vec::new();
+    if let Some(nonce) = nonce {
+        let part = models_dir.join(format!(".part.{id}.{nonce}"));
+        if fs::symlink_metadata(&part).is_ok() {
+            fs::remove_file(&part).map_err(|source| FetchError::Io {
+                path: part.clone(),
+                source,
+            })?;
+            parts_removed.push(part);
+        }
+    }
+    let marker_removed = match fs::remove_file(&path) {
+        Ok(()) => true,
+        // "No marker to discard" is not a failure: the flag says *if one exists*, and running it twice must not
+        // produce a different exit code than running it once.
+        Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => return Err(FetchError::Io { path, source }),
+    };
+    Ok(Discarded {
+        marker_removed,
+        parts_removed,
+    })
+}

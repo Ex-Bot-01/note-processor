@@ -743,6 +743,27 @@ rather than letting a round discover it:
 12. **`bytes_total` may be unknown.** Chunked transfer or a missing `Content-Length` leaves it undefined: the field is optional, and
     `list` prints "size unknown" rather than inventing a denominator.
 
+### As shipped (R7b, 2026-11-02): what landed, in what order, and one thing still owed
+
+Rules 1–8 and 12 are implemented and tested; the deviations a reader should not have to rediscover:
+
+* **Migration 9, not 8** (rule 10), because D12 took 8 on 2026-10-31 — see the correction inside rule 10.
+* **The identity is pinned too.** Rule 7 listed what a pin holds and stopped at bytes; writing a `models` row also needs
+  `dim` and both prefixes, so `pins::PINNED_IDENTITIES` carries them (768 / empty / empty for `embeddinggemma-2`) and an
+  id with pinned bytes but no declared identity **refuses to fetch** rather than guessing. Rule 10's "names are not
+  retrofittable" argument extends to this: a width chosen at download time is a declaration by nobody.
+* **`fetch` is default-on in both crates**, as the premises require, and `--no-default-features` removes the subcommand
+  from argv entirely rather than leaving a command that refuses at runtime.
+* **A marker is removed when the fetch that wrote it returns** — success or refusal. Rule 4 governs *someone else's*
+  marker; claiming one and then leaving it behind after dying would make `list` report a download nobody is running.
+  `--discard-marker` runs before the origin is required, so a machine with no mirror configured can still clean up.
+* **The transport follows redirects**, which rule 8 does not mention: the digest decides acceptance, so a hop that
+  changes host cannot substitute accepted bytes — it can only waste bandwidth. Refusing hops would break the ordinary
+  upstream layout (`/resolve/main/<file>` answers 302 pointing at a CDN).
+* **Still owed:** nothing has fetched the real pair end to end from the real origin on this project's side — the
+  transport is tested against a loopback server, and the pinned digests are checked against the file we hold for
+  `main` only. The first real `np models fetch` of the pair is its own evidence event and belongs in §14 when it runs.
+
 ### What this buys, and what it does not claim
 
 The marker answers the human's actual question — *is it downloading?* — in both cases that matter: no row yet (the listing-level section
