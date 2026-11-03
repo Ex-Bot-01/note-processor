@@ -218,7 +218,7 @@ pub struct LoadedModel {
 
 impl LoadedModel {
     /// The loaded model handle, for [`crate::vision`] — a projector is initialised **against** it and keeps a raw
-    /// pointer to it (`mtmd.cpp:1293`), which is why `VisionModel` borrows this type instead of taking a copy.
+    /// pointer to it (`mtmd.cpp:567`, `:615`), which is why `VisionModel` borrows this type instead of taking a copy.
     #[cfg(feature = "vision")]
     pub(crate) fn model_ptr(&self) -> NonNull<llama_model> {
         self.model

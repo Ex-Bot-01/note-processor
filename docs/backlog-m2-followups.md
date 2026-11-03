@@ -534,6 +534,25 @@ What these numbers can and cannot carry:
   no current golden exercises this shape, so only the new fixture and unit cases move) or amend R2 and add a golden that pins
   the accepted shape deliberately.
 
+## F26 — the image decoder accepts more formats than §7's extension list promises
+
+Found reviewing R7c Task 4 on 2026-11-03, and **measured rather than inferred**: a BMP payload handed to
+`mtmd_helper_bitmap_init_from_buf` came back a live bitmap and then a vector (80 image tokens) — reached through the
+artifact suite with the bytes under a `.png` name. `stb_image`, already inside `libmtmd`, decodes bmp, tga, gif, psd,
+pnm and qoi as well as png and jpeg. The webp and video arms need ffmpeg (`mtmd-helper.cpp:417-427`), which is **not
+installed on this host**, so whether they accept anything here is unmeasured (F18) — the claim in this entry is only
+about what was observed.
+
+What bounds the corpus today is §7's extension gate in `crate::media`, not the decoder. So a mislabelled file embeds,
+and search would report `kind=image` beside a path whose bytes are none of the three formats R7c promised (the human's
+scope decision: png/jpg/jpeg). Nothing is corrupted and no vector is wrong — the pixels are real — but the promise and
+the artefact disagree.
+
+Two ways out, and Task 5's discovery pass is where the choice belongs: sniff content in discovery (PNG signature, JPEG
+SOI marker; everything else refuses as `unsupported-format`, a class §8 already defines and `media.rs` already emits),
+or widen the published promise to what this decoder actually takes. The first costs one read of a few bytes per media
+file — the file is opened for hashing anyway — and keeps the promise small.
+
 ## Carried out of the M2a chunker review (2026-10-28)
 
 Two behaviours `crates/np-core/src/chunk.rs` defers in its own comments, recorded here rather than left in a docstring —

@@ -423,11 +423,12 @@ mod vision {
     /// `mtmd_helper_bitmap_init_from_buf` handed back a live bitmap for a PCM buffer and `mtmd_bitmap_is_audio`
     /// answered true, so the seam's named guard is what refuses it.
     ///
-    /// **What this case cannot show**, recorded because a mutation test said so: deleting that guard leaves this test
-    /// passing. The audio bitmap then reaches `mtmd_tokenize`, produces an `AUDIO` chunk, and the seam's unknown-chunk
-    /// arm refuses it with the same class. Two guards refuse audio on this pin, and §8 has no separate class that would
-    /// distinguish which one fired — so this assertion pins the *answer* (one class, no vector), not the mechanism.
-    /// The guard stays because it refuses before any encoder work happens and because its reason is in the code.
+    /// **This case does pin which guard fires**, and that is a change made after review: the fallback refusal (an `AUDIO`
+    /// chunk reaching `decode_chunks`, whose type this seam does not implement) answers `vision-unavailable`, not
+    /// `undecodable`. Deleting the named guard therefore turns this assertion red instead of letting it pass quietly —
+    /// verified by mutation on 2026-11-03, after an earlier version of both guards answered `undecodable` and the mutant
+    /// survived. The two classes differ on purpose: "these bytes are not an image" is a fact about the vault, "this seam
+    /// cannot serve it" is a bug in our crate.
     #[test]
     fn audio_bytes_refuse_because_this_seam_only_makes_image_vectors() {
         let (model_path, mmproj_path) = artifacts_or_not_coverage!();

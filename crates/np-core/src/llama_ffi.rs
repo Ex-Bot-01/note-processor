@@ -651,8 +651,15 @@ pub mod mtmd {
     /// Two handles, and both are ours if non-null. On this build the image path leaves `video_ctx` null
     /// (`mtmd-helper.cpp:387`, `:406`, `:414`), but `MTMD_VIDEO` is ON in our cmake cache (`LLAMA_SUBPROCESS`
     /// defaults ON, so the force-off at `tools/mtmd/CMakeLists.txt:9-12` does not fire) and a buffer that reaches
-    /// the video path would fill it. [`crate::vision`] frees both and refuses — which is also how §8's refusal of
-    /// webp and every other non-raster stays honest rather than becoming a vector.
+    /// the video path would fill it, so [`crate::vision`] frees both.
+    ///
+    /// **Do not read this mirror as the thing that keeps non-raster formats out.** What bounds the corpus is §7's
+    /// extension gate in `crate::media`, not this decoder: measured on 2026-11-03, a BMP payload reached
+    /// [`mtmd_helper_bitmap_init_from_buf`] through a `.png` filename and came back a live bitmap and then a vector
+    /// (80 tokens). `stb_image` inside `libmtmd` decodes bmp/tga/gif/psd/pnm/qoi as well as png and jpeg, and the webp
+    /// and video arms need ffmpeg (`mtmd-helper.cpp:417-427`), which is not installed on this host — so the promise
+    /// "png/jpg/jpeg only" is enforced where files are discovered, and a mislabelled file is a scope leak rather than
+    /// a decode failure.
     #[repr(C)]
     pub struct mtmd_helper_bitmap_wrapper {
         pub bitmap: *mut mtmd_bitmap,
@@ -668,7 +675,7 @@ pub mod mtmd {
         /// Load a projector against an **already loaded** text model. Null on failure (`mtmd.h:143-145`).
         ///
         /// Memory: the returned context is owned by us and freed with [`mtmd_free`], before the model dies — it
-        /// keeps a raw pointer to `text_model` (`mtmd.cpp:1293`, `ctx->model = text_model`). Unlike llama.cpp's own
+        /// keeps a raw pointer to `text_model` (member at `mtmd.cpp:567`, initialised at `:615`). Unlike llama.cpp's own
         /// loader this entry point catches `std::exception` and answers null (`mtmd.cpp:1256-1260`), so a bad
         /// projector is a refusal rather than a foreign exception crossing into Rust.
         pub fn mtmd_init_from_file(

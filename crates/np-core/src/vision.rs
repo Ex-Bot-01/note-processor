@@ -18,6 +18,14 @@
 //! * **The pooled row arrives un-normalised** (measured ‖v‖ = 180.17 and 206.77 on two probe images), so the seam divides by
 //!   the L2 norm itself. Skipping that still yields 768 finite components; only a norm assertion notices.
 //!
+//! **Which class a refusal carries.** §8 lists three and this seam uses exactly those three, split by *whose* fault it is.
+//! `undecodable` is about these bytes: empty, not a raster, audio, or the vision encoder refusing them.
+//! `vision-unavailable` is about this build and model pair: no projector, no vision graph, tokenization refused, a chunk
+//! shape or position scheme this seam does not implement, a decoder that would not take the rows, a pooled row that is not
+//! usable. `over-budget` is the measured cost. A refusal carries no prose (§12 rule 8), so the class itself has to say
+//! whether the file or the runtime is the problem — that is the whole difference between "re-encode it later" and
+//! "this machine cannot serve images".
+//!
 //! **No instruction prefix exists here.** §1.2: prefixes apply to text, and media must be passed bare — so there is no
 //! parameter that could take one, which is stronger than a rule telling callers not to use it.
 
@@ -43,13 +51,17 @@ pub const UNDECODABLE: &str = "undecodable";
 /// missing guard turns a refusal into an abort (`tests/local_vision.rs::a_large_image_either_embeds_within_the_window_or_refuses_over_budget`
 /// prints whichever branch a given image takes).
 pub const OVER_BUDGET: &str = "over-budget";
-/// This build has no vision graph, or the projector loaded beside this model does not carry one (§8).
+/// This **build and model pair** cannot serve the request (§8): the projector would not load beside this model, carries no
+/// vision graph, tokenized wrong, asked for a position scheme this seam does not implement, refused the rows, or pooled to
+/// nothing usable. Not a statement about the caller's bytes — that distinction is why this class exists next to
+/// [`UNDECODABLE`].
 pub const VISION_UNAVAILABLE: &str = "vision-unavailable";
 
 /// A projector loaded beside one [`LoadedModel`], able to turn image bytes into vectors of that model's width.
 ///
 /// Borrows the model because it must: `mtmd_init_from_file` keeps a raw pointer to the text model
-/// (`mtmd.cpp:1293`), so the projector cannot outlive it and the lifetime says so instead of a comment doing it.
+/// (`mtmd.cpp:567`, initialised at `:615`), so the projector cannot outlive it and the lifetime says so rather than a
+/// comment doing it.
 pub struct VisionModel<'model> {
     /// From [`mtmd::mtmd_init_from_file`]; freed in [`VisionModel::drop`], before the model it borrows dies.
     mctx: NonNull<mtmd::mtmd_context>,
@@ -78,8 +90,10 @@ impl<'model> VisionModel<'model> {
         let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
         // The whole feature is Linux-only in practice — `build.rs` refuses to build the runtime anywhere else (§14) —
         // and this is where that shows up in Rust: bytes-to-OsStr is a unix trait, so the spelling stays honest about it.
-        let path = CString::new(mmproj.as_os_str().as_bytes().to_vec())
-            .map_err(|_| EmbedError::Unavailable(UNDECODABLE.to_string()))?;
+        // A path containing a NUL cannot reach C at all. That is a fact about this machine's paths, not about any image,
+        // so it answers `vision-unavailable` rather than blaming bytes that were never read.
+        let path =
+            CString::new(mmproj.as_os_str().as_bytes().to_vec()).map_err(|_| unavailable())?;
 
         // SAFETY: `path` is a live NUL-terminated string; the params come from mtmd's own defaults with four fields
         // turned off (GPU, timings, warmup) and the token budget left at -1 = "read from the artifact".
@@ -136,8 +150,9 @@ impl<'model> VisionModel<'model> {
 
     /// One image's bytes to one L2-normalised row of [`LoadedModel::facts`]' output width.
     ///
-    /// Every refusal is a class from §8 and carries no path, no URL and none of mtmd's error text (§12 rule 8); mtmd
-    /// writes its own detail to stderr, which is where a filename belongs.
+    /// Every refusal is one of §8's three classes — see this module's header for how they are split — and carries no path,
+    /// no URL and none of mtmd's error text (§12 rule 8); mtmd writes its own detail to stderr, which is where a filename
+    /// belongs.
     pub fn embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError> {
         let undecodable = || EmbedError::Unavailable(UNDECODABLE.to_string());
         if bytes.is_empty() {
@@ -169,10 +184,10 @@ impl<'model> VisionModel<'model> {
         // bitmap here with `mtmd_bitmap_is_audio` answering true. Refusing it by name keeps the reason in the code and stops
         // the encoder being run on a modality nothing downstream knows how to store.
         //
-        // Not the only guard, and this file does not pretend otherwise: remove this arm and the same bytes are refused again
-        // one step later, when `mtmd_tokenize` hands back an `AUDIO` chunk that the match in [`VisionModel::decode_chunks`]
-        // does not recognise. Same class either way, so no test here can tell the two apart (§8 has no audio class); see
-        // `tests/local_vision.rs::audio_bytes_refuse_because_this_seam_only_makes_image_vectors`.
+        // Not the only guard: remove this arm and the same bytes are refused again one step later, when `mtmd_tokenize`
+        // hands back an `AUDIO` chunk that [`VisionModel::decode_chunks`] does not recognise. The two answer differently on
+        // purpose — `undecodable` here, `vision-unavailable` there — so the artifact test pins *which* guard fired: deleting
+        // this one makes that case fail instead of passing quietly (verified by mutation on 2026-11-03).
         // SAFETY: `bitmap` is live and owned by us until the free below.
         let is_audio = unsafe { mtmd::mtmd_bitmap_is_audio(bitmap.as_ptr()) };
         if is_audio {
@@ -194,11 +209,15 @@ impl<'model> VisionModel<'model> {
         &mut self,
         bitmap: NonNull<mtmd::mtmd_bitmap>,
     ) -> Result<Vector, EmbedError> {
-        let undecodable = || EmbedError::Unavailable(UNDECODABLE.to_string());
+        let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
 
         let chunks = unsafe { mtmd::mtmd_input_chunks_init() };
         if chunks.is_null() {
-            return Err(undecodable());
+            // Not expected: C does `new mtmd_input_chunks` with no `try` (`mtmd.cpp:2872-2874`), so an allocation failure
+            // throws and aborts the process rather than handing back null. The check stays because a null list would be
+            // dereferenced by every call below it, and because reading the mirror as "returns null on failure" is exactly
+            // the kind of assumption that should cost nothing to survive.
+            return Err(unavailable());
         }
 
         // The prompt is the marker and nothing else: no instruction prefix (§1.2), no surrounding prose.
@@ -219,7 +238,11 @@ impl<'model> VisionModel<'model> {
         if tokenized != 0 {
             // SAFETY: the list is ours whatever happened to its contents, and this is its only free.
             unsafe { mtmd::mtmd_input_chunks_free(chunks) };
-            return Err(undecodable());
+            // Neither answer is about the caller's bytes. 1 means the bitmap count did not match the marker count
+            // (`mtmd.cpp:1453-1457`, `:1492-1496`) — this prompt holds exactly one marker and we pass exactly one bitmap,
+            // so a 1 here is a bug in this crate. 2 is a caught `std::exception` from inside the tokenizer
+            // (`mtmd.cpp:2073-2078`). Both are "this pair cannot serve it", which is what [`VISION_UNAVAILABLE`] means.
+            return Err(unavailable());
         }
 
         let outcome = self.decode_chunks(chunks);
@@ -235,6 +258,7 @@ impl<'model> VisionModel<'model> {
         chunks: *mut mtmd::mtmd_input_chunks,
     ) -> Result<Vector, EmbedError> {
         let undecodable = || EmbedError::Unavailable(UNDECODABLE.to_string());
+        let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
 
         // SAFETY: `chunks` is live and non-null for the whole loop; every chunk pointer comes from it.
         let count = unsafe { mtmd::mtmd_input_chunks_size(chunks) };
@@ -248,10 +272,14 @@ impl<'model> VisionModel<'model> {
             let n_tokens = unsafe { mtmd::mtmd_input_chunk_get_n_tokens(chunk) };
             match kind {
                 mtmd::MTMD_INPUT_CHUNK_TYPE_IMAGE => {
-                    if n_tokens == 0 || image_rows.is_some() {
-                        // Zero tokens is not an encode; two images would need a pooling decision §1.2 never made,
-                        // because this seam is handed exactly one bitmap at a time.
+                    if n_tokens == 0 {
+                        // The decoder produced no patches for these pixels: the encode failed on the bytes' behalf.
                         return Err(undecodable());
+                    }
+                    if image_rows.is_some() {
+                        // Two image chunks would need a pooling decision §1.2 never made, because this seam is handed one
+                        // bitmap at a time. That is a limit of this seam, not a fault in the file.
+                        return Err(unavailable());
                     }
                     // SAFETY: `mctx` live, `chunk` belongs to it. This runs the vision encoder alone — no text context,
                     // no KV — which is why an image never disturbs the text path's state.
@@ -263,11 +291,13 @@ impl<'model> VisionModel<'model> {
                     // are copied here rather than referenced later.
                     let raw = unsafe { mtmd::mtmd_get_output_embd(self.mctx.as_ptr()) };
                     if raw.is_null() {
-                        return Err(undecodable());
+                        // The encoder said it succeeded and then handed back nothing — the runtime contradicting itself,
+                        // which is not an answer about these bytes.
+                        return Err(unavailable());
                     }
                     // Rows are `n_embd_inp` wide (§1.2's 512), not the stored width — that is what the decoder eats and
                     // what pooling then projects up to 768 inside the model.
-                    let needed = self.n_inp.checked_mul(n_tokens).ok_or_else(undecodable)?;
+                    let needed = self.n_inp.checked_mul(n_tokens).ok_or_else(unavailable)?;
                     let mut rows = Vec::with_capacity(needed);
                     // SAFETY: mtmd promises `n_inp * n_tokens` floats at this pointer for this chunk.
                     rows.extend_from_slice(unsafe { std::slice::from_raw_parts(raw, needed) });
@@ -277,7 +307,7 @@ impl<'model> VisionModel<'model> {
                     // rather than decoding it with silently wrong positions. Neither does this seam.
                     // SAFETY: `mctx` live; a non-null chunk asks about that chunk.
                     if unsafe { mtmd::mtmd_decode_use_mrope(self.mctx.as_ptr()) } {
-                        return Err(undecodable());
+                        return Err(unavailable());
                     }
                     // Whether *this* chunk needs a non-causal mask — asked, not assumed, so a re-pin that changes the
                     // answer changes our behaviour instead of leaving a stale hard-coded `false`.
@@ -287,22 +317,32 @@ impl<'model> VisionModel<'model> {
                     image_rows = Some((rows, n_tokens, non_causal));
                 }
                 mtmd::MTMD_INPUT_CHUNK_TYPE_TEXT => {
-                    // The marker's own text (`<|image>` … `<image|>`, two tokens each side on this pin) is tokenized
-                    // but **not** decoded: §1.2 embeds media on its own, and the spike note measured comparability with
-                    // exactly this sequence — image rows alone through the decoder, pooled at sequence 0. Decoding the
-                    // wrappers too would shift every position and change what was measured.
+                    // The marker's own wrappers — `<|image>` before, `<image|>` after, **two tokens each side** on this pin
+                    // (spike note: `chunk[0] text n_tokens=2`, `chunk[2] text n_tokens=2`) — are tokenized but deliberately
+                    // **not** decoded. §1.2 embeds media on its own and the spike measured comparability with exactly this
+                    // sequence: image rows alone through the decoder, pooled at sequence 0. Decoding the wrappers would
+                    // shift every position and change what was measured; reading their token ids is not possible through
+                    // this mirror anyway (`mtmd_input_chunk_get_tokens_text` returns lossy UTF-8, `mtmd.h:266-269`).
+                    //
+                    // So `n_tokens` here is expected to be non-zero, and skipping it is the design rather than an
+                    // oversight: a prompt we wrote ourselves, containing nothing but the marker, cannot carry note text.
                     let _ = n_tokens;
                 }
-                _ => return Err(undecodable()),
+                _ => {
+                    // An AUDIO chunk (this projector accepts audio; §3 says we do not) or a type this pin added after the
+                    // mirror was written. The named audio guard in [`VisionModel::embed_image`] normally refuses audio
+                    // first — measured here on 2026-11-03, `mtmd_bitmap_is_audio` answered true for PCM — so reaching
+                    // this arm with audio means that guard stopped working, and the class differs on purpose: a refusal
+                    // that says "this seam cannot serve it" instead of "these bytes did not decode" is the difference
+                    // between a bug in our crate and a bad file in someone's vault.
+                    return Err(unavailable());
+                }
             }
         }
-        let Some((rows, image_tokens, non_causal)) = image_rows else {
-            return Err(undecodable());
-        };
-
-        if image_tokens == 0 {
-            return Err(undecodable());
-        }
+        // Every image chunk stored above has a non-zero token count by construction, so the only ways to leave this loop
+        // without rows are "no image chunk at all" and "the tokenizer produced something we did not recognise" — both
+        // answers about this pair, not about the file.
+        let (rows, image_tokens, non_causal) = image_rows.ok_or_else(unavailable)?;
 
         // Cost is recorded for *this* attempt, before the decode that might fail: §8's rule reads the number after an
         // encode, and an over-budget refusal with no number attached would leave the report nothing to say.
@@ -322,11 +362,8 @@ impl<'model> VisionModel<'model> {
         n_tokens: usize,
         non_causal: bool,
     ) -> Result<Vec<f32>, EmbedError> {
-        let undecodable = || EmbedError::Unavailable(UNDECODABLE.to_string());
+        let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
 
-        // One embedding per token, all in sequence 0, positions contiguous from zero. `seq_id` is an array of pointers;
-        // every row belongs to the same single sequence, so they all point at the same id — which is what llama.cpp's
-        // own batch helper produces for `n_seq_max = 1`.
         // One sequence for the whole batch, so every row's `seq_id` pointer targets this same id. It is declared
         // `mut` and passed as a mutable pointer because that is what `llama_batch` asks for; llama.cpp only reads it.
         let mut shared_seq: llama_ffi::llama_seq_id = 0;
@@ -368,13 +405,16 @@ impl<'model> VisionModel<'model> {
             rc
         };
         if decoded != 0 {
-            return Err(undecodable());
+            // The text context refused rows it was given (`llama.h:1002` lists the reasons — no KV slot, batch too large,
+            // eval failed). None of them is a statement about the file.
+            return Err(unavailable());
         }
 
         // SAFETY: `ctx` live; the pooled buffer belongs to it and is copied immediately.
         let pooled = unsafe { llama_ffi::llama_get_embeddings_seq(ctx, 0) };
         if pooled.is_null() {
-            return Err(undecodable());
+            // A decode that succeeded and pooled to nothing is the runtime contradicting itself.
+            return Err(unavailable());
         }
         // SAFETY: the context promises `n_embd_out` floats for sequence 0 when pooling is on (the artifact answers
         // MEAN, which §1.2's recipe expects).
@@ -387,7 +427,8 @@ impl<'model> VisionModel<'model> {
             .sum::<f64>()
             .sqrt();
         if !norm.is_finite() || norm == 0.0 {
-            return Err(undecodable());
+            // Not normalisable, so not a vector — and the pixels decoded fine to get here.
+            return Err(unavailable());
         }
         let scale = 1.0 / norm as f32;
         for component in &mut vector {
@@ -400,7 +441,7 @@ impl<'model> VisionModel<'model> {
 impl Drop for VisionModel<'_> {
     fn drop(&mut self) {
         // SAFETY: the handle came from `mtmd_init_from_file` and is freed exactly once, here. The borrowed model outlives
-        // this because the borrow checker says so — `mtmd_context` keeps a raw pointer to it (`mtmd.cpp:1293`).
+        // this because the borrow checker says so — `mtmd_context` keeps a raw pointer to it (`mtmd.cpp:567`, `:615`).
         unsafe { mtmd::mtmd_free(self.mctx.as_ptr()) };
     }
 }
