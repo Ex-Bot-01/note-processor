@@ -217,6 +217,20 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
+    /// The loaded model handle, for [`crate::vision`] — a projector is initialised **against** it and keeps a raw
+    /// pointer to it (`mtmd.cpp:1293`), which is why `VisionModel` borrows this type instead of taking a copy.
+    #[cfg(feature = "vision")]
+    pub(crate) fn model_ptr(&self) -> NonNull<llama_model> {
+        self.model
+    }
+
+    /// The decoder context, for [`crate::vision`]'s image span. Same ownership rule as [`Self::model_ptr`]: the
+    /// context outlives the seam because the seam borrows it.
+    #[cfg(feature = "vision")]
+    pub(crate) fn ctx_ptr(&self) -> NonNull<llama_context> {
+        self.ctx
+    }
+
     /// The numbers the model and context answered. Copy them out freely — nothing here borrows C memory.
     pub fn facts(&self) -> ModelFacts {
         self.facts
