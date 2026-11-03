@@ -12,6 +12,9 @@ pub mod hash;
 pub mod index_names;
 pub mod items;
 pub mod links;
+// Media discovery is pure Rust over bytes with no runtime behind it, so it carries no feature gate: the resolver
+// runs on every `np embed` and refuses with a class, never with a model (`docs/design-m2-image-embeddings.md` §7).
+pub mod media;
 // The FFI mirror of the pinned llama.cpp header, compiled only when something exists to link it to:
 // `build.rs` hands the linker four static archives under this feature and refuses to build a source
 // tree that is not the pin (`docs/design-m2-local-embeddings.md` §14).

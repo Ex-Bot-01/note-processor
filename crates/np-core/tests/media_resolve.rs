@@ -235,7 +235,7 @@ fn an_encoded_slash_still_escapes() {
     let ws = Workspace::new();
     ws.write_outside("outside.png");
     assert_eq!(
-        resolve_image(ws.root(), NOTE, b"%2e%2e/%2e%2e/outside.png"),
+        resolve_image(ws.root(), NOTE, b"%2e%2e/%2e%2e/%2e%2e/outside.png"),
         Err(MediaRefusal::OutsideWorkspace),
         "an encoded parent step escapes the workspace just the same"
     );
@@ -300,7 +300,11 @@ fn two_spellings_of_one_path_agree() {
     // Mutation: keeping `.` and `..` in the joined path instead of walking components, so `./a/../b.png` and `b.png`
     // become two keys for one file — which is one media row per spelling.
     let ws = Workspace::new();
-    ws.write("notes/deep/a/b.png", b"png");
+    // Normalisation is a walk over components, not a walk down the tree: `a/` is created so the spelling looks like
+    // what an author would write, and the file lives where the two spellings meet.
+    fs::create_dir_all(ws.join("notes/deep/a"))
+        .expect("test setup: the directory the link steps into");
+    ws.write("notes/deep/b.png", b"png");
     let walked = resolve_image(ws.root(), NOTE, b"./a/../b.png").expect("./ then .. then the name");
     let direct = resolve_image(ws.root(), NOTE, b"b.png").expect("the same file spelled directly");
     assert_eq!(walked.rel_bytes, direct.rel_bytes);
@@ -377,9 +381,19 @@ fn a_path_with_no_extension_is_not_a_format() {
     // Mutation: reading the extension as "after the last dot anywhere in the target", which finds `png` in
     // `archive.png/README`, or treating a dot-only name (`.png`, a hidden file) as if it had a format.
     let ws = Workspace::new();
-    for target in ["README", ".png", "no-extension", "a.png/README"] {
+    // `notes/deep` is a real directory: a name with no extension is refused for having no extension, before anything
+    // asks whether it exists — the order §8's table implies for `.gif` applies to a bare name too. The note sits at
+    // the root so every target below is spelled against the workspace itself.
+    fs::create_dir_all(ws.join("notes/deep")).expect("test setup: a directory to name");
+    for target in [
+        "README",
+        ".png",
+        "no-extension",
+        "a.png/README",
+        "notes/deep",
+    ] {
         assert_eq!(
-            resolve_image(ws.root(), NOTE, target.as_bytes()),
+            resolve_image(ws.root(), b"top.md", target.as_bytes()),
             Err(MediaRefusal::UnsupportedFormat),
             "{target} names no accepted raster"
         );
@@ -402,17 +416,23 @@ fn a_missing_file_refuses_missing_target() {
 
 #[test]
 fn a_target_that_names_no_file_refuses_missing_target() {
-    // Mutation: an empty or self-only target being treated as the workspace root's own entry — or its `mime` read
-    // off some other component of the path.
+    // Mutation: an empty or self-only target being walked into the workspace root's own entry and then having its
+    // `mime` read off some other component of the path.
     let ws = Workspace::new();
     ws.write("notes/deep/keep.png", b"png");
-    for target in ["", ".", "./", "a/../.."] {
+    for target in ["", ".", "./", ".//."] {
         assert_eq!(
             resolve_image(ws.root(), NOTE, target.as_bytes()),
             Err(MediaRefusal::MissingTarget),
             "{target:?} names no file"
         );
     }
+
+    // The same shape reached by walking: `a/..` from a root-level note is the workspace root, a directory.
+    assert_eq!(
+        resolve_image(ws.root(), b"top.md", b"a/.."),
+        Err(MediaRefusal::MissingTarget)
+    );
 }
 
 #[test]
