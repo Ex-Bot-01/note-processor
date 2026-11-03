@@ -10,12 +10,23 @@
 //! With the feature on it does four things, in this order, and refuses loudly at each failure:
 //!
 //! 1. reads `third_party/llama-cpp.toml` — the pin, which is the only place the tag, the digest and
-//!    the CMake options are written;
+//!    the CMake options are written — then appends whatever the feature shape asks for ([`Shape`]);
 //! 2. finds a source tree (`NP_LLAMA_CPP_SRC`, else `.vendor/llama.cpp-<tag>/`) and **verifies it is
 //!    the pin**: the digest of `include/llama.h` (the file our FFI mirror was copied from), then the
 //!    version numbers, then the architecture token — never a directory name;
-//! 3. configures and builds target `llama` with cmake;
-//! 4. emits the link search paths, the four static archives, and the system libraries they need.
+//! 3. configures and builds the shape's cmake targets (`llama`, plus `mtmd` under `vision`);
+//! 4. emits the link search paths, the shape's static archives, and the system libraries they need.
+//!
+//! ## The two shapes
+//!
+//! `local-model` builds one target and links four archives. `local-model,vision` adds one cmake option
+//! (`LLAMA_BUILD_MTMD=ON`, which v0.8.0 defaults to off — that is why a text-only build has never compiled
+//! `tools/mtmd`), one target (`mtmd`) and **two** archives: `libmtmd.a` needs `hash_sha256_hex`, which lives in
+//! `libvendor-hash.a`. Measured, not inferred — `crates/np-core/tests/probes/vision-spike-2026-11-02.md` links six
+//! archives and records the `undefined reference to hash_sha256_hex[abi:cxx11]` failure of the five-archive attempt.
+//! The option joins the pin's list before the configure, so the machinery below still covers it: an option cmake filed
+//! as `UNINITIALIZED` is a refusal either way, and an option set that changed still forces a fresh directory rather
+//! than a reconfigure that cannot undo a deletion.
 //!
 //! Two rules it exists to enforce:
 //!
@@ -43,12 +54,31 @@ use std::process::Command;
 /// script reads `tag`/`url`/`sha256`; here we read `tag` and `[cmake]`).
 const PIN: &str = "third_party/llama-cpp.toml";
 
-/// The cmake target that produces everything we link. Building `install`, or the default target,
-/// would compile binaries `np` never contains.
+/// The cmake target that produces everything a text-only build links, and the name a build directory inside
+/// `OUT_DIR` carries. Building `install`, or the default target, would compile binaries `np` never contains;
+/// [`Shape::targets`] is what says whether `mtmd` travels with it.
 const TARGET: &str = "llama";
 
-/// Static archives, in the order GNU ld resolves them — **dependents before dependencies**, left to right:
-/// `llama` → `ggml` → `ggml-cpu` → `ggml-base`.
+/// The extra target `vision` builds: llama.cpp's multimodal library. Its `CMakeLists.txt` is only read when
+/// [`MTMD_CMAKE_OPTION`] is ON (`CMakeLists.txt:267-269` of the pinned tree).
+const MTMD_TARGET: &str = "mtmd";
+
+/// The cmake option that makes `tools/mtmd` exist. The pinned tree declares it as
+/// `option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)`, so it lands in the cache with a real
+/// type and [`verify_options_understood`] can vouch for it.
+const MTMD_CMAKE_OPTION: (&str, &str) = ("LLAMA_BUILD_MTMD", "ON");
+
+/// `libmtmd.a`, first in link order because it is a dependent of `llama`.
+const MTMD_ARCHIVE: &str = "mtmd";
+
+/// `libvendor-hash.a`, last in link order: nothing depends on it and it is here only because `libmtmd.a` names
+/// `hash_sha256_hex`. The target is `vendor-hash` (`vendor/hash/CMakeLists.txt:1`), which is the archive's file name,
+/// not the `vendor::hash` alias `mtmd` links against.
+const HASH_ARCHIVE: &str = "vendor-hash";
+
+/// Static archives for a text-only build, in the order GNU ld resolves them — **dependents before dependencies**,
+/// left to right: `llama` → `ggml` → `ggml-cpu` → `ggml-base`. [`Shape::archives`] puts [`MTMD_ARCHIVE`] in front of
+/// this list and [`HASH_ARCHIVE`] behind it when the feature asks for vision.
 ///
 /// The previous order (`llama, ggml, ggml-base, ggml-cpu`) put the pure dependency ahead of a dependent and linked
 /// anyway, which meant ld had already pulled the base objects `libggml-cpu.a` needs — symbol-overlap luck, not a
@@ -91,13 +121,78 @@ fn main() {
         return;
     }
 
-    if let Err(problem) = link_pinned_llama() {
+    if let Err(problem) = link_pinned_llama(&Shape::from_features()) {
         panic!("{problem}");
     }
 }
 
+/// What the enabled cargo features ask this build to be: the text-only runtime, or that plus `mtmd`.
+///
+/// One type rather than a bool threaded through four call chains, because the three differences between the shapes —
+/// an option, a target, two archives — have to stay in step. A build that configured `LLAMA_BUILD_MTMD=ON` and then
+/// linked four archives fails at link time with a message about missing symbols instead of about features; a build
+/// that built `mtmd` without being asked to pays for C++ nothing links.
+struct Shape {
+    vision: bool,
+}
+
+impl Shape {
+    fn from_features() -> Self {
+        // Cargo declares `vision = ["local-model"]`, so there is no shape with vision on and the runtime off; the
+        // local-model check already happened in [`main`].
+        Self {
+            vision: env::var_os("CARGO_FEATURE_VISION").is_some(),
+        }
+    }
+
+    /// cmake targets to build, in dependency order (`mtmd` links `llama`, so naming both is enough — and naming only
+    /// `mtmd` would leave the archive this file's whole existence depends on unbuilt).
+    fn targets(&self) -> &'static [&'static str] {
+        if self.vision {
+            &[TARGET, MTMD_TARGET]
+        } else {
+            &[TARGET]
+        }
+    }
+
+    /// The `-D` entries this shape adds to the pin's `[cmake]` table. They are deliberately **not** written into
+    /// `third_party/llama-cpp.toml`: that file records how every shape builds the tree, and an option only one shape
+    /// wants belongs with the shape. [`Pin::read`] appends them, so the option stamp and the UNINITIALIZED check see
+    /// them exactly as they see the pinned ones.
+    fn extra_options(&self) -> &'static [(&'static str, &'static str)] {
+        if self.vision {
+            &[MTMD_CMAKE_OPTION]
+        } else {
+            &[]
+        }
+    }
+
+    /// Archives in link order: dependents before dependencies (see [`ARCHIVES`] for the measurement that fixed the
+    /// text-only order, and this file's header for why a vision link is six rather than five).
+    fn archives(&self) -> Vec<&'static str> {
+        if self.vision {
+            vec![
+                MTMD_ARCHIVE,
+                ARCHIVES[0],
+                ARCHIVES[1],
+                ARCHIVES[2],
+                ARCHIVES[3],
+                HASH_ARCHIVE,
+            ]
+        } else {
+            ARCHIVES.to_vec()
+        }
+    }
+
+    /// Name for the build directory inside `OUT_DIR`, so two shapes on one disk are distinguishable. Cargo already
+    /// gives each feature set its own `OUT_DIR`; this keeps the paths honest rather than adding a second cache.
+    fn build_dir_name(&self) -> String {
+        format!("llama-cpp-{}", self.targets().join("-"))
+    }
+}
+
 /// Everything the feature-on path does, so one `Err(String)` becomes one honest panic.
-fn link_pinned_llama() -> Result<(), String> {
+fn link_pinned_llama(shape: &Shape) -> Result<(), String> {
     // Every variable read below gets a `rerun-if-env-changed`, so re-pointing the build at a
     // different tree or a different cmake is enough to make cargo ask us again.
     // `CC`/`CXX` are here because cmake caches the compiler it found first: switching compilers by env
@@ -137,12 +232,23 @@ fn link_pinned_llama() -> Result<(), String> {
 
     let pin_path = root.join(PIN);
     println!("cargo::rerun-if-changed={}", pin_path.display());
-    let pin = Pin::read(&pin_path)?;
+    let pin = Pin::read(&pin_path, shape.extra_options())?;
     eprintln!(
-        "np-core: building llama.cpp {} for `local-model` ({} CMake options from {})",
+        "np-core: building llama.cpp {} for `local-model{}` ({} CMake options from {}{}; targets {:?})",
         pin.tag,
+        if shape.vision {
+            ",vision"
+        } else {
+            ""
+        },
         pin.options.len(),
-        PIN
+        PIN,
+        if shape.vision {
+            ", plus the vision shape's LLAMA_BUILD_MTMD"
+        } else {
+            ""
+        },
+        shape.targets(),
     );
 
     let source = resolve_source(&root, &pin)?;
@@ -161,10 +267,10 @@ fn link_pinned_llama() -> Result<(), String> {
     check_that_this_is_the_pin(&source, &pin)?;
 
     let cmake = cmake_command()?;
-    let build_dir = choose_build_dir(&source, &out_dir);
+    let build_dir = choose_build_dir(&source, &out_dir, shape);
     configure(&cmake, &source, &build_dir, &out_dir, &pin)?;
-    compile(&cmake, &build_dir)?;
-    emit_link_flags(&build_dir)
+    compile(&cmake, &build_dir, shape.targets())?;
+    emit_link_flags(&build_dir, shape)
 }
 
 /// The C++ source to build: `NP_LLAMA_CPP_SRC` if set (offline work, CI caches, and the case where a
@@ -338,12 +444,16 @@ fn cmake_command() -> Result<OsString, String> {
 
 /// Reuse a build directory the source tree already has — that is how `NP_LLAMA_CPP_SRC` avoids
 /// recompiling C++ on every cargo run — and otherwise build inside `OUT_DIR`, where cargo owns it.
-fn choose_build_dir(source: &Path, out_dir: &Path) -> PathBuf {
+///
+/// An in-tree directory is shared by both shapes, which is one reason [`Shape::extra_options`] feeds the option stamp:
+/// a cache configured without `LLAMA_BUILD_MTMD` cannot serve a vision build, and the stamp difference is what says so
+/// — followed by [`configure`]'s refusal to delete a directory that is not ours.
+fn choose_build_dir(source: &Path, out_dir: &Path, shape: &Shape) -> PathBuf {
     let in_tree = source.join("build");
     if in_tree.join("CMakeCache.txt").is_file() {
         return in_tree;
     }
-    out_dir.join(format!("llama-cpp-{}", TARGET))
+    out_dir.join(shape.build_dir_name())
 }
 
 /// Two paths name one directory when both exist and resolve the same — `/tmp` behind a symlink is ordinary on
@@ -561,8 +671,9 @@ fn verify_options_understood(build_dir: &Path, pin: &Pin) -> Result<(), String> 
         .collect();
     if !ignored.is_empty() {
         return Err(format!(
-            "cmake accepted these options from {} but filed them as UNINITIALIZED, meaning this revision \n  \
-             has no such option — the build ran with upstream's default instead:\n    {}\n  \
+            "cmake accepted these options from {} (or from this feature shape) but filed them as \n  \
+             UNINITIALIZED, meaning this revision has no such option — the build ran with upstream's \n  \
+             default instead:\n    {}\n  \
              Either the option was renamed upstream (find the new name and re-pin it) or it is misspelled. \n  \
              Leaving them in place would let {} keep claiming settings that nothing applied.",
             PIN,
@@ -573,15 +684,18 @@ fn verify_options_understood(build_dir: &Path, pin: &Pin) -> Result<(), String> 
     Ok(())
 }
 
-fn compile(cmake: &OsString, build_dir: &Path) -> Result<(), String> {
-    let args = [
-        "--build".to_string(),
-        build_dir.display().to_string(),
-        "--target".to_string(),
-        TARGET.to_string(),
-        "--parallel".to_string(),
-        jobs().to_string(),
-    ];
+/// Build the shape's targets with cmake.
+///
+/// `--target` is repeated per target rather than given a positional list: that is the spelling cmake documents for
+/// several targets, and it keeps the text-only command line byte-identical to what it was before `vision` existed.
+fn compile(cmake: &OsString, build_dir: &Path, targets: &[&str]) -> Result<(), String> {
+    let mut args: Vec<String> = vec!["--build".to_string(), build_dir.display().to_string()];
+    for target in targets {
+        args.push("--target".to_string());
+        args.push(target.to_string());
+    }
+    args.push("--parallel".to_string());
+    args.push(jobs().to_string());
     run(cmake, &args, "build").map(drop)
 }
 
@@ -643,11 +757,13 @@ fn indent(text: &str) -> String {
     text.lines().map(|line| format!("  | {line}\n")).collect()
 }
 
-/// Emit the link instructions: four static archives from our build, then the libraries they need.
-fn emit_link_flags(build_dir: &Path) -> Result<(), String> {
+/// Emit the link instructions: the shape's static archives from our build, then the libraries they need.
+fn emit_link_flags(build_dir: &Path, shape: &Shape) -> Result<(), String> {
+    let archives = shape.archives();
+    let built = shape.targets().join(", ");
     let mut searched: Vec<PathBuf> = Vec::new();
-    for name in ARCHIVES {
-        let archive = find_archive(build_dir, name)?;
+    for name in &archives {
+        let archive = find_archive(build_dir, name, &built)?;
         let dir = archive
             .parent()
             .ok_or_else(|| format!("{} has no parent directory", archive.display()))?;
@@ -671,7 +787,7 @@ fn emit_link_flags(build_dir: &Path) -> Result<(), String> {
         println!("cargo::rustc-link-lib=dylib={OPENMP_LIB}");
     }
     eprintln!(
-        "np-core: linked [{ARCHIVES:?}] + system libs (OpenMP: {})",
+        "np-core: linked {archives:?} + system libs (OpenMP: {})",
         if openmp_on { "on" } else { "off" }
     );
     Ok(())
@@ -680,7 +796,10 @@ fn emit_link_flags(build_dir: &Path) -> Result<(), String> {
 /// Find `lib<name>.a` (or `<name>.lib`) under the build directory. Recursive rather than hardcoded to
 /// `src/` and `ggml/src/`, because those paths are this revision's layout, not a promise — but bounded
 /// so a stray tree cannot make a build script wander forever.
-fn find_archive(build_dir: &Path, name: &str) -> Result<PathBuf, String> {
+///
+/// `built` names the target set inside a refusal, so a missing `libmtmd.a` reads as "this shape asked for mtmd and the
+/// build did not produce it" rather than as a search-path mystery.
+fn find_archive(build_dir: &Path, name: &str, built: &str) -> Result<PathBuf, String> {
     let names = [format!("lib{name}.a"), format!("{name}.lib")];
     let mut found: Vec<PathBuf> = Vec::new();
     let mut queue: Vec<PathBuf> = vec![build_dir.to_path_buf()];
@@ -722,10 +841,10 @@ fn find_archive(build_dir: &Path, name: &str) -> Result<PathBuf, String> {
     found.into_iter().next().ok_or_else(|| {
         format!(
             "the build produced no {name} archive under {}.\n  \
-             It was configured with the options in {PIN} and built with `--target {TARGET}`; \
-             if that target ever stops producing this library, the pin needs a new archive list — \
-             not a silent skip.",
-            build_dir.display()
+             It was configured with the options in {PIN} (plus this feature shape's own) and built with `--target` \
+             for [{built}]; if that target set ever stops producing this library, the archive list in build.rs needs \
+             to change deliberately — not a silent skip.",
+            build_dir.display(),
         )
     })
 }
@@ -749,7 +868,11 @@ impl Pin {
     /// (build-dependencies are dependencies, and §14's rule is that we add none to avoid bindgen).
     /// Anything that is not that shape is refused rather than ignored: a silently dropped option is a
     /// binary built with settings nobody wrote down.
-    fn read(path: &Path) -> Result<Self, String> {
+    ///
+    /// `extra` is the feature shape's own options ([`Shape::extra_options`], e.g. `LLAMA_BUILD_MTMD=ON`), appended
+    /// after the pinned ones so that one list describes what cmake is about to be told — which is what
+    /// [`Pin::option_stamp`] records and [`verify_options_understood`] checks, for both shapes.
+    fn read(path: &Path, extra: &[(&str, &str)]) -> Result<Self, String> {
         let text = read(path)?;
         let mut tag = None;
         let mut header_sha256 = None;
@@ -819,6 +942,13 @@ impl Pin {
                 path.display()
             ));
         }
+        // The shape's additions come last so the pinned file order stays what a reader of `third_party/llama-cpp.toml`
+        // sees, and so turning a feature off never silently reorders an option that is still in force.
+        options.extend(
+            extra
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
         Ok(Self {
             tag,
             header_sha256,
