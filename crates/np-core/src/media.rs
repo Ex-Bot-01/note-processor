@@ -1,7 +1,8 @@
 //! Every image a note links to, and the workspace file that link names.
 //!
 //! Two steps, in this order and no other: [`image_links`] reads note bytes for markdown image syntax, then
-//! [`resolve_image`] places one target in the workspace; [`sha256_file`] digests whatever it found. Design §7 of
+//! [`resolve_image`] places one target in the workspace, and [`crate::hash::sha256_file_with_size`] digests whatever it
+//! found — the digest stays in `hash.rs`, where §12 rule 9 keeps the one definition. Design §7 of
 //! `docs/design-m2-image-embeddings.md` owns the rules; this module is where they are executed.
 //!
 //! **Everything here works on bytes.** A note body, a link target and a resolved path are `&[u8]` end to end, and no
@@ -16,20 +17,14 @@
 //! 8), and none of them is an exit code — every one is a count on an embed report.
 
 use std::ffi::OsStr;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::hash::Sha256Stream;
 use crate::walk;
 
 /// The component spellings normalisation drops without looking at the filesystem.
 const CURRENT_DIR: &[u8] = b".";
 const PARENT_DIR: &[u8] = b"..";
-
-/// Bytes read per iteration by [`sha256_file`], matching `crate::hash`'s private constant so a 4 MB diagram and a
-/// 4 KB one cost the same buffer.
-const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// One image link as it was written in a note.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,19 +87,20 @@ fn strip_cr(line: &[u8]) -> &[u8] {
     }
 }
 
-/// A line that opens or closes a fenced code block: after any leading whitespace, three backticks or three tildes.
+/// A line that opens or closes a fenced code block: three backticks **at column 0**, which is exactly
+/// [`crate::parse`]'s rule and deliberately not a wider one.
 ///
-/// This is deliberately not [`crate::parse`]'s fence test: that one reads `&str` (this module never decodes) and
-/// recognises ``` only, while a note's sample blocks arrive in both spellings and a `~~~` example is as much an
-/// example as a backticked one. **An unclosed fence runs to the end of the file** — state carries to the last line,
-/// because a paste truncated mid-block is still showing code, and treating its tail as prose would embed images that
-/// are only illustrations of syntax.
+/// Two definitions of "inside a code block" would have to be kept in step forever, and this one is not the authority on
+/// markdown — §5's rule 3 is, and `parse::prose_lines` implements it for headings, tags, words and links. So an image in
+/// a `~~~`-fenced example *is* embedded (the chunker indexes that block's words as prose too), and an indented ``` fence
+/// is not a fence here either, because it is not one for the chunker. The CommonMark-faithful reading may well be the
+/// better markdown rule; adopting it here while `parse` kept the column-0 rule would mean a diagram being embedded from a
+/// region whose caption was indexed as prose, which is worse than either consistent choice.
+///
+/// **An unclosed fence runs to the end of the file**, matching `prose_lines`: the toggle stays set, so a paste truncated
+/// mid-block does not start embedding its tail.
 fn is_fence(line: &[u8]) -> bool {
-    let text = match line.iter().position(|byte| !byte.is_ascii_whitespace()) {
-        Some(start) => &line[start..],
-        None => return false,
-    };
-    text.starts_with(b"```") || text.starts_with(b"~~~")
+    line.starts_with(b"```")
 }
 
 /// The image links on one prose line, appended in the order the scan reaches them.
@@ -146,8 +142,16 @@ fn image_at(line: &[u8], bang: usize) -> Option<(Vec<u8>, usize)> {
         )
     } else {
         let close_paren = find(line, b')', start)?;
-        // Leading and trailing spaces around a destination are syntax (`![a]( a.png )`), not part of the name.
-        (line[start..close_paren].trim_ascii().to_vec(), close_paren)
+        // A destination ends at the first ASCII whitespace: everything after it is a title (`![a](x.png "Kafka ingest")`),
+        // and a name that genuinely contains a space has to be written `<with space.png>` — which is the branch above,
+        // where nothing is trimmed because there the bytes *are* the name. Without this cut the title becomes part of the
+        // extension and a real file refuses as `unsupported-format`, a class §8 reserves for extensions outside the set.
+        let destination = line[start..close_paren]
+            .trim_ascii_start()
+            .split(|byte| byte.is_ascii_whitespace())
+            .next()
+            .unwrap_or_default();
+        (destination.to_vec(), close_paren)
     };
     Some((target, end + 1))
 }
@@ -257,26 +261,103 @@ pub fn resolve_image(
     note_rel: &[u8],
     target: &[u8],
 ) -> Result<ResolvedImage, MediaRefusal> {
+    resolve_image_in(PathStyle::native(), root, note_rel, target)
+}
+
+/// Which platform's spelling rules decide what counts as a separator and as a rooted name.
+///
+/// This is public so the rule can be *tested* rather than hoped for: the escape that only exists on Windows
+/// (`C:\shots\a.png`, `\\srv\share\a.png`, `..\..\outside.png`) has to be refused by code this Linux host can run,
+/// because a claim about Windows behaviour nobody executed is exactly what F18 forbids. The refusal happens in the walk,
+/// before any [`PathBuf::push`], so it does not depend on how the host OS would have interpreted the component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathStyle {
+    /// `/` separates and only a leading `/` is rooted. A backslash is an ordinary byte: `a\b.png` is one legal name.
+    Unix,
+    /// `/` and `\` both separate, and a component that carries a drive (`C:`) or a prefix (`\server`, `\share`) is
+    /// rooted rather than named.
+    Windows,
+}
+
+impl PathStyle {
+    /// The style of the platform this binary is running on.
+    pub fn native() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+
+    fn is_separator(self, byte: u8) -> bool {
+        byte == b'/' || (self == Self::Windows && byte == b'\\')
+    }
+
+    /// Whether one component names a root instead of a file inside one. Checked per component and **before** it is
+    /// pushed, because `PathBuf::push` on Windows discards everything already in the path when the argument carries a
+    /// prefix — an escape has to be refused as the spelling it is, never discovered after the fact.
+    fn is_rooted(self, name: &[u8]) -> bool {
+        match self {
+            Self::Unix => name.first() == Some(&b'/'),
+            Self::Windows => {
+                name.first() == Some(&b'/')
+                    || name.first() == Some(&b'\\')
+                    // `C:` / `c:` — an ASCII letter followed by a colon, then anything.
+                    || (name.len() >= 2
+                        && name[0].is_ascii_alphabetic()
+                        && name[1] == b':')
+            }
+        }
+    }
+
+    fn split(self, bytes: &[u8]) -> Vec<&[u8]> {
+        if self == Self::Unix {
+            return bytes.split(|byte| *byte == b'/').collect();
+        }
+        bytes
+            .split(|byte| *byte == b'/' || *byte == b'\\')
+            .collect()
+    }
+}
+
+/// [`resolve_image`] with the platform rules named instead of taken from the host.
+pub fn resolve_image_in(
+    style: PathStyle,
+    root: &Path,
+    note_rel: &[u8],
+    target: &[u8],
+) -> Result<ResolvedImage, MediaRefusal> {
     // Failing closed means passing the bytes through, so a file literally named `kafka%zz.png` still resolves.
     let written = percent_decode(target).unwrap_or_else(|| target.to_vec());
-    if written.first() == Some(&b'/') {
+    if style.is_rooted(&written) {
         return Err(MediaRefusal::OutsideWorkspace);
+    }
+    // A NUL byte names no file on any platform this program runs on, so it is refused here rather than discovered three
+    // steps later by a failed `stat`. **This one is not observable behaviour on Unix**: deleting the check still reports
+    // `missing-target`, because the OS call refuses the same path for its own reason (measured — the mutant survived).
+    // What it buys is determinism on Windows, where the same bytes reach `component_name` and would surface as whatever
+    // that conversion failure happens to be, and a guarantee the reader can use: no component that reaches the OS contains
+    // a NUL, which is what makes `component_name`'s "this platform cannot spell it" arm defence in depth rather than an
+    // unreachable branch with a story attached.
+    if written.contains(&0) {
+        return Err(MediaRefusal::MissingTarget);
     }
     if names_nothing(&written) {
         return Err(MediaRefusal::MissingTarget);
     }
+    // A trailing separator names a directory (`![a](assets.png/)`), so a regular file at that spelling is not what the
+    // author pointed at. §8 has no class for it; "names nothing" is the honest one, because at that spelling it does.
+    let names_a_directory = style.is_separator(*written.last().unwrap_or(&b'/'));
 
-    // Step 4: the note's directory, then the target, in one walk. A `note_rel` that itself pops past the root is not
-    // a workspace path and gets the same refusal — nothing may reach outside through the base either.
+    // Step 4: the note's directory, then the target, in one walk. A `note_rel` that itself pops past the root is not a
+    // workspace path and gets the same refusal — nothing may reach outside through the base either. The rooted test runs
+    // on the base's components too: a registry key that spells a Windows prefix escapes for the same reason a target does.
     let mut path: Vec<Vec<u8>> = Vec::new();
-    let mut directories = note_rel.split(|byte| *byte == b'/').collect::<Vec<_>>();
+    let mut directories = style.split(note_rel);
     // The last component is the note's file name; a root-level note has no directory left to walk.
     directories.pop();
-    for name in directories
-        .into_iter()
-        .chain(written.split(|byte| *byte == b'/'))
-    {
-        if !push_component(&mut path, name) {
+    for name in directories.into_iter().chain(style.split(&written)) {
+        if style.is_rooted(name) || !push_component(&mut path, name) {
             return Err(MediaRefusal::OutsideWorkspace);
         }
     }
@@ -290,10 +371,19 @@ pub fn resolve_image(
         .and_then(mime_of)
         .ok_or(MediaRefusal::UnsupportedFormat)?;
     let abs = abs_path(root, &path).ok_or(MediaRefusal::MissingTarget)?;
+    // Containment is not finished once the components have been walked: a directory *inside* the workspace can be a
+    // symlink to somewhere outside it, and then every byte above is true of a path whose contents are not in the vault.
+    // So each component from the root down is lstat'd, and any link — including the file itself — refuses as
+    // `outside-workspace`. Canonicalising instead would need the target to exist (turning every absent figure into an
+    // error path) or would have to canonicalise the root too (a workspace that is itself a symlink then refuses
+    // everything); neither problem exists here, and the cost is one `stat` per directory level.
+    if escapes_through_a_link(root, &path) {
+        return Err(MediaRefusal::OutsideWorkspace);
+    }
     // `to_open_path` because this is the spelling an OS call wants (a Windows path past `MAX_PATH` still has to be
     // statable), and `is_file` because a directory read would hand back a digest of nothing.
     match fs_metadata(&abs) {
-        Ok(metadata) if metadata.is_file() => {}
+        Ok(metadata) if metadata.is_file() && !names_a_directory => {}
         _ => return Err(MediaRefusal::MissingTarget),
     }
     Ok(ResolvedImage {
@@ -301,6 +391,28 @@ pub fn resolve_image(
         abs,
         mime,
     })
+}
+
+/// Whether any component of `components`, from `root` down, is a symbolic link.
+///
+/// The root itself is not tested: the operator chose where the workspace lives, and a workspace that happens to be a
+/// link is still the workspace. Everything below it has to be bytes the vault actually holds.
+fn escapes_through_a_link(root: &Path, components: &[Vec<u8>]) -> bool {
+    let mut path = root.to_path_buf();
+    for component in components {
+        let Some(name) = component_name(component) else {
+            // A component this platform cannot spell never reaches the disk, so it cannot be a link either; the caller
+            // turns the same condition into `missing-target` at `abs_path`.
+            return false;
+        };
+        path.push(name);
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether a decoded target holds no name at all: only empty components and `.`, with no parent step anywhere.
@@ -433,30 +545,4 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
-}
-
-/// sha256 of one resolved image: its lowercase-hex digest and the number of bytes read.
-///
-/// The digest is [`crate::hash::Sha256Stream`]'s — the program's single SHA-256 definition (local-embeddings §12
-/// rule 9) — so an image and a note chunk digested by this crate are spelled identically. The byte count comes from
-/// the same read loop rather than from `metadata`, because it is the bytes that were actually digested that §6's
-/// `media.size` records, and those two can differ on anything but a healthy regular file.
-///
-/// Errors travel as [`io::Error`] and are never swallowed: a failed open or read has to stay a failure, because the
-/// empty-input digest is a real value that would otherwise be recorded as this file's identity. A directory fails
-/// where its read does, so it cannot become an image either.
-pub fn sha256_file(path: &Path) -> Result<(String, u64), io::Error> {
-    let mut file = File::open(walk::to_open_path(path))?;
-    let mut stream = Sha256Stream::new();
-    let mut chunk = vec![0u8; READ_CHUNK_BYTES];
-    let mut read_total: u64 = 0;
-    loop {
-        let read = file.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        stream.update(&chunk[..read]);
-        read_total += read as u64;
-    }
-    Ok((stream.finish_hex(), read_total))
 }

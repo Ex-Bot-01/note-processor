@@ -167,6 +167,18 @@ pub enum HashError {
 /// The loop feeds [`Sha256Stream`]; it owns nothing about the digest itself. That is the shape §12
 /// rule 9 asks for — one definition, and this is one of its callers.
 pub fn sha256_file(p: &Path) -> Result<String, HashError> {
+    let (hex, _size) = sha256_file_with_size(p)?;
+    Ok(hex)
+}
+
+/// The digest **and the number of bytes digested**, in one pass over one open file.
+///
+/// The size is the count actually read, not `fs::metadata(...).len()`: a file that changed while it was being hashed has
+/// a metadata length that describes neither the bytes digested nor anything the program can point at, and an image row
+/// stores this number as its `media.size`. Callers that want only the digest call [`sha256_file`], which is this function
+/// with the count dropped — one read loop for both, so a chunk-size change cannot make two callers disagree about where a
+/// file ends.
+pub fn sha256_file_with_size(p: &Path) -> Result<(String, u64), HashError> {
     let open_path = walk::to_open_path(p);
     let fail = |source: io::Error| HashError::Read {
         path: p.to_path_buf(),
@@ -176,14 +188,16 @@ pub fn sha256_file(p: &Path) -> Result<String, HashError> {
 
     let mut stream = Sha256Stream::new();
     let mut chunk = vec![0u8; READ_CHUNK_BYTES];
+    let mut digested: u64 = 0;
     loop {
         let read = file.read(&mut chunk).map_err(fail)?;
         if read == 0 {
             break;
         }
         stream.update(&chunk[..read]);
+        digested += read as u64;
     }
-    Ok(stream.finish_hex())
+    Ok((stream.finish_hex(), digested))
 }
 
 /// sha256 of bytes already in memory, formatted exactly like [`sha256_file`] — because it is the same

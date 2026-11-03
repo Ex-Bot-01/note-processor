@@ -181,6 +181,22 @@ The division this design uses instead:
   is **not** decoded — the raw spelling names no file, so it refuses as `missing-target` rather than inventing a class for a
   malformed escape. `undecodable` means something narrower and later: an accepted raster whose decode fails.
 
+**Three things §7 had to settle before Task 3 could be written, now that code exists.** *Containment includes links:* a
+directory inside the workspace can be a symlink to somewhere outside it, and then every component of the path is "inside"
+while the bytes are not, so any symlink in the walk — the file itself included — refuses as `outside-workspace`. Canonicalising
+was the other candidate and has two failure modes this does not: it needs the target to exist (turning every absent figure into
+an error) or it needs the root canonicalised too (a workspace that is itself a symlink then refuses everything). *A destination
+with a title is one reference:* `![d](kafka.png "Kafka ingest")` names `kafka.png`, because markdown ends the destination at
+whitespace and a name containing a space is written `<my diagram.png>`; treating the title as filename bytes would refuse a file
+that exists with `unsupported-format`, a class reserved for extensions outside the accepted set. *A platform's separators are
+that platform's:* `C:\shots\a.png` and `..\..\outside.png` are single, odd filenames on Unix and rooted or escaping on
+Windows, where pushing such a component discards the base path entirely — so the rule is chosen by a `PathStyle` the resolver is
+given rather than assumed, which also means the Windows escapes are tested on the Linux host that wrote them.
+
+An external destination (`https://cdn.example/x.png`) gets no class of its own: §8's set is closed and "not a local file" is
+closest to `missing-target`, which is what it reports on Unix — under the Windows rules a `scheme:` prefix looks like a drive and
+refuses as `outside-workspace` first. A note that wants a remote figure shows the refusal count; nothing is fetched.
+
 **Lifecycle, which the first draft left undefined.** **A media row lives while at least one live path in `media_path` exists
 and at least one live note links one of those paths.** The embed pass computes that set from the same scan that produced the
 links: unlinking a diagram removes its `media_path` row, and when the last one goes the media row goes with it, `ON DELETE

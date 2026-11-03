@@ -14,14 +14,15 @@
 //! deleted the column that would have stored one), containment checked after the extension or after the filesystem, a
 //! percent-decode applied twice or not at all, and line numbers off by one.
 //!
-//! The digest half ([`np_core::media::sha256_file`]) is compared against [`np_core::hash::sha256_bytes`], so a second
+//! The digest half ([`np_core::hash::sha256_file_with_size`], which `media.rs` does not re-implement) is compared
+//! against [`np_core::hash::sha256_bytes`], so a second
 //! SHA-256 spelling in `media.rs` fails here rather than drifting quietly (local-embeddings §12 rule 9).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use np_core::hash::sha256_bytes;
-use np_core::media::{image_links, resolve_image, sha256_file, MediaRefusal};
+use np_core::hash::{sha256_bytes, sha256_file_with_size};
+use np_core::media::{image_links, resolve_image, resolve_image_in, MediaRefusal, PathStyle};
 use tempfile::TempDir;
 
 /// The extraction as `(target, line)` pairs, so a case states its whole expectation in one literal.
@@ -127,10 +128,24 @@ fn a_backtick_fence_holds_no_image_and_its_close_resumes_prose() {
 }
 
 #[test]
-fn a_tilde_fence_holds_no_image() {
-    // Mutation: only ``` recognised as a fence, so a `~~~` sample leaks its example images into the run.
-    let body = "~~~\n![hidden](hidden.png)\n~~~\n![shown](shown.png)\n";
-    assert_eq!(extracted(body), vec![(b"shown.png".to_vec(), 4)]);
+fn a_tilde_block_is_not_a_fence_because_the_chunker_does_not_treat_it_as_one() {
+    // Mutation: recognising `~~~` here while `parse::prose_lines` keeps its column-0 backtick rule, which gives the
+    // program two answers to "is this inside a code block" — the image skipped and its caption indexed as prose. This
+    // module follows §5's published rule wherever that leads, so a tilde block's image is extracted like its words.
+    let body = "~~~\n![example](example.png)\n~~~\n";
+    assert_eq!(extracted(body), vec![(b"example.png".to_vec(), 2)]);
+}
+
+#[test]
+fn an_indented_backtick_fence_is_not_a_fence_for_the_same_reason() {
+    // Mutation: skipping leading whitespace here (CommonMark allows up to three spaces) while `parse` requires column
+    // 0. The divergence is the defect: a fence that the chunker treats as prose has to be treated as prose here too.
+    let body = "    ```\n![example](example.png)\n    ```\n";
+    assert_eq!(extracted(body), vec![(b"example.png".to_vec(), 2)]);
+
+    // Column 0 is a fence, which the case above cannot show on its own.
+    let body = "```\n![hidden](hidden.png)\n```\n";
+    assert_eq!(extracted(body), Vec::<(Vec<u8>, usize)>::new());
 }
 
 #[test]
@@ -244,7 +259,7 @@ fn an_encoded_slash_still_escapes() {
 // --------------------------------------------------------------- containment
 
 #[test]
-fn a_parent_step_out_of_the_workspace_is_refused_and_never_opened() {
+fn a_parent_step_out_of_the_workspace_is_refused() {
     // Mutation: containment checked after the extension or after the existence probe, so an escaping path is opened
     // (or reported as merely missing) instead of refused. Both files exist above the root on purpose.
     let ws = Workspace::new();
@@ -433,6 +448,35 @@ fn a_target_that_names_no_file_refuses_missing_target() {
         resolve_image(ws.root(), b"top.md", b"a/.."),
         Err(MediaRefusal::MissingTarget)
     );
+
+    // A destination written empty is still a link the author wrote, and `image_links` documents producing it — dropping
+    // it here (as `links.rs` drops `[x]()`) would hide the link from the report instead of counting it as a refusal.
+    assert_eq!(extracted("![a]()\n"), vec![(b"".to_vec(), 1)]);
+
+    // A NUL byte cannot name a file anywhere. The class is what is pinned, not the mechanism: on Unix the OS call would
+    // refuse the same path anyway, so this case survives a mutant that deletes the explicit check (measured) and exists to
+    // keep the answer stable on the platform where the conversion could report something else.
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, b"shot%00.png"),
+        Err(MediaRefusal::MissingTarget)
+    );
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, b"shot\0.png"),
+        Err(MediaRefusal::MissingTarget)
+    );
+
+    // A trailing separator names a directory. `assets.png` exists as a file, and the link did not point at it.
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, b"keep.png/"),
+        Err(MediaRefusal::MissingTarget),
+        "the spelling with a trailing slash names no file"
+    );
+
+    // A base that itself pops past the root is not a workspace path either — nothing escapes through `note_rel`.
+    assert_eq!(
+        resolve_image(ws.root(), b"../a.md", b"keep.png"),
+        Err(MediaRefusal::OutsideWorkspace)
+    );
 }
 
 #[test]
@@ -505,18 +549,26 @@ fn every_refusal_class_carries_its_spec_label() {
 }
 
 #[test]
-fn a_refusal_label_never_names_a_file() {
-    // Mutation: a label that grows the path it refused (`unsupported-format: notes/x.png`). §8 rule 8 keeps names out
-    // of refusal text so the report layer decides what to show, and a separator or a space is the fingerprint of one.
-    for class in [
-        MediaRefusal::MissingTarget,
-        MediaRefusal::OutsideWorkspace,
-        MediaRefusal::UnsupportedFormat,
-        MediaRefusal::Undecodable,
-        MediaRefusal::OverBudget,
-        MediaRefusal::VisionUnavailable,
-    ] {
-        let label = class.label();
+fn a_refusal_produced_by_a_real_link_names_a_class_and_not_a_path() {
+    // Mutation: a label that grows the path it refused (`unsupported-format: notes/deep/x.png`). The refusals here are
+    // the ones this module actually returns, from real calls — pinning six hand-written `label()` strings instead would
+    // test nothing that the previous case has not already pinned.
+    let ws = Workspace::new();
+    ws.write("notes/deep/clip.gif", b"gif");
+    let produced = [
+        resolve_image(ws.root(), NOTE, b"gone.png"),
+        resolve_image(ws.root(), NOTE, b"../../../outside.png"),
+        resolve_image(ws.root(), NOTE, b"clip.gif"),
+    ];
+    let labels: Vec<&str> = produced
+        .iter()
+        .map(|outcome| outcome.as_ref().expect_err("each target refuses").label())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["missing-target", "outside-workspace", "unsupported-format"]
+    );
+    for label in labels {
         assert!(
             !label.contains('/') && !label.contains('\\') && !label.contains(char::is_whitespace),
             "a refusal names a class, not a path: {label}"
@@ -524,22 +576,202 @@ fn a_refusal_label_never_names_a_file() {
     }
 }
 
-// ---------------------------------------------------------------- sha256_file
+/// The Windows spelling rules, exercised on a Linux host.
+///
+/// These are the escapes that only exist on a shipped Windows build: `PathBuf::push` there discards the base path when
+/// the argument carries a drive or a UNC prefix, so a component that Unix reads as one odd filename silently moves the
+/// whole result outside the workspace. Refusing them is logic, not an OS call, so it is testable here — which is the
+/// only honest way to make a Windows claim from this machine (F18).
+#[test]
+fn a_windows_prefixed_target_is_refused_before_anything_is_pushed() {
+    let ws = Workspace::new();
+    ws.write("notes/deep/keep.png", b"png");
+    for target in [
+        "C:\\Users\\me\\shot.png",
+        "\\\\srv\\share\\a.png",
+        // Three steps up from a note two directories deep: past the root, so it escapes however it is spelled.
+        "..\\..\\..\\outside.png",
+        "/etc/x.png",
+    ] {
+        assert_eq!(
+            resolve_image_in(PathStyle::Windows, ws.root(), NOTE, target.as_bytes()),
+            Err(MediaRefusal::OutsideWorkspace),
+            "{target:?} is rooted or escapes under Windows spelling rules"
+        );
+    }
+
+    // Containment still wins over the extension: a `.gif` that escapes reports the escape.
+    assert_eq!(
+        resolve_image_in(
+            PathStyle::Windows,
+            ws.root(),
+            NOTE,
+            b"..\\..\\..\\outside.gif"
+        ),
+        Err(MediaRefusal::OutsideWorkspace)
+    );
+
+    // Two steps up from the same note lands *on* the root, which is inside: writing the file there proves the walk is
+    // arithmetic and not a blanket refusal of anything containing `..`.
+    ws.write("stays-inside.png", b"png");
+    let resolved = resolve_image_in(
+        PathStyle::Windows,
+        ws.root(),
+        NOTE,
+        b"..\\..\\stays-inside.png",
+    )
+    .expect("two pops from depth two is the root, not an escape");
+    assert_eq!(resolved.rel_bytes, b"stays-inside.png".to_vec());
+
+    // And on Windows a backslash is a separator, so `a\b.png` from a note in `notes/deep/` means `notes/a/b.png`.
+    ws.write("notes/a/b.png", b"png");
+    let resolved = resolve_image_in(PathStyle::Windows, ws.root(), NOTE, b"..\\a\\b.png")
+        .expect("the same path spelled with separators this platform uses");
+    assert_eq!(resolved.rel_bytes, b"notes/a/b.png".to_vec());
+}
 
 #[test]
-fn sha256_file_reports_the_digest_and_the_byte_count() {
-    // Mutation: reporting `metadata` size instead of the bytes actually read, or re-spelling the digest here instead
-    // of delegating to `hash::Sha256Stream` — hence comparing against the crate's own definition.
+fn a_backslash_is_an_ordinary_byte_in_a_unix_name() {
+    // Mutation: applying the Windows separator rule everywhere, which would refuse — or worse, split — a legal Unix
+    // filename whose bytes include a backslash.
+    let ws = Workspace::new();
+    let abs = ws.write("notes/deep/we\\ird.png", b"png");
+    let resolved = resolve_image_in(PathStyle::Unix, ws.root(), NOTE, b"we\\ird.png")
+        .expect("a backslash is part of a name here, not a separator");
+    assert_eq!(resolved.rel_bytes, b"notes/deep/we\\ird.png".to_vec());
+    assert_eq!(resolved.abs, abs);
+}
+
+/// A link is not a workspace path. §7's containment promise is about the bytes a note can reach, and a directory
+/// inside the vault that points at `/elsewhere` reaches them — so any component of the walk being a symlink refuses as
+/// `outside-workspace`, whether it is the directory holding the file or the file itself.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_or_file_is_outside_the_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let ws = Workspace::new();
+    ws.write("notes/deep/keep.png", b"png");
+    let outside = ws.write_outside("through-a-link.png");
+
+    // A directory link inside the workspace pointing above the root.
+    let link_dir = ws.join("notes/deep/elsewhere");
+    symlink(
+        outside.parent().expect("test setup: parent exists"),
+        &link_dir,
+    )
+    .expect("test setup: directory symlink");
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, b"elsewhere/through-a-link.png"),
+        Err(MediaRefusal::OutsideWorkspace),
+        "the components are all inside; the bytes are not"
+    );
+
+    // A file link pointing at a real image outside the workspace.
+    symlink(&outside, ws.join("notes/deep/looked-local.png")).expect("test setup: file symlink");
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, b"looked-local.png"),
+        Err(MediaRefusal::OutsideWorkspace)
+    );
+
+    // Ordinary directories still resolve — the guard is not "no symlinks anywhere on the host".
+    let resolved =
+        resolve_image(ws.root(), NOTE, b"keep.png").expect("a plain file inside resolves");
+    assert_eq!(resolved.rel_bytes, b"notes/deep/keep.png".to_vec());
+}
+
+/// The Windows name conversion, on the platform that needs it.
+///
+/// `component_name`'s non-unix arm is the only spelling path Windows takes, and a claim about what it does with bytes
+/// that are not valid UTF-16 would otherwise rest on nobody having run it. Writing the **lossy** name to disk is the
+/// point: if the resolver substituted U+FFFD instead of refusing, this file would be found and the case would fail.
+#[cfg(not(unix))]
+#[test]
+fn a_name_this_platform_cannot_spell_refuses_instead_of_substituting() {
+    let ws = Workspace::new();
+    // The replacement-character spelling of `caf\xe9.png` — what a lossy decode would have looked for.
+    ws.write("notes/deep/caf\u{FFFD}.png", b"png");
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, b"caf\xe9.png"),
+        Err(MediaRefusal::MissingTarget),
+        "the raw bytes name no file here, and the lossy spelling must not be tried in their place"
+    );
+}
+
+/// A destination with a title is one reference, not a filename that happens to end in quotes.
+#[test]
+fn a_title_after_the_destination_is_not_part_of_the_name() {
+    // Mutation: taking everything to `)` as the name, which turns the extension into `png "Kafka ingest"` and refuses
+    // a file that exists — with `unsupported-format`, a class §8 reserves for extensions outside the accepted set.
+    let ws = Workspace::new();
+    ws.write("notes/deep/kafka.png", b"png");
+    // The cut belongs to the syntax reader, so each case is written as the note spells it and then resolved — the pair
+    // is what a run does, and resolving the raw bytes with a title in them would be testing something no caller sends.
+    for body in [
+        "![d](kafka.png \"Kafka ingest\")",
+        "![d](kafka.png 'one two')",
+        "![d](kafka.png (parenthesised))",
+    ] {
+        let links = image_links(body.as_bytes());
+        assert_eq!(links.len(), 1, "{body:?}");
+        assert_eq!(
+            links[0].target,
+            b"kafka.png".to_vec(),
+            "the title is not part of the destination"
+        );
+        let resolved = resolve_image(ws.root(), NOTE, &links[0].target)
+            .unwrap_or_else(|err| panic!("{body:?} names the file that exists: {err:?}"));
+        assert_eq!(resolved.rel_bytes, b"notes/deep/kafka.png".to_vec());
+    }
+
+    // A name with a real space still needs the angle form: an unescaped space ends the destination, so the note below
+    // names `my`, which has no extension at all. That is a syntax fact, visible in what extraction hands on — and
+    // `resolve_image` itself never cuts at spaces, because by then it has a name rather than a destination: handing it
+    // the raw bytes finds no file with that spelling and refuses `missing-target`.
+    let links = image_links("![d](my diagram.png)\n".as_bytes());
+    assert_eq!(links[0].target, b"my".to_vec(), "the space ended the name");
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, &links[0].target),
+        Err(MediaRefusal::UnsupportedFormat)
+    );
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, b"my diagram.png"),
+        Err(MediaRefusal::MissingTarget),
+        "resolution takes the name as given; only the reader splits destinations"
+    );
+    // Spelled the way markdown wants, the same file resolves — and the brackets are gone by the time the target is a
+    // name, because `image_links` strips them at syntax level. `resolve_image` never sees `<…>`: handing it those bytes
+    // literally would look for a file whose name starts with `<`, which is what it should do.
+    ws.write("notes/deep/my diagram.png", b"png");
+    let links = image_links(b"![d](<my diagram.png>)\n");
+    assert_eq!(links.len(), 1, "the angle form yields one link");
+    assert_eq!(links[0].target, b"my diagram.png".to_vec());
+    assert_eq!(
+        resolve_image(ws.root(), NOTE, &links[0].target)
+            .expect("the extracted target carries the space")
+            .rel_bytes,
+        b"notes/deep/my diagram.png".to_vec()
+    );
+}
+
+// ---------------------------------------------------------------- digest and count
+
+#[test]
+fn sha256_file_with_size_reports_the_digest_and_the_byte_count() {
+    // Mutation: re-spelling the digest here instead of going through `hash`, which is why the expected value comes from
+    // the crate's own definition rather than a constant. What this case does **not** prove is that the count is the
+    // bytes read rather than `metadata` length — both fixtures are healthy regular files where those numbers are equal,
+    // so nothing here would notice that swap. The claim worth making is narrower: the number is what was digested.
     let ws = Workspace::new();
     let content: &[u8] = b"a diagram, in bytes, of some length\n";
     let abs = ws.write("notes/deep/x.png", content);
-    let (digest, size) = sha256_file(&abs).expect("read the file this test just wrote");
+    let (digest, size) = sha256_file_with_size(&abs).expect("read the file this test just wrote");
     assert_eq!(digest, sha256_bytes(content));
     assert_eq!(size, content.len() as u64);
 
     // An empty file has a real digest and no bytes; treating it as a failure would drop zero-byte attachments.
     let empty = ws.write("notes/deep/empty.png", b"");
-    let (digest, size) = sha256_file(&empty).expect("an empty file still digests");
+    let (digest, size) = sha256_file_with_size(&empty).expect("an empty file still digests");
     assert_eq!(digest, sha256_bytes(b""));
     assert_eq!(size, 0);
 }
@@ -551,11 +783,11 @@ fn sha256_file_refuses_a_directory_and_a_missing_path() {
     let ws = Workspace::new();
     fs::create_dir_all(ws.join("notes/deep/folder")).expect("test setup: a directory");
     assert!(
-        sha256_file(&ws.join("notes/deep/folder")).is_err(),
+        sha256_file_with_size(&ws.join("notes/deep/folder")).is_err(),
         "a directory is not a file"
     );
     assert!(
-        sha256_file(&ws.join("notes/deep/gone.png")).is_err(),
+        sha256_file_with_size(&ws.join("notes/deep/gone.png")).is_err(),
         "a path that is not there has no digest"
     );
 }
