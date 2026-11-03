@@ -229,6 +229,9 @@ fn the_schema_is_what_the_plan_mandates() {
             "files_case_key",
             "files_rel",
             "links_dst_note_id",
+            // Migration 10's lifecycle accessors both ask "does any path still hold this media row", which without an
+            // index on `media_id` is a full scan of `media_path` per media row.
+            "media_path_media_id",
             "notes_rel",
             "notes_rel_bytes",
             "tags_tag",
@@ -272,10 +275,7 @@ fn the_schema_is_what_the_plan_mandates() {
         // row and `np search` reads them by name, so a rename has to break that code rather than merely differ.
         // The two stamp columns sit at the end of `media` because that is where `ADD COLUMN` can put them without a
         // rebuild — the same reason `models` and `model_files` carry theirs last.
-        (
-            "media",
-            "id hash size mime verified_size verified_mtime",
-        ),
+        ("media", "id hash size mime verified_size verified_mtime"),
         ("media_path", "rel_bytes case_key abs media_id"),
         (
             "media_embeddings",

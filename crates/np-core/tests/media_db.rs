@@ -1,8 +1,10 @@
 //! Migration 10: `media`, `media_path`, `media_embeddings`, and the two projector stamps.
 //!
 //! The schema is the place R7c's whole promise is kept or lost — one vector per distinct content hash, byte-exact
-//! image paths, vectors that die with the media row (§6 of `docs/design-m2-image-embeddings.md`) — so every case
-//! below asserts a state of the rows rather than a return value, and each names the production mutation it catches.
+//! image paths, vectors that die with the media row (§6 of `docs/design-m2-image-embeddings.md`) — so a case that
+//! asserts a return value also reads back the row behind it, and every case names the production mutation it catches.
+//! Where a case can only assert a refusal (`None` for an unverified stamp, an `Ok` for stamping a row that is gone) that
+//! is stated in its own comment rather than glossed.
 //! The two CHECK families are migration 4's and migration 7's discipline re-applied to new tables (`typeof` beside
 //! declared affinity, `length(vector) = 4 * dim`), and the stamp pairs are migration 8's D12 semantics carried to
 //! `media` and `model_files`.
@@ -10,9 +12,9 @@
 use std::path::Path;
 
 use np_core::db::{
-    insert_model, link_media_path, media_embeddings, media_stamp, member_stamp, record_media,
-    record_media_embedding, record_member_stamp, set_media_stamp, unlink_media_path, Db, DbError,
-    Migration, MIGRATIONS,
+    insert_model, link_media_path, media_embeddings, media_stamp, member_stamp,
+    prune_unlinked_media, record_media, record_media_embedding, record_member_stamp,
+    record_model_file, set_media_stamp, unlink_media_path, Db, DbError, Migration, MIGRATIONS,
 };
 use tempfile::TempDir;
 
@@ -57,11 +59,33 @@ fn rejects_check(db: &Db, sql: &str, args: &[&dyn rusqlite::ToSql], column: &str
     );
 }
 
+/// The same extended-code assertion `rejects_check` makes, for refusals that reach the caller as [`DbError`] instead of a
+/// statement error. Matching `err.to_string().contains("CHECK")` would accept any message that happens to contain the
+/// word — including one this file's own CHECK raises for a *different* column of the same table.
+fn refused_by_check(err: &DbError) -> bool {
+    matches!(
+        err,
+        DbError::Sqlite(rusqlite::Error::SqliteFailure(fault, _))
+            if fault.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK
+    )
+}
+
 /// A `models` row, because `media_embeddings.model` is a real foreign key — an insert naming no such row would
 /// die on the key and pass a vector test for the wrong reason.
 fn install_model(db: &Db, id: &str) {
     insert_model(db, id, 2, Some(&hash('d')), "", "", 1_730_000_000)
         .expect("test setup: model row");
+}
+
+/// One stored media vector, read back column by column.
+fn read_embedding(db: &Db, media_id: i64, model: &str) -> (i64, Vec<u8>, String, i64) {
+    db.0.query_row(
+        "SELECT dim, vector, source_hash, embedded_at
+           FROM media_embeddings WHERE media_id = ?1 AND model = ?2",
+        rusqlite::params![media_id, model],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .expect("read the embedding row")
 }
 
 /// A media row for `letter`, returned as its id.
@@ -180,7 +204,10 @@ fn a_media_hash_that_is_not_64_characters_is_refused_by_the_schema() {
         "image/png",
     )
     .expect_err("63 characters is not a sha256");
-    assert!(err.to_string().contains("CHECK"), "{err}");
+    assert!(
+        refused_by_check(&err),
+        "expected a CHECK violation, got {err}"
+    );
 
     // The accepting arm, so the refusal above cannot be a writer that always fails.
     let row = record_media(&db, &hash('a'), 10, "image/png").expect("64 characters is one");
@@ -248,28 +275,37 @@ fn a_media_vector_whose_length_is_not_four_times_dim_is_refused() {
 
     record_media_embedding(&db, media, "m", 2, &vector_bytes(2, 7), &hash('a'), 1)
         .expect("exactly 4 * dim is stored");
-    let too_long =
-        record_media_embedding(&db, media, "m", 2, &vector_bytes(2, 7)[..], &hash('a'), 1)
-            .map(|_| ());
-    assert!(too_long.is_ok(), "the good case again: {too_long:?}");
+    // The row the accessor wrote, read back column by column. Without this the case proves only that the function
+    // returns `Ok`: a body that did nothing at all would satisfy an assertion on its return value.
+    assert_eq!(
+        read_embedding(&db, media, "m"),
+        (2, vector_bytes(2, 7), hash('a'), 1),
+        "dim, payload, source hash and clock are what was passed in"
+    );
 
-    let err =
-        db.0.execute(
-            "INSERT INTO media_embeddings (media_id, model, dim, vector, source_hash, embedded_at)
-             VALUES (?1, 'm', 2, ?2, 'h', 1)",
-            rusqlite::params![media, vec![7u8; 9]],
-        )
+    // The boundary itself, through the accessor rather than a hand-written INSERT: one byte over is refused, and by the
+    // CHECK rather than by anything upstream of it.
+    let err = record_media_embedding(&db, media, "m", 2, &[7u8; 9], &hash('a'), 1)
         .expect_err("nine bytes is not two f32 components");
-    assert!(err.to_string().contains("CHECK"), "{err}");
+    assert!(
+        refused_by_check(&err),
+        "expected a CHECK violation, got {err}"
+    );
 
-    let err =
-        db.0.execute(
-            "INSERT INTO media_embeddings (media_id, model, dim, vector, source_hash, embedded_at)
-             VALUES (?1, 'm', 2, ?2, 'h', 1)",
-            rusqlite::params![media, vec![7u8; 7]],
-        )
+    let err = record_media_embedding(&db, media, "m", 2, &[7u8; 7], &hash('a'), 1)
         .expect_err("seven bytes is not two f32 components either");
-    assert!(err.to_string().contains("CHECK"), "{err}");
+    assert!(
+        refused_by_check(&err),
+        "expected a CHECK violation, got {err}"
+    );
+
+    // And a refused write left nothing behind: an upsert that wrote the payload before discovering the length was wrong
+    // would have replaced the good row with garbage the CHECK then refused to describe.
+    assert_eq!(
+        read_embedding(&db, media, "m"),
+        (2, vector_bytes(2, 7), hash('a'), 1),
+        "the accepted row is untouched by the two refusals"
+    );
 }
 
 /// A vector bound as TEXT is refused at the right length.
@@ -421,15 +457,21 @@ fn media_embeddings_reads_one_model_at_a_time_in_media_order() {
     let db = Db::in_memory().expect("in-memory database");
     install_model(&db, "m1");
     install_model(&db, "m2");
-    // Named by rowid rather than by content, because the assertion below is about rowid order: `low` was inserted
-    // first and so holds the smaller id, and a reader missing its `ORDER BY` would hand them back the other way.
+    // Named by rowid rather than by content, because the assertion below is about rowid order: `low` was created first
+    // and so holds the smaller id.
     let low = media_row(&db, 'b');
     let high = media_row(&db, 'a');
-    assert!(low < high, "test setup: rowids ascend with insertion");
+    assert!(
+        low < high,
+        "test setup: rowids ascend with insertion — if that stops being true this case stops testing what it says"
+    );
+    // `high`'s vector is written **first** on purpose. An unordered scan of `media_embeddings` comes back in rowid order,
+    // so writing these in id order would make the assertion below pass with or without the reader's `ORDER BY`; this way
+    // a reader that drops it returns [high, low] and the case fails.
+    record_media_embedding(&db, high, "m1", 2, &vector_bytes(2, 2), &hash('a'), 1)
+        .expect("vector for the higher row, written first");
     record_media_embedding(&db, low, "m1", 2, &vector_bytes(2, 1), &hash('b'), 1)
         .expect("vector for the lower row");
-    record_media_embedding(&db, high, "m1", 2, &vector_bytes(2, 2), &hash('a'), 1)
-        .expect("vector for the higher row");
     record_media_embedding(&db, high, "m2", 2, &vector_bytes(2, 3), &hash('a'), 1)
         .expect("the same diagram under a second model");
 
@@ -538,6 +580,219 @@ fn record_media_embedding_stores_the_clock_it_was_given() {
     assert_eq!(stamps, vec![1_730_000_111, 1_730_000_999]);
 }
 
+/// `dim` has to be a real width; zero is not "a vector with no components".
+///
+/// Catches: leaving `dim` unconstrained. `length(vector) = 4 * dim` alone accepts `dim = 0` beside an empty BLOB, and a
+/// zero-component row reads back as a unit vector of nothing — the garbage-cosine class the length arm exists to stop.
+#[test]
+fn a_media_vector_of_zero_dimensions_is_refused() {
+    let db = Db::in_memory().expect("in-memory database");
+    install_model(&db, "m");
+    let media = media_row(&db, 'a');
+
+    let err = record_media_embedding(&db, media, "m", 0, &[], &hash('a'), 1)
+        .expect_err("dim 0 is not a vector width");
+    assert!(
+        refused_by_check(&err),
+        "expected a CHECK violation, got {err}"
+    );
+
+    // The accepting arm at the smallest honest width, so the refusal above is not a writer that always fails.
+    record_media_embedding(&db, media, "m", 1, &vector_bytes(1, 3), &hash('a'), 1)
+        .expect("one component is a vector");
+    assert_eq!(
+        read_embedding(&db, media, "m"),
+        (1, vector_bytes(1, 3), hash('a'), 1)
+    );
+}
+
+/// A media row that no path holds goes on the sweep — including one that never had a path.
+///
+/// Catches: treating `unlink_media_path` as the whole lifecycle rule. It works from a path, so bytes that were recorded
+/// and then refused by the encoder (undecodable file, provider that would not load) leave a row no later unlink can find,
+/// and §6's "an orphaned diagram cannot haunt `np search`" quietly stops being true.
+#[test]
+fn a_media_row_with_no_paths_is_swept_and_its_vectors_go_with_it() {
+    let db = Db::in_memory().expect("in-memory database");
+    install_model(&db, "m");
+    let linked = media_row(&db, 'a');
+    let stranded = media_row(&db, 'b');
+    record_media_embedding(&db, linked, "m", 2, &vector_bytes(2, 1), &hash('a'), 1)
+        .expect("vector for the linked row");
+    record_media_embedding(&db, stranded, "m", 2, &vector_bytes(2, 2), &hash('b'), 1)
+        .expect("vector for the stranded row");
+    link_media_path(
+        &db,
+        b"notes/a.png",
+        "notes/a.png",
+        Path::new("/ws/notes/a.png"),
+        linked,
+    )
+    .expect("link one path");
+
+    assert_eq!(
+        prune_unlinked_media(&db).expect("sweep"),
+        1,
+        "exactly the row nobody holds"
+    );
+    assert_eq!(
+        media_embeddings(&db, "m")
+            .expect("read the surviving vectors")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec![linked],
+        "the swept row's vector went by cascade, not by luck"
+    );
+
+    // Idempotent, which is what lets the embed pass run it unconditionally instead of only when it thinks something moved.
+    assert_eq!(prune_unlinked_media(&db).expect("sweep again"), 0);
+    assert_eq!(scalar::<i64>(&db, "SELECT COUNT(*) FROM media"), 1);
+}
+
+/// Re-pointing a path at different bytes does not leave the old figure behind.
+///
+/// Catches: an upsert that moves the `media_id` and nothing else — the displaced row keeps its vectors, still answers
+/// `np search`, and is unreachable by both lifecycle accessors (no path names it, so unlink never sees it).
+#[test]
+fn re_pointing_a_path_sweeps_the_figure_it_displaced() {
+    let db = Db::in_memory().expect("in-memory database");
+    install_model(&db, "m");
+    let old_bytes = media_row(&db, 'a');
+    let new_bytes = media_row(&db, 'b');
+    record_media_embedding(&db, old_bytes, "m", 2, &vector_bytes(2, 1), &hash('a'), 1)
+        .expect("vector for the old bytes");
+    link_media_path(
+        &db,
+        b"diagrams/kafka.png",
+        "diagrams/kafka.png",
+        Path::new("/ws/diagrams/kafka.png"),
+        old_bytes,
+    )
+    .expect("first link");
+
+    link_media_path(
+        &db,
+        b"diagrams/kafka.png",
+        "diagrams/kafka.png",
+        Path::new("/ws/diagrams/kafka.png"),
+        new_bytes,
+    )
+    .expect("the same path now holds different bytes");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM media"),
+        1,
+        "the displaced row goes with the last path that held it"
+    );
+    assert_eq!(
+        media_embeddings(&db, "m")
+            .expect("vectors")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        Vec::<i64>::new(),
+        "and its vector went by cascade"
+    );
+
+    // A re-point to a figure that other paths still hold sweeps nothing.
+    let shared = media_row(&db, 'c');
+    link_media_path(
+        &db,
+        b"notes/one.png",
+        "notes/one.png",
+        Path::new("/ws/notes/one.png"),
+        shared,
+    )
+    .expect("first holder");
+    link_media_path(
+        &db,
+        b"notes/two.png",
+        "notes/two.png",
+        Path::new("/ws/notes/two.png"),
+        shared,
+    )
+    .expect("second holder");
+    link_media_path(
+        &db,
+        b"notes/one.png",
+        "notes/one.png",
+        Path::new("/ws/notes/one.png"),
+        new_bytes,
+    )
+    .expect("re-point one of the two holders");
+    assert_eq!(
+        scalar::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM media WHERE id = {shared}")
+        ),
+        1,
+        "the figure that still has a path standing survives its sibling being re-pointed"
+    );
+}
+
+/// Two spellings that differ only in case are two paths; identical bytes are still one figure.
+///
+/// Catches: the dedup being keyed on something other than content. `media_path` has no case-fold uniqueness on purpose
+/// (migration 4 moved that guard away from `case_key`), so this pins what actually matters — one vector, one answer.
+#[test]
+fn case_twin_paths_holding_one_file_answer_once() {
+    let db = Db::in_memory().expect("in-memory database");
+    install_model(&db, "m");
+    let figure = media_row(&db, 'a');
+    for (rel, display) in [
+        (b"Diagram.PNG".as_slice(), "Diagram.PNG"),
+        (b"diagram.png".as_slice(), "diagram.png"),
+    ] {
+        let abs = Path::new("/ws").join(display);
+        link_media_path(&db, rel, display, &abs, figure).expect("link a case twin");
+    }
+    record_media_embedding(&db, figure, "m", 2, &vector_bytes(2, 4), &hash('a'), 1)
+        .expect("one vector for the figure");
+
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM media"),
+        1,
+        "identity is content, not spelling (§7)"
+    );
+    assert_eq!(
+        media_embeddings(&db, "m").expect("vectors").len(),
+        1,
+        "so a search answers once, whatever the case of the link that found it"
+    );
+}
+
+/// `abs` is a display spelling and says so; `rel_bytes` stays the byte-exact identity.
+///
+/// Catches: a comment claiming `link_media_path` binds bytes "and nothing else" while its third column goes through
+/// `to_string_lossy`. This pins which of the two columns is allowed to lose information, so nobody "fixes" the wrong one.
+#[cfg(unix)]
+#[test]
+fn an_absolute_path_that_is_not_valid_utf8_stays_a_display_spelling() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let db = Db::in_memory().expect("in-memory database");
+    let media = media_row(&db, 'a');
+    let raw: &[u8] = b"caf\xe9.png";
+    let abs = Path::new(OsStr::from_bytes(b"/ws/caf\xe9.png"));
+
+    link_media_path(&db, raw, "café.png", abs, media)
+        .expect("link a path no UTF-8 decoder can spell");
+
+    let stored_abs: String =
+        db.0.query_row("SELECT abs FROM media_path", [], |row| row.get(0))
+            .expect("read the display spelling");
+    assert_eq!(
+        stored_abs, "/ws/caf\u{fffd}.png",
+        "the report column is lossy by design (F20)"
+    );
+    let stored_rel: Vec<u8> =
+        db.0.query_row("SELECT rel_bytes FROM media_path", [], |row| row.get(0))
+            .expect("read the identity");
+    assert_eq!(stored_rel, raw, "and the identity column is not");
+}
+
 /// A media stamp round-trips, and a half-written pair reads as no stamp at all.
 ///
 /// Catches: a reader that treats one column present as verified (migration 8's rule — a half stamp would let an embed
@@ -641,4 +896,84 @@ fn member_stamp_separates_no_member_from_unchecked_from_a_stamp_of_zeros() {
 
     // An absent member is a no-op to stamp, not an error — same promise `record_artifact_stamp` makes.
     record_member_stamp(&db, "alpha", "no-such-member", 1, 1).expect("stamping an absent member");
+}
+
+/// Re-recording a member's digest invalidates its stamp.
+///
+/// Catches: `record_model_file`'s update arm rewriting `sha256`/`size` and leaving migration 10's stamp columns alone —
+/// after a fetch that found new bytes, `member_stamp` would still report "verified at the old size", and D12's
+/// verify-on-change would skip hashing a projector it has never checked. This is the 554,821,056-byte case.
+#[test]
+fn re_recording_a_member_with_different_bytes_invalidates_its_stamp() {
+    let db = Db::in_memory().expect("in-memory database");
+    insert_model(&db, "alpha", 768, Some(&hash('a')), "", "", 1_730_000_000).expect("model row");
+    record_model_file(&db, "alpha", "mmproj", &hash('c'), 554_821_056).expect("first record");
+    record_member_stamp(&db, "alpha", "mmproj", 554_821_056, 1_730_000_500)
+        .expect("stamp the bytes we hashed");
+    assert!(member_stamp(&db, "alpha", "mmproj")
+        .expect("read the stamp")
+        .is_some());
+
+    record_model_file(&db, "alpha", "mmproj", &hash('d'), 600_000_000)
+        .expect("a fetch found different bytes");
+    assert_eq!(
+        member_stamp(&db, "alpha", "mmproj").expect("read after re-recording"),
+        None,
+        "the stamp described bytes that are no longer on disk, so it describes nothing"
+    );
+
+    // Re-recording the *same* declaration is the ordinary repeat (a second `np models fetch`, an install retry) and must
+    // not cost a re-hash either: same digest, same size, stamp kept.
+    record_model_file(&db, "alpha", "mmproj", &hash('d'), 600_000_000)
+        .expect("repeat the same record");
+    record_member_stamp(&db, "alpha", "mmproj", 600_000_000, 1_730_000_900)
+        .expect("stamp the new bytes");
+    record_model_file(&db, "alpha", "mmproj", &hash('d'), 600_000_000).expect("repeat again");
+    assert_eq!(
+        member_stamp(&db, "alpha", "mmproj").expect("read after a repeat"),
+        Some((600_000_000, 1_730_000_900)),
+        "an unchanged re-record is not a reason to hash 554 MB again"
+    );
+}
+
+/// A stamp column holds only an integer, because affinity converts on write.
+///
+/// This case exists because a review asked for a `typeof` guard on the stamp pair, and it does not need one: these
+/// columns have INTEGER affinity, so `'40960'` is stored as the number 40960 and there is no text value to misread.
+/// That is a property of declared affinity, not of our writers — `rel_bytes` and `vector` are BLOB-affinity, which is
+/// exactly why *they* need the `typeof` arm (a TEXT bind stays TEXT there). Pinning the difference here stops the next
+/// reader from "fixing" the stamp readers to match them, and from assuming affinity protects a BLOB column.
+#[test]
+fn a_stamp_column_holds_only_an_integer() {
+    let db = Db::in_memory().expect("in-memory database");
+    let media = media_row(&db, 'a');
+    db.0.execute(
+        "UPDATE media SET verified_size = '40960', verified_mtime = '1730000500' WHERE id = ?1",
+        rusqlite::params![media],
+    )
+    .expect("test setup: write the stamp as text");
+
+    // Affinity did the converting, at write time: what comes back is an integer pair, not a string that reads like one.
+    assert_eq!(
+        media_stamp(&db, media).expect("read the coerced stamp"),
+        Some((40_960, 1_730_000_500)),
+        "INTEGER affinity converts on write, so no reader-side typeof guard is needed here"
+    );
+    assert_eq!(
+        scalar::<String>(&db, "SELECT typeof(verified_size) FROM media"),
+        "integer",
+        "the stored value is an integer even though the bind was text — the opposite of a BLOB-affinity column"
+    );
+
+    // The half-pair rule is the guard these columns *do* have.
+    db.0.execute(
+        "UPDATE media SET verified_mtime = NULL WHERE id = ?1",
+        rusqlite::params![media],
+    )
+    .expect("test setup: drop one half");
+    assert_eq!(
+        media_stamp(&db, media).expect("read a half pair"),
+        None,
+        "one column present is not a stamp"
+    );
 }

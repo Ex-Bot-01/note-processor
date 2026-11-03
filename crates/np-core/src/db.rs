@@ -267,9 +267,9 @@ pub const MIGRATIONS: &[Migration] = &[
     // name. So the pair gets names here (`name = 'main'` is the primary, matching the artifact path) and any later
     // member arrives as a row rather than as a schema change.
     //
-    // **One coupling to know before adding migration 10:** three test fixtures rewind a database to version four to
-    // exercise the upgrade path (`tests/db.rs`, `tests/scan.rs`, `np-cli/tests/cli.rs`), and each undoes what later
-    // entries created. A new table that they leave standing makes the next open fail with "table already exists" —
+    // **One coupling to know before adding a migration:** every rewind fixture rewinds a database to version four to
+    // exercise the upgrade path (`tests/db.rs`, `tests/scan.rs`, `np-cli/tests/cli.rs` — eight sites as of migration
+    // 10), and each undoes what later entries created. A new table that they leave standing makes the next open fail with "table already exists" —
     // which is the fixture being right, not the migration being wrong.
     //
     // Not backfilled, like migration 6's `file_id` and migration 8's stamp: a model installed by an older build has
@@ -324,8 +324,18 @@ pub const MIGRATIONS: &[Migration] = &[
         verified_mtime INTEGER
     );
 
-    -- Every workspace path those bytes were seen at. The last row going takes the media row with it (§6's lifecycle),
-    -- which is what stops a deleted figure answering `np search` forever.
+    -- Every workspace path those bytes were seen at. Nothing here deletes a media row: the cascade below points the
+    -- other way (parent to child), and SQLite has no "when the last child goes" constraint, so §6's lifecycle is kept by
+    -- two accessors — [`unlink_media_path`] for a path that went away and [`prune_unlinked_media`] for media that never
+    -- gained one. Both are needed: an embed that records bytes and then refuses to encode them leaves a row no unlink
+    -- call can find, because there is no path left to unlink.
+    --
+    -- No foreign key to `files`, deliberately: `files` rows exist for images too, but a media path is a fact about a
+    -- *link* in a note, and §6 keeps `links` as prose rather than a resolver — an FK here would make the registry, not
+    -- the embed pass, decide when a figure stops being searchable. Re-pointing on a rename is therefore the embed pass's
+    -- job (`link_media_path`'s upsert), and `case_key` exists for its case-folded fallback lookup, unconstrained exactly
+    -- as `files.case_key` is (migration 4 moved that guard to `case_bytes`, which this table does not need because its
+    -- primary key already holds the raw bytes).
     CREATE TABLE media_path (
         rel_bytes   BLOB    NOT NULL CHECK (typeof(rel_bytes) = 'blob'),
         case_key    TEXT    NOT NULL,
@@ -334,10 +344,16 @@ pub const MIGRATIONS: &[Migration] = &[
         PRIMARY KEY (rel_bytes)
     );
 
+    -- Both lifecycle accessors ask "does any path still hold this row?", which without an index on `media_id` is a full
+    -- scan of `media_path` per media row — migration 4's `files_rel` argument, re-argued for the same reason.
+    CREATE INDEX media_path_media_id ON media_path(media_id);
+
     CREATE TABLE media_embeddings (
         media_id      INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
         model         TEXT    NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-        dim           INTEGER NOT NULL,
+        -- `dim > 0` is not decoration: the length arm alone accepts `dim = 0` with an empty BLOB, and a zero-component
+        -- row reads back as a vector of nothing — the garbage-cosine class the length arm exists to stop.
+        dim           INTEGER NOT NULL CHECK (dim > 0),
         vector        BLOB    NOT NULL CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim),
         source_hash   TEXT    NOT NULL,
         embedded_at   INTEGER NOT NULL,
@@ -2514,7 +2530,18 @@ pub fn record_model_file(
     db.0.prepare_cached(
         "INSERT INTO model_files (model, name, sha256, size)
          VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (model, name) DO UPDATE SET sha256 = excluded.sha256, size = excluded.size",
+         ON CONFLICT (model, name) DO UPDATE
+            -- Clearing the stamp pair is the load-bearing half. Re-recording a *different* digest — a fetch that found
+            -- new bytes for this member — would otherwise leave `verified_size`/`verified_mtime` describing bytes that
+            -- are no longer on disk, and D12's verify-on-change would skip hashing a 554,821,056-byte projector it has
+            -- never checked.
+            SET sha256 = excluded.sha256, size = excluded.size,
+                verified_size = NULL, verified_mtime = NULL
+            -- …but only when the declaration actually changed. `install` and a repeat fetch legitimately re-record the
+            -- same bytes (§12 rule 10), and clearing then would throw away a stamp that is still true and cost a full
+            -- 554 MB hash on the next image run for no reason. No row matches the WHERE on an identical re-record, so
+            -- the statement becomes a no-op rather than a wipe.
+            WHERE model_files.sha256 IS NOT excluded.sha256 OR model_files.size IS NOT excluded.size",
     )?
     .execute(params![model, name, sha256, size])?;
     Ok(())
@@ -2776,8 +2803,10 @@ fn read_media_by_hash(db: &Db, hash: &str) -> Result<MediaRow, DbError> {
 ///
 /// An upsert because a diagram replaced in place, or moved and re-added under the same name, is the normal case; a
 /// `SQLITE_CONSTRAINT_PRIMARYKEY` out of the write pass would roll the whole embed pass back over one re-pointed row.
-/// `rel_bytes` is bound as bytes and nothing else — the column's `typeof` CHECK is what keeps a lossy decode from
-/// becoming the stored spelling (F13), which is why this takes `&[u8]` where a `&str` would have compiled.
+/// `rel_bytes` is bound as bytes and never decoded — the column's `typeof` CHECK is what keeps a lossy spelling from
+/// becoming the stored path (F13), which is why this takes `&[u8]` where a `&str` would have compiled. `abs` is the
+/// opposite case and is deliberately lossy: it is the display spelling a report prints (F20's rule that reports show
+/// bytes as text), while `rel_bytes` stays the identity.
 pub fn link_media_path(
     db: &Db,
     rel: &[u8],
@@ -2785,12 +2814,28 @@ pub fn link_media_path(
     abs: &Path,
     media_id: i64,
 ) -> Result<(), DbError> {
+    // What this path pointed at before the upsert, if anything. A figure replaced in place is the ordinary case, and
+    // once its last path re-points elsewhere nothing references it — the same stranded-row shape as an unlink, so the
+    // displaced row is swept here rather than left for `np search` to keep answering.
+    let displaced = db
+        .0
+        .prepare_cached("SELECT media_id FROM media_path WHERE rel_bytes = ?1 AND media_id <> ?2")?
+        .query_row(params![rel, media_id], |row| row.get::<_, i64>(0))
+        .ok();
     db.0.prepare_cached(
         "INSERT INTO media_path (rel_bytes, case_key, abs, media_id) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (rel_bytes) DO UPDATE
             SET case_key = excluded.case_key, abs = excluded.abs, media_id = excluded.media_id",
     )?
     .execute(params![rel, case_key, abs.to_string_lossy(), media_id])?;
+    if let Some(old) = displaced {
+        // Same statement as `prune_unlinked_media`, scoped to the one row this call may have stranded.
+        db.0.prepare_cached(
+            "DELETE FROM media WHERE id = ?1
+              AND NOT EXISTS (SELECT 1 FROM media_path WHERE media_id = media.id)",
+        )?
+        .execute(params![old])?;
+    }
     Ok(())
 }
 
@@ -2801,15 +2846,14 @@ pub fn link_media_path(
 /// a bool lets the embed report say "1 figure removed" without a second query, and says `0` for both "one of two paths
 /// went" and "this path was never linked" — a deleted file is a fact about the world, not a corrupt database.
 pub fn unlink_media_path(db: &Db, rel: &[u8]) -> Result<usize, DbError> {
+    // One statement rather than a SELECT followed by a DELETE: with two statements, a link landing between them gives
+    // two ways to be wrong — the debug assert firing, or `Ok(0)` returned after a row was deleted. `RETURNING` makes
+    // "which media row did this path hold" and "is that path gone" the same instant.
     let holder =
-        db.0.prepare_cached("SELECT media_id FROM media_path WHERE rel_bytes = ?1")?
+        db.0.prepare_cached("DELETE FROM media_path WHERE rel_bytes = ?1 RETURNING media_id")?
             .query_row(params![rel], |row| row.get::<_, i64>(0))
             .ok();
-    let removed_path =
-        db.0.prepare_cached("DELETE FROM media_path WHERE rel_bytes = ?1")?
-            .execute(params![rel])?;
     let Some(media_id) = holder else {
-        debug_assert_eq!(removed_path, 0, "no holder means no row to delete");
         return Ok(0);
     };
     // `NOT EXISTS` rather than a count compare so the check and the delete are one statement: a second process linking
@@ -2821,6 +2865,26 @@ pub fn unlink_media_path(db: &Db, rel: &[u8]) -> Result<usize, DbError> {
         )?
         .execute(params![media_id])?;
     Ok(removed_media)
+}
+
+/// Delete every media row that no path holds any more, returning how many went.
+///
+/// [`unlink_media_path`] cannot be the whole lifecycle rule on its own: it works from a path, so a media row that never
+/// gained one — bytes recorded and then refused by the encoder, or an embed interrupted between the two writes by a
+/// provider that would not load — is invisible to it forever. §6's rule is "a media row lives while at least one live
+/// path exists", and this is the accessor that makes that statement true rather than aspirational. `ON DELETE CASCADE`
+/// takes the vectors, so a swept figure cannot answer `np search`.
+///
+/// Idempotent by construction: the second call finds nothing, which is what lets an embed pass run it unconditionally at
+/// the end rather than only when it thinks something changed.
+pub fn prune_unlinked_media(db: &Db) -> Result<usize, DbError> {
+    let removed = db
+        .0
+        .prepare_cached(
+            "DELETE FROM media WHERE NOT EXISTS (SELECT 1 FROM media_path WHERE media_id = media.id)",
+        )?
+        .execute([])?;
+    Ok(removed)
 }
 
 /// Store (or correct) the vector one model computed for one media row.
@@ -2910,8 +2974,9 @@ pub fn record_member_stamp(
 /// The stamp for one recorded member, or `None` when it has never been verified.
 ///
 /// Three states collapse here on purpose and one does not: "no member row" and "member with no stamp" both read `None`
-/// because both mean *hash it*, while a stamp of `(0, 0)` reads `Some` because zeros are a size and an mtime that were
-/// actually observed. Callers that need the first distinction ask [`model_files`] whether the member is recorded at all
+/// because both mean *hash it*, while a stamp of `(0, 0)` reads `Some` because it is a complete pair: zeros are what a
+/// real `stat` reports for an empty file with a zero mtime, and this reader's job is "was a pair written", not "were the
+/// values plausible" (nothing here stores provenance, so plausibility is not something it could check). Callers that need the first distinction ask [`model_files`] whether the member is recorded at all
 /// — which is precisely what migration 9 could not express for an `install --path` model and this entry adds.
 pub fn member_stamp(db: &Db, model: &str, name: &str) -> Result<Option<(i64, i64)>, DbError> {
     read_stamp_pair(
@@ -2922,6 +2987,10 @@ pub fn member_stamp(db: &Db, model: &str, name: &str) -> Result<Option<(i64, i64
 }
 
 /// One stamp pair, with the half-pair rule in a single place so `media` and `model_files` cannot drift apart.
+///
+/// No `typeof` guard here, unlike the blob columns this file insists on: these two have INTEGER affinity, so SQLite
+/// converts `'40960'` to the integer 40960 **on write** and a text stamp cannot exist to be misread — measured, in
+/// `a_stamp_column_holds_only_an_integer`. The guard that matters is the pair rule below.
 fn read_stamp_pair(
     db: &Db,
     sql: &str,
