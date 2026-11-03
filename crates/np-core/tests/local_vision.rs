@@ -144,16 +144,22 @@ mod vision {
     /// provider stores beside the model it points into) and the borrowing [`VisionModel`] façade. A row that differed
     /// between them would mean `np embed` storing vectors that no search through the other shape could reproduce, so this
     /// case asserts **bit-identical** components — not `≈`, for the same reason
-    /// [`the_same_bytes_twice_give_bit_identical_components`] refuses a tolerance: an embed run compares a fresh row against
-    /// a stored one to decide whether an image is current.
+    /// [`the_same_bytes_twice_give_bit_identical_components`] refuses a tolerance: two shapes of one seam producing rows
+    /// that differ in the last bit is a bug nobody would ever see in a cosine.
+    ///
+    /// **What this case does not do**: compare stored rows against fresh ones. Currency today is a digest of
+    /// `model_inputs` (`embed_run`), and no image has a digest path yet — that comparison arrives with the media pass, so
+    /// saying it here would describe code that does not exist.
     ///
     /// Three drivers, one loaded model: the façade, a [`Projector`] opened by hand, and the same projector held by a
     /// [`LocalEmbedder`] — which is the shape the drop rule in `local_model::LocalEmbedder` exists for, so this is also the
     /// artifact-gated proof that a provider opening its own projector encodes like one opened beside it. The model is
-    /// **moved** into the provider after the first two are dropped (420 MiB once rather than twice), and the same move is
-    /// what proves the projector inside it dies before the model: this case would abort on a re-pin whose context reads its
-    /// model during `~mtmd_context` if the fields were declared the other way round — nothing here demonstrates that today,
-    /// and the field comment says so rather than this sentence pretending otherwise.
+    /// **moved** into the provider after the first two are dropped, so the artifact holds 420 MiB once rather than twice.
+    ///
+    /// Nothing here demonstrates the drop order, and this sentence used to claim it did. Freeing a projector after its
+    /// model is a use of freed memory in C — no assertion in this file can see it either way — so the guarantee rests on
+    /// `LocalEmbedder`'s `Drop` body plus field order, and the mutation that empties the `Drop` body passes every case in
+    /// this file. That is recorded in the field comment, not here.
     ///
     /// The last block is capability, not arithmetic: a provider with no projector must answer `supports_images() == false`
     /// and refuse an image **without loading** (`loaded()` stays false), because §8's `vision-unavailable` is the cheap
@@ -280,9 +286,12 @@ mod vision {
     /// the decoder reads each row at the passed model's (`llama-batch.cpp:1470-1474`). The guard is a pointer comparison,
     /// so two artifacts that happen to share 512/768 are still refused rather than read as safe.
     ///
-    /// This is the one case here holding **two** loaded models (~420 MiB each) at once, because nothing lighter can show
-    /// it: with a single model there is no second pointer to hand in. The refusal has to arrive before any encoder work, so
-    /// the assertion runs first and the matched pair is checked afterwards to prove the guard is not simply breaking the seam.
+    /// **What two loads of one artifact can and cannot show.** It proves the guard keys on the loaded *instance*, not on
+    /// widths — both models here answer 512 in and 768 out, so a width comparison would have let this through. It cannot
+    /// show anything about two genuinely different artifacts, because this host has one model file; that case is untested
+    /// here rather than implied. Two loaded models (~420 MiB each) are held at once because nothing lighter produces a
+    /// second instance. The refusal must arrive before any encoder work, so that assertion runs first and the matched pair
+    /// is checked afterwards — otherwise the guard could be "passing" by simply breaking the seam.
     #[test]
     fn a_projector_refuses_a_model_it_was_not_opened_against() {
         let (model_path, mmproj_path) = artifacts_or_not_coverage!();

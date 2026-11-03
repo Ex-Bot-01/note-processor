@@ -50,16 +50,17 @@ const COMPONENT_BYTES: usize = 4;
 /// no projector, no vision graph, tokenization refused, a chunk shape this seam does not implement, a decoder that would
 /// not take the rows, a pooled row that is not usable.
 ///
-/// **This is the one definition.** It lives here rather than in `crate::vision` because the trait's default refusal has
-/// to answer with it in a build where that module is not compiled at all (`vision` is a cargo feature; this module is
-/// always built), and a second `const` with the same value would let the two halves of one class drift apart.
-/// `crate::vision` re-exports this item under its own path, which is where the design document names it (§8 of
+/// **Defined once in [`crate::media`]** and re-exported here, because the trait's default refusal has to answer with it in
+/// a build where `crate::vision` is not compiled at all (`vision` is a cargo feature; this module and `media` are always
+/// built), and a second `const` with the same value would let the two halves of one class drift apart — measured rather
+/// than argued: renaming one copy on 2026-11-03 left all 534 default-build tests green. `crate::vision` re-exports it too,
+/// under the path the design document names (§8 of
 /// `docs/design-m2-image-embeddings.md`); the re-export carries no value of its own.
 ///
 /// The class is about the pair, never about the caller's bytes — that distinction is what vision's `undecodable` class
 /// exists next to it for (see `crate::vision`, compiled only under the feature, hence no link here) — and it carries no
 /// path, URL, or runtime diagnostic text (§12 rule 8).
-pub const VISION_UNAVAILABLE: &str = "vision-unavailable";
+pub use crate::media::VISION_UNAVAILABLE;
 
 /// One embedding, held as `dim` `f32` components and stored as those components little-endian.
 ///
@@ -465,9 +466,11 @@ pub trait Embedder {
     /// Whether [`Self::embed_image`] can serve on this provider, asked before anything is attempted.
     ///
     /// Defaults to `false`, so a text-only provider — and every provider written before images existed — keeps answering
-    /// it without editing. A provider answers true only when it genuinely has the second encoder (`supports_images` is a
-    /// statement about this build and this configuration, not about the bytes about to be handed over), which is what lets
-    /// a caller refuse an image *before* reading the file instead of after.
+    /// it without editing. A provider answers true when the second encoder is **configured** — for the local providers
+    /// that means an mmproj path is set, not that a projector has opened. Opening can still fail (missing file, no vision
+    /// graph) and `embed_image` refuses with [`VISION_UNAVAILABLE`] when it does, so `true` never promises a vector; what it
+    /// promises is that asking is worth the file read, which is how a caller gets to refuse an image *before* reading it.
+    /// It says nothing about the bytes about to be handed over.
     ///
     /// **An image carries no instruction prefix** (§1.2): prefixes are how a text chunk is dressed for a task, and media
     /// rows are embedded bare and compared against prefixed text rows — so there is no `prefix` parameter on either half

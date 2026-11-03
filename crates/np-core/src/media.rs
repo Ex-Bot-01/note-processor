@@ -219,17 +219,37 @@ pub enum MediaRefusal {
     VisionUnavailable,
 }
 
+/// These bytes are not a raster this build can decode (§8). **The one definition**; `crate::vision` re-exports it, and
+/// `MediaRefusal::label` answers with it, so the seam's refusal and the report's label cannot drift apart.
+pub const UNDECODABLE: &str = "undecodable";
+/// The encode measured larger than the context can hold (§8). **The one definition**, same reasoning as
+/// [`UNDECODABLE`].
+pub const OVER_BUDGET: &str = "over-budget";
+/// This build and model pair cannot serve the request (§8). **The one definition**, shared by three readers: this label,
+/// [`crate::embed::Embedder::embed_image`]'s default refusal, and the vision seam that emits it most often (a module
+/// compiled only under the `vision` feature, so it is named in prose rather than linked — a doc link here would break
+/// every default-build `cargo doc`).
+pub const VISION_UNAVAILABLE: &str = "vision-unavailable";
+
 impl MediaRefusal {
     /// The §8 kebab-case spelling, which is what an embed report prints and its JSON repeats; Tasks 5, 6 and 8 label
     /// through this one function so a class cannot be spelled two ways.
+    ///
+    /// **Three of these six return a `const`, not a literal** — [`UNDECODABLE`], [`OVER_BUDGET`] and
+    /// [`VISION_UNAVAILABLE`] are also emitted by code outside this module (the vision seam, and
+    /// [`crate::embed::Embedder::embed_image`]'s default refusal), so they have exactly one spelling in the tree. A
+    /// measured consequence of keeping them literal: renaming `embed`'s copy on 2026-11-03 left every default-build test
+    /// green (534 passed, 0 failed) because the only assertion comparing the two sits behind `--features vision`.
+    /// `missing-target`, `outside-workspace` and `unsupported-format` are emitted here alone, so they stay literals —
+    /// pinned by name in `tests/media_resolve.rs`.
     pub fn label(&self) -> &'static str {
         match self {
             MediaRefusal::MissingTarget => "missing-target",
             MediaRefusal::OutsideWorkspace => "outside-workspace",
             MediaRefusal::UnsupportedFormat => "unsupported-format",
-            MediaRefusal::Undecodable => "undecodable",
-            MediaRefusal::OverBudget => "over-budget",
-            MediaRefusal::VisionUnavailable => "vision-unavailable",
+            MediaRefusal::Undecodable => UNDECODABLE,
+            MediaRefusal::OverBudget => OVER_BUDGET,
+            MediaRefusal::VisionUnavailable => VISION_UNAVAILABLE,
         }
     }
 }

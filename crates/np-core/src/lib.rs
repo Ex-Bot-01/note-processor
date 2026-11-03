@@ -1,4 +1,10 @@
 //! Core of note-processor: workspace discovery, catalog rendering.
+//!
+//! **Breaking for embedders, as of R7c (2026-11-03):** [`embed_run`]`::{embed, embed_with_resolution,
+//! embed_with_inject}` take `&mut dyn Embedder`, because [`embed::Embedder::embed_image`] may have to open a projector and
+//! that is not something `&self` can do without interior mutability over C handles. Every in-tree caller already passes
+//! mutable; an out-of-tree caller holding a shared `&dyn Embedder`, or reusing one provider across two runs through a
+//! shared reference, needs the same change. There is no CHANGELOG in this tree, so this is where the note lives.
 
 pub mod catalog;
 pub mod change;

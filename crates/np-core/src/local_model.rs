@@ -202,6 +202,19 @@ pub struct ModelFacts {
 /// it may. R6b2 shares one loaded model per process by **holding** it (§3's "one load per process, never per
 /// note"), not by wrapping it in an `Arc`.
 pub struct LoadedModel {
+    /// A token identifying **this loaded instance**, shared with anything that must not outlive it — today only
+    /// [`crate::vision::Projector`], which holds a `Weak` half (`std::sync::Arc`, cheap and lock-free on clone).
+    ///
+    /// It exists because a projector is handed the model as a parameter, and comparing the model's *address* is not
+    /// enough: an address can be reused by a later load after this one is dropped, and mtmd would still hold a pointer to
+    /// memory that no longer describes a model (`mtmd.cpp:567`). Two loads of the same file get two tokens, so a mismatch
+    /// refuses even when both artifacts share every width.
+    ///
+    /// Gated on `vision` because nothing outside that feature can hold the other half of the token; without the gate the
+    /// field is dead code in a text-only build, and a gate asks the honest question ("who reads this?") where an
+    /// `#[allow(dead_code)]` would hide it.
+    #[cfg(feature = "vision")]
+    identity: std::sync::Arc<()>,
     /// From `llama_model_load_from_file`; freed second, because a context stores a raw pointer to its model
     /// rather than retaining it (`crate::llama_ffi`'s note on [`llama_ffi::llama_init_from_model`]).
     model: NonNull<llama_model>,
@@ -217,6 +230,23 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
+    /// The weak half of this instance's identity token — see [`LoadedModel::identity`]. A holder that must not outlive
+    /// this model keeps the `Weak` and upgrades it on every use: an upgrade failing means the model is gone, which no
+    /// address comparison could tell you (`mtmd.cpp:567` keeps a raw pointer, and allocators reuse addresses).
+    #[cfg(feature = "vision")]
+    pub(crate) fn identity_token(&self) -> std::sync::Weak<()> {
+        std::sync::Arc::downgrade(&self.identity)
+    }
+
+    /// True when `other` is this same loaded instance.
+    #[cfg(feature = "vision")]
+    pub(crate) fn same_instance_as(&self, token: &std::sync::Weak<()>) -> bool {
+        match token.upgrade() {
+            Some(alive) => std::sync::Arc::ptr_eq(&self.identity, &alive),
+            None => false,
+        }
+    }
+
     /// The loaded model handle, for [`crate::vision`] — a projector is initialised **against** it and keeps a raw
     /// pointer to it (`mtmd.cpp:567`, `:615`), which is why [`crate::vision::VisionModel`] borrows this type instead of
     /// taking a copy, and why [`crate::vision::Projector`] — the half that owns its context and cannot borrow — takes a
@@ -1376,6 +1406,8 @@ pub fn load_with_options(
     // only success value is "the context is now owned too".
     match open_context(model, configured_dim, options) {
         Ok((ctx, facts, window)) => Ok(LoadedModel {
+            #[cfg(feature = "vision")]
+            identity: std::sync::Arc::new(()),
             model,
             ctx,
             facts,

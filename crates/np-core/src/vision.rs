@@ -49,10 +49,15 @@ use crate::embed::{EmbedError, Vector};
 use crate::llama_ffi::{self, mtmd};
 use crate::local_model::LoadedModel;
 
-/// These bytes are not a raster this build can decode (§8). Audio arrives here too: the pinned projector advertises
-/// audio support, and §3 makes it a non-goal, so "not an image" and "did not decode" get the same answer — the caller's
-/// action is identical either way, and §8's list has no audio class to invent one for.
-pub const UNDECODABLE: &str = "undecodable";
+/// This **build and model pair** cannot serve the request (§8): the projector would not load beside this model, carries no
+/// vision graph, tokenized wrong, asked for a position scheme this seam does not implement, refused the rows, or pooled to
+/// nothing usable. Not a statement about the caller's bytes — that distinction is why this class exists next to
+/// [`UNDECODABLE`].
+///
+/// Re-exported from [`crate::media`], which holds the single definition shared by this seam,
+/// [`crate::embed::Embedder::embed_image`]'s default refusal and `MediaRefusal::label`. A re-pin that needs a different
+/// wording changes `media.rs` — nowhere else, because there is no other spelling to find.
+pub use crate::embed::VISION_UNAVAILABLE;
 /// The encode measured larger than the context can hold (§8). Decided from the patch count this encode produced, never
 /// from file size — the spike measured 336 tokens for a 1024×768 image and 88 for 512×384.
 ///
@@ -60,18 +65,15 @@ pub const UNDECODABLE: &str = "undecodable";
 /// because mtmd clamps the patch grid to the artifact's own soft-token ceiling and this build's window is 8,192. The check
 /// is not decoration — it runs before the decode, and past the window llama.cpp asserts instead of returning a code, so a
 /// missing guard turns a refusal into an abort (`tests/local_vision.rs::a_large_image_either_embeds_within_the_window_or_refuses_over_budget`
-/// prints whichever branch a given image takes).
-pub const OVER_BUDGET: &str = "over-budget";
-/// This **build and model pair** cannot serve the request (§8): the projector would not load beside this model, carries no
-/// vision graph, tokenized wrong, asked for a position scheme this seam does not implement, refused the rows, or pooled to
-/// nothing usable. Not a statement about the caller's bytes — that distinction is why this class exists next to
-/// [`UNDECODABLE`].
+/// prints whichever branch a given image takes). Re-exported from [`crate::media`], which owns §8's spellings.
+pub use crate::media::OVER_BUDGET;
+/// These bytes are not a raster this build can decode (§8). Audio arrives here too: the pinned projector *does* accept
+/// audio bytes, and §3 makes it a non-goal, so "not an image" and "did not decode" get the same answer — the caller's
+/// action is identical either way, and §8's list has no audio class to invent one for.
 ///
-/// The **definition** lives in [`crate::embed`], one `const` shared by this seam and
-/// [`crate::embed::Embedder::embed_image`]'s default refusal, so the two cannot answer with different spellings of one
-/// class; this is the re-export under the path §8 names. A re-pin that needs a different wording changes `embed.rs`, not
-/// this line.
-pub use crate::embed::VISION_UNAVAILABLE;
+/// Re-exported from [`crate::media`], which owns §8's spellings; see this module's header for how the three classes are
+/// divided between "about these bytes" and "about this build".
+pub use crate::media::UNDECODABLE;
 
 /// One image's row, and what the encode that produced it cost.
 ///
@@ -105,15 +107,19 @@ pub struct Projector {
     /// The media marker mtmd splits a prompt on — copied out of C memory at open, because the string it returns is
     /// owned by the context and this seam hands that context to `Drop` while still holding the marker.
     marker: CString,
-    /// Which [`LoadedModel`] this context was built beside, kept **only to compare pointers against**.
+    /// The identity of the [`LoadedModel`] this context was built beside, as a `Weak` token — **never dereferenced, never
+    /// compared by address**. It exists because [`Projector::embed_image`] takes a model as a parameter, and handing one
+    /// model's encoder rows to another model's decoder is not a wrong answer but an out-of-bounds one: the rows were
+    /// copied at this projector's `n_inp` while the batch reads each row at the passed model's width
+    /// (`llama-batch.cpp:1470-1474`).
     ///
-    /// Never dereferenced — holding it says nothing about that model being alive and claims nothing about it. It exists
-    /// because [`Projector::embed_image`] takes a model as a parameter, and handing the rows of one model's vision encoder
-    /// to a different model's decoder is not a wrong answer but an out-of-bounds one: the rows were copied at this
-    /// projector's `n_inp` while the batch is read at the passed model's (`llama-batch.cpp:1470-1474`). The owning type
-    /// keeps them matched by construction ([`crate::local_model::LocalEmbedder`]); this turns a caller that does not into a
-    /// refusal instead of memory unsafety.
-    opened_against: NonNull<llama_ffi::llama_model>,
+    /// A token rather than a pointer because a pointer answers the wrong question. An address can be handed back by the
+    /// allocator after its model is freed, and then a stale projector would pass a pointer check while mtmd's stored
+    /// `text_model` (`mtmd.cpp:567`) dangles; upgrading this `Weak` says plainly whether *that* instance is still alive.
+    /// Two loads of one file get two tokens, so a mismatch refuses even when both artifacts share 512 and 768. The owning
+    /// type keeps the pair matched by construction ([`crate::local_model::LocalEmbedder`]); this turns a caller that does
+    /// not into a refusal instead of memory unsafety.
+    opened_against: std::sync::Weak<()>,
     /// `llama_model_n_embd_inp`: the width of one encoder row (§1.2's 512), which is what the decoder is fed.
     n_inp: usize,
     /// `llama_model_n_embd_out`: the width stored and searched (768). Pooling happens at this width, not at input.
@@ -191,7 +197,7 @@ impl Projector {
         Ok(Self {
             mctx,
             marker,
-            opened_against: model.model_ptr(),
+            opened_against: model.identity_token(),
             n_inp: facts.n_embd_inp,
             n_out: facts.n_embd_out,
             window: model.window(),
@@ -228,7 +234,7 @@ impl Projector {
         // The context encodes for one specific model, so the model handed here has to be that one. Comparing identities
         // rather than widths: two artifacts can share 512/768 and still be different networks whose rows mean different
         // things, and a matched pair of widths is exactly the case that would otherwise read as safe.
-        if model.model_ptr() != self.opened_against {
+        if !model.same_instance_as(&self.opened_against) {
             return Err(unavailable());
         }
         if bytes.is_empty() {
@@ -290,10 +296,11 @@ impl Projector {
 
         let chunks = unsafe { mtmd::mtmd_input_chunks_init() };
         if chunks.is_null() {
-            // Not expected: C does `new mtmd_input_chunks` with no `try` (`mtmd.cpp:2872-2874`), so an allocation failure
-            // throws and aborts the process rather than handing back null. The check stays because a null list would be
-            // dereferenced by every call below it, and because reading the mirror as "returns null on failure" is exactly
-            // the kind of assumption that should cost nothing to survive.
+            // Not expected, and honest about why we cannot promise what happens instead: C does `new mtmd_input_chunks`
+            // with no `try`, so an allocation failure throws a C++ exception that this crate neither catches nor claims to
+            // survive — unwinding through Rust frames is outside our control, whatever the platform ends up doing. The
+            // null check stays because a null list would be dereferenced by every call below it if a future pin turns this
+            // into a checked API; it is not evidence that failure is graceful, and no test here pretends otherwise.
             return Err(unavailable());
         }
 
@@ -356,7 +363,27 @@ impl Projector {
                     }
                     if image_rows.is_some() {
                         // Two image chunks would need a pooling decision §1.2 never made, because this seam is handed one
-                        // bitmap at a time. That is a limit of this seam, not a fault in the file.
+                        // bitmap at a time. That is a limit of this seam, not a fault in the file. (The cost on record
+                        // after this refusal is the first chunk's — an attempt did measure a grid.)
+                        return Err(unavailable());
+                    }
+                    // The patch count is known here, so **this** is where the attempt's cost goes on record — not after the
+                    // loop. Review found the difference: with the write at the end, four refusals that happen once the grid
+                    // exists (null rows, a width that cannot multiply, M-RoPE, a second image chunk) left the *previous*
+                    // encode's number on record for an attempt that had measured patches, contradicting this field's own
+                    // doc. §8 reads the number after an attempt, so it has to be this attempt's from the moment it is knowable.
+                    //
+                    // **No test can tell the two placements apart on this pin**, measured 2026-11-03: moving the write back
+                    // below left all 11 cases green, because every refusal it protects is a path where the runtime
+                    // contradicts itself and this artifact never takes one. It is defensive correctness, written down as
+                    // such rather than sold as a fixed bug.
+                    self.last_cost.set(n_tokens);
+
+                    // M-RoPE would make `llama_batch.pos` section-major (`src/llama-batch.cpp:924`), and asking about it
+                    // needs no encoder run — so it is asked **before** one. This artifact answers false; the probe note
+                    // refused that case rather than decoding it with silently wrong positions, and neither does this seam.
+                    // SAFETY: `mctx` live; a null chunk asks the projector-level question.
+                    if unsafe { mtmd::mtmd_decode_use_mrope(self.mctx.as_ptr()) } {
                         return Err(unavailable());
                     }
                     // SAFETY: `mctx` live, `chunk` belongs to it. This runs the vision encoder alone — no text context,
@@ -380,13 +407,6 @@ impl Projector {
                     // SAFETY: mtmd promises `n_inp * n_tokens` floats at this pointer for this chunk.
                     rows.extend_from_slice(unsafe { std::slice::from_raw_parts(raw, needed) });
 
-                    // M-RoPE would make `llama_batch.pos` section-major
-                    // (`src/llama-batch.cpp:924`); this artifact answers false, and the probe note refused that case
-                    // rather than decoding it with silently wrong positions. Neither does this seam.
-                    // SAFETY: `mctx` live; a non-null chunk asks about that chunk.
-                    if unsafe { mtmd::mtmd_decode_use_mrope(self.mctx.as_ptr()) } {
-                        return Err(unavailable());
-                    }
                     // Whether *this* chunk needs a non-causal mask — asked, not assumed, so a re-pin that changes the
                     // answer changes our behaviour instead of leaving a stale hard-coded `false`.
                     // SAFETY: `mctx` live and `chunk` belongs to it.
@@ -422,10 +442,8 @@ impl Projector {
         // answers about this pair, not about the file.
         let (rows, image_tokens, non_causal) = image_rows.ok_or_else(unavailable)?;
 
-        // Cost is recorded for *this* attempt, before the decode that might fail: §8's rule reads the number after an
-        // encode, and an over-budget refusal with no number attached would leave the report nothing to say. It therefore
-        // stays on the record for a refusal too — see [`Projector::last_cost`] for which cases prove that.
-        self.last_cost.set(image_tokens);
+        // The cost was written when this chunk's grid was measured, above, and it stays on the record through every
+        // refusal below — see [`Projector::last_cost`] for which cases prove that.
         if image_tokens > self.window {
             return Err(EmbedError::Unavailable(OVER_BUDGET.to_string()));
         }
