@@ -46,6 +46,21 @@ use crate::walk;
 /// Bytes per component: the `4` in migration 7's `CHECK (length(vector) = 4 * dim)`.
 const COMPONENT_BYTES: usize = 4;
 
+/// The canonical spelling of [`EmbedError::Unavailable`] for "this **build and model pair** cannot serve the request":
+/// no projector, no vision graph, tokenization refused, a chunk shape this seam does not implement, a decoder that would
+/// not take the rows, a pooled row that is not usable.
+///
+/// **This is the one definition.** It lives here rather than in `crate::vision` because the trait's default refusal has
+/// to answer with it in a build where that module is not compiled at all (`vision` is a cargo feature; this module is
+/// always built), and a second `const` with the same value would let the two halves of one class drift apart.
+/// `crate::vision` re-exports this item under its own path, which is where the design document names it (§8 of
+/// `docs/design-m2-image-embeddings.md`); the re-export carries no value of its own.
+///
+/// The class is about the pair, never about the caller's bytes — that distinction is what vision's `undecodable` class
+/// exists next to it for (see `crate::vision`, compiled only under the feature, hence no link here) — and it carries no
+/// path, URL, or runtime diagnostic text (§12 rule 8).
+pub const VISION_UNAVAILABLE: &str = "vision-unavailable";
+
 /// One embedding, held as `dim` `f32` components and stored as those components little-endian.
 ///
 /// The dimension is the length of the buffer rather than a second field, so there is no pair to keep in
@@ -446,6 +461,35 @@ pub trait Embedder {
     /// Implementations that cannot serve return an [`EmbedError`]; they never panic on absence of a
     /// model or an endpoint (§7: CI runs `--ignored`, so a panicking path poisons a green run).
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError>;
+
+    /// Whether [`Self::embed_image`] can serve on this provider, asked before anything is attempted.
+    ///
+    /// Defaults to `false`, so a text-only provider — and every provider written before images existed — keeps answering
+    /// it without editing. A provider answers true only when it genuinely has the second encoder (`supports_images` is a
+    /// statement about this build and this configuration, not about the bytes about to be handed over), which is what lets
+    /// a caller refuse an image *before* reading the file instead of after.
+    ///
+    /// **An image carries no instruction prefix** (§1.2): prefixes are how a text chunk is dressed for a task, and media
+    /// rows are embedded bare and compared against prefixed text rows — so there is no `prefix` parameter on either half
+    /// of this pair, which is stronger than a rule telling callers not to pass one.
+    fn supports_images(&self) -> bool {
+        false
+    }
+
+    /// One image's encoded bytes (PNG, JPEG, …) to one [`Vector`] of [`Self::dim`] components.
+    ///
+    /// `&mut self` because the vision runtime keeps mutable per-context state across an encode — the projector writes its
+    /// encoder output into a buffer the text decoder reads, and llama.cpp flips the shared causal-attention flag around
+    /// the image decode. Two encodes cannot run through one provider at once, and the borrow says so instead of a comment
+    /// doing it.
+    ///
+    /// The default refuses with [`EmbedError::Unavailable`] carrying [`VISION_UNAVAILABLE`], because "this provider has no
+    /// image encoder" is a fact about the build and model pair. **A refusal is a class, never a path** (§12 rule 8): no
+    /// filename, URL or runtime diagnostic text reaches the payload — the caller's bytes are named nowhere in what we
+    /// report.
+    fn embed_image(&mut self, _bytes: &[u8]) -> Result<Vector, EmbedError> {
+        Err(EmbedError::Unavailable(VISION_UNAVAILABLE.to_string()))
+    }
 }
 
 /// The provider behind `embeddings.provider = "none"` (§2's default): it refuses, and could not do

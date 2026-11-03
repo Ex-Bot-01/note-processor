@@ -33,10 +33,11 @@ mod vision {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
-    use np_core::embed::{EmbedError, Vector};
-    use np_core::local_model::{self, LoadedModel};
+    use np_core::db::ModelRow;
+    use np_core::embed::{EmbedError, Embedder, Vector};
+    use np_core::local_model::{self, LazyLocalEmbedder, LoadedModel, LocalEmbedder};
     use np_core::media::MediaRefusal;
-    use np_core::vision::{VisionModel, OVER_BUDGET, UNDECODABLE, VISION_UNAVAILABLE};
+    use np_core::vision::{Projector, VisionModel, OVER_BUDGET, UNDECODABLE, VISION_UNAVAILABLE};
 
     /// The width `embeddinggemma-2-Q8_0.gguf` answers with — the same 768 `tests/local_load.rs` pins from the
     /// file's header and §1.2's published output dimension.
@@ -121,6 +122,198 @@ mod vision {
 
     fn components(v: &Vector) -> Vec<f32> {
         v.components().to_vec()
+    }
+
+    /// The row a provider in this file is built from. Every field but `dim` and the prefixes is a stamp no case reads:
+    /// `LocalEmbedder::new` compares `dim` against what the artifact answers and copies the prefixes, and nothing here
+    /// writes a vector row.
+    fn provider_row() -> ModelRow {
+        ModelRow {
+            id: "embeddinggemma-2".to_string(),
+            dim: i64::try_from(DIM).expect("768 fits i64"),
+            sha256: None,
+            prefix_doc: "task: search result | query: ".to_string(),
+            prefix_query: "query: ".to_string(),
+            installed_at: 1_730_000_000,
+            verified_size: None,
+            verified_mtime: None,
+        }
+    }
+
+    /// **The two shapes of the seam are one pipeline.** §10's image call now has an owning half ([`Projector`], which a
+    /// provider stores beside the model it points into) and the borrowing [`VisionModel`] façade. A row that differed
+    /// between them would mean `np embed` storing vectors that no search through the other shape could reproduce, so this
+    /// case asserts **bit-identical** components — not `≈`, for the same reason
+    /// [`the_same_bytes_twice_give_bit_identical_components`] refuses a tolerance: an embed run compares a fresh row against
+    /// a stored one to decide whether an image is current.
+    ///
+    /// Three drivers, one loaded model: the façade, a [`Projector`] opened by hand, and the same projector held by a
+    /// [`LocalEmbedder`] — which is the shape the drop rule in `local_model::LocalEmbedder` exists for, so this is also the
+    /// artifact-gated proof that a provider opening its own projector encodes like one opened beside it. The model is
+    /// **moved** into the provider after the first two are dropped (420 MiB once rather than twice), and the same move is
+    /// what proves the projector inside it dies before the model: this case would abort on a re-pin whose context reads its
+    /// model during `~mtmd_context` if the fields were declared the other way round — nothing here demonstrates that today,
+    /// and the field comment says so rather than this sentence pretending otherwise.
+    ///
+    /// The last block is capability, not arithmetic: a provider with no projector must answer `supports_images() == false`
+    /// and refuse an image **without loading** (`loaded()` stays false), because §8's `vision-unavailable` is the cheap
+    /// answer and laziness is the reason `LazyLocalEmbedder` exists.
+    #[test]
+    fn the_provider_seam_and_the_facade_agree_bit_for_bit() {
+        let (model_path, mmproj_path) = artifacts_or_not_coverage!();
+        let _serial = artifact_lock();
+        let model = load(&model_path);
+        let bytes = image("red_square_512x384.png");
+
+        // Driver 1: the façade that borrows the model.
+        let mut facade = open(&model, &mmproj_path);
+        let through_facade = components(
+            &facade
+                .embed_image(&bytes)
+                .expect("the fixture embeds through the façade"),
+        );
+        let facade_cost = facade.last_token_cost();
+        assert!(
+            facade_cost >= 1,
+            "an encode that produced a row reported a cost of {facade_cost}"
+        );
+
+        // Driver 2: the owning projector, handed the model per call — no borrow anywhere in this type.
+        let projector = Projector::open(&model, &mmproj_path)
+            .unwrap_or_else(|problem| panic!("opening {mmproj_path:?} should succeed: {problem}"));
+        let owned = projector
+            .embed_image(&model, &bytes)
+            .expect("the same bytes through the owning half");
+        assert_eq!(
+            components(&owned.vector),
+            through_facade,
+            "the façade and the owning projector disagreed about one byte string: {:?} vs {:?}",
+            &components(&owned.vector)[..4],
+            &through_facade[..4]
+        );
+        assert_eq!(
+            owned.token_cost, facade_cost,
+            "the cost carried in ImageEmbedding is not the cost the facade reported for one encode"
+        );
+
+        // Driver 3: a provider that owns the model and opens its own projector on first image need. Both earlier
+        // projectors are gone by now, which is also why the move below type-checks: nothing borrows `model` any more.
+        drop(projector);
+        drop(facade);
+        let mut provider = LocalEmbedder::new(
+            model,
+            &provider_row(),
+            np_core::config::DEFAULT_EMBEDDING_TOKENS,
+        )
+        .expect("the row declares the width this artifact answers")
+        .with_mmproj(mmproj_path.clone());
+        assert!(
+            provider.supports_images(),
+            "a provider built with an mmproj must say so before anyone is asked to read a file"
+        );
+        let through_provider = components(
+            &provider
+                .embed_image(&bytes)
+                .expect("a provider that opened its own projector encodes the fixture"),
+        );
+        assert_eq!(
+            through_provider, through_facade,
+            "the row a provider stored differs from the row the façade produces for the same bytes"
+        );
+
+        // Capability without a load: two providers over the same artifact, one with a projector file and one without.
+        let mut bare = LazyLocalEmbedder::new(
+            &provider_row(),
+            &model_path,
+            DIM,
+            np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect("test setup: the artifact is readable, so a lazy provider builds");
+        assert!(
+            !bare.supports_images(),
+            "a provider with no mmproj must answer that it cannot serve an image — one that always answered true would \
+             send every note's linked file into an encode that can only refuse"
+        );
+        match bare.embed_image(&bytes) {
+            Err(EmbedError::Unavailable(label)) => assert_eq!(
+                label, VISION_UNAVAILABLE,
+                "the refusal is §8's class for a build and model pair, not a statement about these bytes"
+            ),
+            other => panic!(
+                "a provider with no projector must refuse rather than produce a row, got {other:?}"
+            ),
+        }
+        assert!(
+            !bare.loaded(),
+            "refusing an image this provider cannot serve cost a load: the answer was already in its fields"
+        );
+
+        let with_projector = LazyLocalEmbedder::new(
+            &provider_row(),
+            &model_path,
+            DIM,
+            np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect("test setup: the same artifact again")
+        .with_mmproj(mmproj_path);
+        assert!(
+            with_projector.supports_images(),
+            "and true once a projector file is configured"
+        );
+        assert!(
+            !with_projector.loaded(),
+            "`supports_images` is a question about the configuration, not an invitation to load 420 MiB"
+        );
+
+        println!(
+            "TWO SEAMS: {DIM} components bit-identical through the façade, a hand-opened Projector and a \
+             LocalEmbedder's own projector; ‖v‖ = {:.9}, {facade_cost} image tokens each (the card's \
+             flat default is 280). A provider with no projector refused without loading.",
+            norm(&through_facade)
+        );
+    }
+
+    /// The owning half of the split hands its model in per call, so **a caller can hand in the wrong one** — and that is
+    /// not a wrong answer but an out-of-bounds one: the encoder's rows were copied at this projector's `n_embd_inp` while
+    /// the decoder reads each row at the passed model's (`llama-batch.cpp:1470-1474`). The guard is a pointer comparison,
+    /// so two artifacts that happen to share 512/768 are still refused rather than read as safe.
+    ///
+    /// This is the one case here holding **two** loaded models (~420 MiB each) at once, because nothing lighter can show
+    /// it: with a single model there is no second pointer to hand in. The refusal has to arrive before any encoder work, so
+    /// the assertion runs first and the matched pair is checked afterwards to prove the guard is not simply breaking the seam.
+    #[test]
+    fn a_projector_refuses_a_model_it_was_not_opened_against() {
+        let (model_path, mmproj_path) = artifacts_or_not_coverage!();
+        let _serial = artifact_lock();
+        let opened = load(&model_path);
+        let other = load(&model_path);
+        let projector = Projector::open(&opened, &mmproj_path)
+            .expect("the pinned projector opens beside the pinned model");
+        let bytes = image("red_square_512x384.png");
+
+        match projector.embed_image(&other, &bytes) {
+            Err(EmbedError::Unavailable(label)) => assert_eq!(
+                label, VISION_UNAVAILABLE,
+                "a mismatched pair is a fact about this build's pairing, not about the file"
+            ),
+            Ok(_) => panic!(
+                "a projector fed a model it was not opened against produced a row — the rows would have been \
+                 copied at one width and read at another"
+            ),
+            Err(other) => panic!("expected vision-unavailable, got {other:?}"),
+        }
+
+        let matched = projector
+            .embed_image(&opened, &bytes)
+            .expect("the model this projector was opened against still encodes after the refusal");
+        assert_eq!(matched.vector.dim(), DIM);
+        println!(
+            "MISMATCHED MODEL: refused as {VISION_UNAVAILABLE}; the opened-against model encoded afterwards at {} \
+             tokens",
+            matched.token_cost
+        );
     }
 
     /// §8's class names and `np embed`'s report labels are one list, so the seam cannot spell a class in a way

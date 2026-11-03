@@ -331,7 +331,12 @@ enum BatchWrite {
 pub enum Resolution<'a> {
     /// A provider built from the configured row — the only thing this run can write a vector from, and the only
     /// [`Embedder::dim`] §6's wrong-dim refusal may quote.
-    Provider(&'a dyn Embedder),
+    ///
+    /// `&mut` because [`Embedder::embed_image`] is `&mut self`: a local provider opens its projector on the first image it
+    /// is asked about, and that has to happen through the one provider this run holds rather than through a shared borrow
+    /// that would need interior mutability over FFI handles. Text embedding stays `&self`, so nothing here mutates a
+    /// provider today beyond what an image call will do next round.
+    Provider(&'a mut dyn Embedder),
     /// The caller tried to build a local provider from the installed row and could not read its artifact file.
     ///
     /// Taken as the fact for this run instead of re-statting the path: a file appearing between the caller's
@@ -346,7 +351,7 @@ pub enum Resolution<'a> {
 pub fn embed(
     workspace: &Path,
     cfg: &Config,
-    provider: &dyn Embedder,
+    provider: &mut dyn Embedder,
 ) -> Result<EmbedReport, EmbedRunError> {
     embed_with_inject(workspace, cfg, provider, &mut |_| {})
 }
@@ -374,7 +379,7 @@ pub fn embed_with_resolution(
 pub fn embed_with_inject(
     workspace: &Path,
     cfg: &Config,
-    provider: &dyn Embedder,
+    provider: &mut dyn Embedder,
     between_batches: &mut dyn FnMut(&Path),
 ) -> Result<EmbedReport, EmbedRunError> {
     run(
@@ -428,7 +433,9 @@ fn run(
     // could stop claiming nothing reads it.
     let declared = usize::try_from(row.dim).ok();
     let configured = cfg.embeddings.dim.map(usize::from).or(declared);
-    if let Resolution::Provider(provider) = resolution {
+    // Borrowed rather than bound by value: `Resolution::Provider` now holds a `&mut`, which is not `Copy`, so taking it out
+    // of `resolution` here would move the provider away from the arm (iii) match below.
+    if let Resolution::Provider(provider) = &resolution {
         match configured {
             // A row whose `dim` is not a non-negative integer cannot describe a width this run stores, and there
             // is no number to compare `provider.dim()` against. Report the row's own value rather than narrow it.
@@ -463,8 +470,10 @@ fn run(
     // counts as owed. That costs no work — the run returns before the writer loop either way — but it keeps
     // `current` from claiming a match against bytes nobody produced, which is the difference between "up to date"
     // and "we could not tell" in a report a person acts on.
+    // `&**provider` is a shared reborrow of the run's `&mut`: the currency read only ever asks [`Embedder::model_inputs`],
+    // and the mutable borrow is free again for the writer loop as soon as this loop ends.
     let witness: Option<&dyn Embedder> = match &resolution {
-        Resolution::Provider(provider) => Some(*provider),
+        Resolution::Provider(provider) => Some(&**provider),
         Resolution::ArtifactAbsent => None,
     };
 

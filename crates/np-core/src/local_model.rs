@@ -218,7 +218,9 @@ pub struct LoadedModel {
 
 impl LoadedModel {
     /// The loaded model handle, for [`crate::vision`] — a projector is initialised **against** it and keeps a raw
-    /// pointer to it (`mtmd.cpp:567`, `:615`), which is why `VisionModel` borrows this type instead of taking a copy.
+    /// pointer to it (`mtmd.cpp:567`, `:615`), which is why [`crate::vision::VisionModel`] borrows this type instead of
+    /// taking a copy, and why [`crate::vision::Projector`] — the half that owns its context and cannot borrow — takes a
+    /// `&LoadedModel` on every encode and leaves the "dies first" rule to field order.
     #[cfg(feature = "vision")]
     pub(crate) fn model_ptr(&self) -> NonNull<llama_model> {
         self.model
@@ -625,8 +627,35 @@ pub enum TextKind {
 /// Owns one [`LoadedModel`], so it owns ~420 MB of resident weights (§14) and is neither `Send` nor `Sync`
 /// because the handles inside it are neither. One per process, held for the run's lifetime: §3's "one load per
 /// process, never per note".
+///
+/// **It is also the one struct in this crate allowed to hold a projector**, because it is the one struct that owns a
+/// [`LoadedModel`] outright — which is what makes field order, rather than a lifetime, the thing keeping the two alive in
+/// the right sequence. See the `projector` field below.
 #[derive(Debug)]
 pub struct LocalEmbedder {
+    /// The projector path handed over by [`LocalEmbedder::with_mmproj`], or `None` when this provider serves text only.
+    ///
+    /// Kept as a path rather than opened at construction because capability is optional and lazy: a run that embeds no
+    /// image must not pay for a vision graph, and the projector can only be opened against a model that is already
+    /// resident — which for [`LazyLocalEmbedder`] is not true until the first batch.
+    #[cfg(feature = "vision")]
+    mmproj: Option<PathBuf>,
+    /// The open projector, created on the first [`Embedder::embed_image`] call and kept for every one after it
+    /// ([`LocalEmbedder::ensure_projector`]).
+    ///
+    /// Freed **before** [`Self::model`], by two independent mechanisms, because `mtmd_context` keeps a raw pointer to the
+    /// text model it was opened against (`mtmd.cpp:567`, initialised at `:615`) without retaining it:
+    ///
+    /// * [`impl Drop for LocalEmbedder`] releases this field first, and a `drop` body always runs before any field is
+    ///   dropped — so the rule holds even if someone reorders the struct or reformats it later;
+    /// * declaration order (this field above `model`) says the same thing when there is no `Drop` to read.
+    ///
+    /// **Neither mechanism is testable from inside this process.** Freeing the context after the model would be a use of
+    /// freed memory in C, not an assertion Rust can see; a case that "proved" it would have to catch a segfault. The two
+    /// mechanisms are therefore cheap redundancy on a hazard whose failure mode is invisible, and the honest record is that
+    /// this comment, not a green suite, is what protects a reader who moves these lines.
+    #[cfg(feature = "vision")]
+    projector: Option<crate::vision::Projector>,
     model: LoadedModel,
     /// `models.id`, verbatim — [`Embedder::model_id`] is what a write stamps into `embeddings.model`.
     model_id: String,
@@ -648,6 +677,12 @@ impl LocalEmbedder {
         let declared = usize::try_from(row.dim);
         match declared {
             Ok(dim) if dim == model.facts().n_embd_out => Ok(Self {
+                // No projector until someone asks for an image: `with_mmproj` says *whether*, the first
+                // `embed_image` says *when*.
+                #[cfg(feature = "vision")]
+                mmproj: None,
+                #[cfg(feature = "vision")]
+                projector: None,
                 model,
                 model_id: row.id.clone(),
                 prefix_doc: row.prefix_doc.clone(),
@@ -668,6 +703,42 @@ impl LocalEmbedder {
         &self.model
     }
 
+    /// Say that this provider can serve images, and where its projector lives.
+    ///
+    /// Builder style rather than a fourth argument to [`LocalEmbedder::new`], because `new` is the text path every
+    /// existing caller already builds and an mmproj is a capability, not a requirement: with no call to this method the
+    /// provider keeps [`Embedder`]`s` defaults and behaves exactly as it did before images existed.
+    ///
+    /// Opening is deferred to the first [`Embedder::embed_image`], so a wrong path refuses there — with
+    /// [`crate::embed::VISION_UNAVAILABLE`, §8's class for "this build and model pair cannot serve it" — rather than
+    /// turning construction into a second place a projector file can fail.
+    #[cfg(feature = "vision")]
+    #[must_use]
+    pub fn with_mmproj(mut self, path: PathBuf) -> Self {
+        self.mmproj = Some(path);
+        self
+    }
+
+    /// Open [`Self::mmproj`] against [`Self::model`] once and keep it, so the second image does not load a second vision
+    /// graph beside the first.
+    ///
+    /// The one place a projector is constructed by a provider, which is also the one place the drop-order rule of
+    /// [`Self::projector`] could be broken: the borrow of `model` ends when [`crate::vision::Projector::open`] returns,
+    /// and what remains is two owning fields whose declaration order decides who dies first.
+    #[cfg(feature = "vision")]
+    fn ensure_projector(&mut self) -> Result<(), EmbedError> {
+        if self.projector.is_some() {
+            return Ok(());
+        }
+        let path = self
+            .mmproj
+            .as_deref()
+            .ok_or_else(|| EmbedError::Unavailable(crate::embed::VISION_UNAVAILABLE.to_string()))?;
+        let opened = crate::vision::Projector::open(&self.model, path)?;
+        self.projector = Some(opened);
+        Ok(())
+    }
+
     /// Embed one text under the prefix `kind` selects.
     pub fn embed_as(&self, text: &str, kind: TextKind) -> Result<Vector, EmbedError> {
         let prefix = match kind {
@@ -675,6 +746,19 @@ impl LocalEmbedder {
             TextKind::Query => &self.prefix_query,
         };
         self.model.embed_text(prefix, text, self.max_tokens)
+    }
+}
+
+#[cfg(feature = "vision")]
+impl Drop for LocalEmbedder {
+    /// Release the projector before anything else in this provider dies.
+    ///
+    /// A `Drop` body runs before any field is dropped, so this makes the ordering rule hold without depending on which
+    /// line each field is declared on — see the `projector` field above for why the order matters and why no test can
+    /// watch it happen. Under `#[cfg(not(feature = "vision"))]` there is no projector to release and no `Drop`, which is
+    /// the honest shape: a text-only build has nothing to order.
+    fn drop(&mut self) {
+        self.projector = None;
     }
 }
 
@@ -761,6 +845,14 @@ impl LoadFailure {
 /// The two refusals that need no model — a width the row cannot answer, and an artifact that is not a file — are
 /// taken in [`LazyLocalEmbedder::new`] exactly as [`crate::embed::LocalModelProvider::new`] takes them, so §6's
 /// *artifact absent* arm stays arm (iii) rather than arriving late as a failure.
+///
+/// **Nothing image-shaped is stored here, and that is deliberate.** The rule `crate::vision` states is that the one struct
+/// allowed to hold a `crate::vision::Projector` is the struct that owns the [`LoadedModel`] the projector was opened
+/// against (`mtmd.cpp:567`) — and this type's model lives inside [`Self::loaded`], behind a `Result`, possibly not
+/// constructed at all. A projector field beside that cell could outlive a model that never existed, and no field order can
+/// say "drop me before whichever inner value might hold my counterpart". So only the mmproj **path** is kept here: it is
+/// handed to the [`LocalEmbedder`] built at load time, image calls go through that embedder, and the embedder owns both
+/// halves in the order the rule asks for.
 #[derive(Debug)]
 pub struct LazyLocalEmbedder {
     row: ModelRow,
@@ -774,6 +866,10 @@ pub struct LazyLocalEmbedder {
     /// The CPU allowance this process may use, read once at construction. Kept rather than re-read per load because a
     /// changing answer mid-run would make the reported number belong to a different machine than the run.
     available: usize,
+    /// The projector path from [`LazyLocalEmbedder::with_mmproj`], handed to the inner [`LocalEmbedder`] at load time.
+    /// A path and not an open projector — see this type's header for why that is the only shape the drop rule allows here.
+    #[cfg(feature = "vision")]
+    mmproj: Option<PathBuf>,
     loaded: std::cell::OnceCell<Result<LocalEmbedder, LoadFailure>>,
 }
 
@@ -812,8 +908,25 @@ impl LazyLocalEmbedder {
             available: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
+            // No projector path unless someone calls `with_mmproj`; without one this provider keeps the trait's image
+            // defaults and a text-only run is exactly what it was before images existed.
+            #[cfg(feature = "vision")]
+            mmproj: None,
             loaded: std::cell::OnceCell::new(),
         })
+    }
+
+    /// Say that this provider can serve images once it has loaded, and where its projector file is.
+    ///
+    /// Builder style, so [`LazyLocalEmbedder::new`] keeps the signature np-cli builds against. The path travels into the
+    /// inner [`LocalEmbedder`] when the load happens (in `LazyLocalEmbedder::model`), which is the first moment a projector
+    /// can be opened at all — and asking an unloaded provider for an image refuses before loading anything, so a refusal
+    /// never costs ~420 MiB and three seconds.
+    #[cfg(feature = "vision")]
+    #[must_use]
+    pub fn with_mmproj(mut self, path: PathBuf) -> Self {
+        self.mmproj = Some(path);
+        self
     }
 
     /// How many batch workers the **loaded** model answered with, or `None` while nothing is resident.
@@ -859,6 +972,16 @@ impl LazyLocalEmbedder {
         &self.artifact
     }
 
+    /// Make the model resident without handing back a borrow of it.
+    ///
+    /// Split out from [`Self::model`] because [`Embedder::embed_image`] needs `&mut` access to what is inside the cell —
+    /// the projector lives in there, beside the model it was opened against — and a borrow returned by `model` would keep
+    /// the whole cell claimed for as long as the caller held it.
+    #[cfg(feature = "vision")]
+    fn ensure_loaded(&mut self) -> Result<(), EmbedError> {
+        self.model().map(|_| ())
+    }
+
     fn model(&self) -> Result<&LocalEmbedder, EmbedError> {
         self.loaded
             .get_or_init(|| {
@@ -870,6 +993,18 @@ impl LazyLocalEmbedder {
                     threads: std::num::NonZeroU32::new(u32::try_from(wanted).unwrap_or(u32::MAX)),
                 };
                 match load_with_options(&self.artifact, self.dim, options) {
+                    // The mmproj hand-off happens here rather than as a fourth argument to [`LocalEmbedder::new`]: the
+                    // projector path is an optional capability, and this is the one place that knows both the path and a
+                    // model that is finally resident.
+                    #[cfg(feature = "vision")]
+                    Ok(model) => match LocalEmbedder::new(model, &self.row, self.max_tokens) {
+                        Ok(embedder) => Ok(match &self.mmproj {
+                            Some(path) => embedder.with_mmproj(path.clone()),
+                            None => embedder,
+                        }),
+                        Err(err) => Err(LoadFailure::capture(&err)),
+                    },
+                    #[cfg(not(feature = "vision"))]
                     Ok(model) => LocalEmbedder::new(model, &self.row, self.max_tokens)
                         .map(Ok)
                         .map_err(|err| LoadFailure::capture(&err))?,
@@ -1009,6 +1144,39 @@ impl Embedder for LazyLocalEmbedder {
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
         self.model()?.embed(texts)
     }
+
+    /// True when an mmproj was configured — answered **without loading**, which is the whole point of laziness here: a
+    /// caller deciding whether to read a file must not have to load 420 MiB of weights to ask.
+    #[cfg(feature = "vision")]
+    fn supports_images(&self) -> bool {
+        self.mmproj.is_some()
+    }
+
+    /// Load if nothing is resident yet, then hand the bytes to the inner [`LocalEmbedder`] — the only struct in this build
+    /// that holds a projector next to the model it points into.
+    ///
+    /// The two refusals come in a deliberate order: no configured projector answers [`crate::embed::VISION_UNAVAILABLE`
+    /// ]**before** anything is loaded, because "this provider serves text" is a fact the type already has, and paying for
+    /// a load to discover it would make every refusal cost the lazy provider's entire reason for existing. A load that
+    /// fails afterwards propagates its own typed reason, exactly as [`Self::embed`] does.
+    #[cfg(feature = "vision")]
+    fn embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError> {
+        let unavailable = || EmbedError::Unavailable(crate::embed::VISION_UNAVAILABLE.to_string());
+        if self.mmproj.is_none() {
+            return Err(unavailable());
+        }
+        self.ensure_loaded()?;
+        match self
+            .loaded
+            .get_mut()
+            .and_then(|outcome| outcome.as_mut().ok())
+        {
+            Some(embedder) => embedder.embed_image(bytes),
+            // Unreachable on the path above: `ensure_loaded` returning `Ok` means the cell holds a live embedder. Reaching
+            // this arm means that guarantee broke, which is a statement about this build rather than about any image.
+            None => Err(unavailable()),
+        }
+    }
 }
 
 impl Embedder for LocalEmbedder {
@@ -1038,6 +1206,34 @@ impl Embedder for LocalEmbedder {
             .iter()
             .map(|text| self.embed_as(text, TextKind::Document))
             .collect()
+    }
+
+    /// True exactly when [`LocalEmbedder::with_mmproj`] was called — a statement about this build and configuration, not
+    /// about any file about to be handed over.
+    #[cfg(feature = "vision")]
+    fn supports_images(&self) -> bool {
+        self.mmproj.is_some()
+    }
+
+    /// One image's bytes to one row of the same space [`Self::embed`]'s text rows live in.
+    ///
+    /// No prefix is applied, because §1.2 dresses text only; the pixels go to the encoder bare. The projector opens on the
+    /// first call and is reused after that, and a refusal leaves it open — one bad file does not cost a reload.
+    #[cfg(feature = "vision")]
+    fn embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError> {
+        let unavailable = || EmbedError::Unavailable(crate::embed::VISION_UNAVAILABLE.to_string());
+        // Refuse before touching the projector for a provider that never declared one: `supports_images` is how a caller
+        // is supposed to know this, and the answer must not depend on whether it asked.
+        if self.mmproj.is_none() {
+            return Err(unavailable());
+        }
+        self.ensure_projector()?;
+        // Two fields borrowed at once, which is why this reads the fields directly instead of going through a method that
+        // would take `&mut self` for the projector and then find the model already claimed.
+        let projector = self.projector.as_ref().ok_or_else(unavailable)?;
+        projector
+            .embed_image(&self.model, bytes)
+            .map(|embedding| embedding.vector)
     }
 }
 

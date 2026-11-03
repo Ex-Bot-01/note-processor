@@ -18,6 +18,16 @@
 //! * **The pooled row arrives un-normalised** (measured ‖v‖ = 180.17 and 206.77 on two probe images), so the seam divides by
 //!   the L2 norm itself. Skipping that still yields 768 finite components; only a norm assertion notices.
 //!
+//! **Two types, one pipeline.** [`Projector`] owns an `mtmd_context` and takes the model as a parameter on every encode;
+//! [`VisionModel`] is the façade over it that keeps the pair together by **borrowing** the model. The split exists because
+//! a provider cannot store a borrow of its own model: `mtmd_init_from_file` keeps a raw pointer to the text model
+//! (`mtmd.cpp:567`), so an image capability living inside a provider — which is where `Embedder::supports_images` says it
+//! lives — must hold an owning projector next to the model it was opened against, and storing a borrow of one's own field
+//! is self-reference. [`VisionModel`]'s lifetime is the compile-time answer for a caller that can borrow; field declaration
+//! order is the answer for a provider that owns ([`crate::local_model::LocalEmbedder`] declares its projector first, and
+//! says so). Same pipeline, same refusals, same arithmetic either way — asserted byte-for-byte by
+//! `tests/local_vision.rs::the_provider_seam_and_the_facade_agree_bit_for_bit`.
+//!
 //! **Which class a refusal carries.** §8 lists three and this seam uses exactly those three, split by *whose* fault it is.
 //! `undecodable` is about these bytes: empty, not a raster, audio, or the vision encoder refusing them.
 //! `vision-unavailable` is about this build and model pair: no projector, no vision graph, tokenization refused, a chunk
@@ -29,6 +39,7 @@
 //! **No instruction prefix exists here.** §1.2: prefixes apply to text, and media must be passed bare — so there is no
 //! parameter that could take one, which is stronger than a rule telling callers not to use it.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -55,38 +66,86 @@ pub const OVER_BUDGET: &str = "over-budget";
 /// vision graph, tokenized wrong, asked for a position scheme this seam does not implement, refused the rows, or pooled to
 /// nothing usable. Not a statement about the caller's bytes — that distinction is why this class exists next to
 /// [`UNDECODABLE`].
-pub const VISION_UNAVAILABLE: &str = "vision-unavailable";
-
-/// A projector loaded beside one [`LoadedModel`], able to turn image bytes into vectors of that model's width.
 ///
-/// Borrows the model because it must: `mtmd_init_from_file` keeps a raw pointer to the text model
-/// (`mtmd.cpp:567`, initialised at `:615`), so the projector cannot outlive it and the lifetime says so rather than a
-/// comment doing it.
-pub struct VisionModel<'model> {
-    /// From [`mtmd::mtmd_init_from_file`]; freed in [`VisionModel::drop`], before the model it borrows dies.
+/// The **definition** lives in [`crate::embed`], one `const` shared by this seam and
+/// [`crate::embed::Embedder::embed_image`]'s default refusal, so the two cannot answer with different spellings of one
+/// class; this is the re-export under the path §8 names. A re-pin that needs a different wording changes `embed.rs`, not
+/// this line.
+pub use crate::embed::VISION_UNAVAILABLE;
+
+/// One image's row, and what the encode that produced it cost.
+///
+/// The two travel together because §8's `over-budget` rule is defined over **this** encode's patch count: a caller that
+/// got a vector but not its cost cannot tell whether the next larger image will fit, and a caller that got a cost without
+/// a vector would have nothing to store.
+pub struct ImageEmbedding {
+    /// One L2-normalised row at the opened-against model's output width (the `n_out` read at open, 768 on this artifact).
+    pub vector: Vector,
+    /// Patch/token count of the encode that produced [`Self::vector`], read from the chunk list rather than computed from
+    /// the file's bytes (the spike measured 336 at 1024×768 against 88 at 512×384).
+    pub token_cost: usize,
+}
+
+/// A projector that **owns** an `mtmd_context` and borrows nothing.
+///
+/// This is the half a provider can keep as a field. [`VisionModel`] promises the same lifetime rule with `&'model`, but a
+/// provider owns its [`LoadedModel`] and cannot store a borrow of its own field, so the owning type takes the model on
+/// every call instead: [`Projector::embed_image`] asks for the model whose context the rows go through, and the type that
+/// holds both is responsible for the one thing the compiler can no longer check — that the projector dies first. See
+/// [`crate::local_model::LocalEmbedder`], which gets it right by declaring fields in that order.
+///
+/// **Neither `Send` nor `Sync`, for two independent reasons**: the [`NonNull`] context handle llama.cpp does not document
+/// as thread-safe, and the [`Cell`] holding the last attempt's cost. Nothing here wraps either in a lock or claims
+/// otherwise; one projector is driven by one provider on one thread.
+pub struct Projector {
+    /// From [`mtmd::mtmd_init_from_file`]; freed in [`Projector::drop`]. The context keeps a raw pointer to the text model
+    /// it was opened against (`mtmd.cpp:567`, initialised at `:615`) without retaining it, which is why the owning type
+    /// has to be destroyed before that model — see this type's header for who does that.
     mctx: NonNull<mtmd::mtmd_context>,
-    model: &'model LoadedModel,
     /// The media marker mtmd splits a prompt on — copied out of C memory at open, because the string it returns is
     /// owned by the context and this seam hands that context to `Drop` while still holding the marker.
     marker: CString,
+    /// Which [`LoadedModel`] this context was built beside, kept **only to compare pointers against**.
+    ///
+    /// Never dereferenced — holding it says nothing about that model being alive and claims nothing about it. It exists
+    /// because [`Projector::embed_image`] takes a model as a parameter, and handing the rows of one model's vision encoder
+    /// to a different model's decoder is not a wrong answer but an out-of-bounds one: the rows were copied at this
+    /// projector's `n_inp` while the batch is read at the passed model's (`llama-batch.cpp:1470-1474`). The owning type
+    /// keeps them matched by construction ([`crate::local_model::LocalEmbedder`]); this turns a caller that does not into a
+    /// refusal instead of memory unsafety.
+    opened_against: NonNull<llama_ffi::llama_model>,
     /// `llama_model_n_embd_inp`: the width of one encoder row (§1.2's 512), which is what the decoder is fed.
     n_inp: usize,
     /// `llama_model_n_embd_out`: the width stored and searched (768). Pooling happens at this width, not at input.
     n_out: usize,
-    /// Tokens one forward pass holds, read from the built context rather than the requested number.
+    /// Patch count of the **last attempt**, including attempts that refused after measuring — §8's rule reads the number
+    /// *after* an encode, so a refusal that lost it would leave the report nothing to quote. 0 means no attempt has got as
+    /// far as a measured patch grid yet, which is a different statement from "this image cost nothing".
+    ///
+    /// Two cases pin this: `tests/local_vision.rs::token_cost_is_measured_per_encode_and_printed` (a later failed encode
+    /// must not rewrite the cost of the last one that ran) and
+    /// `tests/local_vision.rs::a_large_image_either_embeds_within_the_window_or_refuses_over_budget` (an `over-budget`
+    /// refusal still has to print the cost it measured). Deleting the write in [`Projector::decode_chunks`] turns the first
+    /// one red.
+    last_cost: Cell<usize>,
+    /// Tokens one forward pass holds, read from the model this projector was opened against rather than the requested
+    /// number. A fact copied at open, like `n_inp` and `n_out` — see [`Projector::embed_image`] for what that means for a
+    /// caller holding two models.
     window: usize,
-    /// Patch count of the most recent encode attempt, or 0 before any ran.
-    last_token_cost: usize,
 }
 
-impl<'model> VisionModel<'model> {
+impl Projector {
     /// Load `mmproj` beside an already loaded model and check it can do vision at all.
     ///
     /// Refuses [`VISION_UNAVAILABLE`] in both shapes of "cannot": this binary built without the feature (a different
     /// module says that), and a projector that loads but carries no vision graph. A projector that will not load at all
     /// is the same refusal — from the caller's side it is one fact, "this build cannot read images", and §12 rule 8 keeps
     /// mtmd's own error text (which names the file) out of what we report.
-    pub fn open(model: &'model LoadedModel, mmproj: &Path) -> Result<Self, EmbedError> {
+    ///
+    /// `model` is borrowed only for this call: its handles go into `mtmd_init_from_file`, and its widths are copied into
+    /// the new projector. Nothing here keeps a reference to it, which is exactly what lets a provider store the result —
+    /// and exactly what moves the "projector dies before the model" rule from the borrow checker into field order.
+    pub fn open(model: &LoadedModel, mmproj: &Path) -> Result<Self, EmbedError> {
         let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
         // The whole feature is Linux-only in practice — `build.rs` refuses to build the runtime anywhere else (§14) —
         // and this is where that shows up in Rust: bytes-to-OsStr is a unix trait, so the spelling stays honest about it.
@@ -131,30 +190,47 @@ impl<'model> VisionModel<'model> {
         let facts = model.facts();
         Ok(Self {
             mctx,
-            model,
             marker,
+            opened_against: model.model_ptr(),
             n_inp: facts.n_embd_inp,
             n_out: facts.n_embd_out,
             window: model.window(),
-            last_token_cost: 0,
+            last_cost: Cell::new(0),
         })
     }
 
-    /// Patch/token count of the most recent encode attempt.
-    ///
-    /// §8's `over-budget` rule reads cost **after** an encode, because nothing before it knows what the patch grid will
-    /// be. Zero means nothing has been attempted yet, which is a different statement from "this image cost nothing".
-    pub fn last_token_cost(&self) -> usize {
-        self.last_token_cost
+    /// Patch/token count of the most recent encode **attempt** — see [`Projector::last_cost`] for what that includes and
+    /// which two cases pin it.
+    fn last_token_cost(&self) -> usize {
+        self.last_cost.get()
     }
 
-    /// One image's bytes to one L2-normalised row of [`LoadedModel::facts`]' output width.
+    /// One image's bytes to one L2-normalised row of `model`'s output width, plus the cost of the encode.
     ///
     /// Every refusal is one of §8's three classes — see this module's header for how they are split — and carries no path,
     /// no URL and none of mtmd's error text (§12 rule 8); mtmd writes its own detail to stderr, which is where a filename
     /// belongs.
-    pub fn embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError> {
+    ///
+    /// **`model` must be the model this projector was opened against.** Its context is where the encoder's rows are
+    /// decoded, and `n_inp`, `n_out` and `window` are the widths and limit read off that artifact at
+    /// [`Projector::open`]. Nothing in the signature enforces the pairing — that is the price of owning instead of
+    /// borrowing, and it is why the two types exist: a caller that can borrow writes [`VisionModel`] and gets the rule
+    /// checked, while a provider that owns holds exactly one model and passes *that* one. Handing a projector a different
+    /// live model would feed rows of one artifact's width into another's decoder, which is a bug in the caller rather than
+    /// a state this seam can report on.
+    pub fn embed_image(
+        &self,
+        model: &LoadedModel,
+        bytes: &[u8],
+    ) -> Result<ImageEmbedding, EmbedError> {
+        let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
         let undecodable = || EmbedError::Unavailable(UNDECODABLE.to_string());
+        // The context encodes for one specific model, so the model handed here has to be that one. Comparing identities
+        // rather than widths: two artifacts can share 512/768 and still be different networks whose rows mean different
+        // things, and a matched pair of widths is exactly the case that would otherwise read as safe.
+        if model.model_ptr() != self.opened_against {
+            return Err(unavailable());
+        }
         if bytes.is_empty() {
             return Err(undecodable());
         }
@@ -185,7 +261,7 @@ impl<'model> VisionModel<'model> {
         // the encoder being run on a modality nothing downstream knows how to store.
         //
         // Not the only guard: remove this arm and the same bytes are refused again one step later, when `mtmd_tokenize`
-        // hands back an `AUDIO` chunk that [`VisionModel::decode_chunks`] does not recognise. The two answer differently on
+        // hands back an `AUDIO` chunk that [`Projector::decode_chunks`] does not recognise. The two answer differently on
         // purpose — `undecodable` here, `vision-unavailable` there — so the artifact test pins *which* guard fired: deleting
         // this one makes that case fail instead of passing quietly (verified by mutation on 2026-11-03).
         // SAFETY: `bitmap` is live and owned by us until the free below.
@@ -196,7 +272,7 @@ impl<'model> VisionModel<'model> {
             return Err(undecodable());
         }
 
-        let outcome = self.encode_and_pool(bitmap);
+        let outcome = self.encode_and_pool(model, bitmap);
         // SAFETY: first and only free of this bitmap, after every use of it above. The chunk list copies what it needs
         // (`mtmd.h` says the bitmaps keep their owners), so freeing here is safe for the pooled row we already copied.
         unsafe { mtmd::mtmd_bitmap_free(bitmap.as_ptr()) };
@@ -204,11 +280,12 @@ impl<'model> VisionModel<'model> {
     }
 
     /// Tokenize, encode, decode and pool one bitmap. Split out so the bitmap's single free lives in one place — see
-    /// [`VisionModel::embed_image`], which calls this and then frees.
+    /// [`Projector::embed_image`], which calls this and then frees.
     fn encode_and_pool(
-        &mut self,
+        &self,
+        model: &LoadedModel,
         bitmap: NonNull<mtmd::mtmd_bitmap>,
-    ) -> Result<Vector, EmbedError> {
+    ) -> Result<ImageEmbedding, EmbedError> {
         let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
 
         let chunks = unsafe { mtmd::mtmd_input_chunks_init() };
@@ -245,18 +322,19 @@ impl<'model> VisionModel<'model> {
             return Err(unavailable());
         }
 
-        let outcome = self.decode_chunks(chunks);
+        let outcome = self.decode_chunks(model, chunks);
         // SAFETY: the list and every chunk inside it go here; `decode_chunks` copied out every row it needed, and the
         // pooled vector it returned is Rust-owned.
         unsafe { mtmd::mtmd_input_chunks_free(chunks) };
         outcome
     }
 
-    /// Decode every chunk of a tokenized prompt into the text context and pool the result.
+    /// Decode every chunk of a tokenized prompt into `model`'s context and pool the result.
     fn decode_chunks(
-        &mut self,
+        &self,
+        model: &LoadedModel,
         chunks: *mut mtmd::mtmd_input_chunks,
-    ) -> Result<Vector, EmbedError> {
+    ) -> Result<ImageEmbedding, EmbedError> {
         let undecodable = || EmbedError::Unavailable(UNDECODABLE.to_string());
         let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
 
@@ -322,7 +400,7 @@ impl<'model> VisionModel<'model> {
                     // **not** decoded. §1.2 embeds media on its own and the spike measured comparability with exactly this
                     // sequence: image rows alone through the decoder, pooled at sequence 0. Decoding the wrappers would
                     // shift every position and change what was measured; reading their token ids is not possible through
-                    // this mirror anyway (`mtmd_input_chunk_get_tokens_text` returns lossy UTF-8, `mtmd.h:266-269`).
+                    // this mirror anyway (`mtmd.h:266-269`).
                     //
                     // So `n_tokens` here is expected to be non-zero, and skipping it is the design rather than an
                     // oversight: a prompt we wrote ourselves, containing nothing but the marker, cannot carry note text.
@@ -330,7 +408,7 @@ impl<'model> VisionModel<'model> {
                 }
                 _ => {
                     // An AUDIO chunk (this projector accepts audio; §3 says we do not) or a type this pin added after the
-                    // mirror was written. The named audio guard in [`VisionModel::embed_image`] normally refuses audio
+                    // mirror was written. The named audio guard in [`Projector::embed_image`] normally refuses audio
                     // first — measured here on 2026-11-03, `mtmd_bitmap_is_audio` answered true for PCM — so reaching
                     // this arm with audio means that guard stopped working, and the class differs on purpose: a refusal
                     // that says "this seam cannot serve it" instead of "these bytes did not decode" is the difference
@@ -345,19 +423,24 @@ impl<'model> VisionModel<'model> {
         let (rows, image_tokens, non_causal) = image_rows.ok_or_else(unavailable)?;
 
         // Cost is recorded for *this* attempt, before the decode that might fail: §8's rule reads the number after an
-        // encode, and an over-budget refusal with no number attached would leave the report nothing to say.
-        self.last_token_cost = image_tokens;
+        // encode, and an over-budget refusal with no number attached would leave the report nothing to say. It therefore
+        // stays on the record for a refusal too — see [`Projector::last_cost`] for which cases prove that.
+        self.last_cost.set(image_tokens);
         if image_tokens > self.window {
             return Err(EmbedError::Unavailable(OVER_BUDGET.to_string()));
         }
 
-        let pooled = self.decode_and_pool(&rows, image_tokens, non_causal)?;
-        Ok(Vector::new(pooled))
+        let pooled = self.decode_and_pool(model, &rows, image_tokens, non_causal)?;
+        Ok(ImageEmbedding {
+            vector: Vector::new(pooled),
+            token_cost: image_tokens,
+        })
     }
 
-    /// Feed the encoder's rows through the text decoder and copy out the pooled row at output width.
+    /// Feed the encoder's rows through `model`'s decoder and copy out the pooled row at output width.
     fn decode_and_pool(
         &self,
+        model: &LoadedModel,
         rows: &[f32],
         n_tokens: usize,
         non_causal: bool,
@@ -388,7 +471,7 @@ impl<'model> VisionModel<'model> {
             logits: logits.as_mut_ptr(),
         };
 
-        let ctx = self.model.ctx_ptr().as_ptr();
+        let ctx = model.ctx_ptr().as_ptr();
         // SAFETY: `ctx` is live for as long as its `LoadedModel`; `batch` points into buffers owned by this function,
         // all alive until after `llama_decode` returns. The flag is read first and **put back to what it was** rather
         // than to an assumed true — see this module's header for why that distinction is the whole point. When the
@@ -438,10 +521,84 @@ impl<'model> VisionModel<'model> {
     }
 }
 
-impl Drop for VisionModel<'_> {
+impl Drop for Projector {
     fn drop(&mut self) {
-        // SAFETY: the handle came from `mtmd_init_from_file` and is freed exactly once, here. The borrowed model outlives
-        // this because the borrow checker says so — `mtmd_context` keeps a raw pointer to it (`mtmd.cpp:567`, `:615`).
+        // SAFETY: the handle came from `mtmd_init_from_file` and is freed exactly once, here. What has to be true is that
+        // the model this context keeps a pointer to (`mtmd.cpp:567`, `:615`) is still alive — for [`VisionModel`] the
+        // borrow guarantees it, and for a provider **field declaration order** does it: the projector field is declared
+        // before the field that owns the model, so it is dropped first. See `local_model::LocalEmbedder`.
         unsafe { mtmd::mtmd_free(self.mctx.as_ptr()) };
+    }
+}
+
+/// Manual rather than derived, following [`LoadedModel`]'s precedent: what a projector *is* is its facts, and the one
+/// field left out on purpose is `mctx`. A context address in a debug line invites a reader to diff two runs and read
+/// meaning into a number that only says where the allocator put it.
+impl std::fmt::Debug for Projector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Projector")
+            .field("marker", &self.marker)
+            .field("n_inp", &self.n_inp)
+            .field("n_out", &self.n_out)
+            .field("window", &self.window)
+            .field("last_token_cost", &self.last_cost)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A [`Projector`] plus the model it was opened against, held by **borrow**.
+///
+/// Borrows the model because it must: `mtmd_init_from_file` keeps a raw pointer to the text model
+/// (`mtmd.cpp:567`, initialised at `:615`), so the projector cannot outlive it and the lifetime says so rather than a
+/// comment doing it.
+///
+/// **This is the façade over [`Projector`], and the split exists because a provider cannot store a borrow of its own
+/// model.** The type that owns a `LoadedModel` is also the type that has to offer image capability, so it needs an owning
+/// projector and must get the drop order right by field declaration instead; [`Projector`] is that half, and this one stays
+/// for every caller that can borrow — including the artifact tests, whose API this task does not change.
+pub struct VisionModel<'model> {
+    /// The half that owns the `mtmd_context`. It holds no reference to [`Self::model`]; this façade supplies that on
+    /// every call, which is what makes the borrow the guarantee it claims to be.
+    projector: Projector,
+    /// The model whose context the encoder's rows are decoded through, and whose widths and window were read at open.
+    model: &'model LoadedModel,
+}
+
+impl<'model> VisionModel<'model> {
+    /// Load `mmproj` beside an already loaded model and check it can do vision at all.
+    ///
+    /// The refusals are [`Projector::open`]'s — see it for the two shapes of "cannot" this answers with
+    /// [`VISION_UNAVAILABLE`].
+    pub fn open(model: &'model LoadedModel, mmproj: &Path) -> Result<Self, EmbedError> {
+        Ok(Self {
+            projector: Projector::open(model, mmproj)?,
+            model,
+        })
+    }
+
+    /// Patch/token count of the most recent encode attempt.
+    ///
+    /// §8's `over-budget` rule reads cost **after** an encode, because nothing before it knows what the patch grid will
+    /// be. Zero means nothing has been attempted yet, which is a different statement from "this image cost nothing".
+    ///
+    /// Read straight through to the projector rather than mirrored into a field here: one number, in the type that
+    /// measured it, so the façade and a provider driven through [`Projector`] cannot report different costs for one
+    /// encode.
+    pub fn last_token_cost(&self) -> usize {
+        self.projector.last_token_cost()
+    }
+
+    /// One image's bytes to one L2-normalised row of [`LoadedModel::facts`]' output width.
+    ///
+    /// `&mut self` keeps this façade's signature as it was while [`Projector::embed_image`] is `&self`: the pipeline
+    /// itself mutates no Rust state (the measured cost goes through a [`Cell`]), and a caller holding one of these should
+    /// not be able to swap the model out from under it mid-encode.
+    ///
+    /// Every refusal is [`Projector::embed_image`]'s — one of §8's three classes, carrying no path, no URL and none of
+    /// mtmd's error text (§12 rule 8).
+    pub fn embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError> {
+        self.projector
+            .embed_image(self.model, bytes)
+            .map(|embedding| embedding.vector)
     }
 }

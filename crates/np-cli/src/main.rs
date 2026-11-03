@@ -304,12 +304,15 @@ fn print_summary(report: &ScanReport) {
 fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
     let resolved = embed_provider(&cfg, workspace)?;
-    let provider = resolved.provider;
+    let mut provider = resolved.provider;
     // The reason a provider could not be built goes to `embed_run` as a value. Handing over a placeholder
     // instead is how R6c1 D-2 happened: an absent artifact became a provider that declares 0 dimensions, and the
     // run refused with a sentence about widths when the truth was a missing file (see [`Resolution`]).
-    let resolution = match &provider {
-        Some(provider) => Resolution::Provider(provider.as_ref()),
+    //
+    // `as_mut`, not `as_ref`: a provider is the thing that can open a projector, so the run holds it mutably for as long
+    // as the resolution lives (`Resolution::Provider`'s note says why).
+    let resolution = match &mut provider {
+        Some(provider) => Resolution::Provider(provider.as_mut()),
         None => Resolution::ArtifactAbsent,
     };
     let mut report = embed_run::embed_with_resolution(workspace, &cfg, resolution)?;

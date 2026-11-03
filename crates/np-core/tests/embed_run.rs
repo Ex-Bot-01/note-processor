@@ -377,8 +377,8 @@ fn chunks_reach_the_provider_in_chunk_order_and_are_stamped_with_what_it_read() 
     let live = setup.live_chunks();
     assert_eq!(live.len(), 3, "three notes cut three chunks");
 
-    let fake = Fake::new();
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+    let mut fake = Fake::new();
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("run");
     assert!(report.succeeded(), "{:?}", report.outcome);
     assert_eq!(report.chunks_seen, 3);
     assert_eq!(report.embedded, 3);
@@ -420,8 +420,8 @@ fn every_text_in_a_batch_travels_with_its_own_prefix() {
 
     // The fake carries the row's prefix because a provider is built from its own row. `Fake::new()` here would be
     // a provider that ignores prefixes — §3's bug, and it now fails this case rather than passing it quietly.
-    let fake = Fake::prefixing("doc: ");
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+    let mut fake = Fake::prefixing("doc: ");
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("run");
     assert!(report.succeeded(), "{:?}", report.outcome);
 
     // What the model was *handed* is the raw chunk text: dressing is the provider's doing, and R6c2's P1 was this
@@ -477,12 +477,12 @@ fn an_unchanged_corpus_never_reaches_the_provider() {
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
 
-    let first = Fake::new();
-    embed(&setup.root, &setup.cfg(), &first).expect("first run");
+    let mut first = Fake::new();
+    embed(&setup.root, &setup.cfg(), &mut first).expect("first run");
     assert_eq!(first.calls(), 1);
 
-    let second = Fake::new();
-    let report = embed(&setup.root, &setup.cfg(), &second).expect("second run");
+    let mut second = Fake::new();
+    let report = embed(&setup.root, &setup.cfg(), &mut second).expect("second run");
     assert_eq!(
         second.calls(),
         0,
@@ -495,8 +495,8 @@ fn an_unchanged_corpus_never_reaches_the_provider() {
 
     // A scan in between changes nothing about the chunk rows, so it must not re-owe them either.
     rescan(&setup);
-    let third = Fake::new();
-    embed(&setup.root, &setup.cfg(), &third).expect("third run");
+    let mut third = Fake::new();
+    embed(&setup.root, &setup.cfg(), &mut third).expect("third run");
     assert_eq!(
         third.calls(),
         0,
@@ -517,7 +517,7 @@ fn a_changed_prefix_makes_a_stored_vector_stale() {
     setup.touch_artifact();
     // Run one dresses chunks with the row's empty prefix; run two, after the UPDATE below, with the new one. A
     // provider is built from its row, so each fake has to say what its own run's row says.
-    embed(&setup.root, &setup.cfg(), &Fake::prefixing("")).expect("first run");
+    embed(&setup.root, &setup.cfg(), &mut Fake::prefixing("")).expect("first run");
 
     // Re-install the same id with a different document prefix. `insert_model` is idempotent, so the row is
     // replaced by hand — the point is the row's `prefix_doc`, not the install path.
@@ -530,8 +530,8 @@ fn a_changed_prefix_makes_a_stored_vector_stale() {
         .expect("test: move the prefix");
     }
 
-    let fake = Fake::prefixing("query-side: ");
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("second run");
+    let mut fake = Fake::prefixing("query-side: ");
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("second run");
     assert_eq!(
         fake.calls(),
         1,
@@ -554,8 +554,8 @@ fn a_provider_answering_the_wrong_number_of_texts_writes_nothing() {
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
 
-    let fake = Fake::short_answer();
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+    let mut fake = Fake::short_answer();
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("run");
 
     assert!(
         matches!(report.outcome, EmbedOutcome::NotProduced { .. }),
@@ -590,8 +590,8 @@ fn a_vector_wider_than_the_provider_declares_is_refused_before_any_write() {
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
 
-    let fake = Fake::lying_about_dim();
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+    let mut fake = Fake::lying_about_dim();
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("run");
 
     assert!(
         matches!(report.outcome, EmbedOutcome::NotProduced { .. }),
@@ -621,8 +621,8 @@ fn an_over_budget_chunk_is_reported_and_stamps_nothing() {
     let live = setup.live_chunks();
 
     // The batch refuses because one member is over budget; the per-item retry then answers two and refuses one.
-    let fake = Fake::over_budget("body text 1 ");
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+    let mut fake = Fake::over_budget("body text 1 ");
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("run");
 
     assert_eq!(
         report.embedded, 2,
@@ -681,8 +681,8 @@ fn a_wrong_width_provider_is_refused_before_any_write() {
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
 
-    let fake = Fake::with_dim(FAKE_DIM + 1);
-    let error = embed(&setup.root, &setup.cfg(), &fake).expect_err("a mismatch must refuse");
+    let mut fake = Fake::with_dim(FAKE_DIM + 1);
+    let error = embed(&setup.root, &setup.cfg(), &mut fake).expect_err("a mismatch must refuse");
     match &error {
         np_core::embed_run::EmbedRunError::ProviderDimMismatch {
             configured,
@@ -716,19 +716,19 @@ fn an_interrupted_run_resumes_with_only_what_is_left() {
     setup.touch_artifact();
 
     // The first batch commits, the second refuses: `fail_from` counts calls, so call 2 is batch two.
-    let interrupted = Fake {
+    let mut interrupted = Fake {
         fail_from: 2,
         ..Fake::new()
     };
-    let report = embed(&setup.root, &setup.cfg(), &interrupted).expect("first run");
+    let report = embed(&setup.root, &setup.cfg(), &mut interrupted).expect("first run");
     assert_eq!(report.embedded, EMBED_BATCH_CHUNKS);
     assert_eq!(report.errors, 1);
     assert!(!report.succeeded());
     assert_eq!(setup.vectors().len(), EMBED_BATCH_CHUNKS);
 
     // The resume sees the committed batch as current and owes exactly one chunk.
-    let resumed = Fake::new();
-    let report = embed(&setup.root, &setup.cfg(), &resumed).expect("second run");
+    let mut resumed = Fake::new();
+    let report = embed(&setup.root, &setup.cfg(), &mut resumed).expect("second run");
     assert!(report.succeeded(), "{:?}", report.outcome);
     assert_eq!(report.current, EMBED_BATCH_CHUNKS);
     assert_eq!(report.embedded, 1);
@@ -768,7 +768,7 @@ fn a_repeated_batch_updates_instead_of_failing() {
         .expect("test: seed a stale vector");
     }
 
-    let report = embed(&setup.root, &setup.cfg(), &Fake::new()).expect("run");
+    let report = embed(&setup.root, &setup.cfg(), &mut Fake::new()).expect("run");
     assert!(report.succeeded(), "{:?}", report.outcome);
     assert_eq!(report.current, 0, "the old stamp is not currency");
     assert_eq!(report.embedded, 1);
@@ -808,8 +808,8 @@ fn a_stale_note_s_chunks_are_never_owed() {
         "the scan marked it stale rather than forgetting it"
     );
 
-    let fake = Fake::new();
-    let embed_report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+    let mut fake = Fake::new();
+    let embed_report = embed(&setup.root, &setup.cfg(), &mut fake).expect("run");
     assert!(embed_report.succeeded(), "{:?}", embed_report.outcome);
     assert_eq!(
         embed_report.chunks_seen, 1,
@@ -854,8 +854,8 @@ fn provider_none_is_configuration_disabled_and_reads_nothing() {
         ..setup.cfg()
     };
 
-    let fake = Fake::new();
-    let report = embed(&setup.root, &cfg, &fake).expect("the arm is a report, not an error");
+    let mut fake = Fake::new();
+    let report = embed(&setup.root, &cfg, &mut fake).expect("the arm is a report, not an error");
     assert_eq!(
         report.outcome,
         EmbedOutcome::ConfigurationDisabled {
@@ -876,8 +876,8 @@ fn a_model_naming_no_row_is_configuration_disabled_naming_the_id() {
     let setup = workspace_owned(&notes(2));
     setup.touch_artifact();
 
-    let fake = Fake::new();
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("the arm is a report");
+    let mut fake = Fake::new();
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("the arm is a report");
     assert_eq!(
         report.outcome,
         EmbedOutcome::ConfigurationDisabled {
@@ -902,8 +902,8 @@ fn an_absent_artifact_names_a_command_that_exists() {
     let setup = workspace_owned(&notes(2));
     setup.install_model(FAKE_DIM as i64, "");
 
-    let fake = Fake::new();
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("the arm is a report");
+    let mut fake = Fake::new();
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("the arm is a report");
     assert_eq!(report.outcome.label(), "artifact absent");
     let detail = report
         .outcome
@@ -932,12 +932,12 @@ fn nothing_owed_exits_zero_even_with_no_artifact() {
     let setup = workspace_owned(&notes(1));
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
-    embed(&setup.root, &setup.cfg(), &Fake::new()).expect("first run");
+    embed(&setup.root, &setup.cfg(), &mut Fake::new()).expect("first run");
 
     fs::remove_file(setup.cfg().workspace_models_dir(&setup.root).join(MODEL_ID))
         .expect("test: remove the artifact");
-    let fake = Fake::new();
-    let report = embed(&setup.root, &setup.cfg(), &fake).expect("run");
+    let mut fake = Fake::new();
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("run");
     assert_eq!(report.outcome, EmbedOutcome::Current);
     assert!(
         report.succeeded(),
@@ -955,7 +955,7 @@ fn owed_and_not_produced_is_the_gave_up_arm() {
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
 
-    let provider = np_core::embed::LocalModelProvider::new(
+    let mut provider = np_core::embed::LocalModelProvider::new(
         &db::model_row(&setup.db(), MODEL_ID)
             .expect("test: read the row")
             .expect("test: the row is installed"),
@@ -964,7 +964,7 @@ fn owed_and_not_produced_is_the_gave_up_arm() {
     )
     .expect("the provider builds against the touched artifact");
 
-    let report = embed(&setup.root, &setup.cfg(), &provider).expect("run");
+    let report = embed(&setup.root, &setup.cfg(), &mut provider).expect("run");
     assert_eq!(report.outcome.label(), "owed and not produced");
     let reason = report.outcome.detail().expect("arm (iv) says why");
     assert!(reason.contains(MODEL_ID), "{reason}");
@@ -995,9 +995,9 @@ fn a_busy_batch_stamps_nothing_and_is_reported() {
         .execute_batch("BEGIN IMMEDIATE;")
         .expect("test setup: take the write lock");
 
-    let fake = Fake::new();
+    let mut fake = Fake::new();
     let report =
-        embed(&setup.root, &setup.cfg(), &fake).expect("a busy batch is reported, not raised");
+        embed(&setup.root, &setup.cfg(), &mut fake).expect("a busy batch is reported, not raised");
     assert_eq!(report.busy_gap, 1, "one batch met the lock");
     assert_eq!(report.embedded, 0);
     assert_eq!(report.errors, 0, "a lock is a gap, not an error count");
@@ -1013,7 +1013,7 @@ fn a_busy_batch_stamps_nothing_and_is_reported() {
 
     // Release, and the same run finishes: the gap was a gap rather than damage.
     holder.0.execute_batch("ROLLBACK;").expect("test: release");
-    let after = embed(&setup.root, &setup.cfg(), &Fake::new()).expect("run after the lock");
+    let after = embed(&setup.root, &setup.cfg(), &mut Fake::new()).expect("run after the lock");
     assert!(after.succeeded(), "{:?}", after.outcome);
     assert_eq!(after.embedded, 2);
 }
@@ -1035,8 +1035,8 @@ fn a_scan_can_take_the_write_lock_between_batches() {
     let root = setup.root.clone();
     let cfg = setup.cfg();
     let mut scans = 0usize;
-    let fake = Fake::new();
-    let report = embed_with_inject(&setup.root, &setup.cfg(), &fake, &mut |db_path| {
+    let mut fake = Fake::new();
+    let report = embed_with_inject(&setup.root, &setup.cfg(), &mut fake, &mut |db_path| {
         assert!(
             db_path.exists(),
             "the hook is handed the database an embed is writing"
@@ -1069,7 +1069,7 @@ fn every_report_carries_the_caveat_line() {
     let setup = workspace_owned(&notes(1));
     setup.install_model(FAKE_DIM as i64, "");
     setup.touch_artifact();
-    let report = embed(&setup.root, &setup.cfg(), &Fake::new()).expect("run");
+    let report = embed(&setup.root, &setup.cfg(), &mut Fake::new()).expect("run");
     assert_eq!(report.verification, "self-consistent, not verified");
 
     let cfg = Config {
@@ -1084,7 +1084,7 @@ fn every_report_carries_the_caveat_line() {
         },
         ..setup.cfg()
     };
-    let disabled = embed(&setup.root, &cfg, &Fake::new()).expect("arm (ii)");
+    let disabled = embed(&setup.root, &cfg, &mut Fake::new()).expect("arm (ii)");
     // The digest field is the caller's to fill (`local_model::verify_artifact`, called by `np embed`), so a run that
     // went through none of that machinery must report nothing rather than something reassuring — on both arms, including
     // the one that embedded vectors. An unstated check is an honest absence; `embed_run` cannot know one happened.
@@ -1104,7 +1104,7 @@ fn an_empty_data_dir_is_refused() {
         data_dir: PathBuf::new(),
         ..setup.cfg()
     };
-    let error = embed(&setup.root, &cfg, &Fake::new()).expect_err("must refuse");
+    let error = embed(&setup.root, &cfg, &mut Fake::new()).expect_err("must refuse");
     assert!(
         error.to_string().contains("data_dir"),
         "the refusal names the missing value: {error}"
