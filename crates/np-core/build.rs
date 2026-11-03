@@ -217,7 +217,7 @@ fn link_pinned_llama(shape: &Shape) -> Result<(), String> {
             "`local-model` is built and tested on Linux only. This target is {target_os:?}.\n  \
              design-m2-local-embeddings.md §14: the C++ build has been measured on one host and no claim \n  \
              exists for any other platform — F18's rule. The system library set here (`stdc++`, `m`, \n  \
-             `pthread`, `dl`) and the four archive names are GNU/Linux's; see §14 for what Windows needs.",
+             `pthread`, `dl`) and these static-archive names are GNU/Linux's; see §14 for what Windows needs.",
         ));
     }
 
@@ -771,6 +771,15 @@ fn emit_link_flags(build_dir: &Path, shape: &Shape) -> Result<(), String> {
             searched.push(dir.to_path_buf());
             println!("cargo::rustc-link-search=native={}", dir.display());
         }
+    }
+    // The order above is **load-bearing**, and that is a measurement rather than a style rule. The spike's link wrapped all
+    // six archives in `-Wl,--start-group … --end-group` (`vision-spike-2026-11-02.md`, "Link"), so its printed order carried
+    // no information; here GNU ld resolves strictly left to right, and `libggml.a` ↔ `libggml-cpu.a` refer to each other.
+    // A linker group was tried on 2026-11-03 and cannot be emitted this way: `-C link-arg` values land *after* rustc's own
+    // `-l static=` flags in the `cc` line (verified with `cargo build -vv`), so `--start-group` would open a group behind
+    // the libraries it is meant to protect. Order, therefore, is the mechanism — and a re-pin that moves a symbol between
+    // two of these archives will fail with an undefined reference no local edit explains, which is what this comment is for.
+    for name in &archives {
         println!("cargo::rustc-link-lib=static={name}");
     }
 

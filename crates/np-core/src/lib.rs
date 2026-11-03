@@ -23,12 +23,12 @@ pub mod llama_ffi;
 // The one place that opens a GGUF: it needs the archives `build.rs` links, so it shares `llama_ffi`'s gate.
 #[cfg(feature = "local-model")]
 pub mod local_model;
-// Image vectors: a projector loaded against an already loaded model, so this cannot exist without `local-model`.
-// Off by default — it costs two extra archives at link time and a wider attack surface for no benefit to a text-only
-// build (`docs/design-m2-image-embeddings.md` §10).
 pub mod models;
 pub mod parse;
 pub mod path_keys;
+// Image vectors: a projector loaded against an already loaded model, so this cannot exist without `local-model`.
+// Off by default — it costs two extra archives at link time and a wider attack surface for no benefit to a text-only
+// build (`docs/design-m2-image-embeddings.md` §10).
 #[cfg(feature = "vision")]
 pub mod vision;
 // The pin table is data with no dependency and no I/O, so it carries no feature gate: the fetch engine behind it

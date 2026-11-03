@@ -130,13 +130,21 @@ mod vision {
         assert_eq!(UNDECODABLE, MediaRefusal::Undecodable.label());
         assert_eq!(OVER_BUDGET, MediaRefusal::OverBudget.label());
         assert_eq!(VISION_UNAVAILABLE, MediaRefusal::VisionUnavailable.label());
+        println!(
+            "CLASSES: the seam's three constants are media's labels verbatim — {UNDECODABLE}, {OVER_BUDGET}, \
+             {VISION_UNAVAILABLE}. No artifact was needed, and none was used: §8 lists six classes in all, and this \
+             file covers the three the vision seam can answer."
+        );
     }
 
     /// The shape of a real image vector: 768 finite components at unit length (§10's contract, §1.2's recipe).
     ///
     /// The norm is the load-bearing assertion in this file. llama.cpp hands back the pooled row **un-normalised**
-    /// — the spike note measured ‖v‖ = 180.17 and 206.77 on two of these same images — so a seam that skipped the
-    /// L2 step would still return 768 finite components and every other case here would pass.
+    /// — the spike note measured ‖v‖ = 180.17 (`stripes_1024x768.png`) and 206.77 (`red_square_1024x768.png`), so on the
+    /// **1024×768** pair rather than the 512×384 file this case embeds — and a seam that skipped the L2 step would still
+    /// return 768 finite components. Mutating the normalisation away on 2026-11-03 turned this case and
+    /// [`text_still_matches_what_it_was_after_an_image_ran`] red (it asserts ‖v‖ ≈ 1 too) and left the rest green, so the
+    /// norm contract is carried by two cases rather than one.
     #[test]
     fn an_image_embeds_to_768_components_of_unit_length() {
         let (model_path, mmproj_path) = artifacts_or_not_coverage!();
@@ -225,9 +233,11 @@ mod vision {
         );
     }
 
-    /// §8's `over-budget` rule needs a cost measured per encode, and the seam checks it **before** decoding: llama.cpp
-    /// asserts rather than returning when a batch is wider than its own context (spike note, "a non-causal artifact
-    /// asserts rather than returning"), and an abort is not a refusal.
+    /// §8's `over-budget` rule needs a cost measured per encode, and the seam checks it **before** decoding. The reason
+    /// it has to come first is recorded in `crates/np-core/tests/probes/decode_probe.c:71` — "a batch wider than the built
+    /// ubatch aborts the encoder path instead of returning a code", against `src/llama-context.cpp:1631` — and an abort is
+    /// not a refusal. That claim is *not* in `vision-spike-2026-11-02.md`; an earlier draft of this comment quoted it from
+    /// there, which review caught on 2026-11-03.
     ///
     /// Whether this pin can even reach that line is a fact about the artifact — mtmd caps one image at a soft-token
     /// ceiling read from the projector file — so the case needs a third variable, `NP_TEST_VISION_LARGE`, pointing at an
@@ -353,8 +363,9 @@ mod vision {
         println!("TOKEN COST: 512x384 -> {small}, 1024x768 -> {large} (card's flat default: 280)");
         assert!(
             large > small,
-            "the cost did not grow with the image: {small} for 512x384 against {large} for 1024x768, so it is not \
-             a count of this encode"
+            "the cost did not grow with the image: {small} for 512x384 against {large} for 1024x768. Either the cost is \
+             not a count of this encode, or mtmd clamped both fixtures to one soft-token ceiling (it did that at \
+             1,064 tokens for a 4096x3072 image) — check which before blaming the seam"
         );
 
         // A refusal still leaves the last measured cost on the record — §8's rule reads the number *after* the
@@ -386,6 +397,15 @@ mod vision {
         );
         let mut truncated = whole.clone();
         truncated.truncate(whole.len() / 5);
+        // The claim is "a decoder that read the header and stopped would answer with *some* image", so the header has
+        // to survive the cut for this case to be that test: signature (8 bytes) plus IHDR (length, `IHDR`, dimensions)
+        // live inside the first 33.
+        assert!(
+            truncated.len() > 33 && truncated[12..16] == *b"IHDR",
+            "a fifth of the fixture is {} bytes, which no longer holds an IHDR chunk, so this would refuse for the \
+             wrong reason",
+            truncated.len()
+        );
 
         let problem = seam
             .embed_image(&truncated)
@@ -419,9 +439,10 @@ mod vision {
         assert_eq!(after.dim(), DIM);
     }
 
-    /// Audio is a §3 non-goal, and this projector *does* accept audio bytes: measured here on 2026-11-03,
-    /// `mtmd_helper_bitmap_init_from_buf` handed back a live bitmap for a PCM buffer and `mtmd_bitmap_is_audio`
-    /// answered true, so the seam's named guard is what refuses it.
+    /// Audio is a §3 non-goal, and this projector *does* accept audio bytes. That is a provenance note rather than
+    /// something this case can see: on 2026-11-03 the seam was instrumented to print `mtmd_bitmap_is_audio`'s answer for
+    /// these exact bytes and it printed **true**, so the refusal below comes from the named guard. What the case asserts
+    /// is only the class — any path that answered `undecodable` would pass it identically.
     ///
     /// **This case does pin which guard fires**, and that is a change made after review: the fallback refusal (an `AUDIO`
     /// chunk reaching `decode_chunks`, whose type this seam does not implement) answers `vision-unavailable`, not
@@ -462,7 +483,11 @@ mod vision {
                  action is identical"),
             other => panic!("expected an undecodable refusal, got {other:?}"),
         }
-        println!("REFUSE: 100 ms of PCM -> {problem}");
+        println!(
+            "REFUSE: {} ms of PCM ({} bytes of file) -> {problem}",
+            samples * 1000 / 8000,
+            wav.len()
+        );
     }
 
     /// **The regression the spike note called load-bearing, and what this host can actually prove about it.**
