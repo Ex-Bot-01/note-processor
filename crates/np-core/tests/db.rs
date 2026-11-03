@@ -276,7 +276,7 @@ fn the_schema_is_what_the_plan_mandates() {
         // The two stamp columns sit at the end of `media` because that is where `ADD COLUMN` can put them without a
         // rebuild — the same reason `models` and `model_files` carry theirs last.
         ("media", "id hash size mime verified_size verified_mtime"),
-        ("media_path", "rel_bytes case_key abs media_id"),
+        ("media_path", "rel_bytes abs media_id"),
         (
             "media_embeddings",
             "media_id model dim vector source_hash embedded_at",

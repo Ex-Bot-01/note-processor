@@ -225,14 +225,8 @@ fn a_media_path_keeps_non_utf8_bytes_and_refuses_a_text_bind() {
     // `café.png` with the `é` as a lone 0xe9 byte: not valid UTF-8, and a name this program has to store.
     let raw: Vec<u8> = b"caf\xe9.png".to_vec();
 
-    link_media_path(
-        &db,
-        &raw,
-        "café.png",
-        Path::new("/ws/caf\u{fffd}.png"),
-        media,
-    )
-    .expect("link a path that is not valid UTF-8");
+    link_media_path(&db, &raw, Path::new("/ws/caf\u{fffd}.png"), media)
+        .expect("link a path that is not valid UTF-8");
     let stored: Vec<u8> =
         db.0.query_row(
             "SELECT rel_bytes FROM media_path WHERE media_id = ?1",
@@ -257,7 +251,7 @@ fn a_media_path_keeps_non_utf8_bytes_and_refuses_a_text_bind() {
     let text_bind = "x.png".to_string();
     rejects_check(
         &db,
-        "INSERT INTO media_path (rel_bytes, case_key, abs, media_id) VALUES (?1, 'x.png', '/ws/x.png', ?2)",
+        "INSERT INTO media_path (rel_bytes, abs, media_id) VALUES (?1, '/ws/x.png', ?2)",
         &[&text_bind, &media],
         "media_path.rel_bytes",
     );
@@ -360,22 +354,9 @@ fn linking_a_path_that_already_exists_re_points_it() {
     let new_bytes = media_row(&db, 'b');
     let rel = b"diagrams/kafka.png";
 
-    link_media_path(
-        &db,
-        rel,
-        "diagrams/kafka.png",
-        Path::new("/ws/diagrams/kafka.png"),
-        old_bytes,
-    )
-    .expect("first link");
-    link_media_path(
-        &db,
-        rel,
-        "diagrams/kafka.png",
-        Path::new("/ws/diagrams/kafka.png"),
-        new_bytes,
-    )
-    .expect("the same path now holds different bytes");
+    link_media_path(&db, rel, Path::new("/ws/diagrams/kafka.png"), old_bytes).expect("first link");
+    link_media_path(&db, rel, Path::new("/ws/diagrams/kafka.png"), new_bytes)
+        .expect("the same path now holds different bytes");
 
     assert_eq!(
         scalar::<i64>(&db, "SELECT COUNT(*) FROM media_path"),
@@ -400,22 +381,10 @@ fn unlinking_the_last_path_removes_the_media_row_and_its_vectors() {
     let media = media_row(&db, 'a');
     record_media_embedding(&db, media, "m", 2, &vector_bytes(2, 3), &hash('a'), 1)
         .expect("one vector for the diagram");
-    link_media_path(
-        &db,
-        b"notes/a.png",
-        "notes/a.png",
-        Path::new("/ws/notes/a.png"),
-        media,
-    )
-    .expect("link one note");
-    link_media_path(
-        &db,
-        b"notes/b.png",
-        "notes/b.png",
-        Path::new("/ws/notes/b.png"),
-        media,
-    )
-    .expect("link a second note");
+    link_media_path(&db, b"notes/a.png", Path::new("/ws/notes/a.png"), media)
+        .expect("link one note");
+    link_media_path(&db, b"notes/b.png", Path::new("/ws/notes/b.png"), media)
+        .expect("link a second note");
 
     assert_eq!(
         unlink_media_path(&db, b"notes/a.png").expect("unlink the first path"),
@@ -621,14 +590,8 @@ fn a_media_row_with_no_paths_is_swept_and_its_vectors_go_with_it() {
         .expect("vector for the linked row");
     record_media_embedding(&db, stranded, "m", 2, &vector_bytes(2, 2), &hash('b'), 1)
         .expect("vector for the stranded row");
-    link_media_path(
-        &db,
-        b"notes/a.png",
-        "notes/a.png",
-        Path::new("/ws/notes/a.png"),
-        linked,
-    )
-    .expect("link one path");
+    link_media_path(&db, b"notes/a.png", Path::new("/ws/notes/a.png"), linked)
+        .expect("link one path");
 
     assert_eq!(
         prune_unlinked_media(&db).expect("sweep"),
@@ -665,7 +628,6 @@ fn re_pointing_a_path_sweeps_the_figure_it_displaced() {
     link_media_path(
         &db,
         b"diagrams/kafka.png",
-        "diagrams/kafka.png",
         Path::new("/ws/diagrams/kafka.png"),
         old_bytes,
     )
@@ -674,7 +636,6 @@ fn re_pointing_a_path_sweeps_the_figure_it_displaced() {
     link_media_path(
         &db,
         b"diagrams/kafka.png",
-        "diagrams/kafka.png",
         Path::new("/ws/diagrams/kafka.png"),
         new_bytes,
     )
@@ -700,7 +661,6 @@ fn re_pointing_a_path_sweeps_the_figure_it_displaced() {
     link_media_path(
         &db,
         b"notes/one.png",
-        "notes/one.png",
         Path::new("/ws/notes/one.png"),
         shared,
     )
@@ -708,7 +668,6 @@ fn re_pointing_a_path_sweeps_the_figure_it_displaced() {
     link_media_path(
         &db,
         b"notes/two.png",
-        "notes/two.png",
         Path::new("/ws/notes/two.png"),
         shared,
     )
@@ -716,7 +675,6 @@ fn re_pointing_a_path_sweeps_the_figure_it_displaced() {
     link_media_path(
         &db,
         b"notes/one.png",
-        "notes/one.png",
         Path::new("/ws/notes/one.png"),
         new_bytes,
     )
@@ -740,12 +698,10 @@ fn case_twin_paths_holding_one_file_answer_once() {
     let db = Db::in_memory().expect("in-memory database");
     install_model(&db, "m");
     let figure = media_row(&db, 'a');
-    for (rel, display) in [
-        (b"Diagram.PNG".as_slice(), "Diagram.PNG"),
-        (b"diagram.png".as_slice(), "diagram.png"),
-    ] {
-        let abs = Path::new("/ws").join(display);
-        link_media_path(&db, rel, display, &abs, figure).expect("link a case twin");
+    for rel in [b"Diagram.PNG".as_slice(), b"diagram.png".as_slice()] {
+        let abs =
+            Path::new("/ws").join(std::str::from_utf8(rel).expect("test setup: ascii spelling"));
+        link_media_path(&db, rel, &abs, figure).expect("link a case twin");
     }
     record_media_embedding(&db, figure, "m", 2, &vector_bytes(2, 4), &hash('a'), 1)
         .expect("one vector for the figure");
@@ -777,8 +733,7 @@ fn an_absolute_path_that_is_not_valid_utf8_stays_a_display_spelling() {
     let raw: &[u8] = b"caf\xe9.png";
     let abs = Path::new(OsStr::from_bytes(b"/ws/caf\xe9.png"));
 
-    link_media_path(&db, raw, "café.png", abs, media)
-        .expect("link a path no UTF-8 decoder can spell");
+    link_media_path(&db, raw, abs, media).expect("link a path no UTF-8 decoder can spell");
 
     let stored_abs: String =
         db.0.query_row("SELECT abs FROM media_path", [], |row| row.get(0))

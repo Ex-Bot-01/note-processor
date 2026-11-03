@@ -143,7 +143,7 @@ CREATE TABLE media (
 -- or by the embed pass's own cleanup — see "Lifecycle" below.
 CREATE TABLE media_path (
     rel_bytes   BLOB    NOT NULL CHECK (typeof(rel_bytes) = 'blob'),
-    case_key    TEXT    NOT NULL,
+    -- no case-folded twin of `rel_bytes`: identity is a content hash, so two spellings of one figure resolve to one row.
     abs         TEXT    NOT NULL,
     media_id    INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
     PRIMARY KEY (rel_bytes)

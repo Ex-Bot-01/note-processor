@@ -333,12 +333,12 @@ pub const MIGRATIONS: &[Migration] = &[
     -- No foreign key to `files`, deliberately: `files` rows exist for images too, but a media path is a fact about a
     -- *link* in a note, and §6 keeps `links` as prose rather than a resolver — an FK here would make the registry, not
     -- the embed pass, decide when a figure stops being searchable. Re-pointing on a rename is therefore the embed pass's
-    -- job (`link_media_path`'s upsert), and `case_key` exists for its case-folded fallback lookup, unconstrained exactly
-    -- as `files.case_key` is (migration 4 moved that guard to `case_bytes`, which this table does not need because its
-    -- primary key already holds the raw bytes).
+    -- job (`link_media_path`'s upsert), and the row carries no case-folded twin of its key: `files.case_key` exists
+    -- because the registry has to notice a case-twin *rename* on a case-insensitive filesystem, while this table's
+    -- identity is a content hash — two spellings of one figure already resolve to one media row, which
+    -- `case_twin_paths_holding_one_file_answer_once` pins. A column nothing reads would only add a NOT NULL to write.
     CREATE TABLE media_path (
         rel_bytes   BLOB    NOT NULL CHECK (typeof(rel_bytes) = 'blob'),
-        case_key    TEXT    NOT NULL,
         abs         TEXT    NOT NULL,
         media_id    INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
         PRIMARY KEY (rel_bytes)
@@ -2807,13 +2807,7 @@ fn read_media_by_hash(db: &Db, hash: &str) -> Result<MediaRow, DbError> {
 /// becoming the stored path (F13), which is why this takes `&[u8]` where a `&str` would have compiled. `abs` is the
 /// opposite case and is deliberately lossy: it is the display spelling a report prints (F20's rule that reports show
 /// bytes as text), while `rel_bytes` stays the identity.
-pub fn link_media_path(
-    db: &Db,
-    rel: &[u8],
-    case_key: &str,
-    abs: &Path,
-    media_id: i64,
-) -> Result<(), DbError> {
+pub fn link_media_path(db: &Db, rel: &[u8], abs: &Path, media_id: i64) -> Result<(), DbError> {
     // What this path pointed at before the upsert, if anything. A figure replaced in place is the ordinary case, and
     // once its last path re-points elsewhere nothing references it — the same stranded-row shape as an unlink, so the
     // displaced row is swept here rather than left for `np search` to keep answering.
@@ -2823,11 +2817,11 @@ pub fn link_media_path(
         .query_row(params![rel, media_id], |row| row.get::<_, i64>(0))
         .ok();
     db.0.prepare_cached(
-        "INSERT INTO media_path (rel_bytes, case_key, abs, media_id) VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO media_path (rel_bytes, abs, media_id) VALUES (?1, ?2, ?3)
          ON CONFLICT (rel_bytes) DO UPDATE
-            SET case_key = excluded.case_key, abs = excluded.abs, media_id = excluded.media_id",
+            SET abs = excluded.abs, media_id = excluded.media_id",
     )?
-    .execute(params![rel, case_key, abs.to_string_lossy(), media_id])?;
+    .execute(params![rel, abs.to_string_lossy(), media_id])?;
     if let Some(old) = displaced {
         // Same statement as `prune_unlinked_media`, scoped to the one row this call may have stranded.
         db.0.prepare_cached(
