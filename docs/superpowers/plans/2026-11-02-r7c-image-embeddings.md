@@ -127,6 +127,32 @@ Behind `vision`; the call sequence comes from Task 1's note.
 
 **Interfaces:**
 - Consumes: Task 2's accessors, Task 3's resolver, Task 4's seam.
+
+#### Amendments to Task 5, written after Task 4 closed (2026-11-03)
+
+**A. The seam splits in two: `Projector` (owns) and `VisionModel<'m>` (borrows).**
+`VisionModel<'m>` borrows the `LoadedModel` it was opened against — that borrow is the guarantee that a projector context
+never outlives the model whose pointer it keeps (`mtmd.cpp:567`). The consequence is that **it cannot be stored in the same
+struct that owns the model**, and that struct is exactly where an image capability has to live: `LazyLocalEmbedder` defers
+loading, so the projector can only be opened on first image need, from inside the provider. Storing a borrow of one's own
+field is self-reference; the workarounds (a raw pointer plus a prose invariant, or an owning crate) trade a compile-time
+guarantee for a comment, which is what §"the lifetime says so instead of a comment doing it" in `src/vision.rs` rejected.
+So: `Projector::open(&LoadedModel, path)` owns the context and takes the model **per call**
+(`projector.embed_image(&model, bytes)`), and `VisionModel<'m>` stays as the borrow-checked façade over it — Task 4's public
+API and its nine artifact cases are unchanged. A provider declares its `Projector` field *before* its model field, because
+field order is drop order, and says so in a comment.
+
+**B. `Embedder::embed_image` takes `&mut self`, so `embed_run`'s three entry points take `&mut dyn Embedder`.** Opening a
+projector behind `&self` needs interior mutability over FFI handles; taking `&mut` says "this call may open something" in
+the type. The ripple is mechanical — `embed`, `embed_with_resolution`, `embed_with_inject`, np-cli's one call site, and
+every test that hands a provider in — and it belongs to this task rather than to the media pass, so the two can be
+reviewed separately (5a: trait + seam + ripple with every existing test green; 5b: the media pass itself).
+
+**C. F26 closes here, by content rather than by name.** Discovery accepts a file only if its bytes are PNG
+(`\x89PNG\r\n\x1a\n`) or JPEG (`\xff\xd8\xff`); anything else refuses as `unsupported-format`, which §8 already defines and
+`media.rs` already emits. This is not theoretical: measured 2026-11-03, a BMP payload under a `.png` name went through the
+pinned decoder and came back a vector at 80 tokens, because `stb_image` decodes bmp/tga/gif/psd/pnm/qoi as well. The file is
+opened for hashing anyway, so the check costs one read of eight bytes and makes §7's promise hold where the bytes are.
 - Produces: `Embedder::supports_images(&self) -> bool` (default `false`); `Embedder::embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError>` (default returns `EmbedError::Unavailable("vision-unavailable")`); on `EmbedReport`: `images_seen: usize`, `images_embedded: usize`, `images_refused: usize`, `image_refusals: Vec<(String, MediaRefusal)>` (path + class, JSON only), and text output `images     seen 7 · embedded 4 · refused 3 (missing-target 1, unsupported-format 2)` suppressed entirely when `images_seen == 0`.
 
 - [ ] **Step 1: Write the failing tests** with a fake provider that records image calls: two notes linking one PNG produce **one** media row, one embedding, and `linked_from == 2`; a note whose text changed but whose image did not re-embeds chunks only (assert embedding row's `embedded_at` unchanged); a `.gif` link counts `unsupported-format` and appears in `image_refusals`; a missing file counts `missing-target`; unlinking the last note deletes the media row and its vector; a provider with `supports_images() == false` reports every image as `vision-unavailable` and still embeds all text.
