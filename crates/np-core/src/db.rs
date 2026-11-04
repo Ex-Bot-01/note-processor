@@ -2803,8 +2803,11 @@ pub struct MediaRow {
     /// Exact byte length as last recorded.
     pub size: i64,
     /// What the bytes **are** (`image/png`, `image/jpeg`), from [`crate::media::image_kind_of_prefix`] rather than the
-    /// filename — a file whose name lies is stored as what it is, because we measured the bytes to get here anyway. Used
-    /// for the report line and nothing else.
+    /// filename — a file whose name lies is stored as what it is, because we measured the bytes to get here anyway.
+    ///
+    /// **Nothing reads this column yet.** The embed report counts figures and never names their format, so `mime` (like
+    /// `size`) is recorded for whoever queries the database directly and for §12's unbuilt `np search`, where a hit will
+    /// name what it found. Claiming it feeds the report line would be a promise no code keeps.
     pub mime: String,
 }
 
@@ -2880,15 +2883,38 @@ pub fn link_media_path(db: &Db, rel: &[u8], abs: &Path, media_id: i64) -> Result
     // What this path pointed at before the upsert, if anything. A figure replaced in place is the ordinary case, and
     // once its last path re-points elsewhere nothing references it — the same stranded-row shape as an unlink, so the
     // displaced row is swept here rather than left for `np search` to keep answering.
-    let displaced = db
+    // **Not `.ok()`**: a `SQLITE_BUSY` here would read as "nothing was displaced", the stranded row would keep its
+    // vectors, and the run would report success. Only "no such row" is absence; everything else is a fault and travels
+    // (`media_by_hash` follows the same rule).
+    let displaced = match db
         .0
         .prepare_cached("SELECT media_id FROM media_path WHERE rel_bytes = ?1 AND media_id <> ?2")?
         .query_row(params![rel, media_id], |row| row.get::<_, i64>(0))
-        .ok();
+    {
+        Ok(old) => Some(old),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(err) => return Err(err.into()),
+    };
+    // Re-pointing a path **clears its stamp pair** when the content changes, which is the load-bearing half of this
+    // statement (`record_model_file` established the rule: a digest change nulls the check). Without it the pair survives
+    // as a complete, confident record of bytes that are no longer there: `verified_size` and `verified_mtime` were measured
+    // against the old content, and if the new file happens to share a size and a whole-second mtime — a rewritten
+    // screenshot, an editor's atomic save, a copy that preserved length — the next pass reads no bytes at all and answers
+    // search with a vector of the figure that used to live here. Same content re-linked (the ordinary second run) keeps its
+    // pair, so §7 rule 2 still costs one `stat`.
     db.0.prepare_cached(
         "INSERT INTO media_path (rel_bytes, abs, media_id) VALUES (?1, ?2, ?3)
          ON CONFLICT (rel_bytes) DO UPDATE
-            SET abs = excluded.abs, media_id = excluded.media_id",
+            SET abs = excluded.abs,
+                media_id = excluded.media_id,
+                verified_size = CASE
+                    WHEN media_path.media_id IS NOT excluded.media_id THEN NULL
+                    ELSE media_path.verified_size
+                END,
+                verified_mtime = CASE
+                    WHEN media_path.media_id IS NOT excluded.media_id THEN NULL
+                    ELSE media_path.verified_mtime
+                END",
     )?
     .execute(params![rel, abs.to_string_lossy(), media_id])?;
     if let Some(old) = displaced {
@@ -2912,10 +2938,18 @@ pub fn unlink_media_path(db: &Db, rel: &[u8]) -> Result<usize, DbError> {
     // One statement rather than a SELECT followed by a DELETE: with two statements, a link landing between them gives
     // two ways to be wrong — the debug assert firing, or `Ok(0)` returned after a row was deleted. `RETURNING` makes
     // "which media row did this path hold" and "is that path gone" the same instant.
-    let holder =
-        db.0.prepare_cached("DELETE FROM media_path WHERE rel_bytes = ?1 RETURNING media_id")?
-            .query_row(params![rel], |row| row.get::<_, i64>(0))
-            .ok();
+    // Again: only `QueryReturnedNoRows` means "this path was not linked". A lock or a read-only file must not come back as
+    // `Ok(0)` — that is the sweep believing it pruned when it pruned nothing, and the run then reporting a corpus with no
+    // stale figures.
+    let holder = match db
+        .0
+        .prepare_cached("DELETE FROM media_path WHERE rel_bytes = ?1 RETURNING media_id")?
+        .query_row(params![rel], |row| row.get::<_, i64>(0))
+    {
+        Ok(media_id) => Some(media_id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(err) => return Err(err.into()),
+    };
     let Some(media_id) = holder else {
         return Ok(0);
     };
@@ -3022,6 +3056,7 @@ pub fn media_stamp(db: &Db, media_id: i64, model: &str) -> Result<Option<String>
 /// `hash` travels with the pair because the pair is worthless on its own — the caller's question is "may I use these
 /// bytes without reading them", and answering it needs both "nothing moved" and "these are the bytes that were there".
 /// It comes from the joined `media` row, which is why the pair lives on `media_path` at all (see migration 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathCheck {
     /// `media.size` as recorded when the check was written.
     pub size: i64,
@@ -3051,10 +3086,10 @@ pub fn media_path_check(db: &Db, rel: &[u8]) -> Result<Option<PathCheck>, DbErro
             ))
         })
         .optional()?;
-    Ok(match row {
-        Some((Some(size), Some(mtime), hash)) => Some(PathCheck { size, mtime, hash }),
-        _ => None,
-    })
+    // The pair rule comes from the same `stamp_pair` every other stamp reader uses; only the hash is this table's own.
+    Ok(row.and_then(|(size, mtime, hash)| {
+        stamp_pair(size, mtime).map(|(size, mtime)| PathCheck { size, mtime, hash })
+    }))
 }
 
 /// Record the check that justifies reading no bytes at this path on the next run.
@@ -3105,7 +3140,11 @@ pub fn member_stamp(db: &Db, model: &str, name: &str) -> Result<Option<(i64, i64
     )
 }
 
-/// One stamp pair, with the half-pair rule in a single place so `media` and `model_files` cannot drift apart.
+/// One stamp pair, with the half-pair rule in a single place so `media_path` and `model_files` cannot drift apart.
+///
+/// The rule itself is [`stamp_pair`], which is also what [`media_path_check`] applies to its own three-column read — the
+/// alternative was a second copy of "half a pair is no check" in that function, which is precisely the drift this helper was
+/// written to prevent (and re-reading the row for a shared query would cost an indexed lookup per figure per run).
 ///
 /// No `typeof` guard here, unlike the blob columns this file insists on: these two have INTEGER affinity, so SQLite
 /// converts `'40960'` to the integer 40960 **on write** and a text stamp cannot exist to be misread — measured, in
@@ -3116,12 +3155,27 @@ fn read_stamp_pair(
     args: impl rusqlite::Params,
 ) -> Result<Option<(i64, i64)>, DbError> {
     let pair = db.0.prepare_cached(sql)?.query_row(args, |row| {
-        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
+        Ok(stamp_pair(
+            row.get::<_, Option<i64>>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+        ))
     });
     match pair {
-        Ok((Some(size), Some(mtime))) => Ok(Some((size, mtime))),
-        Ok(_) => Ok(None),
+        Ok(pair) => Ok(pair),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(err) => Err(DbError::from(err)),
+    }
+}
+
+/// D12's half-pair rule: **one column present is not a check.**
+///
+/// Both stamp columns are written by one statement, so a row with only one of them was edited by hand or written by a build
+/// that has since changed; treating it as a verification would skip a read on the strength of an incomplete record. Every
+/// reader of a pair answers through this function, which is what lets `media_path` and `model_files` mean the same thing by
+/// "unchecked".
+fn stamp_pair(size: Option<i64>, mtime: Option<i64>) -> Option<(i64, i64)> {
+    match (size, mtime) {
+        (Some(size), Some(mtime)) => Some((size, mtime)),
+        _ => None,
     }
 }

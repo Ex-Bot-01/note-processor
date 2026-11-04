@@ -691,18 +691,30 @@ fn re_pointing_a_path_sweeps_the_figure_it_displaced() {
 
 /// Two spellings that differ only in case are two paths; identical bytes are still one figure.
 ///
-/// Catches: the dedup being keyed on something other than content. `media_path` has no case-fold uniqueness on purpose
-/// (migration 4 moved that guard away from `case_key`), so this pins what actually matters — one vector, one answer.
+/// **Catches: dedup keyed on something other than content.** Each spelling goes through `record_media` with the same digest,
+/// the way the pass does it — an earlier version handed one already-recorded media id to both links, which made the
+/// "one row" assertion true no matter how dedup was keyed, because nothing was left to deduplicate. `media_path` has no
+/// case-fold uniqueness on purpose (migration 4 moved that guard away from `case_key`), so what is pinned here is the rule
+/// that matters: one content, one row, one vector.
 #[test]
 fn case_twin_paths_holding_one_file_answer_once() {
     let db = Db::in_memory().expect("in-memory database");
     install_model(&db, "m");
-    let figure = media_row(&db, 'a');
+    let mut figure = None;
     for rel in [b"Diagram.PNG".as_slice(), b"diagram.png".as_slice()] {
         let abs =
             Path::new("/ws").join(std::str::from_utf8(rel).expect("test setup: ascii spelling"));
-        link_media_path(&db, rel, &abs, figure).expect("link a case twin");
+        // Two calls with the same digest, as two notes linking two spellings would do.
+        let row = record_media(&db, &hash('a'), 4096, "image/png").expect("record these bytes");
+        link_media_path(&db, rel, &abs, row.id).expect("link a case twin");
+        figure = Some(row.id);
     }
+    let figure = figure.expect("test setup: both spellings linked");
+    assert_eq!(
+        scalar::<i64>(&db, "SELECT COUNT(*) FROM media_path"),
+        2,
+        "two spellings are two paths (§6: identity is the hash, not the name)"
+    );
     record_media_embedding(&db, figure, "m", 2, &vector_bytes(2, 4), &hash('a'), 1)
         .expect("one vector for the figure");
 
@@ -797,15 +809,24 @@ fn a_media_path_check_round_trips_and_a_half_pair_reads_as_no_check() {
     set_media_path_check(&db, b"gone.png", 1, 1).expect("stamping an absent path is not an error");
     assert_eq!(read(b"gone.png"), None);
 
-    // And a path whose media row was swept answers `None` rather than reviving the figure from its stamp.
+    // A check does not outlive its path: unlinking removes the row that held the pair, so there is nothing to read back.
+    // (Stated plainly because the earlier wording — "a swept media row cannot be revived from its stamp" — described a
+    // state this schema cannot reach: with `ON DELETE CASCADE` and enforcement on, a path row whose media row is gone does
+    // not exist, so the JOIN was never what made this answer `None`.)
     let orphan = media_row(&db, 'b');
     link_media_path(&db, b"orphan.png", Path::new("/ws/orphan.png"), orphan).expect("link");
     set_media_path_check(&db, b"orphan.png", 8, 8).expect("check it");
+    assert_eq!(
+        read(b"orphan.png")
+            .expect("a check exists before the unlink")
+            .2,
+        hash('b')
+    );
     unlink_media_path(&db, b"orphan.png").expect("unlink the last referrer");
     assert_eq!(
         read(b"orphan.png"),
         None,
-        "a swept media row cannot be reused from a stamp"
+        "the pair went with the path row, so no figure can be re-verified from a stamp nobody owns any more"
     );
 }
 
@@ -998,4 +1019,43 @@ fn a_stamp_column_holds_only_an_integer() {
         "integer",
         "the stored value is an integer even though the bind was text — the opposite of a BLOB-affinity column"
     );
+}
+
+/// **Re-pointing a path at different content clears its check.** The pair was measured against the bytes this path used to
+/// hold; leaving it intact after `media_id` changes hands means the next pass matches a size-and-mtime record that describes
+/// other pixels, reads nothing, and answers search with a stale vector forever. `record_model_file` established this rule
+/// for `model_files` (nulling the pair on a digest change is "the load-bearing half"); this is its analogue, and it is the
+/// database's own guarantee — not something the embed pass happens to re-write afterwards.
+#[test]
+fn re_pointing_a_path_at_other_content_clears_its_check() {
+    let db = Db::in_memory().expect("in-memory database");
+    install_model(&db, "m");
+    let first = record_media(&db, &hash('a'), 4096, "image/png").expect("first content");
+    let second = record_media(&db, &hash('b'), 4096, "image/jpeg").expect("other content");
+
+    link_media_path(&db, b"fig.png", Path::new("/ws/fig.png"), first.id).expect("link");
+    set_media_path_check(&db, b"fig.png", 4096, 1_730_000_000).expect("check the old bytes");
+    assert!(
+        media_path_check(&db, b"fig.png")
+            .expect("read the check")
+            .is_some(),
+        "the pair is a real check before anything moves"
+    );
+
+    link_media_path(&db, b"fig.png", Path::new("/ws/fig.png"), second.id).expect("re-point");
+    assert_eq!(
+        media_path_check(&db, b"fig.png").expect("read the check"),
+        None,
+        "a path that now holds other content has no check, whatever its size and mtime happen to be"
+    );
+
+    // The ordinary case must stay cheap: re-linking the **same** content keeps the pair, or §7 rule 2 would cost a read.
+    set_media_path_check(&db, b"fig.png", 4096, 1_730_000_001).expect("check the new bytes");
+    link_media_path(&db, b"fig.png", Path::new("/ws/fig.png"), second.id)
+        .expect("re-link same content");
+    let kept = media_path_check(&db, b"fig.png")
+        .expect("read the check")
+        .expect("same content keeps its check");
+    assert_eq!((kept.size, kept.mtime), (4096, 1_730_000_001));
+    assert_eq!(kept.hash, hash('b'));
 }

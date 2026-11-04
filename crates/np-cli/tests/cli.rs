@@ -1798,9 +1798,11 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             "images_embedded",
             "images_refused",
             "images_seen",
+            // Did the stale-figure sweep finish? `false` on an arm that never opened the database — which is why the summary
+            // says nothing about it here, and why a reader must not infer this from `images_unchecked` being zero.
+            "images_sweep_ran",
             // Notes this run could not read (§6's `images_unchecked`): present and zero even on an arm that opened no
-            // database, because the field also promises "the stale-figure sweep ran", and a reader must be able to tell
-            // "nothing was skipped" from "this build said nothing".
+            // database, because a reader must be able to tell "nothing was skipped" from "this build said nothing".
             "images_unchecked",
             "model",
             "outcome",

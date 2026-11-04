@@ -553,6 +553,32 @@ SOI marker; everything else refuses as `unsupported-format`, a class §8 already
 or widen the published promise to what this decoder actually takes. The first costs one read of a few bytes per media
 file — the file is opened for hashing anyway — and keeps the promise small.
 
+**Closed on 2026-11-03 by the first option.** `media::image_kind_of_prefix` accepts a PNG signature or a JPEG SOI marker and
+nothing else, and the embed pass classifies from the bytes it then digests and encodes — one read, so the judged, digested and
+encoded bytes are literally the same slice. A `.png` whose payload is a BMP now refuses as `unsupported-format`
+(`tests/embed_media.rs::a_remote_or_inline_target_is_counted_and_never_fetched` and the content-gate case in that file;
+`tests/media_resolve.rs::a_mislabelled_file_resolves_and_then_fails_the_content_check` pins the division between placing a path
+and judging bytes).
+
+## F27 — a figure rewritten in place, at the same length and whole-second mtime, keeps its old vector
+
+Filed while reviewing R7c Task 5b on 2026-11-03. §7 chose D12's stamp for image files, and that stamp is **size plus
+whole-second mtime**. An editor that rewrites a figure in place — an atomic save, a re-export of the same diagram at the same
+resolution, a copy that preserved length — can leave both fields identical while every pixel changes. With a current vector
+already stored, the pass reads nothing and the old vector keeps answering `np search`.
+
+This is not a bug in the pass: it is what the chosen stamp means, and closing it means hashing every figure on every run,
+which is the cost §7 traded away. What the pass *does* guarantee, and now tests, is that **anything it encodes is digested from
+the bytes it encoded** (`tests/embed_media.rs::a_figure_encoded_after_a_refusal_is_digested_from_the_bytes_it_encodes`), so a
+fooled stamp can delay an encode but never mislabel one. The blind spot itself is pinned by
+`a_same_size_same_mtime_overwrite_of_a_current_figure_is_not_detected`, which will fail loudly if someone closes the gap and
+forgets to update this entry.
+
+Ways out, if search accuracy starts to matter more than embed time: compare mtime with sub-second precision (needs `statx`
+or a dependency — the reason D12 rounded in the first place), store the digest per path rather than trusting the pair (which
+is a full read anyway), or watch for writes and mark dirty paths out of band. None is a small change; none is needed until a
+corpus demonstrates the loss.
+
 ## Carried out of the M2a chunker review (2026-10-28)
 
 Two behaviours `crates/np-core/src/chunk.rs` defers in its own comments, recorded here rather than left in a docstring —

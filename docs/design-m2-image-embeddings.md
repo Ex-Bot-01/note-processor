@@ -133,19 +133,24 @@ CREATE TABLE media (
     -- Content identity: the same SHA-256 is one diagram, wherever it sits or how often it is copied.
     hash        TEXT    NOT NULL UNIQUE CHECK (length(hash) = 64),
     size        INTEGER NOT NULL CHECK (size >= 0),
-    mime        TEXT    NOT NULL,
-    -- D12's stamp pair (§7): one `stat` when the bytes have not moved since the last check, a full hash when they have.
-    verified_size  INTEGER,
-    verified_mtime INTEGER
+    mime        TEXT    NOT NULL
 );
 
--- Every workspace path those bytes were seen at. Deleting the last row deletes the media row (and its vectors) by trigger
--- or by the embed pass's own cleanup — see "Lifecycle" below.
+-- Every workspace path those bytes were seen at. Removing the last row removes the media row and, by cascade, its vectors —
+-- by `unlink_media_path`'s `NOT EXISTS` delete and the pass's end-of-run sweep, not by trigger: nothing in this schema
+-- creates one, and a trigger could not apply §7 rule 4's "did a live note link this path?" anyway.
 CREATE TABLE media_path (
     rel_bytes   BLOB    NOT NULL CHECK (typeof(rel_bytes) = 'blob'),
     -- no case-folded twin of `rel_bytes`: identity is a content hash, so two spellings of one figure resolve to one row.
     abs         TEXT    NOT NULL,
     media_id    INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+    -- D12's stamp pair (§7): one `stat` when the bytes have not moved since the last check, a full hash when they have.
+    -- **On the path, not on `media`.** The first draft put them beside the hash, which cannot work: reaching that row needs
+    -- the digest, and producing the digest is the reading the stamp exists to skip. A stamp answers a question about a
+    -- *path* — "have the bytes here changed?" — so it lives with the path. Re-pointing a path at different content nulls
+    -- the pair (`record_model_file`'s rule for `model_files`), or the old check would vouch for bytes that were never there.
+    verified_size  INTEGER,
+    verified_mtime INTEGER,
     PRIMARY KEY (rel_bytes)
 );
 
@@ -159,6 +164,12 @@ CREATE TABLE media_embeddings (
     PRIMARY KEY (media_id, model)
 );
 ```
+
+Two limits shipped with, recorded here rather than discovered later. **A path check is size plus whole-second mtime**, so an
+in-place rewrite that preserves both — with a current vector already stored — is not noticed; closing it would mean hashing
+every figure on every run, and backlog **F27** carries the decision. And the pass **re-digests whatever it reads**: when a
+vector is owed and the bytes come off disk, the digest comes from those bytes, so a fooled stamp can delay an encode but never
+mislabel one.
 
 `media_path` keeps byte-exact paths for the same reason `files` and `chunks` do (F13): a name that is not valid UTF-8 is a
 name this program has to store, not one it gets to reject. Renaming a file re-points one row and **does not re-embed**,

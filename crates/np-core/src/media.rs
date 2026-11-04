@@ -371,18 +371,7 @@ pub fn resolve_image_in(
     // author pointed at. §8 has no class for it; "names nothing" is the honest one, because at that spelling it does.
     let names_a_directory = style.is_separator(*written.last().unwrap_or(&b'/'));
 
-    // Step 4: the note's directory, then the target, in one walk. A `note_rel` that itself pops past the root is not a
-    // workspace path and gets the same refusal — nothing may reach outside through the base either. The rooted test runs
-    // on the base's components too: a registry key that spells a Windows prefix escapes for the same reason a target does.
-    let mut path: Vec<Vec<u8>> = Vec::new();
-    let mut directories = style.split(note_rel);
-    // The last component is the note's file name; a root-level note has no directory left to walk.
-    directories.pop();
-    for name in directories.into_iter().chain(style.split(&written)) {
-        if style.is_rooted(name) || !push_component(&mut path, name) {
-            return Err(MediaRefusal::OutsideWorkspace);
-        }
-    }
+    let path = place_in_workspace(style, note_rel, &written)?;
 
     // A target that walked away to nothing (`a/..` on a root-level note) names the workspace root itself, which is a
     // directory and therefore no more an image than `.` was.
@@ -413,6 +402,63 @@ pub fn resolve_image_in(
         abs,
         mime,
     })
+}
+
+/// Where a written target points in the workspace, decided from the bytes of the path and **nothing else** — no `stat`,
+/// no symlink test, no extension check.
+///
+/// This is the walk [`resolve_image_in`] performs, split out because a second caller needs exactly this much of it and not
+/// one step more: §7 rule 4's lifecycle question is *"does a live note link this path?"*, which is answered by the note's
+/// text and nothing else. A figure whose file is momentarily unopenable — unmounted, Sync-in-flight, evicted from a
+/// network volume — is still linked, and a sweep that reads "no file" as "no link" deletes a vector the author never
+/// removed.
+fn place_in_workspace(
+    style: PathStyle,
+    note_rel: &[u8],
+    written: &[u8],
+) -> Result<Vec<Vec<u8>>, MediaRefusal> {
+    // Step 4: the note's directory, then the target, in one walk. A `note_rel` that itself pops past the root is not a
+    // workspace path and gets the same refusal — nothing may reach outside through the base either. The rooted test runs
+    // on the base's components too: a registry key that spells a Windows prefix escapes for the same reason a target does.
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    let mut directories = style.split(note_rel);
+    // The last component is the note's file name; a root-level note has no directory left to walk.
+    directories.pop();
+    for name in directories.into_iter().chain(style.split(written)) {
+        if style.is_rooted(name) || !push_component(&mut path, name) {
+            return Err(MediaRefusal::OutsideWorkspace);
+        }
+    }
+    Ok(path)
+}
+
+/// The workspace path a written image link points at, when it points at one — the answer to "does this note link this
+/// path?", with no claim about whether anything is there.
+///
+/// `None` means the target cannot name a workspace figure at all: it escapes the root, names nothing, or has an extension
+/// §8 does not accept (a `.gif` link never linked the `.png` row that used to hold those bytes, so it must not keep that
+/// row alive). Percent-decoding follows the resolver exactly — one definition of where a target points lives in
+/// `place_in_workspace`, which is also what [`resolve_image_in`] walks.
+///
+/// **Why this exists as its own question:** the stale-figure sweep asks §7 rule 4, "which figures did no live note link?",
+/// and answering it from resolution results conflates two events — the author deleting a link, and the disk failing to
+/// produce a file today. The second is not the author's edit, and a vector destroyed by it costs a full re-encode when the
+/// volume comes back.
+pub fn link_target_rel(style: PathStyle, note_rel: &[u8], target: &[u8]) -> Option<Vec<u8>> {
+    let written = percent_decode(target).unwrap_or_else(|| target.to_vec());
+    if written.contains(&0) || names_nothing(&written) {
+        return None;
+    }
+    // A trailing separator names a directory, which is not a figure path whatever the text says.
+    if style.is_separator(*written.last().unwrap_or(&b'/')) {
+        return None;
+    }
+    let path = place_in_workspace(style, note_rel, &written).ok()?;
+    // The same accepted-extension test the resolver applies, so the two questions cannot disagree about which paths a
+    // figure link can hold.
+    let name = path.last()?;
+    mime_of(extension_of(name)?)?;
+    Some(join_rel(&path))
 }
 
 /// Whether any component of `components`, from `root` down, is a symbolic link.

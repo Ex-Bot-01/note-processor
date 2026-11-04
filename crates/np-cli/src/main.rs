@@ -512,9 +512,11 @@ fn print_embed_summary(report: &EmbedReport) {
         } else {
             format!(" ({classes})")
         };
+        // `links`, because that is the unit: one figure written two ways counts twice here and once in `embedded`, and a
+        // bare "seen 2 · embedded 1" reads like an unexplained loss.
         let _ = writeln!(
             out,
-            "images     seen {} · embedded {} · refused {}{suffix}",
+            "images     links {} · embedded {} · refused {}{suffix}",
             report.images_seen, report.images_embedded, report.images_refused
         );
     }
@@ -523,8 +525,17 @@ fn print_embed_summary(report: &EmbedReport) {
     if report.images_unchecked > 0 {
         let _ = writeln!(
             out,
-            "unchecked  {} note(s) not read — no stale image was removed",
+            "unchecked  {} note(s) not read",
             report.images_unchecked
+        );
+    }
+    // Said only for a run that looked at figures, because `false` means three different things (no pass, held off, stopped
+    // early) and two of them are invisible in the counts above. What it always means is "nothing was decided about stale
+    // figures", which is worth a line exactly when the reader has figures that could be stale.
+    if report.images_seen > 0 && !report.images_sweep_ran {
+        let _ = writeln!(
+            out,
+            "sweep      not completed — stale image rows may remain"
         );
     }
     let _ = writeln!(out, "verify     {}", report.verification);

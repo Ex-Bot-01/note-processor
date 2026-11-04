@@ -587,8 +587,9 @@ fn a_provider_without_images_refuses_once_per_image_and_reports_no_errors() {
 
     assert_eq!(report.images_seen, 2);
     assert_eq!(report.images_embedded, 0);
+    // One assertion about how many refused, not two: `images_refused` **is** `image_refusals.len()` by construction
+    // (`media_fields` fills both from one vec), so asserting both is asserting nothing twice.
     assert_eq!(report.images_refused, 2);
-    assert_eq!(report.image_refusals.len(), 2);
     for (path, refusal) in &report.image_refusals {
         assert_eq!(*refusal, MediaRefusal::VisionUnavailable, "for {path}");
     }
@@ -728,6 +729,9 @@ fn an_arm_that_reads_nothing_reports_zero_images() {
         report.outcome,
         EmbedOutcome::ArtifactAbsent { .. }
     ));
+    // `false` here means "there was no media pass", the same value a held-off or half-run pass carries. That is why the
+    // summary only mentions the sweep for a run that saw figures, and why `images_unchecked == 0` cannot stand in for it.
+    assert!(!report.images_sweep_ran);
     assert_eq!(report.images_seen, 0);
     assert_eq!(report.images_embedded, 0);
     assert_eq!(report.images_refused, 0);
@@ -754,25 +758,30 @@ fn a_note_this_run_cannot_read_keeps_its_figures_and_says_so() {
     setup.touch_artifact();
 
     let mut first = FakeVision::vision();
-    run(&setup, &mut first);
+    let healthy = run(&setup, &mut first);
     let rows = setup.media_rows();
     let vectors = db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors");
     assert_eq!(rows.len(), 1, "one figure, one row");
     assert_eq!(vectors.len(), 1, "and that figure has a vector");
+    // The healthy run before the fault: the sweep completed, so `false` below is not merely a default nobody set.
+    assert!(healthy.images_sweep_ran);
 
     let note = setup.file("notes/a.md");
     fs::set_permissions(&note, fs::Permissions::from_mode(0o000))
         .expect("test setup: the note cannot be read");
+    // **A guard, not a nicety.** Everything below depends on this process being unable to open mode 000 — under a
+    // privileged reader the file still reads, the pass sees its links, and every assertion passes with the behaviour gone.
+    assert!(
+        fs::read(&note).is_err(),
+        "this test only means something unprivileged: a process that can read mode 000 would prove nothing"
+    );
 
     let report = {
         let mut again = FakeVision::vision();
-        let report = run(&setup, &mut again);
-        assert_eq!(
-            again.encodes().len(),
-            0,
-            "a note this run could not read is not a reason to encode anything"
-        );
-        report
+        // No assertion about the encode log here: this corpus's only image link lives in the unread note, so no
+        // implementation of this pass could encode on that run and `encodes().is_empty()` would be unfailable. The claims
+        // worth making are below — the row, the vector and the count.
+        run(&setup, &mut again)
     };
     fs::set_permissions(&note, fs::Permissions::from_mode(0o644))
         .expect("test cleanup: the note can be read again");
@@ -780,6 +789,10 @@ fn a_note_this_run_cannot_read_keeps_its_figures_and_says_so() {
     assert_eq!(
         report.images_unchecked, 1,
         "one live note went unread — the run says so instead of drawing a conclusion from it"
+    );
+    assert!(
+        !report.images_sweep_ran,
+        "and the sweep is reported as not completed, rather than a zero count implying it ran"
     );
     assert_eq!(
         report.images_seen, 0,
@@ -975,4 +988,196 @@ fn a_provider_refusal_is_classified_by_variant_or_exact_label_and_never_by_prose
          the request — matching on substrings would have called this one over-budget"
     );
     assert_eq!(report.outcome, EmbedOutcome::Current);
+}
+
+/// §7 rule 4 says a media row lives while a live note **links** one of its paths. It does not say "while the file opens",
+/// and the difference is a vector's life: the first version let a figure that failed to resolve this run (unmounted volume,
+/// Sync-in-flight file, an asset directory swapped for a symlink) fall out of `referenced`, sweep its path row, cascade the
+/// vector away, exit 0 and report nothing. The author never edited the note.
+#[test]
+fn a_figure_that_is_merely_absent_today_keeps_its_row_until_the_note_stops_linking_it() {
+    let setup = scanned(
+        &[("notes/a.md", "![d](assets/d.png)\n")],
+        &["notes/assets/d.png"],
+    );
+    setup.install_model();
+    setup.touch_artifact();
+
+    let mut first = FakeVision::vision();
+    run(&setup, &mut first);
+    let rows = setup.media_rows();
+    let vectors = db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors");
+    assert_eq!(vectors.len(), 1);
+
+    // The file goes away; the note still says `![d](assets/d.png)`.
+    fs::remove_file(setup.file("notes/assets/d.png")).expect("test setup: figure gone from disk");
+    scan(&setup.root, &setup.cfg()).expect("test: rescan with the figure missing");
+
+    let mut second = FakeVision::vision();
+    let report = run(&setup, &mut second);
+    assert_eq!(
+        report.images_seen, 1,
+        "the link was still there to be looked at"
+    );
+    assert_eq!(
+        report.image_refusal_classes(),
+        vec![("missing-target", 1)],
+        "and it refuses, as it should, for today"
+    );
+    assert_eq!(
+        setup.media_rows(),
+        rows,
+        "but the row survives: a missing file is not an edit to the note"
+    );
+    assert_eq!(
+        db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors"),
+        vectors,
+        "and so does the vector, which is what `np search` would otherwise lose silently"
+    );
+    assert!(
+        report.images_sweep_ran,
+        "every note was read this run, so the sweep did run — and it correctly left a linked figure alone"
+    );
+
+    // The author's edit is what removes it: with the link gone from the text, rule 4 applies.
+    fs::write(
+        setup.file("notes/a.md"),
+        "the figure is no longer referenced\n",
+    )
+    .expect("test setup: unlink in the note");
+    scan(&setup.root, &setup.cfg()).expect("test: rescan after the edit");
+    let mut third = FakeVision::vision();
+    run(&setup, &mut third);
+    assert_eq!(setup.media_rows(), Vec::new(), "now nothing links it");
+    assert_eq!(
+        db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors"),
+        Vec::new()
+    );
+}
+/// When the pass does have to encode, it digests **the bytes in hand** rather than reusing what the path check remembered.
+/// That matters on the ordinary retry path: a first run with no projector records the pair and refuses, the figure is then
+/// replaced in place (same length, same whole-second mtime — an editor's atomic save), and a capable run comes back. Trusting
+/// the remembered hash would encode the new pixels and store them under the old content's digest, leaving `media.hash`,
+/// `source_hash` and the file describing three different things.
+#[test]
+fn a_figure_encoded_after_a_refusal_is_digested_from_the_bytes_it_encodes() {
+    let setup = scanned(
+        &[("notes/a.md", "![d](assets/d.png)\n")],
+        &["notes/assets/d.png"],
+    );
+    setup.install_model();
+    setup.touch_artifact();
+
+    // Run one: no image capability, so nothing is encoded — but the path check is written, which is what §7 rule 2 buys.
+    let mut first = FakeVision::text_only();
+    let report = run(&setup, &mut first);
+    assert_eq!(
+        report.image_refusal_classes(),
+        vec![("vision-unavailable", 1)]
+    );
+    assert_eq!(setup.embeddings().len(), 0, "nothing to store");
+
+    let figure = setup.file("notes/assets/d.png");
+    let mtime = fs::metadata(&figure)
+        .expect("test: stat the figure")
+        .modified()
+        .expect("test setup: figure carries an mtime");
+    let old_bytes = fs::read(&figure).expect("test: read the fixture");
+
+    // Different bytes, identical length, and the original mtime put back: the pair still matches.
+    let mut swapped = png(0);
+    while swapped.len() < old_bytes.len() {
+        swapped.push(b'x');
+    }
+    swapped.truncate(old_bytes.len());
+    assert_ne!(swapped, old_bytes);
+    assert_eq!(
+        swapped.len(),
+        old_bytes.len(),
+        "the swap must be size-neutral"
+    );
+    fs::write(&figure, &swapped).expect("test setup: swap the bytes");
+    mtime_restore(&figure, mtime);
+
+    let mut second = FakeVision::vision();
+    let report = run(&setup, &mut second);
+    assert_eq!(
+        second.encodes().len(),
+        1,
+        "the vector is owed, so the file is read — and what it now holds is what gets encoded"
+    );
+    assert_eq!(
+        second.encodes()[0],
+        sha256_bytes(&swapped),
+        "encoded from the bytes on disk, not from the digest the stamp remembered"
+    );
+    let rows = setup.media_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1,
+        sha256_bytes(&swapped),
+        "the media row describes the content that exists, so a later run can tell they are the same bytes"
+    );
+    assert_eq!(report.images_embedded, 1);
+    assert_eq!(
+        setup.stamp(rows[0].0).as_deref(),
+        Some(sha256_bytes(&swapped).as_str()),
+        "and the currency digest is the same fact about the same bytes"
+    );
+}
+
+/// The blind spot this pass does **not** close, pinned so it stays a decision rather than becoming a surprise: a path check
+/// is size plus whole-second mtime, so an in-place swap that preserves both — with a vector already stored and current — is
+/// not noticed at all, and the old vector keeps answering. §7 chose that stamp knowingly (D12's rule for model files), and
+/// closing it would mean hashing every figure every run. `docs/backlog-m2-followups.md` carries it as F27.
+#[test]
+fn a_same_size_same_mtime_overwrite_of_a_current_figure_is_not_detected() {
+    let setup = scanned(
+        &[("notes/a.md", "![d](assets/d.png)\n")],
+        &["notes/assets/d.png"],
+    );
+    setup.install_model();
+    setup.touch_artifact();
+
+    let mut first = FakeVision::vision();
+    run(&setup, &mut first);
+    assert_eq!(first.encodes().len(), 1);
+
+    let figure = setup.file("notes/assets/d.png");
+    let mtime = fs::metadata(&figure)
+        .expect("test: stat the figure")
+        .modified()
+        .expect("test setup: figure carries an mtime");
+    let old_bytes = fs::read(&figure).expect("test: read the fixture");
+    let mut swapped = png(0);
+    while swapped.len() < old_bytes.len() {
+        swapped.push(b'x');
+    }
+    swapped.truncate(old_bytes.len());
+    fs::write(&figure, &swapped).expect("test setup: swap the bytes");
+    mtime_restore(&figure, mtime);
+
+    let mut second = FakeVision::vision();
+    let report = run(&setup, &mut second);
+    assert_eq!(
+        second.encodes().len(),
+        0,
+        "KNOWN GAP (F27): the pair matches, the vector is current, so no byte is read and the stale vector answers"
+    );
+    assert_eq!(report.images_embedded, 0);
+    assert_eq!(
+        setup.media_rows()[0].1,
+        sha256_bytes(&old_bytes),
+        "and the row still describes the bytes that used to be there"
+    );
+}
+
+/// Put a file's mtime back where it was, so a fixture can change its bytes without changing what `stat` reports.
+fn mtime_restore(path: &Path, mtime: std::time::SystemTime) {
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("test setup: open for utime")
+        .set_modified(mtime)
+        .expect("test setup: put the mtime back");
 }
