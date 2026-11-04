@@ -852,9 +852,10 @@ fn embedding_currency_is_one_digest_per_media_and_model() {
         Some(hash('b').as_str())
     );
 
-    // The stamp's hash is readable without the file, which is what `media_by_hash` exists for.
+    // The **media** row is still keyed by the bytes on disk, which is what `media_by_hash` reads back without opening
+    // the file — re-embedding changes the vector's digest, not the figure's identity.
     assert_eq!(
-        media_by_hash(&db, &hash('b'))
+        media_by_hash(&db, &hash('a'))
             .expect("read by content")
             .map(|row| row.id),
         Some(media),
