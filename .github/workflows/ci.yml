@@ -130,7 +130,7 @@ jobs:
           set -uo pipefail
           cargo test --locked -p np-core --features local-model --lib --test local_runtime \
             --test local_load --test local_embed --test local_window --test artifact_verify \
-            --test local_corpus --test local_threads -- --nocapture 2>&1 \
+            --test local_corpus --test local_threads --test local_vision -- --nocapture 2>&1 \
             | tee /tmp/feature-tests.log
           status=${PIPESTATUS[0]}
           count=$(grep -c 'NOT COVERAGE' /tmp/feature-tests.log)
@@ -153,12 +153,32 @@ jobs:
           # `local_threads` (D13) adds four - **two cases, two lines each**, because a gated case prints what it could
           # not measure and then prints how to measure it. On a runner this row is compilation plus four printed skips:
           # the sweep cell needs both the artifact and `$NP_THREAD_*`, and the worker-count readback needs the runtime.
-          # Total with no artifact, re-measured 2026-11-02 with this exact command after R8's corpus case was added:
-          # **28**. A smaller total means the
+          # `local_vision` (R7c) adds **one** line to this row, not ten. The row builds `--features local-model`, so
+          # the file's ten projector cases are not even compiled (`#[cfg(not(feature = "vision"))]` replaces them) and
+          # what prints is the feature-off statement `vision_feature_is_off`: no projector was opened, re-run with
+          # `--features local-model,vision`. That is the whole of what this row says about images - that a file gated
+          # on a feature it does not have still compiles and still refuses to claim anything.
+          #
+          # What the row does NOT prove about vision, stated because "local_vision is on the link-proof row" reads like
+          # image coverage and is not any. Measured 2026-11-04 with the same command at `--features local-model,vision`
+          # and no artifact: **38** lines - the ten extra are one per case that needs both files
+          # (`an_image_embeds_to_768_components_of_unit_length`, `the_same_bytes_twice_give_bit_identical_components`,
+          # `text_still_matches_what_it_was_after_an_image_ran`, `the_provider_seam_and_the_facade_agree_bit_for_bit`,
+          # `a_truncated_png_refuses_rather_than_returning_a_vector`,
+          # `audio_bytes_refuse_because_this_seam_only_makes_image_vectors`,
+          # `a_projector_refuses_a_model_it_was_not_opened_against`, `token_cost_is_measured_per_encode_and_printed`,
+          # `a_caption_beats_an_unrelated_image`, `a_large_image_either_embeds_within_the_window_or_refuses_over_budget`).
+          # A runner has no 554 MB projector either, so adding the feature to this row would buy ten more printed
+          # skips and no measured pixel; the ten run only where both env vars point at real files.
+          # `refusal_classes_are_the_report_labels_verbatim` is the file's one artifact-free case - it prints `CLASSES:`,
+          # not `NOT COVERAGE`, so neither count includes it.
+          #
+          # Total with no artifact, re-measured 2026-11-04 with this exact command after `--test local_vision` joined
+          # it: **29**, twice (28 before the file was added). A smaller total means the
           # prints stopped reaching the log - `--nocapture` lost, or a case silently became a real pass with no
           # artifact - and "compiled, never ran" would be implied rather than stated again.
-          if [ "$count" -lt 28 ]; then
-            echo "expected at least 28 NOT COVERAGE lines with no artifact, saw $count: §2 step 4 is not on the record" >&2
+          if [ "$count" -lt 29 ]; then
+            echo "expected at least 29 NOT COVERAGE lines with no artifact, saw $count: §2 step 4 is not on the record" >&2
             exit 1
           fi
       # "A green run means llama.cpp was called" is only worth saying if the run can also say *which* llama.cpp.
