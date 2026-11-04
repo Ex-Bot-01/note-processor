@@ -466,6 +466,22 @@ pub trait Embedder {
     /// model or an endpoint (§7: CI runs `--ignored`, so a panicking path poisons a green run).
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError>;
 
+    /// Embed one **search query** under the model's query-side prefix (`docs/design-m2-image-embeddings.md` §12).
+    ///
+    /// Separate from [`Self::embed`] because the two sides of an asymmetric retrieval pair are not interchangeable: a
+    /// vector written under `prefix_query` is not comparable with a stored document row, so which side a piece of text is
+    /// being dressed as has to be spelled at the call site rather than inferred from context. `np search` is the only
+    /// caller today.
+    ///
+    /// The default **refuses** rather than falling back to [`Self::embed`]: a provider with no query prefix of its own —
+    /// the seam's halves, an injected fake — would otherwise hand back scores measured in a vector space the stored rows
+    /// do not live in, which is R6c2's P1 mistake wearing the other prefix.
+    fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
+        Err(EmbedError::Unavailable(
+            "this provider cannot embed a search query".to_string(),
+        ))
+    }
+
     /// Whether [`Self::embed_image`] can serve on this provider, asked before anything is attempted.
     ///
     /// Defaults to `false`, so a text-only provider — and every provider written before images existed — keeps answering

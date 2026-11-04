@@ -26,7 +26,11 @@ use np_core::models::{
     UnclaimedKind,
 };
 use np_core::scan::{scan, ScanReport};
+use np_core::search::{self, Hit, HitKind};
 use serde_json::{json, Value};
+
+/// §12's default top-k for `np search --limit`.
+const DEFAULT_SEARCH_LIMIT: usize = 10;
 
 #[derive(Parser)]
 // The binary is `np`, but the package is `np-cli`; without `name` clap would print the package name
@@ -52,6 +56,27 @@ enum Command {
         /// Workspace root to embed.
         workspace: PathBuf,
         /// Print the report as JSON instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rank the indexed notes and images against a text query.
+    ///
+    /// `<workspace>` is an operand for the same reason `scan` and `embed` take it: the index lives under this
+    /// workspace's key ([`Config::workspace_db`]), so a command without one could not find a database to read.
+    ///
+    /// The command **reads only** — no migration, no stamp, no row written ([`np_core::search`]). Exit codes follow every
+    /// other command: a missing argument is clap's 2, and anything the runtime refuses (no provider, an id nobody
+    /// installed, half an index) is 1. An index with no vectors for this model is not a refusal: it prints one line and
+    /// exits 0.
+    Search {
+        /// Workspace root whose index to read.
+        workspace: PathBuf,
+        /// Text to embed and rank against the stored vectors.
+        query: String,
+        /// Maximum number of hits to print, highest score first.
+        #[arg(long, default_value_t = DEFAULT_SEARCH_LIMIT)]
+        limit: usize,
+        /// Print the hits as JSON instead of one line each.
         #[arg(long)]
         json: bool,
     },
@@ -144,6 +169,12 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Scan { workspace, json } => scan_workspace(&workspace, json),
         Command::Embed { workspace, json } => embed_workspace(&workspace, json),
+        Command::Search {
+            workspace,
+            query,
+            limit,
+            json,
+        } => search_workspace(&workspace, &query, limit, json),
         Command::Models { command } => match command {
             ModelsCommand::Install {
                 workspace,
@@ -340,6 +371,88 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
         report.outcome.detail().unwrap_or_default()
     )
     .into())
+}
+
+/// Rank `query` against `workspace`'s index and print the hits.
+///
+/// The provider is built exactly as `np embed` builds it, because the query must be embedded by the **same** model whose
+/// rows are being read — and under its `prefix_query` spelling, not the document one ([`Embedder::embed_query`]). That is
+/// also where an unbuilt runtime refuses at exit 1: [`embed_provider`] answers `None` when the artifact is absent, and a
+/// query nobody can embed has no ranking to print.
+fn search_workspace(
+    workspace: &Path,
+    query: &str,
+    limit: usize,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let cfg = load_config()?;
+    let db = workspace_db(&cfg, workspace)?;
+    let resolved = embed_provider(&cfg, workspace)?;
+    let Some(provider) = resolved.provider.as_ref() else {
+        return Err("no embedding provider for this workspace: its model artifact is absent, so the query cannot be                     embedded"
+            .into());
+    };
+    // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
+    // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
+    let model = provider.model_id().to_string();
+    let vector = provider.embed_query(query)?;
+    let hits = search::search(&db, &model, &vector.to_bytes(), limit)?;
+
+    let mut out = io::stdout().lock();
+    if json {
+        // One object per hit under `hits`, and nothing else on stdout (§12). The empty case is an empty array — a machine
+        // reader does not need a sentence, and a second key would be a schema change in disguise.
+        let objects: Vec<Value> = hits.iter().map(hit_json).collect();
+        drop(out);
+        emit_json(&json!({ "hits": objects }));
+        return Ok(());
+    }
+    if hits.is_empty() {
+        // §12: an empty index is a fact. Written to stdout, exit 0 — the caller has nothing to fix.
+        // `--limit 0` asks for no hits and gets no lines, which is not the same sentence, so it is not printed.
+        if limit > 0 {
+            let _ = writeln!(out, "nothing indexed for {model}");
+        }
+        return Ok(());
+    }
+    for hit in &hits {
+        // Score to four decimals (full precision travels in `--json`), kind padded so the paths start in one column.
+        let score = format!("{:.4}", hit.score);
+        match &hit.source_note {
+            Some(note) => {
+                let _ = writeln!(
+                    out,
+                    "{score} {:<5}  {}   (from {note})",
+                    hit.kind.label(),
+                    hit.path
+                );
+            }
+            None => {
+                let _ = writeln!(out, "{score} {:<5}  {}", hit.kind.label(), hit.path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One hit as the JSON shape §12 names: `{score, kind, path, source_note, linked_from}`.
+///
+/// `source_note` and `linked_from` are absent for a note hit — a note is not "from" another note, and printing `null` /
+/// `0` there would make a reader ask which of the two meanings a zero carries.
+fn hit_json(hit: &Hit) -> Value {
+    let mut object = json!({
+        "score": hit.score,
+        "kind": hit.kind.label(),
+        "path": hit.path,
+    });
+    if hit.kind == HitKind::Image {
+        object["linked_from"] = json!(hit.linked_from);
+        object["source_note"] = match &hit.source_note {
+            Some(note) => json!(note),
+            None => Value::Null,
+        };
+    }
+    object
 }
 
 /// What `[embeddings]` resolved to, and — on the one path that could — what it proved about the artifact's bytes.

@@ -1175,6 +1175,12 @@ impl Embedder for LazyLocalEmbedder {
         self.model()?.embed(texts)
     }
 
+    /// Load on first use, then answer through the inner provider's query prefix — laziness changes when the weights are
+    /// read, not which side of the retrieval pair the text is dressed as.
+    fn embed_query(&self, text: &str) -> Result<Vector, EmbedError> {
+        self.model()?.embed_as(text, TextKind::Query)
+    }
+
     /// True when an mmproj was configured — answered **without loading**, which is the whole point of laziness here: a
     /// caller deciding whether to read a file must not have to load 420 MiB of weights to ask.
     #[cfg(feature = "vision")]
@@ -1236,6 +1242,14 @@ impl Embedder for LocalEmbedder {
             .iter()
             .map(|text| self.embed_as(text, TextKind::Document))
             .collect()
+    }
+
+    /// The query side of the pair: `prefix_query`, then the text — the only path that reaches [`TextKind::Query`].
+    ///
+    /// Answers a unit-length row, because [`LoadedModel::embed_text`] pools and normalises whatever prefix it was given;
+    /// [`crate::search::search`] asserts that promise rather than rescaling.
+    fn embed_query(&self, text: &str) -> Result<Vector, EmbedError> {
+        self.embed_as(text, TextKind::Query)
     }
 
     /// True exactly when [`LocalEmbedder::with_mmproj`] was called — a statement about this build and configuration, not
