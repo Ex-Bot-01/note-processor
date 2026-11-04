@@ -273,10 +273,14 @@ fn the_schema_is_what_the_plan_mandates() {
         ),
         // Migration 10's three tables, pinned for the same reason as `embeddings`: `crate::media` writes them row by
         // row and `np search` reads them by name, so a rename has to break that code rather than merely differ.
-        // The two stamp columns sit at the end of `media` because that is where `ADD COLUMN` can put them without a
-        // rebuild — the same reason `models` and `model_files` carry theirs last.
-        ("media", "id hash size mime verified_size verified_mtime"),
-        ("media_path", "rel_bytes abs media_id"),
+        // The two stamp columns sit on `media_path`, not on `media`: a stamp that can only be read once the content
+        // hash is known skips no read (design §7's D12 rule is about a file). They come last for the same reason
+        // `models` and `model_files` carry theirs last.
+        ("media", "id hash size mime"),
+        (
+            "media_path",
+            "rel_bytes abs media_id verified_size verified_mtime",
+        ),
         (
             "media_embeddings",
             "media_id model dim vector source_hash embedded_at",

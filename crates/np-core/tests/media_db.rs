@@ -12,9 +12,9 @@
 use std::path::Path;
 
 use np_core::db::{
-    insert_model, link_media_path, media_embeddings, media_stamp, member_stamp,
-    prune_unlinked_media, record_media, record_media_embedding, record_member_stamp,
-    record_model_file, set_media_stamp, unlink_media_path, Db, DbError, Migration, MIGRATIONS,
+    insert_model, link_media_path, media_by_hash, media_embeddings, media_path_check, media_stamp,
+    member_stamp, prune_unlinked_media, record_media, record_media_embedding, record_member_stamp,
+    record_model_file, set_media_path_check, unlink_media_path, Db, DbError, Migration, MIGRATIONS,
 };
 use tempfile::TempDir;
 
@@ -748,49 +748,123 @@ fn an_absolute_path_that_is_not_valid_utf8_stays_a_display_spelling() {
     assert_eq!(stored_rel, raw, "and the identity column is not");
 }
 
-/// A media stamp round-trips, and a half-written pair reads as no stamp at all.
+/// A media **path** check round-trips, and a half-written pair reads as no check at all.
 ///
 /// Catches: a reader that treats one column present as verified (migration 8's rule — a half stamp would let an embed
-/// skip hashing bytes it never checked), and a writer that appends history instead of replacing the pair.
+/// reuse a hash for bytes it never checked), a writer that appends history instead of replacing the pair, and the
+/// placement itself: the pair sits on `media_path` because reading it has to precede reading the file.
 #[test]
-fn a_media_stamp_round_trips_and_a_half_pair_reads_as_no_stamp() {
+fn a_media_path_check_round_trips_and_a_half_pair_reads_as_no_check() {
     let db = Db::in_memory().expect("in-memory database");
     let media = media_row(&db, 'a');
+    link_media_path(&db, b"fig.png", Path::new("/ws/fig.png"), media).expect("link the path");
+
+    let read = |rel: &[u8]| {
+        media_path_check(&db, rel)
+            .expect("read the check")
+            .map(|check| (check.size, check.mtime, check.hash))
+    };
 
     assert_eq!(
-        media_stamp(&db, media).expect("read before any stamp"),
+        read(b"fig.png"),
         None,
         "never checked is not checked at size zero"
     );
 
-    set_media_stamp(&db, media, 40_960, 1_730_000_500).expect("record the stamp");
+    set_media_path_check(&db, b"fig.png", 40_960, 1_730_000_500).expect("record the check");
     assert_eq!(
-        media_stamp(&db, media).expect("read after stamping"),
-        Some((40_960, 1_730_000_500))
+        read(b"fig.png"),
+        Some((40_960, 1_730_000_500, hash('a'))),
+        "the pair answers with the hash it vouches for, which is the whole reason it sits on the path"
     );
 
-    set_media_stamp(&db, media, 40_960, 1_730_000_900).expect("re-stamp");
+    set_media_path_check(&db, b"fig.png", 40_960, 1_730_000_900).expect("re-check");
     assert_eq!(
-        media_stamp(&db, media).expect("read after re-stamping"),
-        Some((40_960, 1_730_000_900)),
+        read(b"fig.png"),
+        Some((40_960, 1_730_000_900, hash('a'))),
         "the pair is replaced, not accumulated"
     );
 
     // A half pair is reachable only by hand-editing the file; D12's rule says that is "unverified".
     db.0.execute(
-        "UPDATE media SET verified_mtime = NULL WHERE id = ?1",
-        rusqlite::params![media],
+        "UPDATE media_path SET verified_mtime = NULL WHERE rel_bytes = ?1",
+        rusqlite::params![b"fig.png".as_slice()],
     )
     .expect("test setup: half-stamp the row");
+    assert_eq!(read(b"fig.png"), None, "one column present is not a check");
+
+    // A check for a path that is gone is a no-op, exactly as `record_artifact_stamp` promises for `models`.
+    set_media_path_check(&db, b"gone.png", 1, 1).expect("stamping an absent path is not an error");
+    assert_eq!(read(b"gone.png"), None);
+
+    // And a path whose media row was swept answers `None` rather than reviving the figure from its stamp.
+    let orphan = media_row(&db, 'b');
+    link_media_path(&db, b"orphan.png", Path::new("/ws/orphan.png"), orphan).expect("link");
+    set_media_path_check(&db, b"orphan.png", 8, 8).expect("check it");
+    unlink_media_path(&db, b"orphan.png").expect("unlink the last referrer");
     assert_eq!(
-        media_stamp(&db, media).expect("read a half pair"),
+        read(b"orphan.png"),
         None,
-        "one column present is not a stamp"
+        "a swept media row cannot be reused from a stamp"
+    );
+}
+
+/// The **embedding** currency is a per-`(media, model)` digest, and it is written only by the vector itself.
+///
+/// Catches: reading one model's stamp as another's (which would call a fresh model's work current), and a second writer
+/// for the same fact — there is deliberately no `set_media_stamp`: `record_media_embedding` takes the digest, so a
+/// vector and the bytes it was made from cannot be stored apart.
+#[test]
+fn embedding_currency_is_one_digest_per_media_and_model() {
+    let db = Db::in_memory().expect("in-memory database");
+    install_model(&db, "alpha");
+    install_model(&db, "beta");
+    let media = media_row(&db, 'a');
+
+    assert_eq!(
+        media_stamp(&db, media, "alpha").expect("read before any vector"),
+        None,
+        "no vector is not a vector made from nothing"
     );
 
-    // A stamp for a row that is gone is a no-op, exactly as `record_artifact_stamp` promises for `models`.
-    set_media_stamp(&db, 999_999, 1, 1).expect("stamping an absent media row is not an error");
-    assert_eq!(media_stamp(&db, 999_999).expect("read it back"), None);
+    record_media_embedding(&db, media, "alpha", 2, &vector_bytes(2, 7), &hash('a'), 1)
+        .expect("store");
+    assert_eq!(
+        media_stamp(&db, media, "alpha")
+            .expect("read the currency")
+            .as_deref(),
+        Some(hash('a').as_str()),
+        "the stored digest is the currency"
+    );
+    assert_eq!(
+        media_stamp(&db, media, "beta").expect("ask as another model"),
+        None,
+        "one model's vector never answers for another's"
+    );
+
+    // A re-embed replaces the digest with the bytes it just read, which is how a changed figure becomes owed again.
+    record_media_embedding(&db, media, "alpha", 2, &vector_bytes(2, 9), &hash('b'), 2)
+        .expect("re-store");
+    assert_eq!(
+        media_stamp(&db, media, "alpha")
+            .expect("read the re-stamped currency")
+            .as_deref(),
+        Some(hash('b').as_str())
+    );
+
+    // The stamp's hash is readable without the file, which is what `media_by_hash` exists for.
+    assert_eq!(
+        media_by_hash(&db, &hash('b'))
+            .expect("read by content")
+            .map(|row| row.id),
+        Some(media),
+        "a stamped path resolves to its row without a read"
+    );
+    assert_eq!(
+        media_by_hash(&db, &hash('z')).expect("ask for absent bytes"),
+        None,
+        "absent is an answer, not an error"
+    );
 }
 
 /// `member_stamp` separates "no stamp recorded" from "a stamp of zeros", and both from "no member recorded".
@@ -902,33 +976,25 @@ fn re_recording_a_member_with_different_bytes_invalidates_its_stamp() {
 fn a_stamp_column_holds_only_an_integer() {
     let db = Db::in_memory().expect("in-memory database");
     let media = media_row(&db, 'a');
+    link_media_path(&db, b"fig.png", Path::new("/ws/fig.png"), media).expect("link the path");
     db.0.execute(
-        "UPDATE media SET verified_size = '40960', verified_mtime = '1730000500' WHERE id = ?1",
-        rusqlite::params![media],
+        "UPDATE media_path SET verified_size = '40960', verified_mtime = '1730000500' WHERE rel_bytes = ?1",
+        rusqlite::params![b"fig.png".as_slice()],
     )
     .expect("test setup: write the stamp as text");
 
     // Affinity did the converting, at write time: what comes back is an integer pair, not a string that reads like one.
+    let check = media_path_check(&db, b"fig.png")
+        .expect("read the coerced stamp")
+        .expect("affinity made a complete pair");
     assert_eq!(
-        media_stamp(&db, media).expect("read the coerced stamp"),
-        Some((40_960, 1_730_000_500)),
+        (check.size, check.mtime),
+        (40_960, 1_730_000_500),
         "INTEGER affinity converts on write, so no reader-side typeof guard is needed here"
     );
     assert_eq!(
-        scalar::<String>(&db, "SELECT typeof(verified_size) FROM media"),
+        scalar::<String>(&db, "SELECT typeof(verified_size) FROM media_path"),
         "integer",
         "the stored value is an integer even though the bind was text — the opposite of a BLOB-affinity column"
-    );
-
-    // The half-pair rule is the guard these columns *do* have.
-    db.0.execute(
-        "UPDATE media SET verified_mtime = NULL WHERE id = ?1",
-        rusqlite::params![media],
-    )
-    .expect("test setup: drop one half");
-    assert_eq!(
-        media_stamp(&db, media).expect("read a half pair"),
-        None,
-        "one column present is not a stamp"
     );
 }

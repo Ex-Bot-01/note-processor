@@ -1791,6 +1791,13 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             "current",
             "embedded",
             "errors",
+            // The four image fields (§6's order puts them after the chunk counts): a run that saw no figure still
+            // carries the keys, with `image_refusals` an empty array, because a reader must be able to tell "zero"
+            // from "this build did not look".
+            "image_refusals",
+            "images_embedded",
+            "images_refused",
+            "images_seen",
             "model",
             "outcome",
             "refused_budget",

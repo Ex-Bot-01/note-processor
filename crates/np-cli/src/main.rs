@@ -494,6 +494,15 @@ fn print_embed_summary(report: &EmbedReport) {
     let _ = writeln!(out, "refused    {}", report.refused_budget);
     let _ = writeln!(out, "busy-gap   {}", report.busy_gap);
     let _ = writeln!(out, "errors     {}", report.errors);
+    // Images get their own line and no place in any other count: a corpus with no figures prints nothing here, so the
+    // text-only report keeps the shape it had before images existed (§6's order puts this after the chunk counts).
+    if report.images_seen > 0 {
+        let _ = writeln!(
+            out,
+            "images: {} seen, {} embedded, {} refused",
+            report.images_seen, report.images_embedded, report.images_refused
+        );
+    }
     let _ = writeln!(out, "verify     {}", report.verification);
     // Printed after §7's standing caveat because the two answer different questions: that one asks whether these
     // *vectors* were checked against a reference implementation, this one asks whether the model's *bytes* were.

@@ -16,6 +16,7 @@
 //! Refusals are classes ([`MediaRefusal`]), never messages: no path, URL or origin crosses this boundary (§8's rule
 //! 8), and none of them is an exit code — every one is a count on an embed report.
 
+use serde::Serialize;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -199,7 +200,8 @@ pub struct ResolvedImage {
 /// A class and nothing else: no variant carries a path, a URL or an origin (models-install §12 rule 8), because these
 /// are counts on a report and the row that produced one already names itself. None of them is an exit code either —
 /// runtime refusals stay `1`, argv problems stay `2`, and an image that will not embed changes neither.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MediaRefusal {
     /// The link resolves inside the workspace and no file is there — including a name this platform cannot spell and
     /// a target that names a directory rather than a file.
@@ -536,6 +538,20 @@ fn abs_path(root: &Path, components: &[Vec<u8>]) -> Option<PathBuf> {
         abs.push(component_name(component)?);
     }
     Some(abs)
+}
+
+/// The OS path for a `/`-separated workspace-relative byte path under `root`, or nothing when this platform cannot
+/// spell one of its components.
+///
+/// This is the reader's half of [`join_rel`]: paths come out of notes and out of `media_path.rel_bytes` as bytes, and a
+/// non-UTF-8 name has to reopen the file it names rather than the U+FFFD spelling of it (F13). The refusal arm is
+/// therefore load-bearing on Windows and inert here, where the conversion is the identity.
+pub fn workspace_path(root: &Path, rel: &[u8]) -> Option<PathBuf> {
+    let components: Vec<Vec<u8>> = rel
+        .split(|byte| *byte == b'/')
+        .map(<[u8]>::to_vec)
+        .collect();
+    abs_path(root, &components)
 }
 
 /// The OS name of one byte-spelled component. Unix paths *are* bytes, so this is the identity — which is the entire
