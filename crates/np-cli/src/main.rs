@@ -497,10 +497,34 @@ fn print_embed_summary(report: &EmbedReport) {
     // Images get their own line and no place in any other count: a corpus with no figures prints nothing here, so the
     // text-only report keeps the shape it had before images existed (§6's order puts this after the chunk counts).
     if report.images_seen > 0 {
+        // §6's line, with the classes spelled out: a count of three refusals tells a reader nothing about whether their
+        // vault is full of `.svg` (a format decision) or missing files (their own edit), and those two answers lead to
+        // different commands. Classes come from `image_refusal_classes`, in §8's order, so this line and `--json` cannot
+        // drift apart.
+        let classes = report
+            .image_refusal_classes()
+            .into_iter()
+            .map(|(class, count)| format!("{class} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if classes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({classes})")
+        };
         let _ = writeln!(
             out,
-            "images: {} seen, {} embedded, {} refused",
+            "images     seen {} · embedded {} · refused {}{suffix}",
             report.images_seen, report.images_embedded, report.images_refused
+        );
+    }
+    // Its own line because it counts **notes**, not images, and its consequence is the run's most surprising one: nothing
+    // was pruned. Silence here means every live note was read, which is exactly when the sweep is allowed to delete.
+    if report.images_unchecked > 0 {
+        let _ = writeln!(
+            out,
+            "unchecked  {} note(s) not read — no stale image was removed",
+            report.images_unchecked
         );
     }
     let _ = writeln!(out, "verify     {}", report.verification);

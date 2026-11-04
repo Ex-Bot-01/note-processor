@@ -198,6 +198,9 @@ struct FakeVision {
     vision: bool,
     /// When set, every encode refuses with this §8 class inside [`EmbedError::Unavailable`], as the vision seam does.
     refuse: Option<String>,
+    /// When set, every encode refuses with the **`TokenBudgetExceeded` variant** instead of a class label — the shape a
+    /// text-path refusal has, which the classification must answer by type rather than by prose.
+    budget_variant: bool,
 }
 
 impl FakeVision {
@@ -219,6 +222,15 @@ impl FakeVision {
         Self {
             vision: true,
             refuse: Some(class.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// A provider that refuses every image with `EmbedError::TokenBudgetExceeded` — the variant, not a label.
+    fn refusing_budget_variant() -> Self {
+        Self {
+            vision: true,
+            budget_variant: true,
             ..Self::default()
         }
     }
@@ -255,6 +267,12 @@ impl Embedder for FakeVision {
             .lock()
             .expect("test: lock the log")
             .push(sha256_bytes(bytes));
+        if self.budget_variant {
+            return Err(EmbedError::TokenBudgetExceeded {
+                tokens: 4_096,
+                budget: 8_192 / 2,
+            });
+        }
         match &self.refuse {
             Some(class) => Err(EmbedError::Unavailable(class.clone())),
             None => Ok(Vector::new(vec![0.25; DIM])),
@@ -673,9 +691,12 @@ fn each_resolution_class_is_counted_against_the_note_that_wrote_it() {
         ],
         "one entry per refusal, in document order, labelled by class"
     );
+    // Three links were written, so three were seen — none of them resolved. `images_seen` is the count that gates the text
+    // line (§6), and while it counted only links that *resolved*, a corpus of nothing but broken or `.gif` figures printed no
+    // image line at all: its refusals existed only in `--json`, invisible to the human who has to act on them.
     assert_eq!(
-        report.images_seen, 0,
-        "nothing resolved, so nothing was seen"
+        report.images_seen, 3,
+        "a refused link is still a link the author wrote and this run looked at"
     );
     assert_eq!(report.images_refused, 3);
     assert_eq!(report.outcome, EmbedOutcome::Current);
@@ -711,4 +732,247 @@ fn an_arm_that_reads_nothing_reports_zero_images() {
     assert_eq!(report.images_embedded, 0);
     assert_eq!(report.images_refused, 0);
     assert!(report.image_refusals.is_empty());
+}
+
+/// A note this run could not read is **not** a note that stopped linking its figures. The first version read "no links"
+/// out of `EACCES`, swept the figure's `media_path` row as stale, and let `prune_unlinked_media` take the vector with it:
+/// derived data destroyed by a permission error, then paid for twice by the next healthy run. Now the note counts in
+/// [`EmbedReport::images_unchecked`] and the sweep does not run.
+#[cfg(unix)]
+#[test]
+fn a_note_this_run_cannot_read_keeps_its_figures_and_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let setup = scanned(
+        &[
+            ("notes/a.md", "![d](assets/d.png)\n"),
+            ("notes/b.md", "no figures here\n"),
+        ],
+        &["notes/assets/d.png"],
+    );
+    setup.install_model();
+    setup.touch_artifact();
+
+    let mut first = FakeVision::vision();
+    run(&setup, &mut first);
+    let rows = setup.media_rows();
+    let vectors = db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors");
+    assert_eq!(rows.len(), 1, "one figure, one row");
+    assert_eq!(vectors.len(), 1, "and that figure has a vector");
+
+    let note = setup.file("notes/a.md");
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o000))
+        .expect("test setup: the note cannot be read");
+
+    let report = {
+        let mut again = FakeVision::vision();
+        let report = run(&setup, &mut again);
+        assert_eq!(
+            again.encodes().len(),
+            0,
+            "a note this run could not read is not a reason to encode anything"
+        );
+        report
+    };
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o644))
+        .expect("test cleanup: the note can be read again");
+
+    assert_eq!(
+        report.images_unchecked, 1,
+        "one live note went unread — the run says so instead of drawing a conclusion from it"
+    );
+    assert_eq!(
+        report.images_seen, 0,
+        "its links were never looked at, so they are neither seen nor refused"
+    );
+    assert_eq!(
+        setup.media_rows(),
+        rows,
+        "the figure's row survives: an unreadable note is not an author deleting a diagram"
+    );
+    assert_eq!(
+        db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors"),
+        vectors,
+        "and its vector survives to a run that can read the file"
+    );
+    assert_eq!(
+        report.outcome,
+        EmbedOutcome::Current,
+        "an unreadable note is not this command's failure either (§8 rule 6)"
+    );
+
+    // And the sweep still works once the note is readable again: with the figure gone from the body, its row goes.
+    fs::write(note, "the diagram is gone now\n").expect("test setup: unlink the figure");
+    scan(&setup.root, &setup.cfg()).expect("test: rescan");
+    let mut third = FakeVision::vision();
+    let report = run(&setup, &mut third);
+    assert_eq!(report.images_unchecked, 0, "every note was read this time");
+    assert_eq!(setup.media_rows(), Vec::new(), "now nothing links it");
+    assert_eq!(
+        db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors"),
+        Vec::new(),
+        "and the vector goes with it (§7 rule 4)"
+    );
+}
+
+/// §7 rule 3's point about deduplication is that a copy cannot make a stale duplicate; this is the other half — an edit to
+/// the **text** re-embeds chunks and leaves the figure's vector exactly as it was, with no encode attempted at all.
+#[test]
+fn editing_a_notes_text_leaves_its_figures_vector_alone() {
+    let setup = scanned(
+        &[
+            ("notes/a.md", "intro\n\n![d](assets/d.png)\n"),
+            ("notes/b.md", "other\n"),
+        ],
+        &["notes/assets/d.png"],
+    );
+    setup.install_model();
+    setup.touch_artifact();
+
+    let mut first = FakeVision::vision();
+    run(&setup, &mut first);
+    let before = db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors");
+    assert_eq!(before.len(), 1);
+
+    rewrite(
+        &setup.file("notes/a.md"),
+        b"intro, rewritten, with a paragraph added\n\n![d](assets/d.png)\n",
+    );
+    scan(&setup.root, &setup.cfg()).expect("test: rescan after the edit");
+
+    let mut second = FakeVision::vision();
+    let report = run(&setup, &mut second);
+    assert!(
+        report.embedded > 0,
+        "the note's chunks are owed, so this run has text work to do"
+    );
+    assert_eq!(
+        second.encodes().len(),
+        0,
+        "and its figure is unchanged bytes: the encode log stays empty (a `source_hash` rewrite would show here)"
+    );
+    assert_eq!(
+        db::media_embeddings(&setup.db(), MODEL_ID).expect("test: read vectors"),
+        before,
+        "the stored vector is byte-for-byte what it was"
+    );
+    assert_eq!(report.images_embedded, 0);
+}
+
+/// `https://` and `data:` targets are refused with a class and never fetched (design §2), and the report says nothing that
+/// names them: §8's rule 8 keeps a URL — or an inline payload — out of a report, so the locator is the note.
+#[test]
+fn a_remote_or_inline_target_is_counted_and_never_fetched() {
+    let setup = workspace_at(&[(
+        "notes/a.md",
+        b"![cdn](https://cdn.example/x.png)\n![inline](data:image/png;base64,iVBORw0KGgo=)\n"
+            .as_slice(),
+    )]);
+    setup.install_model();
+    setup.touch_artifact();
+
+    let mut provider = FakeVision::vision();
+    let report = run(&setup, &mut provider);
+
+    assert_eq!(
+        report.images_seen, 2,
+        "two figures were written into the note"
+    );
+    assert_eq!(
+        report.images_embedded, 0,
+        "and nothing was fetched or encoded"
+    );
+    // The two classes differ because the resolver's own rules do the work, which is what §6 predicts for an external
+    // destination: `https://cdn.example/x.png` is an odd *filename* that ends in `.png`, so it walks to a path and finds no
+    // file there (`missing-target`); an inline payload has no extension at all, so it never gets as far as looking
+    // (`unsupported-format`). Neither is a new class, and neither was fetched — design §2's promise is "refused with a
+    // class", not "one class for everything remote".
+    assert_eq!(
+        classes(&report)
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>(),
+        vec!["missing-target", "unsupported-format"],
+        "a remote or inline destination refuses with an existing §8 class, in document order"
+    );
+    let listed = format!("{:?}", report.image_refusals);
+    for forbidden in ["cdn.example", "http", "base64", "iVBOR"] {
+        assert!(
+            !listed.contains(forbidden),
+            "the report named {forbidden}: §8's rule 8 keeps origins and inline payloads out, \
+             so a refusal's locator is the note ({listed})"
+        );
+    }
+    assert_eq!(report.outcome, EmbedOutcome::Current);
+}
+
+/// `EmbedReport::image_refusal_classes` is what the text summary prints, so its order is a promise: §8's table order, not
+/// document order and not "most frequent first". A reader diffing two runs' summaries line by line needs `missing-target`
+/// to be the same slot in both.
+#[test]
+fn refusal_classes_are_tallied_in_eights_order_with_empty_classes_left_out() {
+    // Document order puts the `.gif` first and the missing file second — the reverse of §8's table.
+    let setup = workspace_at(&[(
+        "notes/a.md",
+        b"![gif](assets/clip.gif)\n![gone](assets/gone.png)\n![gif2](assets/clip2.gif)\n"
+            .as_slice(),
+    )]);
+    setup.install_model();
+    setup.touch_artifact();
+
+    let mut provider = FakeVision::vision();
+    let report = run(&setup, &mut provider);
+    assert_eq!(
+        report.image_refusal_classes(),
+        vec![("missing-target", 1), ("unsupported-format", 2)],
+        "table order, counts tallied, and the four classes with nothing in them absent"
+    );
+    // The per-path list keeps document order; only the tally is reordered. Two views of one report, no disagreement about
+    // how many of each class a corpus has.
+    assert_eq!(
+        classes(&report)
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>(),
+        vec!["unsupported-format", "missing-target", "unsupported-format"],
+        "`image_refusals` itself stays in document order, because it names what to go look at"
+    );
+}
+
+/// A refusal's class comes from its **type or its exact label**, never from prose that happens to contain a class word.
+/// The first version used `str::contains`, which meant a reported §8 class could move when someone reworded an unrelated
+/// message — and a payload naming a file like `over-budget.png` read as a budget refusal.
+#[test]
+fn a_provider_refusal_is_classified_by_variant_or_exact_label_and_never_by_prose() {
+    let setup = scanned(
+        &[("notes/a.md", "![d](assets/d.png)\n")],
+        &["notes/assets/d.png"],
+    );
+    setup.install_model();
+    setup.touch_artifact();
+
+    // (a) the variant that has a variant of its own.
+    let mut budget = FakeVision::refusing_budget_variant();
+    let report = run(&setup, &mut budget);
+    assert_eq!(
+        report.image_refusal_classes(),
+        vec![("over-budget", 1)],
+        "`TokenBudgetExceeded` is a budget refusal whatever its text says"
+    );
+
+    // (b) prose that contains two class words and is neither. A `contains` matcher reports `over-budget` here.
+    fs::write(setup.file("notes/a.md"), "![d](assets/d.png)\n".as_bytes())
+        .expect("test setup: relink");
+    scan(&setup.root, &setup.cfg()).expect("test: rescan");
+    let mut prose = FakeVision::refusing(
+        "the encoder declined over-budget.png: undecodable input at offset 12",
+    );
+    let report = run(&setup, &mut prose);
+    assert_eq!(
+        report.image_refusal_classes(),
+        vec![("vision-unavailable", 1)],
+        "an unrecognised refusal is `vision-unavailable`, the class that is true of any provider that did not serve \
+         the request — matching on substrings would have called this one over-budget"
+    );
+    assert_eq!(report.outcome, EmbedOutcome::Current);
 }

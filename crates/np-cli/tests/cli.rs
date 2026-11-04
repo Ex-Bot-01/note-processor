@@ -1798,6 +1798,10 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             "images_embedded",
             "images_refused",
             "images_seen",
+            // Notes this run could not read (§6's `images_unchecked`): present and zero even on an arm that opened no
+            // database, because the field also promises "the stale-figure sweep ran", and a reader must be able to tell
+            // "nothing was skipped" from "this build said nothing".
+            "images_unchecked",
             "model",
             "outcome",
             "refused_budget",
@@ -1833,6 +1837,18 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             text.stdout()
         );
     }
+    // Neither image line appears here: this run saw no figure and read every note, so both counts are zero and the lines
+    // are suppressed (§6's text shape stays exactly what it was before images existed).
+    let summary_text = text.stdout();
+    for line in ["images", "unchecked"] {
+        assert!(
+            !summary_text
+                .lines()
+                .any(|got| got.split_whitespace().next() == Some(line)),
+            "`{line}` must not appear in a run that saw no figure:\n{summary_text}"
+        );
+    }
+
     assert_eq!(
         report["verification"],
         summary_field(&text.stdout(), "verify")

@@ -239,11 +239,17 @@ pub struct EmbedReport {
     /// written downstream, and every constructor leaves it `None`. That default is the truthful one — a run with
     /// `provider = "none"` has no worker count to report, and printing one would be a number about nothing.
     pub workers: Option<WorkerPlan>,
-    /// Image links the media pass reached, counted **per link occurrence after per-note de-duplication** — so a figure
-    /// linked twice in one note is one here (§7 rule 1), and a byte-identical copy in a second note is two.
+    /// Image links this run looked at, counted **per link occurrence after per-note de-duplication of the written
+    /// target** — so a figure linked twice in one note is one here (§7 rule 1), and a byte-identical copy in a second note
+    /// is two.
     ///
-    /// These four fields count images; [`EmbedReport::chunks_seen`] and its siblings count chunks. Nothing an image did
-    /// moves any of those, and nothing an image failed to do moves the exit code (§8 rule 6).
+    /// **Counted before resolution, so it includes the links that then refused.** The first version counted only links that
+    /// resolved, which made `images_seen == 0` mean "no figure embedded successfully" rather than "no figure was written",
+    /// and this field is what gates the text line: a note whose three figures are all `.svg`, or all misspelled, would print
+    /// nothing while its refusals sat unread in `--json`. A count that silences the line reporting it reports nothing.
+    ///
+    /// These fields count images; [`EmbedReport::chunks_seen`] and its siblings count chunks. Nothing an image did moves any
+    /// of those, and nothing an image failed to do moves the exit code (§8 rule 6).
     pub images_seen: usize,
     /// Images this run encoded and stamped for this model id.
     pub images_embedded: usize,
@@ -254,9 +260,48 @@ pub struct EmbedReport {
     /// other reported path here) and its [`MediaRefusal::label`] class. No URL and no origin crosses this boundary
     /// (§8's rule 8), and a target that appears twice in one note is one entry because it is one image.
     pub image_refusals: Vec<(String, MediaRefusal)>,
+    /// **Notes**, not images — the live notes this run could not examine, so their figures were neither counted nor swept.
+    ///
+    /// Two faults reach this number, and both mean "this pass did not look": a body that would not read (permissions, a
+    /// device error, a file replaced by a directory between scan and embed), and the tail of a corpus after the pass stopped
+    /// early on a database fault. The consequence is the one that matters: [`db::prune_unlinked_media`] **does not run**
+    /// while this is non-zero, because the sweep asks "which figures did no live note link?", and a note this run never read
+    /// cannot answer it. Absence of evidence is not evidence of deletion — the vectors wait for a run that can read the file
+    /// instead of being destroyed by a run that could not.
+    pub images_unchecked: usize,
 }
 
 impl EmbedReport {
+    /// The image refusals grouped by §8 class, in §8's table order, with zero-count classes left out.
+    ///
+    /// The text summary prints this and `--json` prints the per-path list, from one report object, so the two cannot
+    /// disagree about how many `.svg` links a corpus has (§6's reason the report is one object at all). Order is the enum's
+    /// declaration order rather than a sort by count: a reader comparing two runs line by line wants the same line to mean
+    /// the same class in both.
+    pub fn image_refusal_classes(&self) -> Vec<(&'static str, usize)> {
+        let order = [
+            MediaRefusal::MissingTarget,
+            MediaRefusal::OutsideWorkspace,
+            MediaRefusal::UnsupportedFormat,
+            MediaRefusal::Undecodable,
+            MediaRefusal::OverBudget,
+            MediaRefusal::VisionUnavailable,
+        ];
+        order
+            .into_iter()
+            .filter_map(|class| {
+                let count = self
+                    .image_refusals
+                    .iter()
+                    .filter(|(_, got)| {
+                        std::mem::discriminant(got) == std::mem::discriminant(&class)
+                    })
+                    .count();
+                (count > 0).then(|| (class.label(), count))
+            })
+            .collect()
+    }
+
     /// Whether this report may leave exit code 0 — arm (i) alone.
     pub fn succeeded(&self) -> bool {
         matches!(self.outcome, EmbedOutcome::Current)
@@ -280,16 +325,23 @@ impl EmbedReport {
             images_embedded: 0,
             images_refused: 0,
             image_refusals: Vec::new(),
+            images_unchecked: 0,
         }
     }
 }
 
-/// What the media pass counted, assembled into [`EmbedReport`]'s four image fields.
-#[derive(Debug, Default)]
+/// What the media pass counted, assembled into [`EmbedReport`]'s image fields.
+#[derive(Debug, Default, Clone)]
 struct MediaTally {
     seen: usize,
     embedded: usize,
     refusals: Vec<(String, MediaRefusal)>,
+    /// Live notes this pass did not examine — see [`EmbedReport::images_unchecked`]. The unit is notes.
+    unchecked: usize,
+    /// Notes taken off the list so far, and the whole list's length: when the pass stops early on a database fault, the
+    /// difference is what it never reached, and that belongs here rather than in silence.
+    processed: usize,
+    total: usize,
 }
 
 /// Why `embed` could not answer at all — as distinct from the four arms, which it answers *with* a report.
@@ -619,6 +671,7 @@ fn run(
                 images_embedded: 0,
                 images_refused: 0,
                 image_refusals: Vec::new(),
+                images_unchecked: 0,
             });
         }
     };
@@ -776,11 +829,12 @@ fn run_media_pass(
     let mut tally = MediaTally::default();
     match media_pass(db, root, model, provider, &mut tally) {
         Ok(()) => tally,
-        Err(err) if is_busy(&err) => tally,
+        Err(err) if is_busy(&err) => tally_after_stop(&mut tally),
         // A non-lock failure cannot be a refusal (§8's classes are about images, not about the workspace), and cannot
-        // change the exit code either. The counts this pass reached stand; anything after the fault is simply uncounted,
-        // which understates rather than invents — and the next run re-reads the corpus anyway.
-        Err(_) => tally,
+        // change the exit code either (§8 rule 6). What it can do is say so: the notes past the fault count as unchecked,
+        // which holds the sweep back too, so a database that went busy halfway through does not spend the rest of the
+        // corpus' vectors on the strength of never having read them.
+        Err(_) => tally_after_stop(&mut tally),
     }
 }
 
@@ -798,8 +852,9 @@ fn run_media_pass(
 ///    referenced in this pass, which is what a renamed or deleted figure needs (its old path has no mention left to
 ///    contradict it), and [`db::prune_unlinked_media`] then takes the media row and its vectors with it. The pass owns
 ///    this table's whole contents — nothing else writes a media path — so "not referenced by any live note" is the same
-///    statement as "no longer linked", and a note whose body could not be read counts as linking nothing (§7 rule 4's
-///    cost: its figures are re-recorded by the next run that can read it).
+///    statement as "no longer linked" — **unless** some live note went unread, in which case the sweep does not run at all
+///    and [`EmbedReport::images_unchecked`] says how many notes this pass could not ask. Destroying a figure's vector
+///    because `read` returned `EACCES` is not what "nothing links it" means.
 ///
 /// **No image outcome reaches the exit code** (§8 rule 6): every per-image failure below becomes a counted refusal, and
 /// only a workspace-database failure leaves this function with an `Err`, which is the same answer the text half gives for
@@ -821,22 +876,40 @@ fn media_pass(
         .is_some_and(|provider| provider.supports_images());
     let mut referenced: HashSet<Vec<u8>> = HashSet::new();
 
-    for note_rel in db::live_note_paths(db)? {
+    let notes = db::live_note_paths(db)?;
+    tally.total = notes.len();
+    for note_rel in notes {
+        tally.processed += 1;
         // The body comes from disk, not from `chunks.text`: the chunker may have dropped a fenced block that holds a
         // figure, and §7 extracts links from what the author wrote.
-        let links = match media::workspace_path(root, &note_rel) {
-            Some(abs) => std::fs::read(walk::to_open_path(&abs))
-                .map(|body| media::image_links(&body))
-                .unwrap_or_default(),
-            // An unreadable note contributes no links, which the sweep below reads as "its figures are gone"; §7 rule 4
-            // accepts that churn over keeping a vector for a file this run could not look at.
-            None => Vec::new(),
+        let body = match media::workspace_path(root, &note_rel) {
+            Some(abs) => std::fs::read(walk::to_open_path(&abs)).ok(),
+            None => None,
         };
+        let Some(body) = body else {
+            // **Skip the note and hold the sweep off**, which is what `images_unchecked` exists for. Reading "no links" out
+            // of "could not read" would delete this note's figures' rows and vectors on the strength of a permission error:
+            // derived data destroyed by an I/O fault, then paid for twice by the next healthy run. §7 rule 4's lifecycle is
+            // a statement about notes that were read and did not link; this note is neither.
+            tally.unchecked += 1;
+            continue;
+        };
+        let links = media::image_links(&body);
         let note_shown = String::from_utf8_lossy(&note_rel).to_string();
-        // §7 rule 1, per note: the same figure named twice is one image. A second note naming the same *bytes* is a
-        // separate occurrence here and reaches `record_media`'s insert-or-get, which answers with the existing row.
+        // §7 rule 1, per note, keyed on the **written target**: the same figure named twice is one image. Two spellings of
+        // one file (`a.png`, `%61.png`) are two links that were written and so two `images_seen`, and they still collapse to
+        // one row and one encode below, where the key is the resolved path — the two counts answer different questions and
+        // are keyed accordingly. A second note naming the same bytes is a separate occurrence either way and reaches
+        // `record_media`'s insert-or-get, which answers with the existing row.
         let mut named: HashSet<Vec<u8>> = HashSet::new();
+        let mut resolved_paths: HashSet<Vec<u8>> = HashSet::new();
         for link in links {
+            // Counted here, before the target is placed: a link that refuses is still a figure the author wrote, and this
+            // count gates the text line (§6). Deduplication happens first, so §7 rule 1 holds.
+            if !named.insert(link.target.clone()) {
+                continue;
+            }
+            tally.seen += 1;
             let resolved = match media::resolve_image_in(style, root, &note_rel, &link.target) {
                 Ok(resolved) => resolved,
                 // The locator here is the *note*, because resolution refused before a path existed. A target is never
@@ -846,10 +919,10 @@ fn media_pass(
                     continue;
                 }
             };
-            if !named.insert(resolved.rel_bytes.clone()) {
+            // One row and one encode per resolved path per note (§7 rule 1), independent of the count above.
+            if !resolved_paths.insert(resolved.rel_bytes.clone()) {
                 continue;
             }
-            tally.seen += 1;
             let shown = String::from_utf8_lossy(&resolved.rel_bytes).to_string();
             referenced.insert(resolved.rel_bytes.clone());
 
@@ -939,14 +1012,18 @@ fn media_pass(
                     tally.embedded += 1;
                 }
                 // A provider's refusal is a count, never a failed run (§8 rule 6).
-                Err(error) => tally
-                    .refusals
-                    .push((shown, image_refusal_of(&error.to_string()))),
+                Err(error) => tally.refusals.push((shown, image_refusal_of(&error))),
             }
         }
     }
 
-    // §7 rule 4: paths no live note mentioned this pass are stale, and the media rows they held follow at run end.
+    // §7 rule 4, **held off when this pass did not read every live note** (`images_unchecked`): the sweep's question is
+    // "which figures did no live note link?", and a note whose body would not read never answered it. Pruning waits for a
+    // run that can look — a stale row costs disk, a deleted vector costs an encode, and only one of those is destroyed by
+    // something that was not the author's edit.
+    if tally.unchecked > 0 {
+        return Ok(());
+    }
     for rel in db::media_paths(db)? {
         if !referenced.contains(&rel) {
             db::unlink_media_path(db, &rel)?;
@@ -956,20 +1033,39 @@ fn media_pass(
     Ok(())
 }
 
-/// Which §8 class a provider's refusal belongs to, read from the class string the provider carried.
+/// The pass stopped early: everything it never reached counts as unchecked, and the sweep will not have run.
+fn tally_after_stop(tally: &mut MediaTally) -> MediaTally {
+    tally.unchecked = tally
+        .unchecked
+        .saturating_add(tally.total.saturating_sub(tally.processed));
+    tally.clone()
+}
+
+/// Which §8 class a provider's refusal belongs to.
 ///
-/// The three runtime classes have exactly one spelling each ([`media::UNDECODABLE`], [`media::OVER_BUDGET`],
-/// [`media::VISION_UNAVAILABLE`]), so this is a lookup over those constants rather than a match on `EmbedError`
-/// variants: a variant cannot tell "this pixel data is not a raster" from "this build has no projector", and inventing
-/// a fourth class is not available (§8).
-fn image_refusal_of(message: &str) -> MediaRefusal {
-    if message.contains(media::OVER_BUDGET) || message.contains("token budget") {
-        MediaRefusal::OverBudget
-    } else if message.contains(media::UNDECODABLE) {
-        MediaRefusal::Undecodable
-    } else {
-        MediaRefusal::VisionUnavailable
+/// A **variant** answers the one class that has a variant of its own, and an [`EmbedError::Unavailable`] payload is
+/// compared to the class constants **in full**, not as a substring. The first version used `contains`, which made a
+/// reported §8 class depend on how an error happened to be worded: rephrasing a message that mentions a budget would move
+/// refusals between classes with no code change to review, and a payload that merely *contains* `over-budget` — a path, a
+/// model id — would be read as a budget refusal. Exact equality moves the mapping only when a provider starts emitting a
+/// different class, which is the only thing that should move it.
+///
+/// Anything unrecognised answers `vision-unavailable`, because §8's set is closed and "this build and model pair did not
+/// serve the request" is the claim left over. That default is a decision, not a discovery: a future provider error with no
+/// class of its own lands here quietly, so adding a refusal reason must add it here in the same change.
+fn image_refusal_of(error: &EmbedError) -> MediaRefusal {
+    if matches!(error, EmbedError::TokenBudgetExceeded { .. }) {
+        return MediaRefusal::OverBudget;
     }
+    if let EmbedError::Unavailable(message) = error {
+        if message == media::OVER_BUDGET {
+            return MediaRefusal::OverBudget;
+        }
+        if message == media::UNDECODABLE {
+            return MediaRefusal::Undecodable;
+        }
+    }
+    MediaRefusal::VisionUnavailable
 }
 
 /// The four image fields of a report, spelled once so the two arms that run the pass cannot count them differently.
@@ -990,6 +1086,7 @@ fn media_fields(media: &MediaTally) -> EmbedReport {
         images_embedded: media.embedded,
         images_refused: media.refusals.len(),
         image_refusals: media.refusals.clone(),
+        images_unchecked: media.unchecked,
     }
 }
 
