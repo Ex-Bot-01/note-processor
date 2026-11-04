@@ -417,15 +417,94 @@ Two consequences of that decision are load-bearing, and both amend existing rule
 What installation does *not* gain: it never re-fetches over an existing artifact (R7b's overwrite refusal stands), and it does
 not silently repair a digest mismatch — a wrong file is reported, not replaced.
 
-## 14. What this does not claim
+## 14. Measured, and what is still not claimed
 
-Written before the fact, because these are the numbers people reach for:
+The first version of this section was written before the fact, so it could not contain numbers. It contains them now, each one
+with the command that produced it and the date, and every figure measured **once** says single-run — `docs/design-m2-local-embeddings.md`
+§8's rule is two runs and the spread, never one lucky number, and a spike is not a spread.
 
-* **No throughput figure exists yet.** Image encoding cost on this host is unknown; §8's evening-rule arithmetic is a
-  text-chunk measurement and stays one until images are measured through the corpus case.
-* **No retrieval-quality claim.** "It finds the right diagram" needs a labelled set, which we do not have. `np search` proves
-  the plumbing reaches both kinds; it does not prove usefulness, and neither this document nor a report will imply otherwise.
-* **Nothing about remote images has been decided**, only deferred (§3).
+### 14.1 Token cost per image: the patch grid, not the card's flat 280
+
+| Image | image tokens | chunks | measured |
+|---|---|---|---|
+| `red_square_1024x768.png`, `stripes_1024x768.png` | **336** each | 3 — text 2 + image 336 + text 2 | spike 2026-11-02; re-measured through the shipped seam 2026-11-04, twice, identical |
+| `red_square_512x384.png`, `stripes_512x384.png` | **88** each | 3 — same shape | same two dates |
+| a 4096×3072 PNG | **1,064** | not printed | 2026-11-03 through the seam, **single-run** |
+
+The re-measurement is the row that earns a claim about *this* build, because it runs `VisionModel::open` + `embed_image` +
+`last_token_cost` rather than the spike's C driver. Command, run twice on 2026-11-04 with both artifacts set; both passes
+printed `TOKEN COST: 512x384 -> 88, 1024x768 -> 336 (card's flat default: 280)`:
+
+```text
+NP_TEST_MODEL_PATH=/home/agent/models/embeddinggemma-2-Q8_0.gguf \
+NP_TEST_MMPROJ_PATH=/home/agent/models/mmproj-embeddinggemma-2-Q8_0.gguf \
+  cargo test -p np-core --features local-model,vision --test local_vision -- \
+    --nocapture --test-threads=1 token_cost
+```
+
+The six processes' full output — including the two comparability runs below — is kept as a round transcript at
+`.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/r7c-task8-vision-rerun.log` rather than beside the spike's logs,
+because this round touches no file under `crates/`; every number in the table above is quoted from it.
+
+Three consequences, all in code rather than in prose: the cost is **read back per encode** (`ImageEmbedding::token_cost`, and
+`tests/local_vision.rs::token_cost_is_measured_per_encode_and_printed` refuses a cost that is zero or that fails to grow with
+the image), file size predicts nothing (§8's reason `over-budget` is measured rather than computed), and **one image cannot
+reach `over-budget` on this pair** — mtmd clamps the patch grid to the projector's own ceiling (1,064 tokens for an image whose
+pixels would want ~49,000 patches) against a window of 8,192. The guard ships anyway: past that ceiling llama.cpp *asserts*
+instead of returning a code, so the check is the difference between a report line and an abort.
+
+### 14.2 The soft-token budget is honoured by this builder, and nothing here uses it
+
+From the spike's budget runs (`vision-spike-2026-11-02.md`, "Budget runs"): with `--image-min-tokens 70 --image-max-tokens 1120`
+the 512×384 fixture still costs its native **88** — the budget is an upper bound and that image's grid is smaller — while
+`70/70` drops it to **63**. Both are **single-run**: one process per setting, no repeat, so they are the spike's observations
+and not a fence. Product code leaves both parameters unset (`-1`) and takes the native grid, which is why re-measuring them is
+a C-side job — `./vision_probe MODEL MMPROJ --image-min-tokens 70 --image-max-tokens 70 img:…` against a tree built with
+`-DLLAMA_BUILD_MTMD=ON` — and not something `cargo test` can hold. The card's quality/token trade therefore exists in this
+runtime; R7c does not offer it, and no stored vector was made at a narrowed budget.
+
+### 14.3 Comparability: our runtime reproduces the spike's ordering on these shapes
+
+| Pairing | spike 2026-11-02 (C driver) | this seam, 2026-11-04 (two runs) |
+|---|---|---|
+| "a red square on a white background" ↔ its own 1024×768 image | +0.7465 | **+0.746469**, both runs |
+| the same caption ↔ the *other* 1024×768 image (stripes) | +0.5578 | **+0.557844**, both runs |
+| "blue and white diagonal stripes" ↔ its own image | +0.7675 (1024×768) — see the correction below | not re-run |
+| image ↔ image, the two 1024×768 fixtures | +0.7295 | not re-run |
+| text ↔ text, the three sentences | +0.6051 … +0.6440 | not re-run |
+
+The correction Task 8 found while transcribing, applied to the spike note where it stands: that file wrote the stripes caption
+as "+0.7675 / +0.7774 (two runs)", but its RUN A lists item 3 as `stripes_512x384.png` — a **different bitmap** from item 1's
+1024×768 stripes — so those are two pairings, not one pairing measured twice. The ordering claim survives; the "two runs"
+annotation did not.
+
+What the table licenses is narrow and is all §12 needs: **one space on these shapes** — a caption beats an unrelated sentence
+against its own image, its own image wins, and image-to-image sits in the same band as text-to-text. Four generated images and
+three sentences say nothing about a real diagram library, which is why §12's single ranked list rests on the card's published
+property plus this sanity check and never on a retrieval claim.
+
+### 14.4 Not measured, and what it would take
+
+* **Image encode throughput. No figure exists.** What exists is libtest's per-case wall clock (30 s for the token-cost case,
+  51 s for the caption case, 2026-11-04), which is dominated by loading 309 MB of weights and building the vision graph and
+  therefore says nothing about one encode. Closing it: time `embed_image` around the call in an artifact-gated case at both
+  fixture sizes, ≥2 runs, tokens/s derived from the recorded cost — only then may §8's evening-rule arithmetic gain an image
+  column.
+* **Peak RSS with the projector open.** The ~420 MiB figure predates `mtmd` and belongs to a text-only context. Closing it:
+  sample `VmHWM`/`VmRSS` the way `tests/local_corpus.rs` does — before load, after `VisionModel::open`, after N encodes.
+* **Bit-stability of an image vector across worker counts**, which §10 demanded before any claim. What is fenced is a repeat
+  encode *inside one process*: bit-identical components, re-run twice on 2026-11-04. Closing the rest: give
+  `crates/np-core/tests/probes/thread_vectors_compare.py` an image case at 1/4/16 workers, and carry D13's caveat — bit-identity
+  is an observation about this llama.cpp revision and must be re-checked after a re-pin.
+* **Retrieval quality.** Unchanged from the first draft, and it is still the biggest hole: "it finds the right diagram" needs a
+  labelled set (query → which figure answers it), reported as rank@k per kind through `np search --json`. `np search` proves the
+  plumbing reaches both kinds; it does not prove usefulness, and neither this document nor a report will imply otherwise.
+* **Package size of a vision binary**, because no such binary exists: `np-cli` has no `vision` passthrough, so
+  `cargo build --release -p np-cli --features local-model,vision` fails at feature resolution (**F28**). R7b's three shipped
+  sizes are unchanged by this round precisely because nothing that ships can link the new code.
+* **Windows and macOS: nothing.** `build.rs` refuses to build the C++ off Linux, so there is no vision behaviour on those
+  platforms to describe — F18's rule, stated here rather than left as a silence.
+* **Remote images**, still undecided rather than deferred quietly (§3): refused with a class, never fetched.
 
 ## 15. Decisions taken, and what remains open
 
