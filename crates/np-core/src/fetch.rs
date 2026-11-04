@@ -17,9 +17,10 @@
 //! a mirror stays one config line away (`[models] base_url`, or `NP_MODELS_BASE_URL` when the file leaves that key
 //! out), the accepted-bytes list stays one reviewable table, and — the half this module owns — §12 rule 8 keeps the
 //! origin out of every *refusal*, because client error strings carry URLs and this program's reports land in CI logs.
-//! [`FetchError`] is therefore built from classes and counts, never from a URL, and `tests/fetch.rs` proves it by
-//! fetching from a loopback address and asserting that neither that address nor the baked default appears in any
-//! message this module can produce.
+//! [`FetchError`] is therefore built from classes and counts, never from a URL. `tests/fetch.rs` checks that claim where it
+//! can bite — the arms whose text comes from something this module was handed (a transport failure, an `io::Error`) — by
+//! fetching from a loopback address and asserting that neither that address nor the baked default appears; the arms built
+//! purely from ids, counts and paths are named as such there rather than swept silently.
 //!
 //! ## What is deferred, on purpose
 //!
@@ -564,6 +565,18 @@ pub fn fetch_with_table<T: MemberPin>(
         source,
     })?;
 
+    // Rule 5's other half, checked for **every** member before any byte of any member moves. This used to sit inside the
+    // transfer loop below, where it was correct for one member and wrong for two: the first artifact was published, then the
+    // second target refused, leaving a file on disk with no `models` row to explain it and a retry that refuses forever.
+    // Two-member plans stopped being hypothetical when §13 made a projector a fetchable member of the default set, so the
+    // loop below now trusts this one and does not re-check.
+    for member in &members {
+        let target = models_dir.join(local_name(id, member.member()));
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err(FetchError::TargetExists { path: target });
+        }
+    }
+
     let nonce = models::nonce();
     let mut report = FetchReport {
         id: id.into(),
@@ -573,12 +586,8 @@ pub fn fetch_with_table<T: MemberPin>(
     };
 
     for member in &members {
+        // Every target was proved absent above, so this loop publishes into what is still an empty place.
         let target = models_dir.join(local_name(id, member.member()));
-        // Rule 5's other half: never publish over existing bytes. Checked before the transfer so a human is not made
-        // to watch 310 MB arrive before "refusing to overwrite".
-        if fs::symlink_metadata(&target).is_ok() {
-            return Err(FetchError::TargetExists { path: target });
-        }
 
         write_marker(
             models_dir,

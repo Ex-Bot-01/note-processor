@@ -567,6 +567,53 @@ fn an_existing_artifact_is_never_overwritten_and_is_not_even_requested() {
 }
 
 #[test]
+fn a_second_member_that_exists_refuses_before_any_byte_is_transferred() {
+    // Rule 5 was checked per member **inside** the transfer loop, so a two-member plan published member one and then refused
+    // on member two: an artifact sitting on disk with no `models` row to explain it, and every retry refusing on the occupied
+    // target forever. That shape became reachable the day a build could plan two members (§13), which is why the check moved
+    // ahead of byte one for **every** member rather than staying where the first member happened to need it.
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    fs::create_dir_all(&models).expect("test setup: models dir");
+    let occupied = models.join(fetch::local_name("test-model", "extra"));
+    let existing: Vec<u8> = vec![b'q'; EXTRA.len()];
+    fs::write(&occupied, &existing).expect("test setup: second member's target already exists");
+
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Full(MAIN.to_vec()));
+    fake.serve("extra", Serve::Full(EXTRA.to_vec()));
+    let err = refusal(
+        &db,
+        &models,
+        "test-model",
+        &["main", "extra"],
+        &fake,
+        &table,
+        1_730_000_028,
+    );
+
+    assert!(matches!(err, FetchError::TargetExists { .. }), "{err}");
+    assert_eq!(
+        fake.opens(),
+        0,
+        "a plan with one occupied target requests nothing: {err}"
+    );
+    assert!(
+        !models
+            .join(fetch::local_name("test-model", "main"))
+            .exists(),
+        "member one must not be published by a run that refuses at member two"
+    );
+    assert_eq!(
+        fs::read(&occupied).expect("the occupied file is still readable"),
+        existing,
+        "rule 5 does not argue about existing bytes, it leaves them alone"
+    );
+}
+
+#[test]
 fn a_transport_failure_names_a_class_and_never_the_origin() {
     let tmp = dir();
     let db = db();
@@ -749,8 +796,10 @@ fn preflight_refuses_before_byte_one_when_the_disk_cannot_hold_the_pair() {
 
 #[test]
 fn every_refusal_message_is_free_of_the_origin() {
-    // One case per refusal, all checked against the same string: the loopback origin this test's transport would use.
-    // §12 rule 8 is about *every* message, so the fence is written as a sweep rather than attached to one arm.
+    // Not "one case per refusal" — **the arms that could carry an origin, plus one that carries someone else's text**. The
+    // rest are built from ids, counts and paths (`IdentityDisagrees`, `DiskShortfall`, `MarkerExists`, …), so no string this
+    // module was handed can reach them; claiming a sweep of all thirteen would be a fence with a sign on it. `Io` is here
+    // because its message interpolates an `io::Error` verbatim, which is the one arm whose text this module does not write.
     let tmp = dir();
     let db = db();
     let models = tmp.path().join("models");
@@ -759,7 +808,7 @@ fn every_refusal_message_is_free_of_the_origin() {
     let fake = Fake::new();
     fake.serve("main", Serve::Fail("status code 404".to_string()));
     let table = table(MAIN, EXTRA);
-    let refusals = vec![
+    let mut refusals = vec![
         refusal(
             &db,
             &models,
@@ -790,6 +839,15 @@ fn every_refusal_message_is_free_of_the_origin() {
             err
         },
     ];
+    // The arm that quotes a reader's own error text rather than a class this module chose. A real `io::Error` cannot name a
+    // host here (nothing dialed), so the value is the format string: if `Io` ever grows the URL it was reading for, this fails.
+    refusals.push(FetchError::Io {
+        path: models.join("test-model"),
+        source: std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        ),
+    });
     for err in refusals {
         let text = err.to_string();
         assert_no_url_pieces(&text);

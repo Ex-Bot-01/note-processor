@@ -894,8 +894,9 @@ fn a_model_naming_no_row_is_configuration_disabled_naming_the_id() {
     assert!(!report.succeeded());
 }
 
-/// Arm (iii): chunks are owed, the row exists, and there is no artifact — so the advice must name a command
-/// that exists. `np models fetch` does not (§6's wording predates R7b), so the hint names `install`.
+/// Arm (iii): chunks are owed, the row exists, and there is no artifact — so the advice must name commands that
+/// **exist in this build**. `fetch` is a cargo feature, so the assertion follows it: with the feature the reader gets both
+/// doors, without it only `install`, and either way the hint must not name a command this binary would reject.
 #[test]
 fn an_absent_artifact_names_a_command_that_exists() {
     assert_recorder_works();
@@ -910,8 +911,21 @@ fn an_absent_artifact_names_a_command_that_exists() {
         .detail()
         .expect("arm (iii) carries its advice");
     assert!(detail.contains("np models install"), "{detail}");
-    assert!(!detail.contains("np models fetch"), "{detail}");
-    assert!(detail.contains("not implemented"), "{detail}");
+    if cfg!(feature = "fetch") {
+        assert!(
+            detail.contains("np models fetch"),
+            "this build can fetch, so the hint has to say so: {detail}"
+        );
+        assert!(
+            !detail.contains("no fetch command"),
+            "and must not claim the door is shut: {detail}"
+        );
+    } else {
+        assert!(
+            !detail.contains("np models fetch"),
+            "a build without `fetch` must not name it: {detail}"
+        );
+    }
     assert_eq!(
         report.chunks_seen, 2,
         "the corpus was read before the arm fired"

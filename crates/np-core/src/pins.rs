@@ -33,7 +33,9 @@
 //! * the digest still decides acceptance, so a different host serving the same bytes is indistinguishable from this
 //!   one — which is what makes a baked default safe rather than merely convenient;
 //! * a mirror stays one config line away (`[models] base_url`, or `NP_MODELS_BASE_URL` when the file leaves that key
-//!   out), and `[models] sha256` still overrides a pin loudly; [`crate::fetch::resolve_origin`] is the whole
+//!   out). `[models] sha256` is read and validated but **no fetch reads it yet** — the door for an unpinned artifact is
+//!   `np models install --sha256`; see [`crate::config::ModelsConfig::unpinned_digest_override`].
+//!   [`crate::fetch::resolve_origin`] is the whole
 //!   precedence, in one place;
 //! * rule 8 still forbids this string in every refusal and report line — `tests/fetch.rs` carries the baked origin's
 //!   own host on its no-leak list.

@@ -388,14 +388,15 @@ names a class rather than a URL.
 
 Two consequences of that decision are load-bearing, and both amend existing rules rather than sneak past them:
 
-* **A default origin enters the pin table.** `fetch` currently requires `[models] base_url` or `NP_MODELS_BASE_URL`, because
+* **A default origin enters the pin table.** Before this round `fetch` required `[models] base_url` or `NP_MODELS_BASE_URL`, because
   `docs/design-m2-local-embeddings.md` §12 rule 7 makes the *host* configuration and the pin table say only *what to accept*.
   *(This bullet first cited "models-install §12"; that document has no §12 — it ends at §9. Corrected 2026-11-04, when the
   amendment was written into the rule where it actually stands.)* An install-time fetch has no config
   file yet, so it needs a baked-in default: `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main` — where the
   pinned digests came from. **Rule 7's intent survives the amendment**: the digest still decides acceptance, so a different
-  host serving the same bytes is indistinguishable from the right one, and `[models] base_url` / `NP_MODELS_BASE_URL` still
-  override for a mirror or an air-gapped network. What changes is that a machine with no configuration will make one outbound
+  host serving the same bytes is indistinguishable from the right one, and `[models] base_url` (or `NP_MODELS_BASE_URL`, when
+  the file leaves the key unset) still **moves** the transfer for a mirror or an air-gapped network — moves, does not override:
+  a value the config file spelled out wins over the environment, which is every `[models]` key's existing rule. What changes is that a machine with no configuration will make one outbound
   request during installation. That is the human's call, made in these words ("the installation of the program should trigger
   the HuggingFace fetch"), and it is written here so a future reader finds a decision rather than an unexplained default.
   As landed on 2026-11-04, the precedence is `[models] base_url` → `NP_MODELS_BASE_URL` (which fills that key only when the

@@ -1656,12 +1656,21 @@ fn embed_with_the_artifact_file_missing_names_installing_it() {
     );
     for channel in [failed.stdout(), failed.stderr()] {
         assert!(channel.contains("artifact absent"), "{channel}");
-        // §6's remedy, naming a command this build has.
+        // §6's remedy, naming only commands this build actually has. `fetch` is a cargo feature, so the assertion follows it
+        // rather than asserting one build's shape in every row — the hint used to promise "fetching a model is not
+        // implemented", which stopped being true when R7b shipped the command.
         assert!(channel.contains("np models install"), "{channel}");
-        assert!(
-            !channel.contains("np models fetch"),
-            "`fetch` does not exist: {channel}"
-        );
+        if cfg!(feature = "fetch") {
+            assert!(
+                channel.contains("np models fetch"),
+                "this binary can fetch, and the remedy should say so: {channel}"
+            );
+        } else {
+            assert!(
+                !channel.contains("np models fetch"),
+                "a build without `fetch` must not name it: {channel}"
+            );
+        }
     }
     // The defect itself. The row declares 768 and the truth is a missing file, so no width may appear in the
     // answer; this fails the moment np-cli answers an unreadable artifact with a placeholder provider again,
@@ -1821,9 +1830,10 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
     assert_eq!(report["model"], EMBED_MODEL);
     assert_eq!(absent["artifact"], artifact.display().to_string());
     let hint = absent["hint"].as_str().unwrap_or_default();
+    let fetch_expected = cfg!(feature = "fetch");
     assert!(
-        hint.contains("np models install") && !hint.contains("np models fetch"),
-        "the JSON remedy is the text remedy: {hint}"
+        hint.contains("np models install") && hint.contains("np models fetch") == fetch_expected,
+        "the JSON remedy is the text remedy, feature included: {hint}"
     );
 
     for (label, field) in [

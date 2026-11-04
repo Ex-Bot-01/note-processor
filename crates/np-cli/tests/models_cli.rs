@@ -18,13 +18,25 @@
 //! 7's amendment a fetch always resolves an origin, so a case that configured none would download 865 MB.
 
 use std::fs;
-use std::io::{self, Read, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
+
+// Only the `fetch` cases own a fake origin and read its socket log, so every import that exists to build or inspect one
+// follows the feature. Without this the `--no-default-features` row — where all of those cases are compiled out — fails
+// `-D warnings` on unused imports.
+#[cfg(feature = "fetch")]
+use std::io::{self, Read, Write};
+#[cfg(feature = "fetch")]
+use std::net::TcpListener;
+#[cfg(feature = "fetch")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "fetch")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "fetch")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "fetch")]
 use std::thread;
+#[cfg(feature = "fetch")]
 use std::time::Duration;
 
 use np_core::config::Config;
@@ -1222,12 +1234,20 @@ fn nothing_fetching_prints_no_extra_line() {
 
 // --- `np models fetch` (§12) ---------------------------------------------------------------
 //
+// Every case below is `#[cfg(feature = "fetch")]`, and that costs something worth naming: a `--no-default-features` run
+// compiles this section **out**, so its green proves only that nothing here leaks into a build without the command — not
+// that fetch behaves correctly there, because it cannot. The default row is where these cases actually execute.
+//
 // These cases own argv, the two channels and the exit code. What the transfer itself does — streaming, hashing while
 // counting, length-before-digest, publishing by rename — is pinned in `crates/np-core/tests/fetch.rs` (rules against a
 // fake transport) and `fetch_http.rs` (the real client against a loopback origin), because driving 865 MB of pinned
 // bytes through a child process would test the OS's page cache rather than this program.
 
 /// Write a user-level `config.toml` where the binary looks, so a case can configure `[models]`.
+///
+/// The whole block is `fetch`-only: without that feature no case configures an origin, and an un-gated helper is dead code
+/// that `-D warnings` rightly objects to on the `--no-default-features` row.
+#[cfg(feature = "fetch")]
 impl Scratch {
     fn write_user_config(&self, body: &str) {
         let dir = self.config_dir().join("note-processor");
@@ -1258,9 +1278,11 @@ impl Scratch {
 /// Verified on this host: `connect()` to `127.0.0.1:1` answers `ECONNREFUSED`, so a run that reached its transport
 /// here fails at **connect** time — no request bytes are sent, and the refusal is a class (`transport failure`).
 /// That asymmetry is what the capability cases below assert on.
+#[cfg(feature = "fetch")]
 const DEAD_ORIGIN: &str = "http://127.0.0.1:1";
 
 /// The filename of one pinned member, taken from the pin table rather than typed here.
+#[cfg(feature = "fetch")]
 fn pinned_filename(id: &str, member: &str) -> String {
     np_core::pins::pinned_member(id, member)
         .unwrap_or_else(|| panic!("test setup: `{member}` should be pinned for `{id}`"))
@@ -1277,6 +1299,7 @@ fn pinned_filename(id: &str, member: &str) -> String {
 ///
 /// `404` because no fixture serves 309 MB: the fetch has to refuse either way, and what this fixture owns is only
 /// *which files were asked for*, never what was in them.
+#[cfg(feature = "fetch")]
 struct Origin {
     base_url: String,
     stop: Arc<AtomicBool>,
@@ -1284,6 +1307,7 @@ struct Origin {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(feature = "fetch")]
 impl Origin {
     fn serve() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test setup: bind a loopback port");
@@ -1345,6 +1369,7 @@ impl Origin {
     }
 }
 
+#[cfg(feature = "fetch")]
 impl Drop for Origin {
     fn drop(&mut self) {
         // A case that never called [`Origin::requests`] still must not leak a thread holding the listener.
@@ -1355,6 +1380,7 @@ impl Drop for Origin {
     }
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn the_default_member_set_of_this_build_is_the_primary_file_alone() {
     // §13's "fetch what this binary can use", asserted on the wire rather than in a table: with no `--member`, the
@@ -1375,8 +1401,11 @@ fn the_default_member_set_of_this_build_is_the_primary_file_alone() {
     let primary = pinned_filename("embeddinggemma-2", "main");
     let projector = pinned_filename("embeddinggemma-2", "mmproj");
     assert_eq!(asked.len(), 1, "the default plan asked for {asked:?}");
-    assert!(
-        asked[0].contains(&primary),
+    // The exact request line, not `contains(&primary)`: the projector's filename ends with the primary's
+    // (`mmproj-embeddinggemma-2-Q8_0.gguf`), so a substring test passes on a run that asked for the wrong file.
+    assert_eq!(
+        asked[0].as_str(),
+        format!("GET /{primary} HTTP/1.1"),
         "the primary file is what a text-only install needs: {asked:?}"
     );
     for line in &asked {
@@ -1395,6 +1424,7 @@ fn the_default_member_set_of_this_build_is_the_primary_file_alone() {
     }
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn an_explicit_member_list_is_the_plan_and_the_default_set_never_widens_it() {
     // The default set is a default, not a mandate: `--member` spells the whole plan. The distinguishing request is
@@ -1425,6 +1455,7 @@ fn an_explicit_member_list_is_the_plan_and_the_default_set_never_widens_it() {
     );
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn a_projector_request_on_a_build_without_image_support_names_the_capability() {
     // The one refusal §13 adds, and it is about a capability rather than a location: `mmproj` **is** pinned, so the
@@ -1454,6 +1485,74 @@ fn a_projector_request_on_a_build_without_image_support_names_the_capability() {
     );
 }
 
+#[cfg(feature = "fetch")]
+#[test]
+fn an_unconfigured_fetch_says_it_is_using_the_compiled_in_origin() {
+    // §12 rule 7's amendment made "no origin configured" mean *dial the baked default* rather than *refuse*, and an empty
+    // `NP_MODELS_BASE_URL` counts as unset by a rule this suite pins on purpose. So the silence is the hazard: a mirror whose
+    // value was lost to a shell would spend 865 MB of egress with nothing on screen saying where the bytes came from. The run
+    // refuses below before any byte moves, which is also what keeps this case off the network.
+    let scratch = Scratch::new();
+    scratch.write_user_config("[workspace]\n");
+    // An occupied target is refused by rule 5 ahead of the transfer, so the notice above it is observable without dialling.
+    fs::create_dir_all(scratch.models_dir()).expect("test setup: models dir");
+    fs::write(
+        scratch.models_dir().join("embeddinggemma-2"),
+        b"existing bytes",
+    )
+    .expect("test setup: occupied target");
+
+    let mut cmd = scratch.fetch("embeddinggemma-2", &[]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}\n{}", run.stdout(), run.stderr());
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("compiled-in default"),
+        "the run has to say which origin it resolved: {stdout}"
+    );
+    assert!(
+        stdout.contains("[models] base_url"),
+        "and where to change it: {stdout}"
+    );
+    // Rule 8 holds for the notice too: a class, never a host.
+    for both in [run.stdout(), run.stderr()] {
+        for forbidden in ["huggingface", "https://", "http://", "://"] {
+            assert!(
+                !both.contains(forbidden),
+                "{forbidden:?} appeared in fetch output: {both}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "fetch")]
+#[test]
+fn a_configured_origin_says_so_rather_than_staying_silent() {
+    let scratch = Scratch::new();
+    fs::create_dir_all(scratch.models_dir()).expect("test setup: models dir");
+    fs::write(
+        scratch.models_dir().join("embeddinggemma-2"),
+        b"existing bytes",
+    )
+    .expect("test setup: occupied target");
+
+    let mut cmd = scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &[]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}\n{}", run.stdout(), run.stderr());
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("from [models] base_url"),
+        "a mirror is worth confirming by name-of-source: {stdout}"
+    );
+    assert!(
+        !stdout.contains("compiled-in default"),
+        "and the two sources are never both claimed: {stdout}"
+    );
+}
+
+#[cfg(feature = "fetch")]
 #[test]
 fn fetch_refuses_a_member_this_build_does_not_pin_and_names_it() {
     // argv reaches the pin table, and a name that is not pinned is a refusal by name rather than a shrug. The origin
@@ -1483,6 +1582,7 @@ fn fetch_refuses_a_member_this_build_does_not_pin_and_names_it() {
     );
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn fetch_names_an_id_this_build_cannot_fetch() {
     // The id is argv's whole subject here, and an id with no pin is a different refusal from an id with no origin:
@@ -1502,6 +1602,7 @@ fn fetch_names_an_id_this_build_cannot_fetch() {
     assert!(!text.contains("mirror.invalid"), "{text}");
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn discard_marker_reports_the_absence_it_found_and_the_fetch_that_follows_refuses() {
     // Two facts, one run, on two channels: `--discard-marker` prints what it found (here: nothing to discard), and
@@ -1531,6 +1632,7 @@ fn discard_marker_reports_the_absence_it_found_and_the_fetch_that_follows_refuse
     }
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn fetch_is_a_subcommand_of_models_and_not_of_scan() {
     // §12 rule 1's boundary, asserted where argv lives: `fetch` exists under `models`, and `np scan` grows no flag that
@@ -1553,6 +1655,7 @@ fn fetch_is_a_subcommand_of_models_and_not_of_scan() {
     }
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn discard_marker_removes_the_marker_and_the_partial_it_names() {
     // The other branch of the same flag, and the one that matters: a marker left by a dead process, plus the
@@ -1595,6 +1698,7 @@ fn discard_marker_removes_the_marker_and_the_partial_it_names() {
 
 /// The marker path comes from the library rather than a literal, so a rename in `np_core::models` moves this case
 /// instead of leaving it asserting against a file nothing reads.
+#[cfg(feature = "fetch")]
 mod models {
     use std::path::{Path, PathBuf};
 

@@ -777,6 +777,21 @@ fn models_fetch(
     // line stays true of every run: the resolved origin is read here and printed nowhere (§12 rule 8).
     let origin = fetch::resolve_origin(config.models.base_url.as_deref());
 
+    // **Say which origin this run is about to dial, in class terms, before any byte moves.** Rule 8 still forbids the host, so
+    // the line names where the answer came from rather than what it is. It exists because `NP_MODELS_BASE_URL=` (set, empty)
+    // counts as unset — a rule `tests/config.rs` pins on purpose, mirroring how an empty `$XDG_*` is treated — and since §12
+    // rule 7's 2026-11-04 amendment, "unset" no longer means "refuse": it means the compiled-in origin. A mirror whose value
+    // was lost to a shell (`NP_MODELS_BASE_URL=$MIRROR` with `MIRROR` unset) would otherwise spend the operator's egress
+    // budget in silence.
+    if !json {
+        emit(if config.models.base_url.is_none() {
+            "origin      this build's compiled-in default — no [models] base_url is configured (an empty \
+             NP_MODELS_BASE_URL counts as unset)"
+        } else {
+            "origin      from [models] base_url"
+        });
+    }
+
     // **Fetch what this binary can use** (`docs/design-m2-image-embeddings.md` §13): with no `--member`, the plan is
     // the members this build could load, so a text-only install never transfers 554 MB of projector it has no code for.
     let requested_owned: Vec<String> = if members.is_empty() {
@@ -802,8 +817,8 @@ fn models_fetch(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "cannot fetch member `{name}` of model `{id}`: this binary was built without image support, so the \
-                 projector's bytes would never be read here; this build fetches {} by default, and a build with the \
-                 `vision` feature can fetch `{name}`",
+                 projector's bytes would never be read here; this build fetches {} by default, and an \
+                 image-capable build (np-core's `vision` feature) can fetch `{name}`",
                 usable.join(", "),
             ),
         )

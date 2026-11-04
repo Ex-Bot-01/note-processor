@@ -37,7 +37,10 @@ use np_core::pins::{
 /// A bare dot is deliberately **not** on the list — `models::validate_id` allows dots in an id, so "no dots anywhere"
 /// would refuse a legal future row. If a genuinely legal value ever trips one of these endings, the fix is to narrow
 /// the needle (say `.com/`, which no filename holds), not to delete the rule.
-const HOST_SHAPED: [&str; 7] = ["http", "://", ".com", ".org", ".net", ".io", ".dev"];
+/// Host-shaped substrings a pin row must never contain (§12 rule 7: the table says **what** to accept, config says where
+/// from). `.co` joined the list on 2026-11-04: the same change that put an origin in the binary made `huggingface.co` a value
+/// this file must keep out of every row, and without `.co` the scan passed it.
+const HOST_SHAPED: [&str; 8] = ["http", "://", ".com", ".org", ".net", ".io", ".dev", ".co"];
 
 /// Every field a row can hide a host in, in declaration order.
 fn fields(entry: &PinnedModel) -> [(&str, &str); 5] {

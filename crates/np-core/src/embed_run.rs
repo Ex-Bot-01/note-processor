@@ -1223,14 +1223,28 @@ fn artifact_file_exists(artifact: &Path) -> bool {
     std::fs::metadata(statable).is_ok_and(|meta| meta.is_file())
 }
 
-/// The command arm (iii) names.
+/// The command arm (iii) names: the doors this build can actually walk through.
 ///
-/// §6 says "run `np models fetch`"; that command does not exist yet (R7b), and naming it would send a reader to
-/// a help screen that has never heard of it. This names the one install path this build has, with its real
-/// flags, and says fetching is missing rather than implying it is optional.
+/// Two of them exist now. `np models fetch` shipped in R7b, and this hint used to say the opposite — "fetching a model is
+/// not implemented in this build" — which sent an operator away from the one command that could finish the job on a machine
+/// with a network. A `fetch`-less build still gets the truth for its own shape rather than a name it cannot run.
+#[cfg(feature = "fetch")]
 fn install_hint(workspace: &Path) -> String {
     format!(
-        "install the artifact with `np models install {} --id <id> --path <file> --dim <width> --sha256 <digest>` (fetching a model is not implemented in this build)",
+        "fetch it with `np models fetch {} --id <id>`, or install bytes you already hold with \
+         `np models install {} --id <id> --path <file> --dim <width> --sha256 <digest>`",
+        workspace.display(),
+        workspace.display()
+    )
+}
+
+/// The same advice for a build that compiled the fetch path out: naming `np models fetch` here would send a reader to a
+/// help screen that has never heard of it.
+#[cfg(not(feature = "fetch"))]
+fn install_hint(workspace: &Path) -> String {
+    format!(
+        "install the artifact with `np models install {} --id <id> --path <file> --dim <width> --sha256 <digest>` \
+         (this build has no fetch command)",
         workspace.display()
     )
 }

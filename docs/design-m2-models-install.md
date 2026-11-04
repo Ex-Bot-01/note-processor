@@ -204,7 +204,10 @@ rules, including the one compiled-in default origin (`pins::DEFAULT_ORIGIN`) and
 `NP_MODELS_BASE_URL`-fills-an-unset-key → default precedence, are `docs/design-m2-local-embeddings.md` §12 rules 7 and 8 as
 amended that day. `install --path --sha256` remains the offline door that amendment keeps.
 
-No HTTP client, no TLS dependency, no URL scheme (4b). No model execution — no candle, no `local-model` feature
+**Corrected 2026-11-04:** this round's non-goal list said "no HTTP client, no TLS dependency, no URL scheme". R7b shipped
+all three behind the default-on `fetch` feature, so they are a *scope* boundary now rather than an absence: `np models install`
+still performs no network I/O of its own and remains the offline door. What has not arrived is model execution — no candle, no
+`local-model` inference inside `install`
 (per-OS `cargo check --locked -p np-core --features local-model` stays a recorded debt). No embedding calls; nothing
 writes to `embeddings` except tests. No config change: `[embeddings].provider` keeps its `none` default — installing a
 model makes choosing one *possible*, and choosing is the human's call (parent §2).

@@ -34,6 +34,7 @@ filed as F28 in `docs/backlog-m2-followups.md` rather than left for a reader to 
 | `np models hash <file>` | Print the SHA-256 of a file, in the format `install` expects |
 | `np models list <workspace>` | Show each model row and whether its artifact is actually present and matches |
 | `np models fetch <workspace> --id … [--member …] [--discard-marker]` | Download a **pinned** model's artifacts and record them — `fetch` is the only command that dials out, and it accepts only bytes that hash to what this build pins. Where it asks: `[models] base_url`, else `NP_MODELS_BASE_URL` when the file leaves that key out, else the one origin baked into the pin table. Which members: the ones this binary can use — a build without image support fetches the primary artifact only, and asking it for `mmproj` is refused as missing image support. Offline? `install --path` still works |
+| `np search <workspace> <query> [--limit N] [--json]` | Rank what is already indexed against a text query — notes and image vectors together, highest cosine first. **Reads only**: no migration, no stamp, no vector written. An index with nothing in it prints one line and exits 0; vectors stored under a different model id are a refusal naming the id your config asks for |
 | `np embed <workspace>` | Embed what is owed for the configured model and write it to the database — a `local-model` build first checks the artifact against its recorded digest; `--json` reports the same four labelled outcomes this command exits with |
 
 Refusals are deliberate: an unreadable note is reported and left alone, never repaired; an install whose digest does not
@@ -45,8 +46,13 @@ match is refused before a byte is copied; an artifact that disagrees with its ow
 # 1. place the `np` binary on PATH
 np models fetch <workspace> --id embeddinggemma-2   # the one outbound request; a text-only build fetches one file
 np scan  <workspace>                                # index the vault
-np embed <workspace>                                # write the vectors
+np embed <workspace>                                # write the vectors — needs a `local-model` build
 ```
+
+**Read that last line's condition.** The binary you get from `cargo install` links no inference runtime, so steps 1–2 work
+and step 3 reports that nothing was produced (exit 1), as does `np search`: there is nothing to turn your query into numbers.
+The fetch still succeeds, which means a default build will happily download 309 MB it cannot open — build with
+`--features local-model` when this machine is meant to embed.
 
 `fetch` is what pulls the model files, so installation needs no config file. It makes **one kind of outbound request**:
 a plain GET for each member it plans, against `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main`
@@ -55,8 +61,9 @@ move that request, and on an air-gapped host skip `fetch` and use `np models ins
 no network at all.
 
 Two things this command will not do: it never accepts bytes that hash to something other than what the build pins, and
-it never prints where the bytes came from — a refusal or a report line names a class (`not found`, `timed out`), never
-a URL. A text-only binary also refuses to download the 554 MB projector it cannot load; `--member` still spells the
+**its own output** — every transfer refusal, progress line and report — names a class (`not found`, `timed out`) and never a
+host or URL. A *config* refusal is deliberately different: an invalid `[models] base_url` quotes the value you wrote, because
+telling you to fix a key without showing the offending value wastes the one thing a refusal is for. A text-only binary also refuses to download the 554 MB projector it cannot load; `--member` still spells the
 whole plan when you are fetching on behalf of a different build.
 
 ## Where the thinking lives

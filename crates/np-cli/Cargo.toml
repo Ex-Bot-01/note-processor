@@ -27,7 +27,11 @@ fetch = ["np-core/fetch"]
 
 [dependencies]
 clap = { workspace = true }
-np-core = { path = "../np-core" }
+# `default-features = false` is load-bearing, not tidiness. np-core's own default turns `fetch` on, so without this line a
+# `np --no-default-features` build still linked ureq/rustls **and** — the part that produced a wrong message — let np-core's
+# arm-(iii) remedy name `np models fetch`, a subcommand this binary had compiled out of its help screen. One knob across the
+# workspace: np-cli's `fetch` is the only thing that decides whether the command exists and whether the advice may name it.
+np-core = { path = "../np-core", default-features = false }
 serde_json = { workspace = true }
 
 [dev-dependencies]
