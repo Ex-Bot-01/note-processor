@@ -2360,6 +2360,32 @@ pub fn live_chunks(db: &Db) -> Result<Vec<LiveChunk>, DbError> {
     Ok(chunks)
 }
 
+/// Every live note's workspace-relative path, in path order.
+///
+/// **This is a second query with one predicate, not a second definition of "live".** [`live_chunks`] owns the
+/// definition — `JOIN files f ON f.rel_bytes = n.rel_bytes WHERE f.state = 'ok'` — and this repeats that single
+/// join and that single predicate so the media pass walks exactly the notes whose chunks the fence admitted. If
+/// the fence ever widens or narrows, [`live_chunks`] is the owner a change has to be made in; a note counted live
+/// here and stale there would embed images for a deleted file.
+///
+/// Ordered by `rel_bytes` so one run walks notes in the same order on every host and a report's refusal list is
+/// reproducible. Bytes rather than strings because a non-UTF-8 note name is a live note (F13).
+pub fn live_note_paths(db: &Db) -> Result<Vec<Vec<u8>>, DbError> {
+    let mut statement = db.0.prepare_cached(
+        "SELECT n.rel_bytes
+           FROM notes n
+           JOIN files f ON f.rel_bytes = n.rel_bytes
+          WHERE f.state = 'ok'
+          ORDER BY n.rel_bytes",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut paths = Vec::new();
+    for row in rows {
+        paths.push(row?);
+    }
+    Ok(paths)
+}
+
 /// One chunk row as [`live_chunks`] reads it.
 pub struct LiveChunk {
     /// `chunks.id`, the key `embeddings.chunk_id` references.
