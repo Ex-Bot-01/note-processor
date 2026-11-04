@@ -56,9 +56,10 @@ Design: `docs/design-m2-image-embeddings.md`. What landed, task by task, with th
   `model_files` so verifying the 554 MB projector costs one `stat` until it moves. Nothing backfilled; the next `np embed`
   fills it.
 * **Media resolution** (`crates/np-core/src/media.rs`) — reads a note's **raw bytes**, not `links.target`, resolves
-  `![alt](target)` relative to that note's directory byte-exact, percent-decodes once, refuses any symlink that leaves the
-  workspace, and judges format from the **bytes**: `.png`/`.jpg`/`.jpeg` by name, then a PNG signature or JPEG SOI marker.
-  That closes **F26** — a `.png` full of BMP bytes now refuses as `unsupported-format` instead of embedding.
+  `![alt](target)` relative to that note's directory byte-exact, percent-decodes once, and refuses any symlink that leaves the
+  workspace. The same module owns the format rule: `mime_of` accepts `.png`/`.jpg`/`.jpeg` by name and `image_kind_of_prefix`
+  then demands a PNG signature or a JPEG start-of-image marker from the bytes the pass goes on to digest and encode — which is
+  how **F26** closed: a `.png` full of BMP bytes now refuses as `unsupported-format` instead of embedding.
 * **The vision seam** (`crates/np-core/src/vision.rs`, feature `vision`, default off) — `mtmd` behind our own FFI: six archives
   on the link line, not five, and `llama_set_causal_attn(false)` restored after every image decode so a text vector later in
   the same process is still a text vector. Pooled row is 768 floats arriving un-normalised; the seam normalises.
