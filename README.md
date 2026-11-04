@@ -15,8 +15,15 @@ ambiguity), durable upgrade/refusal rules for damaged or unreadable notes, byte-
 M2a ground for embeddings — deterministic chunking, `chunks`/`embeddings`/`models` storage, a model install command that
 verifies what it is given.
 
-**Not built yet: anything that embeds.** The tables are there, no vector is ever written, so semantic search does not
-exist. That is the next round (see below).
+**Built since that sentence was written:** the forward pass (`np embed` writes vectors and reports what it refused), a pinned
+artifact fetched over HTTPS or installed from disk and verified against its recorded digest, `np search` ranking notes and image
+vectors that exist, and a thread policy for the decode.
+
+**The boundary that matters when you read those claims.** Embedding needs the `local-model` feature: the default binary links no
+inference runtime, so there `np embed` reports that nothing was produced and `np search` refuses to turn the query into numbers —
+both at exit 1, with a message naming what to change. Image vectors need one more feature (`vision`) which **the CLI cannot ask
+for yet**: `np-cli` has no `vision` passthrough, so every shipped binary records figures and declines to encode them. That gap is
+filed as F28 in `docs/backlog-m2-followups.md` rather than left for a reader to discover.
 
 ## Commands
 

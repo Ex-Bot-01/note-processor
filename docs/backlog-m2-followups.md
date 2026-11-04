@@ -698,3 +698,37 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   `crates/np-core/tests/probes/corpus-auto-2026-11-02.log`; the older four-worker rows above stay quoted as what they were
   taken at, because `local_corpus.rs`'s `run_pass` still pins four. §14's cohort solve (31.1 ms fixed + 5.53 ms/token) is
   deliberately **still four-worker** — it measures per-decode overhead, which is a different question from thread scaling.
+
+## F28 — the shipped binary cannot reach image code, so `np embed` never embeds an image
+
+**Found 2026-11-04 while measuring R7c Task 7's package sizes.** The plan asked for a fourth
+figure — `local-model,vision` — beside R7b's three shipped sizes, "where the fifth archive shows
+up". It cannot be built: `crates/np-cli/Cargo.toml` declares `local-model = ["np-core/local-model"]`
+and `fetch = ["np-core/fetch"]`, and has **no `vision` passthrough**, so
+`cargo build --release --bin np -p np-cli --features local-model,vision` fails at feature resolution
+with *"the package 'np-cli' does not contain this feature: vision"* (exit 101, measured).
+
+**What that means in practice, stated plainly.** `np_core::vision` is reachable only when the
+`vision` feature is on, and only np-core builds can turn it on. So in every `np` binary — including a
+`--features local-model` one — `Embedder::supports_images()` answers `false`, §11's images arm counts
+figures and refuses them all as `vision-unavailable`, and `np search` ranks whatever image vectors
+already exist but cannot make a new one. The whole R7c pipeline is exercised end to end in
+`crates/np-core/tests/local_vision.rs` and `tests/embed_run.rs`, never through the command line.
+
+**Why this was not caught earlier.** Every gate on this branch runs the feature pair against
+`-p np-core`, so a green `--features local-model,vision` row says the *library* builds that way. The
+one place that would have failed — a CLI build with the same pair — is not in any gate list, because
+the plan's Step 5 phrased the measurement as if the shape already existed.
+
+**The decision owed, which is a product question, not a bug.** Either (a) add `vision =
+["np-core/vision"]` to np-cli and let an operator build a binary that embeds images — at the cost §10
+already predicts: a fifth archive, cmake's `LLAMA_BUILD_MTMD`, and a larger artifact; or (b) keep
+image embeddings library-only for now and say so in README's `np search` section, where a reader
+today would otherwise conclude that `np embed` fills the image index. Under (b) the honest wording is
+"image vectors come from a build made with `--features local-model,vision`; the shipped binary records
+figures and refuses to encode them".
+
+**Do not resolve this by adding the passthrough as a side effect of a docs commit.** It changes what a
+downloaded binary links, which is exactly the kind of size-and-dependency claim §14 exists to keep
+measured. If (a) is chosen: re-measure all four shapes with `strip`, in the same session, and record
+the projector's 554,821,056 bytes as a *fetched* cost separate from the binary's own.
