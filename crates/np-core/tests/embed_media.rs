@@ -566,6 +566,17 @@ fn deleting_the_last_referrer_removes_the_media_row_and_its_vector() {
     assert!(setup.media_rows().is_empty(), "no path holds it");
     assert!(setup.paths().is_empty());
     assert!(setup.embeddings().is_empty(), "the cascade took the vector");
+    // The count exists because this exact run shape was silent. No figure link survived in the text, so `images_seen` is
+    // zero and the summary's image line is suppressed — a sweep that deletes vectors on a run that prints nothing about
+    // figures is the one a reader cannot audit after the fact.
+    assert_eq!(
+        report.images_pruned, 1,
+        "one media row went, with its vector"
+    );
+    assert!(
+        report.images_sweep_ran,
+        "and this sweep finished, so no warning line is owed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,10 +1137,14 @@ fn a_figure_encoded_after_a_refusal_is_digested_from_the_bytes_it_encodes() {
     );
 }
 
-/// The blind spot this pass does **not** close, pinned so it stays a decision rather than becoming a surprise: a path check
-/// is size plus whole-second mtime, so an in-place swap that preserves both — with a vector already stored and current — is
-/// not noticed at all, and the old vector keeps answering. §7 chose that stamp knowingly (D12's rule for model files), and
-/// closing it would mean hashing every figure every run. `docs/backlog-m2-followups.md` carries it as F27.
+/// The blind spot this pass does **not** close, pinned so it stays a decision rather than becoming a surprise: the path
+/// check is size plus whole-second mtime, so an in-place swap that preserves both — with a vector already stored and current
+/// — is not noticed at all, and the old vector keeps answering. §7 chose that stamp knowingly (D12's rule for model files),
+/// and closing it would mean hashing every figure every run; `docs/backlog-m2-followups.md` carries it as F27.
+///
+/// **What this case pins is today's granularity, not a vague "coarse stamp".** If someone sharpens mtime to sub-second
+/// precision, it fails — and the right response is to update F27 and delete or invert this case, *not* to make
+/// `mtime_restore` coarser so it goes green. A fixture that pins a known gap must not become the thing that preserves it.
 #[test]
 fn a_same_size_same_mtime_overwrite_of_a_current_figure_is_not_detected() {
     let setup = scanned(
@@ -1164,11 +1179,23 @@ fn a_same_size_same_mtime_overwrite_of_a_current_figure_is_not_detected() {
         0,
         "KNOWN GAP (F27): the pair matches, the vector is current, so no byte is read and the stale vector answers"
     );
-    assert_eq!(report.images_embedded, 0);
+    assert_eq!(report.images_seen, 1, "the link was looked at");
+    assert_eq!(report.images_embedded, 0, "and nothing was rewritten");
+    assert_eq!(
+        report.images_pruned, 0,
+        "nothing went stale, so the sweep had nothing to remove"
+    );
     assert_eq!(
         setup.media_rows()[0].1,
         sha256_bytes(&old_bytes),
-        "and the row still describes the bytes that used to be there"
+        "the row still describes the bytes that used to be there"
+    );
+    assert_eq!(
+        db::media_embeddings(&setup.db(), MODEL_ID)
+            .expect("test: read vectors")
+            .len(),
+        1,
+        "and a search today answers from the stale vector — the loss F27 records"
     );
 }
 

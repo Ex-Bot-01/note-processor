@@ -287,6 +287,14 @@ pub struct EmbedReport {
     /// zero in that last case and zero for the arms too; guessing "zero means every note was read" would be reading a fact
     /// that is not there.
     pub images_sweep_ran: bool,
+    /// **Media rows** this run deleted along with their vectors — not path rows, and not figures it looked at.
+    ///
+    /// §7 rule 4's cleanup was a number nobody could see until now, and the reason to surface it is the failure mode
+    /// [`EmbedReport::images_sweep_ran`] cannot cover on its own: a database fault *inside* the sweep leaves some rows gone
+    /// and the rest standing, most plausibly on a run where the author had just deleted every figure link — so
+    /// `images_seen` is zero and the image line is suppressed. Without this count that run deletes vectors and prints
+    /// nothing at all. A healthy sweep that removes nothing reports `0`, which is the common case and stays quiet.
+    pub images_pruned: usize,
 }
 
 impl EmbedReport {
@@ -345,6 +353,7 @@ impl EmbedReport {
             image_refusals: Vec::new(),
             images_unchecked: 0,
             images_sweep_ran: false,
+            images_pruned: 0,
         }
     }
 }
@@ -363,6 +372,8 @@ struct MediaTally {
     total: usize,
     /// Whether §7 rule 4's sweep ran to completion this run — see [`EmbedReport::images_sweep_ran`].
     swept: bool,
+    /// Media rows deleted so far this run — see [`EmbedReport::images_pruned`].
+    pruned: usize,
 }
 
 /// Why `embed` could not answer at all — as distinct from the four arms, which it answers *with* a report.
@@ -694,6 +705,7 @@ fn run(
                 image_refusals: Vec::new(),
                 images_unchecked: 0,
                 images_sweep_ran: false,
+                images_pruned: 0,
             });
         }
     };
@@ -950,8 +962,9 @@ fn media_pass(
                     // path, and this note links it — the file is absent, unopenable, or intercepted by a symlink today, which
                     // is an event about the disk, not an edit to the note. Without this line the sweep reads the refusal as
                     // "no longer linked", unlinks the row and `prune_unlinked_media` cascades the vector away: exit 0, nothing
-                    // reported, and `np search` stops answering for a figure the author never deleted. A `.gif` or escaping
-                    // target answers `None` here, because it genuinely never linked the path being swept.
+                    // reported, and `np search` stops answering for a figure the author never deleted. Targets that never
+                    // named this path in the first place — rooted, escaping, or an extension §8 refuses — answer `None` and
+                    // protect nothing; `media::link_target_rel` documents the exact set.
                     if let Some(rel) = media::link_target_rel(style, &note_rel, &link.target) {
                         referenced.insert(rel);
                     }
@@ -1101,10 +1114,13 @@ fn media_pass(
     }
     for rel in db::media_paths(db)? {
         if !referenced.contains(&rel) {
-            db::unlink_media_path(db, &rel)?;
+            // **Counted as it happens**, before the next statement can fail: a fault part-way through this loop leaves
+            // `tally` mutated behind, and "rows were deleted while the run said nothing" is precisely the silence review
+            // caught — most likely on a run where the author had just deleted every figure link, so `images_seen` is zero.
+            tally.pruned += db::unlink_media_path(db, &rel)?;
         }
     }
-    db::prune_unlinked_media(db)?;
+    tally.pruned += db::prune_unlinked_media(db)?;
     tally.swept = true;
     Ok(())
 }
@@ -1168,6 +1184,7 @@ fn media_fields(media: &MediaTally) -> EmbedReport {
         image_refusals: media.refusals.clone(),
         images_unchecked: media.unchecked,
         images_sweep_ran: media.swept,
+        images_pruned: media.pruned,
     }
 }
 

@@ -435,9 +435,19 @@ fn place_in_workspace(
 /// The workspace path a written image link points at, when it points at one — the answer to "does this note link this
 /// path?", with no claim about whether anything is there.
 ///
-/// `None` means the target cannot name a workspace figure at all: it escapes the root, names nothing, or has an extension
-/// §8 does not accept (a `.gif` link never linked the `.png` row that used to hold those bytes, so it must not keep that
-/// row alive). Percent-decoding follows the resolver exactly — one definition of where a target points lives in
+/// **Which targets answer `None`, and why each one must:** rooted (`/assets/d.png`, `C:\shots\a.png`), NUL-containing,
+/// naming nothing (`.`), ending in a separator (a directory), escaping the root with `..`, or carrying an extension §8 does
+/// not accept (a `.gif` link never linked the `.png` row that held those bytes). Every one of these is a refusal
+/// [`resolve_image_in`] makes **before or during the walk**, and this function reproduces exactly that set — it answers a
+/// narrower question, never a more permissive one.
+///
+/// What it cannot see is the filesystem, so one case differs in the other direction: a path intercepted by a symlink refuses
+/// resolution (`escapes_through_a_link`) while this answers `Some`, because the note really does link that path and only the
+/// disk's shape changed. That row survives until the note's text changes, which is §7 rule 4 read literally; if keeping a
+/// vector for a figure whose directory now points outside the vault ever looks wrong, the fix is a containment-aware variant
+/// of this function, not a quietly narrower sweep.
+///
+/// Percent-decoding follows the resolver exactly — one definition of where a target points lives in
 /// `place_in_workspace`, which is also what [`resolve_image_in`] walks.
 ///
 /// **Why this exists as its own question:** the stale-figure sweep asks §7 rule 4, "which figures did no live note link?",
@@ -446,7 +456,12 @@ fn place_in_workspace(
 /// volume comes back.
 pub fn link_target_rel(style: PathStyle, note_rel: &[u8], target: &[u8]) -> Option<Vec<u8>> {
     let written = percent_decode(target).unwrap_or_else(|| target.to_vec());
-    if written.contains(&0) || names_nothing(&written) {
+    // **The same refusals the resolver makes before it walks**, in the same order. Review caught the first version omitting
+    // `is_rooted`: `![d](/assets/d.png)` refuses as `outside-workspace` — an absolute destination never linked a workspace
+    // path — yet this function happily returned `assets/d.png`, so that stray absolute spelling kept a relative row and its
+    // vector alive indefinitely, long after the author deleted the real link. A helper that protects rows from deletion must
+    // not be more generous about what counts as a link than the code that resolves one.
+    if style.is_rooted(&written) || written.contains(&0) || names_nothing(&written) {
         return None;
     }
     // A trailing separator names a directory, which is not a figure path whatever the text says.

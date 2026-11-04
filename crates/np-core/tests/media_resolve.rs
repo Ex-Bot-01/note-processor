@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use np_core::hash::{sha256_bytes, sha256_file_with_size, sha256_reader_with_size};
 use np_core::media::{
-    image_kind_of_prefix, image_links, resolve_image, resolve_image_in, MediaRefusal, PathStyle,
-    PNG_SIGNATURE,
+    image_kind_of_prefix, image_links, link_target_rel, resolve_image, resolve_image_in,
+    MediaRefusal, PathStyle, PNG_SIGNATURE,
 };
 use tempfile::TempDir;
 
@@ -914,4 +914,117 @@ fn a_chained_prefix_digests_like_the_whole_file() {
         sha256_file_with_size(&abs).expect("digest through the path helper");
     assert_eq!(via_reader, via_file);
     assert_eq!(reader_size, file_size);
+}
+
+// ---------------------------------------------------------------- link placement (no filesystem)
+
+/// [`np_core::media::link_target_rel`] answers §7 rule 4's question — "does this note link this path?" — from the text
+/// alone, and its whole job is to refuse **exactly** what the resolver refuses before and during the walk. Review caught
+/// the first version omitting the rooted test: `![d](/assets/d.png)` refuses as `outside-workspace`, yet the helper returned
+/// `assets/d.png` and kept that row and its vector alive indefinitely, long after the author deleted the real link.
+#[test]
+fn link_placement_agrees_with_the_resolver_about_what_counts_as_a_link() {
+    let note = b"notes/deep/note.md";
+    let placed = |target: &[u8]| link_target_rel(PathStyle::Unix, note, target);
+
+    // Targets that do name a workspace figure path, whether or not a file is there.
+    assert_eq!(
+        placed(b"diagram.png").as_deref(),
+        Some(&b"notes/deep/diagram.png"[..])
+    );
+    assert_eq!(
+        placed(b"%64iagram.png").as_deref(),
+        Some(&b"notes/deep/diagram.png"[..]),
+        "`%64` is `d`: one escape, decoded exactly once, the same way the resolver decodes it"
+    );
+    assert_eq!(
+        placed(b"../shared/arch.jpeg").as_deref(),
+        Some(&b"notes/shared/arch.jpeg"[..]),
+        "a parent step that stays inside the vault is a link, not an escape"
+    );
+    assert_eq!(
+        placed(b"../../outside.png").as_deref(),
+        Some(&b"outside.png".to_vec()[..]),
+        "two steps up from `notes/deep/` is the root, which is still inside the vault"
+    );
+    assert_eq!(
+        placed(b"my%20diagram.PNG").as_deref(),
+        Some(&b"notes/deep/my diagram.PNG".to_vec()[..]),
+        "byte-exact: no case fold on the path this protects"
+    );
+
+    // And the refusals, each of which must protect nothing.
+    for (name, target) in [
+        ("an absolute destination", b"/assets/diagram.png".as_slice()),
+        ("a NUL byte", b"diag\x00ram.png".as_slice()),
+        ("the note's own directory", b".".as_slice()),
+        ("a directory", b"sub/".as_slice()),
+        // Two parent steps from `notes/deep/` land on the workspace root, which is inside; the third pops past it.
+        (
+            "an escape past the root",
+            b"../../../outside.png".as_slice(),
+        ),
+        ("an unsupported extension", b"clip.gif".as_slice()),
+        ("no extension at all", b"LICENCE".as_slice()),
+        (
+            "an inline payload",
+            b"data:image/png;base64,AAAA".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            placed(target),
+            None,
+            "{name} never linked a workspace figure path, so it must not keep one alive"
+        );
+    }
+
+    // Windows rules are the same conversation with different separators: a drive prefix or a UNC share is rooted there, and
+    // `..` that pops past the root still refuses. Written and executed here; the platform half stays unmeasured (F18).
+    assert_eq!(
+        link_target_rel(PathStyle::Windows, b"notes\\a.md", b"C:\\shots\\a.png"),
+        None,
+        "a drive-prefixed target names no workspace path"
+    );
+    assert_eq!(
+        link_target_rel(PathStyle::Windows, b"notes\\a.md", b"\\\\srv\\share\\a.png"),
+        None
+    );
+    assert_eq!(
+        link_target_rel(
+            PathStyle::Windows,
+            b"notes\\deep\\a.md",
+            b"..\\arch.jpeg".as_slice()
+        )
+        .as_deref(),
+        Some(&b"notes/arch.jpeg"[..]),
+        "a backslash parent step inside the vault is a link under the Windows rules"
+    );
+}
+/// The same target judged by both questions, in one place: wherever the resolver **succeeds**, placement agrees about the
+/// path it succeeded on — so the sweep can never protect a different path from the one the pass just wrote.
+#[test]
+fn where_resolution_succeeds_placement_agrees_on_the_path() {
+    let ws = Workspace::new();
+    ws.write("notes/deep/diagram.png", b"png");
+    ws.write("notes/shared/arch.jpeg", b"jpeg");
+    ws.write("top.png", b"png");
+    ws.write("notes/deep/my diagram.png", b"png");
+    ws.write("notes/deep/a.md", b"body\n");
+    ws.write("a.md", b"body\n");
+
+    for (note, target) in [
+        ("notes/deep/a.md", "diagram.png"),
+        ("notes/deep/a.md", "../shared/arch.jpeg"),
+        ("notes/deep/a.md", "my%20diagram.png"),
+        ("a.md", "top.png"),
+    ] {
+        let image = resolve_image(ws.root(), note.as_bytes(), target.as_bytes())
+            .expect("the fixture created this figure");
+        assert_eq!(
+            Some(image.rel_bytes),
+            link_target_rel(PathStyle::Unix, note.as_bytes(), target.as_bytes()),
+            "placement and resolution disagree for `{note}` -> `{target}`: the sweep would guard one path while the pass \
+             wrote another"
+        );
+    }
 }

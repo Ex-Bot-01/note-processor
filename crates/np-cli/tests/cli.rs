@@ -1796,6 +1796,8 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             // from "this build did not look".
             "image_refusals",
             "images_embedded",
+            // Media rows this run deleted (§7 rule 4's cleanup, made visible): present and zero when nothing went stale.
+            "images_pruned",
             "images_refused",
             "images_seen",
             // Did the stale-figure sweep finish? `false` on an arm that never opened the database — which is why the summary
