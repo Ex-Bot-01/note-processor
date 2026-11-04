@@ -352,8 +352,13 @@ any claim is written down.
 The report gains counts beside the existing ones, printed in §6's order and mirrored in `--json`:
 
 ```text
-images     seen 7 · embedded 4 · refused 3 (missing-target 1, unsupported-format 2)
+images     links 7 · embedded 4 · refused 3 (missing-target 1, unsupported-format 2)
 ```
+
+**The noun changed on the way to the code, and it was not cosmetic.** This section said `seen`, which reads as "figures this run
+looked at"; the number is really **written link targets**, de-duplicated per note, so a figure behind a broken link counts there
+and nowhere else — which is what makes a corpus of nothing-but-broken-figures still print a line rather than stay silent. `links`
+says that; `seen` did not (Task 6 review).
 
 `workers` (§14's R8 field) applies unchanged — an image encode is the same context. Nothing prints a per-image line at
 default verbosity; `--json` carries the per-file detail because a person diagnosing one bad file needs its path, and a report
