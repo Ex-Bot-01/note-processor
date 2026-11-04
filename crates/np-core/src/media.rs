@@ -469,6 +469,36 @@ fn extension_of(name: &[u8]) -> Option<&[u8]> {
     (!name[..dot].is_empty() && !name[dot + 1..].is_empty()).then_some(&name[dot + 1..])
 }
 
+/// The eight bytes every PNG starts with (§7's format list, straight from the format's own signature block).
+pub const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+/// What a file **actually is**, judged from its first bytes rather than its name — `image/png`, `image/jpeg`, or nothing.
+///
+/// This exists because the extension gate alone was measurably not the promise. On 2026-11-03 a BMP payload reached the
+/// pinned decoder under a `.png` filename and came back a live bitmap, then a vector at 80 image tokens; `stb_image`
+/// inside `libmtmd` also takes tga, gif, psd, pnm and qoi. So §7's "png/jpg/jpeg only" needs enforcing where the bytes are
+/// read, which is what closes backlog **F26**.
+///
+/// **Why a pure prefix function rather than a check inside [`resolve_image`]:** that function's whole job is placing a path
+/// in the workspace — every refusal it makes is about *where* bytes live, and its 37 cases say so. Format is a question
+/// about the bytes, the caller already has the file open to hash it, and a resolver that read content would have to decide
+/// what `missing-target` means for a file that exists but lies. The two-step story is pinned by
+/// `tests/media_resolve.rs::a_mislabelled_file_resolves_and_then_fails_the_content_check`: resolution succeeds, the content
+/// check refuses, and only the second refusal is reportable as `unsupported-format`.
+///
+/// A short prefix simply answers nothing: a three-byte JPEG start-of-image marker cannot be confirmed from two bytes, and
+/// guessing from `\xff\xd8` alone would call a truncated file a JPEG. Callers hand this at least eight bytes; fewer is
+/// not an error, it is just not enough to say.
+pub fn image_kind_of_prefix(prefix: &[u8]) -> Option<&'static str> {
+    if prefix.starts_with(PNG_SIGNATURE) {
+        return Some("image/png");
+    }
+    if prefix.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    None
+}
+
 /// The MIME type of an accepted extension, or nothing for one §8 does not accept.
 ///
 /// Case-folded, because `DIAGRAM.PNG` is the same format as `diagram.png`: this fold judges a **kind of file**, which

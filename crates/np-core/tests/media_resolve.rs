@@ -19,10 +19,14 @@
 //! SHA-256 spelling in `media.rs` fails here rather than drifting quietly (local-embeddings §12 rule 9).
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use np_core::hash::{sha256_bytes, sha256_file_with_size};
-use np_core::media::{image_links, resolve_image, resolve_image_in, MediaRefusal, PathStyle};
+use np_core::hash::{sha256_bytes, sha256_file_with_size, sha256_reader_with_size};
+use np_core::media::{
+    image_kind_of_prefix, image_links, resolve_image, resolve_image_in, MediaRefusal, PathStyle,
+    PNG_SIGNATURE,
+};
 use tempfile::TempDir;
 
 /// The extraction as `(target, line)` pairs, so a case states its whole expectation in one literal.
@@ -790,4 +794,124 @@ fn sha256_file_refuses_a_directory_and_a_missing_path() {
         sha256_file_with_size(&ws.join("notes/deep/gone.png")).is_err(),
         "a path that is not there has no digest"
     );
+}
+
+// ---------------------------------------------------------------- content, not filename
+
+/// §7's promise is "png/jpg/jpeg only", and the extension gate alone does not keep it: measured 2026-11-03, a BMP payload
+/// under a `.png` name reached the pinned decoder and produced a vector at 80 image tokens. This function is what closes
+/// that gap (backlog F26), so its table is the whole promise in one place.
+#[test]
+fn the_content_check_accepts_png_and_jpeg_signatures_only() {
+    let mut png = Vec::new();
+    png.extend_from_slice(PNG_SIGNATURE);
+    png.extend_from_slice(b"IHDR and the rest of a file");
+    let mut jpeg = Vec::new();
+    jpeg.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe0]);
+    jpeg.extend_from_slice(b"JFIF and the rest");
+
+    assert_eq!(image_kind_of_prefix(&png), Some("image/png"));
+    assert_eq!(image_kind_of_prefix(&jpeg), Some("image/jpeg"));
+
+    // Everything else the decoder would happily have eaten, plus the shapes that are not formats at all. Each of these
+    // resolving to `Some` would store a vector whose row came from a format §7 never promised.
+    let bmp = b"BM\x36\x00\x00\x00\x00\x00";
+    let gif = b"GIF89a\x01\x00";
+    let mut webp = Vec::new();
+    webp.extend_from_slice(b"RIFF\x10\x00\x00\x00WEBPVP8 ");
+    for (name, prefix) in [
+        ("bmp", bmp.as_slice()),
+        ("gif", gif.as_slice()),
+        ("webp", webp.as_slice()),
+        ("tga", b"\x10\x00\x02\x00\x00\x00"),
+        (
+            "a truncated jpeg (two of three marker bytes)",
+            &[0xff, 0xd8][..],
+        ),
+        ("an empty file", b"".as_slice()),
+        (
+            "a png signature with its last byte off",
+            b"\x89PNG\r\n\x1b\x0a",
+        ),
+    ] {
+        assert_eq!(
+            image_kind_of_prefix(prefix),
+            None,
+            "{name} is not one of the two formats §7 promises, so it must answer nothing"
+        );
+    }
+}
+
+/// The division of labour between the resolver and the content check, pinned: resolution answers *where* bytes live and
+/// succeeds here; the content check answers *what* they are and refuses. Collapsing the two (checking bytes inside
+/// `resolve_image`) would report a real file as `missing-target`, which is a different statement about the vault.
+#[test]
+fn a_mislabelled_file_resolves_and_then_fails_the_content_check() {
+    let ws = Workspace::new();
+    // A BMP, named `.png`, inside the workspace, linked from a note next to it — exactly the F26 shape.
+    let mut bmp = b"BM\x36\x00\x00\x00\x00\x00".to_vec();
+    bmp.extend_from_slice(&[0u8; 64]);
+    ws.write("notes/deep/diagram.png", &bmp);
+
+    let resolved = resolve_image(
+        ws.root(),
+        b"notes/deep/note.md",
+        b"diagram.png",
+    )
+    .expect("the path is inside the workspace and the file exists, so resolution is not the thing that fails here");
+    assert_eq!(resolved.rel_bytes, b"notes/deep/diagram.png".to_vec());
+
+    let mut file = fs::File::open(&resolved.abs).expect("test setup: read what was just written");
+    let mut prefix = [0u8; 8];
+    std::io::Read::read_exact(&mut file, &mut prefix)
+        .expect("the fixture is longer than the prefix");
+    assert_eq!(
+        image_kind_of_prefix(&prefix),
+        None,
+        "a BMP named .png must be refused by content — accepting it is the defect F26 records as measured"
+    );
+}
+
+/// The digest and the peek have to describe **one read**: a caller that sniffed eight bytes, then re-opened for
+/// [`sha256_file_with_size`], could store a size from one moment and a signature from another. Chaining is what avoids
+/// that, and this pins that chaining neither drops the prefix nor counts it twice.
+#[test]
+fn a_chained_prefix_digests_like_the_whole_file() {
+    let ws = Workspace::new();
+    let content: &[u8] = b"\x89PNG\r\n\x1a\nthen a great many bytes of diagram follow this line\n";
+    let abs = ws.write("notes/deep/real.png", content);
+
+    // The caller's shape: read a prefix, then digest prefix-then-rest from the same handle.
+    let mut file = fs::File::open(&abs).expect("test setup: open the fixture");
+    let mut prefix = vec![0u8; 8];
+    std::io::Read::read_exact(&mut file, &mut prefix)
+        .expect("the fixture is longer than the prefix");
+    let mut chained = prefix.as_slice().chain(file);
+    let (digest, size) =
+        sha256_reader_with_size(&mut chained).expect("digesting a chained reader cannot fail here");
+
+    assert_eq!(
+        digest,
+        sha256_bytes(content),
+        "the digest must cover every byte once"
+    );
+    assert_eq!(
+        size,
+        content.len() as u64,
+        "the count must be the whole file, prefix included"
+    );
+    assert_eq!(
+        image_kind_of_prefix(&prefix),
+        Some("image/png"),
+        "and the same bytes that were digested are the bytes that were classified"
+    );
+
+    // Same function, no prefix: identical to the file helper, so there is still one digest definition (rule 9).
+    let mut again = fs::File::open(&abs).expect("test setup: reopen");
+    let (via_reader, reader_size) =
+        sha256_reader_with_size(&mut again).expect("read it again from the start");
+    let (via_file, file_size) =
+        sha256_file_with_size(&abs).expect("digest through the path helper");
+    assert_eq!(via_reader, via_file);
+    assert_eq!(reader_size, file_size);
 }

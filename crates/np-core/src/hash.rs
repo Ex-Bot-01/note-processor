@@ -185,12 +185,23 @@ pub fn sha256_file_with_size(p: &Path) -> Result<(String, u64), HashError> {
         source,
     };
     let mut file = File::open(&open_path).map_err(fail)?;
+    let (hex, digested) = sha256_reader_with_size(&mut file).map_err(fail)?;
+    Ok((hex, digested))
+}
 
+/// The same digest over anything readable, with the byte count that came out of the read loop.
+///
+/// This is the loop [`sha256_file_with_size`] runs — that function is this one plus an open, so there is still exactly one
+/// place that decides where a file ends (§12 rule 9). It exists for the caller that must look at a file's first bytes and
+/// digest **the same bytes**: `crate::media`'s format check reads a prefix to decide whether a `.png` really is a PNG, and
+/// re-opening for the digest would hash a second read of a file that may have changed in between — a row whose `size` and
+/// signature describe different moments. A caller chains what it peeked back on (`std::io::Read::chain`) and digests once.
+pub fn sha256_reader_with_size<R: Read>(reader: &mut R) -> Result<(String, u64), io::Error> {
     let mut stream = Sha256Stream::new();
     let mut chunk = vec![0u8; READ_CHUNK_BYTES];
     let mut digested: u64 = 0;
     loop {
-        let read = file.read(&mut chunk).map_err(fail)?;
+        let read = reader.read(&mut chunk)?;
         if read == 0 {
             break;
         }

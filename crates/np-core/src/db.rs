@@ -2765,7 +2765,9 @@ pub struct MediaRow {
     pub hash: String,
     /// Exact byte length as last recorded.
     pub size: i64,
-    /// A mime type guessed from the extension (`image/png`, `image/jpeg`), stored for the report line and nothing else.
+    /// What the bytes **are** (`image/png`, `image/jpeg`), from [`crate::media::image_kind_of_prefix`] rather than the
+    /// filename — a file whose name lies is stored as what it is, because we measured the bytes to get here anyway. Used
+    /// for the report line and nothing else.
     pub mime: String,
 }
 
