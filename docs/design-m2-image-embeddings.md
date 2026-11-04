@@ -449,14 +449,19 @@ NP_TEST_MMPROJ_PATH=/home/agent/models/mmproj-embeddinggemma-2-Q8_0.gguf \
 
 The six processes' full output — including the two comparability runs below — sits in this round's transcript at
 `.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/r7c-task8-vision-rerun.log`. That directory is gitignored, so the
-transcript is discoverable rather than published: **this round touched no file under `crates/`**, and the two lines it printed
+transcript is discoverable rather than published. **One file under `crates/` did change**, and it is the one this correction
+depends on: `crates/np-core/tests/probes/vision-spike-2026-11-02.md`, whose "two runs" annotation §14.3 corrects below — a probe
+note is documentation that happens to live in the test tree, and an earlier sentence here claimed no `crates/` file was touched.
+The two lines it printed
 are quoted inline above and in §14.3, which is what has to be re-runnable by someone else.
 
 Three consequences, all in code rather than in prose: the cost is **read back per encode** (`ImageEmbedding::token_cost`, and
 `tests/local_vision.rs::token_cost_is_measured_per_encode_and_printed` refuses a cost that is zero or that fails to grow with
-the image), file size predicts nothing (§8's reason `over-budget` is measured rather than computed), and **one image cannot
-reach `over-budget` on this pair** — mtmd clamps the patch grid to the projector's own ceiling (1,064 tokens for an image whose
-pixels would want ~49,000 patches) against a window of 8,192. The guard ships anyway: past that ceiling llama.cpp *asserts*
+the image), file size predicts nothing (§8's reason `over-budget` is measured rather than computed), and **no single image reached
+`over-budget` here** — measured once, at one size: a 4096×3072 PNG cost 1,064 tokens against a window of 8,192. The inference
+that one image *cannot* is exactly that, an inference: what the run shows is the grid arriving far smaller than its ~49,000 raw
+patches would suggest, and the boundary above that size is unmeasured (`a_large_image_either_embeds_within_the_window_or_refuses_over_budget`
+prints `NOT COVERAGE` unless `$NP_TEST_VISION_LARGE` names an oversized file). The guard ships anyway: past that ceiling llama.cpp *asserts*
 instead of returning a code, so the check is the difference between a report line and an abort.
 
 ### 14.2 The soft-token budget is honoured by this builder, and nothing here uses it

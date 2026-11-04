@@ -22,8 +22,10 @@ vectors that exist, and a thread policy for the decode.
 **The boundary that matters when you read those claims.** Embedding needs the `local-model` feature: the default binary links no
 inference runtime, so there `np embed` reports that nothing was produced and `np search` refuses to turn the query into numbers —
 both at exit 1, with a message naming what to change. Image vectors need one more feature (`vision`) which **the CLI cannot ask
-for yet**: `np-cli` has no `vision` passthrough, so every shipped binary records figures and declines to encode them. That gap is
-filed as F28 in `docs/backlog-m2-followups.md` rather than left for a reader to discover.
+for yet**: `np-cli` has no `vision` passthrough, so every shipped binary that gets as far as the image pass records figures and
+encodes none. "As far as" is worth stating: with no artifact installed at all, `np embed` refuses on the missing artifact
+**before** any figure is examined, so that run prints no `images …` line at all rather than a line full of refusals — the image
+counts appear once the model's own bytes are in place.
 
 ## Commands
 
@@ -97,8 +99,8 @@ images     links 7 · embedded 4 · refused 3 (missing-target 1, unsupported-for
 | `outside-workspace` | The target is absolute or escapes the workspace root (including through a symlink). Nothing outside the vault is read; move the figure in, or link it relatively |
 | `unsupported-format` | Not `.png`/`.jpg`/`.jpeg`, or an accepted name whose bytes are not that raster. Re-export as PNG or JPEG |
 | `undecodable` | Accepted name and signature, but the decode failed — a truncated or damaged file is the usual cause. Re-export the figure; nothing partial was stored |
-| `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Not reachable with one image on this build** — a 4096×3072 PNG costs 1,064 tokens because the projector clamps its own grid — so seeing it means a narrower window or a re-pinned artifact, not a slightly big diagram: shrink the figure and re-run, and treat a fresh `over-budget` on an unchanged vault as a finding about the artifact |
-| `vision-unavailable` | This binary has no image code, or the installed model declares no projector. In every `np` binary built today **every** figure lands here: `np-cli` has no `vision` passthrough to ask for it (**F28**), so a shipped build counts links and encodes none |
+| `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Never observed on this artifact pair**: one size was measured — a 4096×3072 PNG cost 1,064 tokens — and larger sizes have not been (the case that would measure the ceiling needs `$NP_TEST_VISION_LARGE`, unset here). So if you see it, suspect a narrower window or a re-pinned artifact rather than a slightly big diagram: shrink the figure and re-run, and treat a fresh `over-budget` on an unchanged vault as a finding about the artifact |
+| `vision-unavailable` | Three meanings, one label: this binary has no image code; the installed model declares no projector; or **a provider refused something this report has no class for**, which is reported here rather than inventing a fourth name. In a shipped `np` build every figure that *resolves and passes the content gate* lands here — `np-cli` has no `vision` passthrough to ask for it (**F28**). Figures whose links do not resolve, or whose bytes are not PNG/JPEG, still get `missing-target` / `outside-workspace` / `unsupported-format`, because those refusals happen before any image capability is asked about |
 
 ## Where the thinking lives
 

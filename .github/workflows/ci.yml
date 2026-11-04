@@ -118,7 +118,8 @@ jobs:
         # `--nocapture` is load-bearing, not cosmetics (Scope B review P1-3). libtest captures a passing test's stdout
         # and throws it away, so the `NOT COVERAGE` lines this job exists to print never reached the log: measured
         # under the command of that day with no artifact the count was **0**, and 12 only with the flag - the same
-        # measurement today returns 20, because the files have grown since. The count is then
+        # measurement returned 20 on 2026-10-31 and **29 today** (see the floor below), because the files have grown since.
+        # The count is then
         # echoed so "compiled, never ran" is written on the record (§2 step 4) rather than implied - and the test exit
         # code, not the grep, is what fails the job.
         run: |
@@ -161,7 +162,9 @@ jobs:
           #
           # What the row does NOT prove about vision, stated because "local_vision is on the link-proof row" reads like
           # image coverage and is not any. Measured 2026-11-04 with the same command at `--features local-model,vision`
-          # and no artifact: **38** lines - the ten extra are one per case that needs both files
+          # and no artifact: **38** lines. That is +9 net over the 29 above, not +10: enabling `vision` replaces the
+          # feature-off statement with the ten gated cases, so one line leaves as nine arrive. The ten are one per case that
+          # needs both files
           # (`an_image_embeds_to_768_components_of_unit_length`, `the_same_bytes_twice_give_bit_identical_components`,
           # `text_still_matches_what_it_was_after_an_image_ran`, `the_provider_seam_and_the_facade_agree_bit_for_bit`,
           # `a_truncated_png_refuses_rather_than_returning_a_vector`,
@@ -169,7 +172,10 @@ jobs:
           # `a_projector_refuses_a_model_it_was_not_opened_against`, `token_cost_is_measured_per_encode_and_printed`,
           # `a_caption_beats_an_unrelated_image`, `a_large_image_either_embeds_within_the_window_or_refuses_over_budget`).
           # A runner has no 554 MB projector either, so adding the feature to this row would buy ten more printed
-          # skips and no measured pixel; the ten run only where both env vars point at real files.
+          # skips and no measured pixel. Nine of the ten run only where both env vars point at real files; the tenth,
+          # `a_large_image_either_embeds_within_the_window_or_refuses_over_budget`, has a second gate of its own
+          # (`$NP_TEST_VISION_LARGE`, an oversized PNG) and prints its own `NOT COVERAGE` without it - the same two-key shape
+          # this block documents for `local_threads`' `$NP_THREAD_*` cell above.
           # `refusal_classes_are_the_report_labels_verbatim` is the file's one artifact-free case - it prints `CLASSES:`,
           # not `NOT COVERAGE`, so neither count includes it.
           #
