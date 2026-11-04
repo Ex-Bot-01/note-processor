@@ -4,10 +4,16 @@
 //! "verify" bytes against something nobody can check, so the shape of every entry is asserted here rather than left
 //! to the reviewer reading a `const`.
 //!
-//! Second: **a pin says what to accept and never where from.** That half of rule 7 is the one a well-meaning reader
-//! is most likely to "improve" — adding a host would make the table self-contained and break the mirror case, plus
-//! §12 rule 8's guarantee that no refusal text can carry a URL. So it is a test, not only a doc comment: every field
-//! of every row is scanned for scheme- and host-shaped substrings.
+//! Second: **a pin row says what to accept and never where from.** That half of rule 7 is the one a well-meaning
+//! reader is most likely to "improve" — putting a host in a row would make the table self-contained and break the
+//! mirror case, plus §12 rule 8's guarantee that no refusal text can carry a URL. So it is a test, not only a doc
+//! comment: every field of every row is scanned for scheme- and host-shaped substrings.
+//!
+//! **What changed on 2026-11-04, and what did not.** Rule 7 was amended so that one origin is compiled in
+//! ([`np_core::pins::DEFAULT_ORIGIN`]) — an install with no config file has to be able to finish. That does not soften
+//! the scan above: the amendment put the default beside the table, not inside a row, so a row still cannot name a
+//! place, and rule 8's other half (no URL in any refusal or report line) is untouched. The three cases at the end of
+//! this file are the amendment's own fence: the baked value, and the member set a fetch of *this* build plans.
 //!
 //! The gap in the table gets the same treatment as the data ([`MMPROJ_DIGEST_PREFIX_ONLY`]'s own words explain why
 //! the second member of the pair is absent), so the missing row stays a decision instead of becoming a forgotten one.
@@ -18,8 +24,8 @@ use std::path::PathBuf;
 
 use np_core::hash::sha256_file;
 use np_core::pins::{
-    identity, pinned, pinned_member, total_size, PinnedIdentity, PinnedModel, PINNED,
-    PINNED_IDENTITIES,
+    identity, members_for_build, pinned, pinned_member, total_size, PinnedIdentity, PinnedModel,
+    DEFAULT_ORIGIN, PINNED, PINNED_IDENTITIES,
 };
 
 /// Substrings that would mean a field names a place rather than a thing.
@@ -261,6 +267,65 @@ fn every_fetchable_id_declares_an_identity_and_every_pinned_id_has_one() {
     );
     // An id nobody declared answers `None` rather than a plausible default.
     assert!(identity("some-other-model").is_none());
+}
+
+#[test]
+fn members_for_build_is_the_member_set_this_binary_can_use() {
+    // `docs/design-m2-image-embeddings.md` §13: fetch what this build can consume. One case covering both feature
+    // rows, because the row that runs here can only prove its own half unless the other half is written as an
+    // `else` — a vision build plans the projector too, and nothing on this default row can execute that.
+    let names: Vec<&str> = members_for_build().to_vec();
+    if cfg!(feature = "vision") {
+        assert_eq!(
+            names,
+            ["main", "mmproj"],
+            "a vision build's default set must carry the projector it can load"
+        );
+    } else {
+        assert_eq!(
+            names,
+            ["main"],
+            "a build without image support must not plan 554 MB of projector it cannot load"
+        );
+    }
+
+    // The primary member leads on every row: a default set that planned nothing would arrive at `fetch` as
+    // `NothingPinned`, and an install step that fetched no weights installs nothing.
+    assert_eq!(names.first().copied(), Some("main"));
+}
+
+#[test]
+fn every_default_member_is_pinned_for_the_id_a_fetch_will_ask_about() {
+    // A set naming a member no row pins would pass the CLI's plan and refuse inside the engine with
+    // `MemberUnpinned` — after a caller had already treated it as one. The id is named rather than derived because
+    // that is what today's single-id table means; a second id has to decide its own default set.
+    for name in members_for_build() {
+        assert!(
+            pinned_member("embeddinggemma-2", name).is_some(),
+            "`{name}` is in this build's default member set, but no row pins its digest"
+        );
+    }
+}
+
+#[test]
+fn the_baked_default_origin_is_the_repository_the_pinned_digests_came_from() {
+    // Rule 7 as amended 2026-11-04 (the human's R7c scope decision, `docs/design-m2-image-embeddings.md` §13): a
+    // machine with no config file makes one outbound request during installation. Spelled literally rather than
+    // derived, so moving the default is a change made twice — here and in `pins.rs`.
+    assert_eq!(
+        DEFAULT_ORIGIN,
+        "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main"
+    );
+
+    // The three shape facts the transport relies on: a scheme it will accept, no credentials in the authority
+    // (`config::validate_base_url` refuses those in a configured value, and a baked one should not be sloppier),
+    // and no trailing slash — `HttpTransport` joins `origin` + `/` + filename, so a slash here would double up.
+    assert!(DEFAULT_ORIGIN.starts_with("https://"), "{DEFAULT_ORIGIN}");
+    assert!(!DEFAULT_ORIGIN.contains('@'), "{DEFAULT_ORIGIN}");
+    assert!(
+        !DEFAULT_ORIGIN.ends_with('/'),
+        "a trailing slash would reach the transport as `//`"
+    );
 }
 
 #[test]

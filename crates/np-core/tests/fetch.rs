@@ -18,6 +18,7 @@ use np_core::fetch::MemberPin;
 use np_core::fetch::{self, Body, Declaration, Expectation, FetchError, Transport};
 use np_core::hash::sha256_bytes;
 use np_core::models::{self, FetchState};
+use np_core::pins::DEFAULT_ORIGIN;
 use tempfile::TempDir;
 
 /// What a member's body should do when opened.
@@ -795,6 +796,23 @@ fn every_refusal_message_is_free_of_the_origin() {
     }
 }
 
+#[test]
+fn an_unconfigured_run_resolves_to_the_baked_default_origin() {
+    // §12 rule 7 as amended 2026-11-04: with nothing configured, a fetch has somewhere to dial, because an install
+    // that cannot reach a network is an install nobody completes. The value comes from the pin table, so the
+    // accepted bytes and the place they are asked for are reviewed in one file.
+    assert_eq!(fetch::resolve_origin(None), DEFAULT_ORIGIN);
+}
+
+#[test]
+fn a_configured_origin_beats_the_baked_default() {
+    // The mirror case, which is what makes the baked default safe rather than convenient: one config line moves the
+    // transfer, and nothing about acceptance changes because the digest still decides. `fetch_http.rs`'s cases are
+    // the other half of this claim — they hand a loopback origin to the same transport and get bytes from it.
+    let mirror = "http://127.0.0.1:40313/models";
+    assert_eq!(fetch::resolve_origin(Some(mirror)), mirror);
+}
+
 // --- helpers ---------------------------------------------------------------------------------------------
 
 /// Fetch and expect success.
@@ -880,6 +898,10 @@ fn assert_no_url_pieces(text: &str) {
         "upstream.invalid",
         "other-host.example",
         "bob@example.com",
+        // The baked default is a real host, so rule 8 now has something to leak. Nothing may print it: the full
+        // origin and the part of it a message could plausibly echo are both on the list.
+        DEFAULT_ORIGIN,
+        "huggingface",
     ] {
         assert!(
             !text.contains(forbidden),
