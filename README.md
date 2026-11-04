@@ -78,9 +78,10 @@ until something else makes the pass read the file (backlog **F27**).
 **Accepted formats: `.png`, `.jpg`, `.jpeg` — and the name is only half the test.** A `.svg`, `.gif`, `.bmp` or `.pdf` link
 refuses as `unsupported-format` on its extension; a file with an accepted extension then has to *be* that format, judged from
 its first bytes (a PNG signature, or a JPEG start-of-image marker). A `.png` whose payload is really BMP bytes is therefore
-refused as `unsupported-format`, not embedded: the pinned decoder would have taken them, and `np search` would have reported
-an `image` beside a path whose contents are none of the three promised formats. Convert vector figures to PNG if you want
-them searchable — an SVG rasteriser is owed, not hidden.
+refused as `unsupported-format`, not embedded. The byte check exists because the pinned decoder **would** have taken them: on
+2026-11-03 a BMP payload under a `.png` name came back a live bitmap and then a vector (backlog **F26**), so a name-only rule
+promises three formats while the index quietly holds others. Convert vector figures to PNG if you want them searchable — an SVG
+rasteriser is owed (**F29**), not hidden.
 
 Images get their own line on the `np embed` report and never change its exit code; every refusal below is a **count**, and
 `--json` carries an `image_refusals` array of `[name, class]` pairs — the linking note's path when the target never resolved,
@@ -92,11 +93,11 @@ images     links 7 · embedded 4 · refused 3 (missing-target 1, unsupported-for
 
 | Class | What it means, and what to do |
 | --- | --- |
-| `missing-target` | The link names a file this run could not read at that path — absent, unopenable, or unreadable while being hashed. Fix the target or restore the file |
+| `missing-target` | No readable file at that path: absent, a directory rather than a file, unopenable, or unreadable part-way through hashing. Fix the target or restore the file |
 | `outside-workspace` | The target is absolute or escapes the workspace root (including through a symlink). Nothing outside the vault is read; move the figure in, or link it relatively |
 | `unsupported-format` | Not `.png`/`.jpg`/`.jpeg`, or an accepted name whose bytes are not that raster. Re-export as PNG or JPEG |
 | `undecodable` | Accepted name and signature, but the decode failed — a truncated or damaged file is the usual cause. Re-export the figure; nothing partial was stored |
-| `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Not reachable with one image on this build** — a 4096×3072 PNG costs 1,064 tokens because the projector clamps its own grid — so seeing it means an unusually large figure or a changed artifact: shrink the image and re-run |
+| `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Not reachable with one image on this build** — a 4096×3072 PNG costs 1,064 tokens because the projector clamps its own grid — so seeing it means a narrower window or a re-pinned artifact, not a slightly big diagram: shrink the figure and re-run, and treat a fresh `over-budget` on an unchanged vault as a finding about the artifact |
 | `vision-unavailable` | This binary has no image code, or the installed model declares no projector. In every `np` binary built today **every** figure lands here: `np-cli` has no `vision` passthrough to ask for it (**F28**), so a shipped build counts links and encodes none |
 
 ## Where the thinking lives
