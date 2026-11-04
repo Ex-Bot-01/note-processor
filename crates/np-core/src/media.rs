@@ -543,7 +543,7 @@ fn abs_path(root: &Path, components: &[Vec<u8>]) -> Option<PathBuf> {
 /// The OS path for a `/`-separated workspace-relative byte path under `root`, or nothing when this platform cannot
 /// spell one of its components.
 ///
-/// This is the reader's half of [`join_rel`]: paths come out of notes and out of `media_path.rel_bytes` as bytes, and a
+/// This is the reader's half of `join_rel` (the writer that produces a stored `rel_bytes`): paths come out of notes and out of `media_path.rel_bytes` as bytes, and a
 /// non-UTF-8 name has to reopen the file it names rather than the U+FFFD spelling of it (F13). The refusal arm is
 /// therefore load-bearing on Windows and inert here, where the conversion is the identity.
 pub fn workspace_path(root: &Path, rel: &[u8]) -> Option<PathBuf> {
