@@ -40,6 +40,10 @@ pub mod vision;
 // The pin table is data with no dependency and no I/O, so it carries no feature gate: the fetch engine behind it
 // arrives later (§12 rule 7), and a pin a build could compile out would pin nothing.
 pub mod pins;
+// The read side of the index: one cosine pass over both vector kinds, with no write anywhere in its path
+// (`docs/design-m2-image-embeddings.md` §12). No feature gate — it reads bytes the schema already holds, so a text-only
+// build can search the images another build embedded.
+pub mod search;
 pub mod scan;
 pub mod walk;
 
