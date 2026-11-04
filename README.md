@@ -34,7 +34,7 @@ filed as F28 in `docs/backlog-m2-followups.md` rather than left for a reader to 
 | `np models hash <file>` | Print the SHA-256 of a file, in the format `install` expects |
 | `np models list <workspace>` | Show each model row and whether its artifact is actually present and matches |
 | `np models fetch <workspace> --id … [--member …] [--discard-marker]` | Download a **pinned** model's artifacts and record them — `fetch` is the only command that dials out, and it accepts only bytes that hash to what this build pins. Where it asks: `[models] base_url`, else `NP_MODELS_BASE_URL` when the file leaves that key out, else the one origin baked into the pin table. Which members: the ones this binary can use — a build without image support fetches the primary artifact only, and asking it for `mmproj` is refused as missing image support. Offline? `install --path` still works |
-| `np search <workspace> <query> [--limit N] [--json]` | Rank what is already indexed against a text query — notes and image vectors together, highest cosine first. **Reads only**: no migration, no stamp, no vector written. An index with nothing in it prints one line and exits 0; vectors stored under a different model id are a refusal naming the id your config asks for |
+| `np search <workspace> <query> [--limit N] [--json]` | Rank what is already indexed against a text query — notes and image vectors in **one** ranked list, highest cosine first; `--limit` defaults to 10. **Changes nothing about the index**: no vector, no stamp and no note row is written (opening a database that does not exist yet still creates it and runs migrations, exactly as `scan` and `embed` do). An index with no vectors at all prints one line and exits 0; vectors stored under a **different** model id are a refusal naming the id this run asked for. `--json` prints `hits`, every object carrying the same five keys — `score`, `kind`, `path`, `linked_from`, `source_note` |
 | `np embed <workspace>` | Embed what is owed for the configured model and write it to the database — a `local-model` build first checks the artifact against its recorded digest; `--json` reports the same four labelled outcomes this command exits with |
 
 Refusals are deliberate: an unreadable note is reported and left alone, never repaired; an install whose digest does not
@@ -66,6 +66,39 @@ host or URL. A *config* refusal is deliberately different: an invalid `[models] 
 telling you to fix a key without showing the offending value wastes the one thing a refusal is for. A text-only binary also refuses to download the 554 MB projector it cannot load; `--member` still spells the
 whole plan when you are fetching on behalf of a different build.
 
+## Images in the index
+
+`np embed` reads `![alt](target)` out of each note's own bytes and embeds the local file it names — resolved relative to
+**that note's** directory, inside the workspace, percent-decoded once. Identity is the content hash, so one diagram written
+to five paths or copied to three folders gets **one vector** and one search hit; renaming a file re-points a row and does not
+re-embed it. A figure is re-encoded when its bytes change. What that sentence does not cover: the change check is file size
+plus whole-second mtime, so an in-place rewrite that preserves both — same length, same timestamp — keeps its old vector
+until something else makes the pass read the file (backlog **F27**).
+
+**Accepted formats: `.png`, `.jpg`, `.jpeg` — and the name is only half the test.** A `.svg`, `.gif`, `.bmp` or `.pdf` link
+refuses as `unsupported-format` on its extension; a file with an accepted extension then has to *be* that format, judged from
+its first bytes (a PNG signature, or a JPEG start-of-image marker). A `.png` whose payload is really BMP bytes is therefore
+refused as `unsupported-format`, not embedded: the pinned decoder would have taken them, and `np search` would have reported
+an `image` beside a path whose contents are none of the three promised formats. Convert vector figures to PNG if you want
+them searchable — an SVG rasteriser is owed, not hidden.
+
+Images get their own line on the `np embed` report and never change its exit code; every refusal below is a **count**, and
+`--json` carries an `image_refusals` array of `[name, class]` pairs — the linking note's path when the target never resolved,
+the figure's own workspace path otherwise — because "refused 3" alone cannot tell a format decision from a missing file:
+
+```text
+images     links 7 · embedded 4 · refused 3 (missing-target 1, unsupported-format 2)
+```
+
+| Class | What it means, and what to do |
+| --- | --- |
+| `missing-target` | The link names a file this run could not read at that path — absent, unopenable, or unreadable while being hashed. Fix the target or restore the file |
+| `outside-workspace` | The target is absolute or escapes the workspace root (including through a symlink). Nothing outside the vault is read; move the figure in, or link it relatively |
+| `unsupported-format` | Not `.png`/`.jpg`/`.jpeg`, or an accepted name whose bytes are not that raster. Re-export as PNG or JPEG |
+| `undecodable` | Accepted name and signature, but the decode failed — a truncated or damaged file is the usual cause. Re-export the figure; nothing partial was stored |
+| `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Not reachable with one image on this build** — a 4096×3072 PNG costs 1,064 tokens because the projector clamps its own grid — so seeing it means an unusually large figure or a changed artifact: shrink the image and re-run |
+| `vision-unavailable` | This binary has no image code, or the installed model declares no projector. In every `np` binary built today **every** figure lands here: `np-cli` has no `vision` passthrough to ask for it (**F28**), so a shipped build counts links and encodes none |
+
 ## Where the thinking lives
 
 - [`docs/plan-2026-10-28-state-and-roadmap.md`](docs/plan-2026-10-28-state-and-roadmap.md) — what exists today and the
@@ -75,6 +108,10 @@ whole plan when you are fetching on behalf of a different build.
 - [`docs/design-m2-embeddings.md`](docs/design-m2-embeddings.md) and
   [`docs/design-m2-models-install.md`](docs/design-m2-models-install.md) — the M2a decisions, each one carrying the
   measurement or failure that produced it.
+- [`docs/design-m2-local-embeddings.md`](docs/design-m2-local-embeddings.md) — the runtime: feature gates, the pinned
+  llama.cpp, artifact identity, and every throughput figure this repository quotes.
+- [`docs/design-m2-image-embeddings.md`](docs/design-m2-image-embeddings.md) — R7c: image vectors, `np search`, the format
+  and refusal rules above, and §14's list of what is **not** measured.
 - [`docs/roadmap-2026-10-27.md`](docs/roadmap-2026-10-27.md) · [`docs/backlog-m2-followups.md`](docs/backlog-m2-followups.md)
   — what is next, and the debt found along the way (D1–D10 from the M2a whole-branch review).
 
