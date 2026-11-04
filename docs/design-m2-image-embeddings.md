@@ -442,9 +442,10 @@ NP_TEST_MMPROJ_PATH=/home/agent/models/mmproj-embeddinggemma-2-Q8_0.gguf \
     --nocapture --test-threads=1 token_cost
 ```
 
-The six processes' full output — including the two comparability runs below — is kept as a round transcript at
-`.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/r7c-task8-vision-rerun.log` rather than beside the spike's logs,
-because this round touches no file under `crates/`; every number in the table above is quoted from it.
+The six processes' full output — including the two comparability runs below — sits in this round's transcript at
+`.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/r7c-task8-vision-rerun.log`. That directory is gitignored, so the
+transcript is discoverable rather than published: **this round touched no file under `crates/`**, and the two lines it printed
+are quoted inline above and in §14.3, which is what has to be re-runnable by someone else.
 
 Three consequences, all in code rather than in prose: the cost is **read back per encode** (`ImageEmbedding::token_cost`, and
 `tests/local_vision.rs::token_cost_is_measured_per_encode_and_printed` refuses a cost that is zero or that fails to grow with
