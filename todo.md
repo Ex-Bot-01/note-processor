@@ -47,6 +47,46 @@ unresolved.
   Gating that measurement also removed a pre-existing test-isolation race (`Config::load` without `ENV_LOCK`, since
   `ef8a382`), now fenced by `every_case_that_loads_a_config_holds_the_environment_lock`.
 
+## Shipped (branch `r7c/image-embeddings`, not yet merged) — R7c image vectors + read-only `np search`
+
+Design: `docs/design-m2-image-embeddings.md`. What landed, task by task, with the claim each one is allowed to make:
+
+* **Migration 10** — `media` (keyed by SHA-256 of the bytes, not by path), `media_path` (every workspace path those bytes were
+  seen at, carrying D12's size + whole-second-mtime stamp pair), `media_embeddings`, and `verified_size`/`verified_mtime` on
+  `model_files` so verifying the 554 MB projector costs one `stat` until it moves. Nothing backfilled; the next `np embed`
+  fills it.
+* **Media resolution** (`crates/np-core/src/media.rs`) — reads a note's **raw bytes**, not `links.target`, resolves
+  `![alt](target)` relative to that note's directory byte-exact, percent-decodes once, refuses any symlink that leaves the
+  workspace, and judges format from the **bytes**: `.png`/`.jpg`/`.jpeg` by name, then a PNG signature or JPEG SOI marker.
+  That closes **F26** — a `.png` full of BMP bytes now refuses as `unsupported-format` instead of embedding.
+* **The vision seam** (`crates/np-core/src/vision.rs`, feature `vision`, default off) — `mtmd` behind our own FFI: six archives
+  on the link line, not five, and `llama_set_causal_attn(false)` restored after every image decode so a text vector later in
+  the same process is still a text vector. Pooled row is 768 floats arriving un-normalised; the seam normalises.
+* **`np embed`'s images arm** — one line, six refusal classes as counts (`missing-target`, `outside-workspace`,
+  `unsupported-format`, `undecodable`, `over-budget`, `vision-unavailable`), per-path detail in `--json`, no new exit code, and
+  a stale-figure sweep that holds itself off when the pass could not read every note.
+* **`np search <workspace> <query>`** — one cosine pass over `embeddings` and `media_embeddings` for one model id, one ranked
+  list, `--limit` default 10, `--json` with five keys per hit. Writes nothing about the index; opening a first-run database
+  still creates and migrates it, like every other command.
+* **Install-time fetch** — `np models fetch` needs no config file: `[models] base_url` → `NP_MODELS_BASE_URL` → one baked
+  origin (`fetch::resolve_origin`), and the default member set is what **this** binary can consume (`pins::members_for_build`),
+  so a build without image support fetches the primary artifact only and refuses to be asked for `mmproj`.
+* **Measured, written down where it can be re-checked** (design §14): one image costs **336** tokens at 1024×768 and **88** at
+  512×384 — the patch grid, not the card's flat 280 — reproduced through the shipped seam twice on 2026-11-04; a 4096×3072 PNG
+  costs **1,064** because the projector clamps its own grid, which is why `over-budget` cannot fire for a single image on this
+  pair; the soft-token budget (70–1120) *is* honoured by this builder and nothing uses it.
+* **CI**: the `feature-local-model` row's `NOT COVERAGE` floor moved **28 → 29** with `--test local_vision` on the link-proof
+  command (measured twice, 2026-11-04). That row builds without `vision`, so the file contributes one line — its feature-off
+  statement — and proves nothing about images; at `local-model,vision` with no artifact the same command prints **38**, all ten
+  of them skips, because a runner has no projector.
+
+**What this round does not claim, and where the debt is:** image encode **throughput**, peak RSS with the projector open, and
+bit-identity of an image vector **across worker counts** are all unmeasured (design §14.4 says what each would take). Retrieval
+quality is owed as **F31** — no labelled diagram set exists, so "it finds the right figure" is not said anywhere. SVG rasterising
+is **F29**, Matryoshka truncation as a storage lever is **F30**, and **F28 stays open**: `np-cli` has no `vision` passthrough, so
+every binary that ships counts figures and refuses them all as `vision-unavailable`. README's "Images in the index" section says
+that plainly rather than letting a reader infer that `np embed` fills the image index.
+
 ## Shipped (main)
 
 - **M1 core catalog** — `np-core` + `np scan <workspace>` producing a byte-stable `INDEX.md` (+ shards) and a

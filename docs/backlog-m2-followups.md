@@ -732,3 +732,62 @@ figures and refuses to encode them".
 downloaded binary links, which is exactly the kind of size-and-dependency claim §14 exists to keep
 measured. If (a) is chosen: re-measure all four shapes with `strip`, in the same session, and record
 the projector's 554,821,056 bytes as a *fetched* cost separate from the binary's own.
+
+**Still open after R7c Task 8 (2026-11-04).** README now carries option (b)'s wording — its "Images in the index" section
+states that every figure lands as `vision-unavailable` in a binary built today, and the `np search` row says the command ranks
+image vectors *that exist* rather than implying `np embed` filled them. That is documentation of the gap, not its resolution:
+the decision about what a shipped binary links is still owed, and no `vision` passthrough was added here.
+
+## F29 — every `.svg` in the vault refuses as `unsupported-format`, and a diagram library is mostly SVG
+
+Filed 2026-11-04 by R7c Task 8 so that §8's deferred format has a number instead of living inside one design bullet. The human
+asked for ".png, .jpg and .svg" on 2026-11-02 and dropped SVG to "only .png and .jpg for today" once told it is not raster and
+no option turns it on.
+
+- **Where the refusal lives:** `crate::media::mime_of` accepts `png`, `jpg`, `jpeg` — case-folded, extension only — and nothing
+  else, so an `.svg` link refuses before a byte is opened. F26's content gate made this narrower, not wider:
+  `image_kind_of_prefix` then requires a PNG signature or a JPEG start-of-image marker, so a mislabelled file also lands here.
+- **Why it will be noticed:** every `.svg`, `.drawio`, `.excalidraw` and `.pdf` link already resolves today as
+  `links.kind = 'attachment'`, so a vault of exported diagrams prints an `unsupported-format` count on its first image-aware
+  `np embed` — the exact corpus class this round was built for.
+- **Fix shape (its own round, per §8: "not a list edit"):** a pure-Rust rasteriser behind the `vision` feature, rendering at a
+  fixed longest side with external references and DTDs disabled — an SVG is a file that asks to fetch things — plus the
+  dependency's measured package-size delta beside R7b's three shapes, and §8's rule that cost is measured per encode still
+  applies to whatever pixel count the renderer chooses.
+- **Done when:** either that ships with a measured size figure and an SVG case in `tests/embed_media.rs` (embedded, not merely
+  refused), or someone decides vector formats stay out permanently and README says so as a product limit rather than leaving it
+  readable only as a format accident.
+
+## F30 — Matryoshka truncation is the storage lever for a big image index, and it has never been exercised
+
+Filed 2026-11-04 by R7c Task 8. Rows are stored at the model's native **768** (`docs/design-m2-image-embeddings.md` §1.2,
+and the human's locked decision (b) in `todo.md`: "768 with no MRL truncation"). The card supports 768 / 512 / 256 / 128 and two
+rules that are easy to get wrong: a sliced unit vector must be **re-normalised** — skipping it "degrades ranking quality
+silently", in the card's words — and query and corpus **must share a dimension**.
+
+The lever is real because a second vector source doubles the vector surface on an image-heavy vault: 4 × 768 bytes per stored
+row in `embeddings` and again in `media_embeddings`, one row per chunk and per distinct figure respectively. How much that costs
+on a real corpus is **not measured** — no index-size figure for either table exists in this repository, which is the first thing
+this entry owes.
+
+- **Done when:** index bytes are printed for a corpus with figures (D6's sibling measurement, still open), and someone decides
+  whether to re-store at 512. That is a re-store of vectors already held — no re-encode — but it changes model identity
+  (`docs/design-m2-local-embeddings.md` §4), so it needs its own migration and `models` row, a re-normalisation on write, and a
+  refusal rather than a blend when a query's width disagrees with the stored one.
+
+## F31 — nothing can be said about whether search finds the right diagram, because there is no labelled set
+
+Filed 2026-11-04 by R7c Task 8, as the retrieval-quality half of design §14.4. What exists is a **sanity check**: four generated
+shapes and three sentences, where each caption beats an unrelated sentence against its own image and the best-matching image is
+the right one (spike 2026-11-02; the red-square pair re-measured through the shipped seam twice on 2026-11-04, identical to six
+decimals — design §14.3). That establishes one geometry, not usefulness, and §12's single ranked list is honest only if a reader
+knows the difference.
+
+- **What it would take:** a labelled set from the human's own vault — some number of queries, each naming which figure answers
+  it — run through `np search --json`, reported as rank@1 / rank@5 **per kind**, plus how often an image outranks the note that
+  explains it. Measurements and their spread, not assertions: a labelled set small enough to assert against is the same set that
+  cannot support a claim.
+- **Blocks:** any sentence beginning "search finds the right diagram", in a design doc, a README or a report, until numbers
+  exist. `np search` proves the plumbing reaches both kinds; that is the whole claim on record today.
+- **Done when:** §14 gains a measured subsection with the set's size and provenance, or records explicitly that the measurement
+  was declined and why.
