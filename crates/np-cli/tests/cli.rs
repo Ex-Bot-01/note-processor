@@ -1951,12 +1951,43 @@ fn search_with_embedding_disabled_refuses_and_names_the_setting() {
         "a runtime refusal is 1:\n{}",
         failed.stderr()
     );
+    // The exact setting, not "some word that appears near the subject". The first version accepted `contains("provider")`,
+    // which the generic trait refusal satisfied while naming nothing a reader could change (Task 6 review P1).
     let stderr = failed.stderr();
     assert!(
-        stderr.contains("embeddings") || stderr.contains("provider"),
-        "the message has to name what to change: {stderr}"
+        stderr.contains(r#"embeddings.provider = "none""#),
+        "the message has to name the setting that switched embedding off: {stderr}"
     );
     assert!(failed.stdout().is_empty(), "a refusal prints no hit list");
+}
+
+#[cfg(not(feature = "local-model"))]
+#[test]
+fn searching_without_the_runtime_names_the_model_that_stayed_owed() {
+    // §6 arm (iv)'s class, from the search side: the row says installed and the file is there, but **this binary** links no
+    // inference runtime. It has to come back as the runtime-not-built refusal naming the model id — not as "this provider
+    // cannot embed a search query", which reads as a capability the seam lacks rather than one build flag (review P1).
+    let ws = workspace();
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nabout alpha\n").expect("test setup: note");
+    run(&mut ws.command(&["scan"])).assert_success();
+    install_model(&ws);
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("alpha");
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stderr());
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("runtime is not built"),
+        "the refusal has to say the runtime is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains(EMBED_MODEL),
+        "and name the model that produced nothing: {stderr}"
+    );
+    assert!(failed.stdout().is_empty());
 }
 
 #[test]
@@ -1976,8 +2007,12 @@ fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
     assert_eq!(failed.code(), 1, "\n{}", failed.stderr());
     let stderr = failed.stderr();
     assert!(
-        stderr.contains("absent") || stderr.contains("artifact"),
+        stderr.contains("artifact") && stderr.contains("absent"),
         "a reader needs to know the artifact is what is missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("   "),
+        "the message wrapped mid-sentence and printed a run of spaces: [{stderr}]"
     );
     assert!(failed.stdout().is_empty());
 }

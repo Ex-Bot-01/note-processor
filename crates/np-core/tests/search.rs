@@ -64,6 +64,44 @@ impl Fixture {
         }
     }
 
+    /// A live note at a **raw** path, so a name that is not valid UTF-8 can be stored (F13 says it can).
+    ///
+    /// [`Fixture::note`] takes `&str`, which cannot express the one case this file needs: two paths that render to the same
+    /// string through `String::from_utf8_lossy`.
+    fn note_at_raw(&self, rel: &[u8], vector: Vec<f32>) {
+        let db = &self.db;
+        db.0.execute(
+            "INSERT INTO files (rel_bytes, case_bytes, rel, case_key, abs, hash, size, mtime, state, last_seen)
+             VALUES (?1, ?1, ?1, ?1, ?2, 'hh', 10, 1, 'ok', 1)",
+            rusqlite::params![rel, "/ws/raw"],
+        )
+        .expect("test setup: file row (raw path)");
+        db.0.execute(
+            "INSERT INTO notes (rel_bytes, rel, title, title_source, encoding, word_count, body)
+             VALUES (?1, ?1, 't', 'h1', 'utf-8', 1, 'b')",
+            rusqlite::params![rel],
+        )
+        .expect("test setup: note row (raw path)");
+        let note_id = db.0.last_insert_rowid();
+        db.0.execute(
+            "INSERT INTO chunks (note_id, ordinal, chunker, text, byte_start, byte_end, source_hash)
+             VALUES (?1, 0, 1, CAST('text' AS BLOB), 0, 4, 'sh')",
+            rusqlite::params![note_id],
+        )
+        .expect("test setup: chunk row (raw path)");
+        let chunk_id = db.0.last_insert_rowid();
+        db::upsert_vector(
+            db,
+            chunk_id,
+            MODEL,
+            DIM,
+            &bytes(&vector),
+            "sh",
+            1_730_000_001,
+        )
+        .expect("test setup: vector row (raw path)");
+    }
+
     /// One figure identified by content `seed` (a stand-in for its 64-hex-digit digest), seen at `paths`.
     fn image(&self, seed: u8, paths: &[&str], vector: Vec<f32>) {
         let hash = format!("{seed:0>64x}");
@@ -71,6 +109,29 @@ impl Fixture {
         let row = db::record_media(db, &hash, 100, "image/png").expect("test setup: media row");
         for path in paths {
             db::link_media_path(db, path.as_bytes(), std::path::Path::new(path), row.id)
+                .expect("test setup: media path");
+        }
+        db::record_media_embedding(
+            db,
+            row.id,
+            MODEL,
+            DIM as i64,
+            &bytes(&vector),
+            &hash,
+            1_730_000_002,
+        )
+        .expect("test setup: media vector");
+    }
+
+    /// [`Fixture::image`] with **raw** path bytes, so a case can put two figures at paths that render alike.
+    fn image_raw(&self, seed: u8, paths: &[&[u8]], vector: Vec<f32>) {
+        let hash = format!("{seed:0>64x}");
+        let db = &self.db;
+        let row = db::record_media(db, &hash, 100, "image/png").expect("test setup: media row");
+        for path in paths {
+            // `abs` is stored and never read by search, so it stays a plain path: raw bytes here would need
+            // `OsStrExt`, which is Unix-only, and this file's cases do not depend on the absolute form.
+            db::link_media_path(db, path, std::path::Path::new("/ws/figure.png"), row.id)
                 .expect("test setup: media path");
         }
         db::record_media_embedding(
@@ -231,6 +292,18 @@ fn an_image_names_its_smallest_live_linker_and_counts_every_one() {
     assert_eq!(image.kind, HitKind::Image);
     assert_eq!(image.source_note.as_deref(), Some("notes/a.md"));
     assert_eq!(image.linked_from, 3);
+
+    // "live" is part of the claim, so deleting a linker has to move both numbers. Without this half the case tested a
+    // count over every note that ever linked the figure, deleted or not (Task 6 review).
+    f.make_stale("notes/a.md");
+    let after = f.search(QUERY, 10).expect("search: ok after deletion");
+    let image = &after[0];
+    assert_eq!(
+        image.source_note.as_deref(),
+        Some("notes/m.md"),
+        "the smallest **live** linker is now `m`, not the deleted `a`"
+    );
+    assert_eq!(image.linked_from, 2, "a deleted note stops counting");
 }
 
 #[test]
@@ -296,7 +369,13 @@ fn a_note_only_index_answers_with_note_hits() {
         .search(QUERY, 10)
         .expect("a note-only index is searchable");
     assert_eq!(scores(&hits), vec!["note:notes/a.md", "note:notes/b.md"]);
-    assert!(hits.iter().all(|hit| hit.kind == HitKind::Note));
+    // Not `all(kind == Note)`: `scores` already prints the kind, so that assertion could never fail on its own. What a note
+    // hit must never do is borrow the figure fields — it has no linker and reports none.
+    assert!(
+        hits.iter()
+            .all(|hit| hit.source_note.is_none() && hit.linked_from == 0),
+        "a note is not linked from another note: {hits:?}"
+    );
 }
 
 #[test]
@@ -338,8 +417,19 @@ fn an_id_with_no_vectors_while_another_holds_them_refuses_by_id() {
     // The §12 exit-1 case: somebody embedded this workspace, just not under the id the config names (stale config,
     // typo, or an index built before a re-install). "Nothing indexed" would send the reader to `np embed` for nothing.
     let f = Fixture::new();
-    db::insert_model(&f.db, "other@1", DIM as i64, None, "", "", 1)
-        .expect("test setup: second model row");
+    // The other model carries a digest on purpose. §8's rule 8 forbids this message from naming another model's artifact,
+    // and an assertion of "contains no path" proves nothing when the database holds no path to name — so the row is written
+    // with the shape a real install writes, digest included (Task 6 review P2).
+    db::insert_model(
+        &f.db,
+        "other@1",
+        DIM as i64,
+        Some("a]bd[cef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
+        "d:",
+        "q:",
+        1,
+    )
+    .expect("test setup: second model row");
     f.note("notes/a.md", vec![vec![1.0, 0.0]]); // stored under `other@1` below, not under MODEL
 
     let err = search::search(&f.db, "typo@9", &bytes(QUERY), 10)
@@ -348,11 +438,115 @@ fn an_id_with_no_vectors_while_another_holds_them_refuses_by_id() {
         SearchError::NoVectorsForModel { model } => assert_eq!(model, "typo@9"),
         other => panic!("wrong refusal: {other:?}"),
     }
-    // §8's rule 8: names what to change, and carries no path and no URL.
+    // §8's rule 8: names what to change, and carries no path, no URL, and nothing from the other model's row.
     let text = err.to_string();
     assert!(text.contains("typo@9"), "{text}");
     assert!(!text.contains('/'), "{text}");
     assert!(!text.contains("http"), "{text}");
+    assert!(
+        !text.contains("other@1"),
+        "names the configured id, not the other one: {text}"
+    );
+    assert!(
+        !text.contains("bd[cef0123456789"),
+        "the other model's digest must not travel in a refusal: {text}"
+    );
+}
+
+#[test]
+fn a_stored_row_holding_not_a_number_is_refused_rather_than_ranked() {
+    // The schema's CHECK on a vector column tests byte length and type, never value, so `NaN` can be stored by anything that
+    // writes the database directly. Ranked, it wins: `total_cmp` puts +NaN above every real score, so one corrupt row would
+    // top the list and outrank the note that actually matches (Task 6 review P1).
+    let f = Fixture::new();
+    f.note("notes/good.md", vec![vec![1.0, 0.0]]);
+    f.note("notes/corrupt.md", vec![vec![f32::NAN, 0.0]]);
+
+    let err = f
+        .search(QUERY, 10)
+        .expect_err("a row that is not a number is a fault, not a hit");
+    match &err {
+        SearchError::StoredRow { model, dim, .. } => {
+            assert_eq!(model, MODEL);
+            assert_eq!(*dim, DIM);
+        }
+        other => panic!("wrong refusal: {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(text.contains("not a number"), "{text}");
+    assert!(
+        !text.contains("notes/corrupt.md"),
+        "no path in a fault: {text}"
+    );
+}
+
+#[test]
+fn two_notes_whose_names_render_alike_stay_two_hits() {
+    // `notes/caf\u{e9}.md` and `notes/caf<U+FFFD>.md` are different files whose stored bytes both render to
+    // `notes/caf\u{FFFD}.md`. Keying the fold on the rendered form collapsed them into one hit reporting the higher score —
+    // a merged row no note owns, which is what keying on `rel_bytes` prevents.
+    let f = Fixture::new();
+    f.note_at_raw(b"notes/caf\xe9.md", vec![1.0, 0.0]);
+    f.note_at_raw("notes/caf\u{FFFD}.md".as_bytes(), vec![0.6, 0.8]);
+
+    let hits = f.search(QUERY, 10).expect("search: ok");
+    assert_eq!(
+        hits.len(),
+        2,
+        "one file is not two hits' worth of score: {hits:?}"
+    );
+    assert_eq!(
+        hits[0].score, 1.0,
+        "the byte-smaller path keeps its own score: {hits:?}"
+    );
+    // A different *direction*, not a different magnitude: cosine ignores length, so `[0.5, 0]` would also score 1.0 and the
+    // assertion would be comparing two identical numbers.
+    assert!(
+        (hits[1].score - 0.6).abs() < 1e-6,
+        "the other keeps its own cosine: {hits:?}"
+    );
+    assert_eq!(
+        hits[0].path, hits[1].path,
+        "both render alike, which is the point of the case"
+    );
+}
+
+#[test]
+fn a_tie_between_two_identical_hits_does_not_fall_back_to_row_order() {
+    // The last two sort keys exist for exactly this fixture, and only this shape can see them. Two figures render to the same
+    // display path — one stored as UTF-8 `img/x\u{FFFD}.png`, one as the single non-UTF-8 byte `img/x\xe9.png` — with the same
+    // score. Row order would rank the rowid-smaller one (the UTF-8 one, inserted first) ahead; the stored-bytes rule ranks
+    // the byte-smaller one (`0xE9 < 0xEF`) ahead.
+    //
+    // They are still distinguishable: a figure whose name cannot round-trip through `links.target` (TEXT, so a non-UTF-8 name
+    // arrives already lossy-decoded — §6's documented undercount) has no linker, while the UTF-8 one is linked from two notes.
+    // So `linked_from` says which rule the implementation used, and a comparator that returns `Equal` here hands the answer to
+    // `ORDER BY e.media_id` — the rowid fallback §12's ordering note rules out.
+    let f = Fixture::new();
+    for name in ["notes/one.md", "notes/two.md"] {
+        f.note(name, vec![vec![0.0, 1.0]]);
+        f.link(name, "../img/x\u{FFFD}.png");
+    }
+    // Inserted first: the UTF-8 form, so it owns the smaller `media_id` and the two linkers.
+    f.image_raw(31, &[b"img/x\xef\xbf\xbd.png"], vec![1.0, 0.0]);
+    // Inserted second: byte-smaller, unlinkable, therefore zero linkers.
+    f.image_raw(32, &[b"img/x\xe9.png"], vec![1.0, 0.0]);
+
+    let hits = f.search(QUERY, 10).expect("search: ok");
+    let images: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.kind == HitKind::Image)
+        .collect();
+    assert_eq!(images.len(), 2, "two figures, one rendered path: {hits:?}");
+    assert_eq!(images[0].path, images[1].path, "the point of the case");
+    assert_eq!(
+        images[0].linked_from, 0,
+        "the byte-smaller figure (no linkable name) leads; a count of 2 here means row order decided: {images:?}"
+    );
+    assert_eq!(
+        images[1].linked_from, 2,
+        "both notes link the UTF-8 form: {images:?}"
+    );
 }
 
 #[test]

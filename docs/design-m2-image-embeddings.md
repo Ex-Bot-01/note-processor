@@ -211,8 +211,15 @@ refuses as `outside-workspace` first. A note that wants a remote figure shows th
 **Lifecycle, which the first draft left undefined.** **A media row lives while at least one live path in `media_path` exists
 and at least one live note links one of those paths.** The embed pass computes that set from the same scan that produced the
 links: unlinking a diagram removes its `media_path` row, and when the last one goes the media row goes with it, `ON DELETE
-CASCADE` taking the vectors — the same shape as D3/D5's "vectors die only with their row", so an orphaned diagram cannot
-haunt `np search` after its last note is gone. Nothing is deleted by `scan`, which never has a runtime in hand.
+CASCADE` taking the vectors — the same shape as D3/D5's "vectors die only with their row".
+
+**When that stops being true, which is the pass's schedule and not a promise about reads.** The set above is computed by the
+text path's sweep, so it becomes true at the next `np embed` — not when a note is deleted. Between those two moments
+`np search` can still rank a figure whose last linking note is gone: its `media_path` row survives (§7 rule 4 protects figures
+that are merely absent today, so an unmounted volume does not delete anyone's vectors), and `prune_unlinked_media` deletes rows
+holding **no path row at all**, which is a different question from "no live note links it". A read-only command cannot close the
+window without writing, and writing would break §12's rule that search changes nothing, so the window is documented rather than
+closed. Nothing is deleted by `scan`, which never has a runtime in hand.
 
 **Which note a hit reports.** One diagram, five linking notes: the vector belongs to the file, and the report line names one
 source **deterministically** — the lexicographically smallest live `rel_bytes` among the linking notes — with the count

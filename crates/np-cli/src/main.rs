@@ -64,11 +64,15 @@ enum Command {
     /// `<workspace>` is an operand for the same reason `scan` and `embed` take it: the index lives under this
     /// workspace's key ([`Config::workspace_db`]), so a command without one could not find a database to read.
     ///
-    /// The command **reads only** — no migration, no stamp, no row written ([`np_core::search`]). Exit codes follow every
-    /// other command: a missing argument is clap's 2, and anything the runtime refuses (no provider, no artifact to embed
-    /// the query with, an id nobody installed while another holds the vectors) is 1. **Which kinds are indexed is not a
-    /// refusal** — a note-only corpus is searchable, and so is an image-only one — and an index with no vectors at all prints
-    /// one line and exits 0.
+    /// The command writes **no vector, no stamp and no note row** ([`np_core::search`] prepares nothing but `SELECT`s).
+    /// Opening the workspace database is not covered by that promise: like every other command, `workspace_db` creates the
+    /// directory and runs migrations if this is the first run here — "read-only" describes what search changes about the
+    /// index, not what opening a database touches.
+    ///
+    /// Exit codes follow every other command: a missing argument is clap's 2, and anything the runtime refuses (no provider,
+    /// no artifact to embed the query with, an id nobody installed while another holds the vectors) is 1. **Which kinds are
+    /// indexed is not a refusal** — a note-only corpus is searchable, and so is an image-only one — and an index with no
+    /// vectors at all prints one line and exits 0.
     Search {
         /// Workspace root whose index to read.
         workspace: PathBuf,
@@ -390,8 +394,13 @@ fn search_workspace(
     let db = workspace_db(&cfg, workspace)?;
     let resolved = embed_provider(&cfg, workspace)?;
     let Some(provider) = resolved.provider.as_ref() else {
-        return Err("no embedding provider for this workspace: its model artifact is absent, so the query cannot be                     embedded"
-            .into());
+        // One line, spelled out here rather than assembled across a wrapped literal: the first version broke mid-sentence
+        // and printed a run of twenty spaces between "be" and "embedded".
+        return Err(
+            "no embedding provider for this workspace: its model artifact is absent, \
+             so the query cannot be embedded"
+                .into(),
+        );
     };
     // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
     // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
@@ -436,11 +445,7 @@ fn search_workspace(
     Ok(())
 }
 
-/// One hit as the JSON shape §12 names: `{score, kind, path, source_note, linked_from}`.
-///
-/// `source_note` and `linked_from` are absent for a note hit — a note is not "from" another note, and printing `null` /
-/// `0` there would make a reader ask which of the two meanings a zero carries.
-/// One hit as JSON: **the same five keys whatever the kind**.
+/// One hit as JSON: **the same five keys whatever the kind** — `{score, kind, path, linked_from, source_note}`.
 ///
 /// The first version added `linked_from` and `source_note` only for image hits, which made the schema depend on a value
 /// inside the object — a reader then has to branch on `kind` before it knows whether a key is there, and a note hit whose

@@ -23,7 +23,11 @@ use crate::embed::{EmbedError, Vector, COMPONENT_BYTES};
 use crate::media;
 
 /// What a hit is: a note's prose, or an image a note links (§12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a hit points at.
+///
+/// The derive order (`Note`, `Image`) is the search tie-break's last resort after path and stored bytes, so it is part of the
+/// ordering contract rather than a coincidence of declaration — see [`search`]'s "Ordering" note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HitKind {
     /// A note, scored by its best-matching chunk.
     Note,
@@ -86,11 +90,6 @@ pub enum SearchError {
         norm: f64,
     },
     /// No `models` row answers to that id.
-    #[error("no model named \"{model}\" is installed in this workspace; run np models list to see the ids this workspace has")]
-    ModelAbsent {
-        /// The id that was asked for, verbatim.
-        model: String,
-    },
     /// The configured model id holds no vectors while this database holds some under a **different** id.
     ///
     /// This is the mismatch §12's exit-1 refusal is for: a stale `[embeddings] model`, a typo, or an index built before a
@@ -140,7 +139,10 @@ pub enum SearchError {
 ///   identity is deliberately not reported (§12 shows a path, and §6 keeps a note's identity at its path).
 /// * **Liveness fenced exactly like [`db::live_chunks`]**: `JOIN files f ON f.rel_bytes = n.rel_bytes WHERE f.state =
 ///   'ok'`. A deleted note keeps its rows and its vectors (D3), so an un-fenced read would rank a file no catalog can
-///   show. Media rows need no fence of their own: [`db::prune_unlinked_media`] already took any row no live path holds.
+///   show. Media rows get no fence here, and the reason is worth stating exactly: [`db::prune_unlinked_media`] deletes media
+///   rows that hold **no path row at all**, so a figure whose last linking note was deleted still has its path row and its
+///   vector until an embed pass runs its sweep. A stale figure can therefore be ranked by this command; retiring it is the
+///   writer's job (§6's lifecycle), and a read-only reader cannot run a sweep without breaking the rule above.
 /// * **Vectors compared as stored.** Stored rows are not re-normalised (the encoder wrote unit rows, and re-scaling
 ///   would hide a corrupt one); the query's length is asserted instead — see [`SearchError::NotUnitNorm`].
 /// * **Empty is a fact, and coverage is not a condition.** Search never embeds anything itself, so it answers from
@@ -151,7 +153,8 @@ pub enum SearchError {
 ///
 /// # Ordering
 ///
-/// Descending `score`, ties broken by `path` ascending. See the module note for why that is load-bearing.
+/// Descending `score`, then `path` ascending, then kind, then the stored path bytes — a total order with no fallback to row
+/// arrival order. See the module note for why that is load-bearing.
 pub fn search(
     conn: &Db,
     model: &str,
@@ -177,17 +180,35 @@ pub fn search(
         return Ok(Vec::new());
     }
 
-    let mut hits = notes;
-    hits.extend(images);
-    // Descending score, then ascending path. `total_cmp` rather than `partial_cmp` because a score is never `NaN` by
-    // construction (see [`cosine`]) and an `Option<Ordering>` in a sort key is a place for a silent `Equal`.
-    hits.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.path.cmp(&b.path))
+    let mut ranked = notes;
+    ranked.extend(images);
+    // Descending score, then ascending path, then kind, then the stored bytes. `total_cmp` rather than `partial_cmp` because
+    // a score is never non-finite once [`stored_vector`] has decoded the row it came from (a `NaN` component compares
+    // unordered, and an unordered head silently decides the order of everything under it); an `Option<Ordering>` in a sort
+    // key would be a place for a silent `Equal`. The last two keys exist because the display path is lossy: two rows can
+    // share one rendered path while being different files, and without a byte-level key their order is arrival order —
+    // `a_tie_between_two_identical_hits_does_not_fall_back_to_row_order` kills that mutant. The **kind** key is the one part
+    // of this comparator no case can reach: it decides only between a note and a figure at the same rendered path, which a
+    // real corpus cannot produce (notes are `.md`, figures are png/jpg) and no fixture finds worth writing. It keeps the
+    // order total; it is not tested, and says so rather than borrowing the neighbouring case's proof.
+    ranked.sort_by(|a, b| {
+        b.hit
+            .score
+            .total_cmp(&a.hit.score)
+            .then_with(|| a.hit.path.cmp(&b.hit.path))
+            .then_with(|| a.hit.kind.cmp(&b.hit.kind))
+            .then_with(|| a.key.cmp(&b.key))
     });
-    hits.truncate(limit);
-    Ok(hits)
+    ranked.truncate(limit);
+    Ok(ranked.into_iter().map(|ranked| ranked.hit).collect())
+}
+
+/// A hit plus the one key its order needs that [`Hit`] does not carry: the path as stored, before it was rendered.
+struct Ranked {
+    hit: Hit,
+    /// Raw `rel_bytes` / `media_path.rel_bytes`. Kept beside the hit rather than folded into it because two distinct byte
+    /// paths can render to one string, and then this is the only thing that separates them.
+    key: Vec<u8>,
 }
 
 /// The query as components, after the check that makes a comparison meaningful.
@@ -226,6 +247,33 @@ fn any_vectors_exist(conn: &Db) -> Result<bool, SearchError> {
     Ok(value != 0)
 }
 
+/// A stored row decoded, with its components proven finite.
+///
+/// The extra step over [`Vector::from_bytes`] is not paranoia about the encoder: the schema's `CHECK` on a vector column
+/// tests byte length and `typeof`, never value, so a row can hold a `NaN` or an infinity and read as a perfectly shaped
+/// vector. Ranking one would put a non-finite score in the list — see [`search`]'s ordering note — and "which row is corrupt"
+/// is a fact the reader needs now rather than an ordering accident to explain later, so it is refused as
+/// [`SearchError::StoredRow`] naming the model and width.
+fn stored_vector(bytes: &[u8], dim: usize, model: &str) -> Result<Vector, SearchError> {
+    let stored = Vector::from_bytes(bytes, dim).map_err(|err| SearchError::StoredRow {
+        model: model.to_string(),
+        dim,
+        reason: err,
+    })?;
+    if let Some(index) = stored
+        .components()
+        .iter()
+        .position(|component| !component.is_finite())
+    {
+        return Err(SearchError::StoredRow {
+            model: model.to_string(),
+            dim,
+            reason: EmbedError::NonFiniteComponent { index },
+        });
+    }
+    Ok(stored)
+}
+
 /// Cosine of two rows, `0.0` when either has no length.
 ///
 /// A zero-length stored row is not something the encoder writes — but a hand-written fixture or a half-written blob can,
@@ -262,7 +310,7 @@ fn norm_of(components: &[f32]) -> f64 {
 }
 
 /// One hit per live note with at least one vector under `model`, scored by its best chunk.
-fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchError> {
+fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Ranked>, SearchError> {
     let mut statement = conn
         .0
         .prepare_cached(
@@ -284,10 +332,11 @@ fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchE
             ))
         })
         .map_err(DbError::from)?;
-    // Best score per path. A BTreeMap keyed by the display path is what makes the tie rule cheap to state: two live note
-    // rows that lossy-decode identically (F13 allows it) share one display path and therefore one hit, which is the same
-    // collapse §6's `Hit::path` already implies.
-    let mut best: BTreeMap<String, f64> = BTreeMap::new();
+    // Best score per note, keyed by the **stored bytes** of its path. Keying on the rendered form was the first version, and
+    // it is wrong in a way the display hides: two files whose names differ only in bytes that are not valid UTF-8 (F13 lets
+    // them exist) lossy-decode to one string, so two unrelated notes would fold into one hit reporting the higher of their
+    // two scores — a merged row no note owns.
+    let mut best: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
     for row in rows {
         let (rel_bytes, dim, bytes) = row.map_err(DbError::from)?;
         let dim = usize::try_from(dim).unwrap_or(usize::MAX);
@@ -300,14 +349,9 @@ fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchE
         }
         // The width check above is what makes this decode total; the arm stays because a row written by a future
         // migration is not this reader's problem to guess at.
-        let stored = Vector::from_bytes(&bytes, dim).map_err(|err| SearchError::StoredRow {
-            model: model.to_string(),
-            dim,
-            reason: err,
-        })?;
+        let stored = stored_vector(&bytes, dim, model)?;
         let score = cosine(query.components(), stored.components());
-        let path = String::from_utf8_lossy(&rel_bytes).to_string();
-        best.entry(path)
+        best.entry(rel_bytes)
             .and_modify(|held| {
                 if score > *held {
                     *held = score;
@@ -317,18 +361,21 @@ fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchE
     }
     Ok(best
         .into_iter()
-        .map(|(path, score)| Hit {
-            score,
-            kind: HitKind::Note,
-            path,
-            source_note: None,
-            linked_from: 0,
+        .map(|(key, score)| Ranked {
+            hit: Hit {
+                score,
+                kind: HitKind::Note,
+                path: String::from_utf8_lossy(&key).to_string(),
+                source_note: None,
+                linked_from: 0,
+            },
+            key,
         })
         .collect())
 }
 
 /// One hit per image this model has a vector for.
-fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchError> {
+fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Ranked>, SearchError> {
     let linkers = linker_index(conn)?;
     let mut statement = conn
         .0
@@ -361,37 +408,37 @@ fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, Search
         }
         // The width check above is what makes this decode total; the arm stays because a row written by a future
         // migration is not this reader's problem to guess at.
-        let stored = Vector::from_bytes(&bytes, dim).map_err(|err| SearchError::StoredRow {
-            model: model.to_string(),
-            dim,
-            reason: err,
-        })?;
-        let Some((path, source_note, linked_from)) = media_report(conn, media_id, &linkers)? else {
+        let stored = stored_vector(&bytes, dim, model)?;
+        let Some((key, source_note, linked_from)) = media_report(conn, media_id, &linkers)? else {
             // A media row with no path row is a row `prune_unlinked_media` has not reached yet (a run that skipped its
             // sweep). There is no workspace path to name, so there is nothing a reader could open: report nothing rather
             // than a hit whose path column is empty.
             continue;
         };
-        hits.push(Hit {
-            score: cosine(query.components(), stored.components()),
-            kind: HitKind::Image,
-            path,
-            source_note,
-            linked_from,
+        hits.push(Ranked {
+            hit: Hit {
+                score: cosine(query.components(), stored.components()),
+                kind: HitKind::Image,
+                path: String::from_utf8_lossy(&key).to_string(),
+                source_note,
+                linked_from,
+            },
+            key,
         });
     }
     Ok(hits)
 }
 
-/// `(display path, smallest live linker, linker count)` for one media row, or `None` when it holds no path.
+/// `(smallest stored path, smallest live linker, linker count)` for one media row, or `None` when it holds no path.
 ///
 /// Both the path and the note are chosen by **smallest bytes**, not by insertion order: `media_path` is keyed by
 /// `rel_bytes` and `links` by note id, and either could come back in a different sequence after a rename or a re-scan.
+/// The path comes back as bytes rather than rendered text because [`search`] needs the un-lossy form to break ties.
 fn media_report(
     conn: &Db,
     media_id: i64,
     linkers: &Linkers,
-) -> Result<Option<(String, Option<String>, usize)>, SearchError> {
+) -> Result<Option<MediaReport>, SearchError> {
     let mut statement = conn
         .0
         .prepare_cached("SELECT rel_bytes FROM media_path WHERE media_id = ?1 ORDER BY rel_bytes")
@@ -419,11 +466,7 @@ fn media_report(
         .first()
         .map(|note| String::from_utf8_lossy(note).to_string());
     let linked_from = notes.len();
-    Ok(Some((
-        String::from_utf8_lossy(smallest).to_string(),
-        source_note,
-        linked_from,
-    )))
+    Ok(Some((smallest.clone(), source_note, linked_from)))
 }
 
 /// Which live notes link each workspace figure path.
@@ -471,3 +514,8 @@ fn linker_index(conn: &Db) -> Result<Linkers, SearchError> {
 
 /// Every live note that links one workspace figure path, by path.
 type Linkers = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
+
+/// What one media row reports: its smallest **stored** path bytes, the smallest live note that links it, and how many live
+/// notes link it. A name for this pair-of-pairs because [`media_report`]'s bare return type trips `clippy::type_complexity`,
+/// and a reader of that signature deserves the words anyway.
+type MediaReport = (Vec<u8>, Option<String>, usize);

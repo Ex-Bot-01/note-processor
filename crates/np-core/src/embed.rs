@@ -309,6 +309,14 @@ pub enum EmbedError {
     /// permanent footnote.
     #[error("malformed vector buffer: {len} bytes is not a whole number of f32 components")]
     Malformed { len: usize },
+    /// A decoded vector holding a component that is not a finite number; `index` names the first one found.
+    ///
+    /// Nothing the encoder writes can produce one — its rows are unit length by construction — but a hand-written fixture,
+    /// a half-written blob, or a database edited outside this program can: `db.rs`'s `CHECK` on a vector column tests byte
+    /// length and type, never value. Refused rather than ranked because one non-finite component makes the whole cosine
+    /// non-finite, and a score that compares unordered silently decides the order of everything it is sorted against.
+    #[error("vector holds a component that is not a number (component {index})")]
+    NonFiniteComponent { index: usize },
     /// The `local-model` provider was asked to embed and cannot: this build contains no inference
     /// runtime. `model_id` is the row it was built from, so the refusal says which model stayed owed.
     ///
@@ -553,6 +561,14 @@ impl Embedder for NoEmbeddingProvider {
     fn embed(&self, _texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
         Err(EmbedError::Disabled)
     }
+
+    /// [`EmbedError::Disabled`] rather than the trait's default refusal, because the default says *this provider cannot
+    /// embed a search query* and that is not what is wrong: nothing is unavailable, embedding is switched off, and the
+    /// setting that switches it off has a name (`embeddings.provider = "none"`). `np search` prints this text verbatim, so
+    /// the general arm would have told a reader to go find a provider when the answer is one config line (Task 6 review P1).
+    fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
+        Err(EmbedError::Disabled)
+    }
 }
 
 /// The provider behind `embeddings.provider = "local-model"`: one installed [`ModelRow`], the artifact it
@@ -745,6 +761,18 @@ impl Embedder for LocalModelProvider {
     /// `local_model::LazyLocalEmbedder` instead and vectors are computed, so this refusal is what a **default**
     /// binary answers rather than something no binary can do.
     fn embed(&self, _texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
+        Err(EmbedError::RuntimeNotBuilt {
+            model_id: self.model_id.clone(),
+        })
+    }
+
+    /// [`EmbedError::RuntimeNotBuilt`] for the same reason `embed` gives it: a default build cannot turn text into numbers,
+    /// and it matters which model stayed owed.
+    ///
+    /// Overriding is not cosmetic. The trait's default refuses too, but with "this provider cannot embed a search query",
+    /// which reads as a capability the seam lacks rather than the one fact a reader can act on — that this binary was
+    /// compiled without the runtime (§9 item 1). Task 6 review P1.
+    fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
         Err(EmbedError::RuntimeNotBuilt {
             model_id: self.model_id.clone(),
         })
