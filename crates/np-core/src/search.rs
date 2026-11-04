@@ -40,6 +40,13 @@ impl HitKind {
     }
 }
 
+impl std::fmt::Display for HitKind {
+    /// The same word as [`HitKind::label`], so an error message and a report line cannot drift apart.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// One ranked answer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -110,6 +117,16 @@ pub enum SearchError {
     /// The query bytes are not a vector at all (a ragged buffer, or a width no `dim` can name).
     #[error("query vector: {0}")]
     QueryVector(#[from] EmbedError),
+    /// A stored row cannot be decoded at the width its own `dim` declares.
+    #[error("model \"{model}\" holds a {dim}-dimensional row that does not read as a vector: {reason}")]
+    StoredRow {
+        /// The id whose rows were read.
+        model: String,
+        /// The width the row declares.
+        dim: usize,
+        /// Why the bytes are not that width.
+        reason: EmbedError,
+    },
     /// The database could not be read.
     #[error("database: {0}")]
     Db(#[from] DbError),
@@ -241,20 +258,20 @@ fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchE
            JOIN files f ON f.rel_bytes = n.rel_bytes
           WHERE e.model = ?1 AND f.state = 'ok'
           ORDER BY n.rel_bytes, c.id",
-    )?;
+    ).map_err(DbError::from)?;
     let rows = statement.query_map(rusqlite::params![model], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, Vec<u8>>(2)?,
         ))
-    })?;
+    }).map_err(DbError::from)?;
     // Best score per path. A BTreeMap keyed by the display path is what makes the tie rule cheap to state: two live note
     // rows that lossy-decode identically (F13 allows it) share one display path and therefore one hit, which is the same
     // collapse §6's `Hit::path` already implies.
     let mut best: BTreeMap<String, f64> = BTreeMap::new();
     for row in rows {
-        let (rel_bytes, dim, bytes) = row?;
+        let (rel_bytes, dim, bytes) = row.map_err(DbError::from)?;
         let dim = usize::try_from(dim).unwrap_or(usize::MAX);
         if dim != query.dim() || bytes.len() != dim * COMPONENT_BYTES {
             return Err(SearchError::DimensionMismatch {
@@ -263,10 +280,12 @@ fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchE
                 query: query.dim(),
             });
         }
-        let stored = Vector::from_bytes(&bytes, dim).map_err(|_| SearchError::DimensionMismatch {
+        // The width check above is what makes this decode total; the arm stays because a row written by a future
+        // migration is not this reader's problem to guess at.
+        let stored = Vector::from_bytes(&bytes, dim).map_err(|err| SearchError::StoredRow {
             model: model.to_string(),
-            stored: dim,
-            query: query.dim(),
+            dim,
+            reason: err,
         })?;
         let score = cosine(query.components(), stored.components());
         let path = String::from_utf8_lossy(&rel_bytes).to_string();
@@ -298,17 +317,17 @@ fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, Search
            FROM media_embeddings e
           WHERE e.model = ?1
           ORDER BY e.media_id",
-    )?;
+    ).map_err(DbError::from)?;
     let rows = statement.query_map(rusqlite::params![model], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, Vec<u8>>(2)?,
         ))
-    })?;
+    }).map_err(DbError::from)?;
     let mut hits = Vec::new();
     for row in rows {
-        let (media_id, dim, bytes) = row?;
+        let (media_id, dim, bytes) = row.map_err(DbError::from)?;
         let dim = usize::try_from(dim).unwrap_or(usize::MAX);
         if dim != query.dim() || bytes.len() != dim * COMPONENT_BYTES {
             return Err(SearchError::DimensionMismatch {
@@ -317,10 +336,12 @@ fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, Search
                 query: query.dim(),
             });
         }
-        let stored = Vector::from_bytes(&bytes, dim).map_err(|_| SearchError::DimensionMismatch {
+        // The width check above is what makes this decode total; the arm stays because a row written by a future
+        // migration is not this reader's problem to guess at.
+        let stored = Vector::from_bytes(&bytes, dim).map_err(|err| SearchError::StoredRow {
             model: model.to_string(),
-            stored: dim,
-            query: query.dim(),
+            dim,
+            reason: err,
         })?;
         let Some((path, source_note, linked_from)) = media_report(conn, media_id, &linkers)? else {
             // A media row with no path row is a row `prune_unlinked_media` has not reached yet (a run that skipped its
@@ -346,15 +367,17 @@ fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, Search
 fn media_report(
     conn: &Db,
     media_id: i64,
-    linkers: &BTreeMap<Vec<u8>, BTreeSet<&Vec<u8>>>,
+    linkers: &Linkers,
 ) -> Result<Option<(String, Option<String>, usize)>, SearchError> {
     let mut statement = conn.0.prepare_cached(
         "SELECT rel_bytes FROM media_path WHERE media_id = ?1 ORDER BY rel_bytes",
-    )?;
-    let rows = statement.query_map(params![media_id], |row| row.get::<_, Vec<u8>>(0))?;
+    ).map_err(DbError::from)?;
+    let rows = statement
+        .query_map(params![media_id], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(DbError::from)?;
     let mut paths: Vec<Vec<u8>> = Vec::new();
     for row in rows {
-        paths.push(row?);
+        paths.push(row.map_err(DbError::from)?);
     }
     // `ORDER BY rel_bytes` already did the work; `first` is the smallest, byte-for-byte.
     let Some(smallest) = paths.first() else {
@@ -362,10 +385,10 @@ fn media_report(
     };
     // Every path those bytes were seen at contributes its linkers: one figure copied to two folders, linked from three
     // notes, is one hit with `linked_from: 3` (§6), not two hits with 2 and 1.
-    let mut notes: BTreeSet<&Vec<u8>> = BTreeSet::new();
+    let mut notes: BTreeSet<Vec<u8>> = BTreeSet::new();
     for path in &paths {
         if let Some(holders) = linkers.get(path) {
-            notes.extend(holders.iter().copied());
+            notes.extend(holders.iter().cloned());
         }
     }
     let source_note = notes
@@ -399,14 +422,14 @@ fn linker_index(conn: &Db) -> Result<Linkers, SearchError> {
            JOIN files f ON f.rel_bytes = n.rel_bytes
           WHERE l.origin = ?1 AND l.kind = 'attachment' AND f.state = 'ok'
           ORDER BY n.rel_bytes, l.line",
-    )?;
+    ).map_err(DbError::from)?;
     let rows = statement.query_map(params![db::PROSE_ORIGIN], |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-    })?;
+    }).map_err(DbError::from)?;
     let style = media::PathStyle::native();
     let mut index: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
     for row in rows {
-        let (note_rel, target) = row?;
+        let (note_rel, target) = row.map_err(DbError::from)?;
         // The same rule the embed pass and its sweep apply, so "which note links this figure" has exactly one owner and
         // a hit cannot name a note whose link would not have embedded the figure in the first place.
         let Some(rel) = media::link_target_rel(style, &note_rel, target.as_bytes()) else {

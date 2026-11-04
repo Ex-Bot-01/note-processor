@@ -44,7 +44,10 @@ use crate::models;
 use crate::walk;
 
 /// Bytes per component: the `4` in migration 7's `CHECK (length(vector) = 4 * dim)`.
-const COMPONENT_BYTES: usize = 4;
+///
+/// Public because a reader of stored vectors needs the same divisor ([`crate::search`]) and a second `4` written
+/// somewhere else is a width rule with two owners.
+pub const COMPONENT_BYTES: usize = 4;
 
 /// The canonical spelling of [`EmbedError::Unavailable`] for "this **build and model pair** cannot serve the request":
 /// no projector, no vision graph, tokenization refused, a chunk shape this seam does not implement, a decoder that would
