@@ -4,14 +4,15 @@
 //! **This module writes nothing.** No migration, no `INSERT`, no `UPDATE`, no stamp — not even a benign-looking
 //! `last_seen`. A command that cannot write cannot drift out of sync with the index it reads, which is the whole reason
 //! §12 keeps it a proof of concept rather than folding ranking into `np scan`. Every statement below is a `SELECT`, and
-//! [`no_write_statement_reaches_the_database`] pins the rule by running [`search`] against a connection whose write
-//! calls are refused.
+//! `searching_writes_nothing` in `tests/search.rs` pins the rule (a test name is not a documentation target, so it is
+//! named in plain text rather than linked) by running [`search`] on a connection where every
+//! write fails with `SQLITE_READONLY` (`PRAGMA query_only`).
 //!
 //! **Ordering is part of the contract, not a side effect of the planner.** Hits come back by descending score, and a tie
 //! breaks on `Hit::path` ascending — so a stable index answers the same query with the same list on every host and after
 //! every re-embed. Ordering by rowid would do the opposite: re-embedding one note moves its `chunks.id`, and a hit that
 //! was second could become first without a single score changing (§6's argument for the same rule on
-//! [`Hit::source_note']).
+//! [`Hit::source_note`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -90,19 +91,16 @@ pub enum SearchError {
         /// The id that was asked for, verbatim.
         model: String,
     },
-    /// The model indexes one kind and not the other, so a blended top-k would be a lie.
+    /// The configured model id holds no vectors while this database holds some under a **different** id.
     ///
-    /// §12 ranks notes and images in **one** list. Half an index can still do that — but it can only ever show one kind,
-    /// which reads as "this workspace has no figures" when the truth is "nobody embedded them". Refusing names the id and
-    /// the missing kind, per §8's rule that a refusal says what to change.
-    #[error("model \"{model}\" has {present} vectors but no {missing} vectors; run np embed with a build that can read images (or embed the notes) before searching both kinds together")]
-    HalfIndexed {
-        /// The id that was asked for, verbatim.
+    /// This is the mismatch §12's exit-1 refusal is for: a stale `[embeddings] model`, a typo, or an index built before a
+    /// re-install. It is not "nothing indexed" — somebody did embed this workspace, and answering with an empty list would
+    /// send the reader to `np embed` for nothing. The message names the configured id and what to change, never another
+    /// model's artifact path or URL (§8's rule 8).
+    #[error("no vectors indexed for model \"{model}\" while this index holds vectors under another model id; run np models list to see the ids, then np embed (or point [embeddings] model at the one that was embedded)")]
+    NoVectorsForModel {
+        /// The configured id that answered with nothing.
         model: String,
-        /// Which kind is present, so the message never says "nothing".
-        present: HitKind,
-        /// Which kind is missing.
-        missing: HitKind,
     },
     /// A stored row's width disagrees with the query's.
     #[error("model \"{model}\" stores {stored}-dimensional vectors and the query is {query}-dimensional; re-embed under one model or search with the other")]
@@ -118,7 +116,9 @@ pub enum SearchError {
     #[error("query vector: {0}")]
     QueryVector(#[from] EmbedError),
     /// A stored row cannot be decoded at the width its own `dim` declares.
-    #[error("model \"{model}\" holds a {dim}-dimensional row that does not read as a vector: {reason}")]
+    #[error(
+        "model \"{model}\" holds a {dim}-dimensional row that does not read as a vector: {reason}"
+    )]
     StoredRow {
         /// The id whose rows were read.
         model: String,
@@ -143,8 +143,10 @@ pub enum SearchError {
 ///   show. Media rows need no fence of their own: [`db::prune_unlinked_media`] already took any row no live path holds.
 /// * **Vectors compared as stored.** Stored rows are not re-normalised (the encoder wrote unit rows, and re-scaling
 ///   would hide a corrupt one); the query's length is asserted instead — see [`SearchError::NotUnitNorm`].
-/// * **Empty is a fact.** Ok(empty) means this model stores no vectors of either kind; the caller says so and exits 0.
-///   Half an index, or an id nobody installed, is a refusal.
+/// * **Empty is a fact, and coverage is not a condition.** Search never embeds anything itself, so it answers from
+///   whichever kinds this model has: note-only, image-only, or a blend of both. Ok(empty) means no vectors under this id
+///   and none under any other either — the caller says "nothing indexed" and exits 0. Vectors exist under a **different**
+///   id, which is the case a reader can act on, is [`SearchError::NoVectorsForModel`].
 /// * `limit` is a maximum: `0` returns nothing, more than the population returns everything.
 ///
 /// # Ordering
@@ -156,26 +158,23 @@ pub fn search(
     query_vector: &[u8],
     limit: usize,
 ) -> Result<Vec<Hit>, SearchError> {
-    let query = decode_query(conn, model, query_vector)?;
+    let query = decode_query(query_vector)?;
 
     let notes = note_hits(conn, model, &query)?;
     let images = image_hits(conn, model, &query)?;
 
     if notes.is_empty() && images.is_empty() {
-        // Nothing at all under this id: an empty index is a fact (§12), and the caller prints it.
+        // **Which kind is indexed is not a question search asks.** It never embeds anything itself, so it can only answer
+        // from the half that is indexed — note-only, image-only, or both — and that is exactly why every [`Hit`] carries a
+        // `kind`. What is still worth distinguishing is *whose* vectors they are: nothing indexed anywhere is a fact the
+        // caller prints and exits 0 (§12), while an index that holds vectors under some other id means this command was
+        // pointed at a model nobody embedded, which is a refusal.
+        if any_vectors_exist(conn)? {
+            return Err(SearchError::NoVectorsForModel {
+                model: model.to_string(),
+            });
+        }
         return Ok(Vec::new());
-    }
-    if notes.is_empty() || images.is_empty() {
-        let (present, missing) = if notes.is_empty() {
-            (HitKind::Image, HitKind::Note)
-        } else {
-            (HitKind::Note, HitKind::Image)
-        };
-        return Err(SearchError::HalfIndexed {
-            model: model.to_string(),
-            present,
-            missing,
-        });
     }
 
     let mut hits = notes;
@@ -191,8 +190,8 @@ pub fn search(
     Ok(hits)
 }
 
-/// The query as components, after the checks that make a comparison meaningful.
-fn decode_query(conn: &Db, model: &str, query_vector: &[u8]) -> Result<Vector, SearchError> {
+/// The query as components, after the check that makes a comparison meaningful.
+fn decode_query(query_vector: &[u8]) -> Result<Vector, SearchError> {
     // A ragged buffer is [`EmbedError::Malformed`] rather than a width disagreement: it cannot describe *any* vector, so
     // blaming the index's dimensions would point at the wrong thing (`Vector::from_bytes` makes exactly that distinction).
     let dim = query_vector.len() / COMPONENT_BYTES;
@@ -203,14 +202,28 @@ fn decode_query(conn: &Db, model: &str, query_vector: &[u8]) -> Result<Vector, S
     if (norm - 1.0).abs() > 1e-3 {
         return Err(SearchError::NotUnitNorm { norm });
     }
-    // The `models` row is what makes an id meaningful at all; a search against an uninstalled id must name it rather
-    // than report an empty index that belongs to no model.
-    if db::model_row(conn, model)?.is_none() {
-        return Err(SearchError::ModelAbsent {
-            model: model.to_string(),
-        });
-    }
     Ok(query)
+}
+
+/// Whether this database holds a single vector under **any** model id.
+///
+/// Two `EXISTS` probes rather than a join or a count: each stops at the first row, and "somebody embedded this
+/// workspace, just not under the id you asked with" is all the caller needs to know.
+fn any_vectors_exist(conn: &Db) -> Result<bool, SearchError> {
+    // **Read the projected value; do not use rusqlite's `exists()` here.** That helper answers "did this query return one or
+    // more *rows*" (`statement.rs`: `rows.next()?.is_some()`), and a `SELECT EXISTS(...) OR EXISTS(...)` projection returns
+    // exactly one row even when both subqueries are false — so it answered true for every empty index and an unembedded
+    // workspace was refused instead of reporting "nothing indexed". Reading the integer is the question actually being asked.
+    let mut held = conn
+        .0
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM embeddings) OR EXISTS(SELECT 1 FROM media_embeddings)",
+        )
+        .map_err(DbError::from)?;
+    let value: i64 = held
+        .query_row([], |row| row.get::<_, i64>(0))
+        .map_err(DbError::from)?;
+    Ok(value != 0)
 }
 
 /// Cosine of two rows, `0.0` when either has no length.
@@ -250,22 +263,27 @@ fn norm_of(components: &[f32]) -> f64 {
 
 /// One hit per live note with at least one vector under `model`, scored by its best chunk.
 fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchError> {
-    let mut statement = conn.0.prepare_cached(
-        "SELECT n.rel_bytes, e.dim, e.vector
+    let mut statement = conn
+        .0
+        .prepare_cached(
+            "SELECT n.rel_bytes, e.dim, e.vector
            FROM embeddings e
            JOIN chunks c ON c.id = e.chunk_id
            JOIN notes n ON n.id = c.note_id
            JOIN files f ON f.rel_bytes = n.rel_bytes
           WHERE e.model = ?1 AND f.state = 'ok'
           ORDER BY n.rel_bytes, c.id",
-    ).map_err(DbError::from)?;
-    let rows = statement.query_map(rusqlite::params![model], |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
-    }).map_err(DbError::from)?;
+        )
+        .map_err(DbError::from)?;
+    let rows = statement
+        .query_map(rusqlite::params![model], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(DbError::from)?;
     // Best score per path. A BTreeMap keyed by the display path is what makes the tie rule cheap to state: two live note
     // rows that lossy-decode identically (F13 allows it) share one display path and therefore one hit, which is the same
     // collapse §6's `Hit::path` already implies.
@@ -312,19 +330,24 @@ fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchE
 /// One hit per image this model has a vector for.
 fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Hit>, SearchError> {
     let linkers = linker_index(conn)?;
-    let mut statement = conn.0.prepare_cached(
-        "SELECT e.media_id, e.dim, e.vector
+    let mut statement = conn
+        .0
+        .prepare_cached(
+            "SELECT e.media_id, e.dim, e.vector
            FROM media_embeddings e
           WHERE e.model = ?1
           ORDER BY e.media_id",
-    ).map_err(DbError::from)?;
-    let rows = statement.query_map(rusqlite::params![model], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
-    }).map_err(DbError::from)?;
+        )
+        .map_err(DbError::from)?;
+    let rows = statement
+        .query_map(rusqlite::params![model], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(DbError::from)?;
     let mut hits = Vec::new();
     for row in rows {
         let (media_id, dim, bytes) = row.map_err(DbError::from)?;
@@ -369,9 +392,10 @@ fn media_report(
     media_id: i64,
     linkers: &Linkers,
 ) -> Result<Option<(String, Option<String>, usize)>, SearchError> {
-    let mut statement = conn.0.prepare_cached(
-        "SELECT rel_bytes FROM media_path WHERE media_id = ?1 ORDER BY rel_bytes",
-    ).map_err(DbError::from)?;
+    let mut statement = conn
+        .0
+        .prepare_cached("SELECT rel_bytes FROM media_path WHERE media_id = ?1 ORDER BY rel_bytes")
+        .map_err(DbError::from)?;
     let rows = statement
         .query_map(params![media_id], |row| row.get::<_, Vec<u8>>(0))
         .map_err(DbError::from)?;
@@ -415,17 +439,22 @@ fn media_report(
 /// Live means what [`db::live_chunks`] means by it — `files.state = 'ok'`, joined on the byte key — and only `prose`
 /// origins count, because an approved edge is a claim a human made about a note that may no longer exist.
 fn linker_index(conn: &Db) -> Result<Linkers, SearchError> {
-    let mut statement = conn.0.prepare_cached(
-        "SELECT n.rel_bytes, l.target
+    let mut statement = conn
+        .0
+        .prepare_cached(
+            "SELECT n.rel_bytes, l.target
            FROM links l
            JOIN notes n ON n.id = l.src_note_id
            JOIN files f ON f.rel_bytes = n.rel_bytes
           WHERE l.origin = ?1 AND l.kind = 'attachment' AND f.state = 'ok'
           ORDER BY n.rel_bytes, l.line",
-    ).map_err(DbError::from)?;
-    let rows = statement.query_map(params![db::PROSE_ORIGIN], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-    }).map_err(DbError::from)?;
+        )
+        .map_err(DbError::from)?;
+    let rows = statement
+        .query_map(params![db::PROSE_ORIGIN], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(DbError::from)?;
     let style = media::PathStyle::native();
     let mut index: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
     for row in rows {

@@ -26,7 +26,7 @@ use np_core::models::{
     UnclaimedKind,
 };
 use np_core::scan::{scan, ScanReport};
-use np_core::search::{self, Hit, HitKind};
+use np_core::search::{self, Hit};
 use serde_json::{json, Value};
 
 /// §12's default top-k for `np search --limit`.
@@ -65,9 +65,10 @@ enum Command {
     /// workspace's key ([`Config::workspace_db`]), so a command without one could not find a database to read.
     ///
     /// The command **reads only** — no migration, no stamp, no row written ([`np_core::search`]). Exit codes follow every
-    /// other command: a missing argument is clap's 2, and anything the runtime refuses (no provider, an id nobody
-    /// installed, half an index) is 1. An index with no vectors for this model is not a refusal: it prints one line and
-    /// exits 0.
+    /// other command: a missing argument is clap's 2, and anything the runtime refuses (no provider, no artifact to embed
+    /// the query with, an id nobody installed while another holds the vectors) is 1. **Which kinds are indexed is not a
+    /// refusal** — a note-only corpus is searchable, and so is an image-only one — and an index with no vectors at all prints
+    /// one line and exits 0.
     Search {
         /// Workspace root whose index to read.
         workspace: PathBuf,
@@ -439,20 +440,24 @@ fn search_workspace(
 ///
 /// `source_note` and `linked_from` are absent for a note hit — a note is not "from" another note, and printing `null` /
 /// `0` there would make a reader ask which of the two meanings a zero carries.
+/// One hit as JSON: **the same five keys whatever the kind**.
+///
+/// The first version added `linked_from` and `source_note` only for image hits, which made the schema depend on a value
+/// inside the object — a reader then has to branch on `kind` before it knows whether a key is there, and a note hit whose
+/// linker field is simply absent reads differently from one that has none. Absent and zero are different statements, so this
+/// emits both keys always: `source_note: null` and `linked_from: 0` for a hit that has no linking note (every note hit, and
+/// an orphaned figure). Same rule `EmbedReport::artifact_check` already follows — present and null, not missing.
 fn hit_json(hit: &Hit) -> Value {
-    let mut object = json!({
+    json!({
         "score": hit.score,
         "kind": hit.kind.label(),
         "path": hit.path,
-    });
-    if hit.kind == HitKind::Image {
-        object["linked_from"] = json!(hit.linked_from);
-        object["source_note"] = match &hit.source_note {
+        "linked_from": hit.linked_from,
+        "source_note": match &hit.source_note {
             Some(note) => json!(note),
             None => Value::Null,
-        };
-    }
-    object
+        },
+    })
 }
 
 /// What `[embeddings]` resolved to, and — on the one path that could — what it proved about the artifact's bytes.

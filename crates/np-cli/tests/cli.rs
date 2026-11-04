@@ -1910,6 +1910,78 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
 // in parallel, and following the workspace's own path spelling is part of what is being tested.
 // ---------------------------------------------------------------------------
 
+/// `np search` through the real binary: argv stays clap's to refuse, and every runtime refusal keeps exit 1 with a message
+/// that says what to change (§8) — none of them invents a code, and none writes to stdout.
+#[test]
+fn search_without_a_query_is_claps_to_refuse() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+    // `<workspace>` then `<query>`: the operand order every other subcommand uses, so `Workspace::command` cannot build it
+    // (it appends the workspace last, which would put the query where clap expects the root).
+    let mut cmd = ws.command_without_operand(&["search"]);
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 2, "argv is clap's:\n{}", failed.stderr());
+    assert!(
+        failed.stdout().is_empty(),
+        "a refused argv prints no report"
+    );
+    assert!(
+        failed.stderr().contains("QUERY"),
+        "clap has to name the operand it needs: {}",
+        failed.stderr()
+    );
+}
+
+#[test]
+fn search_with_embedding_disabled_refuses_and_names_the_setting() {
+    let ws = workspace();
+    // No `[embeddings]` section at all: `provider = "none"`, so there is no way to turn the query into a vector.
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nnothing indexed here\n").expect("test setup: note");
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("alpha");
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "a runtime refusal is 1:\n{}",
+        failed.stderr()
+    );
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("embeddings") || stderr.contains("provider"),
+        "the message has to name what to change: {stderr}"
+    );
+    assert!(failed.stdout().is_empty(), "a refusal prints no hit list");
+}
+
+#[test]
+fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
+    let ws = workspace();
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nnothing indexed here\n").expect("test setup: note");
+    run(&mut ws.command(&["scan"])).assert_success();
+    install_model(&ws);
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+    // The row says installed; the file is not there — arm (iii)'s shape, seen from the search side.
+    fs::remove_file(ws.models_dir().join(EMBED_MODEL)).ok();
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("alpha");
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stderr());
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("absent") || stderr.contains("artifact"),
+        "a reader needs to know the artifact is what is missing: {stderr}"
+    );
+    assert!(failed.stdout().is_empty());
+}
+
 #[cfg(feature = "local-model")]
 mod real_model {
     use super::*;
@@ -1956,6 +2028,84 @@ mod real_model {
         )
         .expect("test setup: second note");
         Workspace { _tmp: tmp, root }
+    }
+
+    /// `np search` against vectors a real model wrote. The default-build cases above can only prove the refusals; this is
+    /// the one that proves the ranking path end to end — argv order, the four-decimal text line, and `--json` carrying
+    /// nothing but `hits` — with the query embedded by the same artifact that made the stored rows.
+    #[test]
+    fn searching_a_real_index_answers_in_both_channels() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        run(&mut ws.command(&["scan"])).assert_success();
+        link_artifact(&ws, &artifact, "task: search result | query: ");
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+        run(&mut ws.command(&["embed"])).assert_success();
+
+        let search = |json: bool| {
+            let mut cmd = ws.command_without_operand(&["search"]);
+            cmd.arg(&ws.root).arg("the cat sits on the warm mat");
+            if json {
+                cmd.arg("--json");
+            }
+            run(&mut cmd)
+        };
+
+        let text = search(false);
+        assert_eq!(text.code(), 0, "\n{}", text.stderr());
+        let text_out = text.stdout();
+        let first_line = text_out
+            .lines()
+            .next()
+            .expect("a real index answers with at least one hit");
+        let score = first_line
+            .split_whitespace()
+            .next()
+            .expect("the line starts with the score");
+        assert_eq!(
+            score.split('.').nth(1).map(str::len),
+            Some(4),
+            "the text channel prints four decimals and says so in its own shape: {first_line}"
+        );
+        assert!(
+            first_line.contains("note") && first_line.contains("a.md"),
+            "the cat note has to lead a query about the cat: {}",
+            text_out
+        );
+
+        let json = search(true);
+        assert_eq!(json.code(), 0, "\n{}", json.stderr());
+        let value: serde_json::Value =
+            serde_json::from_str(&json.stdout()).expect("`--json` prints exactly one JSON object");
+        assert_eq!(
+            json_keys(&value),
+            vec!["hits"],
+            "nothing else on stdout — no caveat, no counts, no second key"
+        );
+        let hits = value["hits"].as_array().expect("hits is an array");
+        assert!(
+            !hits.is_empty(),
+            "a query about the cat matches the cat note"
+        );
+        assert_eq!(
+            json_keys(&hits[0]),
+            vec!["kind", "linked_from", "path", "score", "source_note"],
+            "§12's five fields, no extras"
+        );
+        assert_eq!(hits[0]["path"].as_str(), Some("a.md"));
+        assert_eq!(hits[0]["kind"].as_str(), Some("note"));
+        let scores: Vec<f64> = hits
+            .iter()
+            .map(|hit| hit["score"].as_f64().expect("score is a number"))
+            .collect();
+        let mut ordered = scores.clone();
+        ordered.sort_by(|a, b| b.partial_cmp(a).expect("scores are comparable"));
+        assert_eq!(
+            scores,
+            ordered,
+            "the array arrives ranked:\n{}",
+            json.stdout()
+        );
     }
 
     /// Record [`EMBED_MODEL`] as installed, with its bytes **linked** rather than copied into place.

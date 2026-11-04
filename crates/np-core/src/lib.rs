@@ -43,8 +43,8 @@ pub mod pins;
 // The read side of the index: one cosine pass over both vector kinds, with no write anywhere in its path
 // (`docs/design-m2-image-embeddings.md` §12). No feature gate — it reads bytes the schema already holds, so a text-only
 // build can search the images another build embedded.
-pub mod search;
 pub mod scan;
+pub mod search;
 pub mod walk;
 
 // The scan pipeline is the crate's entry point, so its three names are reachable without the module
