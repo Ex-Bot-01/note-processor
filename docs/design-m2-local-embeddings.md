@@ -709,9 +709,34 @@ rather than letting a round discover it:
    key. Pin rot is real — nobody notices an upstream re-upload until first start refuses — so `[models] sha256 = "…"` overrides the pin
    with a loud line saying an unpinned digest was accepted; that is no weaker than today, where any human may pass `--sha256`. Silent
    fallback stays impossible.
+
+   **Amended by the human on 2026-11-04: one origin is now compiled in.** Decided in the R7c scope decisions recorded in
+   `docs/design-m2-image-embeddings.md` §13 — "the installation of the program should trigger the HuggingFace fetch" — and
+   accepted for one reason: **an install that cannot reach a network is an install nobody completes**, and the documented
+   install step ("place the binary, then run `np models fetch`") happens before any config file exists to read. So
+   `pins::DEFAULT_ORIGIN` is `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main` — the repository the pinned
+   digests above were read from, which is the only argument for that host rather than another one.
+
+   The precedence, spelled out because this rule's own paraphrase ("an env override") invites a reading that is not what the
+   code does: **the file's `[models] base_url` → `NP_MODELS_BASE_URL`, which fills that key only when the file leaves it unset
+   → `DEFAULT_ORIGIN`.** The first two steps are `[models]`'s existing rule, unchanged and shared by every key in that section
+   (`crates/np-core/tests/config.rs` pins it); `fetch::resolve_origin` adds the third step and nothing else, so exactly one
+   function answers "which origin did this run dial". A mirror therefore stays **one config line away**, a host with no route
+   to the internet keeps `install --path --sha256`, and what an unconfigured machine now does is make one outbound request
+   during installation instead of being refused.
+
+   What rule 7 still forbids did not move: a **pin row** names no place — a row that grew a URL would break the mirror case and
+   hand rule 8 something to leak — the digest alone decides acceptance, so a different host serving these bytes is
+   indistinguishable from this one, and `[models] sha256` still overrides a pin loudly. `crates/np-core/tests/pins.rs` keeps
+   scanning every row for host-shaped substrings, and now also pins the baked value itself plus §13's member rule: a build
+   without image support plans the primary artifact alone, a `vision` build plans both.
 8. **Refusals name a class, never a URL.** Rule 6's "name what was attempted" is bounded by rule 7: `source_kind`, repo and filename,
    HTTP status class — no host, no full URL, because client error strings carry them and this text lands in CI logs. R7b ships a test
    that no substring of a loopback base URL appears in any refusal (parent §7's `127.0.0.1:0` precedent).
+   Rule 7's 2026-11-04 amendment did not move this boundary: the compiled-in origin is a value an operator may override, never
+   one a message may print — `crates/np-core/tests/fetch.rs` now carries `DEFAULT_ORIGIN` and its host on the same no-leak list
+   as the loopback address, and np-cli's capability refusal ("this binary was built without image support") is written to name
+   a capability rather than a place.
 9. **Streaming digests need one home.** `hash.rs` exposes `sha256_file`/`sha256_bytes` only; the fetcher needs an incremental hasher
    because it hashes while counting progress. That goes in `hash.rs` as the program's single SHA-256 definition with two callers — not a
    second one, and not a `sha2` dependency outside np-core (install design §3 refuses exactly that).

@@ -389,18 +389,29 @@ names a class rather than a URL.
 Two consequences of that decision are load-bearing, and both amend existing rules rather than sneak past them:
 
 * **A default origin enters the pin table.** `fetch` currently requires `[models] base_url` or `NP_MODELS_BASE_URL`, because
-  `docs/design-m2-models-install.md` §12 rule 7 makes the *host* configuration and the pin table say only *what to accept*. An install-time fetch has no config
+  `docs/design-m2-local-embeddings.md` §12 rule 7 makes the *host* configuration and the pin table say only *what to accept*.
+  *(This bullet first cited "models-install §12"; that document has no §12 — it ends at §9. Corrected 2026-11-04, when the
+  amendment was written into the rule where it actually stands.)* An install-time fetch has no config
   file yet, so it needs a baked-in default: `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main` — where the
   pinned digests came from. **Rule 7's intent survives the amendment**: the digest still decides acceptance, so a different
   host serving the same bytes is indistinguishable from the right one, and `[models] base_url` / `NP_MODELS_BASE_URL` still
   override for a mirror or an air-gapped network. What changes is that a machine with no configuration will make one outbound
   request during installation. That is the human's call, made in these words ("the installation of the program should trigger
   the HuggingFace fetch"), and it is written here so a future reader finds a decision rather than an unexplained default.
+  As landed on 2026-11-04, the precedence is `[models] base_url` → `NP_MODELS_BASE_URL` (which fills that key only when the
+  file leaves it unset — `config.rs`'s existing rule for this section, not an override) → the baked default, in one function:
+  `fetch::resolve_origin`.
 * **Fetch what this binary can use.** A release build has no `local-model`, so pulling 309 MB of weights it cannot load would
   be waste dressed as convenience; a `local-model` build without `vision` has no use for the 554 MB projector either. So the
   member set fetched by default is **the members this binary can consume** — primary only for a text-only build, both for a
   vision build — with `--member` still explicit for anyone fetching on behalf of a different build. That same design's rule that a refusal
-  never names an origin is unchanged.
+  never names an origin is unchanged, and the refusal §13 adds names the missing capability: asking a text-only build to fetch
+  `mmproj` is refused because it has no image support, not because nothing pins that member.
+  As landed on 2026-11-04 the gate is `vision` alone — `pins::members_for_build()` returns the primary artifact on every build
+  and adds the projector when `vision` is on. Whether a build with no `local-model` at all should skip the **primary** as well was
+  not decided in these words, and shipping that reading would make `np models fetch` install nothing on the release shape §13
+  exists for. What ships is the narrower gate above; if a `local-model`-less build should fetch nothing by default, that is a new
+  decision to ask for, not a consequence of this one.
 
 What installation does *not* gain: it never re-fetches over an existing artifact (R7b's overwrite refusal stands), and it does
 not silently repair a digest mismatch — a wrong file is reported, not replaced.

@@ -199,6 +199,11 @@ mixing verbatim and `\\?\` spellings within one operation is worse than either.
 
 ## 5. Non-goals
 
+**Where the origin rules live (added 2026-11-04).** This document stops at an offline `install`, and it has no §12 — the fetch
+rules, including the one compiled-in default origin (`pins::DEFAULT_ORIGIN`) and the `[models] base_url` →
+`NP_MODELS_BASE_URL`-fills-an-unset-key → default precedence, are `docs/design-m2-local-embeddings.md` §12 rules 7 and 8 as
+amended that day. `install --path --sha256` remains the offline door that amendment keeps.
+
 No HTTP client, no TLS dependency, no URL scheme (4b). No model execution — no candle, no `local-model` feature
 (per-OS `cargo check --locked -p np-core --features local-model` stays a recorded debt). No embedding calls; nothing
 writes to `embeddings` except tests. No config change: `[embeddings].provider` keeps its `none` default — installing a
