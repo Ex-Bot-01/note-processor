@@ -128,8 +128,9 @@ enum ModelsCommand {
     },
     /// Fetch a pinned model's artifacts and record them in this workspace.
     ///
-    /// The only command in this program that dials out (§12 rule 1), and it dials only where `[models] base_url` (or
-    /// `NP_MODELS_BASE_URL`) says. Nothing else does: `np scan` never fetches, and `np embed` keeps refusing with
+    /// The only command in this program that dials out (§12 rule 1), and it dials where `[models] base_url` says, or
+    /// `NP_MODELS_BASE_URL` when the file leaves that key out, or the one origin baked into the pin table when neither
+    /// speaks. Nothing else does: `np scan` never fetches, and `np embed` keeps refusing with
     /// §6's *artifact absent* arm rather than starting a nine-hundred-megabyte download inside a command that then
     /// writes rows. The automatic trigger belongs to the daemon (M4), not to a command line.
     #[cfg(feature = "fetch")]
@@ -139,8 +140,8 @@ enum ModelsCommand {
         /// Model identity to fetch: it must be one this build pins bytes **and** an identity for.
         #[arg(long)]
         id: String,
-        /// Which member to fetch, repeatable (`main`, `mmproj`). Default: every member pinned for the id — which is
-        /// why a build that pins only half a pair refuses instead of quietly transferring half of it.
+        /// Which member to fetch, repeatable (`main`, `mmproj`). Default: the members this binary can use — the
+        /// projector is left out of a build without image support, and naming it explicitly is refused.
         #[arg(long = "member")]
         members: Vec<String>,
         /// Discard this id's fetch marker (and the partial download it names) and then fetch.
@@ -736,7 +737,8 @@ fn workspace_db(config: &Config, workspace: &Path) -> Result<Db, Box<dyn Error>>
 /// success line lands in CI logs as readily as a refusal does — so the report says an origin was configured and names
 /// the members, sizes and digests, which is everything a person can act on. The one thing that must not appear is the
 /// URL, because a mirror's hostname is someone's infrastructure detail and this program has no business publishing it
-/// in a build log.
+/// in a build log. Since 2026-11-04 an origin exists on every run — `[models] base_url` and `NP_MODELS_BASE_URL` both
+/// silent means [`np_core::pins::DEFAULT_ORIGIN`] — which makes *not* printing it the more important half of the rule.
 #[cfg(feature = "fetch")]
 fn models_fetch(
     workspace: &Path,
@@ -749,10 +751,11 @@ fn models_fetch(
     let db = workspace_db(&config, workspace)?;
     let models_dir = config.workspace_models_dir(workspace);
 
-    // **The discard happens before the origin is required.** `--discard-marker` is a filesystem action a human takes
-    // because they know no fetch is running (§12 rule 4's only door), and refusing to perform it on a machine that
-    // has no mirror configured would leave them unable to clean up the very state the flag exists for. Dialing out is
-    // the part that needs configuring, so that check comes second.
+    // **The discard happens first.** `--discard-marker` is a filesystem action a human takes because they know no fetch
+    // is running (§12 rule 4's only door), so it may not depend on anything the rest of the run needs — not which
+    // origin resolves, not whether this build can use the members it would plan. Dialing out is the part that can fail
+    // for reasons outside the workspace, and a case where it does (`crates/np-cli/tests/models_cli.rs`) still expects
+    // the discard to have happened.
     if discard_marker {
         let discarded = fetch::discard_marker(&models_dir, id)?;
         if !json {
@@ -767,27 +770,46 @@ fn models_fetch(
         }
     }
 
-    // Refuse before any transfer when no origin is configured. The message names both places that could supply one and
-    // never guesses a host: §12 rule 7 keeps the origin out of the binary, so an unconfigured build has nowhere to
-    // dial — which is what keeps a fresh machine quiet instead of starting a download nobody asked for.
-    let origin = config.models.base_url.clone().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "no fetch origin configured: set `base_url` under `[models]` or the environment \
-             variable NP_MODELS_BASE_URL (offline? use `np models install --path`)",
-        )
-    })?;
+    // The origin, in the one order §12 rule 7 sets out as amended on 2026-11-04: `[models] base_url` as config left it
+    // (`NP_MODELS_BASE_URL` fills that key only when the file leaves it unset — `np_core::config`'s rule for every key
+    // in that section), then the origin baked into the pin table. A machine with no configuration therefore makes one
+    // outbound request during installation instead of being refused; a mirror is still one config line away, and this
+    // line stays true of every run: the resolved origin is read here and printed nowhere (§12 rule 8).
+    let origin = fetch::resolve_origin(config.models.base_url.as_deref());
 
-    // Default to the whole pinned pair, so a build that pins one member refuses loudly rather than transferring half
-    // a model and calling it installed.
+    // **Fetch what this binary can use** (`docs/design-m2-image-embeddings.md` §13): with no `--member`, the plan is
+    // the members this build could load, so a text-only install never transfers 554 MB of projector it has no code for.
     let requested_owned: Vec<String> = if members.is_empty() {
-        fetch::pinned_member_names(id)
-            .into_iter()
-            .map(str::to_string)
+        np_core::pins::members_for_build()
+            .iter()
+            .map(|name| (*name).to_string())
             .collect()
     } else {
         members.to_vec()
     };
+
+    // A member this build cannot use is refused by name, naming the **capability** that is missing. The engine's own
+    // refusal would be a false sentence here — `mmproj` *is* pinned, so "no recorded digest" describes a different
+    // problem — and the reason to refuse is this binary rather than the pin table or the origin. Today exactly one
+    // member can reach this arm (`np_core::pins::MMPROJ_MEMBER`, absent from `members_for_build` without `vision`);
+    // a second capability-gated member would need that function to say which capability each member needs before this
+    // wording could stay true, so it is written for the one case that exists.
+    let usable = np_core::pins::members_for_build();
+    if let Some(name) = requested_owned.iter().find(|name| {
+        !usable.contains(&name.as_str()) && np_core::pins::pinned_member(id, name).is_some()
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "cannot fetch member `{name}` of model `{id}`: this binary was built without image support, so the \
+                 projector's bytes would never be read here; this build fetches {} by default, and a build with the \
+                 `vision` feature can fetch `{name}`",
+                usable.join(", "),
+            ),
+        )
+        .into());
+    }
+
     let requested: Vec<&str> = requested_owned.iter().map(String::as_str).collect();
 
     let transport = fetch::HttpTransport::new(origin);

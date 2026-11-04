@@ -1287,7 +1287,10 @@ struct Origin {
 impl Origin {
     fn serve() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test setup: bind a loopback port");
-        let port = listener.local_addr().expect("test setup: origin addr").port();
+        let port = listener
+            .local_addr()
+            .expect("test setup: origin addr")
+            .port();
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
         listener
@@ -1334,10 +1337,11 @@ impl Origin {
         if let Some(worker) = self.worker.take() {
             worker.join().expect("test setup: origin thread");
         }
-        Arc::try_unwrap(self.requests)
-            .expect("test setup: the server was the last holder")
-            .into_inner()
+        // The worker is joined above, so this lock has exactly one holder and the answer cannot grow after it.
+        self.requests
+            .lock()
             .expect("test setup: request log")
+            .clone()
     }
 }
 
@@ -1407,7 +1411,10 @@ fn an_explicit_member_list_is_the_plan_and_the_default_set_never_widens_it() {
 
     assert_eq!(run.code(), 1, "{}", run.stderr());
     let text = run.stderr();
-    assert!(text.contains("audio"), "the unpinned member is named: {text}");
+    assert!(
+        text.contains("audio"),
+        "the unpinned member is named: {text}"
+    );
     assert!(
         text.contains("no recorded digest"),
         "the reason is the pin table: {text}"
@@ -1428,11 +1435,7 @@ fn a_projector_request_on_a_build_without_image_support_names_the_capability() {
     // instead is the capability sentence — which pins refusal **before any connection is attempted**, a stronger
     // claim than "no bytes moved", and the one §12 rule 8's no-URL boundary depends on.
     let scratch = Scratch::new();
-    let run = run(&mut scratch.fetch_at(
-        "embeddinggemma-2",
-        DEAD_ORIGIN,
- &["--member", "mmproj"],
-    ));
+    let run = run(&mut scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &["--member", "mmproj"]));
 
     assert_eq!(run.code(), 1, "{}", run.stderr());
     let text = run.stderr();
@@ -1510,11 +1513,7 @@ fn discard_marker_reports_the_absence_it_found_and_the_fetch_that_follows_refuse
     // That proves **no connection was established**, which is more than "no bytes moved": the client never got far
     // enough to send a request.
     let scratch = Scratch::new();
-    let run = run(&mut scratch.fetch_at(
-        "embeddinggemma-2",
-        DEAD_ORIGIN,
-        &["--discard-marker"],
-    ));
+    let run = run(&mut scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &["--discard-marker"]));
 
     assert_eq!(run.code(), 1, "{}", run.stderr());
     assert!(
@@ -1575,11 +1574,7 @@ fn discard_marker_removes_the_marker_and_the_partial_it_names() {
 
     // The discard is a filesystem action and runs first, so it happens even against an origin that cannot answer:
     // [`DEAD_ORIGIN`] makes the fetch that follows refuse at connect rather than reach a real host.
-    let run = run(&mut scratch.fetch_at(
-        "embeddinggemma-2",
-        DEAD_ORIGIN,
-        &["--discard-marker"],
-    ));
+    let run = run(&mut scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &["--discard-marker"]));
 
     assert_eq!(run.code(), 1, "{}", run.stderr());
     assert!(
