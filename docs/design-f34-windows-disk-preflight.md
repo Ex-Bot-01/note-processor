@@ -127,8 +127,10 @@ no assertion that macOS behaves any other way.
 
 ## 8. Non-goals
 
-No `\\?\` extended-path handling. No free-space polling or retry-on-ENOSPC during transfer (a full disk mid-stream is already
-`Interrupted`, which is a refusal, not a corruption). No change to the unix arithmetic. No new dependency, no new exit code
+No `\\?\` extended-path handling. No free-space polling or retry-on-ENOSPC during transfer. A disk that fills mid-stream is already handled: the write fails,
+`receive_member` returns `FetchError::Io` (not `Interrupted`, which means a short stream — corrected here after re-reading
+`fetch.rs:728`), and the error arm at `fetch.rs:604-615` removes the `.part` file and the marker before returning the reason, so a
+refusal leaves no half-written artifact behind. That behaviour is platform-independent and unchanged by this round. No change to the unix arithmetic. No new dependency, no new exit code
 (runtime refusals stay 1), no change to any report field name or golden byte.
 
 ## 9. Risks, and what retires each
