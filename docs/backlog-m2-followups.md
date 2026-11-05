@@ -829,3 +829,21 @@ runs a user cares about.
   that case needs both artifact variables, so it must print `NOT COVERAGE` rather than pass silently without them.
 - **Blocks:** nothing correctness-wise. It costs a line in README ("stdout is the report; stderr is llama.cpp's") and any
   wrapper that treats merged output as machine-readable.
+
+## F34 — the fetch disk preflight cannot answer on Windows, so rule 6 silently does not happen there
+
+Filed 2026-11-05 from the first CI run this repository ever had that actually executed a Windows job (run `42061786030`, job
+`127365138173`): `preflight_refuses_before_byte_one_when_the_disk_cannot_hold_the_pair` failed with
+`expected DiskShortfall, got Interrupted { …, expected: 9223372036854775807 }`. Every run before 2026-11-04 created zero steps, so
+this is not a regression — it is the first time the code ran.
+
+- **Cause:** `available_bytes` is `statvfs` under `#[cfg(unix)]` and a literal `None` elsewhere, and the preflight refuses only on
+  `Some(_)`. The report already says "free space not checked on this platform" rather than claiming a pass, so the product has been
+  honest; what was missing is an answer.
+- **What it would take:** `GetDiskFreeSpaceExW` behind `#[cfg(windows)]` with a hand-written binding (no new dependency), the same
+  climb-to-an-existing-ancestor rule the unix half uses, and the admission decision split into a pure function so all three of its
+  arms are testable on every host. Design: `docs/design-f34-windows-disk-preflight.md`, including what CI proves and what it cannot.
+- **Blocks:** any sentence claiming §12 rule 6 protects a Windows fetch, and keeping `Test (windows-latest)` red — which now matters,
+  because the runner works and a red main is a real signal rather than an absent one.
+- **Done when:** the un-gated preflight test passes on the Windows runner alongside unit tests for the answer, the climb and the
+  refusal to answer, and macOS still claims nothing beyond "cannot say".
