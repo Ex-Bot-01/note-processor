@@ -47,7 +47,7 @@ unresolved.
   Gating that measurement also removed a pre-existing test-isolation race (`Config::load` without `ENV_LOCK`, since
   `ef8a382`), now fenced by `every_case_that_loads_a_config_holds_the_environment_lock`.
 
-## Shipped (branch `r7c/image-embeddings`, not yet merged) — R7c image vectors + read-only `np search`
+## Shipped (main) — R7c image vectors + read-only `np search` (merged 2026-11-04 at `f030bd0`, branch deleted)
 
 Design: `docs/design-m2-image-embeddings.md`. What landed, task by task, with the claim each one is allowed to make:
 
