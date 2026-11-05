@@ -59,7 +59,7 @@ is text to embed already in the table — the first embedding pass costs no re-s
 
 ```mermaid
 flowchart LR
-    subgraph DONE["Shipped — main, CI green Linux + Windows (up to 9193732)"]
+    subgraph DONE["Shipped — main, verified by local exit codes. CI ran zero steps until 2026-11-04, so nothing in this subgraph was ever executed on Windows (up to 9193732)"]
         M1["M1 core catalog<br/>np scan + INDEX.md"]
         H1["Hardening line<br/>F13 F18 F19 F20 F21 F22 F23"]
         H2["Correctness residue<br/>F24 F17 F16 A4"]

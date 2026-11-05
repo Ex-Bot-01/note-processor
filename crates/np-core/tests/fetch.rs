@@ -795,6 +795,61 @@ fn preflight_refuses_before_byte_one_when_the_disk_cannot_hold_the_pair() {
 }
 
 #[test]
+fn a_marker_refuses_before_the_disk_check_does() {
+    // Rule 4 before rule 6, pinned. Nothing tested this combination before F34: the only shortfall case used a small table
+    // and the only marker case used a small table, so moving `preflight` above the marker arm would have turned
+    // `MarkerExists` into `DiskShortfall` with every gate still green — a refusal that tells you to clear disk space when
+    // another process holds the download is worse than useless.
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    fs::create_dir_all(&models).expect("test setup: models dir");
+    write_marker_raw(
+        &models,
+        "test-model",
+        r#"{"nonce":"8888-1-2","started_at":1730000020,"bytes_done":7,"bytes_total":8}"#,
+    );
+
+    // The same impossible pin the shortfall case uses, so the two refusals are competing for the same call.
+    let table = vec![Spec {
+        member: "main",
+        filename: "test-model.gguf",
+        size_bytes: u64::MAX / 2,
+        sha256: sha256_bytes(MAIN),
+    }];
+    let fake = Fake::new();
+    fake.serve("main", Serve::Full(MAIN.to_vec()));
+
+    let err = refusal(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        &table,
+        1_730_000_020,
+    );
+    assert!(matches!(err, FetchError::MarkerExists { .. }), "{err}");
+    assert_eq!(
+        fake.opens(),
+        0,
+        "rule 4 answers before anything else is asked"
+    );
+    assert!(
+        !models.join("test-model.gguf").exists(),
+        "a refusal that reached the disk would have written an artifact"
+    );
+    // And the marker survives **untouched**: it is another process's consent to delete, not this one's to clean up. That is
+    // also why `assert_nothing_left` would be the wrong assertion here — the marker *should* still be in that directory.
+    let kept = fs::read(models.join(".fetching.test-model.json"))
+        .expect("test setup: the marker is there");
+    assert_eq!(
+        String::from_utf8(kept).expect("a marker is utf-8"),
+        r#"{"nonce":"8888-1-2","started_at":1730000020,"bytes_done":7,"bytes_total":8}"#
+    );
+}
+
+#[test]
 fn every_refusal_message_is_free_of_the_origin() {
     // Not "one case per refusal" — **the arms that could carry an origin, plus one that carries someone else's text**. The
     // rest are built from ids, counts and paths (`IdentityDisagrees`, `DiskShortfall`, `MarkerExists`, …), so no string this

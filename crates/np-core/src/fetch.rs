@@ -549,16 +549,10 @@ pub fn fetch_with_table<T: MemberPin>(
         .map(|member| member.size_bytes())
         .sum::<u64>()
         .saturating_add(PREFLIGHT_MARGIN_BYTES);
+    // Bound before it is judged, because the report prints exactly this number: asking the OS a second time would let the line
+    // describe a measurement nobody compared against `needed`.
     let free = available_bytes(models_dir);
-    if let Some(available) = free {
-        if available < needed {
-            return Err(FetchError::DiskShortfall {
-                needed,
-                available,
-                margin: PREFLIGHT_MARGIN_BYTES,
-            });
-        }
-    }
+    preflight(needed, free)?;
 
     fs::create_dir_all(models_dir).map_err(|source| FetchError::Io {
         path: models_dir.to_path_buf(),
@@ -870,10 +864,16 @@ fn remove_part(models_dir: &Path, id: &str, nonce: &str) {
 
 /// Free bytes on the filesystem holding `path`, or `None` where this platform cannot say.
 ///
-/// **Linux/other unix only, and that is a measured limit rather than a hedge** (F18): `statvfs` is what this host
-/// answers with, and its block size times its free blocks is the number §12 rule 6's preflight wants. Windows and
-/// macOS get `None`, which the report prints as "free space not checked on this platform" — never as a pass, because a
-/// check that silently did not happen is worse than one whose absence is stated.
+/// **What this host answers with is measured; what the other arms claim is not** (F18). This half is `statvfs`, whose block
+/// size times free blocks is the number §12 rule 6's preflight wants.
+///
+/// The sentence here used to read "Windows and macOS get `None`", and it was wrong about macOS: macOS is `cfg(unix)`, so it
+/// compiles **this** arm (`libc` declares `statvfs` for every unix but linux-gnu, and np-core's `libc` dependency is gated on
+/// `cfg(unix)`), which means the shipped `aarch64-apple-darwin` binary answers rule 6 with a number today. What nobody has measured
+/// is whether that number is right — no macOS runner exists here, so this round says nothing about it either way.
+///
+/// Where an arm genuinely cannot answer it returns `None`, which the report prints as "free space not checked on this platform" —
+/// never as a pass, because a check that silently did not happen is worse than one whose absence is stated.
 #[cfg(unix)]
 fn available_bytes(path: &Path) -> Option<u64> {
     use std::ffi::CString;
@@ -902,8 +902,8 @@ fn available_bytes(path: &Path) -> Option<u64> {
         }
         stat
     };
-    // `f_bavail`, not `f_bfree`: blocks available to an **unprivileged** writer, which is who this command runs as.
-    // `f_bavail`, not `f_bfree`: blocks available to an **unprivileged** writer, which is who this command runs as.
+    // `f_bavail`, not `f_bfree`: blocks available to an **unprivileged** writer, which is who this command runs as. The
+    // difference on unix is root-reserved blocks; the Windows arm's analogue is quota (see its own note).
     let block = stats.f_frsize;
     let free = stats.f_bavail;
     if block == 0 {
@@ -914,7 +914,104 @@ fn available_bytes(path: &Path) -> Option<u64> {
     block.checked_mul(free)
 }
 
-#[cfg(not(unix))]
+/// §12 rule 6's admission check, given what the platform could say about free space.
+///
+/// Pure **because of how this check was once written**: the decision and the OS query were fused in one inline `if let Some(_)`, so
+/// the only test of it asserted a refusal that only a `statvfs` answer can produce, and "the preflight does not happen on Windows"
+/// survived two rounds of green gates until a runner existed to say otherwise (F34). Split out, all three outcomes are covered on
+/// every host; what stays platform-shaped is the query alone.
+fn preflight(needed: u64, available: Option<u64>) -> Result<(), FetchError> {
+    match available {
+        Some(available) if available < needed => Err(FetchError::DiskShortfall {
+            needed,
+            available,
+            margin: PREFLIGHT_MARGIN_BYTES,
+        }),
+        // Room enough, by the platform's own answer.
+        Some(_) => Ok(()),
+        // Cannot say — which is a stated absence in the report, not a pass. Rule 6 is an admission check rather than a promise, and
+        // the checks after it (a marker that lives, a target that exists) run regardless.
+        None => Ok(()),
+    }
+}
+
+/// [`available_bytes`] on Windows: free bytes **available to the caller**, the quota-aware number, which is what an unprivileged
+/// fetch may actually write. `total_number_of_free_bytes` would over-report it — the same *shape* of choice as this module's unix
+/// half preferring `f_bavail` to `f_bfree`, though there the difference is reserved blocks rather than quota.
+///
+/// Design and the evidence behind each row: `docs/design-f34-windows-disk-preflight.md`.
+#[cfg(windows)]
+fn available_bytes(path: &Path) -> Option<u64> {
+    // Climb to something that exists, for the reason the unix half gives in full: this runs *before* `create_dir_all`, so a first
+    // fetch of a workspace is always asking about a directory that is not there yet.
+    let mut cursor = path;
+    let existing = loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(_) => break cursor,
+            Err(_) => match cursor.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+                _ => return None,
+            },
+        }
+    };
+    // Ask about the **same spelling every other OS call on this path uses**. `walk::to_open_path` hands the `.part` write and the
+    // publish rename a `\\?\` prefix when a long absolute path needs one; querying the bare path here would decline ("not checked")
+    // for exactly the workspace whose bytes it then writes. The helper's own condition carries over: the prefix needs an absolute
+    // path, so a relative `[paths] data_dir` keeps the plain spelling and may answer `None` — stated, never passed.
+    let spelled = PathBuf::from(walk::long_prefix(&existing.to_string_lossy(), true));
+    let name = wide_name(spelled.as_os_str())?;
+    // Zero-initialised so a failing call that writes nothing cannot be read as data, and so `Some(0)` can only mean "the volume
+    // answered zero" — which rule 6 refuses, correctly.
+    let mut available: u64 = 0;
+    let mut total: u64 = 0;
+    let mut total_free: u64 = 0;
+    // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the call, and the three out-parameters are `&mut u64`s we own.
+    // The return is a `BOOL`, so success is read as non-zero rather than as `1`.
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(name.as_ptr(), &mut available, &mut total, &mut total_free) };
+    if ok != 0 {
+        Some(available)
+    } else {
+        None
+    }
+}
+
+/// The one kernel32 symbol this module needs. Declared by hand rather than pulled in as a bindings crate — the pattern
+/// [`crate::llama_ffi`] documents, and the right trade for a single function: a dependency here would sit in every binary, including
+/// the ones that never fetch.
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetDiskFreeSpaceExW(
+        directory_name: *const u16,
+        free_bytes_available_to_caller: *mut u64,
+        total_number_of_bytes: *mut u64,
+        total_number_of_free_bytes: *mut u64,
+    ) -> i32;
+}
+
+/// `name` as a NUL-terminated UTF-16 string, or `None` when it holds U+0000.
+///
+/// The check is load-bearing, not hygiene: `encode_wide` encodes a NUL faithfully and Win32 ends the string there, so without this
+/// a name containing one would answer about its **surviving prefix**. A wrong number in a report that reads as a measurement is
+/// worse than no number, and it is why the decline arm here is explicit rather than "the call will fail anyway".
+#[cfg(windows)]
+fn wide_name(name: &std::ffi::OsStr) -> Option<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut units: Vec<u16> = name.encode_wide().collect();
+    if units.contains(&0) {
+        return None;
+    }
+    units.push(0);
+    Some(units)
+}
+
+/// [`available_bytes`] where the platform has no answer at all.
+///
+/// Gated on `all(not(unix), not(windows))` rather than `not(unix)` for the reason this repository already states at
+/// [`crate::path_keys`]: the Windows body needs `std::os::windows::ffi`, which exists on no other target, so a wider gate would not
+/// be a fallback — it would be a build failure on any target in between.
+#[cfg(all(not(unix), not(windows)))]
 fn available_bytes(_path: &Path) -> Option<u64> {
     None
 }
@@ -1168,4 +1265,125 @@ pub fn discard_marker(models_dir: &Path, id: &str) -> Result<Discarded, FetchErr
         marker_removed,
         parts_removed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three arms of rule 6, asserted directly rather than through an OS query — which is the point of extracting
+    /// [`preflight`]: on a Linux runner these are the arms a Windows-only `available_bytes` can never reach.
+    #[test]
+    fn preflight_arms_are_the_three_outcomes() {
+        // Too little room: the refusal carries both numbers and the margin, so the arithmetic stays checkable by a reader.
+        let err = preflight(1_000, Some(999)).expect_err("999 < 1000 must refuse");
+        match err {
+            FetchError::DiskShortfall {
+                needed,
+                available,
+                margin,
+            } => {
+                assert_eq!((needed, available), (1_000, 999));
+                assert_eq!(margin, PREFLIGHT_MARGIN_BYTES);
+            }
+            other => panic!("expected DiskShortfall, got {other:?}"),
+        }
+        // A volume that answers zero is refused, not excused: the answer arrived, it simply was not a welcome one.
+        assert!(matches!(
+            preflight(1, Some(0)),
+            Err(FetchError::DiskShortfall { available: 0, .. })
+        ));
+        assert!(preflight(1_000, Some(1_000)).is_ok());
+        assert!(preflight(u64::MAX, Some(u64::MAX)).is_ok());
+        // Cannot say is the third outcome, and it is not a shortfall. The report's "not checked on this platform" line is
+        // what makes this honest; a silent pass here would be the defect F34 was filed for, one level down.
+        assert!(preflight(u64::MAX, None).is_ok());
+    }
+
+    /// The decline arm, reachable on **every** host: a relative path whose every ancestor is absent runs the climb out
+    /// before any OS call, so this cannot drift into "answered something about a different directory".
+    #[test]
+    fn available_bytes_declines_when_no_ancestor_exists() {
+        let orphan = Path::new("f34-no-such-root").join("models");
+        assert_eq!(
+            available_bytes(&orphan),
+            None,
+            "a path with no existing ancestor must decline rather than guess"
+        );
+    }
+
+    /// A real directory answers on the platform running this test — and on Windows that is the first executed proof that
+    /// the hand-written `GetDiskFreeSpaceExW` binding links, succeeds, and writes an out-parameter.
+    #[cfg(windows)]
+    #[test]
+    fn available_bytes_answers_a_plausible_number_for_an_existing_directory() {
+        let got = available_bytes(&std::env::temp_dir());
+        assert!(
+            matches!(got, Some(n) if n > 1_048_576),
+            "a CI runner's temp filesystem must report more than a megabyte free: {got:?}"
+        );
+    }
+
+    /// **The only check that pins parameter order.** Every other test here reads one number, so swapping
+    /// `free_bytes_available_to_caller` and `total_number_of_free_bytes` would pass them all while over-reporting what the
+    /// fetch may write — which is the exact distinction this arm argues for.
+    #[cfg(windows)]
+    #[test]
+    fn the_three_out_parameters_keep_their_order() {
+        let dir = std::env::temp_dir();
+        let name = wide_name(dir.as_os_str()).expect("a temp dir path encodes");
+        let mut available: u64 = 0;
+        let mut total: u64 = 0;
+        let mut total_free: u64 = 0;
+        // SAFETY: `name` is a NUL-terminated UTF-16 buffer we own and outlive it here; the out-parameters are ours too.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(name.as_ptr(), &mut available, &mut total, &mut total_free)
+        };
+        assert_ne!(ok, 0, "GetDiskFreeSpaceExW failed for {}", dir.display());
+        assert!(
+            available <= total_free,
+            "caller-available {available} exceeds total-free {total_free}: the free out-parameters are swapped"
+        );
+        assert!(
+            total_free <= total,
+            "total-free {total_free} exceeds total {total}: the size out-parameters are swapped"
+        );
+        assert!(
+            total > 0,
+            "a volume that reports zero total is not a volume"
+        );
+    }
+
+    /// The climb this whole arm depends on: the preflight runs before `create_dir_all`, so a first fetch always asks about
+    /// a directory that does not exist yet.
+    #[cfg(windows)]
+    #[test]
+    fn available_bytes_climbs_out_of_a_directory_that_does_not_exist_yet() {
+        let missing = std::env::temp_dir().join("f34-absent").join("models");
+        assert!(
+            available_bytes(&missing).is_some(),
+            "a first fetch must get an answer from the filesystem it is about to write into"
+        );
+    }
+
+    /// The encoder's zero-unit check fires instead of asking Win32 about a truncated prefix.
+    #[cfg(windows)]
+    #[test]
+    fn available_bytes_declines_for_a_name_holding_an_interior_nul() {
+        // Deterministic by construction: the decline happens in `wide_name`, before any call, so it cannot depend on how
+        // Win32 chooses to treat a name that cannot exist.
+        assert_eq!(available_bytes(Path::new("\u{0}f34")), None);
+        assert_eq!(wide_name(std::ffi::OsStr::new("a\u{0}b")), None);
+    }
+
+    /// Parity for the unix half's own guard: an unencodable name declines rather than answering about something else.
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_arm_declines_a_name_it_cannot_encode() {
+        // Interior NUL cannot be named on unix either — `symlink_metadata` refuses it first, so what this pins is the
+        // *outcome* both halves agree on for a path that has an existing ancestor: it answers about that ancestor, and never
+        // invents a decline. Recorded here because §4 of the F34 design claims exactly this asymmetry.
+        let tmp = std::env::temp_dir();
+        assert!(available_bytes(&tmp).is_some());
+    }
 }

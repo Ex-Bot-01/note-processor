@@ -855,13 +855,24 @@ fn models_fetch(
                 member.sha256
             ));
         }
-        emit(&match report.free_bytes {
-            Some(free) => format!("free before  {}", size_human(free)),
-            // Stated, never implied: a check that could not run is not a check that passed.
-            None => "free before  not checked on this platform".to_string(),
-        });
+        emit(&free_space_line(report.free_bytes));
     }
     Ok(())
+}
+
+/// The free-space line of `np models fetch`'s text report, in both arms.
+///
+/// Built by a function so the second arm can be asserted at all: a successful CLI fetch has to serve bytes that hash to the
+/// **pinned** digest, which no fixture can do, so no end-to-end test ever reaches either sentence — which is precisely how this line
+/// acquired a dangling preposition and a column one wider than its sibling `fetched     `. Both are pinned now.
+///
+/// Stated, never implied: an arm that could not run is not an arm that passed.
+#[cfg(feature = "fetch")]
+fn free_space_line(free: Option<u64>) -> String {
+    match free {
+        Some(free) => format!("free space  {} before the fetch", size_human(free)),
+        None => "free space  not checked on this platform".to_string(),
+    }
 }
 
 fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(), Box<dyn Error>> {
@@ -1139,4 +1150,41 @@ fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+#[cfg(all(test, feature = "fetch"))]
+mod tests {
+    use super::*;
+
+    /// The two arms of the fetch report's free-space line, and the column they share with `fetched     `.
+    #[test]
+    fn the_free_space_line_names_its_number_and_keeps_its_column() {
+        let measured = free_space_line(Some(309_855_456));
+        assert_eq!(measured, "free space  295.5 MB before the fetch");
+        let declined = free_space_line(None);
+        assert_eq!(declined, "free space  not checked on this platform");
+        for line in [measured, declined] {
+            // `fetched     main (…)` puts its value at byte 12; so must this, or the block reads as two columns.
+            assert_eq!(
+                &line[10..12],
+                "  ",
+                "the key is not padded to the column: {line}"
+            );
+            assert!(
+                !line[12..].starts_with(' '),
+                "the value is indented twice and the block stops aligning: {line}"
+            );
+            assert!(
+                !line.contains("before  "),
+                "the dangling preposition came back: {line}"
+            );
+        }
+    }
+
+    /// `None` is a stated absence, never a pass: the sentence has to say it was not checked.
+    #[test]
+    fn an_unanswered_preflight_is_reported_as_unanswered() {
+        assert!(free_space_line(None).contains("not checked"));
+        assert!(!free_space_line(None).contains("ok"));
+    }
 }
