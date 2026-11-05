@@ -829,6 +829,10 @@ runs a user cares about.
   that case needs both artifact variables, so it must print `NOT COVERAGE` rather than pass silently without them.
 - **Blocks:** nothing correctness-wise. It costs a line in README ("stdout is the report; stderr is llama.cpp's") and any
   wrapper that treats merged output as machine-readable.
+- **Also measured 2026-11-05, on the search side** (while measuring F32 with a `local-model` build): `np search <vault> alpha`
+  against an installed artifact opens with `llama_model_loader: loaded meta data with 46 key-value pairs and 413 tensors …`
+  and the metadata dump — so the volume is not confined to `np embed`; **any command that resolves a lazy provider and then
+  encodes** pays it, which makes the escape hatch in §"what it would take" more urgent than an embed-only reading suggested.
 
 ## F34 — the fetch disk preflight cannot answer on Windows, so rule 6 silently does not happen there
 
@@ -864,3 +868,40 @@ any host. Merged at `b2840f9`; run `42090000404` is green on all three jobs, whi
 executes six `fetch::tests` including the four `#[cfg(windows)]` ones — a plausible answer, out-parameter order graded against the
 production arm, the climb out of an absent directory, and the NUL refusal. macOS still claims only the build fact: it compiles the
 `statvfs` arm, and nobody here has read its number.
+
+## F35 — a misspelled or invented **top-level** config section is ignored, while a bad key inside `[embeddings]` is refused
+
+Filed 2026-11-05 while measuring F32, by catching myself doing it. `Config` (`crates/np-core/src/config.rs:543-545`) is
+`#[serde(default)]` with **no** `deny_unknown_fields`, unlike `EmbeddingsConfig`, `ModelsConfig`, `CatalogConfig` and
+`PathsConfig`-style nested structs that all carry it — a deliberate-looking difference the file's own comments justify for the
+nested ones ("a misspelled key here would silently do nothing") but never state for the top level.
+
+Measured with the shipped binary on one config file, two variants:
+
+```toml
+[embeddings]
+provider = "local-model"
+typo_key = 3          # → np: configuration error: config parse error in …/config.toml: TOML parse error at line 6, column 1
+```
+
+```toml
+[paths]               # no such section exists in this schema
+data_dir = "/nonexistent-if-honoured-search-refuses-here"
+```
+
+The first refuses naming file and line. The second is **accepted and ignored**: the run went on to use `$XDG_DATA_HOME`, and
+nothing said a word about the section the author believed they were configuring. My own scratch config carried exactly this
+invented `[paths]` section for several measured runs before the mismatch showed up in `find`.
+
+- **Why it matters more than one wasted afternoon:** `data_dir` decides *which workspace database and which artifact
+  directory* a command touches. A user who writes `[paths] data_dir = …`, or `[embedding]` instead of `[embeddings]`, gets a
+  working command pointing somewhere they did not choose — the failure shape §3's "name what to change" rule exists to
+  prevent, reached from the other side.
+- **What it would take:** decide, then say so in one place. Either (a) `deny_unknown_fields` on `Config` too, which makes every
+  unknown top-level key a parse error naming file and line — consistent with the nested structs, but it also means an older
+  binary refuses a config written for a newer one, which is a compatibility stance someone must own; or (b) keep leniency and
+  state it in README's configuration section ("only these sections are read; anything else in the file is ignored"), which is
+  honest but leaves the trap armed. This card deliberately does not pick: (a) reverses a possible forward-compatibility
+  decision, and that is the human's call, not a cleanup riding along with something else.
+- **Blocks:** nothing correctness-wise; it blocks any sentence claiming "a typo in `config.toml` fails loudly" without naming
+  which levels of the file that covers (the thread-policy design at §84 says exactly that about `[embeddings]`, where it is true).
