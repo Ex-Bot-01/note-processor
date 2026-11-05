@@ -399,11 +399,12 @@ pub enum EmbeddingProvider {
     /// behaviour for anyone who has not chosen a model (§2) — not a stub awaiting a real one.
     #[default]
     None,
-    /// A model running inside this process (`local-model`): [`crate::embed::LocalModelProvider`] is the type it
-    /// will resolve to, owning the API. The runtime exists now — `local_model` opens a GGUF and embeds through it — but
-    /// **nothing instantiates this provider from
-    /// this value yet** — the only code that reads the variant is [`Config::load`]'s own validation; the wiring
-    /// arrives with R6c. What loading one costs is §6's benchmark's question.
+    /// A model running inside this process (`local-model`). `np-cli`'s `embed_provider` is what turns this value into a
+    /// provider: `local_model::LazyLocalEmbedder` (that module is behind `local-model`, so no link) when the binary was built with the runtime — loaded on the first
+    /// batch rather than at resolution, so a run with nothing owed pays no load — and [`crate::embed::LocalModelProvider`]
+    /// when it was not, which answers every batch it is handed with *runtime not built*. `embed_run` matches this same
+    /// variant to decide which of §6's arms are reachable, so the claim that only validation reads it (true before R6c)
+    /// stopped being true when the wiring landed. What loading one costs is §6's benchmark's question, measured in R6d.
     ///
     /// Refused at [`Config::load`] unless [`EmbeddingsConfig::model`] names something `np models install`
     /// would accept — a local provider with no identity has nothing to write `embeddings.model` under, and
