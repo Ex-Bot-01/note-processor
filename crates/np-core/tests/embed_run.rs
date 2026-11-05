@@ -1150,3 +1150,89 @@ fn the_worker_plan_describes_itself_in_one_line() {
         "an oversubscribed explicit count has to read as what it is — a choice, not a bug in the rule"
     );
 }
+
+/// Every [`NoProvider`] sentence, on one line and without a run of two spaces.
+///
+/// The wrap class is not hypothetical: the first `np search` refusal broke mid-sentence and printed twenty spaces between
+/// "be" and "embedded" (R7c Task 6 review P1). Two of the four arms cannot be reached from argv at all — `Config::load`
+/// refuses `local-model` with no `model`, and `np models install --dim` bounds what can be installed — so this file is the
+/// only place those sentences are read by anything. F32 §6 records that as their limit rather than pretending a CLI case
+/// covers them.
+#[test]
+fn no_provider_sentences_are_one_line_and_free_of_double_spaces() {
+    let ws = PathBuf::from("/vault/notes");
+    let arms = [
+        np_core::embed_run::NoProvider::ConfigDisabled,
+        np_core::embed_run::NoProvider::ModelUnnamed,
+        np_core::embed_run::NoProvider::RowMissing {
+            id: "embeddinggemma-2".into(),
+        },
+        np_core::embed_run::NoProvider::RowDimUnusable {
+            id: "embeddinggemma-2".into(),
+            declared: "-1".into(),
+        },
+    ];
+    for arm in arms {
+        let line = arm.sentence(&ws);
+        assert!(!line.contains('\n'), "{arm:?} spans lines: {line:?}");
+        assert!(
+            !line.contains("  "),
+            "{arm:?} holds a run of spaces: {line:?}"
+        );
+        assert!(!line.is_empty(), "an empty refusal helps nobody: {arm:?}");
+    }
+}
+
+/// The two defensive arms name their own cause, and each other's fields are **not** interchangeable.
+///
+/// Written because the design's first draft asserted that both "name the id and the declared width" — which `ModelUnnamed`
+/// cannot do: it has no id, because the state *is* having no id. Splitting the assertion is what keeps a future field add
+/// from quietly making one sentence do another's job.
+#[test]
+fn each_defensive_arm_names_its_own_cause() {
+    let ws = PathBuf::from("/vault/notes");
+
+    let unnamed = np_core::embed_run::NoProvider::ModelUnnamed.sentence(&ws);
+    assert!(
+        unnamed.contains("embeddings.model"),
+        "the key to edit is the whole remedy: {unnamed}"
+    );
+    assert!(
+        unnamed.contains(r#"provider = "local-model""#),
+        "and the state it was reached from: {unnamed}"
+    );
+
+    let dim = np_core::embed_run::NoProvider::RowDimUnusable {
+        id: "embeddinggemma-2".into(),
+        declared: "-1".into(),
+    }
+    .sentence(&ws);
+    assert!(dim.contains("embeddinggemma-2"), "the row is named: {dim}");
+    assert!(
+        dim.contains("\"-1\""),
+        "and its declared width quoted verbatim — a width is a fact about stored bytes: {dim}"
+    );
+    assert!(
+        !dim.contains("this build"),
+        "the width is not a property of the build, and embed's own sentence for this state says \"this run needs\": {dim}"
+    );
+}
+
+/// The pointer each row-level arm gives is `install_hint`'s, so one build's truth cannot be contradicted by another
+/// sentence. This test runs under whatever features np-core was built with, exactly like the hint itself.
+#[test]
+fn the_row_missing_arm_points_at_the_same_door_as_embeds_arm_three() {
+    let ws = PathBuf::from("/vault/notes");
+    let row_missing = np_core::embed_run::NoProvider::RowMissing {
+        id: "embeddinggemma-2".into(),
+    }
+    .sentence(&ws);
+    assert!(
+        row_missing.contains("no model row for \"embeddinggemma-2\""),
+        "it has to say which id is missing before it says what to do: {row_missing}"
+    );
+    assert!(
+        row_missing.contains(&np_core::embed_run::install_hint(&ws)),
+        "and reuse the one existing remedy wording rather than paraphrase it: {row_missing}"
+    );
+}

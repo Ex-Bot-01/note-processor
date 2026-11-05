@@ -325,9 +325,10 @@ figure they belonged to.
 
 | What you saw | What it means |
 | --- | --- |
-| `np: configuration disabled: embeddings.provider = "none"` | No provider chosen. Either write `[embeddings] provider = "local-model"` into the config, or accept that this build indexes only |
-| `np: embedding disabled: embeddings.provider = "none"` from `np search`, when your config *does* say `local-model` | This **workspace** has no model row yet — run `np models install` or `fetch` for it. The message names the wrong cause; that is filed as F32 |
-| `np: no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded` | The row exists but the file under `<key>.models/` does not. Re-install or re-fetch it |
+| `np: configuration disabled: embeddings.provider = "none"` from `np embed` | No provider chosen. Either write `[embeddings] provider = "local-model"` into the config, or accept that this build indexes only |
+| `np: embedding disabled: embeddings.provider = "none" — set it to "local-model" and name an installed model with embeddings.model, then run np embed` from `np search` | Same state, seen from the command that needs a vector. The sentence ends with the two keys to edit (F32 made `search` say its own cause instead of borrowing this one) |
+| `np: no model row for "embeddinggemma-2" in this workspace: fetch it with … or install bytes you already hold with …` | The config names a model this **workspace** has never been given — the usual state after editing `config.toml` by hand. The tail is the argv to run, and it lists only commands this build has (`np models fetch` appears in builds compiled with `fetch`) |
+| `np: no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded: …` | The row exists but the file under `<key>.models/` does not. Same argv tail, same reason it is printed |
 | `np: refusing to overwrite the existing artifact …` from `models fetch` | Rule 5 of §12: a fetch publishes into an absent target only. Remove the artifact deliberately, or install over a declared digest with `np models install` |
 | `model embeddinggemma-2 is already installed with dim = 768; this command declares 512` (abridged: the real message wraps the values in backticks) | Installing a second meaning onto an existing id is refused and nothing is written. A different artifact or width means a new id, not an overwrite |
 | `verify self-consistent, not verified` | This run trusted the stamp instead of re-hashing 300 MB — normal after the first check. `digest` says when it last looked |

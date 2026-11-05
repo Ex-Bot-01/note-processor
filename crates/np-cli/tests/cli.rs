@@ -1962,13 +1962,103 @@ fn search_with_embedding_disabled_refuses_and_names_the_setting() {
         failed.stderr()
     );
     // The exact setting, not "some word that appears near the subject". The first version accepted `contains("provider")`,
-    // which the generic trait refusal satisfied while naming nothing a reader could change (Task 6 review P1).
+    // which the generic trait refusal satisfied while naming nothing a reader could change (Task 6 review P1). F32 pins the
+    // whole line against a literal so a reword that drops the remedy fails too — and against a literal rather than
+    // `NoProvider::sentence()`, because an expectation assembled from the code under test cannot catch a reword.
     let stderr = failed.stderr();
-    assert!(
-        stderr.contains(r#"embeddings.provider = "none""#),
-        "the message has to name the setting that switched embedding off: {stderr}"
+    assert_eq!(
+        stderr.trim_end(),
+        concat!(
+            r#"np: embedding disabled: embeddings.provider = "none" — set it to "local-model" and name an "#,
+            "installed model with embeddings.model, then run np embed"
+        ),
+        "the refusal is this sentence, in full"
     );
+    assert_eq!(stderr.matches('\n').count(), 1, "one line: {stderr:?}");
     assert!(failed.stdout().is_empty(), "a refusal prints no hit list");
+}
+
+#[test]
+fn search_with_no_row_names_the_missing_row_and_says_what_to_run() {
+    // F32's state: the config asks for a local model this workspace has no row for — the reader who edited
+    // `config.toml` before installing anything. Today this prints a sentence about `provider = "none"`, which is
+    // not the configuration they have, and tells them to change a setting that is already right.
+    let ws = workspace();
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nabout alpha\n").expect("test setup: note");
+    run(&mut ws.command(&["scan"])).assert_success();
+    // Deliberately no `install_model`: the row is what is missing.
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("alpha");
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "a refusal is 1, and clap keeps argv at 2:\n{}",
+        failed.stderr()
+    );
+    let stderr = failed.stderr();
+    // A literal prefix, not `NoProvider::sentence()` — building the expectation from the code under test would make this
+    // case pass whatever the sentence became.
+    assert!(
+        stderr.starts_with(&format!(
+            "np: no model row for \"{EMBED_MODEL}\" in this workspace:"
+        )),
+        "the refusal has to name the missing row and the id the config asked for: {stderr}"
+    );
+    assert!(
+        !stderr.contains(r#"embeddings.provider = "none""#),
+        "this config says `local-model`; blaming a setting the reader does not have is the defect: {stderr}"
+    );
+    assert!(
+        !stderr.contains("   "),
+        "the message wrapped mid-sentence and printed a run of spaces: [{stderr}]"
+    );
+    // One line. `Db::open` can write orphan receipts to stderr, so "exactly one" is the honest claim rather than
+    // whole-buffer equality — and it is what catches a refusal that starts printing advice on a second line.
+    assert_eq!(
+        stderr.matches('\n').count(),
+        1,
+        "a refusal is one line, got {stderr:?}"
+    );
+    // The remedy names a command this build has. `fetch` is a cargo feature, so the assertion follows the build rather
+    // than promising a subcommand that `--no-default-features` compiles out of the help table (the same shape as
+    // `embed_remedy_names_only_commands_this_build_has`).
+    assert!(
+        stderr.contains("np models install"),
+        "install is in every build, so it has to be named: {stderr}"
+    );
+    if cfg!(feature = "fetch") {
+        assert!(
+            stderr.contains("np models fetch"),
+            "this binary can fetch, and the remedy should say so: {stderr}"
+        );
+    } else {
+        assert!(
+            !stderr.contains("np models fetch"),
+            "a build without `fetch` must not name it: {stderr}"
+        );
+    }
+    assert!(failed.stdout().is_empty(), "a refusal prints no hit list");
+
+    // The same refusal under `--json`: a machine reader gets the sentence on stderr and nothing on stdout, which is what
+    // today's behaviour is and nothing in the tree pinned for any search refusal before F32.
+    let mut json_cmd = ws.command_without_operand(&["search"]);
+    json_cmd.arg(&ws.root).arg("alpha").arg("--json");
+    let json_failed = run(&mut json_cmd);
+    assert_eq!(json_failed.code(), 1, "{}", json_failed.stderr());
+    assert!(
+        json_failed.stdout().is_empty(),
+        "a refusal writes no JSON: {}",
+        json_failed.stdout()
+    );
+    assert_eq!(
+        json_failed.stderr(),
+        stderr,
+        "the same state must refuse the same way in both channels"
+    );
 }
 
 #[cfg(not(feature = "local-model"))]
@@ -2020,10 +2110,16 @@ fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
         stderr.contains("artifact") && stderr.contains("absent"),
         "a reader needs to know the artifact is what is missing: {stderr}"
     );
+    // F32 appended the same pointer embed's arm (iii) gives. Without this assertion it could be deleted silently.
+    assert!(
+        stderr.contains("np models install"),
+        "and what to run about it: {stderr}"
+    );
     assert!(
         !stderr.contains("   "),
         "the message wrapped mid-sentence and printed a run of spaces: [{stderr}]"
     );
+    assert_eq!(stderr.matches('\n').count(), 1, "one line: {stderr:?}");
     assert!(failed.stdout().is_empty());
 }
 
