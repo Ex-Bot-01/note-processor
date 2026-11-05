@@ -564,8 +564,13 @@ impl Embedder for NoEmbeddingProvider {
 
     /// [`EmbedError::Disabled`] rather than the trait's default refusal, because the default says *this provider cannot
     /// embed a search query* and that is not what is wrong: nothing is unavailable, embedding is switched off, and the
-    /// setting that switches it off has a name (`embeddings.provider = "none"`). `np search` prints this text verbatim, so
-    /// the general arm would have told a reader to go find a provider when the answer is one config line (Task 6 review P1).
+    /// setting that switches it off has a name (`embeddings.provider = "none"`).
+    ///
+    /// **Nothing in `np` prints this text any more** (F32): `np search` now refuses on the [`crate::embed_run::NoProvider`]
+    /// reason it was handed, before asking a placeholder for a vector, and `np embed`'s arms come from
+    /// [`crate::embed_run::EmbedOutcome`]. The override stays because a provider that is asked to embed while embedding is off
+    /// still has to answer with the setting's name rather than "this provider cannot", and `tests/embed.rs` exercises it
+    /// directly — but a caller reaching it today has bypassed a resolution, which is worth knowing before adding one.
     fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
         Err(EmbedError::Disabled)
     }

@@ -438,8 +438,13 @@ enum BatchWrite {
 /// The three *configuration* states (`provider = "none"`, no [`crate::config::EmbeddingsConfig::model`], an id
 /// naming no installed row) are deliberately not variants: arm (ii) derives them from configuration and the
 /// `models` table in that same `run`, which is where those facts live, and it returns before anything here reads
-/// a provider. np-cli still hands over [`crate::embed::NoEmbeddingProvider`] for those states, and that
-/// placeholder can no longer reach a width comparison.
+/// a provider — for **these three**, which is the limit F32's design §2 records: the fourth state np-cli hands a
+/// placeholder for (a row whose declared width cannot be stored) does reach the comparison above and takes §6's
+/// wrong-dim sentence.
+///
+/// A caller that does not run an embed gets nothing from this enum, which is why [`NoProvider`] exists: `np search`
+/// needs the reason as a value too, and re-deriving it at its print site is what made it say
+/// `embeddings.provider = "none"` about a configuration that said `local-model` (F32).
 pub enum Resolution<'a> {
     /// A provider built from the configured row — the only thing this run can write a vector from, and the only
     /// [`Embedder::dim`] §6's wrong-dim refusal may quote.
@@ -455,6 +460,67 @@ pub enum Resolution<'a> {
     /// check and here would otherwise turn a refusal into an embed attempt with no provider at all, which is a
     /// worse answer to the same question. The next run re-reads the directory.
     ArtifactAbsent,
+}
+
+/// Why this workspace has no usable embedding provider, decided where the decision is made — `[embeddings]` and the
+/// `models` table — and handed to any caller that must explain itself rather than embed.
+///
+/// It sits beside [`EmbedOutcome`] because they answer the same question for two different commands, and both print
+/// sentences nothing in np-core prints: arm (ii)'s labels are read by np-cli, and so are these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoProvider {
+    /// `[embeddings] provider = "none"`, the default state of a fresh install. Not a fault, so the sentence names the
+    /// key to change rather than a failure.
+    ConfigDisabled,
+    /// `provider = "local-model"` with no `model`. [`crate::config::Config::load`] refuses this combination before any
+    /// command runs, so reaching this variant needs a `Config` built in memory — hence the unit-test-only coverage F32 §6 records.
+    ModelUnnamed,
+    /// The configured id names nothing installed in **this** workspace. The common first-run state: config edited by hand
+    /// before any artifact was installed, which is the case whose message used to blame the provider setting.
+    RowMissing {
+        /// The id `[embeddings] model` asks for.
+        id: String,
+    },
+    /// A row exists and its file is readable, but its declared width is not a number this run can store. Also
+    /// unit-test-only: `np models install --dim` validates 1..=65535 at argv, so no CLI invocation produces it.
+    RowDimUnusable {
+        /// The id the row was installed under.
+        id: String,
+        /// What the row declares, verbatim — a width is a fact about stored bytes, and quoting it beats paraphrasing one.
+        declared: String,
+    },
+}
+
+impl NoProvider {
+    /// The arm's one-line remedy, naming what to change and, where a command fixes it, the command.
+    ///
+    /// `workspace` is a parameter because the remedy pastes argv a human can run, and argv needs the workspace — the same
+    /// reason [`install_hint`] takes it. Every sentence here is asserted to stay one line and free of double spaces:
+    /// Task 6 shipped a search refusal that wrapped mid-sentence and printed twenty spaces between two words.
+    pub fn sentence(&self, workspace: &Path) -> String {
+        match self {
+            Self::ConfigDisabled => concat!(
+                r#"embedding disabled: embeddings.provider = "none" — set it to "local-model" and name an "#,
+                "installed model with embeddings.model, then run np embed",
+            )
+            .to_string(),
+            // The same words `Config::load` uses for this state, so the two places that can say it cannot disagree.
+            Self::ModelUnnamed => concat!(
+                r#"embeddings.provider = "local-model" needs embeddings.model to name an installed model; "#,
+                "none is set",
+            )
+            .to_string(),
+            Self::RowMissing { id } => format!(
+                "no model row for \"{id}\" in this workspace: {}",
+                install_hint(workspace)
+            ),
+            // "this run cannot store", not "this build cannot use": the width is a fact about the row, and embed's own
+            // arm (iv) sentence for the same state says "this run needs" (§2's limit).
+            Self::RowDimUnusable { id, declared } => format!(
+                "the row for \"{id}\" declares a width this run cannot store (\"{declared}\")"
+            ),
+        }
+    }
 }
 
 /// Embed what this workspace owes, through the injected provider.
@@ -1225,11 +1291,14 @@ fn artifact_file_exists(artifact: &Path) -> bool {
 
 /// The command arm (iii) names: the doors this build can actually walk through.
 ///
+/// Public because `np search`'s refusals name the same doors ([`NoProvider::sentence`]): one definition of "what do I run
+/// now", two callers, so a build that compiled `fetch` out cannot be told to run it by one sentence and refused by another.
+///
 /// Two of them exist now. `np models fetch` shipped in R7b, and this hint used to say the opposite — "fetching a model is
 /// not implemented in this build" — which sent an operator away from the one command that could finish the job on a machine
 /// with a network. A `fetch`-less build still gets the truth for its own shape rather than a name it cannot run.
 #[cfg(feature = "fetch")]
-fn install_hint(workspace: &Path) -> String {
+pub fn install_hint(workspace: &Path) -> String {
     format!(
         "fetch it with `np models fetch {} --id <id>`, or install bytes you already hold with \
          `np models install {} --id <id> --path <file> --dim <width> --sha256 <digest>`",
@@ -1241,7 +1310,7 @@ fn install_hint(workspace: &Path) -> String {
 /// The same advice for a build that compiled the fetch path out: naming `np models fetch` here would send a reader to a
 /// help screen that has never heard of it.
 #[cfg(not(feature = "fetch"))]
-fn install_hint(workspace: &Path) -> String {
+pub fn install_hint(workspace: &Path) -> String {
     format!(
         "install the artifact with `np models install {} --id <id> --path <file> --dim <width> --sha256 <digest>` \
          (this build has no fetch command)",

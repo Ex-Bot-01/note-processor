@@ -17,7 +17,7 @@ use np_core::catalog::size_human;
 use np_core::config::{Config, EmbeddingProvider};
 use np_core::db::{model_row, orphan_total, Db};
 use np_core::embed::{ArtifactCheck, Embedder, NoEmbeddingProvider};
-use np_core::embed_run::{self, EmbedOutcome, EmbedReport, Resolution};
+use np_core::embed_run::{self, EmbedOutcome, EmbedReport, NoProvider, Resolution};
 #[cfg(feature = "fetch")]
 use np_core::fetch;
 use np_core::hash::sha256_file;
@@ -340,27 +340,39 @@ fn print_summary(report: &ScanReport) {
 /// code is introduced — §6 says so, and clap keeps argv failures at 2.
 fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
-    let resolved = embed_provider(&cfg, workspace)?;
-    let mut provider = resolved.provider;
-    // The reason a provider could not be built goes to `embed_run` as a value. Handing over a placeholder
-    // instead is how R6c1 D-2 happened: an absent artifact became a provider that declares 0 dimensions, and the
-    // run refused with a sentence about widths when the truth was a missing file (see [`Resolution`]).
+    // Destructured rather than reached through the struct: the borrow below has to outlive the statement that takes it,
+    // and `Resolution::Provider` needs `&mut` into the box that `state` owns.
+    let Resolved {
+        mut state,
+        artifact_check,
+        workers,
+    } = embed_provider(&cfg, workspace)?;
+    // The reason a provider could not be built travels as a value — [`ProviderState::ArtifactAbsent`] for a missing file,
+    // [`ProviderState::Placeholder`]'s reason for the configuration states. Handing over a bare placeholder is how R6c1 D-2
+    // happened: an absent artifact became a provider that declares 0 dimensions, and the run refused with a sentence about
+    // widths when the truth was a missing file (see [`Resolution`]).
+    //
+    // Both live providers and placeholders map to `Resolution::Provider`, which is exactly what this call site produced
+    // before F32 — the two arms embed can see are unchanged by construction, and that is the reason `ProviderState` was
+    // allowed to exist at all (F32 §5).
     //
     // `as_mut`, not `as_ref`: a provider is the thing that can open a projector, so the run holds it mutably for as long
     // as the resolution lives (`Resolution::Provider`'s note says why).
-    let resolution = match &mut provider {
-        Some(provider) => Resolution::Provider(provider.as_mut()),
-        None => Resolution::ArtifactAbsent,
+    let resolution = match &mut state {
+        ProviderState::Ready(embedder) | ProviderState::Placeholder { embedder, .. } => {
+            Resolution::Provider(embedder.as_mut())
+        }
+        ProviderState::ArtifactAbsent => Resolution::ArtifactAbsent,
     };
     let mut report = embed_run::embed_with_resolution(workspace, &cfg, resolution)?;
     // What was concluded about the model's bytes travels on the report rather than being printed here, so `--json`
     // and the text summary cannot disagree about whether this run verified anything (the same reason §7's caveat is a
     // field). `None` says no local artifact was involved — a `provider = "none"` run has nothing to claim.
-    report.artifact_check = resolved.artifact_check;
+    report.artifact_check = artifact_check;
     // Likewise the worker count: decided where the provider was built, printed here. `None` means **no local-model
     // provider was constructed** — which is not the same sentence as "nothing was embedded": a `local-model` run whose
     // notes were all current still built a provider, and its report states the count it would have used.
-    report.workers = resolved.workers;
+    report.workers = workers;
     if json {
         emit_json(&serde_json::to_value(&report)?);
     } else {
@@ -382,9 +394,10 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
 /// Rank `query` against `workspace`'s index and print the hits.
 ///
 /// The provider is built exactly as `np embed` builds it, because the query must be embedded by the **same** model whose
-/// rows are being read — and under its `prefix_query` spelling, not the document one ([`Embedder::embed_query`]). That is
-/// also where an unbuilt runtime refuses at exit 1: [`embed_provider`] answers `None` when the artifact is absent, and a
-/// query nobody can embed has no ranking to print.
+/// rows are being read — and under its `prefix_query` spelling, not the document one ([`Embedder::embed_query`]). That is also
+/// where a run that cannot embed refuses at exit 1, with the sentence for its own [`ProviderState`]: an absent artifact, an
+/// unbuilt runtime, a missing row, a switched-off provider. A query nobody can embed has no ranking to print (F32: until this
+/// round four of those five shared one sentence about `provider = "none"`).
 fn search_workspace(
     workspace: &Path,
     query: &str,
@@ -393,15 +406,25 @@ fn search_workspace(
 ) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
     let db = workspace_db(&cfg, workspace)?;
-    let resolved = embed_provider(&cfg, workspace)?;
-    let Some(provider) = resolved.provider.as_ref() else {
+    // One `match`, no `_` arm: adding a state to `ProviderState` has to fail to compile *here*, because the last time this
+    // call site knew only one of the five answers it printed `embeddings.provider = "none"` about a configuration that said
+    // `local-model` (F32). Every placeholder reason collapses into a single arm on purpose — §1 of the F32 design measures
+    // that no CLI invocation can reach two of them, so per-state arms here would be mapping sites nothing can test.
+    let provider = match embed_provider(&cfg, workspace)?.state {
+        ProviderState::Ready(provider) => provider,
+        ProviderState::Placeholder { reason, .. } => {
+            return Err(reason.sentence(workspace).into())
+        }
         // One line, spelled out here rather than assembled across a wrapped literal: the first version broke mid-sentence
-        // and printed a run of twenty spaces between "be" and "embedded".
-        return Err(
-            "no embedding provider for this workspace: its model artifact is absent, \
-             so the query cannot be embedded"
-                .into(),
-        );
+        // and printed a run of twenty spaces between "be" and "embedded". The pointer is `install_hint`, the same
+        // feature-gated wording embed's arm (iii) prints — a build that compiled `fetch` out must not be sent to it.
+        ProviderState::ArtifactAbsent => {
+            return Err(format!(
+                "no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded: {}",
+                embed_run::install_hint(workspace)
+            )
+            .into())
+        }
     };
     // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
     // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
@@ -473,8 +496,10 @@ fn hit_json(hit: &Hit) -> Value {
 /// without an out-parameter, and keeps the alternative — verifying inside `embed_run`, which is handed a provider and
 /// cannot know how its bytes were produced — off the table.
 struct Resolved {
-    /// The provider for this run, or `None` for §6's arm (iii): see [`embed_provider`]'s rule about what `None` means.
-    provider: Option<Box<dyn Embedder>>,
+    /// What `[embeddings]` resolved to, including the states where nothing can embed. F32 replaced the
+    /// `Option<Box<dyn Embedder>>` this field used to be: an `Option` could say "no provider" without saying which of five
+    /// reasons, and only one of those reasons was ever explained.
+    state: ProviderState,
     /// D12's verify-on-change result, or `None` when no local artifact was read at all.
     artifact_check: Option<ArtifactCheck>,
     /// The worker-thread plan for this run, or `None` when no local-model provider was built (§6's arms and
@@ -482,24 +507,59 @@ struct Resolved {
     workers: Option<np_core::embed_run::WorkerPlan>,
 }
 
-/// A resolution with nothing to report about artifact bytes.
-fn resolved(provider: Option<Box<dyn Embedder>>) -> Resolved {
+/// What `[embeddings]` and the `models` table added up to, as one value.
+///
+/// Three states because that is how many answers exist: a provider this run can embed with, a provider-shaped placeholder
+/// for a state that refuses before a vector is asked for, and a filesystem fact no downstream code can re-derive.
+enum ProviderState {
+    /// A local provider built from the installed row. Nothing here claims its bytes verified anything — that is
+    /// [`Resolved::artifact_check`]'s job, taken where the row and the path were both in hand.
+    Ready(Box<dyn Embedder>),
+    /// A state that refuses before asking for a vector: configuration off, no model named, no row, an unusable declared
+    /// width. The placeholder is what [`np_core::embed_run`] wants for three of those four (its arm (ii) derives the arm from
+    /// configuration and the table itself), and the reason is what `np search` needs — so both travel.
+    Placeholder {
+        embedder: Box<dyn Embedder>,
+        reason: NoProvider,
+    },
+    /// The row says installed and the file is not there. Not a configuration state, and not recoverable downstream: only
+    /// this function holds the row and the path at the same time (R6c1 D-2).
+    ArtifactAbsent,
+}
+
+/// A resolution that refuses for one of the four placeholder reasons, with the seam's own placeholder provider.
+fn placeholder(reason: NoProvider) -> Resolved {
     Resolved {
-        provider,
+        state: ProviderState::Placeholder {
+            embedder: Box::new(NoEmbeddingProvider),
+            reason,
+        },
         artifact_check: None,
         workers: None,
     }
 }
 
-/// The provider `[embeddings]` names, or `None` when the installed row's artifact file is not there to load.
+/// A resolution for the row-installed-file-absent state: no provider at all, by the reason in [`ProviderState`].
+fn artifact_absent() -> Resolved {
+    Resolved {
+        state: ProviderState::ArtifactAbsent,
+        artifact_check: None,
+        workers: None,
+    }
+}
+
+/// What `[embeddings]` names, as one of three [`ProviderState`]s.
 ///
-/// `None` means **exactly that one thing**, and the call site turns it into [`Resolution::ArtifactAbsent`] so
-/// §6's arm (iii) can say so. It is not the spelling for "no provider could be built" in general: the
-/// configuration states (`provider = "none"`, a missing [`np_core::config::EmbeddingsConfig::model`], an id
-/// naming no installed row, a row whose declared width is not a number) still hand over [`NoEmbeddingProvider`]
-/// as a **placeholder for a state that refuses before any vector is asked for**, because [`np_core::embed_run`]
-/// derives each of those arms from configuration and the `models` table — the sources that hold the fact — and
-/// its arm (ii) returns before anything reads a provider's width.
+/// [`ProviderState::ArtifactAbsent`] means **exactly that one thing** — the row says installed, the file is not there — and
+/// `np embed` turns it into [`Resolution::ArtifactAbsent`] so §6's arm (iii) can say so. The four states that are *not* about
+/// bytes (`provider = "none"`, a missing [`np_core::config::EmbeddingsConfig::model`], an id naming no installed row, a row whose
+/// declared width cannot be stored) hand over [`NoEmbeddingProvider`] as a **placeholder** — what [`np_core::embed_run`] wants,
+/// since it derives those arms from configuration and the `models` table, the sources that hold the fact — **and** a
+/// [`NoProvider`] reason, which is what `np search` prints instead of the placeholder's generic refusal (F32).
+///
+/// Two of those four reasons are unreachable from argv: `Config::load` refuses `local-model` with no `model`, and
+/// `np models install --dim` validates 1..=65535 at the command line. They stay because a `Config` can be built in memory, and
+/// because the alternative is a state with no sentence — F32 §1 records both measurements.
 ///
 /// The row is read through a connection that closes when this function returns, before `embed_run` opens its
 /// own: np-cli holds no SQL of its own, and one workspace's [`np_core::db::ModelRow`] is where a local provider's
@@ -508,7 +568,7 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
     match cfg.embeddings.provider {
         // The default. Nothing is built, nothing is contacted, and the report says *configuration disabled*
         // rather than a fault (§2, §6).
-        EmbeddingProvider::None => Ok(resolved(Some(Box::new(NoEmbeddingProvider)))),
+        EmbeddingProvider::None => Ok(placeholder(NoProvider::ConfigDisabled)),
         EmbeddingProvider::OpenAiCompatible => {
             // Unreachable through `Config::load`, which refuses this variant by name; kept as a refusal rather
             // than a fallthrough into the local branch, because dialling out is not what this build does.
@@ -516,11 +576,13 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
         }
         EmbeddingProvider::LocalModel => {
             let Some(id) = cfg.embeddings.model.as_deref() else {
-                return Ok(resolved(Some(Box::new(NoEmbeddingProvider))));
+                // Defensive: `Config::load` refuses this combination, so argv cannot produce it. See the function's note.
+                return Ok(placeholder(NoProvider::ModelUnnamed));
             };
             let db = workspace_db(cfg, workspace)?;
             let Some(row) = model_row(&db, id)? else {
-                return Ok(resolved(Some(Box::new(NoEmbeddingProvider))));
+                // F32's arm: this is the state that used to print a sentence about `provider = "none"`.
+                return Ok(placeholder(NoProvider::RowMissing { id: id.to_string() }));
             };
             // The width this run needs: `[embeddings] dim`, or the row's own declaration when the config
             // declares none. `embed_run` applies the same rule and refuses a disagreement before any write, so
@@ -531,7 +593,11 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
                 .map(usize::from)
                 .or_else(|| usize::try_from(row.dim).ok())
             else {
-                return Ok(resolved(Some(Box::new(NoEmbeddingProvider))));
+                // Also defensive: `--dim` bounds what can be installed (F32 §1).
+                return Ok(placeholder(NoProvider::RowDimUnusable {
+                    id: id.to_string(),
+                    declared: row.dim.to_string(),
+                }));
             };
             let artifact = cfg.workspace_models_dir(workspace).join(id);
 
@@ -560,7 +626,7 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
                         let plan = embedder.worker_plan();
                         match np_core::local_model::verify_artifact(&db, &row, &artifact) {
                             Ok(check) => Ok(Resolved {
-                                provider: Some(Box::new(embedder)),
+                                state: ProviderState::Ready(Box::new(embedder)),
                                 artifact_check: Some(check),
                                 workers: Some(plan),
                             }),
@@ -568,7 +634,7 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
                         }
                     }
                     Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => {
-                        Ok(resolved(None))
+                        Ok(artifact_absent())
                     }
                     Err(err) => Err(err.into()),
                 }
@@ -582,12 +648,16 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
             match np_core::embed::LocalModelProvider::new(&row, &artifact, configured) {
                 // No digest check on this half: without the runtime nothing reads the artifact, so there is no claim
                 // about its bytes to make — and printing one would be the false report §7 refuses.
-                Ok(provider) => Ok(resolved(Some(Box::new(provider)))),
+                Ok(provider) => Ok(Resolved {
+                    state: ProviderState::Ready(Box::new(provider)),
+                    artifact_check: None,
+                    workers: None,
+                }),
                 // The row is installed and its width is the run's; only the bytes are missing. That is a fact
                 // about the filesystem, not about configuration, so it cannot be recovered downstream — hence
                 // `None` here rather than a placeholder provider whose declared width would then be compared
                 // with the row's (R6c1 D-2).
-                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => Ok(resolved(None)),
+                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => Ok(artifact_absent()),
                 Err(err) => Err(err.into()),
             }
         }
