@@ -2091,6 +2091,47 @@ fn searching_without_the_runtime_names_the_model_that_stayed_owed() {
 }
 
 #[test]
+fn an_invented_log_level_refuses_and_a_valid_one_does_not() {
+    // F33's escape hatch has to be usable, which starts with a typo in it being visible. The refusal belongs to any command
+    // that reads configuration — `scan` is the cheapest such command, and pinning it there rather than on `search` also pins
+    // that the value is checked while resolving config rather than deep inside a model load.
+    let ws = workspace();
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nabout alpha\n").expect("test setup: note");
+
+    let mut cmd = ws.command(&["scan"]);
+    cmd.env("NP_LLAMA_LOG_LEVEL", "deubg");
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "a runtime refusal is 1:\n{}",
+        failed.stderr()
+    );
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("NP_LLAMA_LOG_LEVEL"),
+        "the refusal must name the variable that was mistyped: {stderr}"
+    );
+    assert!(
+        stderr.contains("deubg"),
+        "and the value as written, so the reader knows which word is wrong: {stderr}"
+    );
+    for name in ["off", "error", "warn", "info", "debug"] {
+        assert!(
+            stderr.contains(name),
+            "the refusal omits `{name}`: {stderr}"
+        );
+    }
+
+    // The same command with a real level runs: the refusal is about the spelling, not about the variable existing.
+    let mut ok = ws.command(&["scan"]);
+    ok.env("NP_LLAMA_LOG_LEVEL", "info");
+    let passed = run(&mut ok);
+    assert_eq!(passed.code(), 0, "{}", passed.stderr());
+}
+
+#[test]
 fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
     let ws = workspace();
     fs::write(ws.root.join("a.md"), "# Alpha\n\nnothing indexed here\n").expect("test setup: note");
