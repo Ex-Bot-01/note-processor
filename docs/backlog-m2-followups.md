@@ -791,3 +791,41 @@ knows the difference.
   exist. `np search` proves the plumbing reaches both kinds; that is the whole claim on record today.
 - **Done when:** §14 gains a measured subsection with the set's size and provenance, or records explicitly that the measurement
   was declined and why.
+
+## F32 — `np search` blames `embeddings.provider = "none"` on a workspace whose config says `local-model`
+
+Filed 2026-11-05 while writing the README's troubleshooting table, which had to document the message rather than the cause.
+Measured here with `[embeddings] provider = "local-model"`, `model = "embeddinggemma-2"` in the config and a **fresh data
+directory** (so no `models` row for this workspace): `np search` exits 1 with
+`np: embedding disabled: embeddings.provider = "none"` — a sentence about a configuration state the user does not have. The
+same command with a row installed and its artifact file deleted prints the accurate one, `no embedding provider for this
+workspace: its model artifact is absent, so the query cannot be embedded`.
+
+- **Why:** `embed_provider` answers the *no row* arm with `Some(NoEmbeddingProvider)`, so `search_workspace`'s dedicated
+  artifact-absent sentence — written for exactly this situation in R7c Task 6 — never fires, and the generic `Disabled`
+  message from the trait arrives instead. The two no-provider arms (no row, no bytes) resolve differently and therefore
+  report differently, which is the part worth fixing rather than rewording.
+- **What it would take:** carry the resolution reason out of `embed_provider` as a value (the way `embed`'s report already
+  carries its detail), have `search` print the cause it was given instead of the provider's generic refusal, and pin each arm
+  with a CLI case asserting the exact sentence — one with no row, one with a row and no file, one default build. A test that
+  only asserts "mentions embeddings" is what let this through: the present assertion passes on both messages.
+- **Blocks:** README's claim (design §6, repeated there) that a refusal names what to change, for this arm; and any support
+  answer that tells a user to edit their provider because their provider is disabled.
+
+## F33 — a model load writes ~1,500 lines of llama.cpp progress to stderr
+
+Filed 2026-11-05 by the same README pass. Measured on an `np embed` run that encoded one chunk: **stdout 12 lines** (the
+report), **stderr 1,553 lines** — `create_tensor:` 749, `llama_graph_n_input_tensors:` 567, `print_info:` 65, plus the loader's
+metadata dump. A run with nothing owed writes **0** stderr lines, so the volume tracks real encodes and hides in exactly the
+runs a user cares about.
+
+- **Why:** our FFI never calls `llama_log_set`, so llama.cpp keeps its own default verbosity and streams to the process's
+  stderr. Nothing of ours is mixed in — stdout stays clean, which is what makes this cosmetic rather than corrupting — but
+  `np embed 2>&1 | tee run.log` buries the report under a thousand tensor names, and `--json` consumers that merge the two
+  streams get garbage.
+- **What it would take:** one `llama_log_set` at context creation with a level derived from configuration rather than a
+  constant (default error-only), plus a visible escape hatch — an env var or flag — because `tests/probes/thread_sweep.sh` and
+  the R6d benchmark work read some of these lines. Pin it with a CLI case asserting stderr is empty after a successful encode;
+  that case needs both artifact variables, so it must print `NOT COVERAGE` rather than pass silently without them.
+- **Blocks:** nothing correctness-wise. It costs a line in README ("stdout is the report; stderr is llama.cpp's") and any
+  wrapper that treats merged output as machine-readable.

@@ -1,97 +1,312 @@
 # note-processor
 
-A local-first index for a Markdown vault. `np` scans a folder of notes once and keeps a SQLite catalog that answers,
-without re-reading the corpus: what is in this vault, which files changed since last time, where every link resolves,
-which notes are ambiguous or unreadable — and *why* each row says what it says.
+A local-first indexer for a folder of markdown notes. `np` walks a workspace, keeps an incremental index of every note in a
+SQLite database, resolves the `[[wikilinks]]` and `[text](target)` links between them, regenerates a human-readable catalog
+(`INDEX.md`) in the vault itself, and — when you opt in — embeds notes and the images they link with a small local model so
+`np search` can rank both by meaning rather than by keyword.
 
-Nothing leaves the machine except when you ask it to: there is no telemetry, no sync, and exactly one command that can
-make a network call — `np models fetch`, documented under [Installing a model](#installing-a-model). `np scan` and
-`np embed` reach no network at all.
+Nothing here is a service. No daemon, no server, no account: one binary, one database per workspace, all on disk. The
+indexing path never opens a socket; the only command that can dial out is `np models fetch`, and it says so before it transfers
+a byte.
 
-## Status
+**Everything measured in this file was measured on one host** — Linux x86-64, 16 CPUs, 7.4 GB RAM, 2026-11-05 — and says so
+where a number is host-specific. Where something has *not* been measured, this file says that too rather than guessing.
 
-Built and tested: the scan pipeline (content-hash change detection, FTS5 search index, link resolution with recorded
-ambiguity), durable upgrade/refusal rules for damaged or unreadable notes, byte-exact cross-platform paths, and the
-M2a ground for embeddings — deterministic chunking, `chunks`/`embeddings`/`models` storage, a model install command that
-verifies what it is given.
+## Contents
 
-**Built since that sentence was written:** the forward pass (`np embed` writes vectors and reports what it refused), a pinned
-artifact fetched over HTTPS or installed from disk and verified against its recorded digest, `np search` ranking notes and image
-vectors that exist, and a thread policy for the decode.
+- [What it does, and does not do](#what-it-does-and-does-not-do)
+- [Quick start](#quick-start)
+- [Installing `np`](#installing-np)
+- [Getting a model onto the machine](#getting-a-model-onto-the-machine)
+- [Configuration](#configuration)
+- [Using it day to day](#using-it-day-to-day)
+- [Reading the report](#reading-the-report)
+- [Images in the index](#images-in-the-index)
+- [Troubleshooting](#troubleshooting)
+- [Building from source, and developing](#building-from-source-and-developing)
+- [Where the thinking lives](#where-the-thinking-lives)
 
-**The boundary that matters when you read those claims.** Embedding needs the `local-model` feature: the default binary links no
-inference runtime, so there `np embed` reports that nothing was produced and `np search` refuses to turn the query into numbers —
-both at exit 1, with a message naming what to change. Image vectors need one more feature (`vision`) which **the CLI cannot ask
-for yet**: `np-cli` has no `vision` passthrough, so every shipped binary that gets as far as the image pass records figures and
-encodes none. "As far as" is worth stating: with no artifact installed at all, `np embed` refuses on the missing artifact
-**before** any figure is examined, so that run prints no `images …` line at all rather than a line full of refusals — the image
-counts appear once the model's own bytes are in place.
+## What it does, and does not do
 
-## Commands
-
-| Command | What it does |
+| | |
 | --- | --- |
-| `np scan <workspace>` | Index a vault: detect what changed, re-parse and re-index it, report counts as text or `--json` |
-| `np models install <workspace> --id … --path … --dim … --sha256 …` | Put a model artifact under the workspace's model directory, verifying the digest before and after |
-| `np models hash <file>` | Print the SHA-256 of a file, in the format `install` expects |
-| `np models list <workspace>` | Show each model row and whether its artifact is actually present and matches |
-| `np models fetch <workspace> --id … [--member …] [--discard-marker]` | Download a **pinned** model's artifacts and record them — `fetch` is the only command that dials out, and it accepts only bytes that hash to what this build pins. Where it asks: `[models] base_url`, else `NP_MODELS_BASE_URL` when the file leaves that key out, else the one origin baked into the pin table. Which members: the ones this binary can use — a build without image support fetches the primary artifact only, and asking it for `mmproj` is refused as missing image support. Offline? `install --path` still works |
-| `np search <workspace> <query> [--limit N] [--json]` | Rank what is already indexed against a text query — notes and image vectors in **one** ranked list, highest cosine first; `--limit` defaults to 10. **Changes nothing about the index**: no vector, no stamp and no note row is written (opening a database that does not exist yet still creates it and runs migrations, exactly as `scan` and `embed` do). An index with no vectors at all prints one line and exits 0; vectors stored under a **different** model id are a refusal naming the id this run asked for. `--json` prints `hits`, every object carrying the same five keys — `score`, `kind`, `path`, `linked_from`, `source_note` |
-| `np embed <workspace>` | Embed what is owed for the configured model and write it to the database — a `local-model` build first checks the artifact against its recorded digest; `--json` reports the same four labelled outcomes this command exits with |
+| **Indexes notes** | Discovers files under a workspace root, parses front matter, titles, headings, checklist items and links, and stores them per workspace. A rescan reports added / modified / moved / removed / unchanged and rewrites only what changed |
+| **Resolves links** | `[[Note]]`, `[[Note|alias]]` and `[text](relative.md)` are matched case-insensitively against the corpus. An ambiguous or missing target is left unresolved and *named* in the report — never guessed |
+| **Writes a catalog** | `INDEX.md` at the workspace root, sharded into `INDEX-<a>-<z>.md` when it grows past the configured entry budget. Generated files carry a fingerprint header, so a scan only ever replaces files it owns |
+| **Embeds locally** | With the `local-model` feature and an installed artifact, vectors are computed in-process by llama.cpp from the sha256-pinned source. Default builds contain no inference runtime at all |
+| **Embeds images too** | A `.png`/`.jpg`/`.jpeg` linked from a note is content-hashed, de-duplicated across notes, and (in a build with image support) encoded to a 768-component unit vector. See [Images in the index](#images-in-the-index) |
+| **Searches both kinds** | `np search <workspace> <query>` embeds the query and prints the top hits — notes and figures — with cosine scores, ordered deterministically |
+| **Does not** | Sync, serve, or watch. No OCR, no PDF/audio support, no full-text keyword search (semantic only), no cloud calls outside `models fetch`, and no image encoding in a shipped binary yet ([F28](docs/backlog-m2-followups.md)) |
 
-Refusals are deliberate: an unreadable note is reported and left alone, never repaired; an install whose digest does not
-match is refused before a byte is copied; an artifact that disagrees with its own row is reported, not overwritten.
-
-## Installing a model
+## Quick start
 
 ```sh
-# 1. place the `np` binary on PATH
-np models fetch <workspace> --id embeddinggemma-2   # the one outbound request; a text-only build fetches one file
-np scan  <workspace>                                # index the vault
-np embed <workspace>                                # write the vectors — needs a `local-model` build
+cargo build --workspace --release
+./target/release/np scan ~/Notes
 ```
 
-**Read that last line's condition.** The binary you get from `cargo install` links no inference runtime, so steps 1–2 work
-and step 3 reports that nothing was produced (exit 1), as does `np search`: there is nothing to turn your query into numbers.
-The fetch still succeeds, which means a default build will happily download 309 MB it cannot open — build with
-`--features local-model` when this machine is meant to embed.
+```text
+added      5
+modified   0
+moved      0
+removed    0
+unchanged  0
+notes      3
+unresolved 1 — a target matched more than one file or none; spell its path to place it, e.g. [[notes/a.md]]
+  gone.md
+skipped    0
+index      INDEX.md
+elapsed    163 ms
+```
 
-`fetch` is what pulls the model files, so installation needs no config file. It makes **one kind of outbound request**:
-a plain GET for each member it plans, against `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main`
-— where this build's pinned digests were read from. Point `[models] base_url` (or `NP_MODELS_BASE_URL`) at a mirror to
-move that request, and on an air-gapped host skip `fetch` and use `np models install --path … --sha256 …`, which needs
-no network at all.
+That is a working indexer: `~/Notes/INDEX.md` now lists every note with its size and link counts, and the database lives under
+your OS data directory. Run it again and nothing recomputes (`unchanged 5`, 25 ms in the same test).
 
-Two things this command will not do: it never accepts bytes that hash to something other than what the build pins, and
-**its own output** — every transfer refusal, progress line and report — names a class (`not found`, `timed out`) and never a
-host or URL. A *config* refusal is deliberately different: an invalid `[models] base_url` quotes the value you wrote, because
-telling you to fix a key without showing the offending value wastes the one thing a refusal is for. A text-only binary also refuses to download the 554 MB projector it cannot load; `--member` still spells the
-whole plan when you are fetching on behalf of a different build.
+Embedding and searching need two more decisions of yours — a build with the runtime in it, and a model installed into that
+workspace — because the default binary deliberately ships neither:
+
+```sh
+cargo build --release -p np-cli --features local-model   # also needs cmake; see Building from source
+np models install ~/Notes --id embeddinggemma-2 --path ~/models/embeddinggemma-2-Q8_0.gguf \
+  --dim 768 --sha256 2188ac1d…09135                        # the digest `np models hash` prints for that file
+```
+
+Then write `[embeddings] provider = "local-model"` + `model = "embeddinggemma-2"` into your config (see
+[Configuration](#configuration)) and:
+
+```sh
+np scan ~/Notes && np embed ~/Notes && np search ~/Notes "how are moved files detected"
+```
+
+```text
+model      embeddinggemma-2
+outcome    nothing owed
+seen       3
+current    2
+embedded   1
+refused    0
+busy-gap   0
+errors     0
+images     links 1 · embedded 0 · refused 1 (vision-unavailable 1)
+verify     self-consistent, not verified
+digest     not re-read: same size and mtime as the last check (295.5 MB); detects changed bytes, not a crafted mtime
+threads    12 of 16 available (auto)
+```
+
+```text
+0.7140 note   projects/timeline.md
+0.6566 note   projects/brief.md
+0.5703 note   index-notes.md
+```
+
+Two things that trip people up, both by design:
+
+- **`np embed` reads the index, not the vault.** Edit a note and `np embed` will call it current; run `np scan` first, then
+  `np embed` re-embeds only what moved (`embedded 1` above).
+- **The report goes to stdout; llama.cpp's progress chatter goes to stderr.** When a model actually loads, that chatter runs to
+  ~1,500 lines here (`create_tensor:`, `llama_graph_n_input_tensors:` …), so pipe stdout where you want clean output. Quietening
+  it is filed as F33.
+
+## Installing `np`
+
+### From source (the supported path)
+
+You need a stable Rust toolchain — the repository pins none, and everything here was built with 1.99.1. Nothing else is needed
+for the default build: no C++ compiler and no cmake. The only thing cargo reaches for is its own registry of crates.
+
+```sh
+git clone https://github.com/Ex-Bot-01/note-processor.git
+cd note-processor
+cargo build --workspace --release        # binary at target/release/np
+cargo install --path crates/np-cli       # or install it as `np` on your PATH
+np --help
+```
+
+```text
+Usage: np <COMMAND>
+
+Commands:
+  scan    Index a note workspace and regenerate its catalog
+  embed   Embed the notes a workspace owes, for the configured model
+  search  Rank the indexed notes and images against a text query
+  models  Install and inspect the model artifacts of one workspace
+```
+
+The default build links **no** inference runtime: `np scan` is fully functional, while `np embed` reports that nothing was
+produced and `np search` refuses to turn your query into numbers — both at exit 1, with a message naming what to change. Add
+`--features local-model` (and cmake) if you want the runtime in the binary; see
+[Building from source](#building-from-source-and-developing).
+
+### Pre-built binaries
+
+GitHub Releases carry `np` for Linux (x86-64), Windows (msvc) and macOS (apple silicon), built by `.github/workflows/release.yml`
+on a tag push. **The published `v0.1.0` assets are stale**: that tag points at the 2026-10-28 tree, whose CLI had exactly one
+subcommand (`scan`). Use them for the indexer; build from source if you want `embed`, `search` or `models`.
+
+## Getting a model onto the machine
+
+Embedding is opt-in twice over: a feature at build time and an artifact at run time. One model identity is pinned in this
+repository's build today — `embeddinggemma-2`, 768 components, empty document/query prefixes — and its two artifacts are a
+text encoder (309,855,456 bytes) and a vision projector (554,821,056 bytes).
+
+Artifacts live **per workspace**, next to that workspace's database:
+
+```text
+<data_dir>/workspaces/<key>.sqlite        the index for one workspace
+<data_dir>/workspaces/<key>.models/       its installed artifacts, named by model id
+<data_dir>/workspaces.sqlite              the registry of known workspaces
+```
+
+`<key>` is a digest of the workspace's absolute path as bytes, so two spellings of one directory share one index and two
+directories never share it. `<data_dir>` is `$XDG_DATA_HOME` else `$HOME/.local/share` (`%LOCALAPPDATA%` on Windows).
+
+### Option A — fetch it
+
+```sh
+np models fetch ~/Notes --id embeddinggemma-2
+```
+
+The **only** command in the program that opens a socket. It prints where it is about to dial, in class terms and never as a URL:
+
+```text
+origin      this build's compiled-in default — no [models] base_url is configured (an empty NP_MODELS_BASE_URL counts as unset)
+```
+
+A text-only binary fetches only the text encoder; naming `--member mmproj` from such a build is refused, because transferring
+554 MB that the binary cannot load is not a service. Interrupted downloads are guarded by a marker file that no clock may
+expire — if you know no fetch is running, say so with `--discard-marker`. It will not overwrite an artifact that already
+exists:
+
+```text
+np: refusing to overwrite the existing artifact <data_dir>/workspaces/<key>.models/embeddinggemma-2
+```
+
+### Option B — install a file you already have
+
+```sh
+np models hash ~/models/embeddinggemma-2-Q8_0.gguf     # prints "<sha256>  <path>"
+np models install ~/Notes --id embeddinggemma-2 --path ~/models/embeddinggemma-2-Q8_0.gguf \
+  --dim 768 --sha256 <that digest>
+```
+
+`install` reads the file, verifies it against the digest you declared, and copies it into place — it never moves or truncates
+your original. One word on stdout: `installed`, or `already installed` when the id is recorded with the same tuple. Re-running
+with a **different** dim or prefix for an existing id is refused rather than silently re-stamping history.
+
+`np models list ~/Notes` then says what the workspace believes:
+
+```text
+models     1
+embeddinggemma-2  present  dim 768  sha256 2188ac1deca4  installed_at 1793893791  prefix_doc ""  prefix_query ""
+unclaimed  0
+```
+
+`state` is `present`, or `missing` when the row exists and its file does not — a deleted artifact is reported rather than
+forgotten. Re-declaring an id with a different width is refused outright, because that would silently change what every stored
+vector means; see [Troubleshooting](#troubleshooting) for the sentence it prints.
+
+## Configuration
+
+Optional, and read once per command from:
+
+```text
+$XDG_CONFIG_HOME/note-processor/config.toml     else ~/.config/note-processor/config.toml
+                                                (Windows: %APPDATA%\note-processor\)
+```
+
+A partial file is fine — every key has a default. Two environment variables exist, and they **fill keys the file leaves out**;
+a value in the file always wins, and an empty environment value counts as unset rather than as a choice.
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `catalog.max_entries_per_file` | `600` | Entry budget for one catalog file before it shards |
+| `catalog.continuation_indent` | `2` | Indent for wrapped continuation lines |
+| `embeddings.provider` | `"none"` | `"none"`, or `"local-model"` to embed in-process. `"openai-compatible"` parses and is refused: nothing dials out for a vector |
+| `embeddings.model` | unset — required by `local-model` | The id from `np models install`; there is no guessing, because an id nobody installed cannot own a vector |
+| `embeddings.dim` | the installed row's width | A declared width that disagrees with the row is refused before any write |
+| `embeddings.max_tokens` | `1024` | Token budget per sequence. Over-budget chunks are **reported**, never silently truncated |
+| `embeddings.threads` | `"auto"` | Worker count for llama.cpp: `min(cpus, max(min(cpus, 4), 80%))`, so 16 CPUs → 12 and a 2-core laptop → 2. An integer pins it; `0`, negatives and non-integers are refused |
+| `models.base_url` | the compiled-in origin | Where `models fetch` may go. Mirrors are one line away; refusals never name a host |
+| `models.sha256` | unset | Read into config (`NP_MODELS_SHA256` fills it when the file omits the key). Nothing in the fetch path consults it today, so it does **not** replace a pin — see `docs/design-m2-local-embeddings.md` §12 rule 7's note |
+| `markers.done`, `markers.paused` | built-in lists | Strings that classify checklist items when the catalog renders them |
+
+```toml
+[embeddings]
+provider = "local-model"
+model = "embeddinggemma-2"
+# max_tokens = 1024        # per-sequence budget; over-budget is reported, not truncated
+# threads = "auto"         # or an integer
+
+[catalog]
+max_entries_per_file = 600
+```
+
+## Using it day to day
+
+```sh
+np scan <workspace> [--json]              # index + regenerate the catalog
+np embed <workspace> [--json]             # embed what the index says is owed
+np search <workspace> <query> [--limit N] [--json]     # --limit defaults to 10
+np models install|fetch|hash|list …
+```
+
+- **Order matters: scan, then embed.** Embedding works from the index. `scan` is idempotent and cheap on an unchanged tree.
+- **What counts as a note.** Only files ending `.md` (any case) are parsed as notes; other files under the root are still tracked
+  for changes, which is why a vault of five files can report `added 5` and `notes 3`. Directories whose name begins with `.` and
+  `processed/` are not walked at all.
+- **Incremental both ways.** A note whose bytes have not moved keeps its vector; a figure's vectors are keyed to its *content
+  hash*, so the same image linked from six notes is encoded once, and deleting the last link to it prunes the row and its
+  vectors on the next run.
+- **`search` writes nothing.** It prepares only `SELECT`s — no vector, no stamp, no note row. (Opening a brand-new workspace's
+  database still creates it, like every other command: "read-only" describes what search changes about the index.) Which kinds
+  are indexed is never a refusal: a notes-only corpus searches fine, so does an images-only one, and an index with no vectors
+  prints `nothing indexed for <id>` and exits **0**.
+- **`--json` is the machine interface.** stdout carries exactly one JSON document (`scan`, `embed`, `search`, `models list`);
+  search hits always carry the same five keys — `score`, `kind`, `path`, `linked_from`, `source_note` — because an absent key
+  and a zero would be two different claims.
+
+```sh
+np search ~/Notes "vision projector" --limit 2 --json
+```
+
+```json
+{
+  "hits": [
+    { "kind": "note", "linked_from": 0, "path": "projects/brief.md", "score": 0.6496769175575762, "source_note": null },
+    { "kind": "note", "linked_from": 0, "path": "projects/timeline.md", "score": 0.6416128848890479, "source_note": null }
+  ]
+}
+```
+
+- **Exit codes.** `0` success (including "nothing to do" and "nothing indexed"), `1` anything the runtime refused — disabled
+  provider, missing artifact, a model mismatch — and `2` for argv errors, which is clap's doing. No command invents a code.
+
+## Reading the report
+
+`np embed` prints one line per fact, in this order (measured output above):
+
+| Line | Meaning |
+| --- | --- |
+| `model` | The id whose vectors this run read and wrote |
+| `outcome` | What was left when the pass ended — `nothing owed`, or the arm that stopped it |
+| `seen` / `current` / `embedded` | Notes considered, notes already vectorised for this model, notes encoded now |
+| `refused` | Chunks over `max_tokens`: counted and named, never truncated |
+| `busy-gap` | Work that appeared between the plan and the write; the next run picks it up |
+| `errors` | Failures that did not stop the run — each is a finding, not noise |
+| `images` | `links N · embedded N · refused N (class N …)` plus `unchecked` / `pruned` when they are non-zero. See below |
+| `verify` | Whether this run re-hashed the artifact or took its stamp at face value |
+| `digest` | The same claim in words, with the size it saw and what that check can and cannot detect |
+| `threads` | Workers llama.cpp used, and whether `"auto"` or you chose it |
 
 ## Images in the index
 
-`np embed` reads `![alt](target)` out of each note's own bytes and embeds the local file it names — resolved relative to
-**that note's** directory, inside the workspace, percent-decoded once. Identity is the content hash, so one diagram written
-to five paths or copied to three folders gets **one vector** and one search hit; renaming a file re-points a row and does not
-re-embed it. A figure is re-encoded when its bytes change. What that sentence does not cover: the change check is file size
-plus whole-second mtime, so an in-place rewrite that preserves both — same length, same timestamp — keeps its old vector
-until something else makes the pass read the file (backlog **F27**).
+A note links a figure with ordinary markdown image syntax — `![alt](diagram.png)` — and the path resolves exactly like a note
+link: relative to the linking file, case-insensitively, inside the workspace only. Accepted extensions are `.png`, `.jpg` and
+`.jpeg`, **and** the bytes must carry that format's signature: an accepted name wrapping a BMP or a GIF is refused as
+`unsupported-format` rather than handed to a decoder that would happily read it (F26).
 
-**Accepted formats: `.png`, `.jpg`, `.jpeg` — and the name is only half the test.** A `.svg`, `.gif`, `.bmp` or `.pdf` link
-refuses as `unsupported-format` on its extension; a file with an accepted extension then has to *be* that format, judged from
-its first bytes (a PNG signature, or a JPEG start-of-image marker). A `.png` whose payload is really BMP bytes is therefore
-refused as `unsupported-format`, not embedded. The byte check exists because the pinned decoder **would** have taken them: on
-2026-11-03 a BMP payload under a `.png` name came back a live bitmap and then a vector (backlog **F26**), so a name-only rule
-promises three formats while the index quietly holds others. Convert vector figures to PNG if you want them searchable — an SVG
-rasteriser is owed (**F29**), not hidden.
-
-Images get their own line on the `np embed` report and never change its exit code; every refusal below is a **count**, and
-`--json` carries an `image_refusals` array of `[name, class]` pairs — the linking note's path when the target never resolved,
-the figure's own workspace path otherwise — because "refused 3" alone cannot tell a format decision from a missing file:
-
-```text
-images     links 7 · embedded 4 · refused 3 (missing-target 1, unsupported-format 2)
-```
+Figures are content-addressed, so identical bytes across notes encode once, and every refusal is counted under one of six
+classes on the `images` line:
 
 | Class | What it means, and what to do |
 | --- | --- |
@@ -99,59 +314,101 @@ images     links 7 · embedded 4 · refused 3 (missing-target 1, unsupported-for
 | `outside-workspace` | The target is absolute or escapes the workspace root (including through a symlink). Nothing outside the vault is read; move the figure in, or link it relatively |
 | `unsupported-format` | Not `.png`/`.jpg`/`.jpeg`, or an accepted name whose bytes are not that raster. Re-export as PNG or JPEG |
 | `undecodable` | Accepted name and signature, but the decode failed — a truncated or damaged file is the usual cause. Re-export the figure; nothing partial was stored |
-| `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Never observed on this artifact pair**: one size was measured — a 4096×3072 PNG cost 1,064 tokens — and larger sizes have not been (the case that would measure the ceiling needs `$NP_TEST_VISION_LARGE`, unset here). So if you see it, suspect a narrower window or a re-pinned artifact rather than a slightly big diagram: shrink the figure and re-run, and treat a fresh `over-budget` on an unchanged vault as a finding about the artifact |
-| `vision-unavailable` | Three meanings, one label: this binary has no image code; the installed model declares no projector; or **a provider refused something this report has no class for**, which is reported here rather than inventing a fourth name. In a shipped `np` build every figure that *resolves and passes the content gate* lands here — `np-cli` has no `vision` passthrough to ask for it (**F28**). Figures whose links do not resolve, or whose bytes are not PNG/JPEG, still get `missing-target` / `outside-workspace` / `unsupported-format`, because those refusals happen before any image capability is asked about |
+| `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Never observed on this artifact pair**: one size was measured — a 4096×3072 PNG cost 1,064 tokens — and larger sizes have not been. If you see it, suspect a narrower window or a re-pinned artifact rather than a slightly big diagram |
+| `vision-unavailable` | Three meanings, one label: this binary has no image code; the installed model declares no projector; or **a provider refused something this report has no class for**. In a shipped `np` build every figure that *resolves and passes the content gate* lands here — `np-cli` has no `vision` passthrough to ask for it (**F28**) |
+
+The counts count what their nouns say: `links` is written targets de-duplicated per note (a refused link still counts),
+`unchecked` means some note could not be read so the sweep was held off, and `pruned` reports vectors deleted along with the
+figure they belonged to.
+
+## Troubleshooting
+
+| What you saw | What it means |
+| --- | --- |
+| `np: configuration disabled: embeddings.provider = "none"` | No provider chosen. Either write `[embeddings] provider = "local-model"` into the config, or accept that this build indexes only |
+| `np: embedding disabled: embeddings.provider = "none"` from `np search`, when your config *does* say `local-model` | This **workspace** has no model row yet — run `np models install` or `fetch` for it. The message names the wrong cause; that is filed as F32 |
+| `np: no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded` | The row exists but the file under `<key>.models/` does not. Re-install or re-fetch it |
+| `np: refusing to overwrite the existing artifact …` from `models fetch` | Rule 5 of §12: a fetch publishes into an absent target only. Remove the artifact deliberately, or install over a declared digest with `np models install` |
+| `model embeddinggemma-2 is already installed with dim = 768; this command declares 512` (abridged: the real message wraps the values in backticks) | Installing a second meaning onto an existing id is refused and nothing is written. A different artifact or width means a new id, not an overwrite |
+| `verify self-consistent, not verified` | This run trusted the stamp instead of re-hashing 300 MB — normal after the first check. `digest` says when it last looked |
+| Vectors under another model id | `search` refuses rather than ranking your query against a different model's space; it names the configured id and never another model's path or URL |
+| Thousands of `create_tensor:` lines | llama.cpp progress on **stderr** while a model loads. stdout stays clean (F33) |
+| `np embed` says `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |
+
+## Building from source, and developing
+
+```sh
+cargo build --workspace                 # no C++, no runtime: the default everyone gets
+cargo test --workspace                  # 645 tests pass here; none needs a model
+```
+
+The `local-model` feature builds llama.cpp from sha256-pinned source. It is **Linux-only by refusal** in `build.rs`, and it
+needs two explicit steps, because `cargo build` never fetches anything:
+
+```sh
+CMAKE=/path/to/cmake scripts/vendor-llama-cpp.sh      # fetch + verify the pinned tarball into .vendor/
+CMAKE=/path/to/cmake cargo build --release -p np-cli --features local-model
+```
+
+The vendor script downloads the tarball named in `third_party/llama-cpp.toml`, refuses on any digest mismatch (printing both),
+and records provenance outside the tree; re-running it on an existing tree prints `already vendored: …` and fetches nothing.
+On this host a cold feature build of `np-cli` took 57 s with `-j 4`.
+
+**Watch your disk.** A target directory that has run every gate here reached **10.7 GiB**; `cargo clean` reclaims it, and the
+pinned source in `.vendor/` (184 MB) survives so a rebuild needs no download.
+
+Working on the code means running the whole gate list by exit code — subsetting it is how a green run stops meaning anything:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked -p np-core --features local-model --all-targets -- -D warnings
+cargo clippy --locked -p np-cli --features local-model --all-targets -- -D warnings
+cargo clippy --locked -p np-core --features local-model,vision --all-targets -- -D warnings
+cargo clippy --locked -p np-cli --no-default-features --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p np-cli --no-default-features
+env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config
+RUSTDOCFLAGS="--deny warnings" cargo doc --locked --workspace --no-deps
+```
+
+Two rules that are not negotiable here: **never regenerate the catalog goldens** (any diff in `tests/golden*` is a stop-and-
+report), and a test whose assertion cannot be broken by mutating the code it covers is a defect, not coverage.
+
+The model-backed suites skip loudly instead of failing quietly. Set the two variables and they run for real:
+
+```sh
+NP_TEST_MODEL_PATH=~/models/embeddinggemma-2-Q8_0.gguf \
+NP_TEST_MMPROJ_PATH=~/models/mmproj-embeddinggemma-2-Q8_0.gguf \
+  cargo test -p np-core --features local-model,vision --test local_vision
+```
+
+Without them the default feature row prints **29** `NOT COVERAGE` lines and `--features local-model,vision` prints **38** —
+those numbers are a CI floor this repository checks, and they mean "compiled, never ran", never "passed". `$NP_TEST_VISION_LARGE`
+and `$NP_THREAD_*` gate two further cells the same way. GitHub Actions cannot execute jobs for this account today, so every
+claim in this repository's docs is backed by local exit codes instead.
 
 ## Where the thinking lives
 
-- [`docs/plan-2026-10-28-state-and-roadmap.md`](docs/plan-2026-10-28-state-and-roadmap.md) — what exists today and the
-  order the rest arrives in. Start here.
-- [`docs/superpowers/specs/2026-10-23-note-processor-design.md`](docs/superpowers/specs/2026-10-23-note-processor-design.md)
-  — the original design, including the refusal rules that still govern every later change.
-- [`docs/design-m2-embeddings.md`](docs/design-m2-embeddings.md) and
-  [`docs/design-m2-models-install.md`](docs/design-m2-models-install.md) — the M2a decisions, each one carrying the
-  measurement or failure that produced it.
-- [`docs/design-m2-local-embeddings.md`](docs/design-m2-local-embeddings.md) — the runtime: feature gates, the pinned
-  llama.cpp, artifact identity, and every throughput figure this repository quotes.
-- [`docs/design-m2-image-embeddings.md`](docs/design-m2-image-embeddings.md) — R7c: image vectors, `np search`, the format
-  and refusal rules above, and §14's list of what is **not** measured.
-- [`docs/roadmap-2026-10-27.md`](docs/roadmap-2026-10-27.md) · [`docs/backlog-m2-followups.md`](docs/backlog-m2-followups.md)
-  — what is next, and the debt found along the way (D1–D10 from the M2a whole-branch review).
+The code comments carry the local reasoning; these documents carry the decisions and the measurements behind them.
 
-## Building
+| Document | Holds |
+| --- | --- |
+| `docs/superpowers/specs/2026-10-23-note-processor-design.md` | The original product spec: what to index, how links resolve, what a catalog is |
+| `docs/design-m2-embeddings.md` | The embedding design: chunking, budgets, the provider seam |
+| `docs/design-m2-local-embeddings.md` | llama.cpp ownership (§14), the pin discipline and the §12 fetch rules, §5's context ceiling |
+| `docs/design-m2-models-install.md` | What "installed" means: rows, digests, per-workspace artifacts |
+| `docs/design-m2-image-embeddings.md` | R7c: media tables, discovery and sniffing, the vision seam, §8's refusal classes, §14's measured numbers |
+| `docs/design-m2-thread-policy.md` | The `"auto"` worker rule and the measurements behind it |
+| `docs/backlog-m2-followups.md` | What is owed: F27–F33 open, with what each one costs |
+| `docs/roadmap-2026-10-27.md`, `todo.md` | Where this is going and what is next |
 
-```sh
-cargo build --workspace
-cargo test --workspace
-```
+Repository layout: `crates/np-core` (discovery, parsing, links, catalog, database, embeddings, media, search) and
+`crates/np-cli` (argv, resolution and printers — no decisions of its own), with `third_party/`, `scripts/` and the pinned
+`.vendor/` tree for the C++ side.
 
-Default builds contain no C++ and no inference runtime. The `local-model` feature on `np-core` (and a matching passthrough
-on `np-cli`) builds llama.cpp from the sha256-pinned source under `third_party/`, is **Linux-only by refusal** in `build.rs`,
-and is off in releases; it needs `cmake` (set `CMAKE=/path/to/cmake`) and nothing else new.
-
-Embedding runs ask llama.cpp for worker threads by a rule rather than by its built-in default (which is a compile-time
-`4`, whatever the machine has): `[embeddings] threads = "auto"` — the default — chooses `min(cpus, max(min(cpus, 4),
-80 %))`, so a 16-CPU host gets 12 and a 2-core laptop gets 2 instead of being asked to run four. An explicit
-`threads = 4` restores the old behaviour exactly. The measured basis, the ceiling (32 workers on 16 CPUs is *slower* than
-four) and what has not been measured are in `docs/design-m2-thread-policy.md`; `np embed` prints the count it used
-(`threads 12 of 16 available (auto)`, `"workers"` under `--json`).
-
-`np embed` works on both sides of that line, and the two answers differ on purpose. A `local-model` build checks the
-artifact against `models.sha256` before it reads a note — one `stat` when the file has not moved since the last check, a
-full hash when its size or mtime changed or no check has run yet — then loads the artifact on its **first batch** (not
-while it is deciding whether anything is owed) and writes real vectors. The report's `digest` line says which of those
-happened; "not re-read" means the bytes were not hashed this run, which detects changed files but not a crafted
-timestamp. A default build has nothing to load, so every batch is answered `runtime not built` and §6's fourth arm
-reports that nothing was produced. Neither writes a placeholder: an absent runtime, an absent artifact and an over-budget chunk are each reported
-as the specific thing they are.
-
-CI is **configured** to build and test on Linux and Windows on every push, and **it does not run**. Since 2026-10-29
-GitHub creates each run and then finishes it in about three seconds with **zero steps and no log** — `gh run view --log`
-answers `log not found`, and `GET /repos/…/actions/permissions` answers **404** — so no runner ever picks a job up. The
-account is reported to have no GitHub Actions budget; our token cannot tell that from Actions being switched off, and
-nothing here claims which it is (the green runs this repo had before that date are why we know the workflows themselves
-work). Read the workflows as configuration, not evidence. Every measured claim in this repo therefore comes
-from one Linux host, through the gate list in [`docs/plan-2026-10-28-state-and-roadmap.md`](docs/plan-2026-10-28-state-and-roadmap.md):
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, the no-`$HOME` config suite,
-rustdoc with `--deny warnings`, the two CFG fences, and the catalogue golden check. Release binaries are built for Linux, Windows and macOS; the
-macOS artefact is compiled, not run, so treat its behaviour as unverified until someone runs it.
+**Known gaps, stated plainly.** No shipped binary can encode an image, because `np-cli` has no `vision` passthrough (**F28**, a
+product decision rather than a bug). Image throughput, resident-set growth with a projector open, cross-worker bit-identity and
+retrieval quality have **not** been measured — the list is in `docs/design-m2-image-embeddings.md` §14. Windows and macOS get a
+written refusal from `build.rs` for feature builds and have never been executed here. And CI still cannot start jobs on this
+account, so "green" in this README means exit codes measured locally, listed above.
