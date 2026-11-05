@@ -1409,10 +1409,11 @@ unsafe extern "C" fn log_gate(
     text: *const std::ffi::c_char,
     user_data: *mut std::ffi::c_void,
 ) {
-    debug_assert!(user_data.is_null(), "set_log_level passes no user_data");
     // Unwinding out of this body would abort the process, costing both its exit code and our own `np:` line — so a panic loses one log
-    // line instead of the run.
+    // line instead of the run. That includes the assertion below: it is a check on this crate's own call, and a debug build must not be
+    // able to turn "we passed a non-null user_data" into a panic crossing an `extern "C"` boundary.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        debug_assert!(user_data.is_null(), "set_log_level passes no user_data");
         if !LOG_LEVEL
             .get()
             .is_some_and(|threshold| threshold.forwards(level))

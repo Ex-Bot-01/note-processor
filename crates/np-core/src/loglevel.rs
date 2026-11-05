@@ -57,7 +57,8 @@ pub enum LogLevel {
     Warn,
     /// Add llama.cpp's informational transcript: the model loader's metadata dump, tensor list and build-graph lines.
     Info,
-    /// Everything upstream emits below `NONE`, which in practice means “also show me the debug lines while diagnosing”.
+    /// Everything upstream logs at `DEBUG` or above — the widest setting this gate offers. `NONE` (0) is *below* `DEBUG` in ggml's own
+    /// numbering and stays silent here, along with any number this file does not recognise.
     Debug,
 }
 

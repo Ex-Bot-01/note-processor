@@ -124,7 +124,7 @@ Every figure below is a measured stderr size, 2026-11-05, same vault and artifac
 | `np embed` with three chunks owed, default | **602 B / 6 lines** | same class of warnings; the report on stdout is unchanged |
 | `np embed` with nothing owed, default | **0 B** | nothing loads, so nothing logs — F32's arm table still holds |
 | `[embeddings] log_level = "info"` | 11,691 B / 181 lines | the transcript, on purpose |
-| `NP_LLAMA_LOG_LEVEL=debug np search …` | **145,816 B / 1,553 lines** | byte-identical to the pre-F33 binary: the gate writes what it is handed and adds nothing |
+| `NP_LLAMA_LOG_LEVEL=debug np search …` | **145,816 B / 1,553 lines** | byte-identical to the pre-F33 binary for this artifact — the gate writes what it is handed and adds nothing. Stated as a measurement rather than a proof: `forwards` drops raw level 0 and unrecognised numbers, which upstream's default handler would print, and none appear in this transcript |
 | A load that fails (truncated artifact) | error lines + our refusal | `src/llama.cpp:373-375` logs at error level, so `warn` keeps it; §6.5 pins it |
 | `[embeddings] log_level = "warn"` in the file + `NP_LLAMA_LOG_LEVEL=info` | **424 B / 4 lines** | measured: the file outranks the environment, as §4 requires |
 | A library using `np-core` directly | llama.cpp default sink | **unchanged** — the seam is not installed for you |
@@ -140,7 +140,8 @@ Written first, red against today's binary where that is reachable.
    dropping any one name from the parser fails a row, and dropping one from the message fails the refusal.
 3. **Precedence** (np-core, always built, against the pure resolver rather than a subprocess). File set → file wins even when the env
    names something else; file unset → env decides; neither → `Warn`. A mistyped env value refuses naming the variable and the five names,
-   and an empty one is a typo rather than “unset”. This lives in np-core because np-cli cannot be *read* from a test: it is a
+   and an empty one is unset, exactly as `env_text` treats every other environment value here. This lives in np-core because np-cli cannot
+   be *read* from a test: it is a
    bin-only crate, so `tests/cli.rs` sees only a child's stdout, stderr and exit code, and nothing prints the resolved level — a finding
    against this document's first draft, which asked for an assertion no harness in this repo can make. What np-cli *can* show is the
    refusal, and §6.6 does.
@@ -167,7 +168,7 @@ if upstream changes its wording, test 4 would need updating and that is the hone
 | A panic inside the callback aborts the process, costing the exit code and our own `np:` line. | The body gates on the integer first, allocates nothing, ignores I/O results, never re-enters llama.cpp, and runs inside `catch_unwind(AssertUnwindSafe(..))`. |
 | Silencing hides why a load failed. | Default is `warn`, not `off`; §6 test 5 pins that a failing artifact still speaks. |
 | A probe or benchmark loses data it parses. | Finding 6: none does. The escape hatch is for humans, and the card's stronger claim is corrected rather than repeated. |
-| Two threads race on the global sink — its own header says these functions are “NOT thread safe” (`llama.h:1674`). | np-cli calls `set_log_level` once, in `embed_provider`, before anything can load; the seam keeps the level in a `OnceLock`, so **a second call is ignored rather than swapping mid-write** — first call wins, silently, which is stated here because “silently” is the part a caller would otherwise assume away. The callback reads that lock with `map_or`, never `unwrap`. |
+| Two threads race on the global sink — its own header says these functions are “NOT thread safe” (`llama.h:1674`). | np-cli calls `set_log_level` once, in `embed_provider`, before anything can load; the seam keeps the level in a `OnceLock`, so **a second call is ignored rather than swapping mid-write** — first call wins, silently, which is stated here because “silently” is the part a caller would otherwise assume away. The callback reads that lock with `get().is_some_and(..)`, never `unwrap`. |
 | An np-core test calls the seam and changes the sink for its whole binary. | No test does: §6 grades the pure decision in-process and the installation only through a child process, for exactly this reason. |
 | A downstream library user loses their logs. | np-core installs nothing (§3); only np-cli opts in. |
 | `NP_LLAMA_LOG_LEVEL=deubg` silently means default. | An unrecognised env value refuses at startup, naming the five names. |

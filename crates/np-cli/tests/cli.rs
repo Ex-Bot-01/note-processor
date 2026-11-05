@@ -2325,6 +2325,17 @@ mod real_model {
             !transcript.contains("Dumping metadata"),
             "nor the metadata dump that comes with it: {transcript}"
         );
+        // Something has to survive, or the loop below grades nothing: a `DEFAULT_LEVEL` of `Off` prints an empty stderr and would pass
+        // every absence-assertion in this case. The bound is the measured 424 bytes with room for upstream to grow its warnings (§5).
+        assert!(
+            transcript.contains("load: ") || transcript.contains("init: "),
+            "the default level keeps llama.cpp's warnings, and this artifact emits them: {transcript:?}"
+        );
+        assert!(
+            transcript.len() < 4096,
+            "a healthy run's stderr measured 424 bytes; {} means the transcript leaked: {transcript}",
+            transcript.len()
+        );
         // What *does* survive is warnings only — the difference between a `warn` default and an `off` one. Both prefixes here were read in
         // the pinned tree rather than guessed at: `load:` is `LLAMA_LOG_WARN` from the vocabulary load (`src/llama-vocab.cpp:3072`,
         // `:3403`) and `init:` is `LLAMA_LOG_WARN` from `src/llama-batch.cpp:212`. Asserting a shape rather than a line count means a fifth

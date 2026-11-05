@@ -105,8 +105,9 @@ Two things that trip people up, both by design:
   `np embed` re-embeds only what moved (`embedded 1` above).
 - **The report goes to stdout; llama.cpp's log lines go to stderr, and by default only its warnings survive.** A model load used to write
   145,816 bytes over 1,553 lines here (`create_tensor:`, `llama_model_loader:` …) ahead of a one-line answer; the default level is `warn`,
-  which leaves 424 bytes of actual warnings about the artifact. Ask for the transcript with `[embeddings] log_level = "info"` or, for one
-  run, `NP_LLAMA_LOG_LEVEL=debug`. See [the config table](#configuration).
+  which leaves 424 bytes of actual warnings about the artifact. Ask for the transcript back with `[embeddings] log_level = "info"`, or — when
+  the file names no level at all, since a file that named one wins — `NP_LLAMA_LOG_LEVEL=debug` for a single run. See
+  [the config table](#configuration).
 
 ## Installing `np`
 
