@@ -954,10 +954,15 @@ fn available_bytes(path: &Path) -> Option<u64> {
             },
         }
     };
-    // Ask about the **same spelling every other OS call on this path uses**. `walk::to_open_path` hands the `.part` write and the
-    // publish rename a `\\?\` prefix when a long absolute path needs one; querying the bare path here would decline ("not checked")
-    // for exactly the workspace whose bytes it then writes. The helper's own condition carries over: the prefix needs an absolute
-    // path, so a relative `[paths] data_dir` keeps the plain spelling and may answer `None` — stated, never passed.
+    // Ask about **the same spelling `walk::to_open_path` gives the `.part` write and the publish rename** — a `\\?\` prefix when an
+    // absolute path needs one. Querying the bare path would decline ("not checked") for exactly the long workspace whose bytes this
+    // fetch then writes. Not every call here agrees: `create_dir_all` and the target-absence checks still take the bare path, which
+    // is a separate question and not this round's to settle. The helper's condition carries over — the prefix needs an absolute path,
+    // so a relative `[paths] data_dir` keeps the plain spelling and may answer `None`; stated, never passed.
+    //
+    // `to_string_lossy` is lossy and the prefix is un-normalised, exactly like `walk::to_open_path` (`path_keys.rs:202-206` records
+    // the same hazard): a name containing an unpaired surrogate queries a slightly different string, which can only cost an answer,
+    // never invent one about a volume this fetch did not open.
     let spelled = PathBuf::from(walk::long_prefix(&existing.to_string_lossy(), true));
     let name = wide_name(spelled.as_os_str())?;
     // Zero-initialised so a failing call that writes nothing cannot be read as data, and so `Some(0)` can only mean "the volume
@@ -976,9 +981,13 @@ fn available_bytes(path: &Path) -> Option<u64> {
     }
 }
 
-/// The one kernel32 symbol this module needs. Declared by hand rather than pulled in as a bindings crate — the pattern
-/// [`crate::llama_ffi`] documents, and the right trade for a single function: a dependency here would sit in every binary, including
-/// the ones that never fetch.
+// The one kernel32 symbol this module needs. Declared by hand rather than pulled in as a bindings crate — the pattern
+// `crate::llama_ffi` documents, and the right trade for a single function: a dependency here would sit in every binary,
+// including the ones that never fetch.
+//
+// Plain comments, not `///`: rustdoc generates no documentation for an `extern` block, so a doc comment here is
+// `-D unused_doc_comments` — and that is what the `windows-latest` clippy row failed on for this commit on 2026-11-05,
+// four hours after it looked locally green. Nothing on a Linux host compiles this block, so nothing here can catch it.
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
@@ -992,9 +1001,13 @@ extern "system" {
 
 /// `name` as a NUL-terminated UTF-16 string, or `None` when it holds U+0000.
 ///
-/// The check is load-bearing, not hygiene: `encode_wide` encodes a NUL faithfully and Win32 ends the string there, so without this
-/// a name containing one would answer about its **surviving prefix**. A wrong number in a report that reads as a measurement is
-/// worse than no number, and it is why the decline arm here is explicit rather than "the call will fail anyway".
+/// **Defensive, not reached from [`available_bytes`]**, and the distinction matters for what the tests below prove. That arm climbs
+/// to an existing ancestor first, and `symlink_metadata` refuses a name holding NUL, so a string reaching here is already NUL-free;
+/// measured on this host, `temp_dir().join("f34\0models")` declines or answers from the ancestor and never consults this check.
+///
+/// It stays because `wide_name` is a general helper and the failure mode without it is silent: `encode_wide` encodes a NUL
+/// faithfully and Win32 ends the string there, so a caller that skipped the climb would get an answer about the **surviving prefix**.
+/// A wrong number in a line that reads as a measurement is worse than no number.
 #[cfg(windows)]
 fn wide_name(name: &std::ffi::OsStr) -> Option<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
@@ -1301,7 +1314,8 @@ mod tests {
     }
 
     /// The decline arm, reachable on **every** host: a relative path whose every ancestor is absent runs the climb out
-    /// before any OS call, so this cannot drift into "answered something about a different directory".
+    /// before the free-space query is ever reached — the climb's own metadata calls are the only OS work done here — so this
+    /// cannot drift into "answered something about a different directory".
     #[test]
     fn available_bytes_declines_when_no_ancestor_exists() {
         let orphan = Path::new("f34-no-such-root").join("models");
@@ -1366,24 +1380,36 @@ mod tests {
         );
     }
 
-    /// The encoder's zero-unit check fires instead of asking Win32 about a truncated prefix.
+    /// A NUL-bearing name never yields an answer — and the two assertions here are **different arms**, kept apart on purpose.
+    /// The first declines because the climb runs out: `symlink_metadata` refuses a single-component NUL name, so no ancestor is
+    /// ever found. It does *not* show the encoder's zero-unit check firing, and no Windows test can, because that check is only
+    /// reachable from a path `available_bytes` has already refused to name (see `wide_name`). The second pins the helper itself.
     #[cfg(windows)]
     #[test]
-    fn available_bytes_declines_for_a_name_holding_an_interior_nul() {
-        // Deterministic by construction: the decline happens in `wide_name`, before any call, so it cannot depend on how
-        // Win32 chooses to treat a name that cannot exist.
+    fn a_name_holding_an_interior_nul_never_yields_an_answer() {
         assert_eq!(available_bytes(Path::new("\u{0}f34")), None);
-        assert_eq!(wide_name(std::ffi::OsStr::new("a\u{0}b")), None);
+        assert_eq!(
+            wide_name(std::ffi::OsStr::new("a\u{0}b")),
+            None,
+            "the helper must refuse a NUL-bearing string rather than answer about its prefix"
+        );
     }
 
-    /// Parity for the unix half's own guard: an unencodable name declines rather than answering about something else.
+    /// What unix actually does, measured on this host rather than inferred: it answers with a number for a real directory, and a
+    /// NUL-bearing name **under an existing ancestor** is not declined either — `symlink_metadata` refuses that name, so the climb
+    /// reaches the ancestor and reports about it. Both halves refuse to invent an answer for the path they were handed; neither
+    /// refuses to answer about an ancestor. The asymmetry is only in where Windows would go wrong without `wide_name`'s check.
     #[cfg(unix)]
     #[test]
-    fn the_unix_arm_declines_a_name_it_cannot_encode() {
-        // Interior NUL cannot be named on unix either — `symlink_metadata` refuses it first, so what this pins is the
-        // *outcome* both halves agree on for a path that has an existing ancestor: it answers about that ancestor, and never
-        // invents a decline. Recorded here because §4 of the F34 design claims exactly this asymmetry.
+    fn the_unix_arm_answers_about_an_existing_ancestor() {
         let tmp = std::env::temp_dir();
-        assert!(available_bytes(&tmp).is_some());
+        assert!(
+            available_bytes(&tmp).is_some(),
+            "a real directory must answer"
+        );
+        assert!(
+            available_bytes(&tmp.join("f34\u{0}models")).is_some(),
+            "unix climbs to the ancestor rather than inventing a decline"
+        );
     }
 }

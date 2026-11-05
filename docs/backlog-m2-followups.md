@@ -832,10 +832,14 @@ runs a user cares about.
 
 ## F34 — the fetch disk preflight cannot answer on Windows, so rule 6 silently does not happen there
 
-Filed 2026-11-05 from the first CI run this repository ever had that actually executed a Windows job (run `42061786030`, job
-`127365138173`): `preflight_refuses_before_byte_one_when_the_disk_cannot_hold_the_pair` failed with
-`expected DiskShortfall, got Interrupted { …, expected: 9223372036854775807 }`. Every run before 2026-11-04 created zero steps, so
-this is not a regression — it is the first time the code ran.
+Filed 2026-11-05 from run `42061786030`, job `127365138173`: `preflight_refuses_before_byte_one_when_the_disk_cannot_hold_the_pair`
+failed with `expected DiskShortfall, got Interrupted { …, expected: 9223372036854775807 }`.
+
+**This is not a first-run discovery; it is four days of unread CI.** Re-measured job by job the same day: the Windows job executed on
+every push until 2026-10-29T13:11 UTC, created zero steps from 2026-10-29T14:39 through 2026-10-31T20:23, and has executed on every
+push since 2026-11-01T20:08. The run at `a816b17` — the commit that *added* this test, R7b C2, pushed 2026-11-01T21:21 — already
+failed it (`41351611843`, `15 passed; 1 failed`), and **all 43 CI runs since have failed the Windows job**. Every one of those merges
+rested on green ubuntu rows while three documents still asserted that CI could not run. The failure is old; only the reading is new.
 
 - **Cause:** `available_bytes` is `statvfs` under `#[cfg(unix)]` and a literal `None` elsewhere, and the preflight refuses only on
   `Some(_)`. The report already says "free space not checked on this platform" rather than claiming a pass, so the product has been
@@ -845,5 +849,10 @@ this is not a regression — it is the first time the code ran.
   arms are testable on every host. Design: `docs/design-f34-windows-disk-preflight.md`, including what CI proves and what it cannot.
 - **Blocks:** any sentence claiming §12 rule 6 protects a Windows fetch, and keeping `Test (windows-latest)` red — which now matters,
   because the runner works and a red main is a real signal rather than an absent one.
-- **Done when:** the un-gated preflight test passes on the Windows runner alongside unit tests for the answer, the climb and the
-  refusal to answer, and macOS still claims nothing beyond "cannot say".
+- **Done when:** the un-gated preflight test passes on the Windows runner alongside unit tests for the answer, the climb and the refusal
+  to answer, `Test (windows-latest)` is green again on `main`, and macOS claims nothing beyond "it compiles the unix `statvfs` arm; its
+  number has never been read here" (F18). The first draft of this criterion asked that macOS "still claim nothing beyond cannot say",
+  which would have a future reader restore a false sentence: macOS is `cfg(unix)` and has been answering all along.
+- **What the round also caught** (2026-11-05, head `9de3b2d`): locally green on all 15 gate rows, 651 tests passing, and Windows
+  **clippy** still failed it — `unused doc comment` on a `///` above the `extern` block. No Linux command compiles that block, so no
+  local gate can see that lint; "push the branch before asking for a merge" is what retired it.

@@ -56,9 +56,11 @@ jobs:
   # happen - F18's mistake with a different noun. The Windows feature row lands when someone has seen it
   # green, and §2 keeps release binaries on the feature off until then.
   #
-  # Honest caveat: GitHub Actions is currently down account-side (2026-10-29), so none of this has run
-  # in CI yet. It was written and executed locally, gate for gate; treat the first green run as evidence
-  # still owed, not as coverage already banked.
+  # Honest caveat, corrected 2026-11-05 from the Actions API: hosted jobs ran until 2026-10-29T13:11 UTC,
+  # created zero steps from 2026-10-29T14:39 through 2026-10-31T20:23, and have run on every push since
+  # 2026-11-01T20:08. So this HAS run in CI — and `Test (windows-latest)` has been red there since a816b17
+  # (F34), which is what reading the runs beats assuming the silence. Local gates remain the primary
+  # evidence; a Windows-only lint or platform answer is visible only here.
   feature-local-model:
     name: Feature local-model (ubuntu-latest)
     runs-on: ubuntu-latest
