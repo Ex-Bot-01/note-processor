@@ -36,7 +36,7 @@ is that somebody read it.
 ## 2. What the preflight is, and what "cannot say" already means
 
 §12 rule 6: before a fetch opens a socket, check that the target filesystem can hold the pinned bytes plus a margin. Today
-(`fetch.rs:877-920`):
+(pointers are pre-fix, `main` at `833cb06`: `fetch.rs:877-920`):
 
 ```rust
 #[cfg(unix)]      fn available_bytes(path: &Path) -> Option<u64> { /* statvfs, f_bavail × f_frsize */ }
@@ -204,7 +204,7 @@ No change to the unix arithmetic. No new dependency, no new exit code, no change
 | A Windows-only lint that no Linux command can see | **nothing local.** The first push of this branch failed exactly there (§10). Retired only by step 3: push the branch, read the Windows job, before asking for a merge |
 | Garbage out-parameter read as data | all three are zero-initialised before the call, and the temp-directory test asserts a plausible magnitude |
 | macOS release build breaks on Windows-only code | the three-arm rule in §5, stated with the repository's own reason. **No CI row catches this** — none of the three builds `aarch64-apple-darwin`; only `release.yml:35-36` would, after merge — so it rests on the gate shape and the precedent at `path_keys.rs:206-233`, and that is recorded rather than glossed |
-| The refactor changes unix behaviour | the existing 24-test fetch suite plus the full local gate list, run where they have always run |
+| The refactor changes unix behaviour | the fetch suite as it stood before this round (24 tests in `tests/fetch.rs`, 25 now) plus the full local gate list, run where they have always run — and, since this row was written, on a Windows runner too |
 | A wrong `Some(0)` refusing every Windows fetch | the temp-directory test asserts more than a megabyte, on the runner, before anything ships |
 
 ## 10. Rollout
