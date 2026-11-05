@@ -4,7 +4,9 @@ A local-first index for a Markdown vault. `np` scans a folder of notes once and 
 without re-reading the corpus: what is in this vault, which files changed since last time, where every link resolves,
 which notes are ambiguous or unreadable — and *why* each row says what it says.
 
-Nothing leaves the machine. There is no telemetry, no sync, and no network call in any code path that exists today.
+Nothing leaves the machine except when you ask it to: there is no telemetry, no sync, and exactly one command that can
+make a network call — `np models fetch`, documented under [Installing a model](#installing-a-model). `np scan` and
+`np embed` reach no network at all.
 
 ## Status
 
@@ -13,8 +15,17 @@ ambiguity), durable upgrade/refusal rules for damaged or unreadable notes, byte-
 M2a ground for embeddings — deterministic chunking, `chunks`/`embeddings`/`models` storage, a model install command that
 verifies what it is given.
 
-**Not built yet: anything that embeds.** The tables are there, no vector is ever written, so semantic search does not
-exist. That is the next round (see below).
+**Built since that sentence was written:** the forward pass (`np embed` writes vectors and reports what it refused), a pinned
+artifact fetched over HTTPS or installed from disk and verified against its recorded digest, `np search` ranking notes and image
+vectors that exist, and a thread policy for the decode.
+
+**The boundary that matters when you read those claims.** Embedding needs the `local-model` feature: the default binary links no
+inference runtime, so there `np embed` reports that nothing was produced and `np search` refuses to turn the query into numbers —
+both at exit 1, with a message naming what to change. Image vectors need one more feature (`vision`) which **the CLI cannot ask
+for yet**: `np-cli` has no `vision` passthrough, so every shipped binary that gets as far as the image pass records figures and
+encodes none. "As far as" is worth stating: with no artifact installed at all, `np embed` refuses on the missing artifact
+**before** any figure is examined, so that run prints no `images …` line at all rather than a line full of refusals — the image
+counts appear once the model's own bytes are in place.
 
 ## Commands
 
@@ -24,11 +35,72 @@ exist. That is the next round (see below).
 | `np models install <workspace> --id … --path … --dim … --sha256 …` | Put a model artifact under the workspace's model directory, verifying the digest before and after |
 | `np models hash <file>` | Print the SHA-256 of a file, in the format `install` expects |
 | `np models list <workspace>` | Show each model row and whether its artifact is actually present and matches |
-| `np models fetch <workspace> --id … [--member …] [--discard-marker]` | Download a **pinned** model's artifacts from the configured origin and record them — `fetch` is the only command that dials out, it accepts only bytes that hash to what this build pins, and `[models] base_url` (or `NP_MODELS_BASE_URL`) says where to ask. Offline? `install --path` still works |
+| `np models fetch <workspace> --id … [--member …] [--discard-marker]` | Download a **pinned** model's artifacts and record them — `fetch` is the only command that dials out, and it accepts only bytes that hash to what this build pins. Where it asks: `[models] base_url`, else `NP_MODELS_BASE_URL` when the file leaves that key out, else the one origin baked into the pin table. Which members: the ones this binary can use — a build without image support fetches the primary artifact only, and asking it for `mmproj` is refused as missing image support. Offline? `install --path` still works |
+| `np search <workspace> <query> [--limit N] [--json]` | Rank what is already indexed against a text query — notes and image vectors in **one** ranked list, highest cosine first; `--limit` defaults to 10. **Changes nothing about the index**: no vector, no stamp and no note row is written (opening a database that does not exist yet still creates it and runs migrations, exactly as `scan` and `embed` do). An index with no vectors at all prints one line and exits 0; vectors stored under a **different** model id are a refusal naming the id this run asked for. `--json` prints `hits`, every object carrying the same five keys — `score`, `kind`, `path`, `linked_from`, `source_note` |
 | `np embed <workspace>` | Embed what is owed for the configured model and write it to the database — a `local-model` build first checks the artifact against its recorded digest; `--json` reports the same four labelled outcomes this command exits with |
 
 Refusals are deliberate: an unreadable note is reported and left alone, never repaired; an install whose digest does not
 match is refused before a byte is copied; an artifact that disagrees with its own row is reported, not overwritten.
+
+## Installing a model
+
+```sh
+# 1. place the `np` binary on PATH
+np models fetch <workspace> --id embeddinggemma-2   # the one outbound request; a text-only build fetches one file
+np scan  <workspace>                                # index the vault
+np embed <workspace>                                # write the vectors — needs a `local-model` build
+```
+
+**Read that last line's condition.** The binary you get from `cargo install` links no inference runtime, so steps 1–2 work
+and step 3 reports that nothing was produced (exit 1), as does `np search`: there is nothing to turn your query into numbers.
+The fetch still succeeds, which means a default build will happily download 309 MB it cannot open — build with
+`--features local-model` when this machine is meant to embed.
+
+`fetch` is what pulls the model files, so installation needs no config file. It makes **one kind of outbound request**:
+a plain GET for each member it plans, against `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main`
+— where this build's pinned digests were read from. Point `[models] base_url` (or `NP_MODELS_BASE_URL`) at a mirror to
+move that request, and on an air-gapped host skip `fetch` and use `np models install --path … --sha256 …`, which needs
+no network at all.
+
+Two things this command will not do: it never accepts bytes that hash to something other than what the build pins, and
+**its own output** — every transfer refusal, progress line and report — names a class (`not found`, `timed out`) and never a
+host or URL. A *config* refusal is deliberately different: an invalid `[models] base_url` quotes the value you wrote, because
+telling you to fix a key without showing the offending value wastes the one thing a refusal is for. A text-only binary also refuses to download the 554 MB projector it cannot load; `--member` still spells the
+whole plan when you are fetching on behalf of a different build.
+
+## Images in the index
+
+`np embed` reads `![alt](target)` out of each note's own bytes and embeds the local file it names — resolved relative to
+**that note's** directory, inside the workspace, percent-decoded once. Identity is the content hash, so one diagram written
+to five paths or copied to three folders gets **one vector** and one search hit; renaming a file re-points a row and does not
+re-embed it. A figure is re-encoded when its bytes change. What that sentence does not cover: the change check is file size
+plus whole-second mtime, so an in-place rewrite that preserves both — same length, same timestamp — keeps its old vector
+until something else makes the pass read the file (backlog **F27**).
+
+**Accepted formats: `.png`, `.jpg`, `.jpeg` — and the name is only half the test.** A `.svg`, `.gif`, `.bmp` or `.pdf` link
+refuses as `unsupported-format` on its extension; a file with an accepted extension then has to *be* that format, judged from
+its first bytes (a PNG signature, or a JPEG start-of-image marker). A `.png` whose payload is really BMP bytes is therefore
+refused as `unsupported-format`, not embedded. The byte check exists because the pinned decoder **would** have taken them: on
+2026-11-03 a BMP payload under a `.png` name came back a live bitmap and then a vector (backlog **F26**), so a name-only rule
+promises three formats while the index quietly holds others. Convert vector figures to PNG if you want them searchable — an SVG
+rasteriser is owed (**F29**), not hidden.
+
+Images get their own line on the `np embed` report and never change its exit code; every refusal below is a **count**, and
+`--json` carries an `image_refusals` array of `[name, class]` pairs — the linking note's path when the target never resolved,
+the figure's own workspace path otherwise — because "refused 3" alone cannot tell a format decision from a missing file:
+
+```text
+images     links 7 · embedded 4 · refused 3 (missing-target 1, unsupported-format 2)
+```
+
+| Class | What it means, and what to do |
+| --- | --- |
+| `missing-target` | No readable file at that path: absent, a directory rather than a file, unopenable, or unreadable part-way through hashing. Fix the target or restore the file |
+| `outside-workspace` | The target is absolute or escapes the workspace root (including through a symlink). Nothing outside the vault is read; move the figure in, or link it relatively |
+| `unsupported-format` | Not `.png`/`.jpg`/`.jpeg`, or an accepted name whose bytes are not that raster. Re-export as PNG or JPEG |
+| `undecodable` | Accepted name and signature, but the decode failed — a truncated or damaged file is the usual cause. Re-export the figure; nothing partial was stored |
+| `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Never observed on this artifact pair**: one size was measured — a 4096×3072 PNG cost 1,064 tokens — and larger sizes have not been (the case that would measure the ceiling needs `$NP_TEST_VISION_LARGE`, unset here). So if you see it, suspect a narrower window or a re-pinned artifact rather than a slightly big diagram: shrink the figure and re-run, and treat a fresh `over-budget` on an unchanged vault as a finding about the artifact |
+| `vision-unavailable` | Three meanings, one label: this binary has no image code; the installed model declares no projector; or **a provider refused something this report has no class for**, which is reported here rather than inventing a fourth name. In a shipped `np` build every figure that *resolves and passes the content gate* lands here — `np-cli` has no `vision` passthrough to ask for it (**F28**). Figures whose links do not resolve, or whose bytes are not PNG/JPEG, still get `missing-target` / `outside-workspace` / `unsupported-format`, because those refusals happen before any image capability is asked about |
 
 ## Where the thinking lives
 
@@ -39,6 +111,10 @@ match is refused before a byte is copied; an artifact that disagrees with its ow
 - [`docs/design-m2-embeddings.md`](docs/design-m2-embeddings.md) and
   [`docs/design-m2-models-install.md`](docs/design-m2-models-install.md) — the M2a decisions, each one carrying the
   measurement or failure that produced it.
+- [`docs/design-m2-local-embeddings.md`](docs/design-m2-local-embeddings.md) — the runtime: feature gates, the pinned
+  llama.cpp, artifact identity, and every throughput figure this repository quotes.
+- [`docs/design-m2-image-embeddings.md`](docs/design-m2-image-embeddings.md) — R7c: image vectors, `np search`, the format
+  and refusal rules above, and §14's list of what is **not** measured.
 - [`docs/roadmap-2026-10-27.md`](docs/roadmap-2026-10-27.md) · [`docs/backlog-m2-followups.md`](docs/backlog-m2-followups.md)
   — what is next, and the debt found along the way (D1–D10 from the M2a whole-branch review).
 

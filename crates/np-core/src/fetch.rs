@@ -1,13 +1,26 @@
 //! Fetching a pinned artifact: stream it, hash it while it arrives, verify it, publish it by rename
 //! (`docs/design-m2-local-embeddings.md` §12 rules 4–8 and 12).
 //!
-//! **Nothing in this module names a host.** The bytes a fetch may accept come from [`crate::pins`]; where they come
-//! from is `[models] base_url` (config, plus `NP_MODELS_BASE_URL`), and the only thing that reaches this file from
-//! there is a `&dyn Transport`. That split is load-bearing in both directions: §12 rule 7 keeps the origin out of the
-//! binary so a mirror works and the accepted-bytes list stays reviewable, and §12 rule 8 keeps the origin out of every
-//! *refusal*, because client error strings carry URLs and this program's reports land in CI logs. [`FetchError`] is
-//! therefore built from classes and counts, never from a URL — and `tests/fetch.rs` proves it by fetching from a
-//! loopback address and asserting that no part of that address appears in any message this module can produce.
+//! ## Where the origin comes from — corrected 2026-11-04
+//!
+//! This module still names no host: what reaches it from outside is a `&dyn Transport` and an already-resolved origin
+//! string, and [`resolve_origin`] is where that string is chosen.
+//!
+//! The sentence this replaces read "**Nothing in this module names a host**, because §12 rule 7 keeps the origin out of
+//! the binary", and it is now wrong in its second half. Rule 7 permits exactly one compiled-in origin since
+//! 2026-11-04 — [`crate::pins::DEFAULT_ORIGIN`] — decided by the human in the R7c scope decisions
+//! (`docs/design-m2-image-embeddings.md` §13), because an install that cannot reach a network is an install nobody
+//! completes and `np models fetch` is now the documented install step. The default lives in [`crate::pins`] beside the
+//! bytes it was derived from, not here.
+//!
+//! What the old argument still buys, and why the default sits at the **end** of a precedence instead of replacing it:
+//! a mirror stays one config line away (`[models] base_url`, or `NP_MODELS_BASE_URL` when the file leaves that key
+//! out), the accepted-bytes list stays one reviewable table, and — the half this module owns — §12 rule 8 keeps the
+//! origin out of every *refusal*, because client error strings carry URLs and this program's reports land in CI logs.
+//! [`FetchError`] is therefore built from classes and counts, never from a URL. `tests/fetch.rs` checks that claim where it
+//! can bite — the arms whose text comes from something this module was handed (a transport failure, an `io::Error`) — by
+//! fetching from a loopback address and asserting that neither that address nor the baked default appears; the arms built
+//! purely from ids, counts and paths are named as such there rather than swept silently.
 //!
 //! ## What is deferred, on purpose
 //!
@@ -552,6 +565,18 @@ pub fn fetch_with_table<T: MemberPin>(
         source,
     })?;
 
+    // Rule 5's other half, checked for **every** member before any byte of any member moves. This used to sit inside the
+    // transfer loop below, where it was correct for one member and wrong for two: the first artifact was published, then the
+    // second target refused, leaving a file on disk with no `models` row to explain it and a retry that refuses forever.
+    // Two-member plans stopped being hypothetical when §13 made a projector a fetchable member of the default set, so the
+    // loop below now trusts this one and does not re-check.
+    for member in &members {
+        let target = models_dir.join(local_name(id, member.member()));
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err(FetchError::TargetExists { path: target });
+        }
+    }
+
     let nonce = models::nonce();
     let mut report = FetchReport {
         id: id.into(),
@@ -561,12 +586,8 @@ pub fn fetch_with_table<T: MemberPin>(
     };
 
     for member in &members {
+        // Every target was proved absent above, so this loop publishes into what is still an empty place.
         let target = models_dir.join(local_name(id, member.member()));
-        // Rule 5's other half: never publish over existing bytes. Checked before the transfer so a human is not made
-        // to watch 310 MB arrive before "refusing to overwrite".
-        if fs::symlink_metadata(&target).is_ok() {
-            return Err(FetchError::TargetExists { path: target });
-        }
 
         write_marker(
             models_dir,
@@ -970,6 +991,21 @@ pub fn failure_class(raw: &str) -> String {
     }
 }
 
+/// The origin a fetch dials, from whatever `[models] base_url` resolved to (§12 rule 7 as amended 2026-11-04).
+///
+/// **One question, one answer, in one place**: the configured value if there is one, else
+/// [`crate::pins::DEFAULT_ORIGIN`]. Config has already merged its two sources before a caller reaches here — the file's
+/// own `base_url` wins, and `NP_MODELS_BASE_URL` fills a key the file left unset, which is `crate::config`'s precedence
+/// for every key in that section (`tests/config.rs` pins it) — so this function deliberately does not read the
+/// environment itself. A second reader of `NP_MODELS_BASE_URL` would be a second answer to "which origin did this run
+/// dial", and only one of them could be right.
+///
+/// The default is a fallback, never an override: the operator who mirrors these artifacts changes one config line and
+/// gets their own origin here, while acceptance stays the digest's decision either way.
+pub fn resolve_origin(configured: Option<&str>) -> &str {
+    configured.unwrap_or(crate::pins::DEFAULT_ORIGIN)
+}
+
 /// The member names this build pins for `id`, in [`crate::pins::PINNED`] order — what a caller passes as `fetch`'s
 /// `requested`, and what `model_files` should hold after a fetch of the whole pair.
 pub fn pinned_member_names(id: &str) -> Vec<&'static str> {
@@ -994,8 +1030,9 @@ pub const PRIMARY_MEMBER: &str = MAIN_FILE;
 /// **Lives behind cargo feature `fetch`, which is default-on** (§12's premises: a fetch path release builds compile
 /// out would defeat the amendment; opting out is an explicit `--no-default-features`). It is also the only place in
 /// the workspace that names a network client, and it holds one string — the origin — which arrives from
-/// `[models] base_url` / `NP_MODELS_BASE_URL`. Nothing here knows or cares which host that is; §12 rule 7 keeps the
-/// accepted bytes in the binary and the origin in config so a mirror is an edit, not a rebuild.
+/// `[models] base_url`, `NP_MODELS_BASE_URL`, or [`crate::pins::DEFAULT_ORIGIN`] via [`resolve_origin`]. Nothing here
+/// knows or cares which host that is; §12 rule 7 keeps the accepted bytes in the binary and the origin in
+/// config-plus-default so a mirror is an edit, not a rebuild.
 ///
 /// # The URL shape, and why the model id is not in it
 ///
@@ -1012,7 +1049,7 @@ pub struct HttpTransport {
 
 #[cfg(feature = "fetch")]
 impl HttpTransport {
-    /// Dial the origin `config.models.base_url` resolved to.
+    /// Dial the origin [`resolve_origin`] settled on.
     ///
     /// The value is assumed already validated by [`crate::config`] (scheme, authority, no credentials, one trailing
     /// `/` removed). This does not re-validate: a second parser would be a second opinion about what a valid origin

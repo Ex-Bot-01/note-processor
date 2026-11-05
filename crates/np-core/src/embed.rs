@@ -44,7 +44,26 @@ use crate::models;
 use crate::walk;
 
 /// Bytes per component: the `4` in migration 7's `CHECK (length(vector) = 4 * dim)`.
-const COMPONENT_BYTES: usize = 4;
+///
+/// Public because a reader of stored vectors needs the same divisor ([`crate::search`]) and a second `4` written
+/// somewhere else is a width rule with two owners.
+pub const COMPONENT_BYTES: usize = 4;
+
+/// The canonical spelling of [`EmbedError::Unavailable`] for "this **build and model pair** cannot serve the request":
+/// no projector, no vision graph, tokenization refused, a chunk shape this seam does not implement, a decoder that would
+/// not take the rows, a pooled row that is not usable.
+///
+/// **Defined once in [`crate::media`]** and re-exported here, because the trait's default refusal has to answer with it in
+/// a build where `crate::vision` is not compiled at all (`vision` is a cargo feature; this module and `media` are always
+/// built), and a second `const` with the same value would let the two halves of one class drift apart — measured rather
+/// than argued: renaming one copy on 2026-11-03 left all 534 default-build tests green. `crate::vision` re-exports it too,
+/// under the path the design document names (§8 of
+/// `docs/design-m2-image-embeddings.md`); the re-export carries no value of its own.
+///
+/// The class is about the pair, never about the caller's bytes — that distinction is what vision's `undecodable` class
+/// exists next to it for (see `crate::vision`, compiled only under the feature, hence no link here) — and it carries no
+/// path, URL, or runtime diagnostic text (§12 rule 8).
+pub use crate::media::VISION_UNAVAILABLE;
 
 /// One embedding, held as `dim` `f32` components and stored as those components little-endian.
 ///
@@ -290,6 +309,14 @@ pub enum EmbedError {
     /// permanent footnote.
     #[error("malformed vector buffer: {len} bytes is not a whole number of f32 components")]
     Malformed { len: usize },
+    /// A decoded vector holding a component that is not a finite number; `index` names the first one found.
+    ///
+    /// Nothing the encoder writes can produce one — its rows are unit length by construction — but a hand-written fixture,
+    /// a half-written blob, or a database edited outside this program can: `db.rs`'s `CHECK` on a vector column tests byte
+    /// length and type, never value. Refused rather than ranked because one non-finite component makes the whole cosine
+    /// non-finite, and a score that compares unordered silently decides the order of everything it is sorted against.
+    #[error("vector holds a component that is not a number (component {index})")]
+    NonFiniteComponent { index: usize },
     /// The `local-model` provider was asked to embed and cannot: this build contains no inference
     /// runtime. `model_id` is the row it was built from, so the refusal says which model stayed owed.
     ///
@@ -446,6 +473,53 @@ pub trait Embedder {
     /// Implementations that cannot serve return an [`EmbedError`]; they never panic on absence of a
     /// model or an endpoint (§7: CI runs `--ignored`, so a panicking path poisons a green run).
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError>;
+
+    /// Embed one **search query** under the model's query-side prefix (`docs/design-m2-image-embeddings.md` §12).
+    ///
+    /// Separate from [`Self::embed`] because the two sides of an asymmetric retrieval pair are not interchangeable: a
+    /// vector written under `prefix_query` is not comparable with a stored document row, so which side a piece of text is
+    /// being dressed as has to be spelled at the call site rather than inferred from context. `np search` is the only
+    /// caller today.
+    ///
+    /// The default **refuses** rather than falling back to [`Self::embed`]: a provider with no query prefix of its own —
+    /// the seam's halves, an injected fake — would otherwise hand back scores measured in a vector space the stored rows
+    /// do not live in, which is R6c2's P1 mistake wearing the other prefix.
+    fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
+        Err(EmbedError::Unavailable(
+            "this provider cannot embed a search query".to_string(),
+        ))
+    }
+
+    /// Whether [`Self::embed_image`] can serve on this provider, asked before anything is attempted.
+    ///
+    /// Defaults to `false`, so a text-only provider — and every provider written before images existed — keeps answering
+    /// it without editing. A provider answers true when the second encoder is **configured** — for the local providers
+    /// that means an mmproj path is set, not that a projector has opened. Opening can still fail (missing file, no vision
+    /// graph) and `embed_image` refuses with [`VISION_UNAVAILABLE`] when it does, so `true` never promises a vector; what it
+    /// promises is that asking is worth the file read, which is how a caller gets to refuse an image *before* reading it.
+    /// It says nothing about the bytes about to be handed over.
+    ///
+    /// **An image carries no instruction prefix** (§1.2): prefixes are how a text chunk is dressed for a task, and media
+    /// rows are embedded bare and compared against prefixed text rows — so there is no `prefix` parameter on either half
+    /// of this pair, which is stronger than a rule telling callers not to pass one.
+    fn supports_images(&self) -> bool {
+        false
+    }
+
+    /// One image's encoded bytes (PNG, JPEG, …) to one [`Vector`] of [`Self::dim`] components.
+    ///
+    /// `&mut self` because the vision runtime keeps mutable per-context state across an encode — the projector writes its
+    /// encoder output into a buffer the text decoder reads, and llama.cpp flips the shared causal-attention flag around
+    /// the image decode. Two encodes cannot run through one provider at once, and the borrow says so instead of a comment
+    /// doing it.
+    ///
+    /// The default refuses with [`EmbedError::Unavailable`] carrying [`VISION_UNAVAILABLE`], because "this provider has no
+    /// image encoder" is a fact about the build and model pair. **A refusal is a class, never a path** (§12 rule 8): no
+    /// filename, URL or runtime diagnostic text reaches the payload — the caller's bytes are named nowhere in what we
+    /// report.
+    fn embed_image(&mut self, _bytes: &[u8]) -> Result<Vector, EmbedError> {
+        Err(EmbedError::Unavailable(VISION_UNAVAILABLE.to_string()))
+    }
 }
 
 /// The provider behind `embeddings.provider = "none"` (§2's default): it refuses, and could not do
@@ -485,6 +559,14 @@ impl Embedder for NoEmbeddingProvider {
     /// Always [`EmbedError::Disabled`], with no argument inspection and nothing to contact: the refusal
     /// is the whole behaviour (§2).
     fn embed(&self, _texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
+        Err(EmbedError::Disabled)
+    }
+
+    /// [`EmbedError::Disabled`] rather than the trait's default refusal, because the default says *this provider cannot
+    /// embed a search query* and that is not what is wrong: nothing is unavailable, embedding is switched off, and the
+    /// setting that switches it off has a name (`embeddings.provider = "none"`). `np search` prints this text verbatim, so
+    /// the general arm would have told a reader to go find a provider when the answer is one config line (Task 6 review P1).
+    fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
         Err(EmbedError::Disabled)
     }
 }
@@ -679,6 +761,18 @@ impl Embedder for LocalModelProvider {
     /// `local_model::LazyLocalEmbedder` instead and vectors are computed, so this refusal is what a **default**
     /// binary answers rather than something no binary can do.
     fn embed(&self, _texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
+        Err(EmbedError::RuntimeNotBuilt {
+            model_id: self.model_id.clone(),
+        })
+    }
+
+    /// [`EmbedError::RuntimeNotBuilt`] for the same reason `embed` gives it: a default build cannot turn text into numbers,
+    /// and it matters which model stayed owed.
+    ///
+    /// Overriding is not cosmetic. The trait's default refuses too, but with "this provider cannot embed a search query",
+    /// which reads as a capability the seam lacks rather than the one fact a reader can act on — that this binary was
+    /// compiled without the runtime (§9 item 1). Task 6 review P1.
+    fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
         Err(EmbedError::RuntimeNotBuilt {
             model_id: self.model_id.clone(),
         })

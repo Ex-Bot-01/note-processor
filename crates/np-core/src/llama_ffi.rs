@@ -476,6 +476,489 @@ extern "C" {
     pub fn llama_get_embeddings_ith(ctx: *mut llama_context, i: i32) -> *mut f32;
 }
 
+// ---- vision: the `mtmd` mirrors -------------------------------------------
+//
+// Everything in this section exists because one cargo feature links two more archives (`build.rs`'s `Shape`).
+// Two headers are mirrored here, both from the tree named by `third_party/llama-cpp.toml`:
+//
+//   * `include/llama.h` — two functions the text path never needed. They stay in this module rather than in the
+//     block above because nothing outside the image decode may flip a context's attention mask.
+//   * `tools/mtmd/mtmd.h` and `tools/mtmd/mtmd-helper.h` — the projector, in a submodule of their own so a reader
+//     can see at once which half of `np`'s FFI needs `libmtmd.a`.
+//
+// **One asymmetry worth knowing before a re-pin.** `build.rs` hashes `include/llama.h` and refuses a tree whose
+// digest differs, so the text-path mirrors above are pinned to bytes. No digest covers `mtmd.h` — v0.8.0's own
+// header calls its API "experimental and subject to many BREAKING CHANGES" (`mtmd.h:26-27`). These mirrors are
+// therefore checked by hand on a re-pin: re-run the layout probe below against the new headers, because
+// `mtmd_context_params` is passed **by value** and a field inserted in the middle would be C reading past what
+// Rust wrote.
+
+// `void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn)` (`include/llama.h:1114`) and
+// `bool llama_get_causal_attn(const struct llama_context * ctx)` (`:1117`).
+//
+// Mirrored for one reason, recorded in `crates/np-core/tests/probes/vision-spike-2026-11-02.md`:
+// `mtmd_decode_use_non_causal` answers **true** for this architecture, so the image rows must be decoded with a
+// non-causal mask. The get-half exists so the set is reversible: a seam that left the flag flipped would make
+// every later *text* vector in the process quietly wrong while every image vector kept looking healthy — a
+// failure no image-side assertion can see. `crate::vision` sets, decodes, and restores in one straight line with
+// no early return between them, and `tests/local_vision.rs` pins that with bitwise text comparison.
+#[cfg(feature = "vision")]
+extern "C" {
+    /// Set whether this context masks attention causally. Affects later decodes only.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a live context from [`llama_init_from_model`].
+    pub fn llama_set_causal_attn(ctx: *mut llama_context, causal_attn: bool);
+
+    /// What this context currently masks with — read it **before** changing it, so the change can be undone.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a live context from [`llama_init_from_model`].
+    pub fn llama_get_causal_attn(ctx: *const llama_context) -> bool;
+}
+
+/// Mirrors of llama.cpp v0.8.0's `tools/mtmd/mtmd.h` and `tools/mtmd/mtmd-helper.h`, behind `vision`.
+///
+/// The C spellings are kept (`mtmd_context`, not `MtmdContext`) for the reason this file already gives: a reviewer
+/// checking a mirror greps for the C name. Every declaration names the header line it was read from, and — as in
+/// the text-path block — each one says who owns what, because that is the only thing between us and a
+/// use-after-free across a language boundary.
+///
+/// What is **not** declared here is deliberate: audio (`mtmd_support_audio`, the stream and generation APIs — §3
+/// of `docs/design-m2-image-embeddings.md` makes audio a non-goal, and the seam refuses an audio bitmap rather
+/// than modelling it), video, batching (`mtmd_batch_*`: one image per call is what [`crate::vision`] promises),
+/// chunk save/load/copy, and M-RoPE position helpers (`mtmd_decode_use_mrope` answers false for this projector and
+/// the seam refuses a true answer rather than guessing at section-major positions). Declaring an API we never call
+/// would only make the wrong one reachable without a compile error.
+#[cfg(feature = "vision")]
+pub mod mtmd {
+    // The C spellings again, for the same reason as the parent module.
+    #![allow(non_camel_case_types)]
+
+    // `mtmd_init_from_file` takes the text model by pointer: the projector is built *against* a loaded model
+    // rather than beside one (`mtmd.h:143-145`).
+    use super::llama_model;
+
+    /// Opaque handles (`mtmd.h:70-76`, `mtmd-helper.h:23`): pointee types with no layout we may read.
+    pub enum mtmd_context {}
+    /// One decoded image or audio clip (`mtmd.h:71`). Owned by whoever built it; freed with [`mtmd_bitmap_free`].
+    pub enum mtmd_bitmap {}
+    /// A video decoder a helper attached to a bitmap (`mtmd-helper.h:23`). Never ours to read, only to free.
+    pub enum mtmd_helper_video {}
+    /// One decode-ready piece of input — text or media (`mtmd.h:72`). Owned by the chunks list that holds it.
+    pub enum mtmd_input_chunk {}
+    /// A list of chunks, filled only by [`mtmd_tokenize`] (`mtmd.h:73`).
+    pub enum mtmd_input_chunks {}
+
+    /// `enum mtmd_input_chunk_type` (`mtmd.h:53-58`) as constants, following the pooling-type precedent in the
+    /// parent module: the field crossing the boundary is a 4-byte C enum, mirrored as `i32`, and every value the
+    /// header declares is spelled out so "unrecognised" stays distinguishable from "text".
+    pub const MTMD_INPUT_CHUNK_TYPE_TEXT: i32 = 0;
+    /// An image chunk: [`mtmd_encode_chunk`] turns it into embedding rows.
+    pub const MTMD_INPUT_CHUNK_TYPE_IMAGE: i32 = 1;
+    /// An audio chunk — refused by [`crate::vision`], never encoded (§3's non-goal).
+    pub const MTMD_INPUT_CHUNK_TYPE_AUDIO: i32 = 2;
+    /// Validation sentinel, not a real chunk type.
+    pub const MTMD_INPUT_CHUNK_TYPE_COUNT: i32 = 3;
+
+    /// `struct mtmd_context_params` (`mtmd.h:107-128`) — passed **by value** to [`mtmd_init_from_file`].
+    ///
+    /// Same rule as [`crate::llama_ffi::llama_context_params`]: start from [`mtmd_context_params_default`] and set
+    /// named fields; never construct one field-by-field, because the defaults are mtmd's choice (`mtmd.cpp:533-552`
+    /// asks for GPU, timings and a warmup pass — three things this crate turns off, and the only place that gets to
+    /// decide what "off" means alongside them is the caller that reads them back).
+    #[repr(C)]
+    pub struct mtmd_context_params {
+        /// Upstream default is `true`; this crate asks for CPU, matching how the text model is loaded.
+        pub use_gpu: bool,
+        /// `ggml_backend_dev_t` (`ggml-backend.h`) — a device pointer; null means "choose".
+        pub device: *mut std::ffi::c_void,
+        /// Per-encode timing lines on stderr. Off: our output is one line per image, not llama.cpp's.
+        pub print_timings: bool,
+        /// Worker count for the vision encoder's own ggml graph. Left at mtmd's default (4) — R7c's worker policy
+        /// governs the text context, and §11 says an image encode runs on the same llama context.
+        pub n_threads: i32,
+        /// Deprecated in favour of [`mtmd_context_params::media_marker`] (`mtmd.h:113`), but still a field: leaving
+        /// it out would shift every offset after it.
+        pub image_marker: *const std::ffi::c_char,
+        /// The marker string that splits the prompt around the media. Null means mtmd's own default.
+        pub media_marker: *const std::ffi::c_char,
+        /// `enum llama_flash_attn_type` — mirrored as `i32`, as in the parent module.
+        pub flash_attn_type: i32,
+        /// Whether to run a warmup encode after init. Off: nothing here needs a warmed encoder, and it costs an
+        /// image-sized pass at open time.
+        pub warmup: bool,
+        /// Soft-token floor; -1 means "read from the artifact" (the card's 70–1120 lever, unused this round — the
+        /// spike note measured that it *is* honoured, and §8 measures cost per encode instead of choosing a budget).
+        pub image_min_tokens: i32,
+        /// Soft-token ceiling; -1 means "read from the artifact".
+        pub image_max_tokens: i32,
+        /// `ggml_backend_sched_eval_callback` — **three** parameters (`ggml-backend.h`:
+        /// `bool (*cb)(struct ggml_tensor * t, bool ask, void * user_data)`), the same trap R6b0 review P1-1 caught
+        /// in the text-path mirror: two compiles, keeps every offset, and reads `user_data` from a garbage register.
+        pub cb_eval: Option<
+            extern "C" fn(
+                t: *mut std::ffi::c_void,
+                ask: bool,
+                user_data: *mut std::ffi::c_void,
+            ) -> bool,
+        >,
+        pub cb_eval_user_data: *mut std::ffi::c_void,
+        /// Max tokens per encode batch; the first image is added even if it exceeds this. Only `mtmd_batch_*` reads
+        /// it, and those are not declared — but the field is part of the layout we pass by value.
+        pub batch_max_tokens: i32,
+        /// `mtmd_progress_callback` (`mtmd.h:105`): `bool (*)(float progress, void * user_data)`.
+        pub progress_callback: Option<extern "C" fn(f32, *mut std::ffi::c_void) -> bool>,
+        pub progress_callback_user_data: *mut std::ffi::c_void,
+    }
+
+    /// `struct mtmd_input_text` (`mtmd.h:77-82`) — passed by **pointer** to [`mtmd_tokenize`].
+    ///
+    /// `text` need not be NUL-terminated: `mtmd.cpp:1330` does `input_text.assign(text->text, text->text_len)`,
+    /// so the length is what decides. The pointer must outlive that call.
+    #[repr(C)]
+    pub struct mtmd_input_text {
+        pub text: *const std::ffi::c_char,
+        /// Bytes at [`mtmd_input_text::text`], not characters.
+        pub text_len: usize,
+        pub add_special: bool,
+        pub parse_special: bool,
+    }
+
+    /// `struct mtmd_helper_video_init_params` (`mtmd-helper.h:26-33`) — mirrored only because it is the *whole*
+    /// body of [`mtmd_helper_init_opt`], which crosses the boundary by value. Nothing reads a field.
+    #[repr(C)]
+    pub struct mtmd_helper_video_init_params {
+        pub fps_target: f32,
+        pub ffmpeg_bin_dir: *const std::ffi::c_char,
+        pub timestamp_interval_ms: i64,
+        pub no_soundtrack: bool,
+    }
+
+    /// `struct mtmd_helper_init_opt` (`mtmd-helper.h:37-39`, typedef'd at `:40`) — by value to
+    /// [`mtmd_helper_bitmap_init_from_buf`]. Take it from [`mtmd_helper_init_opt_default`]; the pinned code marks
+    /// the whole option `GGML_UNUSED` on the image path (`mtmd-helper.cpp:379`) and video is not something this
+    /// crate decodes.
+    #[repr(C)]
+    pub struct mtmd_helper_init_opt {
+        pub video_params: mtmd_helper_video_init_params,
+    }
+
+    /// `struct mtmd_helper_bitmap_wrapper` (`mtmd-helper.h:49-52`) — returned **by value**.
+    ///
+    /// Two handles, and both are ours if non-null. On this build the image path leaves `video_ctx` null
+    /// (`mtmd-helper.cpp:387`, `:406`, `:414`), but `MTMD_VIDEO` is ON in our cmake cache (`LLAMA_SUBPROCESS`
+    /// defaults ON, so the force-off at `tools/mtmd/CMakeLists.txt:9-12` does not fire) and a buffer that reaches
+    /// the video path would fill it, so [`crate::vision`] frees both.
+    ///
+    /// **Do not read this mirror as the thing that keeps non-raster formats out.** What bounds the corpus is §7's
+    /// extension gate in `crate::media`, not this decoder: measured on 2026-11-03, a BMP payload reached
+    /// [`mtmd_helper_bitmap_init_from_buf`] through a `.png` filename and came back a live bitmap and then a vector
+    /// (80 tokens). `stb_image` inside `libmtmd` decodes bmp/tga/gif/psd/pnm/qoi as well as png and jpeg, and the webp
+    /// and video arms need ffmpeg (`mtmd-helper.cpp:417-427`), which is not installed on this host — so the promise
+    /// "png/jpg/jpeg only" is enforced where files are discovered, and a mislabelled file is a scope leak rather than
+    /// a decode failure.
+    #[repr(C)]
+    pub struct mtmd_helper_bitmap_wrapper {
+        pub bitmap: *mut mtmd_bitmap,
+        pub video_ctx: *mut mtmd_helper_video,
+    }
+
+    extern "C" {
+        // ---- context ---------------------------------------------------------
+
+        /// Fresh params with mtmd's own defaults (`mtmd.h:139`; body `mtmd.cpp:533`). Value type, nothing to free.
+        pub fn mtmd_context_params_default() -> mtmd_context_params;
+
+        /// Load a projector against an **already loaded** text model. Null on failure (`mtmd.h:143-145`).
+        ///
+        /// Memory: the returned context is owned by us and freed with [`mtmd_free`], before the model dies — it
+        /// keeps a raw pointer to `text_model` (member at `mtmd.cpp:567`, initialised at `:615`). Unlike llama.cpp's own
+        /// loader this entry point catches `std::exception` and answers null (`mtmd.cpp:1256-1260`), so a bad
+        /// projector is a refusal rather than a foreign exception crossing into Rust.
+        pub fn mtmd_init_from_file(
+            mmproj_fname: *const std::ffi::c_char,
+            text_model: *const llama_model,
+            ctx_params: mtmd_context_params,
+        ) -> *mut mtmd_context;
+
+        /// Free a context from [`mtmd_init_from_file`] (`mtmd.h:147`). Idempotent only in that `delete` tolerates
+        /// null; passing a twice-freed pointer is our bug.
+        pub fn mtmd_free(ctx: *mut mtmd_context);
+
+        // ---- capability and shape facts --------------------------------------
+
+        /// Whether the loaded projector has a vision graph (`mtmd.h:157`).
+        ///
+        /// True for the pinned `mmproj` (measured in the spike note). The seam refuses a false answer as §8's
+        /// `vision-unavailable` rather than decoding into an encoder that is not there.
+        ///
+        /// # Safety
+        ///
+        /// `ctx` must be live.
+        pub fn mtmd_support_vision(ctx: *const mtmd_context) -> bool;
+
+        /// Whether this model needs a non-causal mask for `chunk` (`mtmd.h:151`); a null chunk asks about the
+        /// default image case. **True for this architecture** — the reason [`crate::llama_ffi::llama_set_causal_attn`]
+        /// is mirrored.
+        ///
+        /// # Safety
+        ///
+        /// `ctx` live; `chunk` either null or owned by a live chunks list.
+        pub fn mtmd_decode_use_non_causal(
+            ctx: *const mtmd_context,
+            chunk: *const mtmd_input_chunk,
+        ) -> bool;
+
+        /// Whether the model uses M-RoPE positions (`mtmd.h:154`). False for this projector; [`crate::vision`]
+        /// refuses a true answer instead of writing 1-D positions into a batch that expects four sections.
+        ///
+        /// # Safety
+        ///
+        /// `ctx` must be live (from [`mtmd_init_from_file`]).
+        pub fn mtmd_decode_use_mrope(ctx: *const mtmd_context) -> bool;
+
+        /// The marker string this context splits prompts on (`mtmd.h:181`; body returns a `std::string`'s
+        /// `c_str()`, so it is NUL-terminated and owned by `ctx`). Valid while `ctx` is.
+        ///
+        /// # Safety
+        ///
+        /// `ctx` must be live (from [`mtmd_init_from_file`]).
+        pub fn mtmd_get_marker(ctx: *const mtmd_context) -> *const std::ffi::c_char;
+
+        // ---- bitmap ----------------------------------------------------------
+
+        /// Whether a decoded bitmap holds audio (`mtmd.h:205`). The seam's guard for §3's audio non-goal: this
+        /// projector answers `mtmd_support_audio == true`, so without this check WAV bytes would reach the encoder.
+        ///
+        /// # Safety
+        ///
+        /// `bitmap` must be live.
+        pub fn mtmd_bitmap_is_audio(bitmap: *const mtmd_bitmap) -> bool;
+
+        /// Free a bitmap from [`crate::llama_ffi::mtmd::mtmd_helper_bitmap_init_from_buf`] (`mtmd.h:206`).
+        ///
+        /// # Safety
+        ///
+        /// First and only free of this handle.
+        pub fn mtmd_bitmap_free(bitmap: *mut mtmd_bitmap);
+
+        // ---- helper (decode + video) -----------------------------------------
+
+        /// Fresh helper options (`mtmd-helper.h:42`). Value type, nothing to free.
+        pub fn mtmd_helper_init_opt_default() -> mtmd_helper_init_opt;
+
+        /// Decode an image or audio buffer into a bitmap (`mtmd-helper.h:75-79`) — PNG and JPEG through the
+        /// `stb_image` already inside `libmtmd` (§8's reason no new dependency enters this build).
+        ///
+        /// Ownership: on success **both** wrapper fields are ours if non-null. The bitmap copies the buffer, so
+        /// `buf` may be dropped as soon as this returns; the id it stamps is a sha256 of these bytes
+        /// (`mtmd-helper.cpp:381-383`), which is why no caller needs to name the file. A null bitmap means "these
+        /// bytes are not media this build can decode" — mtmd's own error text goes to stderr and never into our
+        /// refusal (§12 rule 8). Unlike [`mtmd_init_from_file`] this function has no `try`/`catch`: the image path
+        /// is C (stb) plus one hash, so nothing throws short of an allocation failure, which aborts either way.
+        ///
+        /// `placeholder == false`, always, for us: a placeholder bitmap is a token-counting stand-in that
+        /// [`mtmd_encode_chunk`] refuses by contract (`mtmd.h:190-195`).
+        pub fn mtmd_helper_bitmap_init_from_buf(
+            ctx: *const mtmd_context,
+            buf: *const std::ffi::c_uchar,
+            len: usize,
+            placeholder: bool,
+            opt: mtmd_helper_init_opt,
+        ) -> mtmd_helper_bitmap_wrapper;
+
+        /// Free a video decoder handed back by [`mtmd_helper_bitmap_init_from_buf`] (`mtmd-helper.h:176`).
+        /// Declared so the wrapper's second handle is always releasable — `MTMD_VIDEO` is ON in our configure, so
+        /// treating it as impossible would be a claim about this build rather than a fact of it.
+        ///
+        /// # Safety
+        ///
+        /// First and only free of this handle.
+        pub fn mtmd_helper_video_free(ctx: *mut mtmd_helper_video);
+
+        // ---- chunks ----------------------------------------------------------
+
+        /// An empty chunk list, filled only by [`mtmd_tokenize`] (`mtmd.h:251`).
+        pub fn mtmd_input_chunks_init() -> *mut mtmd_input_chunks;
+
+        /// How many chunks the list holds (`mtmd.h:252`).
+        ///
+        /// # Safety
+        ///
+        /// `chunks` must be live.
+        pub fn mtmd_input_chunks_size(chunks: *const mtmd_input_chunks) -> usize;
+
+        /// Chunk `idx`, borrowed from the list and freed with it (`mtmd.h:253`). Out-of-range is not checked here,
+        /// so callers bound the index by [`mtmd_input_chunks_size`].
+        ///
+        /// # Safety
+        ///
+        /// `chunks` live and `idx` below its size.
+        pub fn mtmd_input_chunks_get(
+            chunks: *const mtmd_input_chunks,
+            idx: usize,
+        ) -> *const mtmd_input_chunk;
+
+        /// Free the list and every chunk inside it (`mtmd.h:254`) — which invalidates every pointer from
+        /// [`mtmd_input_chunks_get`] and every row [`mtmd_get_output_embd`] handed back for those chunks.
+        pub fn mtmd_input_chunks_free(chunks: *mut mtmd_input_chunks);
+
+        /// What kind of chunk this is (`mtmd.h:260`), one of the `MTMD_INPUT_CHUNK_TYPE_*` constants.
+        ///
+        /// # Safety
+        ///
+        /// `chunk` must be live.
+        pub fn mtmd_input_chunk_get_type(chunk: *const mtmd_input_chunk) -> i32;
+
+        /// Tokens this chunk occupies in the decoder (`mtmd.h:263`) — for an image chunk, its patch count, which
+        /// is the number §8's budget rule and [`crate::vision::VisionModel::last_token_cost`] report.
+        ///
+        /// # Safety
+        ///
+        /// `chunk` must be live.
+        pub fn mtmd_input_chunk_get_n_tokens(chunk: *const mtmd_input_chunk) -> usize;
+
+        // ---- the pipeline ----------------------------------------------------
+
+        /// Split a prompt around the media marker and pair each marker with a bitmap (`mtmd.h:330-334`).
+        ///
+        /// Returns 0, 1 for "marker count does not match the bitmaps", 2 for a preprocessing error — and 2 is also
+        /// what an internal `std::exception` becomes (`mtmd.cpp:2067-2076`), so no C++ exception escapes here.
+        /// `output` is filled on success only; either way the caller frees it.
+        ///
+        /// # Safety
+        ///
+        /// `ctx` live; `output` from [`mtmd_input_chunks_init`]; `text` a valid pointer whose `text_len` bytes are
+        /// readable and outlive the call; `bitmaps` an array of `n_bitmaps` live bitmap pointers. The bitmaps keep
+        /// their owners — mtmd copies what it needs into the chunks.
+        pub fn mtmd_tokenize(
+            ctx: *const mtmd_context,
+            output: *mut mtmd_input_chunks,
+            text: *const mtmd_input_text,
+            bitmaps: *const *const mtmd_bitmap,
+            n_bitmaps: usize,
+        ) -> i32;
+
+        /// Run the vision encoder over one media chunk (`mtmd.h:354-355`); 0 on success, 1 on a generic error, and
+        /// an internal exception is caught into that same 1 (`mtmd.cpp:2207-2213`). Text chunks are ignored
+        /// silently, which is why the caller picks them out by type first.
+        ///
+        /// # Safety
+        ///
+        /// `ctx` live; `chunk` a live chunk belonging to a list this context tokenized.
+        pub fn mtmd_encode_chunk(ctx: *mut mtmd_context, chunk: *const mtmd_input_chunk) -> i32;
+
+        /// The rows the last [`mtmd_encode_chunk`] produced (`mtmd.h:360`): reading size is
+        /// `llama_model_n_embd_inp(model) * n_tokens * 4` bytes — **input** width, not the stored 768.
+        ///
+        /// Memory: owned by `ctx`, valid until the next encode on it. Never freed here, and null means the last
+        /// pass produced nothing.
+        ///
+        /// # Safety
+        ///
+        /// `ctx` must be live.
+        pub fn mtmd_get_output_embd(ctx: *mut mtmd_context) -> *mut f32;
+    }
+
+    mod layout {
+        //! Layout pins for the three structs that cross by value or by pointer — same discipline, and the same
+        //! measured provenance, as the `layout` module of [`crate::llama_ffi`]: a wrong field order here is not a compile error, it
+        //! is C reading past what Rust wrote.
+        //!
+        //! ```text
+        //! $ cc -O1 -std=c11 -I .vendor/llama.cpp-v0.8.0/include -I .vendor/llama.cpp-v0.8.0/ggml/include \
+        //!       -I .vendor/llama.cpp-v0.8.0/tools/mtmd -o /tmp/mtmd_layout /tmp/mtmd_layout.c && /tmp/mtmd_layout
+        //! sizeof(struct mtmd_context_params)=96 align=8
+        //!   use_gpu=0 device=8 print_timings=16 n_threads=20 image_marker=24 media_marker=32
+        //!   flash_attn_type=40 warmup=44 image_min_tokens=48 image_max_tokens=52 cb_eval=56
+        //!   cb_eval_user_data=64 batch_max_tokens=72 progress_callback=80 progress_callback_user_data=88
+        //! sizeof(mtmd_input_text)=24 align=8
+        //!   text=0 text_len=8 add_special=16 parse_special=17
+        //! sizeof(struct mtmd_helper_video_init_params)=32 align=8
+        //!   fps_target=0 ffmpeg_bin_dir=8 timestamp_interval_ms=16 no_soundtrack=24
+        //! sizeof(mtmd_helper_init_opt)=32 align=8  video_params=0
+        //! sizeof(struct mtmd_helper_bitmap_wrapper)=16 align=8  bitmap=0 video_ctx=8
+        //! sizeof(enum mtmd_input_chunk_type)=4 sizeof(enum llama_flash_attn_type)=4
+        //! ```
+        //!
+        //! Measured on this host on 2026-11-03 against the tree `third_party/llama-cpp.toml` pins. The header itself
+        //! is not digest-pinned (see this module's note), which is exactly why these numbers exist: they turn a
+        //! silent layout disagreement into a build failure on the first feature-on compile after a re-pin.
+
+        use super::*;
+        use std::mem::{align_of, offset_of, size_of};
+
+        const _: () = assert!(size_of::<*mut u8>() == 8, "this is the 64-bit layout");
+
+        const _: () = {
+            assert!(size_of::<mtmd_context_params>() == 96);
+            assert!(align_of::<mtmd_context_params>() == 8);
+            // `bool` then a pointer forces 7 bytes of padding at 1..8; four 4-byte scalars follow the two bools.
+            assert!(offset_of!(mtmd_context_params, use_gpu) == 0);
+            assert!(offset_of!(mtmd_context_params, device) == 8);
+            assert!(offset_of!(mtmd_context_params, print_timings) == 16);
+            assert!(offset_of!(mtmd_context_params, n_threads) == 20);
+            assert!(offset_of!(mtmd_context_params, image_marker) == 24);
+            assert!(offset_of!(mtmd_context_params, media_marker) == 32);
+            assert!(offset_of!(mtmd_context_params, flash_attn_type) == 40);
+            assert!(offset_of!(mtmd_context_params, warmup) == 44);
+            assert!(offset_of!(mtmd_context_params, image_min_tokens) == 48);
+            assert!(offset_of!(mtmd_context_params, image_max_tokens) == 52);
+            assert!(offset_of!(mtmd_context_params, cb_eval) == 56);
+            assert!(offset_of!(mtmd_context_params, cb_eval_user_data) == 64);
+            assert!(offset_of!(mtmd_context_params, batch_max_tokens) == 72);
+            assert!(offset_of!(mtmd_context_params, progress_callback) == 80);
+            assert!(offset_of!(mtmd_context_params, progress_callback_user_data) == 88);
+        };
+
+        const _: () = {
+            assert!(size_of::<mtmd_input_text>() == 24);
+            assert!(align_of::<mtmd_input_text>() == 8);
+            assert!(offset_of!(mtmd_input_text, text) == 0);
+            assert!(offset_of!(mtmd_input_text, text_len) == 8);
+            assert!(offset_of!(mtmd_input_text, add_special) == 16);
+            assert!(offset_of!(mtmd_input_text, parse_special) == 17);
+        };
+
+        const _: () = {
+            // The float at 0 leaves 4 bytes before the pointer; the bool at 24 pads the struct to 32.
+            assert!(size_of::<mtmd_helper_video_init_params>() == 32);
+            assert!(offset_of!(mtmd_helper_video_init_params, fps_target) == 0);
+            assert!(offset_of!(mtmd_helper_video_init_params, ffmpeg_bin_dir) == 8);
+            assert!(offset_of!(mtmd_helper_video_init_params, timestamp_interval_ms) == 16);
+            assert!(offset_of!(mtmd_helper_video_init_params, no_soundtrack) == 24);
+            // The wrapper is two pointers, and the option struct is exactly its one member — both cross by value.
+            assert!(size_of::<mtmd_helper_init_opt>() == 32);
+            assert!(offset_of!(mtmd_helper_init_opt, video_params) == 0);
+            assert!(size_of::<mtmd_helper_bitmap_wrapper>() == 16);
+            assert!(offset_of!(mtmd_helper_bitmap_wrapper, bitmap) == 0);
+            assert!(offset_of!(mtmd_helper_bitmap_wrapper, video_ctx) == 8);
+        };
+
+        /// The chunk-type mirror is `i32`, which is what the probe measured C's enum to be on this ABI. The C-side
+        /// width is still the part no Rust assertion can pin — see the parent module's layout notes.
+        const _: () = {
+            assert!(MTMD_INPUT_CHUNK_TYPE_TEXT == 0);
+            assert!(MTMD_INPUT_CHUNK_TYPE_IMAGE == 1);
+            assert!(MTMD_INPUT_CHUNK_TYPE_AUDIO == 2);
+            assert!(MTMD_INPUT_CHUNK_TYPE_COUNT == 3);
+        };
+
+        /// Both by-value structs must be `Copy` in Rust for the call to pass them the way C does; a field that ever
+        /// gained a `Drop` type would make this fail at compile time instead of at the boundary.
+        #[cfg(test)]
+        #[test]
+        fn by_value_structs_are_plain_copies() {
+            assert!(!std::mem::needs_drop::<mtmd_context_params>());
+            assert!(!std::mem::needs_drop::<mtmd_helper_init_opt>());
+            assert!(!std::mem::needs_drop::<mtmd_helper_bitmap_wrapper>());
+        }
+    }
+}
+
 mod layout {
     //! Layout pins for the three structs that cross the FFI by value — see below for what they can and
     //! cannot catch.

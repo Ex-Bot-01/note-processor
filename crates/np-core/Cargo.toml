@@ -18,12 +18,22 @@ edition.workspace = true
 # `cargo check --locked -p np-core --features local-model` is the fence that matters now, and it runs on
 # the Linux row only until someone has watched it go green elsewhere (§14's per-OS honesty). Release
 # builds keep the feature off until a Windows build of it is recorded in CI once (§2).
+# `vision` (R7c) sits on top of `local-model` and implies it: `docs/design-m2-image-embeddings.md` §10. What turning it
+# on costs is one cmake option (`LLAMA_BUILD_MTMD=ON`, which the pinned tree defaults to off), one extra cmake target
+# (`mtmd`), **two** extra archives on the link line — `libmtmd.a` needs `hash_sha256_hex`, which lives in
+# `libvendor-hash.a`, so a vision link measures six archives rather than five
+# (`crates/np-core/tests/probes/vision-spike-2026-11-02.md`) — and the 554 MB projector artifact. Default-off like
+# `local-model`, so no shipped shape changes size or dependencies; the package-size re-measurement for this row is
+# R7c Task 7's work, not a number claimed here.
 [features]
 # **`fetch` is default-ON, unlike `local-model`** (`docs/design-m2-local-embeddings.md` §12's premises): a fetch path
 # that release builds compile out would defeat the human's amendment of 2026-10-29, so opting out has to be an explicit
 # `--no-default-features`. The cost is stated where it is paid — an HTTP+TLS client in three release OSes' binaries.
 default = ["fetch"]
 local-model = []
+# Image embedding through llama.cpp's `mtmd`. There is no vision code in a build that has no runtime to attach it to,
+# which is what the implication states rather than what it enforces.
+vision = ["local-model"]
 fetch = ["dep:ureq"]
 
 [dependencies]

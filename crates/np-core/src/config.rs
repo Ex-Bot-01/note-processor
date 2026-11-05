@@ -151,13 +151,16 @@ impl Default for CatalogConfig {
 /// The `[models]` section: where artifacts may be fetched from, and the one door around the pin table
 /// (`docs/design-m2-local-embeddings.md` §12 rule 7).
 ///
-/// Both keys are `Option`, and **absent is the shipped state** — not a degraded one. With no `base_url` this build
-/// has nowhere to fetch from, which is what keeps an unconfigured machine quiet; with no `sha256` it accepts nothing
-/// that disagrees with [`crate::pins`].
+/// Both keys are `Option`, and **absent is still a valid state** — but since §12 rule 7's amendment of 2026-11-04 it no
+/// longer means "quiet": with no `base_url` a fetch dials the origin compiled into [`crate::pins::DEFAULT_ORIGIN`], and `np
+/// models fetch` says in words that it resolved to that default rather than doing it silently. With no `sha256` a fetch accepts
+/// nothing that disagrees with [`crate::pins`].
 ///
-/// **Nothing reads either key as a destination yet.** The fetch command is a later stage of R7b (design §12 rule 1:
-/// the automatic trigger is M4's daemon, not a command), so this round makes the keys legal, defaulted, validated
-/// and retrievable — and stops there. It is also why there is no documented default origin to name here: §12 rule 7
+/// **`base_url` is read as a destination** by `np models fetch`, through [`crate::fetch::resolve_origin`] — the one function
+/// that answers "which origin did this run dial". It is not read by `install`, which never touches the network. An **empty**
+/// value counts as unset (the rule `env_path` applies to paths), so `NP_MODELS_BASE_URL=` means "not configured" and now
+/// carries a consequence it did not use to: see `an_unconfigured_fetch_says_it_is_using_the_compiled_in_origin` in
+/// `crates/np-cli/tests/models_cli.rs`. §12 rule 7
 /// promises one, and inventing a host would be exactly the compile-time secret that rule refuses to hold.
 ///
 /// `deny_unknown_fields`, like [`EmbeddingsConfig`] and for the same reason (§7 there): a misspelled key here would
@@ -205,11 +208,14 @@ impl ModelsConfig {
     /// hence a code span).
     ///
     /// **Using it is a deliberate act and has to look like one.** §12 rule 7 permits an unpinned digest only because
-    /// a human named it (`[models] sha256`, or `NP_MODELS_SHA256`), and requires that accepting it **prints a line
-    /// saying an unpinned digest was accepted** — the override is loud, or it is indistinguishable from a pin nobody
-    /// checked. This round makes the fact retrievable and tested; nothing prints it yet, because no code path can
-    /// fetch yet (see [`ModelsConfig`]'s header note), so a caller that starts using this accessor owes that line in
-    /// the same change.
+    /// a human named it (`[models] sha256`, or `NP_MODELS_SHA256`), and requires that accepting it **prints a line saying an
+    /// unpinned digest was accepted** — the override is loud, or it is indistinguishable from a pin nobody checked.
+    ///
+    /// **It has no production caller today, and fetch is not the omission's victim.** A fetch compares the pin and nothing
+    /// else, so an operator who sets `[models] sha256` expecting to accept a different build gets a refusal, not an override;
+    /// the working door for that case remains `np models install --sha256`, where the human names the digest in argv. Anyone
+    /// who wires this accessor into `fetch` owes rule 6's loud line **in the same change** — and owes correcting the sentence
+    /// in `docs/design-m2-local-embeddings.md` §12 rule 7 that says the override is live.
     pub fn unpinned_digest_override(&self) -> Option<&str> {
         self.sha256.as_deref()
     }

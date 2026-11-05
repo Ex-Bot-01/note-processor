@@ -1127,6 +1127,7 @@ fn seed_duplicate_pair_at_version_four(ws: &Workspace) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
     ))
@@ -1281,6 +1282,7 @@ fn rewind_to_version_four_without_a_pair(ws: &Workspace) {
          ALTER TABLE files DROP COLUMN file_id;
          DROP TABLE embeddings;
          DROP TABLE chunks;
+         DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
          DROP TABLE models;"
     ))
@@ -1654,12 +1656,21 @@ fn embed_with_the_artifact_file_missing_names_installing_it() {
     );
     for channel in [failed.stdout(), failed.stderr()] {
         assert!(channel.contains("artifact absent"), "{channel}");
-        // §6's remedy, naming a command this build has.
+        // §6's remedy, naming only commands this build actually has. `fetch` is a cargo feature, so the assertion follows it
+        // rather than asserting one build's shape in every row — the hint used to promise "fetching a model is not
+        // implemented", which stopped being true when R7b shipped the command.
         assert!(channel.contains("np models install"), "{channel}");
-        assert!(
-            !channel.contains("np models fetch"),
-            "`fetch` does not exist: {channel}"
-        );
+        if cfg!(feature = "fetch") {
+            assert!(
+                channel.contains("np models fetch"),
+                "this binary can fetch, and the remedy should say so: {channel}"
+            );
+        } else {
+            assert!(
+                !channel.contains("np models fetch"),
+                "a build without `fetch` must not name it: {channel}"
+            );
+        }
     }
     // The defect itself. The row declares 768 and the truth is a missing file, so no width may appear in the
     // answer; this fails the moment np-cli answers an unreadable artifact with a placeholder provider again,
@@ -1789,6 +1800,21 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             "current",
             "embedded",
             "errors",
+            // The four image fields (§6's order puts them after the chunk counts): a run that saw no figure still
+            // carries the keys, with `image_refusals` an empty array, because a reader must be able to tell "zero"
+            // from "this build did not look".
+            "image_refusals",
+            "images_embedded",
+            // Media rows this run deleted (§7 rule 4's cleanup, made visible): present and zero when nothing went stale.
+            "images_pruned",
+            "images_refused",
+            "images_seen",
+            // Did the stale-figure sweep finish? `false` on an arm that never opened the database — which is why the summary
+            // says nothing about it here, and why a reader must not infer this from `images_unchecked` being zero.
+            "images_sweep_ran",
+            // Notes this run could not read (§6's `images_unchecked`): present and zero even on an arm that opened no
+            // database, because a reader must be able to tell "nothing was skipped" from "this build said nothing".
+            "images_unchecked",
             "model",
             "outcome",
             "refused_budget",
@@ -1804,9 +1830,10 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
     assert_eq!(report["model"], EMBED_MODEL);
     assert_eq!(absent["artifact"], artifact.display().to_string());
     let hint = absent["hint"].as_str().unwrap_or_default();
+    let fetch_expected = cfg!(feature = "fetch");
     assert!(
-        hint.contains("np models install") && !hint.contains("np models fetch"),
-        "the JSON remedy is the text remedy: {hint}"
+        hint.contains("np models install") && hint.contains("np models fetch") == fetch_expected,
+        "the JSON remedy is the text remedy, feature included: {hint}"
     );
 
     for (label, field) in [
@@ -1824,6 +1851,18 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             text.stdout()
         );
     }
+    // Neither image line appears here: this run saw no figure and read every note, so both counts are zero and the lines
+    // are suppressed (§6's text shape stays exactly what it was before images existed).
+    let summary_text = text.stdout();
+    for line in ["images", "unchecked"] {
+        assert!(
+            !summary_text
+                .lines()
+                .any(|got| got.split_whitespace().next() == Some(line)),
+            "`{line}` must not appear in a run that saw no figure:\n{summary_text}"
+        );
+    }
+
     assert_eq!(
         report["verification"],
         summary_field(&text.stdout(), "verify")
@@ -1881,6 +1920,113 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
 // in parallel, and following the workspace's own path spelling is part of what is being tested.
 // ---------------------------------------------------------------------------
 
+/// `np search` through the real binary: argv stays clap's to refuse, and every runtime refusal keeps exit 1 with a message
+/// that says what to change (§8) — none of them invents a code, and none writes to stdout.
+#[test]
+fn search_without_a_query_is_claps_to_refuse() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+    // `<workspace>` then `<query>`: the operand order every other subcommand uses, so `Workspace::command` cannot build it
+    // (it appends the workspace last, which would put the query where clap expects the root).
+    let mut cmd = ws.command_without_operand(&["search"]);
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 2, "argv is clap's:\n{}", failed.stderr());
+    assert!(
+        failed.stdout().is_empty(),
+        "a refused argv prints no report"
+    );
+    assert!(
+        failed.stderr().contains("QUERY"),
+        "clap has to name the operand it needs: {}",
+        failed.stderr()
+    );
+}
+
+#[test]
+fn search_with_embedding_disabled_refuses_and_names_the_setting() {
+    let ws = workspace();
+    // No `[embeddings]` section at all: `provider = "none"`, so there is no way to turn the query into a vector.
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nnothing indexed here\n").expect("test setup: note");
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("alpha");
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "a runtime refusal is 1:\n{}",
+        failed.stderr()
+    );
+    // The exact setting, not "some word that appears near the subject". The first version accepted `contains("provider")`,
+    // which the generic trait refusal satisfied while naming nothing a reader could change (Task 6 review P1).
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains(r#"embeddings.provider = "none""#),
+        "the message has to name the setting that switched embedding off: {stderr}"
+    );
+    assert!(failed.stdout().is_empty(), "a refusal prints no hit list");
+}
+
+#[cfg(not(feature = "local-model"))]
+#[test]
+fn searching_without_the_runtime_names_the_model_that_stayed_owed() {
+    // §6 arm (iv)'s class, from the search side: the row says installed and the file is there, but **this binary** links no
+    // inference runtime. It has to come back as the runtime-not-built refusal naming the model id — not as "this provider
+    // cannot embed a search query", which reads as a capability the seam lacks rather than one build flag (review P1).
+    let ws = workspace();
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nabout alpha\n").expect("test setup: note");
+    run(&mut ws.command(&["scan"])).assert_success();
+    install_model(&ws);
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("alpha");
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stderr());
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("runtime is not built"),
+        "the refusal has to say the runtime is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains(EMBED_MODEL),
+        "and name the model that produced nothing: {stderr}"
+    );
+    assert!(failed.stdout().is_empty());
+}
+
+#[test]
+fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
+    let ws = workspace();
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nnothing indexed here\n").expect("test setup: note");
+    run(&mut ws.command(&["scan"])).assert_success();
+    install_model(&ws);
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+    // The row says installed; the file is not there — arm (iii)'s shape, seen from the search side.
+    fs::remove_file(ws.models_dir().join(EMBED_MODEL)).ok();
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("alpha");
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stderr());
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("artifact") && stderr.contains("absent"),
+        "a reader needs to know the artifact is what is missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("   "),
+        "the message wrapped mid-sentence and printed a run of spaces: [{stderr}]"
+    );
+    assert!(failed.stdout().is_empty());
+}
+
 #[cfg(feature = "local-model")]
 mod real_model {
     use super::*;
@@ -1927,6 +2073,84 @@ mod real_model {
         )
         .expect("test setup: second note");
         Workspace { _tmp: tmp, root }
+    }
+
+    /// `np search` against vectors a real model wrote. The default-build cases above can only prove the refusals; this is
+    /// the one that proves the ranking path end to end — argv order, the four-decimal text line, and `--json` carrying
+    /// nothing but `hits` — with the query embedded by the same artifact that made the stored rows.
+    #[test]
+    fn searching_a_real_index_answers_in_both_channels() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        run(&mut ws.command(&["scan"])).assert_success();
+        link_artifact(&ws, &artifact, "task: search result | query: ");
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+        run(&mut ws.command(&["embed"])).assert_success();
+
+        let search = |json: bool| {
+            let mut cmd = ws.command_without_operand(&["search"]);
+            cmd.arg(&ws.root).arg("the cat sits on the warm mat");
+            if json {
+                cmd.arg("--json");
+            }
+            run(&mut cmd)
+        };
+
+        let text = search(false);
+        assert_eq!(text.code(), 0, "\n{}", text.stderr());
+        let text_out = text.stdout();
+        let first_line = text_out
+            .lines()
+            .next()
+            .expect("a real index answers with at least one hit");
+        let score = first_line
+            .split_whitespace()
+            .next()
+            .expect("the line starts with the score");
+        assert_eq!(
+            score.split('.').nth(1).map(str::len),
+            Some(4),
+            "the text channel prints four decimals and says so in its own shape: {first_line}"
+        );
+        assert!(
+            first_line.contains("note") && first_line.contains("a.md"),
+            "the cat note has to lead a query about the cat: {}",
+            text_out
+        );
+
+        let json = search(true);
+        assert_eq!(json.code(), 0, "\n{}", json.stderr());
+        let value: serde_json::Value =
+            serde_json::from_str(&json.stdout()).expect("`--json` prints exactly one JSON object");
+        assert_eq!(
+            json_keys(&value),
+            vec!["hits"],
+            "nothing else on stdout — no caveat, no counts, no second key"
+        );
+        let hits = value["hits"].as_array().expect("hits is an array");
+        assert!(
+            !hits.is_empty(),
+            "a query about the cat matches the cat note"
+        );
+        assert_eq!(
+            json_keys(&hits[0]),
+            vec!["kind", "linked_from", "path", "score", "source_note"],
+            "§12's five fields, no extras"
+        );
+        assert_eq!(hits[0]["path"].as_str(), Some("a.md"));
+        assert_eq!(hits[0]["kind"].as_str(), Some("note"));
+        let scores: Vec<f64> = hits
+            .iter()
+            .map(|hit| hit["score"].as_f64().expect("score is a number"))
+            .collect();
+        let mut ordered = scores.clone();
+        ordered.sort_by(|a, b| b.partial_cmp(a).expect("scores are comparable"));
+        assert_eq!(
+            scores,
+            ordered,
+            "the array arrives ranked:\n{}",
+            json.stdout()
+        );
     }
 
     /// Record [`EMBED_MODEL`] as installed, with its bytes **linked** rather than copied into place.

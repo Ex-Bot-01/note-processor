@@ -534,6 +534,51 @@ What these numbers can and cannot carry:
   no current golden exercises this shape, so only the new fixture and unit cases move) or amend R2 and add a golden that pins
   the accepted shape deliberately.
 
+## F26 — the image decoder accepts more formats than §7's extension list promises
+
+Found reviewing R7c Task 4 on 2026-11-03, and **measured rather than inferred**: a BMP payload handed to
+`mtmd_helper_bitmap_init_from_buf` came back a live bitmap and then a vector (80 image tokens) — reached through the
+artifact suite with the bytes under a `.png` name. `stb_image`, already inside `libmtmd`, decodes bmp, tga, gif, psd,
+pnm and qoi as well as png and jpeg. The webp and video arms need ffmpeg (`mtmd-helper.cpp:417-427`), which is **not
+installed on this host**, so whether they accept anything here is unmeasured (F18) — the claim in this entry is only
+about what was observed.
+
+What bounds the corpus today is §7's extension gate in `crate::media`, not the decoder. So a mislabelled file embeds,
+and search would report `kind=image` beside a path whose bytes are none of the three formats R7c promised (the human's
+scope decision: png/jpg/jpeg). Nothing is corrupted and no vector is wrong — the pixels are real — but the promise and
+the artefact disagree.
+
+Two ways out, and Task 5's discovery pass is where the choice belongs: sniff content in discovery (PNG signature, JPEG
+SOI marker; everything else refuses as `unsupported-format`, a class §8 already defines and `media.rs` already emits),
+or widen the published promise to what this decoder actually takes. The first costs one read of a few bytes per media
+file — the file is opened for hashing anyway — and keeps the promise small.
+
+**Closed on 2026-11-03 by the first option.** `media::image_kind_of_prefix` accepts a PNG signature or a JPEG SOI marker and
+nothing else, and the embed pass classifies from the bytes it then digests and encodes — one read, so the judged, digested and
+encoded bytes are literally the same slice. A `.png` whose payload is a BMP now refuses as `unsupported-format`
+(`tests/embed_media.rs::a_remote_or_inline_target_is_counted_and_never_fetched` and the content-gate case in that file;
+`tests/media_resolve.rs::a_mislabelled_file_resolves_and_then_fails_the_content_check` pins the division between placing a path
+and judging bytes).
+
+## F27 — a figure rewritten in place, at the same length and whole-second mtime, keeps its old vector
+
+Filed while reviewing R7c Task 5b on 2026-11-03. §7 chose D12's stamp for image files, and that stamp is **size plus
+whole-second mtime**. An editor that rewrites a figure in place — an atomic save, a re-export of the same diagram at the same
+resolution, a copy that preserved length — can leave both fields identical while every pixel changes. With a current vector
+already stored, the pass reads nothing and the old vector keeps answering `np search`.
+
+This is not a bug in the pass: it is what the chosen stamp means, and closing it means hashing every figure on every run,
+which is the cost §7 traded away. What the pass *does* guarantee, and now tests, is that **anything it encodes is digested from
+the bytes it encoded** (`tests/embed_media.rs::a_figure_encoded_after_a_refusal_is_digested_from_the_bytes_it_encodes`), so a
+fooled stamp can delay an encode but never mislabel one. The blind spot itself is pinned by
+`a_same_size_same_mtime_overwrite_of_a_current_figure_is_not_detected`, which will fail loudly if someone closes the gap and
+forgets to update this entry.
+
+Ways out, if search accuracy starts to matter more than embed time: compare mtime with sub-second precision (needs `statx`
+or a dependency — the reason D12 rounded in the first place), store the digest per path rather than trusting the pair (which
+is a full read anyway), or watch for writes and mark dirty paths out of band. None is a small change; none is needed until a
+corpus demonstrates the loss.
+
 ## Carried out of the M2a chunker review (2026-10-28)
 
 Two behaviours `crates/np-core/src/chunk.rs` defers in its own comments, recorded here rather than left in a docstring —
@@ -653,3 +698,96 @@ make before round 4b embeds anything** — after that they cost vectors, not jus
   `crates/np-core/tests/probes/corpus-auto-2026-11-02.log`; the older four-worker rows above stay quoted as what they were
   taken at, because `local_corpus.rs`'s `run_pass` still pins four. §14's cohort solve (31.1 ms fixed + 5.53 ms/token) is
   deliberately **still four-worker** — it measures per-decode overhead, which is a different question from thread scaling.
+
+## F28 — the shipped binary cannot reach image code, so `np embed` never embeds an image
+
+**Found 2026-11-04 while measuring R7c Task 7's package sizes.** The plan asked for a fourth
+figure — `local-model,vision` — beside R7b's three shipped sizes, "where the fifth archive shows
+up". It cannot be built: `crates/np-cli/Cargo.toml` declares `local-model = ["np-core/local-model"]`
+and `fetch = ["np-core/fetch"]`, and has **no `vision` passthrough**, so
+`cargo build --release --bin np -p np-cli --features local-model,vision` fails at feature resolution
+with *"the package 'np-cli' does not contain this feature: vision"* (exit 101, measured).
+
+**What that means in practice, stated plainly.** `np_core::vision` is reachable only when the
+`vision` feature is on, and only np-core builds can turn it on. So in every `np` binary — including a
+`--features local-model` one — `Embedder::supports_images()` answers `false`, §11's images arm counts
+figures and refuses them all as `vision-unavailable`, and `np search` ranks whatever image vectors
+already exist but cannot make a new one. The whole R7c pipeline is exercised end to end in
+`crates/np-core/tests/local_vision.rs` and `tests/embed_run.rs`, never through the command line.
+
+**Why this was not caught earlier.** Every gate on this branch runs the feature pair against
+`-p np-core`, so a green `--features local-model,vision` row says the *library* builds that way. The
+one place that would have failed — a CLI build with the same pair — is not in any gate list, because
+the plan's Step 5 phrased the measurement as if the shape already existed.
+
+**The decision owed, which is a product question, not a bug.** Either (a) add `vision =
+["np-core/vision"]` to np-cli and let an operator build a binary that embeds images — at the cost §10
+already predicts: a fifth archive, cmake's `LLAMA_BUILD_MTMD`, and a larger artifact; or (b) keep
+image embeddings library-only for now and say so in README's `np search` section, where a reader
+today would otherwise conclude that `np embed` fills the image index. Under (b) the honest wording is
+"image vectors come from a build made with `--features local-model,vision`; the shipped binary records
+figures and refuses to encode them".
+
+**Do not resolve this by adding the passthrough as a side effect of a docs commit.** It changes what a
+downloaded binary links, which is exactly the kind of size-and-dependency claim §14 exists to keep
+measured. If (a) is chosen: re-measure all four shapes with `strip`, in the same session, and record
+the projector's 554,821,056 bytes as a *fetched* cost separate from the binary's own.
+
+**Still open after R7c Task 8 (2026-11-04).** README now carries option (b)'s wording — its "Images in the index" section
+states that every figure lands as `vision-unavailable` in a binary built today, and the `np search` row says the command ranks
+image vectors *that exist* rather than implying `np embed` filled them. That is documentation of the gap, not its resolution:
+the decision about what a shipped binary links is still owed, and no `vision` passthrough was added here.
+
+## F29 — every `.svg` in the vault refuses as `unsupported-format`, and a diagram library is mostly SVG
+
+Filed 2026-11-04 by R7c Task 8 so that §8's deferred format has a number instead of living inside one design bullet. The human
+asked for ".png, .jpg and .svg" on 2026-11-02 and dropped SVG to "only .png and .jpg for today" once told it is not raster and
+no option turns it on.
+
+- **Where the refusal lives:** `crate::media::mime_of` accepts `png`, `jpg`, `jpeg` — case-folded, extension only — and nothing
+  else, so an `.svg` link refuses before a byte is opened. F26's content gate made this narrower, not wider:
+  `image_kind_of_prefix` then requires a PNG signature or a JPEG start-of-image marker, so a mislabelled file also lands here.
+- **Why it will be noticed:** every `.svg`, `.drawio`, `.excalidraw` and `.pdf` link already resolves today as
+  `links.kind = 'attachment'`, so a vault of exported diagrams prints an `unsupported-format` count on its first image-aware
+  `np embed` — the exact corpus class this round was built for.
+- **Fix shape (its own round, per §8: "not a list edit"):** a pure-Rust rasteriser behind the `vision` feature, rendering at a
+  fixed longest side with external references and DTDs disabled — an SVG is a file that asks to fetch things — plus the
+  dependency's measured package-size delta beside R7b's three shapes, and §8's rule that cost is measured per encode still
+  applies to whatever pixel count the renderer chooses.
+- **Done when:** either that ships with a measured size figure and an SVG case in `tests/embed_media.rs` (embedded, not merely
+  refused), or someone decides vector formats stay out permanently and README says so as a product limit rather than leaving it
+  readable only as a format accident.
+
+## F30 — Matryoshka truncation is the storage lever for a big image index, and it has never been exercised
+
+Filed 2026-11-04 by R7c Task 8. Rows are stored at the model's native **768** (`docs/design-m2-image-embeddings.md` §1.2,
+and the human's locked decision (b) in `todo.md`: "768 with no MRL truncation"). The card supports 768 / 512 / 256 / 128 and two
+rules that are easy to get wrong: a sliced unit vector must be **re-normalised** — skipping it "degrades ranking quality
+silently", in the card's words — and query and corpus **must share a dimension**.
+
+The lever is real because a second vector source doubles the vector surface on an image-heavy vault: 4 × 768 bytes per stored
+row in `embeddings` and again in `media_embeddings`, one row per chunk and per distinct figure respectively. How much that costs
+on a real corpus is **not measured** — no index-size figure for either table exists in this repository, which is the first thing
+this entry owes.
+
+- **Done when:** index bytes are printed for a corpus with figures (D6's sibling measurement, still open), and someone decides
+  whether to re-store at 512. That is a re-store of vectors already held — no re-encode — but it changes model identity
+  (`docs/design-m2-local-embeddings.md` §4), so it needs its own migration and `models` row, a re-normalisation on write, and a
+  refusal rather than a blend when a query's width disagrees with the stored one.
+
+## F31 — nothing can be said about whether search finds the right diagram, because there is no labelled set
+
+Filed 2026-11-04 by R7c Task 8, as the retrieval-quality half of design §14.4. What exists is a **sanity check**: four generated
+shapes and three sentences, where each caption beats an unrelated sentence against its own image and the best-matching image is
+the right one (spike 2026-11-02; the red-square pair re-measured through the shipped seam twice on 2026-11-04, identical to six
+decimals — design §14.3). That establishes one geometry, not usefulness, and §12's single ranked list is honest only if a reader
+knows the difference.
+
+- **What it would take:** a labelled set from the human's own vault — some number of queries, each naming which figure answers
+  it — run through `np search --json`, reported as rank@1 / rank@5 **per kind**, plus how often an image outranks the note that
+  explains it. Measurements and their spread, not assertions: a labelled set small enough to assert against is the same set that
+  cannot support a claim.
+- **Blocks:** any sentence beginning "search finds the right diagram", in a design doc, a README or a report, until numbers
+  exist. `np search` proves the plumbing reaches both kinds; that is the whole claim on record today.
+- **Done when:** §14 gains a measured subsection with the set's size and provenance, or records explicitly that the measurement
+  was declined and why.

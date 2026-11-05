@@ -703,15 +703,46 @@ rather than letting a round discover it:
    Lesson kept on record rather than smoothed over — an eight-character prefix copied from a metadata screen is not a
    pin, and a pin nobody can reproduce is a refusal with someone else's name on it.
 
-   The **host is config**: `[models] base_url` with a documented
-   default and an env override, so a mirror works and the origin is not a compile-time secret. One sentence to keep a future reader
+   The **host is config**: `[models] base_url`, filled from `NP_MODELS_BASE_URL` only when the file leaves that key
+   unset — *not* an "env override", which is how this sentence used to read and what the amendment below exists to correct.
+   Before 2026-11-04 there was no default at all, so a mirror worked and the origin was not a compile-time secret; see the
+   amendment under this rule for what changed. One sentence to keep a future reader
    from "fixing" this: a public artifact host is **not** parent §9's secret class, which protects the self-hosted chat server's URL and
    key. Pin rot is real — nobody notices an upstream re-upload until first start refuses — so `[models] sha256 = "…"` overrides the pin
    with a loud line saying an unpinned digest was accepted; that is no weaker than today, where any human may pass `--sha256`. Silent
    fallback stays impossible.
+
+   **Amended by the human on 2026-11-04: one origin is now compiled in.** Decided in the R7c scope decisions recorded in
+   `docs/design-m2-image-embeddings.md` §13 — "the installation of the program should trigger the HuggingFace fetch" — and
+   accepted for one reason: **an install that cannot reach a network is an install nobody completes**, and the documented
+   install step ("place the binary, then run `np models fetch`") happens before any config file exists to read. So
+   `pins::DEFAULT_ORIGIN` is `https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main` — the repository the pinned
+   digests above were read from, which is the only argument for that host rather than another one.
+
+   The precedence, spelled out because this rule's own paraphrase ("an env override") invites a reading that is not what the
+   code does: **the file's `[models] base_url` → `NP_MODELS_BASE_URL`, which fills that key only when the file leaves it unset
+   → `DEFAULT_ORIGIN`.** The first two steps are `[models]`'s existing rule, unchanged and shared by every key in that section
+   (`crates/np-core/tests/config.rs` pins it); `fetch::resolve_origin` adds the third step and nothing else, so exactly one
+   function answers "which origin did this run dial". A mirror therefore stays **one config line away**, a host with no route
+   to the internet keeps `install --path --sha256`, and what an unconfigured machine now does is make one outbound request
+   during installation instead of being refused.
+
+   What rule 7 still forbids did not move: a **pin row** names no place — a row that grew a URL would break the mirror case and
+   hand rule 8 something to leak — the digest alone decides acceptance, so a different host serving these bytes is
+   indistinguishable from this one. **What does not exist yet, stated here because an earlier draft claimed it:**
+   `[models] sha256` / `NP_MODELS_SHA256` are read, validated and retrievable through
+   [`ModelsConfig::unpinned_digest_override`](crates/np-core/src/config.rs), but **no fetch consults them** — the accessor has
+   no production caller — so today the door for an unpinned artifact is `np models install --sha256`, where a human names the
+   digest on the command line. Whoever wires that accessor owes rule 6's loud line in the same change. `crates/np-core/tests/pins.rs` keeps
+   scanning every row for host-shaped substrings, and now also pins the baked value itself plus §13's member rule: a build
+   without image support plans the primary artifact alone, a `vision` build plans both.
 8. **Refusals name a class, never a URL.** Rule 6's "name what was attempted" is bounded by rule 7: `source_kind`, repo and filename,
    HTTP status class — no host, no full URL, because client error strings carry them and this text lands in CI logs. R7b ships a test
    that no substring of a loopback base URL appears in any refusal (parent §7's `127.0.0.1:0` precedent).
+   Rule 7's 2026-11-04 amendment did not move this boundary: the compiled-in origin is a value an operator may override, never
+   one a message may print — `crates/np-core/tests/fetch.rs` now carries `DEFAULT_ORIGIN` and its host on the same no-leak list
+   as the loopback address, and np-cli's capability refusal ("this binary was built without image support") is written to name
+   a capability rather than a place.
 9. **Streaming digests need one home.** `hash.rs` exposes `sha256_file`/`sha256_bytes` only; the fetcher needs an incremental hasher
    because it hashes while counting progress. That goes in `hash.rs` as the program's single SHA-256 definition with two callers — not a
    second one, and not a `sha2` dependency outside np-core (install design §3 refuses exactly that).
@@ -889,6 +920,7 @@ has a C number to be compared against; build line in that file's header). **Memo
 | Context on top of the model, nothing decoded | **+1.8 MiB** resident at `n_ctx = 4096` | same probe. The weights dominate, not the context — and this artifact has no KV cache to dominate anything (`create_memory` returns null), so what that 1.8 MiB buys is a compute buffer and a window number |
 | **Corrected in R6b2: that +1.8 MiB was the whole story only because nothing had decoded.** Peak RSS above the C probe's own 419.4 MiB with the model open, by longest sequence run (`n_ctx = n_batch = n_ubatch = 4096`) | 133 tok **+0 MiB** · 513 **+47** · 1,026 **+109** · 2,052 **+218** · 4,085 **+458** | `crates/np-core/tests/probes/decode_probe.c` (committed, build line in its header — it also prints `memory=(nil)` and `n_threads=4`, the two facts behind the encoder-path and CPU-utilisation claims above); a compute buffer is *reserved* at context creation and *touched* per forward pass, so cost tracks the longest sequence actually run, not the ceiling asked for. This is why widening the window to escape the `n_ubatch` abort bought memory only for long notes, and it is the number R6d's peak-RSS headline should be read against. The 8,192 row above extends this curve: the shape holds at the wider window (+0 MiB at rest, ~+1 GiB near the ceiling) |
 | **Package size, stripped — re-measured 2026-11-02 after `fetch` became default-on** (`cargo build --release --bin np`, `strip`) | no features **5.7 MiB** (5,931,152 B) · default (`fetch` on) **7.7 MiB** (8,024,912 B) · `fetch` + `local-model` **13.2 MiB** (13,820,984 B). So **`fetch` costs +2.0 MiB** (2,093,760 B: a blocking HTTP client plus rustls and its crypto) and the C++ still costs **+5.5 MiB** on top; all three sit under this section's ≤ **40 MB** ceiling | **superseded figures**, measured 2026-10-30 with `np-cli`'s `local-model` passthrough: feature off 5,780,432 B, on 11,554,872 B — kept because the +5.5 MiB C++ attribution below was derived from them and still holds; the growth since is `fetch`, not the C++. This row is the re-measurement R6d promised before quoting headroom again. **Why the C++ is retained is not that `np` calls it** — nothing in `np-cli` reaches `local_model`; retention follows from np-core's own public code referencing those symbols while `build.rs` emits a plain `-l static=llama` with no `--whole-archive`, so the linker pulls what the references name. That makes +5.5 MiB today's figure rather than a floor: an LTO or `codegen-units` change could reclaim part of it, and R6d re-measures on the release profile before this section's headroom is quoted again. Symbol counts come from the *unstripped* files (`nm --defined-only`: 252 `T llama_` and 1,276 `llama_`/`ggml_` total with the feature on, zero without) — a stripped binary has no symbol table, so counting on it says "0" either way and reads as "nothing was linked in" while 5.7 MB of C++ sits in the file |
+| **Package size, stripped — re-measured 2026-11-04, twice** (`cargo build --release --bin np -p np-cli`, `strip`, one host, one run each) | First pass (head `ec8c3b3`): no features **6,093,744 B** · default **8,182,992 B** · `fetch + local-model` **13,983,160 B**. Second pass, after `np-cli`'s dependency on `np-core` gained `default-features = false`: no features **6,047,024 B** (−46,720) · default **8,182,544 B** (−448) · `fetch + local-model` **13,983,672 B** (+512). **The honest reading of that −46 KB:** the alignment removes ureq and rustls from a `--no-default-features` build's *graph*, and the binary shrank by less than 1 % — so most of what those crates could contribute was already being dropped at link time rather than carried. Measured, not explained further: this row records sizes, and §12's ≤ **40 MB** ceiling has ~26 MiB of headroom on the largest shape either way | **`local-model,vision` is not a shape `np` can be built in**, and that is the finding this row exists to record rather than paper over: `crates/np-cli/Cargo.toml` passes through `local-model` and `fetch` but has no `vision` feature, so `cargo build --features local-model,vision -p np-cli` fails with "does not contain this feature" (measured). The fifth archive therefore appears in **no shipped artifact** — §10's package-size question is answered for the three shapes that ship, and the vision size delta can only be measured on an `np-core` build until F28 decides whether the CLI should reach image code at all |
 | Throughput, `GGML_OPENMP = OFF`, this host | **141 tok/s** at 543 tokens, **120 tok/s** at 2,163 tokens (3.85 s and 18.0 s per decode; first decode of a run is no slower than a warm one) | `tests/local_embed.rs`'s throughput case prints it on every artifact run — the only one of R6b2's three numbers a test prints. `/usr/bin/time -v` on a 2,052-token pass reports **392% CPU**: with OpenMP off, ggml runs its own pthread pool (`ggml/src/ggml-cpu/ggml-cpu.c` — `ggml_threadpool_new_impl` at `:3324`, created per graph plan at `:3418`, with non-OpenMP worker state under `#ifndef GGML_USE_OPENMP` at `:509` and its barrier at `:2756`) and `llama_n_threads_batch` answers **4**. So "OpenMP off" is not "one core" — and R6d's A/B (below) found that turning OpenMP *on* changes nothing measurable either, at those same four threads
 | Independent cross-check of the FFI mirror | C prints `n_embd_out 768, n_embd_inp 512, n_ctx_train 262144, vocab 262144, pooling 1`; Rust's `ModelFacts` prints the same five numbers | two programs, one artifact: a wrong struct field in our mirror shows up as a disagreement rather than as a green suite |
 

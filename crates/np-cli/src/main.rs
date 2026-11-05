@@ -26,7 +26,11 @@ use np_core::models::{
     UnclaimedKind,
 };
 use np_core::scan::{scan, ScanReport};
+use np_core::search::{self, Hit};
 use serde_json::{json, Value};
+
+/// §12's default top-k for `np search --limit`.
+const DEFAULT_SEARCH_LIMIT: usize = 10;
 
 #[derive(Parser)]
 // The binary is `np`, but the package is `np-cli`; without `name` clap would print the package name
@@ -52,6 +56,32 @@ enum Command {
         /// Workspace root to embed.
         workspace: PathBuf,
         /// Print the report as JSON instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rank the indexed notes and images against a text query.
+    ///
+    /// `<workspace>` is an operand for the same reason `scan` and `embed` take it: the index lives under this
+    /// workspace's key ([`Config::workspace_db`]), so a command without one could not find a database to read.
+    ///
+    /// The command writes **no vector, no stamp and no note row** ([`np_core::search`] prepares nothing but `SELECT`s).
+    /// Opening the workspace database is not covered by that promise: like every other command, `workspace_db` creates the
+    /// directory and runs migrations if this is the first run here — "read-only" describes what search changes about the
+    /// index, not what opening a database touches.
+    ///
+    /// Exit codes follow every other command: a missing argument is clap's 2, and anything the runtime refuses (no provider,
+    /// no artifact to embed the query with, an id nobody installed while another holds the vectors) is 1. **Which kinds are
+    /// indexed is not a refusal** — a note-only corpus is searchable, and so is an image-only one — and an index with no
+    /// vectors at all prints one line and exits 0.
+    Search {
+        /// Workspace root whose index to read.
+        workspace: PathBuf,
+        /// Text to embed and rank against the stored vectors.
+        query: String,
+        /// Maximum number of hits to print, highest score first.
+        #[arg(long, default_value_t = DEFAULT_SEARCH_LIMIT)]
+        limit: usize,
+        /// Print the hits as JSON instead of one line each.
         #[arg(long)]
         json: bool,
     },
@@ -98,8 +128,9 @@ enum ModelsCommand {
     },
     /// Fetch a pinned model's artifacts and record them in this workspace.
     ///
-    /// The only command in this program that dials out (§12 rule 1), and it dials only where `[models] base_url` (or
-    /// `NP_MODELS_BASE_URL`) says. Nothing else does: `np scan` never fetches, and `np embed` keeps refusing with
+    /// The only command in this program that dials out (§12 rule 1), and it dials where `[models] base_url` says, or
+    /// `NP_MODELS_BASE_URL` when the file leaves that key out, or the one origin baked into the pin table when neither
+    /// speaks. Nothing else does: `np scan` never fetches, and `np embed` keeps refusing with
     /// §6's *artifact absent* arm rather than starting a nine-hundred-megabyte download inside a command that then
     /// writes rows. The automatic trigger belongs to the daemon (M4), not to a command line.
     #[cfg(feature = "fetch")]
@@ -109,8 +140,8 @@ enum ModelsCommand {
         /// Model identity to fetch: it must be one this build pins bytes **and** an identity for.
         #[arg(long)]
         id: String,
-        /// Which member to fetch, repeatable (`main`, `mmproj`). Default: every member pinned for the id — which is
-        /// why a build that pins only half a pair refuses instead of quietly transferring half of it.
+        /// Which member to fetch, repeatable (`main`, `mmproj`). Default: the members this binary can use — the
+        /// projector is left out of a build without image support, and naming it explicitly is refused.
         #[arg(long = "member")]
         members: Vec<String>,
         /// Discard this id's fetch marker (and the partial download it names) and then fetch.
@@ -144,6 +175,12 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Scan { workspace, json } => scan_workspace(&workspace, json),
         Command::Embed { workspace, json } => embed_workspace(&workspace, json),
+        Command::Search {
+            workspace,
+            query,
+            limit,
+            json,
+        } => search_workspace(&workspace, &query, limit, json),
         Command::Models { command } => match command {
             ModelsCommand::Install {
                 workspace,
@@ -304,12 +341,15 @@ fn print_summary(report: &ScanReport) {
 fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
     let resolved = embed_provider(&cfg, workspace)?;
-    let provider = resolved.provider;
+    let mut provider = resolved.provider;
     // The reason a provider could not be built goes to `embed_run` as a value. Handing over a placeholder
     // instead is how R6c1 D-2 happened: an absent artifact became a provider that declares 0 dimensions, and the
     // run refused with a sentence about widths when the truth was a missing file (see [`Resolution`]).
-    let resolution = match &provider {
-        Some(provider) => Resolution::Provider(provider.as_ref()),
+    //
+    // `as_mut`, not `as_ref`: a provider is the thing that can open a projector, so the run holds it mutably for as long
+    // as the resolution lives (`Resolution::Provider`'s note says why).
+    let resolution = match &mut provider {
+        Some(provider) => Resolution::Provider(provider.as_mut()),
         None => Resolution::ArtifactAbsent,
     };
     let mut report = embed_run::embed_with_resolution(workspace, &cfg, resolution)?;
@@ -337,6 +377,93 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
         report.outcome.detail().unwrap_or_default()
     )
     .into())
+}
+
+/// Rank `query` against `workspace`'s index and print the hits.
+///
+/// The provider is built exactly as `np embed` builds it, because the query must be embedded by the **same** model whose
+/// rows are being read — and under its `prefix_query` spelling, not the document one ([`Embedder::embed_query`]). That is
+/// also where an unbuilt runtime refuses at exit 1: [`embed_provider`] answers `None` when the artifact is absent, and a
+/// query nobody can embed has no ranking to print.
+fn search_workspace(
+    workspace: &Path,
+    query: &str,
+    limit: usize,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let cfg = load_config()?;
+    let db = workspace_db(&cfg, workspace)?;
+    let resolved = embed_provider(&cfg, workspace)?;
+    let Some(provider) = resolved.provider.as_ref() else {
+        // One line, spelled out here rather than assembled across a wrapped literal: the first version broke mid-sentence
+        // and printed a run of twenty spaces between "be" and "embedded".
+        return Err(
+            "no embedding provider for this workspace: its model artifact is absent, \
+             so the query cannot be embedded"
+                .into(),
+        );
+    };
+    // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
+    // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
+    let model = provider.model_id().to_string();
+    let vector = provider.embed_query(query)?;
+    let hits = search::search(&db, &model, &vector.to_bytes(), limit)?;
+
+    let mut out = io::stdout().lock();
+    if json {
+        // One object per hit under `hits`, and nothing else on stdout (§12). The empty case is an empty array — a machine
+        // reader does not need a sentence, and a second key would be a schema change in disguise.
+        let objects: Vec<Value> = hits.iter().map(hit_json).collect();
+        drop(out);
+        emit_json(&json!({ "hits": objects }));
+        return Ok(());
+    }
+    if hits.is_empty() {
+        // §12: an empty index is a fact. Written to stdout, exit 0 — the caller has nothing to fix.
+        // `--limit 0` asks for no hits and gets no lines, which is not the same sentence, so it is not printed.
+        if limit > 0 {
+            let _ = writeln!(out, "nothing indexed for {model}");
+        }
+        return Ok(());
+    }
+    for hit in &hits {
+        // Score to four decimals (full precision travels in `--json`), kind padded so the paths start in one column.
+        let score = format!("{:.4}", hit.score);
+        match &hit.source_note {
+            Some(note) => {
+                let _ = writeln!(
+                    out,
+                    "{score} {:<5}  {}   (from {note})",
+                    hit.kind.label(),
+                    hit.path
+                );
+            }
+            None => {
+                let _ = writeln!(out, "{score} {:<5}  {}", hit.kind.label(), hit.path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One hit as JSON: **the same five keys whatever the kind** — `{score, kind, path, linked_from, source_note}`.
+///
+/// The first version added `linked_from` and `source_note` only for image hits, which made the schema depend on a value
+/// inside the object — a reader then has to branch on `kind` before it knows whether a key is there, and a note hit whose
+/// linker field is simply absent reads differently from one that has none. Absent and zero are different statements, so this
+/// emits both keys always: `source_note: null` and `linked_from: 0` for a hit that has no linking note (every note hit, and
+/// an orphaned figure). Same rule `EmbedReport::artifact_check` already follows — present and null, not missing.
+fn hit_json(hit: &Hit) -> Value {
+    json!({
+        "score": hit.score,
+        "kind": hit.kind.label(),
+        "path": hit.path,
+        "linked_from": hit.linked_from,
+        "source_note": match &hit.source_note {
+            Some(note) => json!(note),
+            None => Value::Null,
+        },
+    })
 }
 
 /// What `[embeddings]` resolved to, and — on the one path that could — what it proved about the artifact's bytes.
@@ -491,6 +618,50 @@ fn print_embed_summary(report: &EmbedReport) {
     let _ = writeln!(out, "refused    {}", report.refused_budget);
     let _ = writeln!(out, "busy-gap   {}", report.busy_gap);
     let _ = writeln!(out, "errors     {}", report.errors);
+    // Images get their own line and no place in any other count: a corpus with no figures prints nothing here, so the
+    // text-only report keeps the shape it had before images existed (§6's order puts this after the chunk counts).
+    if report.images_seen > 0 {
+        // §6's line, with the classes spelled out: a count of three refusals tells a reader nothing about whether their
+        // vault is full of `.svg` (a format decision) or missing files (their own edit), and those two answers lead to
+        // different commands. Classes come from `image_refusal_classes`, in §8's order, so this line and `--json` cannot
+        // drift apart.
+        let classes = report
+            .image_refusal_classes()
+            .into_iter()
+            .map(|(class, count)| format!("{class} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if classes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({classes})")
+        };
+        // `links`, because that is the unit: one figure written two ways counts twice here and once in `embedded`, and a
+        // bare "seen 2 · embedded 1" reads like an unexplained loss.
+        let _ = writeln!(
+            out,
+            "images     links {} · embedded {} · refused {}{suffix}",
+            report.images_seen, report.images_embedded, report.images_refused
+        );
+    }
+    // Its own line because it counts **notes**, not images, and its consequence is the run's most surprising one: nothing
+    // was pruned. Silence here means every live note was read, which is exactly when the sweep is allowed to delete.
+    if report.images_unchecked > 0 {
+        let _ = writeln!(
+            out,
+            "unchecked  {} note(s) not read",
+            report.images_unchecked
+        );
+    }
+    // Said only for a run that looked at figures, because `false` means three different things (no pass, held off, stopped
+    // early) and two of them are invisible in the counts above. What it always means is "nothing was decided about stale
+    // figures", which is worth a line exactly when the reader has figures that could be stale.
+    if report.images_seen > 0 && !report.images_sweep_ran {
+        let _ = writeln!(
+            out,
+            "sweep      not completed — stale image rows may remain"
+        );
+    }
     let _ = writeln!(out, "verify     {}", report.verification);
     // Printed after §7's standing caveat because the two answer different questions: that one asks whether these
     // *vectors* were checked against a reference implementation, this one asks whether the model's *bytes* were.
@@ -566,7 +737,8 @@ fn workspace_db(config: &Config, workspace: &Path) -> Result<Db, Box<dyn Error>>
 /// success line lands in CI logs as readily as a refusal does — so the report says an origin was configured and names
 /// the members, sizes and digests, which is everything a person can act on. The one thing that must not appear is the
 /// URL, because a mirror's hostname is someone's infrastructure detail and this program has no business publishing it
-/// in a build log.
+/// in a build log. Since 2026-11-04 an origin exists on every run — `[models] base_url` and `NP_MODELS_BASE_URL` both
+/// silent means [`np_core::pins::DEFAULT_ORIGIN`] — which makes *not* printing it the more important half of the rule.
 #[cfg(feature = "fetch")]
 fn models_fetch(
     workspace: &Path,
@@ -579,10 +751,11 @@ fn models_fetch(
     let db = workspace_db(&config, workspace)?;
     let models_dir = config.workspace_models_dir(workspace);
 
-    // **The discard happens before the origin is required.** `--discard-marker` is a filesystem action a human takes
-    // because they know no fetch is running (§12 rule 4's only door), and refusing to perform it on a machine that
-    // has no mirror configured would leave them unable to clean up the very state the flag exists for. Dialing out is
-    // the part that needs configuring, so that check comes second.
+    // **The discard happens first.** `--discard-marker` is a filesystem action a human takes because they know no fetch
+    // is running (§12 rule 4's only door), so it may not depend on anything the rest of the run needs — not which
+    // origin resolves, not whether this build can use the members it would plan. Dialing out is the part that can fail
+    // for reasons outside the workspace, and a case where it does (`crates/np-cli/tests/models_cli.rs`) still expects
+    // the discard to have happened.
     if discard_marker {
         let discarded = fetch::discard_marker(&models_dir, id)?;
         if !json {
@@ -597,27 +770,61 @@ fn models_fetch(
         }
     }
 
-    // Refuse before any transfer when no origin is configured. The message names both places that could supply one and
-    // never guesses a host: §12 rule 7 keeps the origin out of the binary, so an unconfigured build has nowhere to
-    // dial — which is what keeps a fresh machine quiet instead of starting a download nobody asked for.
-    let origin = config.models.base_url.clone().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "no fetch origin configured: set `base_url` under `[models]` or the environment \
-             variable NP_MODELS_BASE_URL (offline? use `np models install --path`)",
-        )
-    })?;
+    // The origin, in the one order §12 rule 7 sets out as amended on 2026-11-04: `[models] base_url` as config left it
+    // (`NP_MODELS_BASE_URL` fills that key only when the file leaves it unset — `np_core::config`'s rule for every key
+    // in that section), then the origin baked into the pin table. A machine with no configuration therefore makes one
+    // outbound request during installation instead of being refused; a mirror is still one config line away, and this
+    // line stays true of every run: the resolved origin is read here and printed nowhere (§12 rule 8).
+    let origin = fetch::resolve_origin(config.models.base_url.as_deref());
 
-    // Default to the whole pinned pair, so a build that pins one member refuses loudly rather than transferring half
-    // a model and calling it installed.
+    // **Say which origin this run is about to dial, in class terms, before any byte moves.** Rule 8 still forbids the host, so
+    // the line names where the answer came from rather than what it is. It exists because `NP_MODELS_BASE_URL=` (set, empty)
+    // counts as unset — a rule `tests/config.rs` pins on purpose, mirroring how an empty `$XDG_*` is treated — and since §12
+    // rule 7's 2026-11-04 amendment, "unset" no longer means "refuse": it means the compiled-in origin. A mirror whose value
+    // was lost to a shell (`NP_MODELS_BASE_URL=$MIRROR` with `MIRROR` unset) would otherwise spend the operator's egress
+    // budget in silence.
+    if !json {
+        emit(if config.models.base_url.is_none() {
+            "origin      this build's compiled-in default — no [models] base_url is configured (an empty \
+             NP_MODELS_BASE_URL counts as unset)"
+        } else {
+            "origin      from [models] base_url"
+        });
+    }
+
+    // **Fetch what this binary can use** (`docs/design-m2-image-embeddings.md` §13): with no `--member`, the plan is
+    // the members this build could load, so a text-only install never transfers 554 MB of projector it has no code for.
     let requested_owned: Vec<String> = if members.is_empty() {
-        fetch::pinned_member_names(id)
-            .into_iter()
-            .map(str::to_string)
+        np_core::pins::members_for_build()
+            .iter()
+            .map(|name| (*name).to_string())
             .collect()
     } else {
         members.to_vec()
     };
+
+    // A member this build cannot use is refused by name, naming the **capability** that is missing. The engine's own
+    // refusal would be a false sentence here — `mmproj` *is* pinned, so "no recorded digest" describes a different
+    // problem — and the reason to refuse is this binary rather than the pin table or the origin. Today exactly one
+    // member can reach this arm (`np_core::pins::MMPROJ_MEMBER`, absent from `members_for_build` without `vision`);
+    // a second capability-gated member would need that function to say which capability each member needs before this
+    // wording could stay true, so it is written for the one case that exists.
+    let usable = np_core::pins::members_for_build();
+    if let Some(name) = requested_owned.iter().find(|name| {
+        !usable.contains(&name.as_str()) && np_core::pins::pinned_member(id, name).is_some()
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "cannot fetch member `{name}` of model `{id}`: this binary was built without image support, so the \
+                 projector's bytes would never be read here; this build fetches {} by default, and an \
+                 image-capable build (np-core's `vision` feature) can fetch `{name}`",
+                usable.join(", "),
+            ),
+        )
+        .into());
+    }
+
     let requested: Vec<&str> = requested_owned.iter().map(String::as_str).collect();
 
     let transport = fetch::HttpTransport::new(origin);

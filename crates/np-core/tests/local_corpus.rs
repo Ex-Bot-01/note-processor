@@ -357,7 +357,7 @@ mod corpus {
     }
 
     fn run_pass_with(setup: &Setup, threads: np_core::config::ThreadCount) -> Pass {
-        let provider = np_core::local_model::LazyLocalEmbedder::new(
+        let mut provider = np_core::local_model::LazyLocalEmbedder::new(
             &db::model_row(&setup.db(), MODEL_ID)
                 .expect("row readable")
                 .expect("row installed by the fixture"),
@@ -377,16 +377,20 @@ mod corpus {
         let mut batches = 0usize;
         let mut rss_samples: Vec<u64> = Vec::new();
         let started = Instant::now();
-        let report =
-            embed_run::embed_with_inject(&setup.root, &setup.cfg(), &provider, &mut |_db_path| {
+        let report = embed_run::embed_with_inject(
+            &setup.root,
+            &setup.cfg(),
+            &mut provider,
+            &mut |_db_path| {
                 batches += 1;
                 // The first batch too: a corpus small enough to fit in one batch still has a "before and after" worth
                 // printing, and sampling only on multiples would report it as no samples at all.
                 if batches == 1 || batches.is_multiple_of(SAMPLE_EVERY_BATCHES) {
                     rss_samples.push(rss_kib("VmRSS:"));
                 }
-            })
-            .expect("a corpus pass over an installed model completes");
+            },
+        )
+        .expect("a corpus pass over an installed model completes");
         let wall = started.elapsed();
 
         Pass {

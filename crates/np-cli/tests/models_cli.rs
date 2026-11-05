@@ -13,9 +13,31 @@
 //! this file needs neither `rusqlite` nor a second derivation of any path — every path it asserts on comes from
 //! [`Config::workspace_models_dir`], which is what makes an assertion about artifact placement mean something.
 
+//! Every `fetch` case dials a fixture this file owns — either [`Origin`], which answers 404 to everything it is
+//! asked for, or [`DEAD_ORIGIN`], a port with nothing listening. None of them reaches the internet: since §12 rule
+//! 7's amendment a fetch always resolves an origin, so a case that configured none would download 865 MB.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+// Only the `fetch` cases own a fake origin and read its socket log, so every import that exists to build or inspect one
+// follows the feature. Without this the `--no-default-features` row — where all of those cases are compiled out — fails
+// `-D warnings` on unused imports.
+#[cfg(feature = "fetch")]
+use std::io::{self, Read, Write};
+#[cfg(feature = "fetch")]
+use std::net::TcpListener;
+#[cfg(feature = "fetch")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "fetch")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "fetch")]
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "fetch")]
+use std::thread;
+#[cfg(feature = "fetch")]
+use std::time::Duration;
 
 use np_core::config::Config;
 use np_core::hash::sha256_file;
@@ -52,6 +74,11 @@ impl Scratch {
             .env("HOME", self._tmp.path())
             .env("XDG_CONFIG_HOME", self.config_dir())
             .env("APPDATA", self.config_dir());
+        // Since §12 rule 7's amendment a fetch always has an origin, so these cases decide their own: a developer's
+        // shell carrying `NP_MODELS_BASE_URL` must not point a suite at a real host, and one carrying
+        // `NP_MODELS_SHA256` must not loosen a digest check. A case that wants either says so with `.env(…)`.
+        cmd.env_remove("NP_MODELS_BASE_URL");
+        cmd.env_remove("NP_MODELS_SHA256");
         cmd.args(args);
         cmd
     }
@@ -1207,12 +1234,20 @@ fn nothing_fetching_prints_no_extra_line() {
 
 // --- `np models fetch` (§12) ---------------------------------------------------------------
 //
+// Every case below is `#[cfg(feature = "fetch")]`, and that costs something worth naming: a `--no-default-features` run
+// compiles this section **out**, so its green proves only that nothing here leaks into a build without the command — not
+// that fetch behaves correctly there, because it cannot. The default row is where these cases actually execute.
+//
 // These cases own argv, the two channels and the exit code. What the transfer itself does — streaming, hashing while
 // counting, length-before-digest, publishing by rename — is pinned in `crates/np-core/tests/fetch.rs` (rules against a
 // fake transport) and `fetch_http.rs` (the real client against a loopback origin), because driving 865 MB of pinned
 // bytes through a child process would test the OS's page cache rather than this program.
 
 /// Write a user-level `config.toml` where the binary looks, so a case can configure `[models]`.
+///
+/// The whole block is `fetch`-only: without that feature no case configures an origin, and an un-gated helper is dead code
+/// that `-D warnings` rightly objects to on the `--no-default-features` row.
+#[cfg(feature = "fetch")]
 impl Scratch {
     fn write_user_config(&self, body: &str) {
         let dir = self.config_dir().join("note-processor");
@@ -1226,36 +1261,298 @@ impl Scratch {
         cmd.args(extra);
         cmd
     }
+
+    /// The same, with `[models] base_url` written first so the run dials `origin` and nothing else.
+    ///
+    /// Every fetch case in this file goes through here or through [`Scratch::fetch`] with an explicit reason not to:
+    /// with a baked default origin there is no such thing as "nowhere to dial", so an unconfigured case would be a
+    /// real outbound transfer of 865 MB inside `cargo test`.
+    fn fetch_at(&self, id: &str, origin: &str, extra: &[&str]) -> Command {
+        self.write_user_config(&format!("[models]\nbase_url = \"{origin}\"\n"));
+        self.fetch(id, extra)
+    }
 }
 
-#[test]
-fn fetch_without_an_origin_refuses_and_names_both_places_that_could_supply_one() {
-    // §12 rule 7: the origin is config, never a compile-time default. So an unconfigured build has nowhere to dial,
-    // and the refusal has to say which two places could change that — plus the offline door, because a human on an
-    // air-gapped machine should not be told to configure a URL they cannot use.
-    let scratch = Scratch::new();
-    let mut cmd = scratch.fetch("embeddinggemma-2", &[]);
-    let run = run(&mut cmd);
+/// A loopback port with nothing listening on it.
+///
+/// Verified on this host: `connect()` to `127.0.0.1:1` answers `ECONNREFUSED`, so a run that reached its transport
+/// here fails at **connect** time — no request bytes are sent, and the refusal is a class (`transport failure`).
+/// That asymmetry is what the capability cases below assert on.
+#[cfg(feature = "fetch")]
+const DEAD_ORIGIN: &str = "http://127.0.0.1:1";
 
+/// The filename of one pinned member, taken from the pin table rather than typed here.
+#[cfg(feature = "fetch")]
+fn pinned_filename(id: &str, member: &str) -> String {
+    np_core::pins::pinned_member(id, member)
+        .unwrap_or_else(|| panic!("test setup: `{member}` should be pinned for `{id}`"))
+        .filename
+        .to_string()
+}
+
+/// A loopback origin that answers **every** request with `404` and records each request line.
+///
+/// It answers rather than staying silent on purpose: a socket nobody reads from cannot distinguish "this build
+/// planned one member" from "this build planned two, and the second is waiting for a reply", so a wrong plan would
+/// hang instead of failing. Here every plan is observable in [`Origin::requests`], which is what makes "the default
+/// set is one file" an assertion rather than a hope.
+///
+/// `404` because no fixture serves 309 MB: the fetch has to refuse either way, and what this fixture owns is only
+/// *which files were asked for*, never what was in them.
+#[cfg(feature = "fetch")]
+struct Origin {
+    base_url: String,
+    stop: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<String>>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "fetch")]
+impl Origin {
+    fn serve() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test setup: bind a loopback port");
+        let port = listener
+            .local_addr()
+            .expect("test setup: origin addr")
+            .port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        listener
+            .set_nonblocking(true)
+            .expect("test setup: nonblocking listener");
+        let thread_stop = Arc::clone(&stop);
+        let thread_requests = Arc::clone(&requests);
+        let worker = thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 2048];
+                        let read = stream.read(&mut buffer).unwrap_or(0);
+                        let first_line = String::from_utf8_lossy(&buffer[..read])
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        thread_requests
+                            .lock()
+                            .expect("test setup: request log")
+                            .push(first_line);
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Origin {
+            base_url: format!("http://127.0.0.1:{port}"),
+            stop,
+            requests,
+            worker: Some(worker),
+        }
+    }
+
+    /// The request lines, in arrival order. Stops the server first, so the answer is complete rather than racy.
+    fn requests(mut self) -> Vec<String> {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("test setup: origin thread");
+        }
+        // The worker is joined above, so this lock has exactly one holder and the answer cannot grow after it.
+        self.requests
+            .lock()
+            .expect("test setup: request log")
+            .clone()
+    }
+}
+
+#[cfg(feature = "fetch")]
+impl Drop for Origin {
+    fn drop(&mut self) {
+        // A case that never called [`Origin::requests`] still must not leak a thread holding the listener.
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(feature = "fetch")]
+#[test]
+fn the_default_member_set_of_this_build_is_the_primary_file_alone() {
+    // §13's "fetch what this binary can use", asserted on the wire rather than in a table: with no `--member`, the
+    // only file this run asks an origin for is the primary artifact. The projector is 554 MB of encoders a build
+    // without image support cannot load, so asking for it would be waste dressed as convenience.
+    //
+    // Which builds this case can speak for: `crates/np-cli/Cargo.toml` declares no `vision` passthrough, so every
+    // row that runs this binary is a text-only build and the two-member default set is not reachable from here. The
+    // projector half of the rule is pinned where it can be executed —
+    // `crates/np-core/tests/pins.rs::members_for_build_is_the_member_set_this_binary_can_use`.
+    let origin = Origin::serve();
+    let scratch = Scratch::new();
+    let run = run(&mut scratch.fetch_at("embeddinggemma-2", &origin.base_url, &[]));
+
+    // 404 is a refusal, and the fixture answers 404 to everything by design.
     assert_eq!(run.code(), 1, "{}", run.stderr());
-    let text = run.stderr();
-    for wanted in ["[models]", "NP_MODELS_BASE_URL", "np models install --path"] {
+    let asked = origin.requests();
+    let primary = pinned_filename("embeddinggemma-2", "main");
+    let projector = pinned_filename("embeddinggemma-2", "mmproj");
+    assert_eq!(asked.len(), 1, "the default plan asked for {asked:?}");
+    // The exact request line, not `contains(&primary)`: the projector's filename ends with the primary's
+    // (`mmproj-embeddinggemma-2-Q8_0.gguf`), so a substring test passes on a run that asked for the wrong file.
+    assert_eq!(
+        asked[0].as_str(),
+        format!("GET /{primary} HTTP/1.1"),
+        "the primary file is what a text-only install needs: {asked:?}"
+    );
+    for line in &asked {
         assert!(
-            text.contains(wanted),
-            "refusal must name {wanted:?}: {text}"
+            !line.contains(&projector),
+            "a build without image support requested the projector: {line}"
         );
     }
-    // Nothing was created: a refusal that left a models directory behind would look like a partial install to `list`.
-    assert!(
-        !scratch.models_dir().exists(),
-        "an unconfigured fetch creates no state"
-    );
-    // And the host is nowhere in the message — there is no host to name.
-    for forbidden in ["http://", "https://", "://"] {
+    // And the refusal it did print is a transport class, not a capability sentence about the member it never asked
+    // for. §12 rule 8: no URL, either.
+    let text = run.stderr();
+    assert!(text.contains("not found"), "expected a class: {text}");
+    assert!(!text.contains("image support"), "{text}");
+    for forbidden in ["http://", "https://", "://", "127.0.0.1"] {
         assert!(!text.contains(forbidden), "{forbidden:?} in: {text}");
     }
 }
 
+#[cfg(feature = "fetch")]
+#[test]
+fn an_explicit_member_list_is_the_plan_and_the_default_set_never_widens_it() {
+    // The default set is a default, not a mandate: `--member` spells the whole plan. The distinguishing request is
+    // `audio`, which nothing pins — if argv were merged with (or replaced by) the build's default set, this run
+    // would dial the origin for the primary file and refuse on `main`. It must instead refuse on `audio` **before**
+    // byte one, so the recorded request count is the assertion that matters.
+    let origin = Origin::serve();
+    let scratch = Scratch::new();
+    let run = run(&mut scratch.fetch_at(
+        "embeddinggemma-2",
+        &origin.base_url,
+        &["--member", "main", "--member", "audio"],
+    ));
+
+    assert_eq!(run.code(), 1, "{}", run.stderr());
+    let text = run.stderr();
+    assert!(
+        text.contains("audio"),
+        "the unpinned member is named: {text}"
+    );
+    assert!(
+        text.contains("no recorded digest"),
+        "the reason is the pin table: {text}"
+    );
+    assert!(
+        origin.requests().is_empty(),
+        "a plan with an unpinned member requests nothing at all"
+    );
+}
+
+#[cfg(feature = "fetch")]
+#[test]
+fn a_projector_request_on_a_build_without_image_support_names_the_capability() {
+    // The one refusal §13 adds, and it is about a capability rather than a location: `mmproj` **is** pinned, so the
+    // honest sentence is "this binary was built without image support", not "nothing pins that member".
+    //
+    // What this case proves about the network: `[models] base_url` names a port with nothing listening on it, so a
+    // run that reached its transport would fail at connect with a class naming a member. The message that arrives
+    // instead is the capability sentence — which pins refusal **before any connection is attempted**, a stronger
+    // claim than "no bytes moved", and the one §12 rule 8's no-URL boundary depends on.
+    let scratch = Scratch::new();
+    let run = run(&mut scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &["--member", "mmproj"]));
+
+    assert_eq!(run.code(), 1, "{}", run.stderr());
+    let text = run.stderr();
+    assert!(text.contains("mmproj"), "the member is named: {text}");
+    assert!(
+        text.contains("image support"),
+        "the refusal must name the capability it is missing: {text}"
+    );
+    // Rule 8, and no accident of this host: a capability sentence carries no URL-shaped text at all.
+    for forbidden in ["http", "://", "127.0.0.1"] {
+        assert!(!text.contains(forbidden), "{forbidden:?} in: {text}");
+    }
+    assert!(
+        !scratch.models_dir().exists(),
+        "a capability refusal creates no state"
+    );
+}
+
+#[cfg(feature = "fetch")]
+#[test]
+fn an_unconfigured_fetch_says_it_is_using_the_compiled_in_origin() {
+    // §12 rule 7's amendment made "no origin configured" mean *dial the baked default* rather than *refuse*, and an empty
+    // `NP_MODELS_BASE_URL` counts as unset by a rule this suite pins on purpose. So the silence is the hazard: a mirror whose
+    // value was lost to a shell would spend 865 MB of egress with nothing on screen saying where the bytes came from. The run
+    // refuses below before any byte moves, which is also what keeps this case off the network.
+    let scratch = Scratch::new();
+    scratch.write_user_config("[workspace]\n");
+    // An occupied target is refused by rule 5 ahead of the transfer, so the notice above it is observable without dialling.
+    fs::create_dir_all(scratch.models_dir()).expect("test setup: models dir");
+    fs::write(
+        scratch.models_dir().join("embeddinggemma-2"),
+        b"existing bytes",
+    )
+    .expect("test setup: occupied target");
+
+    let mut cmd = scratch.fetch("embeddinggemma-2", &[]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}\n{}", run.stdout(), run.stderr());
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("compiled-in default"),
+        "the run has to say which origin it resolved: {stdout}"
+    );
+    assert!(
+        stdout.contains("[models] base_url"),
+        "and where to change it: {stdout}"
+    );
+    // Rule 8 holds for the notice too: a class, never a host.
+    for both in [run.stdout(), run.stderr()] {
+        for forbidden in ["huggingface", "https://", "http://", "://"] {
+            assert!(
+                !both.contains(forbidden),
+                "{forbidden:?} appeared in fetch output: {both}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "fetch")]
+#[test]
+fn a_configured_origin_says_so_rather_than_staying_silent() {
+    let scratch = Scratch::new();
+    fs::create_dir_all(scratch.models_dir()).expect("test setup: models dir");
+    fs::write(
+        scratch.models_dir().join("embeddinggemma-2"),
+        b"existing bytes",
+    )
+    .expect("test setup: occupied target");
+
+    let mut cmd = scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &[]);
+    let run = run(&mut cmd);
+
+    assert_eq!(run.code(), 1, "{}\n{}", run.stdout(), run.stderr());
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("from [models] base_url"),
+        "a mirror is worth confirming by name-of-source: {stdout}"
+    );
+    assert!(
+        !stdout.contains("compiled-in default"),
+        "and the two sources are never both claimed: {stdout}"
+    );
+}
+
+#[cfg(feature = "fetch")]
 #[test]
 fn fetch_refuses_a_member_this_build_does_not_pin_and_names_it() {
     // argv reaches the pin table, and a name that is not pinned is a refusal by name rather than a shrug. The origin
@@ -1285,6 +1582,7 @@ fn fetch_refuses_a_member_this_build_does_not_pin_and_names_it() {
     );
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn fetch_names_an_id_this_build_cannot_fetch() {
     // The id is argv's whole subject here, and an id with no pin is a different refusal from an id with no origin:
@@ -1304,15 +1602,19 @@ fn fetch_names_an_id_this_build_cannot_fetch() {
     assert!(!text.contains("mirror.invalid"), "{text}");
 }
 
+#[cfg(feature = "fetch")]
 #[test]
-fn discard_marker_reports_the_absence_it_found_and_still_refuses_without_an_origin() {
-    // Two facts, one run, on two channels: `--discard-marker` prints what it did (here: nothing to discard), and the
-    // missing origin still refuses. The order matters — discarding is a filesystem action the human asked for
-    // explicitly, while dialing out is the thing that needs configuring — and a case that only checked the exit code
-    // could not tell those two lines apart.
+fn discard_marker_reports_the_absence_it_found_and_the_fetch_that_follows_refuses() {
+    // Two facts, one run, on two channels: `--discard-marker` prints what it found (here: nothing to discard), and
+    // the fetch that follows it still refuses. There is no longer a "no origin configured" refusal for the second
+    // half — §12 rule 7's amendment baked a default — so the origin here is [`DEAD_ORIGIN`] and the refusal that
+    // arrives is a transport class.
+    //
+    // Which network claim this pins: nothing listens on that port, so the connection is refused at connect time.
+    // That proves **no connection was established**, which is more than "no bytes moved": the client never got far
+    // enough to send a request.
     let scratch = Scratch::new();
-    let mut cmd = scratch.fetch("embeddinggemma-2", &["--discard-marker"]);
-    let run = run(&mut cmd);
+    let run = run(&mut scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &["--discard-marker"]));
 
     assert_eq!(run.code(), 1, "{}", run.stderr());
     assert!(
@@ -1320,13 +1622,17 @@ fn discard_marker_reports_the_absence_it_found_and_still_refuses_without_an_orig
         "the discard line is printed on stdout: {:?}",
         run.stdout()
     );
+    let text = run.stderr();
     assert!(
-        run.stderr().contains("NP_MODELS_BASE_URL"),
-        "{}",
-        run.stderr()
+        text.contains("transport failure"),
+        "the fetch that followed the discard refused on the transport: {text}"
     );
+    for forbidden in ["http://", "https://", "://", "127.0.0.1"] {
+        assert!(!text.contains(forbidden), "{forbidden:?} in: {text}");
+    }
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn fetch_is_a_subcommand_of_models_and_not_of_scan() {
     // §12 rule 1's boundary, asserted where argv lives: `fetch` exists under `models`, and `np scan` grows no flag that
@@ -1349,6 +1655,7 @@ fn fetch_is_a_subcommand_of_models_and_not_of_scan() {
     }
 }
 
+#[cfg(feature = "fetch")]
 #[test]
 fn discard_marker_removes_the_marker_and_the_partial_it_names() {
     // The other branch of the same flag, and the one that matters: a marker left by a dead process, plus the
@@ -1368,9 +1675,9 @@ fn discard_marker_removes_the_marker_and_the_partial_it_names() {
     fs::write(&other_part, b"someone else's bytes")
         .expect("test setup: plant an unclaimed partial");
 
-    // No origin configured: the discard is a filesystem action and runs first, so it happens even here.
-    let mut cmd = scratch.fetch("embeddinggemma-2", &["--discard-marker"]);
-    let run = run(&mut cmd);
+    // The discard is a filesystem action and runs first, so it happens even against an origin that cannot answer:
+    // [`DEAD_ORIGIN`] makes the fetch that follows refuse at connect rather than reach a real host.
+    let run = run(&mut scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &["--discard-marker"]));
 
     assert_eq!(run.code(), 1, "{}", run.stderr());
     assert!(
@@ -1391,6 +1698,7 @@ fn discard_marker_removes_the_marker_and_the_partial_it_names() {
 
 /// The marker path comes from the library rather than a literal, so a rename in `np_core::models` moves this case
 /// instead of leaving it asserting against a file nothing reads.
+#[cfg(feature = "fetch")]
 mod models {
     use std::path::{Path, PathBuf};
 
