@@ -849,19 +849,37 @@ fn models_fetch(
             emit(&format!(
                 // `size_human` spells the unit itself, so the word must not be repeated here: "295.5 MB bytes" is the
                 // kind of line that makes a reader distrust the number next to it.
-                "fetched     {} ({}, sha256 {})",
+                "{FETCHED_KEY}{} ({}, sha256 {})",
                 member.member,
                 size_human(member.bytes),
                 member.sha256
             ));
         }
-        emit(&match report.free_bytes {
-            Some(free) => format!("free before  {}", size_human(free)),
-            // Stated, never implied: a check that could not run is not a check that passed.
-            None => "free before  not checked on this platform".to_string(),
-        });
+        emit(&free_space_line(report.free_bytes));
     }
     Ok(())
+}
+
+/// The two padded keys of `np models fetch`'s text report, spelled out so their shared column is a named thing a test can pin:
+/// widening one alone used to misalign the block with every gate green, which is how the line below ended up one space wider.
+#[cfg(feature = "fetch")]
+const FETCHED_KEY: &str = "fetched     ";
+#[cfg(feature = "fetch")]
+const FREE_SPACE_KEY: &str = "free space  ";
+
+/// The free-space line of `np models fetch`'s text report, in both arms.
+///
+/// Built by a function so the second arm can be asserted at all: a successful CLI fetch has to serve bytes that hash to the
+/// **pinned** digest, which no fixture can do, so no end-to-end test ever reaches either sentence — which is precisely how this line
+/// acquired a dangling preposition and a column one wider than its sibling `fetched     `. Both are pinned now.
+///
+/// Stated, never implied: an arm that could not run is not an arm that passed.
+#[cfg(feature = "fetch")]
+fn free_space_line(free: Option<u64>) -> String {
+    match free {
+        Some(free) => format!("{FREE_SPACE_KEY}{} before the fetch", size_human(free)),
+        None => format!("{FREE_SPACE_KEY}not checked on this platform"),
+    }
 }
 
 fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(), Box<dyn Error>> {
@@ -1139,4 +1157,49 @@ fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+#[cfg(all(test, feature = "fetch"))]
+mod tests {
+    use super::*;
+
+    /// The two arms of the fetch report's free-space line, and the column it shares with the member lines. Pinned on **both**
+    /// sides of that column: pinning only this line is what let it drift a space wider than its neighbour in the first place.
+    #[test]
+    fn the_free_space_line_names_its_number_and_keeps_its_column() {
+        assert_eq!(
+            FREE_SPACE_KEY, "free space  ",
+            "the key's own bytes are the contract"
+        );
+        assert_eq!(
+            FETCHED_KEY.len(),
+            FREE_SPACE_KEY.len(),
+            "the two keys must put their values in the same column"
+        );
+        let measured = free_space_line(Some(309_855_456));
+        assert_eq!(measured, "free space  295.5 MB before the fetch");
+        let declined = free_space_line(None);
+        assert_eq!(declined, "free space  not checked on this platform");
+        for line in [measured, declined] {
+            assert!(
+                line.starts_with(FREE_SPACE_KEY),
+                "the line does not begin with the padded key: {line}"
+            );
+            assert!(
+                !line[FREE_SPACE_KEY.len()..].starts_with(' '),
+                "the value is indented twice and the block stops aligning: {line}"
+            );
+            assert!(
+                !line.contains("before  "),
+                "the dangling preposition came back: {line}"
+            );
+        }
+    }
+
+    /// `None` is a stated absence, never a pass: the sentence has to say it was not checked.
+    #[test]
+    fn an_unanswered_preflight_is_reported_as_unanswered() {
+        assert!(free_space_line(None).contains("not checked"));
+        assert!(!free_space_line(None).contains("ok"));
+    }
 }

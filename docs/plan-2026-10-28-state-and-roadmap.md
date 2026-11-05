@@ -59,7 +59,7 @@ is text to embed already in the table — the first embedding pass costs no re-s
 
 ```mermaid
 flowchart LR
-    subgraph DONE["Shipped — main, CI green Linux + Windows (up to 9193732)"]
+    subgraph DONE["Shipped — main, verified by local exit codes. Windows jobs executed through 2026-10-29T13:11 UTC and were green at 9193732; zero steps 2026-10-29T14:39→2026-10-31T20:23; running again since 2026-11-01T20:08 — red on Windows every run since a816b17 (F34)"]
         M1["M1 core catalog<br/>np scan + INDEX.md"]
         H1["Hardening line<br/>F13 F18 F19 F20 F21 F22 F23"]
         H2["Correctness residue<br/>F24 F17 F16 A4"]
@@ -158,10 +158,15 @@ build in one round and lose the endpoint window — which is how rounds die here
 
 ## 5. Debts recorded rather than hidden
 
-- **CI has not run since 14:39 UTC on 2026-10-29.** Runs fail in ≤6 s with zero steps and no log — docs-only commits included, a rerun
-  I triggered included. Private repo ⇒ hosted minutes from plan quota (Windows ×10), so the leading explanation is Actions minutes or a
-  spending limit; annotations and billing both return 403 for this token. **Until a green run exists, no platform claim is earned** — which
-  cuts both ways: nothing is proven broken either. Local gates are green at `f526751` (415 ok / 0 failed).
+- **CI ran, went silent for 53 hours, and has been running since.** Measured job by job from the Actions API on 2026-11-05:
+  `Test (windows-latest)` executed 10 steps per run on every push from 2026-10-26T09:02 UTC to 2026-10-29T13:11, created **zero steps**
+  from 2026-10-29T14:39 through 2026-10-31T20:23 (≤6 s, no log — docs-only commits and a `gh run rerun` included; annotations and
+  billing both return 403 for this token, so the cause stayed undiagnosed), and has executed on every push since 2026-11-01T20:08.
+  The plan's earlier claim that CI "has not run since 2026-10-29" was true when written and stale by the time it was read, which is how
+  `main` accumulated **43 consecutive red Windows runs** starting at `a816b17` — see F34. Two lessons, both kept: a green local gate list
+  is not evidence about another platform, and *absent* CI output is not evidence either — go re-measure whether it is absent today. What
+  the resumed runner still does **not** buy: no row in `ci.yml` builds `aarch64-apple-darwin`, so the macOS release binary
+  (`release.yml:35-36`) continues to be built and never run by us anywhere.
 - **A4** merged on your word without its A/B/A benchmark or whole-branch review.
 - **F18**: Windows file identity needs real hardware; CI proves only that the path is inert.
 - **F25**: an over-wide token can render a physical line holding only `-`. Filed, unadjudicated.
