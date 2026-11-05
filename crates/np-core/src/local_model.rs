@@ -1359,14 +1359,14 @@ pub struct LoadOptions {
 ///
 /// Every error path frees what it allocated. The model is freed in exactly one place — the `Err` arm below —
 /// and the context in exactly two: this function's pooling refusal, and `LoadedModel`'s `Drop`.
-/// The level this process asked llama.cpp to log at, read by [`log_gate`] on every line.
+/// The level this process asked llama.cpp to log at, read by the private `log_gate` hook on every line.
 ///
 /// A `OnceLock` rather than an `AtomicU8` because the value and the installed callback have to agree with each other: a level stored
 /// without the hook in place would still let upstream write its transcript, and swapping a hook while llama.cpp is mid-write is what
 /// `include/llama.h:1674` warns about in its own words (“The logger state is global so these functions are NOT thread safe”).
 static LOG_LEVEL: std::sync::OnceLock<crate::loglevel::LogLevel> = std::sync::OnceLock::new();
 
-/// Route llama.cpp's and ggml's log lines through [`log_gate`], which writes only what `level` allows (F33).
+/// Route llama.cpp's and ggml's log lines through a private gate, which writes only what `level` allows (F33).
 ///
 /// **Nothing in np-core calls this.** The sink is process-global, so choosing it is the host program's decision: a library that quieted
 /// its caller's stderr would be doing something nobody asked for. `np` opts in from `embed_provider`, once, before anything can load a
