@@ -812,6 +812,15 @@ workspace: its model artifact is absent, so the query cannot be embedded`.
 - **Blocks:** README's claim (design §6, repeated there) that a refusal names what to change, for this arm; and any support
   answer that tells a user to edit their provider because their provider is disabled.
 
+**Closed on 2026-11-05 by carrying the reason out of resolution.** `embed_provider` answers with a `ProviderState`
+(`Ready` / `Placeholder { embedder, reason }` / `ArtifactAbsent`) and the placeholder carries a new
+`np_core::embed_run::NoProvider`; `search_workspace` matches it with no `_` arm, so a future state fails to compile rather
+than borrowing another arm's sentence. The remedy text reuses `install_hint`, which already exists in two feature-gated halves —
+the design's first draft invented prose naming `np models fetch` in a build that compiles it out, and review caught that before
+code. Merged at `18d0f5a`; CI run `42110909478` is green on all three jobs with the new cases executed on `windows-latest`.
+Design: `docs/design-f32-search-refusal-arms.md`, including the five-arm matrix measured in three build shapes and the one
+mutant that survived because it is equivalent.
+
 ## F33 — a model load writes ~1,500 lines of llama.cpp progress to stderr
 
 Filed 2026-11-05 by the same README pass. Measured on an `np embed` run that encoded one chunk: **stdout 12 lines** (the

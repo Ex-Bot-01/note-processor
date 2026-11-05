@@ -24,6 +24,25 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
+## Shipped (main) — F32 search refusals name their own cause (merged 2026-11-05 at `18d0f5a`, branch deleted)
+
+* `np search` on a workspace whose config says `local-model` but has no model row used to print
+  `np: embedding disabled: embeddings.provider = "none"` — a sentence about a configuration the reader does not have, telling them
+  to change a setting that is already right. Measured in **both** builds before the fix; the README documented the wrong message as
+  a defect instead of fixing it.
+* Resolution now answers with a `ProviderState` — `Ready`, `Placeholder { embedder, reason }`, `ArtifactAbsent` — where the
+  placeholder carries a new `np_core::embed_run::NoProvider` beside the provider `embed_run` wants. `search_workspace` matches it
+  with **no `_` arm**, so adding a state fails to compile there instead of printing someone else's sentence; every placeholder reason
+  collapses into one arm because argv cannot reach two of them, and per-state arms would be mapping sites nothing can test.
+  `embed_workspace` maps to exactly the two `Resolution` values it produced before, verified by running the four-arm embed matrix
+  after the change.
+* Remedies reuse `embed_run::install_hint`, which already exists in two feature-gated halves: a `--no-default-features` build names
+  only `np models install`, and a CLI case asserts that per build. One definition of "what do I run now", two callers.
+* **Process, stated because it deviated:** three review runs on this diff timed out without reporting, so the implementation review
+  was done by measurement — the embed and search arm matrices across default / `local-model` / `--no-default-features`, five mutants
+  (four killed, one recorded as equivalent because arm (ii) returns before the resolution is read), and CI green on all three jobs with
+  the six new cases executing on `windows-latest`. Narrow briefs have worked before; this one did not land.
+
 ## Shipped (main) — F34 Windows disk preflight (merged 2026-11-05 at `b2840f9`, branch deleted)
 
 * §12 rule 6 now answers on Windows. `available_bytes` was `statvfs` under `#[cfg(unix)]` and a literal `None` elsewhere, and the
