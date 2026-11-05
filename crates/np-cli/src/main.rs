@@ -849,7 +849,7 @@ fn models_fetch(
             emit(&format!(
                 // `size_human` spells the unit itself, so the word must not be repeated here: "295.5 MB bytes" is the
                 // kind of line that makes a reader distrust the number next to it.
-                "fetched     {} ({}, sha256 {})",
+                "{FETCHED_KEY}{} ({}, sha256 {})",
                 member.member,
                 size_human(member.bytes),
                 member.sha256
@@ -859,6 +859,13 @@ fn models_fetch(
     }
     Ok(())
 }
+
+/// The two padded keys of `np models fetch`'s text report, spelled out so their shared column is a named thing a test can pin:
+/// widening one alone used to misalign the block with every gate green, which is how the line below ended up one space wider.
+#[cfg(feature = "fetch")]
+const FETCHED_KEY: &str = "fetched     ";
+#[cfg(feature = "fetch")]
+const FREE_SPACE_KEY: &str = "free space  ";
 
 /// The free-space line of `np models fetch`'s text report, in both arms.
 ///
@@ -870,8 +877,8 @@ fn models_fetch(
 #[cfg(feature = "fetch")]
 fn free_space_line(free: Option<u64>) -> String {
     match free {
-        Some(free) => format!("free space  {} before the fetch", size_human(free)),
-        None => "free space  not checked on this platform".to_string(),
+        Some(free) => format!("{FREE_SPACE_KEY}{} before the fetch", size_human(free)),
+        None => format!("{FREE_SPACE_KEY}not checked on this platform"),
     }
 }
 
@@ -1156,22 +1163,30 @@ fn now_secs() -> i64 {
 mod tests {
     use super::*;
 
-    /// The two arms of the fetch report's free-space line, and the column they share with `fetched     `.
+    /// The two arms of the fetch report's free-space line, and the column it shares with the member lines. Pinned on **both**
+    /// sides of that column: pinning only this line is what let it drift a space wider than its neighbour in the first place.
     #[test]
     fn the_free_space_line_names_its_number_and_keeps_its_column() {
+        assert_eq!(
+            FREE_SPACE_KEY, "free space  ",
+            "the key's own bytes are the contract"
+        );
+        assert_eq!(
+            FETCHED_KEY.len(),
+            FREE_SPACE_KEY.len(),
+            "the two keys must put their values in the same column"
+        );
         let measured = free_space_line(Some(309_855_456));
         assert_eq!(measured, "free space  295.5 MB before the fetch");
         let declined = free_space_line(None);
         assert_eq!(declined, "free space  not checked on this platform");
         for line in [measured, declined] {
-            // `fetched     main (…)` puts its value at byte 12; so must this, or the block reads as two columns.
-            assert_eq!(
-                &line[10..12],
-                "  ",
-                "the key is not padded to the column: {line}"
+            assert!(
+                line.starts_with(FREE_SPACE_KEY),
+                "the line does not begin with the padded key: {line}"
             );
             assert!(
-                !line[12..].starts_with(' '),
+                !line[FREE_SPACE_KEY.len()..].starts_with(' '),
                 "the value is indented twice and the block stops aligning: {line}"
             );
             assert!(

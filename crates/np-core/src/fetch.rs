@@ -957,8 +957,11 @@ fn available_bytes(path: &Path) -> Option<u64> {
     // Ask about **the same spelling `walk::to_open_path` gives the `.part` write and the publish rename** — a `\\?\` prefix when an
     // absolute path needs one. Querying the bare path would decline ("not checked") for exactly the long workspace whose bytes this
     // fetch then writes. Not every call here agrees: `create_dir_all` and the target-absence checks still take the bare path, which
-    // is a separate question and not this round's to settle. The helper's condition carries over — the prefix needs an absolute path,
-    // so a relative `[paths] data_dir` keeps the plain spelling and may answer `None`; stated, never passed.
+    // is a separate question and not this round's to settle. The helper's own caveat carries over verbatim (`walk.rs:398-400`: "it
+    // expects an absolute path, because a prefixed relative path is not valid on Windows"): `long_prefix` tests length, not absoluteness,
+    // so a **short** relative `data_dir` keeps the plain spelling, while a long relative one gets the prefix anyway and the call fails
+    // → `None`. Same shape as `to_open_path` does to a long relative write, which is the parity this row exists for: decline loudly,
+    // never pass.
     //
     // `to_string_lossy` is lossy and the prefix is un-normalised, exactly like `walk::to_open_path` (`path_keys.rs:202-206` records
     // the same hazard): a name containing an unpaired surrogate queries a slightly different string, which can only cost an answer,
@@ -1338,9 +1341,19 @@ mod tests {
         );
     }
 
-    /// **The only check that pins parameter order.** Every other test here reads one number, so swapping
-    /// `free_bytes_available_to_caller` and `total_number_of_free_bytes` would pass them all while over-reporting what the
-    /// fetch may write — which is the exact distinction this arm argues for.
+    /// **The only check that grades what `available_bytes` reads.** Two things, because the first alone is weaker than it looks.
+    ///
+    /// 1. The direct call below asserts `caller_available ≤ total_free ≤ total`. That catches a parameter that never gets written,
+    ///    or one read at the wrong width. It does **not** catch a mislabelled declaration: FFI binds by position, so renaming
+    ///    `free_bytes_available_to_caller` to mean something else is runtime-inert.
+    /// 2. So the arm's own answer is compared against this test's independent read of `total_free`: an implementation that returns
+    ///    total bytes instead of free-bytes-available over-reports how much a fetch may write, which is the F34 defect class. The
+    ///    slack is for writers racing us between the two calls on a shared runner.
+    ///
+    /// What stays **unkillable**, stated rather than glossed: returning `total_number_of_free_bytes` instead of
+    /// `free_bytes_available_to_caller` cannot be detected on a volume with no quota in force, where those two values are equal —
+    /// and that is the common case on a CI runner. §12 rule 6 errs low there anyway, so the choice is argued in §3 of the design and
+    /// not claimed as tested.
     #[cfg(windows)]
     #[test]
     fn the_three_out_parameters_keep_their_order() {
@@ -1365,6 +1378,12 @@ mod tests {
         assert!(
             total > 0,
             "a volume that reports zero total is not a volume"
+        );
+        // (2) above: the production arm must read parameter 2, not one of the two larger numbers.
+        let arm = available_bytes(&dir).expect("the arm answers for the temp dir");
+        assert!(
+            arm <= total_free + 1_073_741_824,
+            "available_bytes reported {arm}, which is more than total-free {total_free} plus 1 GiB of slack: it reads the wrong out-parameter"
         );
     }
 
