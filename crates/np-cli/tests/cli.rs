@@ -1971,6 +1971,47 @@ fn search_with_embedding_disabled_refuses_and_names_the_setting() {
     assert!(failed.stdout().is_empty(), "a refusal prints no hit list");
 }
 
+#[test]
+fn search_with_no_row_names_the_missing_row_and_says_what_to_run() {
+    // F32's state: the config asks for a local model this workspace has no row for — the reader who edited
+    // `config.toml` before installing anything. Today this prints a sentence about `provider = "none"`, which is
+    // not the configuration they have, and tells them to change a setting that is already right.
+    let ws = workspace();
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nabout alpha\n").expect("test setup: note");
+    run(&mut ws.command(&["scan"])).assert_success();
+    // Deliberately no `install_model`: the row is what is missing.
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("alpha");
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "a refusal is 1, and clap keeps argv at 2:\n{}",
+        failed.stderr()
+    );
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("no model row for"),
+        "the refusal has to name what is actually missing: {stderr}"
+    );
+    assert!(
+        stderr.contains(EMBED_MODEL),
+        "and the id the configuration asked for: {stderr}"
+    );
+    assert!(
+        !stderr.contains(r#"embeddings.provider = "none""#),
+        "this config says `local-model`; blaming a setting the reader does not have is the defect: {stderr}"
+    );
+    assert!(
+        !stderr.contains("   "),
+        "the message wrapped mid-sentence and printed a run of spaces: [{stderr}]"
+    );
+    assert!(failed.stdout().is_empty(), "a refusal prints no hit list");
+}
+
 #[cfg(not(feature = "local-model"))]
 #[test]
 fn searching_without_the_runtime_names_the_model_that_stayed_owed() {
