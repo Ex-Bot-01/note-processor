@@ -24,6 +24,29 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
+## Shipped (main) — F34 Windows disk preflight (merged 2026-11-05 at `b2840f9`, branch deleted)
+
+* §12 rule 6 now answers on Windows. `available_bytes` was `statvfs` under `#[cfg(unix)]` and a literal `None` elsewhere, and the
+  admission check refused only inside `Some(_)` — so on Windows the preflight simply did not happen (honestly printed as "free space not
+  checked", but a test named "refuses before byte one" asserted as if it had). Now three arms — `unix` / `windows` /
+  neither — with Windows answering from a hand-declared `GetDiskFreeSpaceExW` (`kernel32`, no new dependency, bytes back so the unix
+  block-size guards stay put, free-bytes-available-to-caller read for the same reason unix reads `f_bavail`, out-parameters
+  zero-initialised so `Some(0)` can only mean "the volume answered zero", which rule 6 refuses).
+* The admission decision is now a pure `preflight(needed, Option<available>)` with the value bound before judging. **Fusing the decision
+  to the OS query is what hid this for two rounds**: on a host that cannot answer, every assertion about refusing looked like a pass.
+  All three outcomes — enough, short, cannot-say — are now unit-tested on any host.
+* **The process lesson, in four documents.** Windows CI executed 10 steps per push from 2026-10-26T09:02 to 2026-10-29T13:11 UTC, created
+  zero steps from 2026-10-29T14:39 through 2026-10-31T20:23, and has executed on every push since 2026-11-01T20:08. The run at `a816b17`
+  — the commit that added the failing test — already failed it, and the next 43 CI runs all failed `Test (windows-latest)`, every one
+  merged on green ubuntu rows while README, the plan, the roadmap and `ci.yml` still asserted CI could not start jobs. All four now carry
+  dates and counts. Two rules: *absent* CI output is not evidence either — re-measure whether it is absent today; and a locally green gate
+  list says nothing about another platform — the first push of this branch was green on all 15 local rows and failed Windows **clippy**
+  (`unused doc comment` on the `extern` block, which no Linux command compiles). Push the branch and read the job before asking to merge.
+* Also corrected: the docstring's "Windows and macOS get `None`" was false about macOS (it is `cfg(unix)` and compiles the `statvfs` arm —
+  a build fact; its number has still never been read here), `Cargo.toml` said non-unix answers `None`, and the report line read
+  `free before  not checked on this platform`; it says `free space  …` in its sibling's column now, with both arms and the shared column
+  pinned from both sides. Design: `docs/design-f34-windows-disk-preflight.md`.
+
 ## Shipped (main) — R8 worker-thread policy (merged 2026-11-02: `e238aa1` measurement, `67cbe14` policy, `457f443` re-measurement)
 
 * `np embed` stopped inheriting llama.cpp's compile-time four. `[embeddings] threads = "auto"` (default) resolves to

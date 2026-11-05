@@ -58,9 +58,9 @@ jobs:
   #
   # Honest caveat, corrected 2026-11-05 from the Actions API: hosted jobs ran until 2026-10-29T13:11 UTC,
   # created zero steps from 2026-10-29T14:39 through 2026-10-31T20:23, and have run on every push since
-  # 2026-11-01T20:08. So this HAS run in CI — and `Test (windows-latest)` has been red there since a816b17
-  # (F34), which is what reading the runs beats assuming the silence. Local gates remain the primary
-  # evidence; a Windows-only lint or platform answer is visible only here.
+  # 2026-11-01T20:08. So this HAS run in CI — and the next 43 runs failed `Test (windows-latest)` until F34
+  # landed at b2840f9, which is what reading the runs beats assuming the silence. Local gates remain the
+  # primary evidence; a Windows-only lint or platform answer is visible only here.
   feature-local-model:
     name: Feature local-model (ubuntu-latest)
     runs-on: ubuntu-latest

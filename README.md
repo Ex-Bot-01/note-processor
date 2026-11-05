@@ -414,6 +414,7 @@ written refusal from `build.rs` for feature builds and have never been executed 
 
 CI runs again, and reading it is what surfaced **F34**. Measured from the Actions API on 2026-11-05: hosted jobs ran continuously until
 2026-10-29T13:11 UTC, created zero steps from 2026-10-29T14:39 through 2026-10-31T20:23, and have run on every push since
-2026-11-01T20:08. The run just before `a816b17` was green on Windows; **all 43 CI runs since it have failed**
-`Test (windows-latest)` on the same disk-preflight assertion — four days of merges that were green on Linux and red on Windows. "Green" in this README still means the exit codes measured locally and listed
+2026-11-01T20:08. The run just before `a816b17` was green on Windows, and the **next 43 CI runs all failed**
+`Test (windows-latest)` on the same disk-preflight assertion — four days of merges that were green on Linux and red on Windows. F34's
+fixes turned that around: green on the branch from `2ba7dc0`, and green on `main` at `b2840f9` (run `42090000404`, all three jobs). "Green" in this README still means the exit codes measured locally and listed
 above; the Windows job is now a second reader, and it has already caught something local gates could not.

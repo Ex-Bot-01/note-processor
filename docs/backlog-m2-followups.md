@@ -838,7 +838,8 @@ failed with `expected DiskShortfall, got Interrupted { …, expected: 9223372036
 **This is not a first-run discovery; it is four days of unread CI.** Re-measured job by job the same day: the Windows job executed on
 every push until 2026-10-29T13:11 UTC, created zero steps from 2026-10-29T14:39 through 2026-10-31T20:23, and has executed on every
 push since 2026-11-01T20:08. The run at `a816b17` — the commit that *added* this test, R7b C2, pushed 2026-11-01T21:21 — already
-failed it (`41351611843`, `15 passed; 1 failed`), and **all 43 CI runs since have failed the Windows job**. Every one of those merges
+failed it (`41351611843`, `15 passed; 1 failed`), and **the next 43 CI runs all failed the Windows job** (counted before this round's
+own pushes turned them green). Every one of those merges
 rested on green ubuntu rows while three documents still asserted that CI could not run. The failure is old; only the reading is new.
 
 - **Cause:** `available_bytes` is `statvfs` under `#[cfg(unix)]` and a literal `None` elsewhere, and the preflight refuses only on
@@ -856,3 +857,10 @@ rested on green ubuntu rows while three documents still asserted that CI could n
 - **What the round also caught** (2026-11-05, head `9de3b2d`): locally green on all 15 gate rows, 651 tests passing, and Windows
   **clippy** still failed it — `unused doc comment` on a `///` above the `extern` block. No Linux command compiles that block, so no
   local gate can see that lint; "push the branch before asking for a merge" is what retired it.
+
+**Closed on 2026-11-05 by the full fix.** Three arms (`unix` / `windows` / neither), Windows answering from a hand-declared
+`GetDiskFreeSpaceExW`, and `preflight(needed, Option<available>)` split out as a pure function so all three outcomes are testable on
+any host. Merged at `b2840f9`; run `42090000404` is green on all three jobs, which ends the 43-run streak, and the Windows Test step
+executes six `fetch::tests` including the four `#[cfg(windows)]` ones — a plausible answer, out-parameter order graded against the
+production arm, the climb out of an absent directory, and the NUL refusal. macOS still claims only the build fact: it compiles the
+`statvfs` arm, and nobody here has read its number.
