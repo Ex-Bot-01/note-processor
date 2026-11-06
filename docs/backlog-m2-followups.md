@@ -2,10 +2,11 @@
 
 **How to read a card's status.** A card is closed when it carries a **Closed on …** paragraph; the absence of one used to mean "open", and on
 2026-11-06 that reading proved wrong: work landed in hardening rounds whose commit messages named several cards at once, and the cards were
-never updated. Sixteen are marked below with the evidence that shows the fix is in the tree — a file:line that did not exist when the card was
-filed, or a gate row that now passes: eight from the first audit pass on 2026-11-06 and eight from the second the same day. (Cards closed by
-their own round say it differently — “Resolved in …”, “**shipped**” in the heading — and those words are theirs, not this convention.) Cards **not** listed there have not been re-checked; treat them as open, and add the evidence line when one
-closes rather than editing the prose away.
+never updated. Twenty cards carry a **Closed on …** paragraph now: sixteen marked by the two audit passes of 2026-11-06 (eight each), four
+written by the round that did the work (F26, F32, F33, F34). Each names the evidence that shows the fix is in the tree — a file:line that did
+not exist when the card was filed, or a gate row that now passes. Cards closed some other way say it in their own words (“Resolved in …”,
+“**shipped**” in the heading), and those words are theirs, not this convention. A card with neither has not been re-checked: treat it as open,
+and add the evidence line when one closes rather than editing the prose away.
 
 Audited 2026-11-06 (first pass): F1, F2, F3, F4, F5, F6, F8, F14 → closed below.
 
@@ -14,8 +15,9 @@ F22, F24 — each quoting the file:line or the test that puts the fix in the tre
 what was checked and what is left: **F18** (needs a Windows box; nothing here can even cross-compile the arm it is about), **F21** (the panic
 is gone; a person still cannot learn what an old upgrade deleted without `sqlite3`), **F23** (its “Still open — the residue” is narrower than
 it reads, because A4 shipped after the card was written), **F25** (re-measured: the shape still comes off the renderer; it waits on a human
-decision about `- [[title]]`, not on a measurement). Not audited as far as this file knows: F26, F28–F31, F35 — and F27 carries its own
-do-not-implement stance, which an audit does not overturn.
+decision about `- [[title]]`, not on a measurement). Not audited as far as this file knows: **F28–F31 and F35**. Two cards are off the queue for
+reasons an audit did not have to discover: F26 carries its own Closed on paragraph (2026-11-03), so it is closed rather than awaiting a check,
+and F27 holds a deliberate do-not-implement stance that an audit does not overturn.
 
 
 These are not new features. They are the items the Milestone 1 reviews judged *correct enough to ship* but
