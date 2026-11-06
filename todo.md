@@ -37,10 +37,19 @@ Four questions went up as human decisions; four answers came back, and one of th
 * **F28 — yes, ship image embedding in `np`,** and: *"image embeddings need their own separate vector, linked to the place where an image is
   mentioned or placed in notes."* The first half already exists (`media_embeddings`, one row per figure-model pair). The second does not: a figure
   is tied to *paths that hold its bytes*, and `np search` reports the lexicographically smallest path plus one representative linker note — twelve
-  notes using one diagram report one of them by sort order. So F28 became two pieces: capability (`vision` passthrough + re-measured archives) and
-  placement (a `note → media` occurrence edge, migration 11). **Ruled the same turn: the link is figure → note**, not a coordinate inside the note — one
-  edge per (note, figure) with no line/heading column. Design note next, then code; both pieces still have to be measured, and §14's ~40 MB binary claim
-  has to survive the `vision` passthrough or be corrected.
+  notes using one diagram report one of them by sort order. **Ruled the same turn: the link is figure → note**, not a coordinate inside the note.
+* **F28, corrected after measuring (`docs/design-f28-image-embedding-in-np.md`, `ae9fa0a`)**: the bullet above said placement needs "a `note → media`
+  occurrence edge, migration 11". It does not — the relation is already derived in search (`links` + `media::link_target_rel`,
+  `search.rs:484-510`) and only the *set* is discarded (`source_note` keeps `notes.first()`, `:465-467`). So placement is a contract change on `Hit`
+  (`linked_notes`), not a schema version; a parallel edge table would be a second source for one fact. Wrong-then-written-down is kept here rather
+  than tidied, because the wrong plan was the one the ruling was answered against.
+* **F28 step ① landed (`1ce9ffd`, branch `f28/image-embedding-in-np`)** — the refusal split: `ImageBlocker::{Build, ProjectorAbsent}` on the trait,
+  `MediaRefusal::ProjectorAbsent` (`projector-absent`) emitted by `embed_run`, README's class table gains a row and loses a meaning, and `local_vision`
+  carries a second artifact-free case (both questions are answered before anything loads). Mutants: folding either direction into one class kills one of
+  the pair; `LazyLocalEmbedder` answering `Build` kills the vision case. Two doc-link defects appeared only on the feature rustdoc rows and are fixed
+  with the reason written where someone would shorten them again. **Remaining for F28:** np-cli `vision` passthrough (default off), projector location +
+  verification before `with_mmproj`, `install --member` — otherwise this new class tells people to install a file no command can place — then the five
+  size rows against §14's ~40 MB claim, then `linked_notes`.
 * **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
   binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
   attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.
