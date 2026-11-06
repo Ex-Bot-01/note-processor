@@ -43,13 +43,23 @@ Four questions went up as human decisions; four answers came back, and one of th
   `search.rs:484-510`) and only the *set* is discarded (`source_note` keeps `notes.first()`, `:465-467`). So placement is a contract change on `Hit`
   (`linked_notes`), not a schema version; a parallel edge table would be a second source for one fact. Wrong-then-written-down is kept here rather
   than tidied, because the wrong plan was the one the ruling was answered against.
-* **F28 step ① landed (`1ce9ffd`, branch `f28/image-embedding-in-np`)** — the refusal split: `ImageBlocker::{Build, ProjectorAbsent}` on the trait,
+* **F28 steps ① and ② shipped (merged with history at `8317a1b` and `736a66d`; 2026-11-06).** ② is the passthrough itself: np-cli declares `vision`
+  (default off), so `cargo check -p np-cli --features local-model,vision` — the command F28 measured as failing at *feature resolution* — compiles;
+  the projector is handed to the runtime only when this workspace recorded it and its digest or stamp matches (`local_model::projector_artifact`,
+  np-core's rule so the CLI cannot accept a file the pin table would refuse), and a moved digest ends the run. CI gained
+  `Feature local-model,vision (ubuntu-latest)` — the row whose absence kept the card open through five days of green runs; first grading was the run
+  that added it (`42258831178`, four jobs success, vision step 15 passed / 0 failed with artifact-backed cases printing `NOT COVERAGE`). Merged-tree
+  gates: 17 rows exit 0 (now including the CLI-with-pair check), workspace 670 passed / 0 failed. Mutants: skip-digest, path-existence, ignore-stamp —
+  three cases, three killers, no model file needed. Two corrections recorded where they were made: `db::member_stamp`/`record_member_stamp` already
+  existed (the design note's "needs accessors" came from a grep that stopped at `*model_file*`), and keeping the existing pair matters because it reads
+  half a pair as *no stamp*, which my new struct would not have.
+* **F28 step ①** — the refusal split: `ImageBlocker::{Build, ProjectorAbsent}` on the trait,
   `MediaRefusal::ProjectorAbsent` (`projector-absent`) emitted by `embed_run`, README's class table gains a row and loses a meaning, and `local_vision`
   carries a second artifact-free case (both questions are answered before anything loads). Mutants: folding either direction into one class kills one of
   the pair; `LazyLocalEmbedder` answering `Build` kills the vision case. Two doc-link defects appeared only on the feature rustdoc rows and are fixed
-  with the reason written where someone would shorten them again. **Remaining for F28:** np-cli `vision` passthrough (default off), projector location +
-  verification before `with_mmproj`, `install --member` — otherwise this new class tells people to install a file no command can place — then the five
-  size rows against §14's ~40 MB claim, then `linked_notes`.
+  with the reason written where someone would shorten them again. **Remaining for F28:** `np models install --member <main|mmproj>` (dim/prefixes belong
+  to the main member only) so an offline machine can place the projector this class tells it to install; the five archive shapes measured with `strip`
+  against §14's ~40 MB sentence, rewritten from the table even if the vision row exceeds it; then `linked_notes`, the placement half.
 * **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
   binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
   attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.

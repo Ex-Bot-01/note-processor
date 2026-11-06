@@ -961,6 +961,17 @@ So F28 is now two pieces, and the second is larger than the feature flag this ca
    instead of one chosen by byte order — which changes what a media hit renders as, and therefore its goldens, its README section, and
    `media_report`'s contract.
 
+**Steps ① and ② landed on `main` (2026-11-06).** ① `8317a1b`: "this build has no image code" and "this workspace has no projector" are separate
+refusal classes (`ImageBlocker` on the provider, `projector-absent` emitted by the image pass). ② `736a66d` (commit `94def8f`): np-cli declares
+`vision`, so `cargo check -p np-cli --features local-model,vision` — the command this card measured as impossible at filing — now compiles; the CLI
+hands over a projector only if this database recorded it and its digest or stamp matches (`local_model::projector_artifact`), refusing the run when a
+recorded file's bytes moved; and CI gained `Feature local-model,vision (ubuntu-latest)`, the row whose absence let this card stay open through five
+days of green runs. Evidence: branch run `42258831178`, four jobs success, its vision step reporting 15 passed / 0 failed with the artifact-backed cases
+printing `NOT COVERAGE`; merged-tree gates 17 rows exit 0 including the CLI-with-pair check, workspace 670 passed / 0 failed, `GOLDEN CHECK: pass`.
+Three mutants killed by three distinct cases (skip the digest comparison, resolve by path existence, ignore the stamp pair), none needing a model file.
+**Still open in this card:** `np models install --member`, without which an offline machine cannot place the projector that `projector-absent` now tells
+it to install; the five archive shapes measured with `strip` against §14's ~40 MB sentence; and the placement half below.
+
 **Ruled in the same turn: the link is figure → note.** Not a coordinate inside the note — so the edge is one row per (note, figure), with no line,
 heading or chunk column. That settles the shape question this card ended on and leaves two to measure rather than debate: what the `vision`
 passthrough costs a shipped binary (§14's ~40 MB sentence has to survive it or be corrected), and what a media hit should render now that a figure
