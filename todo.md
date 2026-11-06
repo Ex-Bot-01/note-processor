@@ -24,22 +24,23 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
-## Ruled by the human, awaiting merge or design (2026-11-06)
+## Ruled by the human (2026-11-06) — two merged with history, one awaiting design
 
 Four questions went up as human decisions; four answers came back, and one of them arrived with a requirement the card had not contained.
 
-* **F25 — keep the bullet.** Option A: an over-wide entry keeps `- [[` on its first physical line instead of publishing a bare `-`. Implemented,
-  green, CI-passing on `f25/bullet-stays-with-entry` at `9abb5b4` (`03cb04a` fix, `0d7bf65` falsifiability + the 99-column boundary case). Not in
-  `main`, so the card carries no **Closed on** paragraph: this file counts work closed when it is on `main`.
-* **F35 — refuse unknown config keys everywhere.** Option (a), implemented and green on `f35/refuse-unknown-sections` at `c99ee6b`, decision and
-  cost in `docs/design-f35-unknown-keys.md`. Same merge caveat.
+* **F25 — keep the bullet. Shipped.** Merged with history into `main` at `4ec0794`; card closed there. An over-wide entry keeps `- [[` on its first
+  physical line (`catalog.rs::wrap` refuses a break before token index 1), and the accepted cost — a 99/100-column link yielding a 101/102-column line —
+  is written into the function's comment and pinned by `the_bullet_rule_bites_at_ninety_nine_columns_of_link`.
+* **F35 — refuse unknown config keys everywhere. Shipped.** Merged at `ec79e93`; card closed there; decision and cost in
+  `docs/design-f35-unknown-keys.md`. Both merges graded on the merged tree: 14 gate rows exit 0, workspace 669 passed / 0 failed, `GOLDEN CHECK: pass`
+  with no golden touched, CI `42223491720` success on all three jobs.
 * **F28 — yes, ship image embedding in `np`,** and: *"image embeddings need their own separate vector, linked to the place where an image is
   mentioned or placed in notes."* The first half already exists (`media_embeddings`, one row per figure-model pair). The second does not: a figure
   is tied to *paths that hold its bytes*, and `np search` reports the lexicographically smallest path plus one representative linker note — twelve
-  notes using one diagram report one of them by sort order. So F28 became two pieces, capability (`vision` passthrough + re-measured archives) and
-  placement (a `note → media` occurrence edge, migration 11). **The open question is what "place" means: the note, or the position inside it**
-  (line / heading / chunk). That decides one edge table or an edge with coordinates, and it changes what a media hit renders as — so it needs its own
-  design note before code.
+  notes using one diagram report one of them by sort order. So F28 became two pieces: capability (`vision` passthrough + re-measured archives) and
+  placement (a `note → media` occurrence edge, migration 11). **Ruled the same turn: the link is figure → note**, not a coordinate inside the note — one
+  edge per (note, figure) with no line/heading column. Design note next, then code; both pieces still have to be measured, and §14's ~40 MB binary claim
+  has to survive the `vision` passthrough or be corrected.
 * **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
   binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
   attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.

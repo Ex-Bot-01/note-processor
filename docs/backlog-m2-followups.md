@@ -2,8 +2,8 @@
 
 **How to read a card's status.** A card is closed when it carries a **Closed on …** paragraph; the absence of one used to mean "open", and on
 2026-11-06 that reading proved wrong: work landed in hardening rounds whose commit messages named several cards at once, and the cards were
-never updated. Twenty cards carry a **Closed on …** paragraph now: sixteen marked by the two audit passes of 2026-11-06 (eight each), four
-written by the round that did the work (F26, F32, F33, F34). Each names the evidence that shows the fix is in the tree — a file:line that did
+never updated. Twenty-two cards carry a **Closed on …** paragraph now: sixteen marked by the two audit passes of 2026-11-06 (eight each), four
+written by the round that did the work (F26, F32, F33, F34), and two closed on the human's ruling of 2026-11-06 once merged (F25, F35). Each names the evidence that shows the fix is in the tree — a file:line that did
 not exist when the card was filed, or a gate row that now passes. Cards closed some other way say it in their own words (“Resolved in …”,
 “**shipped**” in the heading), and those words are theirs, not this convention. A card with neither has not been re-checked: treat it as open,
 and add the evidence line when one closes rather than editing the prose away.
@@ -16,9 +16,9 @@ what was checked and what is left: **F18** (needs a Windows box; nothing here ca
 is gone; a person still cannot learn what an old upgrade deleted without `sqlite3`), **F23** (its “Still open — the residue” is narrower than
 it reads, because A4 shipped after the card was written), **F25** (re-measured: the shape still comes off the renderer; it waits on a human
 decision about `- [[title]]`, not on a measurement). **[Later the same day]** two of those waits ended: the human ruled on F25 (keep the
-bullet, option A) and on F35 (refuse unknown keys everywhere), and both are implemented and green on branches — `f25/bullet-stays-with-entry`
-at `9abb5b4`, `f35/refuse-unknown-sections` at `c99ee6b` — awaiting a merge decision, so neither carries a **Closed on** paragraph yet: this
-file counts a card closed when the fix is in `main`, which is the rule that caught the miscount below. Not audited as far as this file knows:
+bullet, option A) and on F35 (refuse unknown keys everywhere); both were implemented on branches, merged with history into `main` at `4ec0794`
+and `ec79e93`, and carry **Closed on** paragraphs below. The wait before the merge was the convention working, not stalling — a branch is not
+the tree, and the same rule is what caught the miscount above. Not audited as far as this file knows:
 **F28–F31**. Two cards are off the queue for
 reasons an audit did not have to discover: F26 carries its own Closed on paragraph (2026-11-03), so it is closed rather than awaiting a check,
 and F27 holds a deliberate do-not-implement stance that an audit does not overturn.
@@ -714,6 +714,25 @@ start with `- `, and a bare `-` fails that check before any entry regex runs. **
 option B keeps the renderer, amends R2, and adds a deliberate golden. Neither is an audit's call. F16's fixture still avoids the shape on
 purpose (`docs/design-f16-wide-goldens.md` §3), so nothing pins today's behaviour.
 
+**Closed on 2026-11-06 — option A, by the human's ruling, merged into `main` at `4ec0794`** (branch `f25/bullet-stays-with-entry`: `03cb04a` the fix,
+`0d7bf65` falsifiability and the boundary case, `9abb5b4` an unrelated stale-README correction). The card's framing was that someone must decide
+whether an entry begins with its bullet; the ruling is that it does, because `- ` at the start of a physical line is what makes that line parseable as
+an entry — titles are optional in this catalog, the marker is not.
+
+- **The mechanism** (`crates/np-core/src/catalog.rs`, `wrap`): a break is refused before token index 1, so the widest second token travels with its
+  bullet instead of being pushed off it. Its doc comment states both the boundary (the old code broke when the second token exceeded 98 columns) and
+  what the fix accepts in exchange — a link of exactly 99 or 100 columns now yields a first line of 101 or 102, which §14 permits because that line
+  holds a single unsplittable token, and which `verify_catalog_goldens.py`'s `width_ok` allows on the same condition.
+- **Two cases, each able to lose.** `an_over_wide_second_token_keeps_the_bullet_on_its_line` asserts an absolute width of 139 rather than "the entry is
+  unchanged", because an identity assertion passes on any renderer; `the_bullet_rule_bites_at_ninety_nine_columns_of_link` is the boundary case, and it
+  is the only thing that kills a "break when the token would fit alone" mutant. Mutants run against production: `index > 1` → `index > 0` and
+  `index > 1` → `index > 2` each fail both cases; the fits-alone mutant fails only the boundary case.
+- **End to end, not just unit:** the built binary over a scratch vault containing a 110-column CJK title produced an `INDEX.md` with
+  `grep -c '^-$'` = **0** and both entries starting `- [[`.
+- **R2 was not amended and no golden was touched.** The card's warning that this could not be closed by relaxing the verifier is why option B stayed
+  unchosen; `GOLDEN CHECK: pass` on the merged tree, with `git status --porcelain` at 0 afterwards. Merged-tree gates: 14 rows exit 0, `cargo test
+  --workspace` 669 passed / 0 failed, CI run `42223491720` success on all three jobs.
+
 ## F26 — the image decoder accepts more formats than §7's extension list promises
 
 Found reviewing R7c Task 4 on 2026-11-03, and **measured rather than inferred**: a BMP payload handed to
@@ -940,8 +959,13 @@ So F28 is now two pieces, and the second is larger than the feature flag this ca
    cost beside the binary's own, and keep the ~40 MB ceiling claim honest or correct it.
 2. **Placement.** An occurrence edge (migration 11) from a note to the figure it references, so a hit can name the note that placed it
    instead of one chosen by byte order — which changes what a media hit renders as, and therefore its goldens, its README section, and
-   `media_report`'s contract. Whether "place" means *the note* or *the position inside it* (line/heading/chunk) is the next decision, and
-   it decides whether this is one edge table or an edge with coordinates.
+   `media_report`'s contract.
+
+**Ruled in the same turn: the link is figure → note.** Not a coordinate inside the note — so the edge is one row per (note, figure), with no line,
+heading or chunk column. That settles the shape question this card ended on and leaves two to measure rather than debate: what the `vision`
+passthrough costs a shipped binary (§14's ~40 MB sentence has to survive it or be corrected), and what a media hit should render now that a figure
+has more than one honest note to name — `media_report`'s "smallest path, one linker" contract was chosen because there was no edge to ask, and once
+there is, choosing by byte order becomes an arbitrary answer to a question the database can now answer properly.
 
 ## F29 — every `.svg` in the vault refuses as `unsupported-format`, and a diagram library is mostly SVG
 
@@ -1153,7 +1177,8 @@ invented `[paths]` section for several measured runs before the mismatch showed 
 - **Blocks:** nothing correctness-wise; it blocks any sentence claiming "a typo in `config.toml` fails loudly" without naming
   which levels of the file that covers (the thread-policy design at §84 says exactly that about `[embeddings]`, where it is true).
 
-**Ruled and implemented 2026-11-06, not closed yet — it waits on a merge, not on work.** Option **(a)**, by the human's ruling, with option
+**Closed on 2026-11-06 — merged into `main` at `ec79e93`** (branch `f35/refuse-unknown-sections`: `c99ee6b` the change, `2e50127` the rulings recorded).
+Option **(a)**, by the human's ruling, with option
 (b)'s honesty explicitly declined: "only these sections are read; anything else is ignored" would document the trap instead of disarming it.
 `Config`, `CatalogConfig` and `MarkerConfig` now carry `deny_unknown_fields` beside the two that always did, so one sentence covers the file:
 *a key this build does not know is refused, naming the file, the line and the key as written*. Decision, cost (forward compatibility for
@@ -1177,3 +1202,8 @@ Evidence to re-run after merge: `cargo test -p np-core --test config` (54 cases,
 ruling rather than taking it, and both pins are still in the file saying what they used to mean. One of our own fixtures was living off the
 leniency: `an_unconfigured_fetch_says_it_is_using_the_compiled_in_origin` wrote an invented `[workspace]` section to mean "a config that says
 nothing", and now writes an empty file — caught by the suite before a user met it.
+
+On the merged tree: the 14-row gate list exits 0 (`cargo test --workspace` 669 passed / 0 failed, `GOLDEN CHECK: pass` with no golden touched,
+rustdoc `--deny warnings` on all three feature sets), and CI run `42223491720` is success on all three jobs. One gate-list correction came out of this
+round and belongs to every future one: the `local-model` rows need `CMAKE=$HOME/tools/cmake/bin/cmake`, or `crates/np-core/build.rs:125` panics and
+three rows fail for a reason that reads like a code defect.
