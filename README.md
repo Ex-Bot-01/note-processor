@@ -320,7 +320,7 @@ classes on the `images` line:
 | `unsupported-format` | Not `.png`/`.jpg`/`.jpeg`, or an accepted name whose bytes are not that raster. Re-export as PNG or JPEG |
 | `undecodable` | Accepted name and signature, but the decode failed — a truncated or damaged file is the usual cause. Re-export the figure; nothing partial was stored |
 | `over-budget` | The encode measured more image patches than the context window holds (8,192 tokens). **Never observed on this artifact pair**: one size was measured — a 4096×3072 PNG cost 1,064 tokens — and larger sizes have not been. If you see it, suspect a narrower window or a re-pinned artifact rather than a slightly big diagram |
-| `vision-unavailable` | Two meanings, one label: this binary has no image code, or **a provider refused something this report has no class for**. In a shipped `np` build every figure that *resolves and passes the content gate* lands here — `np-cli` has no `vision` passthrough to ask for it (**F28**) |
+| `vision-unavailable` | Two meanings, one label: this binary has no image code, or **a provider refused something this report has no class for**. Every release build of `np` is the first case (`vision` is off by default, like `local-model`), so every figure that *resolves and passes the content gate* lands here — and a build made with `--features local-model,vision` reports `projector-absent` instead until the projector is installed |
 | `projector-absent` | This binary **does** have the image code and this workspace has no projector for it to load: the `mmproj` member is not recorded by this database, or is on disk but not the bytes that record vouches for. Fetch or install it. Split out of `vision-unavailable` by **F28**, because the two advise different actions — one file versus a rebuild — and the old folded label kept the count honest while sending someone to the wrong command |
 
 The counts count what their nouns say: `links` is written targets de-duplicated per note (a refused link still counts),
@@ -374,6 +374,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --locked -p np-core --features local-model --all-targets -- -D warnings
 cargo clippy --locked -p np-cli --features local-model --all-targets -- -D warnings
 cargo clippy --locked -p np-core --features local-model,vision --all-targets -- -D warnings
+cargo clippy --locked -p np-cli --features local-model,vision --all-targets -- -D warnings   # the row whose absence was F28
 cargo clippy --locked -p np-cli --no-default-features --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p np-cli --no-default-features
@@ -392,9 +393,12 @@ NP_TEST_MMPROJ_PATH=~/models/mmproj-embeddinggemma-2-Q8_0.gguf \
   cargo test -p np-core --features local-model,vision --test local_vision
 ```
 
-Without them the default feature row prints **29** `NOT COVERAGE` lines and `--features local-model,vision` prints **38** —
-those numbers are a CI floor this repository checks, and they mean "compiled, never ran", never "passed". `$NP_TEST_VISION_LARGE`
-and `$NP_THREAD_*` gate two further cells the same way. **GitHub Actions does run this repository.** That sentence used to read "cannot execute
+Without them, nothing that needs weights runs. Counted on 2026-11-06 on this host with both variables unset — `cargo test --workspace` prints
+**5** such lines (most artifact-gated suites are not even compiled without the runtime), `-p np-core -p np-cli --features local-model` prints
+**36**, and the same pair with `--features local-model,vision` prints **45**. They mean "compiled, never ran", never "passed". The commands are
+printed beside the numbers on purpose: an earlier pair recorded here (29 / 38) could not be reproduced by any command in this file once F28's
+artifact-free cases landed, and a count that moves with every gated case is worth re-measuring rather than trusting. `$NP_TEST_VISION_LARGE` and
+`$NP_THREAD_*` gate two further cells the same way. **GitHub Actions does run this repository.** That sentence used to read "cannot execute
 jobs for this account today", which was true during the gap `todo.md` dates (no Windows steps from 2026-10-29 to 2026-10-31) and false ever since:
 measured on 2026-11-06, `Test (ubuntu-latest)`, `Test (windows-latest)` and `Feature local-model (ubuntu-latest)` each executed and each passed on
 every push to `main` at `2c65525`, `935b2cd` and `64a6b73` (runs `42171010611`, `42187057325`, `42188471272`) and on a branch push at `03cb04a`
@@ -424,8 +428,11 @@ Repository layout: `crates/np-core` (discovery, parsing, links, catalog, databas
 `crates/np-cli` (argv, resolution and printers — no decisions of its own), with `third_party/`, `scripts/` and the pinned
 `.vendor/` tree for the C++ side.
 
-**Known gaps, stated plainly.** No shipped binary can encode an image, because `np-cli` has no `vision` passthrough (**F28**, a
-product decision rather than a bug). Image throughput, resident-set growth with a projector open, cross-worker bit-identity and
+**Known gaps, stated plainly.** The binaries CI publishes still cannot encode an image: `vision` is off by default, so every figure in a release
+build's corpus lands in `vision-unavailable`. A build made with `--features local-model,vision` does encode them — the passthrough **F28** was is
+in place, and the run hands over only a projector this workspace has recorded and whose digest (or stamp) matches. What that build needs from you is
+the file itself: `np models fetch --member mmproj`, and until `install` grows a `--member` (**F28**, still open), fetching is the only door — an
+offline machine can place the text encoder and not the projector. Image throughput, resident-set growth with a projector open, cross-worker bit-identity and
 retrieval quality have **not** been measured — the list is in `docs/design-m2-image-embeddings.md` §14. Windows and macOS get a
 written refusal from `build.rs` for feature builds and have never been executed here.
 
@@ -435,3 +442,8 @@ CI runs again, and reading it is what surfaced **F34**. Measured from the Action
 `Test (windows-latest)` on the same disk-preflight assertion — four days of merges that were green on Linux and red on Windows. F34's
 fixes turned that around: green on the branch from `2ba7dc0`, and green on `main` at `b2840f9` (run `42090000404`, all three jobs). "Green" in this README still means the exit codes measured locally and listed
 above; the Windows job is now a second reader, and it has already caught something local gates could not.
+
+A fourth job joins on this branch — **`Feature local-model,vision (ubuntu-latest)`** — and it exists because of what the three above could not see:
+every `--features local-model,vision` row ever run was graded on `-p np-core`, so a green CI said nothing about whether `np` itself could be built
+with image support. It could not (**F28**), and no failure any of the other jobs produce would have said so. Its first grading is the run that adds it,
+which is worth stating rather than backdating: this sentence was written before that job had ever gone green.

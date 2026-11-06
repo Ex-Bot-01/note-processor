@@ -628,6 +628,29 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
                     // pays nothing. When it does hash (the first run under this build, or bytes that moved) it refuses
                     // **before** `embed_run` reads a note, so a swapped artifact never earns a stamped vector.
                     Ok(embedder) => {
+                        // **F28: a build with the image code asks this workspace for a projector.** Which bytes qualify is
+                        // np-core's rule, not this file's (`local_model::projector_artifact`: recorded by *this* database,
+                        // present on disk, and either stamped or digest-matching), because two copies of that rule could
+                        // disagree in exactly one direction — the CLI accepting a file the pin table would refuse.
+                        //
+                        // Three outcomes, and none of them is silent. `Ok(Some)` configures the projector, so figures encode.
+                        // `Ok(None)` leaves the provider text-only and every figure then refuses as `projector-absent`, whose
+                        // advice names the file to install or fetch — the class exists so this line does not have to print a
+                        // warning of its own to be honest. `Err` is a recorded projector whose bytes are not the recorded
+                        // ones, and it ends the run: encoding every figure with an encoder nobody vouched for, then stamping
+                        // those rows as though the pinned pair produced them, is not a degraded mode (R6c2's defect, aimed at
+                        // the second artifact this program loads).
+                        #[cfg(feature = "vision")]
+                        let embedder = match np_core::local_model::projector_artifact(
+                            &db,
+                            &row.id,
+                            &cfg.workspace_models_dir(workspace),
+                        ) {
+                            Ok(Some(projector)) => embedder.with_mmproj(projector),
+                            Ok(None) => embedder,
+                            Err(err) => return Err(err.into()),
+                        };
+
                         // Read before the embedder is boxed into a trait object: `worker_plan` is a method on the
                         // concrete type, and the plan belongs to the provider that was just built.
                         let plan = embedder.worker_plan();

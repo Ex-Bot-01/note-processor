@@ -1455,11 +1455,14 @@ fn an_explicit_member_list_is_the_plan_and_the_default_set_never_widens_it() {
     );
 }
 
-#[cfg(feature = "fetch")]
+#[cfg(all(feature = "fetch", not(feature = "vision")))]
 #[test]
 fn a_projector_request_on_a_build_without_image_support_names_the_capability() {
     // The one refusal §13 adds, and it is about a capability rather than a location: `mmproj` **is** pinned, so the
     // honest sentence is "this binary was built without image support", not "nothing pins that member".
+    //
+    // Gated off on a `vision` build (F28), where the sentence would be a lie — and its sibling below is what makes that
+    // gate a claim rather than a way to keep the old assertion green by never running it.
     //
     // What this case proves about the network: `[models] base_url` names a port with nothing listening on it, so a
     // run that reached its transport would fail at connect with a class naming a member. The message that arrives
@@ -1482,6 +1485,37 @@ fn a_projector_request_on_a_build_without_image_support_names_the_capability() {
     assert!(
         !scratch.models_dir().exists(),
         "a capability refusal creates no state"
+    );
+}
+
+#[cfg(all(feature = "fetch", feature = "vision"))]
+#[test]
+fn a_vision_build_asks_for_the_projector_instead_of_refusing_it() {
+    // The other side of the capability gate, and the only CLI-level statement this round makes about a vision build
+    // without 554 MB on disk: asking for `mmproj` is no longer a capability refusal. It reaches the transport — which is
+    // why the origin is a port with nothing listening — and fails there.
+    //
+    // Two halves, both falsifiable. The **absence** of the capability sentence is the claim about F28; the **presence** of
+    // `transport failure` is the proof that the run got *past* the capability gate rather than exiting early for some other
+    // reason — without it, any new refusal before the transport would satisfy the first half. Revert np-cli's `vision`
+    // feature and both halves fail at once, which is how F28's missing passthrough would reappear.
+    let scratch = Scratch::new();
+    let run = run(&mut scratch.fetch_at("embeddinggemma-2", DEAD_ORIGIN, &["--member", "mmproj"]));
+
+    assert_eq!(
+        run.code(),
+        1,
+        "a dead origin still refuses: {}",
+        run.stderr()
+    );
+    let text = run.stderr();
+    assert!(
+        !text.contains("image support"),
+        "a build with the image code must not claim to lack it: {text}"
+    );
+    assert!(
+        text.contains("transport failure"),
+        "the run has to reach its transport, which is what proves nothing refused it for want of a capability: {text}"
     );
 }
 
