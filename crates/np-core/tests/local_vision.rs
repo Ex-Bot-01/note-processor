@@ -4,9 +4,11 @@
 //! Every case here needs both artifacts, because every claim is about what *this* projector answers — so each one
 //! prints `NOT COVERAGE` and passes when `NP_TEST_MODEL_PATH` or `NP_TEST_MMPROJ_PATH` is unset (F18: an absent
 //! 310 MB or 554 MB file must not look like a failure, and must not look like coverage either). No `#[ignore]`,
-//! for the standing reason: an ignored test is the silent skip that rule exists to forbid. One case —
-//! [`refusal_classes_are_the_report_labels_verbatim`] — needs the feature but no artifact, and it is the one line
-//! in this file that runs on a CI row without model files.
+//! for the standing reason: an ignored test is the silent skip that rule exists to forbid. Two cases —
+//! [`refusal_classes_are_the_report_labels_verbatim`] and [`a_vision_provider_without_a_projector_blames_the_file_not_the_build`]
+//! — need the feature but no artifact, and they are the lines in this file that run on a CI row without model files:
+//! both are statements about what a provider answers *before* it loads anything, which is exactly when they have to be
+//! true.
 //!
 //! ```text
 //! NP_TEST_MODEL_PATH=/path/to/embeddinggemma-2-Q8_0.gguf \
@@ -26,7 +28,7 @@
 //! * **Token cost is read back, never assumed.** `last_token_cost()` is what §8's `over-budget` rule will be
 //!   measured against, so the flat 280 from the model card gets checked against what this builder really does.
 
-/// The projector-gated claims. All of them need `vision`, and all but one need both artifacts.
+/// The projector-gated claims. All of them need `vision`, and all but two need both artifacts.
 #[cfg(feature = "vision")]
 mod vision {
     use std::fs;
@@ -34,10 +36,11 @@ mod vision {
     use std::sync::{Mutex, MutexGuard};
 
     use np_core::db::ModelRow;
-    use np_core::embed::{EmbedError, Embedder, Vector};
+    use np_core::embed::{EmbedError, Embedder, ImageBlocker, Vector};
     use np_core::local_model::{self, LazyLocalEmbedder, LoadedModel, LocalEmbedder};
     use np_core::media::MediaRefusal;
     use np_core::vision::{Projector, VisionModel, OVER_BUDGET, UNDECODABLE, VISION_UNAVAILABLE};
+    use tempfile::TempDir;
 
     /// The width `embeddinggemma-2-Q8_0.gguf` answers with — the same 768 `tests/local_load.rs` pins from the
     /// file's header and §1.2's published output dimension.
@@ -334,8 +337,55 @@ mod vision {
         assert_eq!(VISION_UNAVAILABLE, MediaRefusal::VisionUnavailable.label());
         println!(
             "CLASSES: the seam's three constants are media's labels verbatim — {UNDECODABLE}, {OVER_BUDGET}, \
-             {VISION_UNAVAILABLE}. No artifact was needed, and none was used: §8 lists six classes in all, and this \
-             file covers the three the vision seam can answer."
+             {VISION_UNAVAILABLE}. No artifact was needed, and none was used: §8 lists seven classes in all (F28 added \
+             `projector-absent`, which is media's own label and never a seam payload), and this file covers the three \
+             the vision seam can answer."
+        );
+    }
+
+    /// **Which of F28's two sentences a vision provider tells** — answered with no artifact, because both questions are
+    /// answered before anything loads, and that is the property that lets `np embed` refuse a figure for the cost of one
+    /// `stat` instead of 420 MiB.
+    ///
+    /// The pair matters on its own: [`ImageBlocker::ProjectorAbsent`] exists because "install the projector" and "rebuild
+    /// with the feature" are different advice, and a provider that answered `Build` here would put the wrong sentence in
+    /// every report line of a run whose only problem was a missing file.
+    #[test]
+    fn a_vision_provider_without_a_projector_blames_the_file_not_the_build() {
+        let dir = TempDir::new().expect("test setup: tempdir");
+        let artifact = dir.path().join("embeddinggemma-2");
+        fs::write(&artifact, b"not weights, and never read")
+            .expect("test setup: artifact stand-in");
+
+        let provider = LazyLocalEmbedder::new(
+            &provider_row(),
+            &artifact,
+            DIM,
+            np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            np_core::config::ThreadCount::Auto,
+        )
+        .expect("test setup: a readable artifact builds a lazy provider");
+
+        assert!(
+            !provider.supports_images(),
+            "no projector has been handed over, so images are not served"
+        );
+        assert_eq!(
+            provider.image_blocker(),
+            Some(ImageBlocker::ProjectorAbsent),
+            "a `vision` build is out of files, not out of code — the advice is one file, not a rebuild"
+        );
+
+        let with_projector = provider.with_mmproj(dir.path().join("mmproj-embeddinggemma-2"));
+        assert!(with_projector.supports_images());
+        assert_eq!(
+            with_projector.image_blocker(),
+            None,
+            "a configured projector blocks nothing: the two methods must agree, not be asked in turn"
+        );
+        println!(
+            "BLOCKER: vision build with no projector → `projector-absent`; with a projector path configured → unblocked. \
+             No artifact was read (`loaded()` stays false), which is what keeps the refusal cheap."
         );
     }
 

@@ -71,7 +71,7 @@ use thiserror::Error;
 
 use crate::config::{abs_path, Config, ConfigError, EmbeddingProvider};
 use crate::db::{self, Db, DbError};
-use crate::embed::{EmbedError, Embedder, Vector};
+use crate::embed::{EmbedError, Embedder, ImageBlocker, Vector};
 use crate::hash::{sha256_bytes, sha256_reader_with_size};
 use crate::media::{self, MediaRefusal};
 use crate::models;
@@ -983,6 +983,13 @@ fn media_pass(
     let capable = provider
         .as_ref()
         .is_some_and(|provider| provider.supports_images());
+    // …and asked in the same breath, for the same reason, is *why not* (F28). "This build has no image code" and "this
+    // workspace has no projector" were one class until here; they advise different actions — build with a feature, or
+    // fetch one file — so folding them kept the counts honest and the advice wrong. `None` means either the provider can
+    // encode or there is no provider to ask, and both keep the pre-F28 label below.
+    let blocker = provider
+        .as_ref()
+        .and_then(|provider| provider.image_blocker());
     let mut referenced: HashSet<Vec<u8>> = HashSet::new();
 
     let notes = db::live_note_paths(db)?;
@@ -1140,9 +1147,14 @@ fn media_pass(
             // No provider at all (`Resolution::ArtifactAbsent`) is §8's `vision-unavailable` in its plainest form: this
             // build and model pair cannot serve the request, and asking was still worth the count.
             if !capable {
-                tally
-                    .refusals
-                    .push((shown, MediaRefusal::VisionUnavailable));
+                // Written as an exhaustive match with no wildcard on purpose: a future `ImageBlocker` variant has to be
+                // given a class here deliberately rather than falling into `vision-unavailable`, which is the closed-set
+                // habit [`image_refusal_of`] documents as a decision rather than a discovery.
+                let class = match blocker {
+                    Some(ImageBlocker::ProjectorAbsent) => MediaRefusal::ProjectorAbsent,
+                    Some(ImageBlocker::Build) | None => MediaRefusal::VisionUnavailable,
+                };
+                tally.refusals.push((shown, class));
                 continue;
             }
             let Some(provider) = provider.as_mut() else {

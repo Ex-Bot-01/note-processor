@@ -433,6 +433,25 @@ pub enum EmbedError {
     },
 }
 
+/// Why a provider cannot encode an image, spelled as the two sentences a report can print (F28).
+///
+/// **Why a type rather than the refusal class itself.** The class is decided where the refusal is counted
+/// ([`crate::embed_run`]'s image pass), and this is answered by whoever knows the reason; keeping them separate means a
+/// provider says *what is missing* and the report decides *which §8 class that is*, so adding a class cannot silently
+/// re-label what a provider meant. It also keeps the pair honest in one place: [`Embedder::supports_images`] answers
+/// whether asking is worth a file read, and this answers why not, for the same reason laziness does — a caller deciding
+/// what to tell a user must not have to load weights to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageBlocker {
+    /// This build contains no image code at all. The fix is a different binary: the advice is about how it was built,
+    /// and `np models fetch` would be a wasted afternoon.
+    Build,
+    /// This build has the image code and the workspace has no projector for it to load — not recorded by this
+    /// database, or present but not the bytes that record vouches for. The fix is one file: install or fetch the
+    /// `mmproj` member (§13 of the image-embeddings design), which is why this is not folded into [`Self::Build`].
+    ProjectorAbsent,
+}
+
 /// Anything that can turn texts into vectors — in-process model, HTTP endpoint, or a test's stand-in.
 ///
 /// The interface is three methods and no async, no builder, no config type: a scan needs to know which
@@ -504,6 +523,23 @@ pub trait Embedder {
     /// of this pair, which is stronger than a rule telling callers not to pass one.
     fn supports_images(&self) -> bool {
         false
+    }
+
+    /// Which [`ImageBlocker`] describes why this provider cannot encode an image, or `None` when it can.
+    ///
+    /// **The default is [`ImageBlocker::Build`]** because the providers that inherit it have no image path to be missing
+    /// anything else: the trait's [`Self::supports_images`] already answers `false`, and a provider that never learned
+    /// about projectors is out of code rather than out of files. A provider that *can* encode returns `None`, and one
+    /// compiled with the image code returns [`ImageBlocker::ProjectorAbsent`] while its projector is missing —
+    /// `np_core::local_model::LazyLocalEmbedder` is the only type in this workspace that overrides this, and it is named in
+    /// prose rather than linked because that module exists only under the `local-model` feature, so a doc link would break
+    /// every default-build `cargo doc` (the same reason [`crate::media`] spells its vision-seam cross-reference this way).
+    ///
+    /// Asked only after [`Self::supports_images`] answered `false`, so a capable provider's answer is never consulted;
+    /// it is still expected to be `None` there, and `tests/embed_media.rs`'s fake keeps the two methods agreeing so a
+    /// future provider that disagrees has somewhere to be caught.
+    fn image_blocker(&self) -> Option<ImageBlocker> {
+        Some(ImageBlocker::Build)
     }
 
     /// One image's encoded bytes (PNG, JPEG, …) to one [`Vector`] of [`Self::dim`] components.
