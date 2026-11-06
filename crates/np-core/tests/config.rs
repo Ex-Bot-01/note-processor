@@ -874,26 +874,180 @@ fn every_provider_spelling_parses_and_a_partial_section_keeps_its_defaults() {
     // dropping the container `default`, which makes the partial section below error on its missing sibling.
 }
 
+/// Write `body` into a config file and load it expecting refusal; return the file and the error.
+///
+/// [`embeddings_refusal`] does the same for `[embeddings]`; this one exists so the panic on a wrong pass
+/// describes what a *root-level* refusal would have meant, rather than printing an embedding provider nobody
+/// was asking about.
+fn root_refusal(body: &str) -> (PathBuf, ConfigError) {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), body);
+    let err = match Config::load(Some(&path)) {
+        Ok(cfg) => panic!(
+            "the file must be refused; it loaded with catalog.max_entries_per_file = {}",
+            cfg.catalog.max_entries_per_file
+        ),
+        Err(err) => err,
+    };
+    (path, err)
+}
+
+/// **F35, and a stance reversed rather than quietly deleted.** This case used to read
+/// `an_unknown_key_outside_embeddings_still_loads` and its whole purpose was to prove that strictness stopped
+/// at the `[embeddings]` boundary. The human ruled on 2026-11-06 that it does not (`docs/design-f35-unknown-keys.md`),
+/// so the fixture survives — same TOML bytes, including both stray keys it was written to defend — and what it
+/// demands of them is inverted. A file's history should show a decision reversed on purpose, not a test that
+/// vanished.
 #[test]
-fn an_unknown_key_outside_embeddings_still_loads() {
+fn a_stray_key_at_the_top_level_is_refused_naming_key_and_file() {
     let _env = hold_env();
-    // The strictness is scoped, and this is the half that proves it: `[catalog]` and the top level keep
-    // the lenient posture every existing config file relies on. Without this case, a reader of the test
-    // above could not tell "one section refuses typos" from "the whole file does" — and flipping the
-    // file strict would be a silent behaviour change for every installed config.
+    // One unknown key per fixture, on purpose. Measured with two in one file (`stray_top_level` at the root and
+    // `stray` inside `[catalog]`), toml reports the **nested** one — "unknown field `stray`, expected
+    // `max_entries_per_file` …, at line 5" — because the descent into a table happens before the root's own
+    // unknown-field check. Asserting on a name the driver may or may not have chosen is how a refusal test
+    // starts passing for the wrong key, so each case here has exactly one candidate cause.
+    let (path, err) = root_refusal("stray_top_level = 1\n[catalog]\nmax_entries_per_file = 400\n");
+    let message = err.to_string();
+
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "an unknown key must travel as the typed parse refusal, got {err:?}"
+    );
+    // Quoted for the same reason `[embeddings]`'s case quotes: toml appends "expected one of `data_dir`,
+    // `catalog`, …", so an unquoted assertion would be satisfied by the suggestion list.
+    assert!(
+        message.contains("`stray_top_level`"),
+        "the refusal must name the key as written: {message}"
+    );
+    assert!(
+        message.contains(&path.display().to_string()),
+        "and name the file to go and fix, in its own words: {message}"
+    );
+
+    // Mutation this catches: dropping `deny_unknown_fields` from `Config`, which loads this file and drops the
+    // stray key — the panic inside `root_refusal` prints the value that would have been published instead.
+}
+
+/// Two unknowns in one file, and which one gets named. This is the diagnostic's own rule, measured rather than
+/// assumed, and it belongs in the suite because a reader who expects the *first line* to be named would write
+/// the assertion above wrong: with `stray_top_level` on line 2 and `stray` inside `[catalog]` on line 5, the
+/// refusal points at line 5.
+#[test]
+fn an_unknown_key_inside_a_section_is_the_one_named_when_the_root_has_one_too() {
+    let _env = hold_env();
+    let (_path, err) =
+        root_refusal("stray_top_level = 1\n[catalog]\nmax_entries_per_file = 400\nstray = \"x\"\n");
+    let message = err.to_string();
+
+    assert!(
+        message.contains("`stray`") && message.contains("line 5"),
+        "the nested key is the one named, at its own line: {message}"
+    );
+
+    // Mutation this catches: any change that makes the root report first — a hand-written visitor, or moving
+    // `deny_unknown_fields` off `CatalogConfig` — flips which name appears here, and this case is where that
+    // change would have to be re-decided rather than discovered by a red suite.
+}
+
+/// The card's own scenario: one letter wrong in a **section** name, which used to cost that subsystem's whole
+/// settings in silence. `[catalogg]` is not read as `[catalog]`, so `max_entries_per_file` stayed at 600 while
+/// its owner believed they had written 200 — a catalog rendered at defaults under a config that says otherwise.
+#[test]
+fn an_invented_section_is_refused_naming_the_section_and_its_line() {
+    let _env = hold_env();
+    let (path, err) = root_refusal("[catalogg]\nmax_entries_per_file = 200\n");
+    let message = err.to_string();
+
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "an invented section is a parse refusal, not a warning: {err:?}"
+    );
+    assert!(
+        message.contains("`catalogg`"),
+        "the invented section must be named as written: {message}"
+    );
+    // The line number is what makes this fixable in a 40-line file. `data_dir` sits on line 1 (written by the
+    // helper), so the bad section is line 2 — asserted as a number rather than "some digits", because a
+    // diagnostic that pointed at line 1 would still contain a line number.
+    assert!(
+        message.contains("line 2"),
+        "the refusal must point at the line holding the section: {message}"
+    );
+    assert!(
+        message.contains(&path.display().to_string()),
+        "and name the file: {message}"
+    );
+
+    // Mutation this catches: a root that ignores unknown *tables* while refusing unknown scalars — serde's
+    // `flatten`, or a hand-written visitor, both plausible ways to make the top level strict-looking while
+    // `[catalogg]` keeps loading whole.
+}
+
+/// The two remaining containers, asserted separately so a struct added later cannot rejoin a lenient set by
+/// omission: an unknown key inside `[catalog]` and inside `[markers]` is refused like any other.
+#[test]
+fn every_section_refuses_an_unknown_key() {
+    let _env = hold_env();
+    for (section, body, named) in [
+        (
+            "[catalog]",
+            "[catalog]\nmax_entries_per_file = 400\nstray = \"x\"\n",
+            "`stray`",
+        ),
+        (
+            "[markers]",
+            "[markers]\ndone = [\"done\"]\npausedd = [\"later\"]\n",
+            "`pausedd`",
+        ),
+    ] {
+        let (path, err) = root_refusal(body);
+        let message = err.to_string();
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "{section}: expected a parse refusal, got {err:?}"
+        );
+        assert!(
+            message.contains(named),
+            "{section}: the stray key must be named ({named}) in: {message}"
+        );
+        assert!(
+            message.contains(&path.display().to_string()),
+            "{section}: and the file, in: {message}"
+        );
+    }
+
+    // Mutations this catches: dropping `deny_unknown_fields` from `CatalogConfig` or from `MarkerConfig` — each
+    // half fails only its own row, which is why they are one test with two fixtures rather than one fixture.
+}
+
+/// **The half a strictness change gets wrong.** Refusing everything also satisfies every assertion above, so
+/// this case pins the other direction: a file whose keys are all real loads, in every section, with its values
+/// arriving. It is the same TOML shape the refusal cases use, with the strays spelled correctly.
+#[test]
+fn a_file_of_real_keys_still_loads_every_section() {
+    let _env = hold_env();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = write_config_with_data_dir(
         tmp.path(),
-        "stray_top_level = 1\n[catalog]\nmax_entries_per_file = 400\nstray = \"x\"\n",
+        "[catalog]\nmax_entries_per_file = 400\ncontinuation_indent = 4\n\
+         [markers]\ndone = [\"done\"]\npaused = [\"on hold\"]\n\
+         [embeddings]\nprovider = \"none\"\nmax_tokens = 512\n\
+         [models]\nbase_url = \"https://mirror.example\"\n",
     );
 
-    let cfg = Config::load(Some(&path)).expect("unknown keys outside [embeddings] stay accepted");
-
+    let cfg = Config::load(Some(&path)).expect("a file with no unknown key must never be refused");
     assert_eq!(cfg.catalog.max_entries_per_file, 400);
+    assert_eq!(cfg.catalog.continuation_indent, 4);
+    assert_eq!(cfg.markers.paused, ["on hold".to_string()]);
     assert_eq!(cfg.embeddings.provider, EmbeddingProvider::None);
+    assert_eq!(cfg.embeddings.max_tokens, 512);
+    assert_eq!(
+        cfg.models.base_url.as_deref(),
+        Some("https://mirror.example")
+    );
 
-    // Mutation this catches: adding `deny_unknown_fields` to `Config` or `CatalogConfig`, which would
-    // refuse config files that work today.
+    // Mutation this catches: making the root strict by refusing *nested tables* wholesale (a visitor that only
+    // accepts scalars), which fails here on `[catalog]` while every refusal case above still passes.
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,8 +1332,10 @@ fn the_new_refusals_are_scoped_to_the_provider_that_needs_them() {
     let _env = hold_env();
     // The other half of "refuse loudly", and the half a single fixture cannot see: an id that would be refused
     // beside `local-model` is ordinary text beside `none`, because nothing will embed. Refusing it there would
-    // break config files that work today — the same scoping argument as
-    // `an_unknown_key_outside_embeddings_still_loads`, one level down.
+    // break config files that work today. (This used to cite `an_unknown_key_outside_embeddings_still_loads` as
+    // the same argument one level up; F35 reversed *that* rule, and this one stands on its own: refusing an
+    // unread `model` id beside a provider that will never embed is a different claim from refusing an unknown
+    // key, and it is still scoped by design.)
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path =
         write_config_with_data_dir(tmp.path(), "[embeddings]\nmodel = \"GEMMA-2\"\ndim = 512\n");
@@ -1510,26 +1666,36 @@ fn an_unrecognised_models_key_is_refused_naming_key_and_file() {
 }
 
 #[test]
-fn the_models_strictness_is_scoped_to_the_models_section() {
-    // The other half of the rule, and the half one refusal test cannot show: strictness stops at the section's
-    // boundary, so an existing config file with a stray key beside it keeps loading (`an_unknown_key_outside_embeddings_still_loads`
-    // is the same argument for `[embeddings]`).
+fn strictness_no_longer_stops_at_a_section_boundary() {
+    // Was `the_models_strictness_is_scoped_to_the_models_section`, whose entire claim was that a stray key
+    // outside `[models]` kept loading. F35 removed the boundary (`docs/design-f35-unknown-keys.md`), so the
+    // fixture stays — it is the exact file that used to load, `[models]` and all — and the demand inverts.
+    // Keeping `[models] base_url` in it matters: the refusal has to arrive even when a *strict* section is
+    // present and valid, because "one strict section" was the posture being replaced.
     let _env = TestEnv::install();
-    let tmp = TempDir::new().expect("test setup: tempdir");
-    let path = write_config_with_data_dir(
-        tmp.path(),
-        "stray_top_level = 1\n[catalog]\nmax_entries_per_file = 400\nstray = \"x\"\n[models]\nbase_url = \"https://mirror.example\"\n",
+    // `[catalog]` lost its stray for the reason the other case gives: one unknown key per fixture, so the name
+    // in the message is the one this test is about. What stays is the point — a valid, strict `[models]`
+    // beside a root-level stray must not rescue the file.
+    let (path, err) = root_refusal(
+        "stray_top_level = 1\n[catalog]\nmax_entries_per_file = 400\n[models]\nbase_url = \"https://mirror.example\"\n",
+    );
+    let message = err.to_string();
+
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "a valid `[models]` beside a stray key must not rescue the file: {err:?}"
+    );
+    assert!(
+        message.contains("`stray_top_level`"),
+        "the root's own stray must be named even beside a valid strict section: {message}"
+    );
+    assert!(
+        message.contains(&path.display().to_string()),
+        "and the file is named, in: {message}"
     );
 
-    let cfg = Config::load(Some(&path)).expect("unknown keys outside [models] stay accepted");
-    assert_eq!(cfg.catalog.max_entries_per_file, 400);
-    assert_eq!(
-        cfg.models.base_url.as_deref(),
-        Some("https://mirror.example")
-    );
-
-    // Mutation this catches: adding `deny_unknown_fields` to `Config` or `CatalogConfig`, which would refuse config
-    // files that work today.
+    // Mutation this catches: reverting the root to lenient while leaving the sections strict — the pre-F35
+    // posture, which loads this file and drops both strays.
 }
 
 /// A variable whose bytes are not valid UTF-8, so no `String` can hold it — the same construction

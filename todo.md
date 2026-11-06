@@ -24,6 +24,29 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
+## Ruled by the human, awaiting merge or design (2026-11-06)
+
+Four questions went up as human decisions; four answers came back, and one of them arrived with a requirement the card had not contained.
+
+* **F25 — keep the bullet.** Option A: an over-wide entry keeps `- [[` on its first physical line instead of publishing a bare `-`. Implemented,
+  green, CI-passing on `f25/bullet-stays-with-entry` at `9abb5b4` (`03cb04a` fix, `0d7bf65` falsifiability + the 99-column boundary case). Not in
+  `main`, so the card carries no **Closed on** paragraph: this file counts work closed when it is on `main`.
+* **F35 — refuse unknown config keys everywhere.** Option (a), implemented and green on `f35/refuse-unknown-sections` at `c99ee6b`, decision and
+  cost in `docs/design-f35-unknown-keys.md`. Same merge caveat.
+* **F28 — yes, ship image embedding in `np`,** and: *"image embeddings need their own separate vector, linked to the place where an image is
+  mentioned or placed in notes."* The first half already exists (`media_embeddings`, one row per figure-model pair). The second does not: a figure
+  is tied to *paths that hold its bytes*, and `np search` reports the lexicographically smallest path plus one representative linker note — twelve
+  notes using one diagram report one of them by sort order. So F28 became two pieces, capability (`vision` passthrough + re-measured archives) and
+  placement (a `note → media` occurrence edge, migration 11). **The open question is what "place" means: the note, or the position inside it**
+  (line / heading / chunk). That decides one edge table or an edge with coordinates, and it changes what a media hit renders as — so it needs its own
+  design note before code.
+* **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
+  binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
+  attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.
+* **F31 — still owed by the human:** ~20 labelled retrieval queries from the real vault (`query<TAB>path`), or a recorded decline with the reason.
+  Nothing was invented in its place, because a benchmark built from guessed queries measures the guesses.
+* **F27 — unchanged:** deliberate do-not-implement, and an audit does not overturn it.
+
 ## Audited (main, docs-only) — the twelve unaudited backlog cards (2026-11-06)
 
 * Audited **F7, F9, F10, F15, F22, F25, F18–F21, F23, F24** in `docs/backlog-m2-followups.md`, one card at a time: read its *Where* and *Done
