@@ -830,6 +830,73 @@ fn an_over_wide_token_on_a_continuation_line_reaches_the_documented_ceiling() {
     );
 }
 
+/// **F25's shape, pinned: an entry whose *second* token is too wide for the line keeps its bullet.**
+/// The second token of every entry is `[[title]](rel)`, and spec §14 forbids breaking inside a path, so
+/// a title long enough to exceed the budget leaves no legal break between the bullet and that token.
+/// Before the fix `wrap` broke there anyway and published a physical line holding nothing but `-`: not an
+/// entry, refused by R2 in `verify_catalog_goldens.py`, and rendered by a Markdown viewer as an empty list
+/// item followed by two orphan lines. What the exemption still does is give the over-wide token a line of
+/// its own; what changed is that the bullet rides with it instead of being left behind on a line alone.
+#[test]
+fn an_over_wide_second_token_keeps_the_bullet_on_its_line() {
+    // 55 CJK ideographs are 110 display columns in one token, so `[[title]](rel)` cannot share a
+    // 100-column line with anything — the exact shape F16's fixture stepped around rather than pin.
+    let title = "\u{76EE}".repeat(55);
+    let wide = entry(&title, "plans/cjk-unbroken.md", "3 B", &["long"], 0, 0);
+
+    // Indents other than the default, because the bullet rule must not depend on how wide the
+    // continuation prefix is — the same reason F12 pinned its ceiling at 0, 2 and 5.
+    for indent in [0usize, 2, 5] {
+        let layout = CatalogConfig {
+            max_entries_per_file: 600,
+            continuation_indent: indent,
+        };
+        let rendered = render(std::slice::from_ref(&wide), &layout);
+        let text = contents(&rendered, "INDEX.md");
+        let lines: Vec<&str> = body(text).lines().collect();
+
+        assert_eq!(
+            lines[0],
+            format!("- [[{title}]](plans/cjk-unbroken.md)"),
+            "indent {indent}: an entry's first physical line is the bullet plus its link: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.trim() == "-"),
+            "indent {indent}: no physical line may hold nothing but the bullet: {lines:?}"
+        );
+        // The rest of the entry still gets a continuation line, and the indent is still charged to it.
+        assert_eq!(
+            lines[1],
+            format!("{}· 3 B · #long · \u{2192}0 \u{2190}0", " ".repeat(indent)),
+            "indent {indent}: the metadata follows on a continuation line: {lines:?}"
+        );
+        assert_eq!(lines.len(), 2, "indent {indent}: {lines:?}");
+
+        // What this costs, named rather than hidden: the over-wide line is exactly two columns wider
+        // than the token alone (the bullet and its space), and it is still over the limit — the fix moved
+        // the bullet, it did not remove an overflow no legal break can remove.
+        assert_eq!(
+            columns(lines[0]),
+            2 + columns(&format!("[[{title}]](plans/cjk-unbroken.md)")),
+            "indent {indent}: the bullet rides with the token: {lines:?}"
+        );
+        assert!(
+            columns(lines[0]) > 100,
+            "test premise: the token must still not fit, or this pins nothing"
+        );
+
+        // And the entry's bytes are untouched by where the break lands: unwrapped, it is the one line
+        // `entry_line` writes, which is what keeps a regeneration diff showing real changes only.
+        assert_eq!(
+            body(text)
+                .trim_end()
+                .replace(&format!("\n{}", " ".repeat(indent)), " "),
+            format!("- [[{title}]](plans/cjk-unbroken.md) \u{00b7} 3 B \u{00b7} #long \u{00b7} \u{2192}0 \u{2190}0"),
+            "indent {indent}: the logical line is unchanged by where the break lands"
+        );
+    }
+}
+
 #[test]
 fn a_token_longer_than_the_limit_is_not_split() {
     let path = format!("dir/{}/leaf.md", "a".repeat(140));
