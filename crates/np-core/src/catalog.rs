@@ -197,6 +197,28 @@ fn entry_line(entry: &CatalogEntry) -> String {
 /// `COLUMN_LIMIT + indent` columns. There is no alternative break point without splitting the token or
 /// dropping the indent, and both change published bytes.
 ///
+/// **The bullet never stays behind (F25).** The exemption above can also fire on an entry's *second* token —
+/// the whole `[[title]](rel)` link — because the budget charges the bullet and its space before that link is
+/// measured: it fits alongside `- ` only up to **98 columns**, so a 99-column link used to break and publish a
+/// physical line holding nothing but `-`. That is not an entry. R2 of `verify_catalog_goldens.py` requires
+/// every first physical line of an entry to start with `- `, and a Markdown viewer renders the shape as an
+/// empty list item followed by two orphan lines — in the one file this program writes for a person to read.
+/// So no break is taken before the second token, and the link rides with its bullet.
+///
+/// The cost, in both directions. A link of 101 columns or more was already forcing an over-budget line, so
+/// that shape only changes company (`2 + token` where the token had `token` to itself). **A link of exactly 99
+/// or 100 columns gains an over-budget first line the old layout did not have** — 101 or 102 columns where the
+/// three-line shape stayed inside the promise. That trade is the whole card, and it was taken for the bullet:
+/// the column limit is a courtesy this file already breaks for any path long enough (spec §14 forbids splitting
+/// one), while `- ` at the start of a line is what makes that line *an entry* — to R2, to `grep '^- \[\['`,
+/// and to whoever opens `INDEX.md` in a viewer.
+///
+/// No committed golden exercises either shape: F16's fixture stays inside the budget precisely so this case has
+/// no bytes to move, and the widest second token in any committed golden is 12 columns. That is why the shape
+/// is pinned in `tests/catalog.rs` rather than by a golden — R4's width exemption accepts an over-wide line
+/// only when it holds a *single* token, so the verifier would refuse a golden reading `- [[…]](…)`, and
+/// loosening a gate rule to admit one is a decision for whoever first wants those bytes committed.
+///
 /// Width is measured in display columns (UAX #11 via `unicode-width`, which carries Unicode 17.0.0 tables),
 /// not characters: a CJK
 /// ideograph or emoji occupies two columns and a combining mark none, so counting characters let a
@@ -204,20 +226,34 @@ fn entry_line(entry: &CatalogEntry) -> String {
 /// reads nothing but these bytes — no terminal, locale or environment — which is what keeps a
 /// regeneration byte-stable (spec §10). Ambiguous-width characters (`·`, `—`, `→`) count one, the
 /// non-CJK spelling; choosing the other one would rewrite every committed golden.
+/// Its only caller is [`render`], on a line `entry_line` wrote, so the first token is always the bullet —
+/// which is what makes "the second token" mean "the start of the entry" rather than some other pair.
 fn wrap(line: &str, indent: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
-    for token in line.split(' ') {
+    // Indexed rather than counted by hand: index 1 is the entry's second token, and that is the break F25
+    // forbids (clippy's `explicit_counter_loop` is right that a hand-kept counter reads worse here, and the
+    // index says the same thing).
+    for (index, token) in line.split(' ').enumerate() {
         // A continuation line spends `indent` columns on its prefix before its first token, so those
         // columns are already gone when deciding whether the next token still fits. Leaving the prefix
         // out of the budget let a wrapped entry reach `COLUMN_LIMIT + indent` on screen — 101 visible
         // columns against a 100-column promise.
         let prefix = if lines.len() > 1 { indent } else { 0 };
+        // **F25:** no break before an entry's second token. The first is the bullet, so a break taken there
+        // publishes a physical line holding nothing but `-` — refused by R2 of the golden verifier and shown
+        // by a Markdown viewer as an empty list item plus two orphan lines.
+        //
+        // So `index` counts tokens of the *logical* line, never of the physical one being filled. Gating on
+        // `lines.len()` instead — "still on the first line" — reads like the same thing and is not: it makes
+        // every first line unbreakable (a 133-column entry with twelve tags came out whole), while gating on
+        // "this line holds one token" would suppress the break after a continuation line whose single token
+        // is over-wide, which is the ceiling the exemption above documents and a test pins.
         let current = lines.last_mut();
         match current {
             None => lines.push(token.to_string()),
             Some(current) => {
                 let width = current.width() + prefix + 1 + token.width();
-                if width > COLUMN_LIMIT {
+                if width > COLUMN_LIMIT && index > 1 {
                     lines.push(token.to_string());
                 } else {
                     current.push(' ');

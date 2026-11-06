@@ -393,8 +393,16 @@ NP_TEST_MMPROJ_PATH=~/models/mmproj-embeddinggemma-2-Q8_0.gguf \
 
 Without them the default feature row prints **29** `NOT COVERAGE` lines and `--features local-model,vision` prints **38** —
 those numbers are a CI floor this repository checks, and they mean "compiled, never ran", never "passed". `$NP_TEST_VISION_LARGE`
-and `$NP_THREAD_*` gate two further cells the same way. GitHub Actions cannot execute jobs for this account today, so every
-claim in this repository's docs is backed by local exit codes instead.
+and `$NP_THREAD_*` gate two further cells the same way. **GitHub Actions does run this repository.** That sentence used to read "cannot execute
+jobs for this account today", which was true during the gap `todo.md` dates (no Windows steps from 2026-10-29 to 2026-10-31) and false ever since:
+measured on 2026-11-06, `Test (ubuntu-latest)`, `Test (windows-latest)` and `Feature local-model (ubuntu-latest)` each executed and each passed on
+every push to `main` at `2c65525`, `935b2cd` and `64a6b73` (runs `42171010611`, `42187057325`, `42188471272`) and on a branch push at `03cb04a`
+(run `42192715021`). So a build or test claim about Linux or Windows has CI behind it as well as the local exit codes quoted above — and absent CI
+output is still not evidence either way, which is the rule that round wrote down.
+
+What CI never has is the model weights, so the artifact-gated rows print their `NOT COVERAGE` there by design and every *measured* figure in these
+docs — bytes, milliseconds, vector counts — still comes from this host with those two variables set. macOS keeps its standing limit: the build fact
+only (the unix `statvfs` arm compiles), its number never read here.
 
 ## Where the thinking lives
 
