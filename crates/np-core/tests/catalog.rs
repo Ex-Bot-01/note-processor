@@ -860,10 +860,9 @@ fn an_over_wide_second_token_keeps_the_bullet_on_its_line() {
             format!("- [[{title}]](plans/cjk-unbroken.md)"),
             "indent {indent}: an entry's first physical line is the bullet plus its link: {lines:?}"
         );
-        assert!(
-            !lines.iter().any(|line| line.trim() == "-"),
-            "indent {indent}: no physical line may hold nothing but the bullet: {lines:?}"
-        );
+        // No separate "no line holds only `-`" assertion lives here: with the first line pinned exactly
+        // above and the file's whole entry pinned to two lines below, there is no third line for a stray
+        // bullet to hide on. It was dropped as entailed padding, not because the harm stopped mattering.
         // The rest of the entry still gets a continuation line, and the indent is still charged to it.
         assert_eq!(
             lines[1],
@@ -872,27 +871,74 @@ fn an_over_wide_second_token_keeps_the_bullet_on_its_line() {
         );
         assert_eq!(lines.len(), 2, "indent {indent}: {lines:?}");
 
-        // What this costs, named rather than hidden: the over-wide line is exactly two columns wider
-        // than the token alone (the bullet and its space), and it is still over the limit — the fix moved
-        // the bullet, it did not remove an overflow no legal break can remove.
+        // What the exemption costs, in absolute columns: `- `, then `[[` + 110 columns of title + `]]`,
+        // then a 23-column `(plans/cjk-unbroken.md)` — **139**, against the 100 the budget promises.
+        // Spelled as a number on purpose. The first version derived it from `lines[0]` itself
+        // (`2 + columns(the link)`), which is an identity for any title and therefore could not fail; a
+        // quantity taken out of the value under test asserts nothing. The exact figure carries the fixture
+        // premise as well: shorten the title and this line fails rather than quietly pinning nothing.
         assert_eq!(
             columns(lines[0]),
-            2 + columns(&format!("[[{title}]](plans/cjk-unbroken.md)")),
-            "indent {indent}: the bullet rides with the token: {lines:?}"
-        );
-        assert!(
-            columns(lines[0]) > 100,
-            "test premise: the token must still not fit, or this pins nothing"
+            139,
+            "indent {indent}: the cost of the exemption, in display columns: {lines:?}"
         );
 
-        // And the entry's bytes are untouched by where the break lands: unwrapped, it is the one line
-        // `entry_line` writes, which is what keeps a regeneration diff showing real changes only.
+        // And the entry's bytes are untouched by where the break lands. **What this guards is byte
+        // preservation, not F25**: it rejoins whatever lines came out, so it passed against the buggy
+        // three-line layout too (the review caught that). It stays because dropping a token or reordering
+        // the entry would fail here and nowhere else — `golden_render_matches_committed_bytes` cannot see
+        // this shape, no golden holds it.
+        // F25's own teeth are the two exact pins and the column figure above.
         assert_eq!(
             body(text)
                 .trim_end()
                 .replace(&format!("\n{}", " ".repeat(indent)), " "),
             format!("- [[{title}]](plans/cjk-unbroken.md) \u{00b7} 3 B \u{00b7} #long \u{00b7} \u{2192}0 \u{2190}0"),
             "indent {indent}: the logical line is unchanged by where the break lands"
+        );
+    }
+}
+
+/// **Where the bullet rule bites: 99 columns of link, not 101.** `wrap` charges the bullet and its space
+/// before measuring the entry's second token, so `[[title]](rel)` fits on the first line up to 98 columns and
+/// no further. Below the threshold the published bytes are what they always were — that is what makes this a
+/// boundary rather than a preference — and one column later the link rides with its bullet at 101 columns,
+/// which is the cost `wrap`'s doc names for exactly this width band.
+#[test]
+fn the_bullet_rule_bites_at_ninety_nine_columns_of_link() {
+    // The first line is `- ` then `[[` + title + `]]` then `(plans/x.md)`: 2 + (w + 4) + 12 columns, so the
+    // link itself is w + 16. An 82-column title therefore puts the link at exactly 98 — the widest that fits
+    // beside the bullet inside 100 — and an 83-column one at 99, one past it.
+    for (title_width, expected_line) in [
+        (82usize, "fits beside the bullet, as it always did"),
+        (83, "rides with it, one column over the promise"),
+    ] {
+        let title = "t".repeat(title_width);
+        let link_columns = title_width + 16;
+        let line_one = format!("- [[{title}]](plans/x.md)");
+        assert_eq!(
+            columns(&line_one),
+            2 + link_columns,
+            "test setup: {title_width} → a {}-column link ({expected_line})",
+            link_columns
+        );
+
+        let rendered = render(
+            &[entry(&title, "plans/x.md", "3 B", &["long"], 0, 0)],
+            &config(600),
+        );
+        let lines: Vec<&str> = body(contents(&rendered, "INDEX.md")).lines().collect();
+
+        assert_eq!(
+            lines[0], line_one,
+            "{title_width}-column title ({expected_line}): {lines:?}"
+        );
+        // The break after the link is the ordinary one in both cases: `·` no longer fits, so the metadata
+        // starts a continuation line. A threshold pushed one token too far (glue three tokens, not two)
+        // lands `·` on the first line and fails here — which is what pins 98/99 rather than 100/101.
+        assert_eq!(
+            lines[1], "  · 3 B · #long · →0 ←0",
+            "{title_width}-column title: the metadata still starts line two: {lines:?}"
         );
     }
 }

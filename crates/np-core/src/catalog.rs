@@ -197,17 +197,27 @@ fn entry_line(entry: &CatalogEntry) -> String {
 /// `COLUMN_LIMIT + indent` columns. There is no alternative break point without splitting the token or
 /// dropping the indent, and both change published bytes.
 ///
-/// **The bullet never stays behind (F25).** The exemption above would take its break *before* an entry's
-/// second token — the whole `[[title]](rel)` link — and leave a physical line holding nothing but `-`. That
-/// is not an entry: `verify_catalog_goldens.py`'s R2 requires every first physical line of an entry to start
-/// with `- `, R4's width exemption covers only a line that holds a *single* token, and a Markdown viewer
-/// renders the shape as an empty list item followed by two orphan lines. So no break is taken while the
-/// current line still holds nothing but the bullet, and the over-wide link rides with it: that first line can
-/// reach `2 + token` columns instead of `token`. The overflow itself is unchanged — the same token was
-/// already on a line alone two columns narrower — and no committed golden exercises the shape (F16's fixture
-/// stays inside the budget precisely so this case has no bytes to move), which is why it is pinned in
-/// `tests/catalog.rs` rather than by a golden: R4 as written would refuse such a golden, and loosening a gate
-/// rule to accept it is a decision for whoever first wants those bytes committed.
+/// **The bullet never stays behind (F25).** The exemption above can also fire on an entry's *second* token —
+/// the whole `[[title]](rel)` link — because the budget charges the bullet and its space before that link is
+/// measured: it fits alongside `- ` only up to **98 columns**, so a 99-column link used to break and publish a
+/// physical line holding nothing but `-`. That is not an entry. R2 of `verify_catalog_goldens.py` requires
+/// every first physical line of an entry to start with `- `, and a Markdown viewer renders the shape as an
+/// empty list item followed by two orphan lines — in the one file this program writes for a person to read.
+/// So no break is taken before the second token, and the link rides with its bullet.
+///
+/// The cost, in both directions. A link of 101 columns or more was already forcing an over-budget line, so
+/// that shape only changes company (`2 + token` where the token had `token` to itself). **A link of exactly 99
+/// or 100 columns gains an over-budget first line the old layout did not have** — 101 or 102 columns where the
+/// three-line shape stayed inside the promise. That trade is the whole card, and it was taken for the bullet:
+/// the column limit is a courtesy this file already breaks for any path long enough (spec §14 forbids splitting
+/// one), while `- ` at the start of a line is what makes that line *an entry* — to R2, to `grep '^- \[\['`,
+/// and to whoever opens `INDEX.md` in a viewer.
+///
+/// No committed golden exercises either shape: F16's fixture stays inside the budget precisely so this case has
+/// no bytes to move, and the widest second token in any committed golden is 12 columns. That is why the shape
+/// is pinned in `tests/catalog.rs` rather than by a golden — R4's width exemption accepts an over-wide line
+/// only when it holds a *single* token, so the verifier would refuse a golden reading `- [[…]](…)`, and
+/// loosening a gate rule to admit one is a decision for whoever first wants those bytes committed.
 ///
 /// Width is measured in display columns (UAX #11 via `unicode-width`, which carries Unicode 17.0.0 tables),
 /// not characters: a CJK
