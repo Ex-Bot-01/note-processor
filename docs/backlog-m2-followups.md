@@ -843,6 +843,22 @@ runs a user cares about.
   and the metadata dump — so the volume is not confined to `np embed`; **any command that resolves a lazy provider and then
   encodes** pays it, which makes the escape hatch in §"what it would take" more urgent than an embed-only reading suggested.
 
+**Closed on 2026-11-06 by a level the user chose.** `llama_log_set` is declared and installed once, from np-cli's `embed_provider`, behind
+`local-model`; the names, the gate and the precedence live in ungated `np_core::loglevel` because `[embeddings] log_level` is config vocabulary
+and np-cli builds np-core with `default-features = false`. np-core installs nothing on its own — the sink is process-global, so quieting a host
+program's stderr stays the host program's decision. Default `warn`; `NP_LLAMA_LOG_LEVEL` fills the key when the file leaves it unset and does
+**not** override a file that named one (this card's first draft argued the reverse while citing §12 rule 7, which says the opposite).
+
+Two corrections to this card, kept rather than edited away. The volume was understated: measured against the pre-F33 binary, `np search` wrote
+**145,816 bytes over 1,553 lines**, not ~2,985 / ~120 — twice, identical. And the claim above that the thread sweep and the R6d benchmark "read
+some of these lines" is **false**: both committed probe logs contain zero llama.cpp loader lines (`grep -c` = 0 over 190 and 82 lines), because
+the sweep sends each cell's combined output to a scratch file it never commits and parses only its own tags. So the escape hatch exists for a
+human diagnosing a load failure, which is a weaker justification than this card offered — and the design carries the weaker one.
+
+Merged at `62ddcfb`; CI runs `42124160287` and `42128684675` green on all three jobs; measured ladder `off` 0 B / `error` 0 B / `warn` 424 B /
+`info` 11,691 B / `debug` 145,816 B — the last byte-identical to the pre-F33 binary, which is what shows the gate adds nothing. Design:
+`docs/design-f33-llama-log-level.md`.
+
 ## F34 — the fetch disk preflight cannot answer on Windows, so rule 6 silently does not happen there
 
 Filed 2026-11-05 from run `42061786030`, job `127365138173`: `preflight_refuses_before_byte_one_when_the_disk_cannot_hold_the_pair`

@@ -24,6 +24,29 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
+## Shipped (main) — F33 llama.cpp's stderr at a chosen level (merged 2026-11-06 at `62ddcfb`, branch deleted)
+
+* A model load wrote **145,816 bytes over 1,553 lines** to stderr ahead of a one-line answer (`np search`, measured twice against the
+  pre-F33 binary). The backlog card said ~2,985 bytes and was 49× low; it also claimed the thread sweep parses those lines, which is false —
+  both committed probe logs hold zero loader lines. Both corrections are in the card rather than edited away.
+* `np_core::loglevel` owns the five names, the pure gate over llama.cpp's numbers and the precedence, **ungated on purpose**: the key is config
+  vocabulary and np-cli builds np-core with `default-features = false`, so a gated enum would parse in one build and refuse as unknown in
+  another. Only `llama_log_set`, the callback and `set_log_level` sit behind `local-model`, and np-core installs nothing for anybody.
+* Default `warn`. Measured ladder: `off` 0 B, `error` 0 B, `warn` **424 B / 4 lines**, `info` 11,691 B, `debug` **145,816 B — byte-identical to
+  the pre-F33 binary**. The four survivors are upstream `LLAMA_LOG_WARN` about the artifact's tokenizer, so this round does not claim an empty
+  stderr: keeping warnings is the point of a `warn` default.
+* Precedence follows the program's existing rule (file wins; env fills what the file left unset; empty means unset), **not** the "env override"
+  my design draft argued for while citing §12 rule 7 — that rule says the environment never overrides a file that named a value, and it was
+  amended by the human on 2026-11-04, so an exception was not this round's to invent. Measured: `log_level = "warn"` in the file plus
+  `NP_LLAMA_LOG_LEVEL=info` stays quiet.
+* **Review value, recorded because narrow briefs are what made it possible:** a three-item design review caught the precedence contradiction and
+  two test specifications no harness here can execute (np-cli is bin-only; np-core cannot capture its own fd 2 — and a case that graded
+  llama.cpp's default sink could never have been red). A four-item code review found a `debug_assert!` sitting outside the `catch_unwind` whose
+  comment claimed to cover it, and proved my strongest CLI case was **vacuous** — every assertion in it was an absence-assertion, so a default of
+  `Off` passed. Both fixed, and the `Off` mutant re-run to confirm it now dies. Seven mutants total, all killed, sources restored with `cmp`.
+* Feature rows earned their keep again: a public-to-private intra-doc link (`set_log_level` → `log_gate`) was invisible at default features and
+  fatal under `cargo doc --features local-model`. Second round running where only the feature rows found a defect.
+
 ## Shipped (main) — F32 search refusals name their own cause (merged 2026-11-05 at `18d0f5a`, branch deleted)
 
 * `np search` on a workspace whose config says `local-model` but has no model row used to print
