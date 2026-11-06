@@ -279,6 +279,13 @@ Refusal classes, all of them counts on the report rather than exit codes (runtim
 | `over-budget` | the encoded image exceeds the context window's room — ceiling = window = 8,192 (§5 of the local-embeddings design), against a published default cost of **280 tokens per image** (§1.2), so at the default budget this should never fire and firing means something is wrong |
 | `vision-unavailable` | built without the vision code, or `mtmd_support_vision` answers false |
 
+**[Added 2026-11-06 by F28: an eighth row, `projector-absent`.** This table's `vision-unavailable` carried three meanings, and one of them —
+"the projector is not installed" — needed a command the reader could run, which "rebuild with the feature" is not. The class now means
+"this build has no image code" (or a provider refusal with no class of its own), and a `vision` build whose workspace has no recorded
+projector answers `projector-absent`. Decided and measured in `docs/design-f28-image-embedding-in-np.md`; the distinction is emitted from
+`embed_run`'s image pass out of `crate::embed::ImageBlocker`, so a provider says what is missing and the report decides which class that
+is — which is also why the new class is a `media` label and never a seam payload.]**
+
 `over-budget` is measured after encoding rather than guessed from file size, for the same reason the tokenizer probe came
 before the chunk-size constant: a 40 KB PNG and a 4 MB one can cost the same number of patches.
 

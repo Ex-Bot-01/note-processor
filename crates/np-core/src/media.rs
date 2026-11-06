@@ -217,8 +217,15 @@ pub enum MediaRefusal {
     Undecodable,
     /// The encoded image needs more of the context window than the run allows (§8 measures this after encoding).
     OverBudget,
-    /// This build cannot read images, or the loaded model carries no projector.
+    /// This build cannot read images: it was compiled without the image code. (Before F28 this class also covered "the
+    /// projector is not installed", which sent someone to rebuild a binary when the fix was one file — see
+    /// [`Self::ProjectorAbsent`].)
     VisionUnavailable,
+    /// This build has the image code and this workspace has no projector for it to load: not recorded by this database,
+    /// or present but not the bytes that record vouches for. Emitted from [`crate::embed_run`]'s image pass out of
+    /// [`crate::embed::ImageBlocker::ProjectorAbsent`], and the reason it is its own class rather than a sentence inside
+    /// `vision-unavailable` is that the two advise different actions — fetch a file, or build with a feature (F28).
+    ProjectorAbsent,
 }
 
 /// These bytes are not a raster this build can decode (§8). **The one definition**; `crate::vision` re-exports it, and
@@ -237,7 +244,7 @@ impl MediaRefusal {
     /// The §8 kebab-case spelling, which is what an embed report prints and its JSON repeats; Tasks 5, 6 and 8 label
     /// through this one function so a class cannot be spelled two ways.
     ///
-    /// **Three of these six return a `const`, not a literal** — [`UNDECODABLE`], [`OVER_BUDGET`] and
+    /// **Three of these seven return a `const`, not a literal** — [`UNDECODABLE`], [`OVER_BUDGET`] and
     /// [`VISION_UNAVAILABLE`] are also emitted by code outside this module (the vision seam, and
     /// [`crate::embed::Embedder::embed_image`]'s default refusal), so they have exactly one spelling in the tree. A
     /// measured consequence of keeping them literal: renaming `embed`'s copy on 2026-11-03 left every default-build test
@@ -252,6 +259,10 @@ impl MediaRefusal {
             MediaRefusal::Undecodable => UNDECODABLE,
             MediaRefusal::OverBudget => OVER_BUDGET,
             MediaRefusal::VisionUnavailable => VISION_UNAVAILABLE,
+            // A literal, like the three resolution classes above it: emitted from one place (`embed_run`'s mapping from
+            // `ImageBlocker::ProjectorAbsent`) and never by a provider's error payload, so there is no second spelling to
+            // keep in step. Pinned by name in `tests/embed_media.rs`.
+            MediaRefusal::ProjectorAbsent => "projector-absent",
         }
     }
 }

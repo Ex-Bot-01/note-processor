@@ -1188,6 +1188,26 @@ impl Embedder for LazyLocalEmbedder {
         self.mmproj.is_some()
     }
 
+    /// The reason this provider cannot encode, in the one build where there are two reasons to choose between (F28).
+    ///
+    /// Under `vision` this type *has* the image code, so an absent projector is the only thing left that can make
+    /// [`Self::supports_images`] answer `false` — hence [`crate::embed::ImageBlocker::ProjectorAbsent`] rather than the
+    /// trait's default [`crate::embed::ImageBlocker::Build`], which would tell someone to rebuild a binary that already
+    /// contains the code. Under `#[cfg(not(feature = "vision"))]` this method is not implemented at all and the default
+    /// answers `Build`, which is then the truth: there is no projector this build could load.
+    ///
+    /// Those paths are spelled in full because this module imports none of `embed`'s image vocabulary. A bare
+    /// `[ImageBlocker]` link resolves on the `local-model,vision` rustdoc row and breaks the other two — measured
+    /// 2026-11-06, which is the argument for keeping the rustdoc rows on every feature set rather than on defaults.
+    #[cfg(feature = "vision")]
+    fn image_blocker(&self) -> Option<crate::embed::ImageBlocker> {
+        if self.mmproj.is_some() {
+            None
+        } else {
+            Some(crate::embed::ImageBlocker::ProjectorAbsent)
+        }
+    }
+
     /// Load if nothing is resident yet, then hand the bytes to the inner [`LocalEmbedder`] — the only struct in this build
     /// that holds a projector next to the model it points into.
     ///

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use np_core::config::{Config, EmbeddingProvider, EmbeddingsConfig};
 use np_core::db::{self, Db};
-use np_core::embed::{EmbedError, Embedder, Vector};
+use np_core::embed::{EmbedError, Embedder, ImageBlocker, Vector};
 use np_core::embed_run::{embed, EmbedOutcome};
 use np_core::hash::sha256_bytes;
 use np_core::media::{self, MediaRefusal};
@@ -202,6 +202,9 @@ struct FakeVision {
     /// When set, every encode refuses with the **`TokenBudgetExceeded` variant** instead of a class label — the shape a
     /// text-path refusal has, which the classification must answer by type rather than by prose.
     budget_variant: bool,
+    /// What [`Embedder::image_blocker`] answers while `vision` is false. The default (`None`) inherits the trait's
+    /// answer, which is [`ImageBlocker::Build`] — "this build has no image code".
+    blocker: Option<ImageBlocker>,
 }
 
 impl FakeVision {
@@ -216,6 +219,15 @@ impl FakeVision {
     /// A text-only provider: `supports_images() == false`, which is [`Embedder`]'s default answer.
     fn text_only() -> Self {
         Self::default()
+    }
+
+    /// A provider from a build that **does** carry the image code and has no projector to load (F28): incapable, for a
+    /// reason the operator can act on by installing a file rather than rebuilding.
+    fn without_projector() -> Self {
+        Self {
+            blocker: Some(ImageBlocker::ProjectorAbsent),
+            ..Self::default()
+        }
     }
 
     /// A provider that attempts every encode and refuses each one with `class`.
@@ -261,6 +273,14 @@ impl Embedder for FakeVision {
 
     fn supports_images(&self) -> bool {
         self.vision
+    }
+
+    fn image_blocker(&self) -> Option<ImageBlocker> {
+        match self.blocker {
+            Some(blocker) => Some(blocker),
+            None if self.vision => None,
+            None => Some(ImageBlocker::Build),
+        }
     }
 
     fn embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError> {
@@ -584,7 +604,50 @@ fn deleting_the_last_referrer_removes_the_media_row_and_its_vector() {
 // §8: one case per refusal class, and none of them is an exit code
 // ---------------------------------------------------------------------------
 
+/// **The two ways to be incapable are different sentences** (F28). `vision-unavailable` tells someone to rebuild the
+/// binary with the feature that has the image code; `projector-absent` tells them to install or fetch one file. The
+/// first version of this round had only the first, so a workspace that needed 554 MB of projector was advised to do
+/// nothing at all — and the count stayed right while the advice went wrong.
+#[test]
+fn a_build_with_image_code_and_no_projector_refuses_as_projector_absent() {
+    let setup = scanned(&[("a.md", "![one](assets/one.png)\n")], &["assets/one.png"]);
+    setup.install_model();
+    setup.touch_artifact();
+
+    let mut provider = FakeVision::without_projector();
+    let report = run(&setup, &mut provider);
+
+    assert_eq!(
+        report.images_seen, 1,
+        "the figure was still counted as written"
+    );
+    assert_eq!(report.images_embedded, 0);
+    assert_eq!(
+        classes(&report)
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>(),
+        vec!["projector-absent"],
+        "the class names the file to install, not the build to rebuild"
+    );
+    assert_eq!(
+        report.outcome,
+        EmbedOutcome::Current,
+        "a refusal is not a failure"
+    );
+
+    // Mutations this catches: `embed_run` answering `VisionUnavailable` for every incapable provider — the posture
+    // this case replaces, and it fails here on the label — and a provider answering `image_blocker()` with `Build`
+    // when its projector is merely missing, which fails the same assertion from the other side.
+}
+
 /// A provider with no projector refuses once per image and reports zero errors (§8's `vision-unavailable`).
+///
+/// The other half of F28's pair — "this build has no image code" stays in this class while
+/// [`a_build_with_image_code_and_no_projector_refuses_as_projector_absent`] takes the new one. Its assertions are
+/// unchanged from before that split, which is the point: the new arm had to be added *beside* this class, not in place of
+/// it. A mutation mapping every incapable provider to `projector-absent` (asking `image_blocker().is_some()` rather than
+/// which blocker) fails here and passes there, so the pair is what keeps both sentences honest.
 #[test]
 fn a_provider_without_images_refuses_once_per_image_and_reports_no_errors() {
     let setup = scanned(
