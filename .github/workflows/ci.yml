@@ -213,3 +213,47 @@ jobs:
             exit 1
           fi
           echo "ok: llama_version defined locally (static linkage from an archive this build produced)"
+
+  # **F28's gap, closed.** Every `--features local-model,vision` row this repository ever ran was graded on `-p np-core`,
+  # while the crate a user actually builds — np-cli — did not declare the feature at all. That pair therefore failed at
+  # *feature resolution* ("the package 'np-cli' does not contain this feature: vision", exit 101), which is a different
+  # failure from a compile error and one no np-core row can produce. A green row proving a library builds some way says
+  # nothing about whether the binary can be built that way; this job is the difference between those two claims, and it is
+  # why the card could stay open while CI was green for five days.
+  feature-vision:
+    name: Feature local-model,vision (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain components
+        run: rustup component add clippy rustfmt
+      # Same cache key as the row above — one tree, two feature sets. Keyed on the pin file *and* the unpack script for the
+      # reason R6b0 review P2-3 recorded: an layout change must invalidate the cache too.
+      - name: Cache the pinned llama.cpp source
+        uses: actions/cache@v4
+        with:
+          path: .vendor
+          key: llama-cpp-${{ hashFiles('third_party/llama-cpp.toml', 'scripts/vendor-llama-cpp.sh') }}
+      - name: Vendor llama.cpp
+        run: ./scripts/vendor-llama-cpp.sh
+      # The mechanical half of F28 as a gate: `np` itself, with the pair. This is the step that would have failed on
+      # 2026-11-04 when the card was filed, and it costs one `cargo check`.
+      - name: Check the CLI with the pair
+        run: cargo check --locked -p np-cli --features local-model,vision
+      - name: Clippy (np-core and np-cli, pair on)
+        run: cargo clippy --locked -p np-core -p np-cli --features local-model,vision --all-targets -- -D warnings
+      # Rustdoc is the second invisible way a feature goes ungraded, and it bites in both directions across this workspace:
+      # a doc link to `crate::local_model::…` resolves on no default build, while a bare `[ImageBlocker]` link resolves *only*
+      # here and breaks the other two. Both were measured on 2026-11-06, in the order "default passes, this row fails".
+      - name: Docs (pair on)
+        env:
+          RUSTDOCFLAGS: "--deny warnings"
+        run: cargo doc --locked -p np-core -p np-cli --features local-model,vision --no-deps
+      # What this row covers with no 554 MB projector on a runner, and what it cannot. It runs for real: which bytes may be
+      # handed to `with_mmproj` (an unrecorded file stays a file; a recorded one is hashed once and stamped; a same-size swap
+      # behind a live stamp is trusted — the documented shortcut, asserted rather than assumed; a moved digest refuses), the
+      # capability-versus-projector blocker distinction, and §8's class-constant agreement. It does **not** encode an image:
+      # every projector-backed case in this file prints `NOT COVERAGE` without both artifacts, which is the difference between
+      # "compiled" and "ran" that F18's rule exists to keep loud.
+      - name: Test (pair on, artifacts absent ⇒ printed NOT COVERAGE)
+        run: cargo test --locked -p np-core --features local-model,vision --test local_vision -- --nocapture

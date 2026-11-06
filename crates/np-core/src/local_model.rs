@@ -1146,6 +1146,96 @@ pub fn verify_artifact(db: &Db, row: &ModelRow, path: &Path) -> Result<ArtifactC
     }
 }
 
+/// Which projector file, if any, this install may hand to [`LazyLocalEmbedder::with_mmproj`] — and the only rule for that
+/// question (F28 step 2).
+///
+/// **Three answers, because there are three facts.** `Ok(None)` means *this workspace has no projector*: the member was never
+/// recorded here, or the file is not on disk. That is not a failure — it is the fact behind §8's `projector-absent` refusal,
+/// whose advice ("fetch or install the `mmproj` member") is only correct if an unrecorded file really is treated as absent.
+/// `Ok(Some(path))` means the bytes at that path are the ones this database vouches for. `Err` means a file is present,
+/// recorded, and **not** what the record says — which refuses the run rather than encoding every figure in the vault with an
+/// encoder of unknown provenance and stamping the rows as though the pinned pair produced them.
+///
+/// **Why the rule lives here rather than in `np-cli`.** The CLI's job is to decide *whether to ask* (a build without
+/// `vision` never does); which bytes qualify is the same install-level fact `verify_artifact` holds for the main artifact,
+/// and two copies of it would disagree in exactly one direction: the CLI would accept a file the pin table refuses.
+///
+/// **The stamp shortcut, inherited deliberately.** Size plus whole-second mtime matching the last verification means no hash
+/// is computed — the same D12 rule as the main artifact, with the same caveat written there: a corruption detector, not a
+/// security boundary, and a same-size swap inside one second passes it. The pair is read from `model_files`, whose
+/// [`crate::db::record_model_file`] clears it whenever the recorded digest changes, so new bytes never inherit an old
+/// "already checked".
+#[cfg(feature = "vision")]
+pub fn projector_artifact(
+    db: &Db,
+    id: &str,
+    models_dir: &Path,
+) -> Result<Option<PathBuf>, EmbedError> {
+    let member = crate::pins::MMPROJ_MEMBER;
+    let unreadable_index = || EmbedError::Unavailable(PROJECTOR_RECORD.to_string());
+    let recorded = db::model_files(db, id)
+        .map_err(|_| unreadable_index())?
+        .into_iter()
+        .find(|file| file.name == member);
+    let Some(recorded) = recorded else {
+        // Nothing recorded: the file someone dropped in the models directory is a file, not a projector.
+        return Ok(None);
+    };
+    let path = models_dir.join(models::member_artifact_name(id, member));
+    let accessible = models::access(&path);
+    let Ok(meta) = fs::metadata(&accessible) else {
+        return Ok(None);
+    };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let size = i64::try_from(meta.len()).map_err(|_| EmbedError::ArtifactUnreadable {
+        path: path.clone(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "projector size is not representable as SQLite's INTEGER",
+        ),
+    })?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|when| when.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs() as i64);
+
+    if let Some((stamped_size, stamped_mtime)) =
+        db::member_stamp(db, id, member).map_err(|_| unreadable_index())?
+    {
+        if size == stamped_size && mtime == Some(stamped_mtime) {
+            return Ok(Some(path));
+        }
+    }
+
+    let found = hash::sha256_file(&accessible).map_err(|err| EmbedError::ArtifactUnreadable {
+        path: path.clone(),
+        source: models::hash_io(err),
+    })?;
+    if !digests_agree(&found, &recorded.sha256) {
+        return Err(EmbedError::ArtifactDigestMismatch {
+            path,
+            expected: recorded.sha256,
+            found,
+        });
+    }
+    // A stamp is written only after the bytes matched, and never turns a verified projector into a failed one: a
+    // filesystem that will not answer `modified()` simply earns a hash next run — the slower-and-honest half of D12, not
+    // a reason to refuse an image. A refused *write* is reported nowhere for the same reason `verify_artifact` reports it
+    // as `VerifiedUnstampable` rather than failing: the bytes proved themselves, and the next run pays for the miss.
+    if let Some(mtime) = mtime {
+        let _ = db::record_member_stamp(db, id, member, size, mtime);
+    }
+    Ok(Some(path))
+}
+
+/// The label raised when the index cannot say what it recorded about the projector (§3's fifth class: a label we chose,
+/// never the driver's own text — see [`EmbedError::Unavailable`]'s payload rule).
+#[cfg(feature = "vision")]
+const PROJECTOR_RECORD: &str = "the projector record could not be read from the index";
+
 /// Compare two spellings of the same sha256, ignoring hex case only.
 fn digests_agree(found: &str, expected: &str) -> bool {
     found.eq_ignore_ascii_case(expected.trim())

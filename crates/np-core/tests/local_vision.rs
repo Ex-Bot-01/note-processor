@@ -5,9 +5,10 @@
 //! prints `NOT COVERAGE` and passes when `NP_TEST_MODEL_PATH` or `NP_TEST_MMPROJ_PATH` is unset (F18: an absent
 //! 310 MB or 554 MB file must not look like a failure, and must not look like coverage either). No `#[ignore]`,
 //! for the standing reason: an ignored test is the silent skip that rule exists to forbid. Two cases —
-//! [`refusal_classes_are_the_report_labels_verbatim`] and [`a_vision_provider_without_a_projector_blames_the_file_not_the_build`]
-//! — need the feature but no artifact, and they are the lines in this file that run on a CI row without model files:
-//! both are statements about what a provider answers *before* it loads anything, which is exactly when they have to be
+//! [`refusal_classes_are_the_report_labels_verbatim`],
+//! [`a_vision_provider_without_a_projector_blames_the_file_not_the_build`] and the three `projector_*` cases below it —
+//! need the feature but no artifact, and they are the lines in this file that run on a CI row without model files: all of
+//! them are statements about what a provider answers *before* it loads anything, which is exactly when they have to be
 //! true.
 //!
 //! ```text
@@ -28,14 +29,14 @@
 //! * **Token cost is read back, never assumed.** `last_token_cost()` is what §8's `over-budget` rule will be
 //!   measured against, so the flat 280 from the model card gets checked against what this builder really does.
 
-/// The projector-gated claims. All of them need `vision`, and all but two need both artifacts.
+/// The projector-gated claims. All of them need `vision`, and all but four need both artifacts.
 #[cfg(feature = "vision")]
 mod vision {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
-    use np_core::db::ModelRow;
+    use np_core::db::{self, Db, ModelRow};
     use np_core::embed::{EmbedError, Embedder, ImageBlocker, Vector};
     use np_core::local_model::{self, LazyLocalEmbedder, LoadedModel, LocalEmbedder};
     use np_core::media::MediaRefusal;
@@ -387,6 +388,168 @@ mod vision {
             "BLOCKER: vision build with no projector → `projector-absent`; with a projector path configured → unblocked. \
              No artifact was read (`loaded()` stays false), which is what keeps the refusal cheap."
         );
+    }
+
+    // --- F28 step 2: which file, if any, gets handed to `with_mmproj` -----------------------------------------
+    //
+    // `projector_artifact` is the one rule behind that question, so it is tested here rather than through the CLI: the
+    // rule has to hold identically in a build with no model weights at all, which is every CI row and every machine
+    // that has not downloaded 554 MB. A real projector never enters — this is about *which bytes are offered*, not what
+    // they encode.
+
+    /// A workspace models directory plus an open database over it.
+    struct Models {
+        dir: PathBuf,
+        db: Db,
+        _tmp: TempDir,
+    }
+
+    fn models() -> Models {
+        let tmp = TempDir::new().expect("test setup: tempdir");
+        let dir = tmp.path().join("models");
+        fs::create_dir_all(&dir).expect("test setup: models dir");
+        let db = Db::open(&tmp.path().join("index.db")).expect("test setup: workspace db");
+        Models { dir, db, _tmp: tmp }
+    }
+
+    /// Write `bytes` at the path a projector of `id` belongs at, and return it.
+    fn projector_file(models: &Models, id: &str, bytes: &[u8]) -> PathBuf {
+        let path = models
+            .dir
+            .join(np_core::models::member_artifact_name(id, "mmproj"));
+        fs::write(&path, bytes).expect("test setup: write the projector file");
+        path
+    }
+
+    /// **Nothing recorded means nothing handed over** — and a file sitting in the models directory does not change that.
+    /// The refusal the operator then sees is `projector-absent`, whose advice is "install or fetch it", and that advice is
+    /// only right if an unrecorded file really is treated as absent rather than as a projector with an unknown history.
+    #[test]
+    fn a_projector_this_database_never_recorded_is_not_handed_over() {
+        let models = models();
+        let id = "embeddinggemma-2";
+
+        assert_eq!(
+            local_model::projector_artifact(&models.db, id, &models.dir)
+                .expect("an absent projector is not a failure"),
+            None,
+            "no `model_files` row, so nothing to offer"
+        );
+
+        // The same answer with the file physically present: bytes nobody vouched for are not a projector, they are a
+        // file in a directory. Handing them over would encode figures with an encoder of unknown provenance and stamp
+        // the vectors as though the pinned model produced them — R6c2's defect with a different noun.
+        projector_file(&models, id, b"somebody dropped this here");
+        assert_eq!(
+            local_model::projector_artifact(&models.db, id, &models.dir)
+                .expect("still not a failure"),
+            None,
+            "a file the database does not vouch for stays a file"
+        );
+
+        // Mutation this catches: resolving by path existence alone, which is the shape that would make `np models
+        // install --member` optional and every digest in `model_files` decorative.
+    }
+
+    /// **Recorded and matching means handed over, with a stamp written** — and the stamp is what keeps the next run from
+    /// hashing 554 MB again. The second act is the load-bearing one: bytes that no longer match are still handed over
+    /// while the stamp stands, which is the same documented shortcut the main artifact takes (size plus whole-second
+    /// mtime is a corruption detector, not a security boundary), and it is asserted rather than assumed because a mutant
+    /// that always re-hashes would otherwise pass every case in this file while costing every run minutes.
+    #[test]
+    fn a_recorded_projector_is_handed_over_then_trusted_on_its_stamp() {
+        let models = models();
+        let id = "embeddinggemma-2";
+        let bytes = b"mmproj-shaped bytes, digested once";
+        let digest = np_core::hash::sha256_bytes(bytes);
+        let path = projector_file(&models, id, bytes);
+        // The recorded length is read from the same `bytes` that were written, so a future edit to the fixture cannot
+        // leave the row describing a different file than the one on disk — which would make act one fail for the wrong
+        // reason and look like a digest bug.
+        db::record_model_file(
+            &models.db,
+            id,
+            "mmproj",
+            &digest,
+            i64::try_from(bytes.len()).expect("a test fixture fits i64"),
+        )
+        .expect("test setup: record the member");
+
+        assert_eq!(
+            local_model::projector_artifact(&models.db, id, &models.dir)
+                .expect("the bytes match the record"),
+            Some(path.clone()),
+            "a recorded projector at its own path is handed over"
+        );
+        // `(size, mtime)` as one pair: `db::member_stamp` returns half a pair as no stamp at all, so reaching `Some`
+        // already proves both halves were written — an assertion that only the size was stored could not tell a
+        // half-written stamp from a working shortcut.
+        let stamped = db::member_stamp(&models.db, id, "mmproj")
+            .expect("read the stamp back")
+            .expect("verifying writes both halves of a stamp");
+        assert_eq!(stamped.0, bytes.len() as i64);
+
+        // Second act: replace the bytes with a **same-size** payload, *then* set the mtime to the stamped value — in that
+        // order, because writing a file moves its mtime and the shortcut keys on size plus whole-second mtime. Same size is
+        // the trick, so it is built rather than counted: `swapped` has `bytes.len()` bytes by construction and no future
+        // edit to the fixture can quietly make the swap detectable by length alone.
+        let swapped = vec![b'x'; bytes.len()];
+        assert_ne!(
+            np_core::hash::sha256_bytes(&swapped),
+            digest,
+            "a same-size swap that hashes the same would prove nothing"
+        );
+        fs::write(&path, &swapped).expect("test setup: swap the bytes");
+        let rolled = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(
+                u64::try_from(stamped.1).expect("a stamp mtime is a unix second"),
+            );
+        fs::File::options()
+            .append(true)
+            .open(&path)
+            .expect("test setup: open for utime")
+            .set_modified(rolled)
+            .expect("test setup: roll the mtime back");
+
+        assert_eq!(
+            local_model::projector_artifact(&models.db, id, &models.dir).expect("the stamp still stands"),
+            Some(path),
+            "a stamped projector is trusted without re-hashing — the documented shortcut, not a bug to fix"
+        );
+    }
+
+    /// **Recorded and *not* matching refuses before anything loads.** This is the arm that keeps `model_files` honest:
+    /// a swapped projector would otherwise encode every figure in the vault with an unknown encoder and stamp the rows as
+    /// though the pinned pair produced them, and search would rank them beside text vectors forever.
+    #[test]
+    fn a_recorded_projector_whose_bytes_moved_refuses_before_anything_loads() {
+        let models = models();
+        let id = "embeddinggemma-2";
+        let wanted = b"the bytes the record vouches for";
+        let digest = np_core::hash::sha256_bytes(wanted);
+        let path = projector_file(&models, id, b"different bytes on disk");
+        db::record_model_file(
+            &models.db,
+            id,
+            "mmproj",
+            &digest,
+            i64::try_from(wanted.len()).expect("a test fixture fits i64"),
+        )
+        .expect("test setup: record the member");
+
+        let err = local_model::projector_artifact(&models.db, id, &models.dir)
+            .expect_err("a digest mismatch must not hand over a projector");
+        assert!(
+            matches!(err, EmbedError::ArtifactDigestMismatch { .. }),
+            "the refusal is the same typed mismatch the main artifact raises, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "and it names the file to go and look at: {err}"
+        );
+
+        // Mutation this catches: dropping the digest comparison (return `Some(path)` once a row exists), which turns
+        // every case above green and makes the pin table documentation.
     }
 
     /// The shape of a real image vector: 768 finite components at unit length (§10's contract, §1.2's recipe).

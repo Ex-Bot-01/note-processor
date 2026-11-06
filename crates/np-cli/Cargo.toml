@@ -18,6 +18,14 @@ path = "src/main.rs"
 # (iv) reports that nothing was produced. The default CI row must keep proving exactly that — a default build that
 # wrote a vector would mean the flag stopped meaning anything.
 local-model = ["np-core/local-model"]
+# **F28: the passthrough this crate was missing.** Without it `cargo build --features local-model,vision -p np-cli` fails at *feature resolution*
+# — "the package 'np-cli' does not contain this feature: vision" — so no CLI build, and no gate built on one, could ever have embedded a figure;
+# every green `--features local-model,vision` row in CI was grading np-core alone. Default **off**, for the same two reasons `local-model` is off:
+# §9's "the shipped binary links no C++", and §13's promise that a build which cannot load the projector never plans its 554,821,056 bytes.
+# What turns it on buys one behaviour: `np embed` hands a recorded, digest-matching projector to the runtime, so figures encode instead of
+# refusing as `projector-absent`. It changes no default artifact's size, and CI builds it (`feature-vision`) because "a feature nothing compiles"
+# is precisely how this card stayed open.
+vision = ["np-core/vision"]
 # The fetch path is default-**on** here, mirroring `np-core`'s own default (§12's premises: a fetch command release
 # builds compile out would defeat the human's amendment of 2026-10-29). Opting out is explicit and visible in argv:
 # `--no-default-features` leaves `np models fetch` out of the subcommand table entirely, so a build cannot advertise a
