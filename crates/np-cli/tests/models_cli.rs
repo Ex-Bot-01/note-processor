@@ -1493,7 +1493,12 @@ fn an_unconfigured_fetch_says_it_is_using_the_compiled_in_origin() {
     // value was lost to a shell would spend 865 MB of egress with nothing on screen saying where the bytes came from. The run
     // refuses below before any byte moves, which is also what keeps this case off the network.
     let scratch = Scratch::new();
-    scratch.write_user_config("[workspace]\n");
+    // An empty file, which is what this fixture always meant: "a user config exists and says nothing here".
+    // It used to write `[workspace]` — **an invented section**, accepted only because the root was lenient.
+    // F35 refuses that shape (correctly: a section this build does not know is exactly the thing a user should
+    // be told about), and this test caught it rather than CI or a user. Recorded in
+    // `docs/design-f35-unknown-keys.md` §3 as the cost of the change, observed on our own fixture.
+    scratch.write_user_config("");
     // An occupied target is refused by rule 5 ahead of the transfer, so the notice above it is observable without dialling.
     fs::create_dir_all(scratch.models_dir()).expect("test setup: models dir");
     fs::write(

@@ -131,8 +131,15 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
 pub const MAX_EMBEDDING_TOKENS: usize = 8_192;
 
 /// How the catalog (`INDEX.md` and its shards) is laid out.
+///
+/// **`deny_unknown_fields`, since F35.** This used to be the lenient half of the file — "rendering choices,
+/// where an unrecognised key costs one wrong-looking line" — and the argument held for a key *inside* the
+/// section. It never covered the case that started the round: `[catalogg]`, one letter off, is not a stray key
+/// in this struct at all but the whole struct going unread, so `max_entries_per_file` stayed 600 under a config
+/// claiming 200. One rule for every container (`docs/design-f35-unknown-keys.md` §2) is what makes the file's
+/// behaviour describable in a sentence a user can rely on.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CatalogConfig {
     /// Entries one index file holds before the catalog splits into shards.
     pub max_entries_per_file: usize,
@@ -167,8 +174,9 @@ impl Default for CatalogConfig {
 /// `deny_unknown_fields`, like [`EmbeddingsConfig`] and for the same reason (§7 there): a misspelled key here would
 /// load as *no value at all*, in silence — a mistyped `baseurl` meaning "nowhere to fetch from", a mistyped
 /// `sha256` meaning "the pin stands". §12 rule 7's closing sentence is that **silent fallback stays impossible**, so
-/// the file is refused instead. The strictness stops at this section's boundary, as it does there: unknown keys
-/// elsewhere keep loading as they always have.
+/// the file is refused instead. That rule now covers the whole file, not just this section (F35,
+/// `docs/design-f35-unknown-keys.md`): this struct was the second to get it, and the root was the missing one —
+/// an invented section never reached a struct to be refused by.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelsConfig {
@@ -381,13 +389,17 @@ impl<'de> serde::Deserialize<'de> for ThreadCount {
 
 /// Which embedding provider to ask for work from (`docs/design-m2-embeddings.md` §2).
 ///
-/// An **enum**, not a `String`, and that choice is the whole of §7's argument. Every other config
-/// struct here is `#[serde(default)]` with no unknown-key refusal, so a free-text provider field would
-/// take a hand-typed `provide = "openai-compatible"` — the key misspelled, the value perfect — and
-/// load it as *no provider at all*, in silence, on a machine whose owner believes they configured
-/// embeddings. In a project whose F-series exists to stop exactly that shape of lie about status, the
-/// spelling has to be refused rather than defaulted, which is what [`EmbeddingsConfig`]'s
-/// `deny_unknown_fields` does and what `tests/config.rs` pins.
+/// An **enum**, not a `String`, and that choice is the whole of §7's argument. A free-text provider field
+/// would take a hand-typed `provide = "openai-compatible"` — the key misspelled, the value perfect — and load it
+/// as *no provider at all*, in silence, on a machine whose owner believes they configured embeddings. In a
+/// project whose F-series exists to stop exactly that shape of lie about status, the spelling has to be refused
+/// rather than defaulted, which is what [`EmbeddingsConfig`]'s `deny_unknown_fields` does and what
+/// `tests/config.rs` pins.
+///
+/// (This paragraph used to add "every other config struct here is `#[serde(default)]` with no unknown-key
+/// refusal" as the contrast. F35 removed that contrast — every container refuses now — so the enum's argument
+/// stands on its own: refusing a bad *key* was never enough if a bad *value* could still name a provider this
+/// build cannot honour.)
 ///
 /// The accepted spellings are exactly the ones §2 writes — `"none"`, `"local-model"`,
 /// `"openai-compatible"` — via `rename_all` plus one hand-written exception noted on
@@ -439,13 +451,12 @@ pub enum EmbeddingProvider {
 /// `tests/config.rs` pins, because "adding a key must not change what an existing file means" is the half of
 /// a strict-section story that a refusal test cannot see.
 ///
-/// **`deny_unknown_fields`, unlike every other struct in this file.** That is a deliberate break with
-/// the lenient posture of [`CatalogConfig`] and [`MarkerConfig`], and §7 says why: those structs guard
-/// rendering choices, where an unrecognised key costs one wrong-looking line, while this one guards a
-/// *status claim* — whether the corpus is embedded at all. A misspelled key there must not become
-/// `provider = "none"` by omission, so the file is refused instead. The strictness stops at this
-/// section's boundary: unknown keys elsewhere keep loading as they always have (`tests/config.rs`
-/// asserts both halves, because a reader of one half cannot tell a scoped rule from a global one).
+/// **`deny_unknown_fields`, and since F35 that is no longer special** — every container in this file carries
+/// it, so what §7 argued for this section is now the file's single rule (`docs/design-f35-unknown-keys.md`).
+/// §7's reasoning still explains why this struct was the first: it guards a *status claim* — whether the corpus
+/// is embedded at all — where an unrecognised key could become `provider = "none"` by omission. What F35 added
+/// is the observation that a rendering section can lose just as much through a different door: `[catalogg]` is
+/// not a stray key inside [`CatalogConfig`], it is that struct never being read at all.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingsConfig {
@@ -518,8 +529,11 @@ impl Default for EmbeddingsConfig {
 
 /// Status markers (spec §8.7). Stored exactly as written here; later tasks match
 /// them case-insensitively against the lowercased line.
+///
+/// `deny_unknown_fields` for the same reason and by the same rule as [`CatalogConfig`] (F35): a marker list that
+/// silently failed to arrive does not look wrong on the file — it looks like a corpus with no done items.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MarkerConfig {
     /// Markers that make an item done.
     pub done: Vec<String>,
@@ -556,8 +570,15 @@ fn marker_list(markers: &[&str]) -> Vec<String> {
 }
 
 /// Loaded configuration: where data lives, catalog layout, status markers, embedding provider.
+///
+/// **`deny_unknown_fields`, since F35 — and this is the one that mattered.** A key inside a known section could
+/// already be refused by that section; an *invented section* never reached any struct, so `[catalogg]` loaded
+/// clean and left `[catalog]` at its defaults in silence. Refusing at the root is what closes the gap between
+/// "a typo costs one setting" and "a typo costs a subsystem", and it gives up forward compatibility with
+/// sections invented after this binary was built — a trade written down in `docs/design-f35-unknown-keys.md` §3
+/// rather than discovered later.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// OS data dir, from `$XDG_DATA_HOME` else `$HOME/.local/share`
     /// (Windows: `%LOCALAPPDATA%`). Empty only when the environment names none.
@@ -596,8 +617,12 @@ impl Config {
     /// only changes the keys it spells out; unparsable content is
     /// [`ConfigError::Parse`], which names the file it refused.
     ///
-    /// Unknown keys are allowed everywhere except `[embeddings]` and `[models]`, which refuse them
-    /// ([`EmbeddingsConfig`], §7 of the M2a design; [`ModelsConfig`], §12 rule 7 of the fetch design).
+    /// **Every key in the file must be one this build knows** (F35): all five containers — [`Config`] itself,
+    /// [`CatalogConfig`], [`MarkerConfig`], [`EmbeddingsConfig`], [`ModelsConfig`] — carry
+    /// `deny_unknown_fields`, so an unknown key or an invented section is [`ConfigError::Parse`] naming the file,
+    /// the line and the key as written. Before F35 only `[embeddings]` and `[models]` refused anything, which
+    /// meant a misspelled *section* was ignored whole; the decision and its cost are in
+    /// `docs/design-f35-unknown-keys.md`.
     /// A `data_dir` neither the file nor the environment supplied is a failure, not a default:
     /// every path this program derives from it would go relative — a `workspaces/` directory next
     /// to whatever directory the command happened to run in. The CLI reports it and exits 1.

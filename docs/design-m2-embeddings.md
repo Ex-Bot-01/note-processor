@@ -293,7 +293,12 @@ answer to compare against.
   struct (`EmbeddingsConfig`: `provider`, `model`, `dim`) carries `#[serde(deny_unknown_fields)]` — both written in Round
   3a, with tests that an unknown key there is refused naming key and file, that a stray key beside a valid one is still
   refused, that omitting the section yields `None`, and that unknown keys **outside** this section keep loading (the
-  strictness is scoped, and one half of that pair cannot be inferred from the other). The refusal travels as
+  strictness is scoped, and one half of that pair cannot be inferred from the other). **[Superseded 2026-11-06 by
+  F35: the scoping was removed — every config container now carries `deny_unknown_fields`, because an invented
+  *section* such as `[catalogg]` never reaches a struct to be refused by and silently loses its whole subsystem.
+  The two fixtures that pinned "outside stays accepted" were rewritten rather than deleted, and the decision with
+  its cost (forward compatibility given up) is `docs/design-f35-unknown-keys.md`. Everything else in this bullet,
+  including the enum argument and the `path` field on `Parse`, stands.]** The refusal travels as
   `ConfigError::Parse { path, source }`: the variant gained a `path` field in the same round because `toml::de::Error`
   knows its own line and column but never which file it read.
 - Migration 7 updates `the_schema_is_what_the_plan_mandates`, which pins the table list by exact array and whose index
