@@ -122,6 +122,7 @@ Every figure below is a measured stderr size, 2026-11-05, same vault and artifac
 | `np search`, pre-F33 binary | **145,816 B / 1,553 lines** | what F33 is fixing |
 | `np search`, default (`warn`) | **424 B / 4 lines** | the four are upstream `LLAMA_LOG_WARN` tokenizer lines |
 | `np embed` with three chunks owed, default | **602 B / 6 lines** | same class of warnings; the report on stdout is unchanged |
+| `np embed` over the 15-chunk fixture corpus, default | **1,670 B / 18 lines** | `init: embeddings required but some input tokens …` is logged per batch (`src/llama-batch.cpp:212`), so warn volume tracks **work done**. A first draft of this table implied 424 B was the command's steady state; measured 2026-11-06 in `docs/measurement-f30-vector-surface.md` |
 | `np embed` with nothing owed, default | **0 B** | nothing loads, so nothing logs — F32's arm table still holds |
 | `[embeddings] log_level = "info"` | 11,691 B / 181 lines | the transcript, on purpose |
 | `NP_LLAMA_LOG_LEVEL=debug np search …` | **145,816 B / 1,553 lines** | byte-identical to the pre-F33 binary for this artifact — the gate writes what it is handed and adds nothing. Stated as a measurement rather than a proof: `forwards` drops raw level 0 and unrecognised numbers, which upstream's default handler would print, and none appear in this transcript |

@@ -105,9 +105,10 @@ Two things that trip people up, both by design:
   `np embed` re-embeds only what moved (`embedded 1` above).
 - **The report goes to stdout; llama.cpp's log lines go to stderr, and by default only its warnings survive.** A model load used to write
   145,816 bytes over 1,553 lines here (`create_tensor:`, `llama_model_loader:` …) ahead of a one-line answer; the default level is `warn`,
-  which leaves 424 bytes of actual warnings about the artifact. Ask for the transcript back with `[embeddings] log_level = "info"`, or — when
-  the file names no level at all, since a file that named one wins — `NP_LLAMA_LOG_LEVEL=debug` for a single run. See
-  [the config table](#configuration).
+  which leaves 424 bytes on a search and 1,670 on an embed of 15 chunks: what survives are llama.cpp's own warnings, and one of them repeats
+  per batch, so the volume tracks work done rather than the size of the answer. Ask for the transcript back with
+  `[embeddings] log_level = "info"`, or — when the file names no level at all, since a file that named one wins — `NP_LLAMA_LOG_LEVEL=debug`
+  for a single run. See [the config table](#configuration).
 
 ## Installing `np`
 
@@ -338,7 +339,7 @@ figure they belonged to.
 | `verify self-consistent, not verified` | This run trusted the stamp instead of re-hashing 300 MB — normal after the first check. `digest` says when it last looked |
 | Vectors under another model id | `search` refuses rather than ranking your query against a different model's space; it names the configured id and never another model's path or URL |
 | Thousands of `create_tensor:` lines | You asked for them: `log_level` is set to `info`/`debug` somewhere in your environment or config, and `debug` prints llama.cpp's entire transcript. Unset it and a healthy run leaves only warnings on stderr |
-| `load: control-looking token: … was not control-type; this is probably a bug in the model` | A real warning from llama.cpp about the GGUF's tokenizer metadata, kept by the default `warn` level. It is about the artifact, not about your config; `log_level = "error"` silences it and everything below errors |
+| `load: control-looking token: … was not control-type; this is probably a bug in the model`, and `init: embeddings required but some input tokens were not marked as outputs` | Real warnings from llama.cpp about the GGUF's tokenizer metadata and batching, kept by the default `warn` level. The second repeats once per batch, so an embed that does work prints more of them than a search does; `log_level = "error"` silences them — and with them a genuine load failure, which is why silence is not the default |
 | `np: configuration error: config io: NP_LLAMA_LOG_LEVEL: "deubg" is not a log level — write one of off, error, warn, info, debug` | A typo in the variable. It refuses rather than silently defaulting, because a hatch you cannot trust is worse than no hatch — and note that a value in your **config file wins over it**, like every other key here |
 | `np embed` says `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |
 

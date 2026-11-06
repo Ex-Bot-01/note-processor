@@ -771,7 +771,17 @@ on a real corpus is **not measured** — no index-size figure for either table e
 this entry owes.
 
 - **Done when:** index bytes are printed for a corpus with figures (D6's sibling measurement, still open), and someone decides
-  whether to re-store at 512. That is a re-store of vectors already held — no re-encode — but it changes model identity
+  whether to re-store at 512.
+
+**Half closed on 2026-11-06 by `docs/measurement-f30-vector-surface.md`.** Measured on the fixture corpus (16 notes → 15 chunks → 15 rows):
+payload **3,072 B per row** exactly (4 × 768), whole database **212,992 B**, and **147,456 B** with the vectors deleted and `VACUUM`ed on a
+copy — so the vector surface is **65,536 B over 15 rows, 4,369 B per stored row** including index and page slack. The card's "no index-size
+figure for either table exists" is now true of `media_embeddings` only.
+
+The corpus-with-figures half is **blocked on F28, not on effort**: `np-cli` never calls `with_mmproj` (grep count 0), so no shipped command can
+produce an image row to weigh. The doc does the arithmetic on the measured per-row figure and labels it arithmetic — roughly −23% at 512 rather
+than the −33% the payload alone suggests, because index slack does not shrink with the slice — and lists ranking quality at 512 as unmeasured,
+which needs F31's labelled set. What remains here is the human's decision, now with numbers attached. That is a re-store of vectors already held — no re-encode — but it changes model identity
   (`docs/design-m2-local-embeddings.md` §4), so it needs its own migration and `models` row, a re-normalisation on write, and a
   refusal rather than a blend when a query's width disagrees with the stored one.
 
