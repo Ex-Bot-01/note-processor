@@ -24,6 +24,39 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
+## Audited (main, docs-only) — the twelve unaudited backlog cards (2026-11-06)
+
+* Audited **F7, F9, F10, F15, F22, F25, F18–F21, F23, F24** in `docs/backlog-m2-followups.md`, one card at a time: read its *Where* and *Done
+  when*, grep the mechanism it asked for, re-run whatever backs the strongest claim by exit code, then write the evidence into the card.
+  **Eight closed** (F7, F9, F10, F15, F19, F20, F22, F24), **four left open with what was checked written into them**: F18 (needs a Windows
+  box), F21 (panic fixed; a person still cannot learn what an old upgrade deleted without `sqlite3`), F23 (residue narrowed by A4 — see below),
+  F25 (re-measured, needs a decision). No card's prose was edited away; every correction is an added dated paragraph.
+* Two cards turned out to be **stale in the direction that understates the tree**, which is the same failure the last audit found in reverse.
+  F19 said "the entry is closed" while carrying no evidence — migration 5 is `db.rs:161`/`:1350`, receipt `note_merges` (`:1305`) →
+  `Db::merged_notes` (`:580`), and both of its "Met by" tests pass here. **F23's "Still open — the residue" is now wrong as written:** A4
+  durable file identity merged `cbcb12a` (2026-10-28) after the card was filed, so fix candidate (i) is shipped on Unix and the permanent-class
+  case converges (`tests/scan.rs:3652`). What the residue means now is a *migration-keyed* row whose identity is unknown — pinned by
+  `an_unknown_identity_leaves_that_row_refused_and_discharged_exactly_as_before` (`:3788`, which forces `file_id = NULL`). F23 stays open.
+* **What was run, by exit code** (default features, artifacts unset, host `pi`, euid 1000): `cargo test --workspace` → 0, **38 suites,
+  0 failed**; `-p np-core --test parse` → 0, 11/0; `-p np-core --test scan -- --nocapture` → 0, **74/0 with zero `NOT COVERAGE` lines**, so
+  F20's and F23's `chmod 000` + latin-1 fixtures really executed; `--test walk -- --nocapture` → 0, 12/0, zero `NOT COVERAGE`; the three
+  scripts → cfg pass (61 files), attribute pass (63 files), **`GOLDEN CHECK: pass`**; CI run `42171010611` at `2c65525` → all three jobs
+  success including `Test (windows-latest)`.
+* **F9's benchmark re-run twice (§8): cold 500 / 497 ms, warm 92 / 92 ms at head** — and those numbers are *not* a regression against the
+  card's table. A cold pass now writes chunk rows (M2a `f752485`) and reads file identity (`cbcb12a`), neither of which existed at `14b2935`
+  when the table was written; the two rows measure different programs. The card's standing caveat is untouched: no percentage without an A/B/A,
+  and none was run here.
+* **Process, stated because it deviated.** (1) The full gate list was *not* re-run — this commit touches no code — so the rows above are named
+  individually rather than claimed as "the gates". (2) `cargo check -p np-core --target x86_64-pc-windows-msvc --all-targets`, which F18 cites,
+  **cannot be re-run on this host**: it exits 101 because `ring` and `libsqlite3-sys` build scripts need MSVC's `lib.exe`, absent here, and no
+  mingw toolchain exists either. CI's native compile is the only Windows evidence reachable from Linux, which is F18's own lesson with a date on
+  it. (3) Measuring F25 needed a renderer call, so one throwaway integration test was written, run, and deleted; `git status --porcelain` back
+  to 0 before committing.
+* **Left for the human, newest first:** **F25** needs a ruling — must every catalog entry begin `- [[title]]`? The shape still comes off the
+  renderer today (`-` alone, then the over-wide token, then the rest) and `verify_catalog_goldens.py`'s R2 still rejects it, so neither closing
+  nor golden-ing is an audit's call. **F21** needs its remaining half: surface a stored upgrade receipt on a later scan (F22's shape), not a new
+  echo. F28, F35, F29, F31 and F27 are unchanged from the last handoff. Still unaudited as far as this file knows: **F26, F28–F31, F35**.
+
 ## Shipped (main) — F33 llama.cpp's stderr at a chosen level (merged 2026-11-06 at `62ddcfb`, branch deleted)
 
 * A model load wrote **145,816 bytes over 1,553 lines** to stderr ahead of a one-line answer (`np search`, measured twice against the
@@ -243,7 +276,11 @@ what fails is not a check, because removal makes tests pass.
   design, not before.
 - **F18 residue:** Windows file identity (`VolumeSerialNumber` + `FileId`) needs real Windows hardware and a
   recorded run; CI proves only that the path is inert.
-- **F25** (over-wide token renders a physical line holding only `-`) is filed and unadjudicated.
+- **F25** (over-wide token renders a physical line holding only `-`) is filed and unadjudicated; re-measured 2026-11-06 at `2c65525`, the shape
+  still renders and R2 still refuses it. Two ways out, both costing a decision: move the bullet onto the over-wide token (golden-affecting), or
+  keep the renderer and amend R2 plus a deliberate golden.
+- **F21's remaining half** (audited 2026-11-06): make a *stored* upgrade receipt readable without `sqlite3` — F22's bounded-record shape applied
+  to `fk_orphans`, no new exit code, no second echo.
 - **Owed measurements:** A4's A/B/A benchmark and whole-branch review were skipped on instruction at merge time;
   `typeof(vector)` is probed (`a_string_bind_is_refused_from_embeddings_vector`). Still open: the "chunks owed but unembedded" count in the scan report, and backlog D1–D10 from the M2a whole-branch review.
 

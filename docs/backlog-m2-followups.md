@@ -2,12 +2,20 @@
 
 **How to read a card's status.** A card is closed when it carries a **Closed on …** paragraph; the absence of one used to mean "open", and on
 2026-11-06 that reading proved wrong: work landed in hardening rounds whose commit messages named several cards at once, and the cards were
-never updated. Eight are marked below with the evidence that shows the fix is in the tree — a file:line that did not exist when the card was
-filed, or a gate row that now passes. Cards **not** listed there have not been re-checked; treat them as open, and add the evidence line when one
+never updated. Sixteen are marked below with the evidence that shows the fix is in the tree — a file:line that did not exist when the card was
+filed, or a gate row that now passes: eight from the first audit pass on 2026-11-06 and eight from the second the same day. (Cards closed by
+their own round say it differently — “Resolved in …”, “**shipped**” in the heading — and those words are theirs, not this convention.) Cards **not** listed there have not been re-checked; treat them as open, and add the evidence line when one
 closes rather than editing the prose away.
 
-Audited 2026-11-06: F1, F2, F3, F4, F5, F6, F8, F14 → closed below. Not audited (still open as far as this file knows): F7, F9, F10, F15,
-F22, F25, F18–F21, F23, F24, F27–F31, F35.
+Audited 2026-11-06 (first pass): F1, F2, F3, F4, F5, F6, F8, F14 → closed below.
+
+Audited 2026-11-06 (second pass): F7, F9, F10, F15, F18–F25. Eight of them carry a **Closed on** paragraph now — F7, F9, F10, F15, F19, F20,
+F22, F24 — each quoting the file:line or the test that puts the fix in the tree, plus the command re-run to check it. Four stay open and say
+what was checked and what is left: **F18** (needs a Windows box; nothing here can even cross-compile the arm it is about), **F21** (the panic
+is gone; a person still cannot learn what an old upgrade deleted without `sqlite3`), **F23** (its “Still open — the residue” is narrower than
+it reads, because A4 shipped after the card was written), **F25** (re-measured: the shape still comes off the renderer; it waits on a human
+decision about `- [[title]]`, not on a measurement). Not audited as far as this file knows: F26, F28–F31, F35 — and F27 carries its own
+do-not-implement stance, which an audit does not overturn.
 
 
 These are not new features. They are the items the Milestone 1 reviews judged *correct enough to ship* but
@@ -111,6 +119,15 @@ warning fails CI instead of accumulating. This round's own example: a public-to-
   opens with a horizontal rule followed by prose. **Done when:** that note keeps its first section in `headings` and
   `word_count`, while every existing frontmatter test still passes.
 
+**Closed on 2026-11-06 by audit, in `c2f68ff` (“require a key before reading frontmatter, fold tags by Unicode case”) — the card's rule is the
+deciding test.** `crates/np-core/src/parse.rs:207` returns “not frontmatter” for a `---` region that holds content and no key
+(`if !keyed && !blank_only`); the rule is written up as F7's own at `parse.rs:169-183`, and `key_line` (`:257`) is the whole test. The fixture
+this card asked for exists — `tests/fixtures/notes/thematic-break-note.md` opens with `---` and then prose — and
+`crates/np-core/tests/parse.rs:202 leading_rule_is_content_not_frontmatter` pins the “Done when”: `!note.frontmatter`, headings
+`(2, "Erste Liste", 4)` and `(1, "Zweite Sektion", 10)`, the title won by that heading, and `note.words ==
+lf.split_whitespace().count()`. Re-run here: `cargo test -p np-core --test parse` → **exit 0, 11 passed / 0 failed**, which is this case plus
+every frontmatter case that had to keep passing.
+
 ## F8 — tag dedup folds ASCII case only
 
 - **Where:** tag normalisation in `crates/np-core/src/parse.rs` (see the `#ÄNER-TAG` gap recorded in the M1 ledger).
@@ -127,11 +144,29 @@ leave beside it) and applies it at `:487`.
 - **Fix:** cached prepares for `upsert_file`, `apply_move`, `mark_stale`. **Done when:** behaviour is unchanged
   (all existing tests green) and a repeated-scan benchmark on the fixture corpus does not regress.
 
+**Closed on 2026-11-06 by audit, in `14b2935` (“cache write-path prepares, resolve note ids once”) — all three statements are cached
+prepares.** `upsert_file` at `crates/np-core/src/db.rs:1581`, `:1595`, `:1616`; `apply_move` at `:1743`, `:1761`, `:1780`; `mark_stale` at
+`:1796`. The doc at `:1565-1572` says what the caching buys (one prepare per path, not three per file) and that no error — the identity
+collisions included — reaches the caller differently. “Behaviour unchanged” re-measured here: `cargo test --workspace` → **exit 0, 38 suites,
+0 failed**. The benchmark was re-run twice at `2c65525`, per §8: cold **500 / 497 ms**, warm **92 / 92 ms** — and those two figures are *not*
+comparable to the rows in the table below, because a cold pass now also writes chunk rows (M2a `f752485`, three days after `14b2935`) and reads
+file identity (`cbcb12a`); they record what head costs today, not an F9 delta. The table's own caveat survives this audit untouched: no figure
+in it may be quoted as an improvement without an A/B/A repeat, and no A/B/A was run here.
+
 ## F10 — `note_id` looked up twice per note
 
 - **Where:** `scan.rs:489` then again at `:517` / `:596`.
 - **Fix:** resolve once per note and pass the id down. **Done when:** no duplicated lookup remains in the re-parse
   path and the scan tests are unchanged.
+
+**Closed on 2026-11-06 by audit, in `14b2935` — one lookup per note, and the id travels instead of being read again.** `index_file` resolves
+once at `crates/np-core/src/scan.rs:1422` (`let existing = match note_row(db, &path)?`) and hands that answer to `store_note`, whose
+`existing: Option<i64>` parameter (`:1583`) is what removed the second read; `store_note`'s doc at `:1567-1571` names the single branch that
+used to ask twice (its `rewritten || note_id(…)?.is_none()` short-circuits on `Added | Modified`). It returns the id it wrote under, so the
+chunk pass hangs its rows off the same value rather than looking it up again, and `links.rs` resolves each path once through its own cache
+(`crates/np-core/src/links.rs:512`, `:516`). “The scan tests are unchanged” re-measured here: `cargo test -p np-core --test scan --
+--nocapture` → **exit 0, 74 passed / 0 failed with zero `NOT COVERAGE` lines** (host `pi`, euid 1000). The measurement protocol's limit is
+quoted rather than smoothed over: nothing in the benchmark measures F10, because a warm pass never reaches the re-parse path.
 
 ## F11 — the generated-name rule lives in three places
 
@@ -216,6 +251,17 @@ What these numbers can and cannot carry:
   the current rules, and a second scan reports zero changes; plus a test that bumping the constant again re-triggers.
 - **Priority:** must land before the first M2 release. Every future parse-rule change depends on this mechanism, so it
   is cheaper to build once now than to retrofit after clustering stores derived data too.
+
+**Closed on 2026-11-06 by audit — `parse_version` exists, is compared at scan start, and forces exactly one rewrite.** The constant is
+`crates/np-core/src/parse.rs:42`, the `meta` key `scan.rs:75`, the comparison `parse_version()` / `refresh_needed()` at `scan.rs:2016` /
+`:2026`, and the write at `scan.rs:565`; migrations stayed schema-only, and a refresh is not a modification — the report stays
+`(added, modified, moved, removed) == (0, 0, 0, 0)` in every case below. Each “Done when” clause is a test that ran green in this audit's scan
+suite: `a_stale_parse_version_reparses_every_unchanged_note` (`tests/scan.rs:1691`: hand-built lagging database, derived rows equal to a
+reference workspace, catalog equal, and `[[Real Heading]](thematic-break.md)` present in `INDEX.md`),
+`the_refresh_is_one_shot_and_the_next_scan_writes_no_bytes` (`:2209`: the second scan reports zero changes, the catalog is byte-identical, no
+child rowid moves), `a_second_rule_change_refreshes_once_and_the_scan_after_it_is_quiet` (`:2253`: the card's “bumping the constant again
+re-triggers”), and `a_database_that_never_recorded_a_parse_version_is_refreshed_too` (`:2181`). The stderr announcement is pinned CLI-side at
+`crates/np-cli/tests/cli.rs:506`.
 
 ## F14 — two configuration tests depend on ambient `$HOME`
 
@@ -332,6 +378,17 @@ What these numbers can and cannot carry:
   only in unpaired surrogates key apart *and* are both indexed — not merely reported — and a `Ämli.md` → `ämli.md`
   rename on Windows still carries the note.
 
+**Audited 2026-11-06 — still open, and every item on its “Still open” list still holds.** Checked rather than assumed:
+`crates/np-core/src/path_keys.rs:143-145` is still `to_string_lossy().into_owned().into_bytes()`, so Windows has no byte identity; no WTF-8
+exists anywhere under `crates/`; the identity fold is still ASCII `case_bytes`. The shipped half re-checks out — a refused file names itself in
+`Walked::unrepresentable`, a refused directory goes to `unreadable` with the prefix rule (`walk.rs:214-279`), and CI's native Windows job ran
+and passed at this commit (run `42171010611`: `Test (windows-latest)` success beside both ubuntu rows). **What could not be re-measured here,
+and the card should say so:** `cargo check -p np-core --target x86_64-pc-windows-msvc --all-targets` exits 101 on this host today, because
+`ring` and `libsqlite3-sys` run build scripts needing MSVC's `lib.exe` and no Windows C toolchain is installed (`x86_64-pc-windows-gnu` is not
+installed either). CI's compile is therefore the only Windows-compile evidence this machine can reach — which sharpens the card's own point: a
+Linux host cannot even type-check the arm it describes. Related, and consistent with design-a4 §6.5: A4's `file_identity` returns `None` off
+Unix (`walk.rs:501-506`), so file identity is *inert* on Windows by design, not supported.
+
 ## F19 — a legacy duplicate note pair re-parses the whole corpus forever
 
 - **Where:** `crates/np-core/src/scan.rs`'s `Indexed::Duplicate` arm charging `written.uncovered` on every
@@ -370,6 +427,14 @@ What these numbers can and cannot carry:
   is the protection; the clause is defence in depth, and **F-5's keyless-row pin becomes possible only when some
   future migration admits keyless note rows.** What is pinned instead is the reachable half of the same shape: a
   merged survivor with no `rel` at all (`a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key`).
+
+**Closed on 2026-11-06 by audit — the entry said “the entry is closed”; now it carries the evidence.** Migration 5 is registered at
+`crates/np-core/src/db.rs:161` (`Migration::Code(merge_duplicate_notes)`) and defined at `:1350`; the receipt lands in `meta` under
+`note_merges` (`:1305`) and reaches a person through `Db::merged_notes` (`:580`) → `ScanReport::merged_notes`; `PRAGMA foreign_key_check`
+runs inside that same transaction (`:781`, `:1020`). Both “Met by” tests passed in this audit's runs:
+`a_merged_duplicate_pair_clears_the_charge_and_records_the_parse_version` (`tests/scan.rs:4975`) and
+`the_scan_that_merges_reports_the_string_it_stored` (`tests/db.rs:3997`). The card's note about the unfixtureable `WHERE rel_bytes IS NOT NULL`
+arm is still true: `notes.rel_bytes` carries `CHECK (typeof(rel_bytes) = 'blob')` at `db.rs:348`, and `typeof(NULL)` is `'null'`.
 
 ## F20 — two report-side filters still compare display text
 
@@ -423,6 +488,17 @@ What these numbers can and cannot carry:
   `#[cfg(windows)]` test in `tests/walk.rs` which **no CI run can execute**: it prints `NOT COVERAGE` and returns,
   because no filesystem there will hold an unpaired surrogate either.
 
+**Closed on 2026-11-06 by audit — bytes travel all the way to the matcher, and the fixture ran here instead of early-returning.**
+`walk::UnknownPath` carries `display` + `bytes` (`crates/np-core/src/walk.rs:99-113`) with a doc that forbids handing a text-only entry to a
+byte-keyed matcher; `under_unreadable` compares a byte prefix plus a real `/` (`scan.rs:1117-1124`); `skipped` is sorted and deduplicated by
+bytes and printed as display text (`scan.rs:167-173`, built at `:722`, pinned by `tests/scan.rs:3116`). The runner caveat F23's entry demands
+was satisfied when re-measured: `cargo test -p np-core --test scan -- --nocapture` → **exit 0, 74 passed / 0 failed, zero `NOT COVERAGE`
+lines**, host `pi`, euid 1000 — so `an_unreadable_directory_does_not_hide_its_readable_twin` (`tests/scan.rs:2876`) and
+`two_unreadable_twins_publish_two_report_lines_that_look_alike` (`:3063`) executed, as did the single-charge arithmetic case
+(`src/scan.rs:3327`) and both display-keyed fences (`tests/scan.rs:3161`, `:3306`). `GOLDEN CHECK: pass`, so no catalog byte moved. **What
+stays open belongs to F23, not here:** the display-keyed over-hiding that no predicate at `known_rows` can resolve, and Windows' lossy-keyed
+floor on one `skipped` line.
+
 ## F21 — a refusing stderr could block the first upgrade of an orphan-holding workspace
 
 - **Was:** `db.rs`'s `report_orphans` did `.expect` on its write to descriptor 2, from inside migration 3's
@@ -443,6 +519,15 @@ What these numbers can and cannot carry:
   `meta`, which is what "no stream is load-bearing" means here. **Do when:** a person can learn what an old upgrade
   deleted without opening `sqlite3` — that is F22's durable-announcement mechanism applied to receipts, not a new
   echo.
+
+**Audited 2026-11-06 — the panic is gone and verified; the card's own Do-when is not met, so it stays open.** In the tree and under test: the
+receipt is written before anything deletes, pinned by `a_receipt_that_cannot_be_written_rolls_the_cleanup_back` (`tests/db.rs:1911`, passed);
+the echo dropped its `.expect` and moved after the commit (`src/db.rs:676` → `:688`); the stored string reaches
+`ScanReport::upgrade_orphans` (`scan.rs:209`). Two CLI cases ran green here: `an_error_is_reported_rather_than_panicked_when_stderr_refuses_it`
+(`crates/np-cli/tests/cli.rs:701`) and `a_scan_upgrades_when_stderr_refuses_writes`. The remaining ask is unmet as written:
+`upgrade_orphans` is `Some` only on the open that ran the cleanup (`scan.rs:189-193`), so somebody asking today what an upgrade deleted last
+month still needs `sqlite3`. F22's shape — a bounded `meta` record whose one string is printed on stdout and in `--json` — now exists for
+refusals; applying that shape to upgrade receipts is the rest of this card, and it needs no new exit code and no second echo.
 
 ## F22 — a refusal exists only as one report line, with no reason attached
 
@@ -468,6 +553,23 @@ What these numbers can and cannot carry:
   Report text plus a `meta` key only, so catalog goldens stay put. **Do when:** a workspace scanned with stderr
   refusing writes still lets a later `np scan` name the refused path, and the two causes are distinguishable in the
   output.
+
+**Closed on 2026-11-06 by audit — one bounded record, counts carrying causes, the same string on both channels.** The `meta` key `unindexable`
+(`scan.rs:101`) holds `unreadable=N;unkeyable=N;duplicates=N;ambiguous=N;names=…`, written **after** the commit and best-effort
+(`record_unindexable`, `scan.rs:1986-1993`: a refused `meta` write costs the record, never the scan — F21's lesson), rendered verbatim by
+`np scan` (`crates/np-cli/src/main.rs:314-323`) and as an object in `--json`. The two causes are distinguishable, which was half the card, and
+F23's duplicate state is folded into this record instead of growing a third mechanism (`duplicated_rels`, `scan.rs:1969`). Cases that ran green
+here: `an_unreadable_directory_is_recorded_as_a_loss_of_that_exact_kind` (`tests/scan.rs:4484`),
+`a_scan_that_loses_nothing_overwrites_the_record_an_earlier_scan_left` (`:4539`),
+`the_duplicate_count_names_a_display_path_with_two_live_rows_and_not_one_with_a_stale_row` (`:4635`),
+`a_refused_record_write_leaves_the_scan_successful` (`:4723`), `names_order_a_duplicated_path_before_an_unreadable_directory` (`:4792`),
+`a_healed_pair_leaves_no_duplicate_in_the_record_but_still_names_the_loss` (`:4852`), and CLI-side
+`an_unreadable_directory_prints_one_record_line` (`crates/np-cli/tests/cli.rs:1318`), which asserts stdout, `--json` and the stored value are
+one string. **Two limits, stated rather than smoothed over.** (1) The card's sentence names *stderr* specifically; what is pinned is that the
+record depends on no stream at all (written with `let _ = set_meta`, after the commit, whatever stdout and stderr do) plus F21's cases that a
+refusing stderr neither panics nor moves the exit code — no single case combines “stderr refused” with “the next scan named the path”. (2)
+Nothing drives an F23-shaped row to `duplicates=1` any more, because F23 healed the shape that used to produce it; that gap is recorded in the
+test's own doc (`tests/scan.rs:4620-4634`) and left open on purpose.
 
 ## F23 — a display-text key cannot say which byte twin its row is for
 
@@ -524,6 +626,18 @@ What these numbers can and cannot carry:
   obstruction is gone**. While the twin is blocked some charge to the hidden count remains correct and `PARSE_VERSION`
   stays withheld — that withholding is the safety, not the bug.
 
+**Audited 2026-11-06 — still open, but “Still open — the residue” above is narrower than it reads, and A4 is why.**
+`docs/design-a4-file-identity.md` shipped as `cbcb12a` (2026-10-28), after this card was written: the OS identity (`st_dev`/`st_ino`,
+`walk.rs:490-497`) is stored on every successful index (`files.file_id`, `db.rs:169`) and may *add* a match, never remove one. So fix candidate
+(i) is no longer a candidate — it is shipped on Unix — and the permanent-class case has healed:
+`a_permanent_class_row_whose_content_changed_while_a_twin_is_blocked_rejoins_its_own_row` (`tests/scan.rs:3652`) passes here, in a run with
+**zero `NOT COVERAGE` lines** (host `pi`, euid 1000). What the residue means now, precisely, is a **migration-keyed** row whose stored key is
+display text, whose real path is byte-distinct, and whose identity is unknown — pinned by
+`an_unknown_identity_leaves_that_row_refused_and_discharged_exactly_as_before` (`:3788`, which sets `file_id = NULL` at `:3808` to keep the
+pre-A4 state asserted), and named as such by the healed test's own doc (`:3647-3650`). Design-a4 §8 states the boundary this card should carry:
+“the residue only stops being permanent where an id was recorded before the obstruction”. A4's two debts ride along and are already on the
+record (roadmap §A4): no A/B/A benchmark, no whole-branch review. Windows identity remains F18's blocker.
+
 ## F24 — the two merge tests carry the same assertions twice
 
 - **Where:** `crates/np-core/tests/db.rs` —
@@ -540,6 +654,17 @@ What these numbers can and cannot carry:
   ("the edge crossed the rebuild and the merge together" is not the claim the version-four case makes) costs most
   of the saving, so the honest extraction is under twenty lines and would flatten those messages to buy it.
   **Do when:** the next change to migration 5's delete list — take it then, with both fixtures in front of you.
+
+**Closed on 2026-11-06 by audit, in `eea29cd`/`af1d504`, with a deviation from the fix this card proposed.** The card asked for an
+`assert_merged_pair_folded(&db)` helper; what shipped is shared *measurement* with unshared verdicts — `MergedPairFacts` (`tests/db.rs:3632`)
+and `merged_pair_facts` (`:3644`) read the survivor ids, the winner's heading/tag/item, the loser's four shapes each paired with the query that
+measured them, the re-pointed edge and the receipt, while each fixture keeps its own assertions and its own failure messages. The deviation is
+argued in `docs/design-f24-merge-assertions.md` and in the commit message: the card's incident was an **unasserted precondition**, and
+extracting assertion text would have left that hole exactly where it was — so both seeders now end in `assert_planted_pair` (`:3674`), and
+deleting one seeder's loser-edge `INSERT` fails at setup naming the query. Both fixtures pass here:
+`merging_a_duplicate_pair_keeps_the_oldest_id_and_moves_every_incoming_edge` (`:3740`) and
+`a_version_three_file_jumps_four_to_five_in_one_open_and_its_pair_merges` (`:3933`). The card's trigger — “take it at the next change to
+migration 5's delete list” — never had to be waited for.
 
 ## F25 — an over-wide token leaves a physical line holding nothing but the bullet
 
@@ -565,6 +690,23 @@ What these numbers can and cannot carry:
 - **Do when:** someone decides whether `- [[…]]` must begin every entry. Then either fix `wrap` (a golden-affecting change:
   no current golden exercises this shape, so only the new fixture and unit cases move) or amend R2 and add a golden that pins
   the accepted shape deliberately.
+
+**Audited 2026-11-06 — still open, re-measured, and waiting on a human decision rather than on a measurement.** Reproduced at `2c65525` with a
+throwaway probe against the public renderer (`catalog::render`, one entry, 55 ideographs in the title = 110 columns in one token,
+`continuation_indent = 2`), which printed exactly:
+
+```text
+-
+  [[目目…目]](plans/cjk-unbroken.md)
+  · 3 B · #long · →0 ←0
+```
+
+The probe file was deleted afterwards and `git status --porcelain` returned to 0. The verifier still rejects the shape, so the card's claim
+that this cannot be closed by quietly adding a golden is true: `verify_catalog_goldens.py`'s entry loop requires every first physical line to
+start with `- `, and a bare `-` fails that check before any entry regex runs. **What it needs:** someone decides whether an entry must begin
+`- [[title]]`. Option A moves the bullet into the over-wide token (a golden-affecting decision, though no committed golden exercises the shape);
+option B keeps the renderer, amends R2, and adds a deliberate golden. Neither is an audit's call. F16's fixture still avoids the shape on
+purpose (`docs/design-f16-wide-goldens.md` §3), so nothing pins today's behaviour.
 
 ## F26 — the image decoder accepts more formats than §7's extension list promises
 
