@@ -2091,6 +2091,47 @@ fn searching_without_the_runtime_names_the_model_that_stayed_owed() {
 }
 
 #[test]
+fn an_invented_log_level_refuses_and_a_valid_one_does_not() {
+    // F33's escape hatch has to be usable, which starts with a typo in it being visible. The refusal belongs to any command
+    // that reads configuration — `scan` is the cheapest such command, and pinning it there rather than on `search` also pins
+    // that the value is checked while resolving config rather than deep inside a model load.
+    let ws = workspace();
+    fs::write(ws.root.join("a.md"), "# Alpha\n\nabout alpha\n").expect("test setup: note");
+
+    let mut cmd = ws.command(&["scan"]);
+    cmd.env("NP_LLAMA_LOG_LEVEL", "deubg");
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "a runtime refusal is 1:\n{}",
+        failed.stderr()
+    );
+    let stderr = failed.stderr();
+    assert!(
+        stderr.contains("NP_LLAMA_LOG_LEVEL"),
+        "the refusal must name the variable that was mistyped: {stderr}"
+    );
+    assert!(
+        stderr.contains("deubg"),
+        "and the value as written, so the reader knows which word is wrong: {stderr}"
+    );
+    for name in ["off", "error", "warn", "info", "debug"] {
+        assert!(
+            stderr.contains(name),
+            "the refusal omits `{name}`: {stderr}"
+        );
+    }
+
+    // The same command with a real level runs: the refusal is about the spelling, not about the variable existing.
+    let mut ok = ws.command(&["scan"]);
+    ok.env("NP_LLAMA_LOG_LEVEL", "info");
+    let passed = run(&mut ok);
+    assert_eq!(passed.code(), 0, "{}", passed.stderr());
+}
+
+#[test]
 fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
     let ws = workspace();
     fs::write(ws.root.join("a.md"), "# Alpha\n\nnothing indexed here\n").expect("test setup: note");
@@ -2246,6 +2287,157 @@ mod real_model {
             ordered,
             "the array arrives ranked:\n{}",
             json.stdout()
+        );
+    }
+
+    /// F33's claim about a healthy run, measured rather than asserted in prose: the load transcript is gone from stderr by
+    /// default, and one environment variable brings it back.
+    ///
+    /// Gated on `local-model` **and** `NP_TEST_MODEL_PATH`, because the feature is what decides vacuity here: without it nothing loads, so
+    /// a default-features row would run this case, see no transcript, and conclude F33 worked when it had merely compiled the loader out.
+    /// That is why the guard prints `NOT COVERAGE` rather than skipping quietly.
+    #[test]
+    fn a_healthy_run_writes_no_transcript_and_the_hatch_brings_it_back() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        run(&mut ws.command(&["scan"])).assert_success();
+        link_artifact(&ws, &artifact, "task: search result | query: ");
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+        run(&mut ws.command(&["embed"])).assert_success();
+
+        let search = |env: &[(&str, &str)]| {
+            let mut cmd = ws.command_without_operand(&["search"]);
+            cmd.arg(&ws.root).arg("the cat sits on the warm mat");
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+            run(&mut cmd)
+        };
+
+        let quiet = search(&[]);
+        assert_eq!(quiet.code(), 0, "\n{}", quiet.stderr());
+        let transcript = quiet.stderr();
+        assert!(
+            !transcript.contains("llama_model_loader:"),
+            "the default level must not print the load transcript, got {transcript}"
+        );
+        assert!(
+            !transcript.contains("Dumping metadata"),
+            "nor the metadata dump that comes with it: {transcript}"
+        );
+        // Something has to survive, or the loop below grades nothing: a `DEFAULT_LEVEL` of `Off` prints an empty stderr and would pass
+        // every absence-assertion in this case. The bound is the measured 424 bytes with room for upstream to grow its warnings (§5).
+        assert!(
+            transcript.contains("load: ") || transcript.contains("init: "),
+            "the default level keeps llama.cpp's warnings, and this artifact emits them: {transcript:?}"
+        );
+        assert!(
+            transcript.len() < 4096,
+            "a healthy run's stderr measured 424 bytes; {} means the transcript leaked: {transcript}",
+            transcript.len()
+        );
+        // What *does* survive is warnings only — the difference between a `warn` default and an `off` one. Both prefixes here were read in
+        // the pinned tree rather than guessed at: `load:` is `LLAMA_LOG_WARN` from the vocabulary load (`src/llama-vocab.cpp:3072`,
+        // `:3403`) and `init:` is `LLAMA_LOG_WARN` from `src/llama-batch.cpp:212`. Asserting a shape rather than a line count means a fifth
+        // tokenizer quirk upstream will not trip this case, while a leaked progress fragment (a run of dots at `CONT`) still will.
+        for line in transcript.lines() {
+            assert!(
+                line.starts_with("load: ") || line.starts_with("init: ") || line.is_empty(),
+                "the default level keeps llama.cpp's warnings, and nothing else: {transcript}"
+            );
+        }
+
+        // The hatch, one variable, no rebuild and no config edit.
+        let loud = search(&[("NP_LLAMA_LOG_LEVEL", "info")]);
+        assert_eq!(loud.code(), 0, "\n{}", loud.stderr());
+        let noisy = loud.stderr();
+        assert!(
+            noisy.contains("llama_model_loader:"),
+            "`NP_LLAMA_LOG_LEVEL=info` has to bring the transcript back: {noisy}"
+        );
+
+        // And it changes only stderr. A verbosity switch that moved the answer would be a different bug with the same name, so
+        // the two runs' stdout is compared rather than each being checked against a guess.
+        assert_eq!(
+            quiet.stdout(),
+            loud.stdout(),
+            "the hit list must not depend on how loud the loader was"
+        );
+
+        // The file outranks the environment (§4, §12 rule 7): `warn` in `config.toml` beats `info` in the shell. This is the
+        // direction the house rule points, so it is pinned rather than left to a code reader's interpretation.
+        ws.write_user_config(&format!(
+            "{}\nlog_level = \"warn\"\n",
+            local_model_config(EMBED_MODEL).trim_end()
+        ));
+        let outranked = search(&[("NP_LLAMA_LOG_LEVEL", "info")]);
+        assert_eq!(outranked.code(), 0, "\n{}", outranked.stderr());
+        assert!(
+            !outranked.stderr().contains("llama_model_loader:"),
+            "a file that named `warn` must not be outvoted by the environment: {}",
+            outranked.stderr()
+        );
+    }
+
+    /// A load that **fails** has to stay explainable at the default level — the risk F33's own silence creates.
+    ///
+    /// Not unfalsifiable, unlike the version of this case that first lived in np-core: `src/llama.cpp:373-375` catches the loader's throw
+    /// and logs `error loading model: …` at error level, so a `warn` default is required to keep that line, and an absent transcript is a
+    /// failure rather than an escape hatch. It runs against the real binary because llama.cpp writes to the process's own fd 2, which no
+    /// in-process test can capture.
+    #[test]
+    fn a_failing_load_still_explains_itself_at_the_default_level() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        run(&mut ws.command(&["scan"])).assert_success();
+        // The config is what makes this a load at all: without it `embed` refuses in configuration and never opens a file, which is how the
+        // first run of this case failed — with a correct refusal for a different problem.
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+        // A prefix of the real file, recorded under **its own** digest. That is deliberate: D12's verify-on-change would otherwise refuse
+        // the swapped bytes before a model was ever opened, and this case is about llama.cpp refusing a GGUF whose tensors run past its
+        // end — not about our digest check, which has cases of its own.
+        use std::io::{copy, Read as _};
+        const KEEP: u64 = 128 * 1024 * 1024;
+        let path = ws.models_dir().join(EMBED_MODEL);
+        fs::create_dir_all(ws.models_dir()).expect("test setup: models dir");
+        // Not `mut`: `Read::take` takes the reader by value, so the binding is moved rather than borrowed.
+        let from = fs::File::open(&artifact).expect("test setup: open the artifact");
+        let mut to = fs::File::create(&path).expect("test setup: write the prefix");
+        copy(&mut from.take(KEEP), &mut to).expect("test setup: copy 128 MiB");
+        drop(to);
+
+        let digest = np_core::hash::sha256_file(&path).expect("test setup: digest the prefix");
+        let conn = rusqlite::Connection::open(ws.db_path()).expect("test setup: open the index");
+        conn.execute(
+            "INSERT INTO models (id, dim, sha256, prefix_doc, prefix_query, installed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                EMBED_MODEL,
+                REAL_DIM,
+                digest,
+                "task: search result | query: ",
+                "query: ",
+                1_730_000_000_i64
+            ],
+        )
+        .expect("test setup: install the row");
+
+        let failed = run(&mut ws.command(&["embed"]));
+        assert_eq!(
+            failed.code(),
+            1,
+            "an artifact that cannot be loaded is a runtime refusal:\n{}",
+            failed.stderr()
+        );
+        let stderr = failed.stderr();
+        assert!(
+            stderr.contains("error loading model"),
+            "the default level must keep llama.cpp's own explanation of the failure: {stderr}"
+        );
+        assert!(
+            stderr.contains("np:"),
+            "and our refusal has to be on stderr beside it: {stderr}"
         );
     }
 

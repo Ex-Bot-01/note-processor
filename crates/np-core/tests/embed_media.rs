@@ -48,6 +48,7 @@ impl Setup {
                 dim: None,
                 max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
                 threads: np_core::config::ThreadCount::Auto,
+                log_level: None,
             },
             ..Config::default()
         }

@@ -103,9 +103,11 @@ Two things that trip people up, both by design:
 
 - **`np embed` reads the index, not the vault.** Edit a note and `np embed` will call it current; run `np scan` first, then
   `np embed` re-embeds only what moved (`embedded 1` above).
-- **The report goes to stdout; llama.cpp's progress chatter goes to stderr.** When a model actually loads, that chatter runs to
-  ~1,500 lines here (`create_tensor:`, `llama_graph_n_input_tensors:` …), so pipe stdout where you want clean output. Quietening
-  it is filed as F33.
+- **The report goes to stdout; llama.cpp's log lines go to stderr, and by default only its warnings survive.** A model load used to write
+  145,816 bytes over 1,553 lines here (`create_tensor:`, `llama_model_loader:` …) ahead of a one-line answer; the default level is `warn`,
+  which leaves 424 bytes of actual warnings about the artifact. Ask for the transcript back with `[embeddings] log_level = "info"`, or — when
+  the file names no level at all, since a file that named one wins — `NP_LLAMA_LOG_LEVEL=debug` for a single run. See
+  [the config table](#configuration).
 
 ## Installing `np`
 
@@ -226,6 +228,7 @@ a value in the file always wins, and an empty environment value counts as unset 
 | `embeddings.dim` | the installed row's width | A declared width that disagrees with the row is refused before any write |
 | `embeddings.max_tokens` | `1024` | Token budget per sequence. Over-budget chunks are **reported**, never silently truncated |
 | `embeddings.threads` | `"auto"` | Worker count for llama.cpp: `min(cpus, max(min(cpus, 4), 80%))`, so 16 CPUs → 12 and a 2-core laptop → 2. An integer pins it; `0`, negatives and non-integers are refused |
+| `embeddings.log_level` | unset, which means `warn` | How loud llama.cpp may be on stderr: `off`, `error`, `warn`, `info`, `debug`. Anything else is refused naming the key and all five. `NP_LLAMA_LOG_LEVEL` fills it when the file leaves it unset — it does **not** override a file that named one, the same precedence every other environment value here follows |
 | `models.base_url` | the compiled-in origin | Where `models fetch` may go. Mirrors are one line away; refusals never name a host |
 | `models.sha256` | unset | Read into config (`NP_MODELS_SHA256` fills it when the file omits the key). Nothing in the fetch path consults it today, so it does **not** replace a pin — see `docs/design-m2-local-embeddings.md` §12 rule 7's note |
 | `markers.done`, `markers.paused` | built-in lists | Strings that classify checklist items when the catalog renders them |
@@ -236,6 +239,7 @@ provider = "local-model"
 model = "embeddinggemma-2"
 # max_tokens = 1024        # per-sequence budget; over-budget is reported, not truncated
 # threads = "auto"         # or an integer
+# log_level = "warn"       # off | error | warn | info | debug — llama.cpp's stderr volume
 
 [catalog]
 max_entries_per_file = 600
@@ -333,7 +337,9 @@ figure they belonged to.
 | `model embeddinggemma-2 is already installed with dim = 768; this command declares 512` (abridged: the real message wraps the values in backticks) | Installing a second meaning onto an existing id is refused and nothing is written. A different artifact or width means a new id, not an overwrite |
 | `verify self-consistent, not verified` | This run trusted the stamp instead of re-hashing 300 MB — normal after the first check. `digest` says when it last looked |
 | Vectors under another model id | `search` refuses rather than ranking your query against a different model's space; it names the configured id and never another model's path or URL |
-| Thousands of `create_tensor:` lines | llama.cpp progress on **stderr** while a model loads. stdout stays clean (F33) |
+| Thousands of `create_tensor:` lines | You asked for them: `log_level` is set to `info`/`debug` somewhere in your environment or config, and `debug` prints llama.cpp's entire transcript. Unset it and a healthy run leaves only warnings on stderr |
+| `load: control-looking token: … was not control-type; this is probably a bug in the model` | A real warning from llama.cpp about the GGUF's tokenizer metadata, kept by the default `warn` level. It is about the artifact, not about your config; `log_level = "error"` silences it and everything below errors |
+| `np: configuration error: config io: NP_LLAMA_LOG_LEVEL: "deubg" is not a log level — write one of off, error, warn, info, debug` | A typo in the variable. It refuses rather than silently defaulting, because a hatch you cannot trust is worse than no hatch — and note that a value in your **config file wins over it**, like every other key here |
 | `np embed` says `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |
 
 ## Building from source, and developing

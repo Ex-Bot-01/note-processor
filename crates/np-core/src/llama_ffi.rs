@@ -200,7 +200,40 @@ pub struct llama_context_params {
     pub ctx_other: *mut llama_context,
 }
 
+/// llama.cpp's logger hook, mirroring `ggml/include/ggml.h:2956`:
+/// `void (*ggml_log_callback)(enum ggml_log_level level, const char * text, void * user_data)`.
+///
+/// Two properties of this signature are load-bearing and neither is visible from the type:
+///
+/// * **The buffer carries no length.** v0.8.0 hands an already-`vsnprintf`'d NUL-terminated string, so
+///   [`std::ffi::CStr::from_ptr`] is the only way to read it — and reading must wait until the level has been
+///   gated, because a filtered line should cost nothing beyond the comparison.
+/// * **The enum arrives as a C `int`.** Rust has no layout claim about a C enum, so the parameter is `c_int` and
+///   [`crate::loglevel::LogLevel::forwards`] decides on the number; an unrecognised one writes nothing rather than
+///   guessing a level it was not given.
+///
+/// A callback that unwinds aborts the process, costing both the exit code and our own `np:` line, so the body this
+/// type names is wrapped in `catch_unwind` (`local_model::set_log_level`).
+pub type GgmlLogCallback = Option<
+    unsafe extern "C" fn(
+        level: std::ffi::c_int,
+        text: *const std::ffi::c_char,
+        user_data: *mut std::ffi::c_void,
+    ),
+>;
+
 extern "C" {
+    // ---- logging --------------------------------------------------------------
+
+    /// Route llama.cpp's and ggml's log lines through our callback.
+    ///
+    /// Passing `None` restores upstream's behaviour, which its header spells out: “If this is not called, or NULL
+    /// is supplied, everything is output on stderr” (`include/llama.h:1672-1676`) — the load transcript F33 exists
+    /// to quiet. The state is **process-global and not thread safe** by the same comment (“The logger state is global
+    /// so these functions are NOT thread safe”), which is why `local_model::set_log_level` installs once, before any
+    /// model load, rather than per embedder.
+    pub fn llama_log_set(callback: GgmlLogCallback, user_data: *mut std::ffi::c_void);
+
     // ---- identity -------------------------------------------------------------
 
     /// The library's version string, e.g. `0.8.0-dev` (`src/llama.cpp`: `return LLAMA_VERSION;`).

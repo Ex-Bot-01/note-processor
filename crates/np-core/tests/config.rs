@@ -1636,6 +1636,107 @@ fn auto_workers_follow_the_machine_within_measured_bounds() {
     assert!(!ThreadCount::Workers(three).is_auto());
 }
 
+/// `log_level` takes exactly the five names (F33), and absence means "the caller's default", not "off".
+///
+/// The field is `Option`: a config that says nothing must not become a decision, because np-core installs no log callback at all for
+/// a library caller and the CLI's default is its own choice. What this case pins is that the *spelling* is validated here, at the
+/// boundary, so a typo cannot reach a threshold as silence.
+#[test]
+fn log_level_takes_the_five_names_and_absence_means_unset() {
+    let _env = hold_env();
+    let tmp = tempfile::tempdir().expect("test setup: tempdir");
+    let data = toml_str(&tmp.path().display().to_string());
+
+    for (name, body) in [
+        (None, ""),
+        (
+            Some(np_core::loglevel::LogLevel::Off),
+            "log_level = \"off\"",
+        ),
+        (
+            Some(np_core::loglevel::LogLevel::Error),
+            "log_level = \"error\"",
+        ),
+        (
+            Some(np_core::loglevel::LogLevel::Warn),
+            "log_level = \"warn\"",
+        ),
+        (
+            Some(np_core::loglevel::LogLevel::Info),
+            "log_level = \"info\"",
+        ),
+        (
+            Some(np_core::loglevel::LogLevel::Debug),
+            "log_level = \"debug\"",
+        ),
+    ] {
+        let path = write_config(
+            tmp.path(),
+            &format!("data_dir = {data}\n[embeddings]\n{body}\n"),
+        );
+        let cfg =
+            Config::load(Some(&path)).unwrap_or_else(|err| panic!("`{body}` must load: {err}"));
+        assert_eq!(cfg.embeddings.log_level, name, "`{body}`");
+    }
+}
+
+/// An invented level refuses naming the key, the value as written and all five permitted names.
+///
+/// The rows are not one kind of mistake and they do not fail alike, in the same split `threads` documents at
+/// [`an_impossible_worker_count_is_refused_naming_the_key`]: a wrong *spelling* reaches our visitor and produces our sentence naming
+/// `embeddings.log_level`, while a value of the wrong **type** is refused by serde before the visitor sees it — that message names the file
+/// and lists what was expected, but not the key path. Pinning the difference is the point: smoothing it over would let a future change to
+/// the visitor drop one half unnoticed.
+#[test]
+fn an_impossible_log_level_is_refused_naming_key_value_and_the_five_names() {
+    let _env = hold_env();
+    let tmp = tempfile::tempdir().expect("test setup: tempdir");
+    let data = toml_str(&tmp.path().display().to_string());
+
+    for (body, names_key) in [
+        (r#"log_level = "trace""#, true),
+        (r#"log_level = "INFO""#, true),
+        (r#"log_level = """#, true),
+        ("log_level = 3", false),
+        ("log_level = true", false),
+    ] {
+        let path = write_config(
+            tmp.path(),
+            &format!("data_dir = {data}\n[embeddings]\n{body}\n"),
+        );
+        let err = Config::load(Some(&path)).expect_err("`{body}` must be refused");
+        let text = err.to_string();
+        let expectation = if names_key { "must" } else { "must not" };
+        assert_eq!(
+            text.contains("embeddings.log_level"),
+            names_key,
+            "`{body}` {expectation} name embeddings.log_level: {text}"
+        );
+        // Every refusal lists all five spellings, whichever layer produced it — that list is one constant in `loglevel.rs`, and this
+        // assertion is what stops the parser and the promise from drifting apart.
+        for name in ["off", "error", "warn", "info", "debug"] {
+            assert!(
+                text.contains(name),
+                "`{body}` refusal must list the permitted name `{name}`: {text}"
+            );
+        }
+        assert!(
+            text.contains(&tmp.path().display().to_string()),
+            "`{body}` must name the config file: {text}"
+        );
+    }
+
+    // And a wrong *spelling* quotes what was written, so the reader knows which word to fix.
+    let path = write_config(
+        tmp.path(),
+        &format!("data_dir = {data}\n[embeddings]\nlog_level = \"trace\"\n"),
+    );
+    let text = Config::load(Some(&path))
+        .expect_err("must refuse")
+        .to_string();
+    assert!(text.contains("\"trace\""), "must quote the value: {text}");
+}
+
 /// Both accepted spellings load, and absence means `auto` rather than "unset, so four".
 #[test]
 fn threads_defaults_to_auto_and_takes_both_spellings() {

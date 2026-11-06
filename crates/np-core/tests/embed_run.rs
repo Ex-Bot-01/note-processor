@@ -58,6 +58,7 @@ impl Setup {
                 // The policy default, spelled out: these fixtures must not inherit a worker count by
                 // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
                 threads: np_core::config::ThreadCount::Auto,
+                log_level: None,
             },
             ..Config::default()
         }
@@ -850,6 +851,7 @@ fn provider_none_is_configuration_disabled_and_reads_nothing() {
             // The policy default, spelled out: these fixtures must not inherit a worker count by
             // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
             threads: np_core::config::ThreadCount::Auto,
+            log_level: None,
         },
         ..setup.cfg()
     };
@@ -1095,6 +1097,7 @@ fn every_report_carries_the_caveat_line() {
             // The policy default, spelled out: these fixtures must not inherit a worker count by
             // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
             threads: np_core::config::ThreadCount::Auto,
+            log_level: None,
         },
         ..setup.cfg()
     };

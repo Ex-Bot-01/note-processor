@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::db::BUSY_TIMEOUT_MS;
+use crate::loglevel::{resolve_level_from_env, LogLevel};
 
 /// Name of the registry database inside the data dir.
 const REGISTRY_FILE: &str = "workspaces.sqlite";
@@ -484,6 +485,19 @@ pub struct EmbeddingsConfig {
     /// is not a new looseness — `docs/design-m2-thread-policy.md` §3 records the choice, including why there is no
     /// `[local_model]` section and no environment override). Accepted spellings and refusals: [`ThreadCount`].
     pub threads: ThreadCount,
+    /// How loud llama.cpp may be on this program's stderr — **absent means unset, not `off`** (F32's sibling F33).
+    ///
+    /// Three things worth writing down, because each one was a review finding against the first draft:
+    ///
+    /// * The type is [`crate::loglevel::LogLevel`], which carries **no feature gate**. `[embeddings] log_level` is config vocabulary, and
+    ///   np-cli builds np-core with `default-features = false`: gating the enum would make one key parse in a build with `local-model` and
+    ///   refuse as unknown without it. Only installing a sink is gated, in `local_model`.
+    /// * `Option`, because "the file said nothing" must stay distinguishable from "the file said `off`": the environment fills the first and
+    ///   must not outvote the second ([`crate::loglevel::resolve_level`], §12 rule 7's precedence).
+    /// * It is validated at load but **not** merged from the environment into this field, unlike `[models]`: the effective level is asked for
+    ///   by name through [`crate::loglevel::resolve_level_from_env`], and a field that sometimes held the file's word and sometimes the
+    ///   environment's would leave a reader unable to tell which they edited.
+    pub log_level: Option<LogLevel>,
 }
 
 /// Hand-written rather than derived, so the default `max_tokens` is one number in one place — and so a later
@@ -496,6 +510,8 @@ impl Default for EmbeddingsConfig {
             dim: None,
             max_tokens: DEFAULT_EMBEDDING_TOKENS,
             threads: ThreadCount::default(),
+            // Unset rather than a level: see the field's note on why "nobody said" is not "said `off`".
+            log_level: None,
         }
     }
 }
@@ -620,6 +636,12 @@ impl Config {
         }
         validate_embeddings(&cfg)?;
         resolve_models(&mut cfg)?;
+        // F33: the log level is *checked* here and stored nowhere. Two reasons, both stated because they are not obvious from the call:
+        // the value can arrive from the environment, and a rule watching only the file would let an env typo route around it (the same
+        // argument `resolve_models` gives for validating its merged values); and the effective level is then asked for by name through
+        // [`crate::loglevel::resolve_level_from_env`] by the one caller that installs a sink, so merging it into `embeddings.log_level`
+        // would make that field mean "the file's word" or "the environment's word" depending on load order.
+        resolve_level_from_env(cfg.embeddings.log_level).map_err(invalid_data)?;
         Ok(cfg)
     }
 

@@ -1359,6 +1359,79 @@ pub struct LoadOptions {
 ///
 /// Every error path frees what it allocated. The model is freed in exactly one place — the `Err` arm below —
 /// and the context in exactly two: this function's pooling refusal, and `LoadedModel`'s `Drop`.
+/// The level this process asked llama.cpp to log at, read by the private `log_gate` hook on every line.
+///
+/// A `OnceLock` rather than an `AtomicU8` because the value and the installed callback have to agree with each other: a level stored
+/// without the hook in place would still let upstream write its transcript, and swapping a hook while llama.cpp is mid-write is what
+/// `include/llama.h:1674` warns about in its own words (“The logger state is global so these functions are NOT thread safe”).
+static LOG_LEVEL: std::sync::OnceLock<crate::loglevel::LogLevel> = std::sync::OnceLock::new();
+
+/// Route llama.cpp's and ggml's log lines through a private gate, which writes only what `level` allows (F33).
+///
+/// **Nothing in np-core calls this.** The sink is process-global, so choosing it is the host program's decision: a library that quieted
+/// its caller's stderr would be doing something nobody asked for. `np` opts in from `embed_provider`, once, before anything can load a
+/// model; a downstream user of this crate keeps upstream's behaviour exactly as written.
+///
+/// The **first call wins and later calls are ignored silently** — stated because silence is the surprising half. A second call could not
+/// be honoured safely anyway: it would mean swapping a hook while another thread may be inside it, which is the race the header above
+/// names. A caller that wants a different level mid-run has to decide that before the first load.
+pub fn set_log_level(level: crate::loglevel::LogLevel) {
+    if LOG_LEVEL.set(level).is_err() {
+        return;
+    }
+    // SAFETY: `log_gate` is an `extern "C"` function with exactly `ggml_log_callback`'s signature
+    // (`ggml/include/ggml.h:2956`), lives for the process lifetime, and never unwinds out of its body; `user_data` is null and the gate
+    // never dereferences it. Passing a callback rather than `None` is what replaces upstream's "everything on stderr" default — including
+    // for [`crate::loglevel::LogLevel::Off`], where the gate writes nothing at all.
+    unsafe { llama_ffi::llama_log_set(Some(log_gate), std::ptr::null_mut()) };
+}
+
+/// The hook itself: write the line if this threshold wants it, and otherwise cost one integer comparison.
+///
+/// Three rules bind here, in this order, and each exists because of something specific in v0.8.0 rather than as general FFI hygiene
+/// (`docs/design-f33-llama-log-level.md` §4):
+///
+/// 1. **Gate before reading.** The signature carries no length, so the only way to read `text` is
+///    [`std::ffi::CStr::from_ptr`](std::ffi::CStr::from_ptr) over whatever bytes upstream NUL-terminated — and a line we have already
+///    decided to drop should never be walked at all.
+/// 2. **Write it as it arrived, or not at all.** `to_str()` then one `write_all`, ignoring the `Result`: a progress line this program
+///    cannot spell is not worth re-encoding, and nothing in this repo parses these bytes (design §1's finding 6). Not
+///    `to_string_lossy`, which allocates to repair characters nobody asked about.
+/// 3. **Never re-enter llama.cpp or ggml.** The body touches stderr and nothing else; the logger state is global and not thread safe, so
+///    calling upstream from inside its own callback is how a log line becomes a deadlock.
+///
+/// # Safety
+///
+/// Called from C on whatever thread llama.cpp logs from, with a `text` pointer that is either null or a NUL-terminated buffer valid for
+/// the duration of the call, and a `user_data` this crate always passes as null.
+unsafe extern "C" fn log_gate(
+    level: std::ffi::c_int,
+    text: *const std::ffi::c_char,
+    user_data: *mut std::ffi::c_void,
+) {
+    // Unwinding out of this body would abort the process, costing both its exit code and our own `np:` line — so a panic loses one log
+    // line instead of the run. That includes the assertion below: it is a check on this crate's own call, and a debug build must not be
+    // able to turn "we passed a non-null user_data" into a panic crossing an `extern "C"` boundary.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        debug_assert!(user_data.is_null(), "set_log_level passes no user_data");
+        if !LOG_LEVEL
+            .get()
+            .is_some_and(|threshold| threshold.forwards(level))
+        {
+            return;
+        }
+        if text.is_null() {
+            return;
+        }
+        // SAFETY: the contract above promises a NUL-terminated buffer, live for this call, that we only read.
+        let Ok(line) = (unsafe { std::ffi::CStr::from_ptr(text) }).to_str() else {
+            return;
+        };
+        use std::io::Write;
+        let _ = io::stderr().write_all(line.as_bytes());
+    }));
+}
+
 /// With [`LoadOptions::default()`]: the runtime's own worker counts, and the only entry point production uses.
 pub fn load(path: &Path, configured_dim: usize) -> Result<LoadedModel, EmbedError> {
     load_with_options(path, configured_dim, LoadOptions::default())

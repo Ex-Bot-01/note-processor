@@ -609,6 +609,13 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
             // absent* arm stays arm (iii) instead of arriving late as a failure.
             #[cfg(feature = "local-model")]
             {
+                // F33: decide how loud llama.cpp may be on this run's stderr, once, before anything can load. The rules — the five names,
+                // which source wins, what an empty value means — live in `np_core::loglevel` beside the vocabulary; this call is only the
+                // decision to opt in, because *this* process owns its stderr and a library quietly installing a global sink would not.
+                // `Config::load` already refused a value that cannot be honoured, so the error arm is unreachable from argv; propagating
+                // rather than unwrapping keeps it honest if that ever stops being true.
+                let level = np_core::loglevel::resolve_level_from_env(cfg.embeddings.log_level)?;
+                np_core::local_model::set_log_level(level);
                 match np_core::local_model::LazyLocalEmbedder::new(
                     &row,
                     &artifact,
