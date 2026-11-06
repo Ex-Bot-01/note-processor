@@ -15,7 +15,11 @@ F22, F24 — each quoting the file:line or the test that puts the fix in the tre
 what was checked and what is left: **F18** (needs a Windows box; nothing here can even cross-compile the arm it is about), **F21** (the panic
 is gone; a person still cannot learn what an old upgrade deleted without `sqlite3`), **F23** (its “Still open — the residue” is narrower than
 it reads, because A4 shipped after the card was written), **F25** (re-measured: the shape still comes off the renderer; it waits on a human
-decision about `- [[title]]`, not on a measurement). Not audited as far as this file knows: **F28–F31 and F35**. Two cards are off the queue for
+decision about `- [[title]]`, not on a measurement). **[Later the same day]** two of those waits ended: the human ruled on F25 (keep the
+bullet, option A) and on F35 (refuse unknown keys everywhere), and both are implemented and green on branches — `f25/bullet-stays-with-entry`
+at `9abb5b4`, `f35/refuse-unknown-sections` at `c99ee6b` — awaiting a merge decision, so neither carries a **Closed on** paragraph yet: this
+file counts a card closed when the fix is in `main`, which is the rule that caught the miscount below. Not audited as far as this file knows:
+**F28–F31**. Two cards are off the queue for
 reasons an audit did not have to discover: F26 carries its own Closed on paragraph (2026-11-03), so it is closed rather than awaiting a check,
 and F27 holds a deliberate do-not-implement stance that an audit does not overturn.
 
@@ -914,6 +918,31 @@ states that every figure lands as `vision-unavailable` in a binary built today, 
 image vectors *that exist* rather than implying `np embed` filled them. That is documentation of the gap, not its resolution:
 the decision about what a shipped binary links is still owed, and no `vision` passthrough was added here.
 
+**Ruled 2026-11-06 by the human — option (a), plus a requirement this card did not contain.** "`np` should also embed images",
+and: an image embedding needs **its own separate vector, linked to the place where an image is mentioned or placed in notes**.
+Measured against `main` = `64a6b73`, the ruling's first half is already shipped and its second half is not, which changes what
+this card is asking for:
+
+- **"its own separate vector" — exists.** `media_embeddings` keys a vector by `(media_id, model)` with `dim > 0` and
+  `length(vector) = 4 * dim` (`crates/np-core/src/db.rs:362-375`), one row per figure per model. Image vectors are not folded into
+  text chunks, and nothing about the ruling asks them to be.
+- **"linked to the place where an image is mentioned or placed" — only partly exists, at the wrong grain.** What links a figure to
+  somewhere is `media_path`: every workspace *path* whose bytes hash to that figure (`db.rs:347-359`). It answers "which files hold
+  these bytes", not "where a note placed this figure". And `np search` does not even report the set: `media_report` returns the
+  **lexicographically smallest** stored path and one smallest live linker note (`search.rs:432-447`, documented at `:67`), so a
+  figure used in twelve notes reports one of them by sort order. The code says why it stopped there — "a `note → media` edge would be
+  an eleventh migration, which Task 6 forbids" (`search.rs:480`).
+
+So F28 is now two pieces, and the second is larger than the feature flag this card was written about:
+
+1. **Capability.** `vision = ["np-core/vision"]` in `crates/np-cli/Cargo.toml`, so a shipped binary can encode a figure at all — with
+   §14's rule intact: re-measure every archive shape with `strip` in one session, name the projector's 554,821,056 bytes as a *fetched*
+   cost beside the binary's own, and keep the ~40 MB ceiling claim honest or correct it.
+2. **Placement.** An occurrence edge (migration 11) from a note to the figure it references, so a hit can name the note that placed it
+   instead of one chosen by byte order — which changes what a media hit renders as, and therefore its goldens, its README section, and
+   `media_report`'s contract. Whether "place" means *the note* or *the position inside it* (line/heading/chunk) is the next decision, and
+   it decides whether this is one edge table or an edge with coordinates.
+
 ## F29 — every `.svg` in the vault refuses as `unsupported-format`, and a diagram library is mostly SVG
 
 Filed 2026-11-04 by R7c Task 8 so that §8's deferred format has a number instead of living inside one design bullet. The human
@@ -933,6 +962,13 @@ no option turns it on.
 - **Done when:** either that ships with a measured size figure and an SVG case in `tests/embed_media.rs` (embedded, not merely
   refused), or someone decides vector formats stay out permanently and README says so as a product limit rather than leaving it
   readable only as a format accident.
+
+**Ruled 2026-11-06: the second branch of "done when", on the assistant's recommendation — not implemented yet.** Vector formats stay out,
+and README is to say so as a product limit rather than leaving `.svg` refusal readable as a format accident. The ruling follows F28's: now
+that a shipped binary is to encode figures, this card becomes the question "what will it encode", and the answer is raster formats — because
+the fix shape above needs a rasteriser that must disable external references and DTDs ("an SVG is a file that asks to fetch things"), which is
+a dependency and an attack surface added for a capability nobody has asked for yet. Not closed: the README wording does not exist until someone
+writes it, and `unsupported-format` will keep counting diagrams on the first image-aware `np embed` until it does.
 
 ## F30 — Matryoshka truncation is the storage lever for a big image index, and it has never been exercised
 
@@ -1116,3 +1152,28 @@ invented `[paths]` section for several measured runs before the mismatch showed 
   decision, and that is the human's call, not a cleanup riding along with something else.
 - **Blocks:** nothing correctness-wise; it blocks any sentence claiming "a typo in `config.toml` fails loudly" without naming
   which levels of the file that covers (the thread-policy design at §84 says exactly that about `[embeddings]`, where it is true).
+
+**Ruled and implemented 2026-11-06, not closed yet — it waits on a merge, not on work.** Option **(a)**, by the human's ruling, with option
+(b)'s honesty explicitly declined: "only these sections are read; anything else is ignored" would document the trap instead of disarming it.
+`Config`, `CatalogConfig` and `MarkerConfig` now carry `deny_unknown_fields` beside the two that always did, so one sentence covers the file:
+*a key this build does not know is refused, naming the file, the line and the key as written*. Decision, cost (forward compatibility for
+sections invented after this binary was built) and measurements: `docs/design-f35-unknown-keys.md`. Branch `f35/refuse-unknown-sections`,
+commit `c99ee6b`; CI run 42213055546.
+
+Two things the card got wrong, recorded rather than smoothed over:
+
+- Its premise that `CatalogConfig` "already carries it". Measured at `main` = `64a6b73`: `grep -n 'deny_unknown_fields'` finds the attribute
+  on exactly two structs — `ModelsConfig` (`config.rs:173-174`) and `EmbeddingsConfig` (`:450-451`). Nothing else refused anything, which is
+  a wider gap than the card describes and makes the `[paths]` case the general one rather than an edge of it.
+- Its framing as *top-level* only. The root was the hole that mattered, but `[catalog]` and `[markers]` were lenient too, so a stray key there
+  vanished quietly as well; all three containers are strict now and each has a case that fails if its own attribute is removed.
+
+Evidence to re-run after merge: `cargo test -p np-core --test config` (54 cases, 0 failed), whose new ones are
+`a_stray_key_at_the_top_level_is_refused_naming_key_and_file`, `an_invented_section_is_refused_naming_the_section_and_its_line`,
+`every_section_refuses_an_unknown_key`, `an_unknown_key_inside_a_section_is_the_one_named_when_the_root_has_one_too`,
+`a_file_of_real_keys_still_loads_every_section`, plus `strictness_no_longer_stops_at_a_section_boundary` — which is
+`the_models_strictness_is_scoped_to_the_models_section`'s fixture with the demand inverted, alongside
+`an_unknown_key_outside_embeddings_still_loads`'s rewritten twin. Reversing a stance that three tests pinned is why this card asked for a human
+ruling rather than taking it, and both pins are still in the file saying what they used to mean. One of our own fixtures was living off the
+leniency: `an_unconfigured_fetch_says_it_is_using_the_compiled_in_origin` wrote an invented `[workspace]` section to mean "a config that says
+nothing", and now writes an empty file — caught by the suite before a user met it.
