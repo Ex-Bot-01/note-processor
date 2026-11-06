@@ -1,5 +1,15 @@
 # M2 follow-up backlog (carried out of the M1 whole-branch review)
 
+**How to read a card's status.** A card is closed when it carries a **Closed on …** paragraph; the absence of one used to mean "open", and on
+2026-11-06 that reading proved wrong: work landed in hardening rounds whose commit messages named several cards at once, and the cards were
+never updated. Eight are marked below with the evidence that shows the fix is in the tree — a file:line that did not exist when the card was
+filed, or a gate row that now passes. Cards **not** listed there have not been re-checked; treat them as open, and add the evidence line when one
+closes rather than editing the prose away.
+
+Audited 2026-11-06: F1, F2, F3, F4, F5, F6, F8, F14 → closed below. Not audited (still open as far as this file knows): F7, F9, F10, F15,
+F22, F25, F18–F21, F23, F24, F27–F31, F35.
+
+
 These are not new features. They are the items the Milestone 1 reviews judged *correct enough to ship* but
 worth fixing before the code carries embeddings, clustering or a UI on top of it. Each entry lists what was
 decided in M1, the evidence, and how to tell a fix is done. Line references are as of `b719138` (merge of
@@ -28,6 +38,10 @@ Order of attack, round by round — each round is one task brief with its own re
   assertions. **Done when:** a deliberately failing assertion inside that test leaves no read-only directory behind
   (`strace`-free check: re-run the test suite twice after `cargo test -p np-core --test walk`).
 
+**Closed on 2026-11-06 by audit — the drop guard the card asked for is what the test now uses.** `crates/np-core/tests/walk.rs` reads the
+directory's own mode first and comments it as “whatever was there is what the guard puts back”, so a failing assertion between the `chmod 0`
+and the restore no longer leaks a read-only directory. The card's own “done when” (re-run the suite twice after a deliberate failure) was
+satisfied by that structure rather than re-measured here; what is verified is that the mechanism exists at the site the card named.
 ## F2 — skipped configuration tests stay silent
 
 - **Where:** `crates/np-core/tests/config.rs:157` returns early when a precondition is unmet; its sibling at `:145`
@@ -35,6 +49,8 @@ Order of attack, round by round — each round is one task brief with its own re
 - **Fix:** same visible skip message, so a green CI run cannot hide an untested branch on some platform.
   **Done when:** every early return in that file either asserts or prints.
 
+**Closed on 2026-11-06 by audit, in `cc8ee4a` (“hermetic and honest config tests”).** `grep -n 'return;' crates/np-core/tests/config.rs`
+now finds no bare early return, so every unmet precondition in that file prints rather than exits quietly — the card's “done when”.
 ## F3 — rustdoc warnings
 
 - **Where:** 9 remaining from `cargo doc -p np-core --no-deps`: `items.rs` ×5, `scan.rs:11` ×2, `walk.rs`
@@ -42,6 +58,9 @@ Order of attack, round by round — each round is one task brief with its own re
 - **Fix:** plain code spans or fully-qualified paths; add `cargo doc -p np-core --no-deps --deny warnings` as a CI
   step so it cannot regress. **Done when:** the command is clean and CI enforces it.
 
+**Closed on 2026-11-06 by audit — rustdoc warnings are now a gate failure, at three feature levels.** The gate list runs
+`RUSTDOCFLAGS="--deny warnings" cargo doc --locked --workspace --no-deps` plus the `local-model` and `local-model,vision` variants, so a new
+warning fails CI instead of accumulating. This round's own example: a public-to-private intra-doc link in F33 was caught by exactly that row.
 ## F4 — no `busy_timeout`, though WAL exists for concurrent access
 
 - **Where:** `crates/np-core/src/db.rs:182` — that `execute_batch` sets `journal_mode = WAL` and `foreign_keys = ON`
@@ -52,6 +71,9 @@ Order of attack, round by round — each round is one task brief with its own re
   **Done when:** a test opens two connections where the second writes while the first holds a transaction and the
   write succeeds after waiting rather than returning `SQLITE_BUSY`.
 
+**Closed on 2026-11-06 by audit, in `cc8ee4a` (“busy_timeout”).** `crates/np-core/src/db.rs:538` and `:552` set
+`PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}` before anything else, with the comment explaining it also covers the schema path; the report gained a
+`busy-gap` line so a run that waited says so.
 ## F5 — child tables have no foreign keys
 
 - **Where:** `crates/np-core/src/db.rs:68-101` — `headings`, `tags`, `links`, `items` carry `note_id` with no
@@ -62,6 +84,8 @@ Order of attack, round by round — each round is one task brief with its own re
   **Done when:** a test inserts a child row with a dangling `note_id` and it fails, and every M1 scan test still
   passes unchanged.
 
+**Closed on 2026-11-06 by audit.** `crates/np-core/src/db.rs` declares 15 `REFERENCES` clauses and turns enforcement on with
+`PRAGMA foreign_keys = ON` (`:552`); the orphan-receipt machinery (`FK_ORPHANS_KEY`) exists precisely because those constraints can fire.
 ## F6 — published-file fingerprint rejects CRLF
 
 - **Where:** `crates/np-core/src/scan.rs:1008-1018` (`np_published`) versus `catalog::HEADER`.
@@ -77,6 +101,8 @@ Order of attack, round by round — each round is one task brief with its own re
   `a_hand_written_file_carrying_our_header_under_a_generated_name_is_deleted` in
   `crates/np-core/tests/scan.rs` pins that behaviour.
 
+**Closed on 2026-11-06 by audit, in `cc8ee4a` (“CRLF-tolerant catalog fingerprint”).** The fixture corpus carries
+`crlf-note.md`, and CRLF handling is asserted in `tests/chunk.rs`, `tests/items.rs` and `tests/links.rs`.
 ## F7 — a leading horizontal rule reads as frontmatter
 
 - **Where:** `crates/np-core/src/parse.rs:146-160`: any file whose first line is exactly `---` with another `---`
@@ -91,6 +117,9 @@ Order of attack, round by round — each round is one task brief with its own re
 - **Fix:** Unicode-aware case folding for dedup while preserving the first spelling for display. **Done when:** a
   note with `#ÄNER-TAG` and `#äner-tag` yields one tag, rendered as first seen.
 
+**Closed on 2026-11-06 by audit — the fold is now full Unicode, not ASCII.** `crates/np-core/src/parse.rs:467-487` documents the
+choice in the direction the card wanted (`str::to_lowercase` kept deliberately, with the `#ÄNER-TAG` example that `to_ascii_lowercase` would
+leave beside it) and applies it at `:487`.
 ## F9 — per-statement re-preparation in the write path
 
 - **Where:** `crates/np-core/src/db.rs:242`, `:308`, `:324` use `Connection::execute`; the scan path already uses
@@ -200,6 +229,9 @@ What these numbers can and cannot carry:
   already isolate config) instead of inheriting the ambient environment. **Done when:**
   `env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config` passes, and the normal run still passes.
 
+**Closed on 2026-11-06 by audit, in `cc8ee4a`.** The card's own “done when” is now a standing gate row —
+`env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config` — and it passes; the tests take an explicit temporary environment
+(`TestEnv::install`) instead of inheriting `$HOME`.
 ## F13 — `rel` / `abs` stored as lossy strings
 
 - **Where:** `crates/np-core/src/db.rs:256` (`to_string_lossy`), same family as the workspace-key digest fixed in M1
