@@ -878,6 +878,20 @@ fn an_upgrade_that_removed_nothing_is_announced_nowhere() {
         report["upgrade_orphans"].is_null(),
         "a cleanup that removed no rows has no loss to report: {report}"
     );
+    // The durable record is a different question and gets a different answer: nothing was lost, and the file still
+    // proves the sweep ran. `null` here would mean "this workspace never went through migration 3", which is not true of
+    // a database this build created a moment ago (F21's second half).
+    assert_eq!(
+        report["recorded_upgrade_orphans"].as_str(),
+        Some(NOTHING_REMOVED),
+        "the zero receipt reaches anyone who asks, through `np scan --json` and not through `sqlite3`: {report}"
+    );
+    assert!(
+        report["recorded_merged_notes"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("merged=0")),
+        "same for the merge check: {report}"
+    );
 
     let plain = workspace();
     let first = run(&mut plain.command(&["scan"]));
@@ -1039,6 +1053,14 @@ fn only_the_scan_that_removed_the_orphans_announces_them() {
     assert!(
         again["upgrade_orphans"].is_null(),
         "a scan that migrated nothing has nothing to announce: {again}"
+    );
+    // **F21's Do-when, met through argv.** The announcement is once per process; the record is forever. Someone who
+    // missed the run — a month late, on another machine, with the same file — asks the question of `np scan --json` and
+    // gets the string `meta` holds, byte for byte, without opening a database shell.
+    assert_eq!(
+        again["recorded_upgrade_orphans"].as_str(),
+        Some(ORPHAN_RECEIPT),
+        "the receipt outlives the run that wrote it: {again}"
     );
 
     let printed = run(&mut ws.command(&["scan"]));

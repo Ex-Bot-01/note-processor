@@ -283,6 +283,11 @@ np models install|fetch|hash|list …
   database still creates it, like every other command: "read-only" describes what search changes about the index.) Which kinds
   are indexed is never a refusal: a notes-only corpus searches fine, so does an images-only one, and an index with no vectors
   prints `nothing indexed for <id>` and exits **0**.
+- **A schema upgrade's record outlives the run that made it.** The scan whose open cleaned up orphan rows says so on stdout, once — a permanent
+  one-line warning would train everyone to ignore it. The record itself lives in the workspace database and reaches every later report as
+  `recorded_upgrade_orphans` and `recorded_merged_notes`, so "what did an upgrade delete here last month?" is a question `np scan --json` answers instead of
+  one that needs a database shell (**F21**). A `null` means the file holds no such record; the all-zero string means the check ran and removed nothing, and
+  those two states are never collapsed into an empty string.
 - **`--json` is the machine interface.** stdout carries exactly one JSON document (`scan`, `embed`, `search`, `models list`);
   search hits always carry the same six keys — `score`, `kind`, `path`, `linked_from`, `source_note`, `linked_notes` — because
   an absent key and a zero would be two different claims. The last one is F28's: **every** live note linking a figure,
@@ -386,6 +391,7 @@ figure they belonged to.
 | --- | --- |
 | `np: configuration disabled: embeddings.provider = "none"` from `np embed` | No provider chosen. Either write `[embeddings] provider = "local-model"` into the config, or accept that this build indexes only |
 | `np: embedding disabled: embeddings.provider = "none" — set it to "local-model" and name an installed model with embeddings.model, then run np embed` from `np search` | Same state, seen from the command that needs a vector. The sentence ends with the two keys to edit (F32 made `search` say its own cause instead of borrowing this one) |
+| You want to know what an old schema upgrade removed — headings, tags, checklist items or links that predated the constraints | `np scan <workspace> --json`, and read `recorded_upgrade_orphans` / `recorded_merged_notes`. They carry the same strings the run that did the work printed once, out of the database rather than off a stream (**F21**). `null` means this file never recorded one; `headings=0,tags=0,…` means the sweep ran and removed nothing |
 | `np: no model row for "embeddinggemma-2" in this workspace: fetch it with … or install bytes you already hold with …` | The config names a model this **workspace** has never been given — the usual state after editing `config.toml` by hand. The tail is the argv to run, and it lists only commands this build has (`np models fetch` appears in builds compiled with `fetch`) |
 | `np: no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded: …` | The row exists but the file under `<key>.models/` does not. Same argv tail, same reason it is printed |
 | `np: refusing to overwrite the existing artifact …` from `models fetch` | Rule 5 of §12: a fetch publishes into an absent target only. Remove the artifact deliberately, or install over a declared digest with `np models install` |
