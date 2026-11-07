@@ -143,9 +143,18 @@ produced and `np search` refuses to turn your query into numbers — both at exi
 
 ### Pre-built binaries
 
-GitHub Releases carry `np` for Linux (x86-64), Windows (msvc) and macOS (apple silicon), built by `.github/workflows/release.yml`
-on a tag push. **The published `v0.1.0` assets are stale**: that tag points at the 2026-10-28 tree, whose CLI had exactly one
-subcommand (`scan`). Use them for the indexer; build from source if you want `embed`, `search` or `models`.
+GitHub Releases carry `np` archives named `np-<version>-<target>`. **`v0.1.0`'s assets are stale** — that tag points at the
+2026-10-28 tree, whose CLI had exactly one subcommand (`scan`) — so use them for the indexer only, never for `embed`, `search` or
+`models`.
+
+From **`v0.2.0` onward, read the release notes before downloading**: `.github/workflows/release.yml` builds on hosted Windows,
+Linux and macOS runners, and those runners are metered — when an account is out of included Actions minutes the workflow cannot
+run at all (`docs/ops-actions-minutes.md`). A release produced by `.github/scripts/package-assets.sh` instead carries **the one
+platform the packager was standing on**, and its notes say so. Source builds need no CI and no minutes:
+
+```sh
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.2.0 -p np-cli --locked
+```
 
 ## Getting a model onto the machine
 
