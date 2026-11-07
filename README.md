@@ -196,6 +196,23 @@ np models install ~/Notes --id embeddinggemma-2 --path ~/models/embeddinggemma-2
 your original. One word on stdout: `installed`, or `already installed` when the id is recorded with the same tuple. Re-running
 with a **different** dim or prefix for an existing id is refused rather than silently re-stamping history.
 
+The projector of a model — the file that lets a vision build encode figures — installs the same way, from the same offline
+file, with `--member`:
+
+```sh
+np models hash ~/models/mmproj-embeddinggemma-2-Q8_0.gguf
+np models install ~/Notes --id embeddinggemma-2 --member mmproj \
+  --path ~/models/mmproj-embeddinggemma-2-Q8_0.gguf --sha256 <that digest>
+```
+
+Three things about that command are deliberate. **`--dim` is refused, not ignored**: a projector carries no vector width, and
+a flag that reads like a fact about the file would be a quieter failure than a refusal. **The model has to be installed
+first** — a member row describes a file belonging to an installed identity, so `--member mmproj` on a workspace with no such
+model refuses before reading anything, including the 554 MB you pointed it at. **The digest is still mandatory**: an
+unverified projector would encode every figure in your vault with bytes nobody vouched for, and those vectors would then be
+compared against pinned-model text vectors forever. `--json` on a member install prints `{"id", "member", "state"}` — the
+extra key because `state` alone cannot say which artifact the run placed; the plain model install keeps its two keys.
+
 `np models list ~/Notes` then says what the workspace believes:
 
 ```text
@@ -431,8 +448,11 @@ Repository layout: `crates/np-core` (discovery, parsing, links, catalog, databas
 **Known gaps, stated plainly.** The binaries CI publishes still cannot encode an image: `vision` is off by default, so every figure in a release
 build's corpus lands in `vision-unavailable`. A build made with `--features local-model,vision` does encode them — the passthrough **F28** was is
 in place, and the run hands over only a projector this workspace has recorded and whose digest (or stamp) matches. What that build needs from you is
-the file itself: `np models fetch --member mmproj`, and until `install` grows a `--member` (**F28**, still open), fetching is the only door — an
-offline machine can place the text encoder and not the projector. Image throughput, resident-set growth with a projector open, cross-worker bit-identity and
+the file itself, and either door is open now: `np models fetch --member mmproj`, or `np models install --member mmproj` from a
+file you copied there yourself (**F28** step 3, offline, digest verified). What neither tells you yet is what the workspace
+recorded: `np models list` prints one line per model and never mentions members — true of fetched projectors too, so it is a
+reporting gap rather than an install one — which means the way to confirm a projector landed is that `np embed` stops
+reporting `projector-absent`. Image throughput, resident-set growth with a projector open, cross-worker bit-identity and
 retrieval quality have **not** been measured — the list is in `docs/design-m2-image-embeddings.md` §14. Windows and macOS get a
 written refusal from `build.rs` for feature builds and have never been executed here.
 

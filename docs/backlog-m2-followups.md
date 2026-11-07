@@ -972,6 +972,24 @@ Three mutants killed by three distinct cases (skip the digest comparison, resolv
 **Still open in this card:** `np models install --member`, without which an offline machine cannot place the projector that `projector-absent` now tells
 it to install; the five archive shapes measured with `strip` against §14's ~40 MB sentence; and the placement half below.
 
+**Step ③ landed the same day.** `np models install --member <main|mmproj>`: the member name keys `model_files`, the file lands at `<id>.mmproj`
+(`member_artifact_name`), and the model row is not written — asserted as a whole-row comparison, because a projector digest copied into `models.sha256`
+would leave every file readable and make each later verification compare the wrong bytes. Three refusals precede any read: an invented member names
+itself and offers what is installable (`models::INSTALLABLE_MEMBERS`, one list for the parser and the write path so they cannot drift); `--dim` beside a
+member that has no width refuses instead of being ignored; and `--member mmproj` where no model is installed answers about the missing model **before**
+touching the file — the row check sits ahead of the source hash, deliberately out of step with `install`, whose row comparison needs that hash. The
+default binary in this run has no `fetch` feature at all, which is the point: eleven shipped-binary cases (refusal order, both JSON shapes, repeat =
+`already installed`, `unclaimed 0`, `models.sha256` still the main artifact's digest) ran on a machine that dialled nothing. np-core gained five cases
+and np-cli five; mutants killed: skip the row check, record under the `main` member name (two tests), accept an unverified existing projector, drop the
+`--dim` guard, drop the member-set check — the last meaning `--member audio` silently installs a projector, which is exactly the drift the shared list
+prevents. **One equivalent mutant was found and removed rather than kept**: skipping the member write when the recorded digest already matched decided
+nothing (`record_model_file`'s CASE clears a stamp only when the digest changes), so the branch is gone and the rule lives in one place.
+
+**A gap this step exposes without causing:** `np models list` prints one line per model and never mentions members, so nothing tells you what the
+workspace recorded — true of fetched projectors since migration 9, so it is a reporting gap rather than an install one. The confirmation today is that
+`np embed` stops reporting `projector-absent`; that sentence is in the README's Option B, and closing it properly means adding member names to the
+listing's pinned key set, which is its own change.
+
 **Ruled in the same turn: the link is figure → note.** Not a coordinate inside the note — so the edge is one row per (note, figure), with no line,
 heading or chunk column. That settles the shape question this card ended on and leaves two to measure rather than debate: what the `vision`
 passthrough costs a shipped binary (§14's ~40 MB sentence has to survive it or be corrected), and what a media hit should render now that a figure
