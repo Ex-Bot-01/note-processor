@@ -1700,3 +1700,74 @@ What that settles for distribution, while CI minutes are gone:
 * **which product owns the policy is still unnamed** — Defender's ASR rule `d4f940ab…`, third-party AV app control and WDAC all remain
   candidates, and the ladder above is what names it. That is worth ten minutes on a quiet afternoon because it decides whether *building*
   becomes possible there too, and until someone runs it this card stays open.
+
+## F40 — with the artifact present and no runtime compiled in, `np embed` reports a *report-integrity* failure instead of saying "this build cannot embed"
+
+**Filed 2026-11-08 from the first Windows run with a real artifact** (`out.zip`, log `run-20261107-225434.log`), reproduced on Linux the
+same evening — so this is not a Windows oddity, it is what `np` does.
+
+The operator fetched `embeddinggemma-2` (295.5 MB, digest verified) and ran `np embed` with the release asset, which is compiled without
+the inference feature:
+
+```
+model      embeddinggemma-2
+outcome    owed and not produced
+detail     1 chunk(s) or batch(es) failed: the local embedding runtime is not built yet: model `embeddinggemma-2` … produced nothing
+seen       1        current 0   embedded 0   errors 1        exit=1
+```
+
+The same binary with the artifact **absent** takes a different, calmer path — `outcome configuration disabled`, `errors 0`, refusing before
+any work. So the difference is the presence of the artifact, and the worse branch is the one a real user meets: they installed a model
+correctly, and are told the program owed vectors and failed to produce them.
+
+**Why the wording is a defect and not cosmetics.** [`EmbedOutcome::OwedAndNotProduced`](../crates/np-core/src/embed_run.rs) is defined in
+`embed_run.rs` as §6's *report-integrity* state: the accounting says work was owed and nothing arrived, which points at our chunking or our
+stamping. Here it points at a compile-time feature. Three consequences:
+
+* an operator reads "possible data problem in my vault" when the truth is "wrong binary — install one with `local-model`, or search by
+  keyword";
+* `errors 1` counts as a failure a monitor would page on, and nothing about this run can be fixed by retrying;
+* it **does work before refusing** (`seen 1`), so the refusal arrives after scanning and opening the database rather than before them.
+
+Nothing was written — `current 0 embedded 0`, no rows stamped — so there is no corruption to clean up. This is about the answer, not the state.
+
+**The fix has one shape:** provider resolution answers "can this process embed at all?" **before** any batch runs, and the answer
+`RuntimeNotBuilt` carries its own outcome — same exit 1, sentence naming the feature and the two ways forward — with both artifact states
+taking that path identically. That is also a prerequisite for **F38**: `docs/design-f38-auto-fetch.md` §5 promises auto-fetch will *not* fire
+on `RuntimeNotBuilt`, and today there is no such state to test against, only a per-batch error string. So F40 lands before or with F38's
+Task 3, not after it.
+
+**Done when:** the artifact-present/no-runtime case exits 1 naming the feature without the words "owed" or "errors", `seen` stays 0 because
+nothing was scanned for work, and a test pins that both artifact states produce the same outcome — asserter: two cases, one outcome enum, no
+string-matching on a per-batch error.
+
+---
+
+## F18 — round three (2026-11-08): Windows graded four things for the first time, and one of this card's claims is false
+
+Same bundle (`out.zip`, two logs; binary `np.exe` sha256 `d36f3e3b…44c270`, the cross-built release asset — **no `.git`, so the tree is
+unnamed**, which is now a standing caveat on every row below).
+
+**Passed, first time ever on Windows:** `[search] modee` refused naming file, line 2, column 1 and the key (**F35**); a valid
+`[search] mode = "keyword"` obeyed with no caveat; hybrid `--json` carried `cosine: null`, `bm25`, `vectors: false` and the F36 note at exit 0.
+
+**F34's Windows arm answered in the field for the first time:** `np models fetch` printed `free space 285.8 GB before the fetch`, fetched
+295.5 MB from the compiled-in origin, verified sha256 `2188ac1d…09135`, and `models list` then reported `present dim 768`. Nothing about
+rule 6 is theoretical on that platform any more.
+
+**This card's §5 claim is falsified.** It asserted the Windows identity fold is ASCII-only, so a rename `Ämli.md → ämli.md` would not be
+followed. Measured: `moved 1`, and the regenerated `INDEX.md` lists `ämli.md`. The ASCII-only fold is still real — `path_keys.rs:112`
+says `u8::to_ascii_lowercase` "is the whole rule: it changes only 0x41..=0x5A" — but it is not the whole *story*: the rename pairing caught
+the unmatched path and reported a move. So the honest statement is "the identity key does not fold non-ASCII case, and the move-detection
+heuristic rescues that case in practice", which is a materially weaker claim than the one this card made — and better news for users.
+
+**And the ASCII case behaves differently, correctly.** `Note.md → note.md` reported `unchanged 1`, not `moved 1`: on a case-insensitive
+volume the identity keys are equal after the ASCII fold, so nothing moved as far as identity is concerned. The `INDEX.md` in the same bundle
+lists `note.md` — the disk spelling — so no stale display path was left behind. My own test script asserted `moved 1` here and printed a
+CHECK; that expectation was wrong for Windows and has been corrected, which is worth stating because it is the second round in a row where a
+script expectation, not the binary, produced the red line.
+
+**Still unproven:** byte identity under unpaired-surrogate collisions, and the full interactive test suite (Stage 5) — that needs a working
+toolchain, which this machine does not have (**F39**). Also new: `%LOCALAPPDATA%\workspaces` held **40** `*.sqlite` files at 167,936 B after
+two runs, because every fresh vault path mints a workspace that nothing ever forgets. Not F18's subject; recorded here so whoever picks up
+workspace lifecycle does not have to rediscover it, and noted in **F37**'s population estimate: the layout is loose *and* growing.
