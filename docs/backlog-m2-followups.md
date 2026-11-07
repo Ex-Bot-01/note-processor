@@ -1439,8 +1439,11 @@ three rows fail for a reason that reads like a code defect.
 
 ## F36 — `np search` can only rank by meaning, so the first query anyone types in a vault has no answer
 
-**Implemented on 2026-11-08; closure withheld.** The card closes when a CI run with steps grades it — see the note under
-*Evidence* for why this round could not cite one. Design and rulings: `docs/design-m3-hybrid-search.md`.
+**Implemented on 2026-11-08; closure withheld.** Merged into `main` at `0fa2f0b` (branch `f36/hybrid-search`: `e872c66` the change,
+`7ce7335` the rulings and measurements). CI still cannot grade anything: run `42394486534` on the merged tree completed as a failure with
+**zero steps on every job** — `Decide the matrix` failed before step one and the other three reported `skipped`, which is the account-out-of-
+included-minutes signature recorded in `docs/ops-actions-minutes.md`, not a code defect (count `[.steps[]?] | length` before believing red).
+So this card carries local gate evidence and no graded run, and says so. Design and rulings: `docs/design-m3-hybrid-search.md`.
 
 ### What was asked, by whom
 
