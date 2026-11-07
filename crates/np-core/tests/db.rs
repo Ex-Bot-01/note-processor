@@ -211,6 +211,14 @@ fn the_schema_is_what_the_plan_mandates() {
             "model_files",
             "models",
             "notes",
+            // Migration 11's keyword index. `notes_fts` is the table a query names; the four under it are FTS5's own shadow
+            // tables (index, document store, sizes, config) — implementation of one index rather than four forgotten tables,
+            // and pinned by name so nobody adds them to a `SELECT` by accident.
+            "notes_fts",
+            "notes_fts_config",
+            "notes_fts_data",
+            "notes_fts_docsize",
+            "notes_fts_idx",
             "schema_version",
             "tags"
         ]
@@ -3335,6 +3343,14 @@ const LOSSY_DISPLAY: &str = "a\u{FFFD}b.md";
 /// only row moves, so "version four plus a pair" is exactly the file that step meets in the wild, and
 /// deleting its recorded `schema_version` row reproduces that without a third hand-copied schema to keep
 /// in step (this file already carries two of those, which is one too many to grow).
+/// What rewinding past **migration 11** has to undo, spelled once because five fixtures rewind and each one that forgets it
+/// fails on `table notes_fts already exists` — the rule this file already follows for migrations 6, 7 and 9 (a rewind deletes
+/// a version number, so it must also delete what the later entries created). Triggers first: they hang off `notes`, not off
+/// the FTS table. FTS5's four shadow tables go with their parent, so naming only `notes_fts` is enough.
+const REWIND_MIGRATION_11: &str =
+    "DROP TRIGGER notes_fts_ai; DROP TRIGGER notes_fts_ad; DROP TRIGGER notes_fts_au; \
+                                   DROP TABLE notes_fts;";
+
 fn seed_duplicate_pair_at_version_four(path: &Path) {
     let db = Db::open(path).expect("test setup: create the current schema");
     db.0.execute_batch(
@@ -3378,7 +3394,8 @@ fn seed_duplicate_pair_at_version_four(path: &Path) {
          DROP TABLE chunks;
          DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
-         DROP TABLE models;"
+         DROP TABLE models;
+         {REWIND_MIGRATION_11}"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -3481,7 +3498,8 @@ fn seed_two_duplicate_groups_at_version_four(path: &Path) {
          DROP TABLE chunks;
          DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
-         DROP TABLE models;"
+         DROP TABLE models;
+         {REWIND_MIGRATION_11}"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -3530,7 +3548,8 @@ fn seed_nine_duplicate_groups_at_version_four(path: &Path) {
          DROP TABLE chunks;
          DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
-         DROP TABLE models;"
+         DROP TABLE models;
+         {REWIND_MIGRATION_11}"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -3567,7 +3586,8 @@ fn seed_keyless_display_pair_at_version_four(path: &Path) {
          DROP TABLE chunks;
          DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
-         DROP TABLE models;"
+         DROP TABLE models;
+         {REWIND_MIGRATION_11}"
     ))
     .expect("test setup: rewind the file to version four");
 }
@@ -4242,7 +4262,8 @@ fn the_merge_gate_refuses_damage_that_no_merge_could_have_caused() {
          DROP TABLE chunks;
          DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
-         DROP TABLE models;"
+         DROP TABLE models;
+         {REWIND_MIGRATION_11}"
         ))
         .expect("test setup: rewind the file to version four");
 

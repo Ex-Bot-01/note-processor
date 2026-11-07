@@ -88,6 +88,23 @@ pub struct Hit {
     pub linked_notes: Vec<String>,
     /// How many live notes link this image, always `0` for a note hit: [`Hit::linked_notes`]`().len()`.
     pub linked_from: usize,
+    /// Cosine as the vector list computed it, or `None` when no vector list vouched for this hit.
+    ///
+    /// **Why this sits beside [`Hit::score`] instead of replacing it.** In hybrid mode `score` is a fused rank sum (§4 of
+    /// `docs/design-m3-hybrid-search.md`) and a reader who mistakes it for a similarity will draw conclusions about how close
+    /// the match was — a claim the number cannot support. The raw evidence is therefore carried separately rather than
+    /// recovered from context, and a hit that no vector list held says so with `None` instead of a plausible 0.0.
+    pub cosine: Option<f64>,
+    /// SQLite's own `bm25()` value for this note (negative-is-better, unremapped), or `None` when the keyword list did not
+    /// hold it. Kept as returned because any rescaling of it would be a constant nobody measured.
+    pub bm25: Option<f64>,
+    /// 1-based position in the semantic list, when there was one.
+    pub semantic_rank: Option<usize>,
+    /// 1-based position in the keyword list, when there was one.
+    pub keyword_rank: Option<usize>,
+    /// A fragment of the note showing what matched, brackets around the hit term. `None` for a hit the keyword list did
+    /// not produce — including every image, which has no prose to snippet.
+    pub snippet: Option<String>,
 }
 
 impl Hit {
@@ -109,6 +126,11 @@ impl Hit {
             source_note,
             linked_notes,
             linked_from,
+            cosine: Some(score),
+            bm25: None,
+            semantic_rank: None,
+            keyword_rank: None,
+            snippet: None,
         }
     }
 
@@ -122,7 +144,24 @@ impl Hit {
             source_note: None,
             linked_notes: Vec::new(),
             linked_from: 0,
+            cosine: Some(score),
+            bm25: None,
+            semantic_rank: None,
+            keyword_rank: None,
+            snippet: None,
         }
+    }
+
+    /// One hit that **only** the keyword list produced.
+    ///
+    /// A separate constructor rather than [`Hit::note`] with a zeroed score, because `note` fills `cosine` with the number it
+    /// was given and a note nobody embedded has no cosine to report — `Some(0.0)` would read as "we compared vectors and they
+    /// were orthogonal", which is a different fact from "no vector list held this row" and the kind of plausible zero a reader
+    /// acts on. The score starts at nothing because hybrid adds to it, and keyword-only mode overwrites it with SQLite's own.
+    fn keyword_note(path: String) -> Hit {
+        let mut hit = Self::note(0.0, path);
+        hit.cosine = None;
+        hit
     }
 }
 
@@ -563,3 +602,323 @@ type Linkers = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 /// A name for this pair because [`media_report`]'s bare return type trips `clippy::type_complexity`, and a reader of that
 /// signature deserves the words anyway.
 type MediaReport = (Vec<u8>, Vec<Vec<u8>>);
+
+// --- keyword and hybrid ranking (`docs/design-m3-hybrid-search.md`) ------------------
+
+/// Which lists a query may consult. The three spellings below are the whole vocabulary: `--mode`, `[search] mode` in config,
+/// and `--json` all read these strings, so a fourth spelling appearing in one door and not another (F28's split-refusal
+/// lesson) cannot happen while this stays the only definition. The serde derive renames to lowercase, which is the same set
+/// [`std::str::FromStr`] accepts — one list, two doors, no drift possible; [`SearchMode::label`] is what both print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Cosine over stored vectors only — the behaviour before FTS5 existed.
+    Semantic,
+    /// SQLite `bm25()` over note titles and bodies only. Answers with no model installed, and never returns a figure.
+    Keyword,
+    /// Both lists, fused by rank (§4). The default the human chose on 2026-11-07.
+    Hybrid,
+}
+
+impl SearchMode {
+    /// The one spelling of each mode, shared by the CLI flag, the config value and `--json`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Keyword => "keyword",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+impl std::fmt::Display for SearchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// A mode name that is not one of the three. Named rather than swallowed: F35's rule is that an unrecognised config value is
+/// refused, and a CLI flag deserves the same sentence as a config key.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown search mode `{0}`: expected `hybrid`, `semantic` or `keyword`")]
+pub struct UnknownSearchMode(pub String);
+
+impl std::str::FromStr for SearchMode {
+    type Err = UnknownSearchMode;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "hybrid" => Ok(Self::Hybrid),
+            "semantic" => Ok(Self::Semantic),
+            "keyword" => Ok(Self::Keyword),
+            other => Err(UnknownSearchMode(other.to_string())),
+        }
+    }
+}
+
+/// One answer from the keyword list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeywordHit {
+    /// Display path of the live note (`notes.rel`), which is what a reader opens.
+    pub path: String,
+    /// `bm25(notes_fts)` exactly as SQLite returned it: **lower is better**, and corpus-relative. Not rescaled — any
+    /// constant applied here would be one nobody measured (F31 has no labelled set to fit against).
+    pub bm25: f64,
+    /// A fragment of the body with the matched term in brackets; falls back to the title when the body holds no hit term.
+    pub snippet: String,
+}
+
+/// Why an answer came back from fewer lists than the mode asked for. Kept as an enum rather than a `String` so the CLI prints
+/// one sentence per real cause instead of free text invented at the print site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankNote {
+    /// The workspace holds no vectors at all, so hybrid's semantic half had nothing to read. A state, not an error: this is a
+    /// machine that has not downloaded an artifact yet. Vectors under some *other* model id stay a refusal — see [`SearchError::NoVectorsForModel`].
+    NoVectors,
+}
+
+/// The whole sentence for a build that can fetch: which doors this reader can actually walk through. F32's rule, because a
+/// `fetch`-less binary that names `np models fetch` sends them to a help screen that has never heard of it — the same reason
+/// `embed_run::install_hint` is two functions rather than one. Two consts, one per feature shape, so the wording a build
+/// prints is the wording that build can honour; `tests/cli.rs` pins each of them with the matching `cfg`.
+#[cfg(feature = "fetch")]
+const NO_VECTORS_SENTENCE: &str = concat!(
+    "no vectors in this workspace: ranked by keyword only \u{2014} ",
+    "`np models fetch` or `np embed` adds the semantic half"
+);
+
+/// The same advice where the fetch path is compiled out: install bytes you hold, then embed.
+#[cfg(not(feature = "fetch"))]
+const NO_VECTORS_SENTENCE: &str = concat!(
+    "no vectors in this workspace: ranked by keyword only \u{2014} ",
+    "`np embed` adds the semantic half once a model is installed"
+);
+
+impl RankNote {
+    /// The one sentence per cause. Spelled here rather than at the print site so text output and `--json` cannot disagree
+    /// about what was missing, and a future third variant has to be worded once.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NoVectors => NO_VECTORS_SENTENCE,
+        }
+    }
+}
+
+impl std::fmt::Display for RankNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// What [`ranked`] produced: the list, and which halves of it are real.
+#[derive(Debug, Clone)]
+pub struct Answer {
+    /// Fused, ordered, already truncated to the caller's limit.
+    pub hits: Vec<Hit>,
+    /// Whether a vector list was consulted at all. `false` is the report line "no vectors here", not a failure.
+    pub semantic_used: bool,
+    /// Whether the keyword list ran (it does not in [`SearchMode::Semantic`], and there is nothing to ask when the query has
+    /// no word characters in it).
+    pub keyword_used: bool,
+    /// The one honest sentence about a missing half, if any.
+    pub note: Option<RankNote>,
+}
+
+impl Answer {
+    /// Display paths in order — a test and CLI convenience that cannot disagree with [`Answer::hits`], because it reads them.
+    pub fn paths(&self) -> Vec<&str> {
+        self.hits.iter().map(|hit| hit.path.as_str()).collect()
+    }
+}
+
+/// Whether this workspace holds any vectors at all, so a caller can decide **before loading a 310 MB model** that the
+/// semantic half has nothing to read. Same question [`search`] asks internally, exposed because the CLI otherwise pays for a
+/// runtime it will not use.
+pub fn vectors_present(conn: &Db) -> Result<bool, SearchError> {
+    any_vectors_exist(conn)
+}
+
+/// How many words one query is allowed to ask about. Beyond this the AND-joined expression costs more than it answers; the
+/// cap exists so a pasted page of text cannot turn one search into a thousand phrase lookups.
+const MAX_QUERY_TERMS: usize = 32;
+
+/// Turn user text into an FTS5 **phrase conjunction**: every word quoted, joined with `AND`.
+///
+/// The query is treated as a bag of words rather than as FTS5 syntax — deliberately, and it is the reason this function
+/// exists. A raw query string would make `"`, `*`, `-`, `(` and `:` a supported input surface whose malformed forms return
+/// SQLite parse errors from inside a library call, and exposing that grammar is a decision of its own (§8 of the design
+/// note). Quoting each token also keeps an identifier like `GGML_DEFAULT_N_THREADS` — the reason hybrid became the default —
+/// out of the parser's way.
+fn match_expression(query: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for token in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if token.is_empty() {
+            continue;
+        }
+        // An FTS5 phrase is `"..."` with any inner quote doubled.
+        parts.push(format!("\"{}\"", token.replace('"', "\"\"")));
+        if parts.len() == MAX_QUERY_TERMS {
+            break;
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" AND "))
+}
+
+/// The keyword list: live notes whose title or body contains every word of `query`, ordered by `bm25()` and then by path
+/// **bytes** (F20's rule — the display text is a rendering, so it never decides an order on its own).
+pub fn keyword(conn: &Db, query: &str, limit: usize) -> Result<Vec<KeywordHit>, SearchError> {
+    let Some(expression) = match_expression(query) else {
+        return Ok(Vec::new());
+    };
+    let mut statement = conn
+        .0
+        .prepare_cached(
+            "SELECT notes.rel,
+                    bm25(notes_fts),
+                    snippet(notes_fts, 1, '[', ']', ' … ', 12),
+                    snippet(notes_fts, 0, '[', ']', ' … ', 8)
+             FROM notes_fts
+             JOIN notes ON notes.id = notes_fts.rowid
+             JOIN files ON files.rel = notes.rel
+             WHERE notes_fts MATCH ?1 AND files.state = 'ok'
+             ORDER BY bm25(notes_fts), notes.rel_bytes
+             LIMIT ?2",
+        )
+        .map_err(DbError::from)?;
+    let rows = statement
+        .query_map(rusqlite::params![expression, limit as i64], |row| {
+            let rel: String = row.get(0)?;
+            let bm25_score: f64 = row.get(1)?;
+            let body_snippet: String = row.get(2)?;
+            let title_snippet: String = row.get(3)?;
+            Ok((rel, bm25_score, body_snippet, title_snippet))
+        })
+        .map_err(DbError::from)?;
+    let mut hits = Vec::new();
+    for row in rows {
+        let (path, bm25_score, body_snippet, title_snippet) = row.map_err(DbError::from)?;
+        // A body snippet with no bracket found nothing in the body: the match was in the title, so show the title.
+        let snippet = if body_snippet.contains('[') {
+            body_snippet
+        } else {
+            title_snippet
+        };
+        hits.push(KeywordHit {
+            path,
+            bm25: bm25_score,
+            snippet,
+        });
+    }
+    Ok(hits)
+}
+
+/// The reciprocal-rank constant the fusion is defined with (§4). Not tuned here — there is no labelled set to tune against
+/// (F31), and inventing a number this repository cannot measure would be the worse invention.
+const RRF_K: f64 = 60.0;
+
+fn rrf(rank: usize) -> f64 {
+    1.0 / (RRF_K + rank as f64)
+}
+
+/// Rank one query against the lists `mode` allows, and fuse them.
+///
+/// `query_vector` is optional because **the caller may have no way to produce one**: a workspace with no vectors, or a
+/// keyword-only mode, should not have to embed anything. Absent vector input simply means no semantic list — hybrid answers
+/// from keywords and sets [`RankNote::NoVectors`] when the workspace holds no vectors at all; [`SearchMode::Semantic`]
+/// answers empty rather than inventing a ranking it cannot compute.
+///
+/// Ordering is the existing contract extended, not replaced: fused score descending, then display path ascending, then kind,
+/// then the raw evidence as bit patterns — so an equal-score pair still has exactly one order on every host and after every
+/// re-embed ([`search`] explains why row order may never be a tie-break).
+pub fn ranked(
+    conn: &Db,
+    mode: SearchMode,
+    model: Option<&str>,
+    query_vector: Option<&[u8]>,
+    query_text: &str,
+    limit: usize,
+) -> Result<Answer, SearchError> {
+    let mut semantic: Vec<Hit> = Vec::new();
+    let mut semantic_used = false;
+    if mode != SearchMode::Keyword {
+        if let (Some(model), Some(vector)) = (model, query_vector) {
+            // **Ask whether there are any vectors before calling it a half of the answer.** Hybrid skips the read entirely
+            // when the workspace holds none — that is the machine with no artifact yet, and its report says so. Semantic mode
+            // still runs the query, because "no vectors at all" is an empty answer there while "vectors under another model
+            // id" is a refusal, and only asking tells those two apart.
+            let present = any_vectors_exist(conn)?;
+            if mode != SearchMode::Hybrid || present {
+                semantic = search(conn, model, vector, limit)?;
+                semantic_used = present;
+            }
+        }
+    }
+
+    let keyword_used = mode != SearchMode::Semantic && match_expression(query_text).is_some();
+    let keywords = if keyword_used {
+        keyword(conn, query_text, limit)?
+    } else {
+        Vec::new()
+    };
+
+    // Keyed by (kind, path): a note can sit in both lists, and an image can only ever be in the semantic one.
+    let mut merged: BTreeMap<(HitKind, String), Hit> = BTreeMap::new();
+    for (index, mut hit) in semantic.into_iter().enumerate() {
+        hit.semantic_rank = Some(index + 1);
+        hit.score = if mode == SearchMode::Hybrid {
+            rrf(index + 1)
+        } else {
+            hit.cosine.unwrap_or(hit.score)
+        };
+        merged.insert((hit.kind, hit.path.clone()), hit);
+    }
+    for (index, found) in keywords.into_iter().enumerate() {
+        let key = (HitKind::Note, found.path.clone());
+        let entry = merged
+            .entry(key)
+            .or_insert_with(|| Hit::keyword_note(found.path.clone()));
+        if mode == SearchMode::Hybrid {
+            entry.score += rrf(index + 1);
+        } else {
+            // Keyword-only mode: the number that orders the list is SQLite's own, negated so better still means larger.
+            entry.score = -found.bm25;
+        }
+        entry.keyword_rank = Some(index + 1);
+        entry.bm25 = Some(found.bm25);
+        entry.snippet = Some(found.snippet);
+    }
+
+    let mut hits: Vec<Hit> = merged.into_values().collect();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| raw_key(left).cmp(&raw_key(right)))
+    });
+    hits.truncate(limit);
+
+    let note = if mode == SearchMode::Hybrid && !semantic_used && !any_vectors_exist(conn)? {
+        Some(RankNote::NoVectors)
+    } else {
+        None
+    };
+    // `semantic_used` is false in two different situations and only one of them deserves the printed sentence: no vectors
+    // at all (a state, worth saying) versus a keyword-only mode that never asked (nothing to say).
+    Ok(Answer {
+        hits,
+        semantic_used,
+        keyword_used,
+        note,
+    })
+}
+
+/// The last-resort ordering key: the raw evidence, as bit patterns, so `None` sorts before any number and two hits with equal
+/// scores still have one order. `total_cmp` is not used here because this compares a tuple of `Option<u64>`, which already is
+/// a total order.
+fn raw_key(hit: &Hit) -> (Option<u64>, Option<u64>) {
+    (
+        hit.cosine.map(|value| value.to_bits()),
+        hit.bm25.map(|value| value.to_bits()),
+    )
+}

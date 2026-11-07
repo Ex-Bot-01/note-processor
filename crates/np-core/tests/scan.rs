@@ -28,6 +28,15 @@ const CORPUS_ATTACHMENTS: i64 = 1;
 const CORPUS_FILES: i64 = CORPUS_NOTES + CORPUS_ATTACHMENTS;
 
 /// A workspace copy plus the config that points its data dir at the same tempdir.
+/// Undoing **migration 11** when a fixture rewinds `schema_version` past it: the keyword index and its three triggers, or the
+/// next open replays that entry onto a schema that still holds them and fails on `table notes_fts already exists`. The same
+/// const lives in `tests/db.rs`, which has five rewind sites; two copies of one string is the kind of drift this repository
+/// normally refuses, and it stands here only because integration tests cannot share a private helper — both point at
+/// `db::MIGRATIONS` as the thing they must keep up with.
+const REWIND_MIGRATION_11: &str =
+    "DROP TRIGGER notes_fts_ai; DROP TRIGGER notes_fts_ad; DROP TRIGGER notes_fts_au; \
+                                   DROP TABLE notes_fts;";
+
 struct Workspace {
     /// Kept alive so the directories outlive the scans run against them.
     _tmp: TempDir,
@@ -4960,7 +4969,8 @@ fn rewind_past_the_merge(open: &Db) {
          DROP TABLE chunks;
          DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
-         DROP TABLE models;",
+         DROP TABLE models;
+         {REWIND_MIGRATION_11}",
             db::NOTE_MERGE_KEY
         ))
         .expect("test setup: rewind past migration 5");

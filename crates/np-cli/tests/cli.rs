@@ -31,6 +31,13 @@ const CORPUS_NOTES: u64 = 16;
 const CORPUS_FILES: u64 = CORPUS_NOTES + 1;
 
 /// A workspace copy whose data dir lives in the same tempdir.
+/// Undoing **migration 11** where a fixture rewinds `schema_version` past it, or the next open replays that entry onto a
+/// schema that still holds the keyword index and fails on `table notes_fts already exists`. Copies of this live in
+/// `crates/np-core/tests/{db,scan}.rs` for the same reason; all three follow `db::MIGRATIONS` as the thing to keep up with.
+const REWIND_MIGRATION_11: &str =
+    "DROP TRIGGER notes_fts_ai; DROP TRIGGER notes_fts_ad; DROP TRIGGER notes_fts_au; \
+                                   DROP TABLE notes_fts;";
+
 struct Workspace {
     /// Kept alive so both directories outlive the runs against them.
     _tmp: TempDir,
@@ -1151,7 +1158,8 @@ fn seed_duplicate_pair_at_version_four(ws: &Workspace) {
          DROP TABLE chunks;
          DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
-         DROP TABLE models;"
+         DROP TABLE models;
+         {REWIND_MIGRATION_11}"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -1306,7 +1314,8 @@ fn rewind_to_version_four_without_a_pair(ws: &Workspace) {
          DROP TABLE chunks;
          DROP TABLE media_embeddings; DROP TABLE media_path; DROP TABLE media;
          DROP TABLE model_files;
-         DROP TABLE models;"
+         DROP TABLE models;
+         {REWIND_MIGRATION_11}"
     ))
     .expect("test setup: rewind the file to version four");
     assert_eq!(
@@ -1974,7 +1983,7 @@ fn search_with_embedding_disabled_refuses_and_names_the_setting() {
     run(&mut ws.command(&["scan"])).assert_success();
 
     let mut cmd = ws.command_without_operand(&["search"]);
-    cmd.arg(&ws.root).arg("alpha");
+    cmd.arg(&ws.root).arg("--mode").arg("semantic").arg("alpha");
     let failed = run(&mut cmd);
 
     assert_eq!(
@@ -2002,6 +2011,11 @@ fn search_with_embedding_disabled_refuses_and_names_the_setting() {
 
 #[test]
 fn search_with_no_row_names_the_missing_row_and_says_what_to_run() {
+    // **Hybrid changed what this test has to ask for (2026-11-08).** `docs/design-m3-hybrid-search.md` made keyword search a
+    // legitimate answer, so a workspace with no vectors now exits 0 with a hit list instead of refusing — and F32's sentence
+    // would never print. `--mode semantic` is the request this refusal belongs to: *only* the vector list, which genuinely
+    // cannot run. The sentences themselves are unchanged, and `search_without_a_model_answers_from_keywords_and_says_the_half`
+    // pins the new default alongside them.
     // F32's state: the config asks for a local model this workspace has no row for — the reader who edited
     // `config.toml` before installing anything. Today this prints a sentence about `provider = "none"`, which is
     // not the configuration they have, and tells them to change a setting that is already right.
@@ -2012,7 +2026,7 @@ fn search_with_no_row_names_the_missing_row_and_says_what_to_run() {
     ws.write_user_config(&local_model_config(EMBED_MODEL));
 
     let mut cmd = ws.command_without_operand(&["search"]);
-    cmd.arg(&ws.root).arg("alpha");
+    cmd.arg(&ws.root).arg("--mode").arg("semantic").arg("alpha");
     let failed = run(&mut cmd);
 
     assert_eq!(
@@ -2068,7 +2082,12 @@ fn search_with_no_row_names_the_missing_row_and_says_what_to_run() {
     // The same refusal under `--json`: a machine reader gets the sentence on stderr and nothing on stdout, which is what
     // today's behaviour is and nothing in the tree pinned for any search refusal before F32.
     let mut json_cmd = ws.command_without_operand(&["search"]);
-    json_cmd.arg(&ws.root).arg("alpha").arg("--json");
+    json_cmd
+        .arg(&ws.root)
+        .arg("--mode")
+        .arg("semantic")
+        .arg("alpha")
+        .arg("--json");
     let json_failed = run(&mut json_cmd);
     assert_eq!(json_failed.code(), 1, "{}", json_failed.stderr());
     assert!(
@@ -2086,6 +2105,11 @@ fn search_with_no_row_names_the_missing_row_and_says_what_to_run() {
 #[cfg(not(feature = "local-model"))]
 #[test]
 fn searching_without_the_runtime_names_the_model_that_stayed_owed() {
+    // **Hybrid changed what this test has to ask for (2026-11-08).** `docs/design-m3-hybrid-search.md` made keyword search a
+    // legitimate answer, so a workspace with no vectors now exits 0 with a hit list instead of refusing — and F32's sentence
+    // would never print. `--mode semantic` is the request this refusal belongs to: *only* the vector list, which genuinely
+    // cannot run. The sentences themselves are unchanged, and `search_without_a_model_answers_from_keywords_and_says_the_half`
+    // pins the new default alongside them.
     // §6 arm (iv)'s class, from the search side: the row says installed and the file is there, but **this binary** links no
     // inference runtime. It has to come back as the runtime-not-built refusal naming the model id — not as "this provider
     // cannot embed a search query", which reads as a capability the seam lacks rather than one build flag (review P1).
@@ -2096,7 +2120,7 @@ fn searching_without_the_runtime_names_the_model_that_stayed_owed() {
     ws.write_user_config(&local_model_config(EMBED_MODEL));
 
     let mut cmd = ws.command_without_operand(&["search"]);
-    cmd.arg(&ws.root).arg("alpha");
+    cmd.arg(&ws.root).arg("--mode").arg("semantic").arg("alpha");
     let failed = run(&mut cmd);
 
     assert_eq!(failed.code(), 1, "\n{}", failed.stderr());
@@ -2155,6 +2179,11 @@ fn an_invented_log_level_refuses_and_a_valid_one_does_not() {
 
 #[test]
 fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
+    // **Hybrid changed what this test has to ask for (2026-11-08).** `docs/design-m3-hybrid-search.md` made keyword search a
+    // legitimate answer, so a workspace with no vectors now exits 0 with a hit list instead of refusing — and F32's sentence
+    // would never print. `--mode semantic` is the request this refusal belongs to: *only* the vector list, which genuinely
+    // cannot run. The sentences themselves are unchanged, and `search_without_a_model_answers_from_keywords_and_says_the_half`
+    // pins the new default alongside them.
     let ws = workspace();
     fs::write(ws.root.join("a.md"), "# Alpha\n\nnothing indexed here\n").expect("test setup: note");
     run(&mut ws.command(&["scan"])).assert_success();
@@ -2164,7 +2193,7 @@ fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
     fs::remove_file(ws.models_dir().join(EMBED_MODEL)).ok();
 
     let mut cmd = ws.command_without_operand(&["search"]);
-    cmd.arg(&ws.root).arg("alpha");
+    cmd.arg(&ws.root).arg("--mode").arg("semantic").arg("alpha");
     let failed = run(&mut cmd);
 
     assert_eq!(failed.code(), 1, "\n{}", failed.stderr());
@@ -2184,6 +2213,234 @@ fn search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded() {
     );
     assert_eq!(stderr.matches('\n').count(), 1, "one line: {stderr:?}");
     assert!(failed.stdout().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid search (F36, `docs/design-m3-hybrid-search.md`). These four cases are the default-build proof that keyword
+// search is a real answer rather than an error path: no artifact, no runtime, exit 0. The F32 refusals above survive by
+// asking for `--mode semantic`, which is the one request that genuinely cannot run without a model.
+// ---------------------------------------------------------------------------
+
+/// The sentence every build owes when the vector half was not there to answer. Pinned as a literal in both feature
+/// shapes, because a reword that drops the remedy would otherwise pass by matching a substring of itself.
+#[cfg(feature = "fetch")]
+const NO_VECTORS_SENTENCE: &str = concat!(
+    "no vectors in this workspace: ranked by keyword only \u{2014} ",
+    "`np models fetch` or `np embed` adds the semantic half"
+);
+
+#[cfg(not(feature = "fetch"))]
+const NO_VECTORS_SENTENCE: &str = concat!(
+    "no vectors in this workspace: ranked by keyword only \u{2014} ",
+    "`np embed` adds the semantic half once a model is installed"
+);
+
+#[test]
+fn search_without_a_model_answers_from_keywords_and_says_the_half_that_ran() {
+    // The property hybrid exists for: a workspace on a machine that has never downloaded 310 MB still answers a word
+    // query. Nothing here installs a model, sets `NP_TEST_MODEL_PATH`, or builds a runtime — if this test ever needs an
+    // artifact to pass, the default has stopped meaning anything.
+    let ws = workspace();
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let ok = {
+        let mut cmd = ws.command_without_operand(&["search"]);
+        cmd.arg(&ws.root).arg("demo");
+        run(&mut cmd)
+    };
+
+    assert_eq!(ok.code(), 0, "keyword search answers:\n{}", ok.stderr());
+    let text = ok.stdout();
+    assert!(
+        text.contains("sprint-review.md"),
+        "`demo` appears in one note, and that note has to come back:\n{text}"
+    );
+    assert!(
+        !text.contains("bom-note.md"),
+        "a note with no such word must not appear:\n{text}"
+    );
+    // Which half produced a hit is printed as evidence beside the score. `kind` labels *what* the hit is — a note or a
+    // figure, F28's distinction — not which list found it, and conflating the two would cost the text channel that.
+    assert!(
+        text.contains("bm25"),
+        "the line has to show the keyword half produced this hit:\n{text}"
+    );
+    // **A tiny number is not a missing one.** SQLite's `bm25()` on a corpus this small answers in millionths, and the first
+    // version of this column printed `-0.0000` — which reads as "no score was computed" on the one screen where a reader is
+    // deciding whether the ranking is trustworthy. Small magnitudes print in scientific notation instead (`number`).
+    let first_line = text.lines().next().expect("one hit means one line");
+    assert!(
+        !first_line.starts_with("0.0000") && !first_line.contains("bm25 -0.0000"),
+        "a real, small score must not print as zero: {first_line}"
+    );
+    // The missing half is said out loud, on stderr, once, in this build's own words. Stderr so stdout stays a parseable
+    // hit list; one line because the F32 refusals set that shape and a two-line caveat breaks the same readers.
+    assert_eq!(
+        ok.stderr().trim_end(),
+        NO_VECTORS_SENTENCE,
+        "the caveat is this sentence, in full"
+    );
+}
+
+#[test]
+fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
+    // `--json` gains three keys beside `hits`, and they describe the **list**, not one hit: which mode ran, whether this
+    // workspace holds vectors at all, and why a half is missing. A machine reader that used to see `{hits}` alone cannot
+    // tell "no semantic hits" from "no model installed"; these three keys are that difference.
+    let ws = workspace();
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("demo").arg("--json");
+    let ok = run(&mut cmd);
+
+    assert_eq!(ok.code(), 0, "\n{}", ok.stderr());
+    let value: serde_json::Value =
+        serde_json::from_str(&ok.stdout()).expect("`--json` prints exactly one JSON object");
+    assert_eq!(
+        json_keys(&value),
+        vec!["hits", "mode", "note", "vectors"],
+        "the hit list plus the three keys that say how it was made"
+    );
+    assert_eq!(
+        value["mode"], "hybrid",
+        "the default mode reports its own name"
+    );
+    assert_eq!(
+        value["vectors"], false,
+        "this workspace has no vectors, and pretending otherwise would be the F32 mistake again"
+    );
+    assert_eq!(
+        value["note"], NO_VECTORS_SENTENCE,
+        "the same sentence stderr carries, so the two channels cannot tell different stories"
+    );
+    let hits = value["hits"].as_array().expect("hits is an array");
+    assert!(!hits.is_empty(), "the keyword list answers");
+    assert_eq!(
+        hits[0]["kind"], "note",
+        "keyword search finds notes and says so"
+    );
+    assert_eq!(
+        json_keys(&hits[0]),
+        vec![
+            "bm25",
+            "cosine",
+            "keyword_rank",
+            "kind",
+            "linked_from",
+            "linked_notes",
+            "path",
+            "score",
+            "semantic_rank",
+            "snippet",
+            "source_note",
+        ],
+        "every hit carries the same eleven keys, with null where a half did not run"
+    );
+    assert!(
+        hits[0]["cosine"].is_null() && hits[0]["semantic_rank"].is_null(),
+        "no vector ran, so no cosine and no semantic rank: {}",
+        ok.stdout()
+    );
+    assert!(
+        hits[0]["snippet"].is_string() && hits[0]["bm25"].is_number(),
+        "the keyword half has to show its evidence: {}",
+        ok.stdout()
+    );
+}
+
+#[test]
+fn config_can_owe_the_semantic_half_alone_and_says_so() {
+    // Proves `[search] mode` is read rather than parsed: with `semantic` in the file and no model installed, the F32
+    // refusal returns — the same exit 1 the flag form pins above, reached through config instead of argv.
+    let ws = workspace();
+    // The mode has to be *in the file*, or this test proves nothing about config being read: with no `[search]` section the
+    // default is hybrid, and hybrid answers from keywords instead of refusing.
+    ws.write_user_config(&format!(
+        "{}\n[search]\nmode = \"semantic\"\n",
+        local_model_config(EMBED_MODEL)
+    ));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let failed = {
+        let mut cmd = ws.command_without_operand(&["search"]);
+        cmd.arg(&ws.root).arg("demo");
+        run(&mut cmd)
+    };
+    assert_eq!(
+        failed.code(),
+        1,
+        "a mode that needs a row this workspace lacks refuses:\n{}",
+        failed.stderr()
+    );
+    assert!(failed.stdout().is_empty(), "a refusal prints no hit list");
+    assert!(
+        failed.stderr().contains("no model row"),
+        "F32's sentence about the missing row, not the keyword caveat: {}",
+        failed.stderr()
+    );
+    assert!(
+        !failed.stderr().contains(NO_VECTORS_SENTENCE),
+        "`semantic` asked for one list and did not get a partial answer instead: {}",
+        failed.stderr()
+    );
+}
+
+#[test]
+fn keyword_mode_answers_where_the_semantic_half_would_refuse() {
+    // The other half of the same workspace: identical config, `mode = "keyword"` in the file, and the query answers with
+    // exit 0 even though a model is configured and absent. That is the escape hatch the human asked for — search on a
+    // machine that cannot get the artifact — and it also proves the mode reaches the code path that decides whether to
+    // load a provider at all.
+    let ws = workspace();
+    ws.write_user_config(&format!(
+        "{}\n[search]\nmode = \"keyword\"\n",
+        local_model_config(EMBED_MODEL)
+    ));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let ok = {
+        let mut cmd = ws.command_without_operand(&["search"]);
+        cmd.arg(&ws.root).arg("demo");
+        run(&mut cmd)
+    };
+    assert_eq!(
+        ok.code(),
+        0,
+        "keyword mode ignores the absent model:\n{}",
+        ok.stderr()
+    );
+    assert!(ok.stdout().contains("sprint-review.md"), "{}", ok.stdout());
+    assert!(
+        ok.stderr().is_empty(),
+        "keyword mode asked for one list and got it: nothing to caveat: {}",
+        ok.stderr()
+    );
+}
+
+#[test]
+fn an_invented_mode_refuses_with_claps_exit_two() {
+    // A fourth spelling has to be refused by both doors. This is argv's; config's is `tests/config.rs`.
+    let ws = workspace();
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root).arg("--mode").arg("fuzzy").arg("demo");
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        2,
+        "clap's usage error is exit 2:\n{}",
+        failed.stderr()
+    );
+    for name in ["hybrid", "semantic", "keyword"] {
+        assert!(
+            failed.stderr().contains(name),
+            "the refusal has to list the three real names, and `{name}` is missing from:\n{}",
+            failed.stderr()
+        );
+    }
 }
 
 #[cfg(feature = "local-model")]
@@ -2236,7 +2493,8 @@ mod real_model {
 
     /// `np search` against vectors a real model wrote. The default-build cases above can only prove the refusals; this is
     /// the one that proves the ranking path end to end — argv order, the four-decimal text line, and `--json` carrying
-    /// nothing but `hits` — with the query embedded by the same artifact that made the stored rows.
+    /// the hit list beside `mode`, `note` and `vectors` — with the query embedded by the same artifact that made the stored
+    /// rows, which is what makes `note: null` and `vectors: true` worth pinning here rather than in a default-build case.
     #[test]
     fn searching_a_real_index_answers_in_both_channels() {
         let artifact = artifact_or_not_coverage!();
@@ -2283,8 +2541,26 @@ mod real_model {
             serde_json::from_str(&json.stdout()).expect("`--json` prints exactly one JSON object");
         assert_eq!(
             json_keys(&value),
-            vec!["hits"],
-            "nothing else on stdout — no caveat, no counts, no second key"
+            vec!["hits", "mode", "note", "vectors"],
+            "the hit list plus F36's three keys that say how it was made — and nothing else on stdout"
+        );
+        // **A healthy run says so by silence.** `note` is null and `vectors` is true exactly when both halves answered, so
+        // the caveat key cannot be read as a routine warning; this is the pair to the default-build case
+        // `search_json_names_the_mode_that_ran_and_the_half_that_was_missing`, which pins the other side.
+        assert_eq!(
+            value["mode"].as_str(),
+            Some("hybrid"),
+            "the default mode names itself"
+        );
+        assert_eq!(
+            value["vectors"].as_bool(),
+            Some(true),
+            "this workspace holds vectors a real model wrote"
+        );
+        assert!(
+            value["note"].is_null(),
+            "nothing was missing, so nothing is caveated: {}",
+            json.stdout()
         );
         let hits = value["hits"].as_array().expect("hits is an array");
         assert!(
@@ -2294,14 +2570,26 @@ mod real_model {
         assert_eq!(
             json_keys(&hits[0]),
             vec![
+                "bm25",
+                "cosine",
+                "keyword_rank",
                 "kind",
                 "linked_from",
                 "linked_notes",
                 "path",
                 "score",
+                "semantic_rank",
+                "snippet",
                 "source_note",
             ],
-            "§12's hit fields plus F28's linker list, no extras"
+            "§12's hit fields, F28's linker list and F36's five evidence keys, no extras"
+        );
+        // Both halves ran here, so neither number is null — the claim that would be invisible in a default build, where
+        // only the keyword side can answer.
+        assert!(
+            hits[0]["cosine"].is_number() && hits[0]["semantic_rank"].is_number(),
+            "the vector half ran, so it shows its numbers: {}",
+            json.stdout()
         );
         assert_eq!(hits[0]["path"].as_str(), Some("a.md"));
         assert_eq!(hits[0]["kind"].as_str(), Some("note"));
