@@ -103,6 +103,12 @@ Four questions went up as human decisions; four answers came back, and one of th
   token's scope, so the reason is inferred from timing and step counts rather than read. No further pushes or reruns were spent on it; when a run gets
   steps again, that is the recovery signal, and `main` at `e4bdba3` carries three graded commits whose code was green locally (17 rows exit 0, workspace
   680 passed / 0 failed, `GOLDEN CHECK: pass`) and whose last CI-graded tree is `5e368ac` (`42325538290`, four jobs success).
+* **F29 closed (2026-11-07, docs-only):** README's "Images in the index" now states the limit — `.svg`/`.drawio`/`.excalidraw`/`.pdf` out by decision, with
+  the rasteriser's real cost named (external references and DTDs, a dependency, an attack surface, a per-encode measurement §8 demands) — answers "what will
+  `np` encode" as PNG and JPEG by extension *and* signature, points the `unsupported-format` row at that paragraph, and says what a refused figure does not
+  cost (the note's prose is still indexed and searchable, the link is still in `links`). Retired a stale "Does not" sentence claiming a shipped binary cannot
+  encode images at all — untrue since `736a66d`. Closed on local gates with CI out of minutes, said out loud in the card: no code path changed, so there is
+  no behaviour for a runner to grade, and the one testable claim added was already pinned by F26's cases.
 * **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
   binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
   attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.

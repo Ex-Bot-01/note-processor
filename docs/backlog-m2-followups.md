@@ -1057,6 +1057,26 @@ the fix shape above needs a rasteriser that must disable external references and
 a dependency and an attack surface added for a capability nobody has asked for yet. Not closed: the README wording does not exist until someone
 writes it, and `unsupported-format` will keep counting diagrams on the first image-aware `np embed` until it does.
 
+**Closed on 2026-11-07, on the second branch of its own "done when"** — vector formats stay out permanently, and README says so as a product limit. The
+wording is in `README.md`, "Images in the index": a paragraph naming `.svg`, `.drawio`, `.excalidraw` and `.pdf` as out *by decision*, giving the reason a
+rasteriser would cost (a decoder that must disable external references and DTDs — an SVG is a file that asks to fetch things — plus a dependency, an attack
+surface, and a per-encode measurement §8 requires before anything ships), and stating the answer to "what will `np` encode" as **PNG and JPEG, extension
+and content signature both**. The `unsupported-format` row in the class table now points there instead of implying a re-export is all that stands between a
+diagram vault and image search. The paragraph also says what a refused figure does *not* cost: the note's own prose is indexed and searchable as always, and
+the link is recorded in `links` like any other attachment — which is the card's own opening observation ("every `.svg` … already resolves today as
+`links.kind = 'attachment'`") turned into something a reader can rely on rather than a surprise count.
+
+**Closed without CI grading, deliberately, and that choice is stated rather than skipped past.** CI has been out of included minutes since
+`2026-11-07T01:57Z` (`docs/ops-actions-minutes.md`), and this card's "done when" is satisfied by text a reader can open — no code path changed, so there is
+no behaviour for a runner to grade. What was run on the tree: 17 local gate rows exit 0 and `GOLDEN CHECK: pass`. The one *factual* claim added here that a
+test could hold — that an unsupported attachment link still lands in `links` as an `attachment` row — is already pinned elsewhere (F26's content gate cases
+in `crates/np-core/tests/embed_media.rs`, and the resolver cases in `tests/media.rs`), so no new assertion was invented to make a docs commit look like work.
+
+**A stale sentence this closure retired on the way.** README's "Does not" row still claimed "no image encoding in a shipped binary yet (F28)" — untrue since
+step ② merged at `736a66d`. It now says image encoding needs a `--features local-model,vision` build plus an installed projector, that release binaries are
+text-only by default, and that they say so per figure rather than skipping silently; the row also gained the F29 limit, so "does not" lists vector formats
+explicitly instead of leaving them to be inferred from a refusal label.
+
 ## F30 — Matryoshka truncation is the storage lever for a big image index, and it has never been exercised
 
 Filed 2026-11-04 by R7c Task 8. Rows are stored at the model's native **768** (`docs/design-m2-image-embeddings.md` §1.2,
