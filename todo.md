@@ -85,6 +85,13 @@ Four questions went up as human decisions; four answers came back, and one of th
   incident is now ~7 hours and spans markdown-only SHAs too. The closure paragraph goes in when a run with steps grades `main`.
 * **Remaining for F28:** nothing implemented; only CI grading of `main`, then the closing paragraph. Then, exposed by step ③ and not caused by it:
   member names in `np models list`, which needs a change to that command's pinned key set.
+* **CI's zero-step failures explained: the account is out of included minutes** (`docs/ops-actions-minutes.md`). Measured from the Actions API — October
+  spent **2,028 billed minutes** and went zero-step on Oct 29; November spent **2,137 in 6.4 days**, crossing the cap at `2026-11-07T01:57:05Z`, seven
+  seconds before the first failure. Windows is 54.6 % of the spend and both feature rows rebuild vendored llama.cpp every run (November costs 25.4 billed
+  minutes per push against October's 10.6). Billing endpoints are unreachable with this token (**403**, billing scope), so the allowance is inferred from
+  where two months stopped rather than read from a meter. **Owed by the human, because it is money and CI shape:** raise the limit (~$80/month at today's
+  pace) or move Windows + both feature rows to `main`/PR only with a vendor cache (≈1,200–1,800/month, inside the allowance). Recommendation in the doc; no
+  workflow file has been touched here. Until then: check `steps=` before believing a red main.
 * **CI observation (2026-11-06, on `03ef6d8`, a markdown-only commit).** All four jobs failed in ~58 s with **zero steps created**, three attempts
   (`--failed` rerun, full rerun), while the two pushes five minutes earlier (`5374dc1`, `5e368ac`) completed green on the same workflow file. That is
   F34's signature returning — a job that never reaches a step cannot be a code defect, because nothing ran — and it is recorded here rather than

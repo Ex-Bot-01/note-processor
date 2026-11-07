@@ -1203,6 +1203,16 @@ executes six `fetch::tests` including the four `#[cfg(windows)]` ones — a plau
 production arm, the climb out of an absent directory, and the NUL refusal. macOS still claims only the build fact: it compiles the
 `statvfs` arm, and nobody here has read its number.
 
+**Root cause of the zero-step window this card turned on (found 2026-11-07).** The card's own measurement — "created zero steps from
+2026-10-29T14:39 through 2026-10-31T20:23" — was reported as an unexplained outage, and the same shape returned on 2026-11-07. Measured from the Actions
+API: this private repository spent **2,028 billed minutes in October** (stopping at the moment CI went zero-step) and **2,137 in the first 6.4 days of
+November**, crossing the allowance at `2026-11-07T01:57:05Z` — seven seconds before the first zero-step failure. The account ran out of included minutes;
+nothing about the tree was involved, and a zero-step job spends nothing. Numbers, method and the options for spending less are in
+`docs/ops-actions-minutes.md`. **This does not reopen F34**, which was closed on its own evidence (the Windows preflight answering through
+`GetDiskFreeSpaceExW`, green on the runner at `b2840f9`). What it changes is what "CI is red" means operationally: the first question is whether the jobs
+have steps, and this card exists because four days of *executed-but-red* Windows runs were read as absent — a mistake in the opposite direction from
+treating an unprovisioned runner as a defect.
+
 ## F35 — a misspelled or invented **top-level** config section is ignored, while a bad key inside `[embeddings]` is refused
 
 Filed 2026-11-05 while measuring F32, by catching myself doing it. `Config` (`crates/np-core/src/config.rs:543-545`) is

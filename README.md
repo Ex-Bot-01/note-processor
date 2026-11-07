@@ -493,3 +493,10 @@ A fourth job joins on this branch — **`Feature local-model,vision (ubuntu-late
 every `--features local-model,vision` row ever run was graded on `-p np-core`, so a green CI said nothing about whether `np` itself could be built
 with image support. It could not (**F28**), and no failure any of the other jobs produce would have said so. Its first grading is the run that adds it,
 which is worth stating rather than backdating: this sentence was written before that job had ever gone green.
+
+**Why the zero-step windows happen, now measured (`docs/ops-actions-minutes.md`).** This repository is private, so its hosted minutes are metered against
+the account's monthly allowance — and both unexplained gaps in CI line up with that allowance running out. October spent **2,028 billed minutes** and went
+zero-step on 2026-10-29T14:39; November had no C++ cache and spent **2,137 in six days**, crossing the cap at `2026-11-07T01:57:05Z`, seven seconds before
+the first zero-step failure. A Windows job is 54.6 % of that spend, and both feature rows rebuild the vendored llama.cpp from scratch every run. So a red
+main gets one check before anything else: do the jobs have **steps**? `steps=0` on all four means the account is out, not the tree — re-triggering until it
+goes green would only teach everyone to ignore CI.
