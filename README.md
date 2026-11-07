@@ -153,8 +153,15 @@ run at all (`docs/ops-actions-minutes.md`). A release produced by `.github/scrip
 platform the packager was standing on**, and its notes say so. Source builds need no CI and no minutes:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.2.0 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.2.1 -p np-cli --locked
 ```
+
+**`v0.2.1` is the patch that exists because of a Windows report.** Its assets are built locally, not by CI: Linux (`x86_64-unknown-linux-gnu`,
+by `package-assets.sh`) and Windows (`x86_64-pc-windows-gnu`, cross-compiled with mingw-w64 — recipe in
+[`docs/ops-cross-build-windows-gnu.md`](docs/ops-cross-build-windows-gnu.md)). Both are unsigned, and the Windows one is compiled **without**
+the inference feature, so `np embed` refuses there by design; `scan`, `search` in all three modes, `models list/install/fetch` and everything
+about paths and identity work. If you can build from source with `--features local-model`, do that instead — it is the only shape with a
+runtime in it. No macOS asset exists yet: that needs an Apple SDK, which no cross-compiler here has.
 
 ## Getting a model onto the machine
 
