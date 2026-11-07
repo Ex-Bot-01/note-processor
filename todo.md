@@ -79,6 +79,13 @@ Four questions went up as human decisions; four answers came back, and one of th
   (`--failed` rerun, full rerun), while the two pushes five minutes earlier (`5374dc1`, `5e368ac`) completed green on the same workflow file. That is
   F34's signature returning — a job that never reaches a step cannot be a code defect, because nothing ran — and it is recorded here rather than
   papered over with a re-trigger until the shape is known: the next push (this one) is the probe that separates "this SHA" from "the platform right now".
+  **The probe answered: the platform.** The next push (`e4bdba3`, also markdown-only, also a different tree) failed the same way — run `42327001398`, all
+  four jobs `completed failure` in **1–2 seconds** (started 02:00:28Z, ended 02:00:29–30Z), zero steps each time. Two SHAs, three attempts of the first
+  (`--failed` rerun and a full rerun both), identical shape, nothing ever executed: runner provisioning, not this repository. What the diagnosis could
+  **not** reach is GitHub's own explanation — `check-runs/<id>/annotations` answers **403 Resource not accessible by personal access token** with this
+  token's scope, so the reason is inferred from timing and step counts rather than read. No further pushes or reruns were spent on it; when a run gets
+  steps again, that is the recovery signal, and `main` at `e4bdba3` carries three graded commits whose code was green locally (17 rows exit 0, workspace
+  680 passed / 0 failed, `GOLDEN CHECK: pass`) and whose last CI-graded tree is `5e368ac` (`42325538290`, four jobs success).
 * **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
   binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
   attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.
