@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/np-core", "crates/np-cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # Every dependency is declared once here; member crates opt in with
