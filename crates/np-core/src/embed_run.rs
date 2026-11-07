@@ -126,6 +126,21 @@ pub enum EmbedOutcome {
         /// shipped, and §6's wording "run `np models fetch`" therefore names a command R7b owes.
         hint: String,
     },
+    /// Arm (vi): fetching was allowed and needed, and **nothing was reached** (**F38** §5).
+    ///
+    /// The arm exists because offline is a state, not an error to be dressed up as one. `np embed` may fetch a missing
+    /// pinned artifact by default; when the transport says no connection (never a probe — the attempt *is* the probe),
+    /// the honest report is "nothing was embedded because nothing could be reached", at exit 1, with the counts all zero
+    /// and an instruction to re-run. It is not arm (ii) — configuration is fine and did its job — and it must never be
+    /// arm (iv), which would read as a vault whose vectors failed to arrive.
+    ///
+    /// **Exit 1 on purpose.** `np setup` treats this state as an accepted degradation and exits 0 with `vectors:false`,
+    /// because its contract is "get as far as you can and tell me where you are". A caller that asked for vectors and got
+    /// none must not see success — that is how an application ends up believing it has embeddings.
+    Offline {
+        /// The pinned model this run could not obtain.
+        id: String,
+    },
     /// Arm (v): this **binary** cannot embed at all — no inference runtime was compiled into it (**F40**).
     ///
     /// It exists because arm (iv) was answering here and lying about it. `(iv)` means *our accounting said vectors
@@ -159,6 +174,7 @@ impl EmbedOutcome {
             Self::ConfigurationDisabled { .. } => "configuration disabled",
             Self::ArtifactAbsent { .. } => "artifact absent",
             Self::RuntimeNotBuilt { .. } => "runtime not built",
+            Self::Offline { .. } => "offline",
             Self::NotProduced { .. } => "owed and not produced",
         }
     }
@@ -176,6 +192,10 @@ impl EmbedOutcome {
             // than half-embedded. Names a flag that exists (`--features local-model`) and a command that exists in this
             // very binary (`np search --mode keyword`, F36) — the rule §6's hints follow, because arm (iii)'s first
             // version named `np models fetch` before it shipped.
+            Self::Offline { id } => Some(format!(
+                "offline: could not reach the pinned origin to fetch `{id}`, so nothing was embedded — connect and \
+                 run `np embed` again, or search meanwhile by keyword (`np search --mode keyword`)"
+            )),
             Self::RuntimeNotBuilt { id } => Some(format!(
                 "this binary was built without an embedding runtime: install one built with `--features local-model`, \
                  or search by keyword (`np search --mode keyword`) — `{id}` stays owed"
@@ -263,6 +283,20 @@ pub struct EmbedReport {
     /// written downstream, and every constructor leaves it `None`. That default is the truthful one — a run with
     /// `provider = "none"` has no worker count to report, and printing one would be a number about nothing.
     pub workers: Option<WorkerPlan>,
+    /// What this run **transferred from an origin**, or `None` when it transferred nothing (**F38**).
+    ///
+    /// Present-and-null in every document, like [`EmbedReport::artifact_check`], because the question a caller asks is
+    /// binary and cheap: *"did this invocation move 310 MB, or were the vectors already fine?"* An absent key forces them
+    /// to parse prose to find out; `null` answers it in one field. Set by np-cli where the fetch actually happened —
+    /// `embed_run` is handed a provider and cannot know that bytes arrived a moment ago.
+    pub fetched: Option<FetchedRecord>,
+    /// Whether a permitted fetch was **skipped because nothing answered** (**F38**).
+    ///
+    /// `true` only when this run attempted a fetch and the transport reported no connection; never `true` alongside a
+    /// [`EmbedOutcome::Offline`] produced without an attempt, and never `true` when the origin *answered* (404, 403, a
+    /// redirect, wrong bytes) — those are refusals, not outages, and skipping past them is how a broken mirror becomes
+    /// permanent.
+    pub offline: bool,
     /// Image links this run looked at, counted **per link occurrence after per-note de-duplication of the written
     /// target** — so a figure linked twice in one note is one here (§7 rule 1), and a byte-identical copy in a second note
     /// is two.
@@ -371,6 +405,8 @@ impl EmbedReport {
             verification: CAVEAT,
             artifact_check: None,
             workers: None,
+            fetched: None,
+            offline: false,
             images_seen: 0,
             images_embedded: 0,
             images_refused: 0,
@@ -380,6 +416,37 @@ impl EmbedReport {
             images_pruned: 0,
         }
     }
+}
+
+/// One fetch's report card, carried on [`EmbedReport::fetched`] (**F38**).
+///
+/// Deliberately **no URL and no host**: §12 rule 8 bounds what a report may say about where bytes came from, so this names
+/// the *kind* of origin (`compiled-in-pin` / `configured-mirror`) and everything else that is actionable — which members,
+/// how many bytes, whether each was digest-verified before it was published. A caller that wants the host already has it:
+/// they set `[models] base_url`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FetchedRecord {
+    /// The pinned id whose bytes arrived.
+    pub id: String,
+    /// One entry per member transferred in this run.
+    pub members: Vec<FetchedMember>,
+    /// Which kind of origin served: `compiled-in-pin` or `configured-mirror`. Never a hostname.
+    pub origin: &'static str,
+}
+
+/// One member's arrival, as [`EmbedReport::fetched`] reports it (**F38**).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FetchedMember {
+    /// `main` or `mmproj` — the same name `models install --member` and `model_files.name` use.
+    pub name: String,
+    /// Exact bytes written by this run.
+    pub bytes: u64,
+    /// Always `true` when this exists: fetch publishes only after the digest matches the pin (**F12** §12 rule 6), so a
+    /// record of an unverified member would describe an event that cannot happen. It is a field rather than an omission
+    /// because a reader should not have to know that rule to trust the row.
+    pub digest_verified: bool,
 }
 
 /// What the media pass counted, assembled into [`EmbedReport`]'s image fields.
@@ -475,6 +542,13 @@ pub enum Resolution<'a> {
     /// [`EmbedOutcome::RuntimeNotBuilt`] for what it cost an operator who had done everything right.
     RuntimeNotBuilt {
         /// The configured model id, so the refusal names what stays owed.
+        id: String,
+    },
+    /// A fetch was permitted and attempted for `id`, and the transport said **no connection** (**F38**). Carried in so
+    /// the run answers arm (vi) before reading a chunk: nothing this process can do will produce vectors now, and the
+    /// currency read would only be an expensive way of saying so.
+    FetchSkippedOffline {
+        /// The pinned model that could not be obtained.
         id: String,
     },
     /// A provider built from the configured row — the only thing this run can write a vector from, and the only
@@ -615,6 +689,20 @@ fn run(
     let db_path = cfg.workspace_db(&root);
     let db = Db::open(&db_path)?;
 
+    // ---- arm (vi): a fetch was permitted, attempted, and met no connection (**F38**). First arm in the function, on
+    // purpose: nothing about configuration or the model table can outrank "we tried to get the model and could not reach
+    // anyone". Placed lower, arm (ii) answered `configuration disabled` for a workspace whose only fault was the network —
+    // the config was fine, it asked for a fetch, and the fetch was allowed. Refused before the currency read like arm (v),
+    // so refusing honestly still costs no pass over live chunks.
+    if let Resolution::FetchSkippedOffline { id } = &resolution {
+        let mut report =
+            EmbedReport::unread(Some(id.clone()), EmbedOutcome::Offline { id: id.clone() });
+        // The flag is the machine-readable half of the same fact, so a caller never has to string-match an outcome label
+        // to learn that this run was offline (`fetched` stays `null`: nothing transferred).
+        report.offline = true;
+        return Ok(report);
+    }
+
     // ---- arm (ii): configuration, decided before one chunk row is read.
     let model_id = match configured_model(cfg) {
         Ok(id) => id,
@@ -693,7 +781,9 @@ fn run(
     // and the mutable borrow is free again for the writer loop as soon as this loop ends.
     let witness: Option<&dyn Embedder> = match &resolution {
         Resolution::Provider(provider) => Some(&**provider),
-        Resolution::ArtifactAbsent | Resolution::RuntimeNotBuilt { .. } => None,
+        Resolution::ArtifactAbsent
+        | Resolution::RuntimeNotBuilt { .. }
+        | Resolution::FetchSkippedOffline { .. } => None,
     };
 
     let mut owed = Vec::new();
@@ -799,6 +889,14 @@ fn run(
                 EmbedOutcome::RuntimeNotBuilt { id: model_id },
             ));
         }
+        // **F38, defensive and unreachable today** (arm (vi) returns above), spelled for the same reason as the arm over
+        // it: falling through to "artifact absent" would tell a machine with no network to go install a file it cannot
+        // reach, which is a different wrong sentence from the one F40 filed.
+        Resolution::FetchSkippedOffline { id } => {
+            let mut report = EmbedReport::unread(Some(model_id), EmbedOutcome::Offline { id });
+            report.offline = true;
+            return Ok(report);
+        }
         Resolution::Provider(_) | Resolution::ArtifactAbsent => {
             return Ok(EmbedReport {
                 model: Some(model_id.clone()),
@@ -815,6 +913,10 @@ fn run(
                 errors,
                 verification: CAVEAT,
                 artifact_check: None,
+                // Nothing transferred, and nothing was skipped for being unreachable: arm (iii) says the file is not
+                // there, which is a filesystem fact and stays one even when the network is down (**F38**).
+                fetched: None,
+                offline: false,
                 workers: None,
                 images_seen: 0,
                 images_embedded: 0,
@@ -961,8 +1063,10 @@ fn media_through<'a, 'r>(
     let asked: Option<&'r mut dyn Embedder> = match resolution {
         Resolution::Provider(provider) => Some(&mut **provider),
         // No provider means no figure can be encoded, and every image row then refuses as unavailable — which is the
-        // honest shape. Unreachable under arm (v) (**F40**), listed so it stays that way by construction.
-        Resolution::ArtifactAbsent | Resolution::RuntimeNotBuilt { .. } => None,
+        // honest shape. Unreachable under arms (v) and (vi) (**F40**, **F38**), listed so it stays that way by construction.
+        Resolution::ArtifactAbsent
+        | Resolution::RuntimeNotBuilt { .. }
+        | Resolution::FetchSkippedOffline { .. } => None,
     };
     run_media_pass(db, root, model, asked)
 }
@@ -1309,6 +1413,8 @@ fn media_fields(media: &MediaTally) -> EmbedReport {
         verification: CAVEAT,
         artifact_check: None,
         workers: None,
+        fetched: None,
+        offline: false,
         images_seen: media.seen,
         images_embedded: media.embedded,
         images_refused: media.refusals.len(),

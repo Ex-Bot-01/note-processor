@@ -1036,6 +1036,61 @@ fn runtime_not_built_refuses_before_the_currency_read() {
     // which is why the label is asserted first.
 }
 
+/// Arm (vi), **F38**: fetching was allowed and needed, and nothing answered. The counts are the argument — `chunks_seen 0`
+/// because refusing before the currency read is the whole point, `errors 0` because an outage is not a failure count, and
+/// `offline: true` because a caller must be able to learn that without string-matching a label.
+///
+/// The arm exists so this state cannot borrow anyone else's sentence: arm (ii) would blame configuration that is fine,
+/// arm (iii) would tell a machine with no network to go install a file it cannot reach, and arm (iv) would report a vault
+/// whose vectors failed to arrive.
+#[test]
+fn offline_is_its_own_arm_and_does_no_work() {
+    assert_recorder_works();
+    let setup = workspace_owned(&notes(2));
+    setup.install_model(FAKE_DIM as i64, "");
+
+    let report = np_core::embed_run::embed_with_resolution(
+        &setup.root,
+        &setup.cfg(),
+        np_core::embed_run::Resolution::FetchSkippedOffline {
+            id: MODEL_ID.into(),
+        },
+    )
+    .expect("an outage is a report, not an error");
+
+    assert_eq!(report.outcome.label(), "offline");
+    assert!(report.offline, "the machine-readable half is set");
+    assert!(
+        report.fetched.is_none(),
+        "nothing transferred, so nothing is claimed"
+    );
+    assert_eq!(
+        report.chunks_seen, 0,
+        "no chunk was read to discover the impossible"
+    );
+    assert_eq!(report.errors, 0, "an outage is not a failure count");
+    assert!(
+        !report.succeeded(),
+        "vectors were asked for and none exist: exit 1"
+    );
+
+    let detail = report.outcome.detail().expect("arm (vi) says what to do");
+    assert!(detail.contains(MODEL_ID), "{detail}");
+    assert!(detail.contains("nothing was embedded"), "{detail}");
+    assert!(
+        detail.contains("np search --mode keyword"),
+        "and names the half that still works: {detail}"
+    );
+    assert!(setup.vectors().is_empty(), "and writes nothing");
+
+    // Mutation this catches: folding offline into arm (ii) or (iii). Both keep every count at zero and both pass on
+    // numbers, which is why the label and the flag are asserted first.
+}
+
+// (The serialised shape of `fetched` / `offline` is pinned in `crates/np-cli/tests/cli.rs`, where the JSON is actually
+// emitted: asserting it here would mean adding serde_json to np-core's dev-deps for one key-presence test, and the CLI
+// assertion is the stronger one anyway because it compares the document against the text summary of the same run.)
+
 // ---------------------------------------------------------------------------
 // SQLITE_BUSY: a reported gap, never a silent skip
 // ---------------------------------------------------------------------------

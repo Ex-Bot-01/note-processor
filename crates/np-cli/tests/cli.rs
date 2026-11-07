@@ -1987,6 +1987,63 @@ fn argv_and_the_environment_each_outrank_the_file_in_one_direction() {
     );
 }
 
+/// **F38's other half of the contract, on the arm where both keys mean something.** No connection: `offline` flips to
+/// `true`, `fetched` stays `null` (nothing arrived), the outcome is its own arm rather than a borrowed one, and every count
+/// is zero because the run refused before reading a chunk. Text and JSON must agree on the exit code — one fact, one code.
+#[cfg(feature = "local-model")]
+#[test]
+fn embed_json_says_it_was_offline_and_that_nothing_was_fetched() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config("embeddinggemma-2"));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut text_cmd = ws.command(&["embed"]);
+    text_cmd.env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let mut json_cmd = ws.command(&["embed", "--json"]);
+    json_cmd.env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+
+    let text = run(&mut text_cmd);
+    let json = run(&mut json_cmd);
+    assert_eq!(text.code(), 1, "\n{}", text.stdout());
+    assert_eq!(json.code(), text.code(), "one fact, one exit code");
+
+    let report: serde_json::Value =
+        serde_json::from_str(&json.stdout()).expect("one JSON object on stdout");
+    assert_eq!(json_keys(&report["outcome"]), vec!["offline"], "{report}");
+    assert_eq!(
+        report["offline"], true,
+        "the state, not a sentence about it"
+    );
+    assert_eq!(
+        report["fetched"],
+        serde_json::Value::Null,
+        "an attempted fetch that reached nobody transferred nothing"
+    );
+    for field in ["chunks_seen", "current", "embedded", "errors"] {
+        assert_eq!(
+            report[field].as_u64(),
+            Some(0),
+            "`{field}` on the offline arm: {report}"
+        );
+    }
+    // The arm's payload is the id it could not obtain; the *sentence* stays in text, exactly as for every other arm
+    // (`artifact-absent` carries `hint`, `offline` carries nothing a caller cannot derive). A reader wanting prose runs
+    // without `--json`; a reader wanting facts gets `offline: true` plus this id.
+    assert_eq!(report["outcome"]["offline"]["id"], "embeddinggemma-2");
+    let detail = text.stderr();
+    assert!(
+        detail.contains("nothing was embedded") && detail.contains("np search --mode keyword"),
+        "the text channel carries the remedy: {detail}"
+    );
+    assert!(
+        !json.stdout().contains("127.0.0.1"),
+        "no host in the document either (§12 rule 8)"
+    );
+
+    // Mutation this catches: returning offline as an error from provider resolution (the first draft), which leaves no
+    // document at all — this test fails on the `from_str` before it can agree with itself about the exit code.
+}
+
 /// §6 adds no exit code: a missing operand stays clap's problem, and clap's 2 has to survive the trip from
 /// `main`'s own `ExitCode::SUCCESS`/`FAILURE` handling.
 #[test]
@@ -2049,6 +2106,11 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             "current",
             "embedded",
             "errors",
+            // **Amended 2026-11-08 (F38):** did this invocation transfer a model, and was it stopped by having no
+            // connection? Both keys are present in *every* document — `null` / `false` when nothing happened — because the
+            // question a caller asks is binary, and an absent key would make "no fetch" and "this build said nothing" the
+            // same answer. Their values on this arm are pinned below, not just their names.
+            "fetched",
             // The four image fields (§6's order puts them after the chunk counts): a run that saw no figure still
             // carries the keys, with `image_refusals` an empty array, because a reader must be able to tell "zero"
             // from "this build did not look".
@@ -2065,6 +2127,8 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
             // database, because a reader must be able to tell "nothing was skipped" from "this build said nothing".
             "images_unchecked",
             "model",
+            // **F38**, same contract as `fetched`: a state, not an error string to parse.
+            "offline",
             "outcome",
             "refused_budget",
             "verification",
@@ -2077,6 +2141,14 @@ fn embed_json_reports_the_same_outcome_and_counts_as_the_summary() {
     assert_eq!(json_keys(absent), vec!["artifact", "hint", "model"]);
     assert_eq!(absent["model"], EMBED_MODEL);
     assert_eq!(report["model"], EMBED_MODEL);
+    // The F38 pair on an arm that fetched nothing and was never offline. Asserted as values, because a key list alone
+    // would still pass if one of them started serialising as `true` by accident.
+    assert_eq!(
+        report["fetched"],
+        serde_json::Value::Null,
+        "no transfer happened, so nothing is claimed"
+    );
+    assert_eq!(report["offline"], false, "an absent file is not an outage");
     assert_eq!(absent["artifact"], artifact.display().to_string());
     let hint = absent["hint"].as_str().unwrap_or_default();
     let fetch_expected = cfg!(feature = "fetch");

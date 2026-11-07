@@ -477,6 +477,7 @@ fn embed_workspace(
         mut state,
         artifact_check,
         workers,
+        fetched,
     } = embed_provider(&cfg, workspace, auto_fetch.allowed(&cfg), !json)?;
     // The reason a provider could not be built travels as a value — [`ProviderState::ArtifactAbsent`] for a missing file,
     // [`ProviderState::Placeholder`]'s reason for the configuration states. Handing over a bare placeholder is how R6c1 D-2
@@ -502,6 +503,12 @@ fn embed_workspace(
         },
         ProviderState::Placeholder { embedder, .. } => Resolution::Provider(embedder.as_mut()),
         ProviderState::ArtifactAbsent => Resolution::ArtifactAbsent,
+        // **F38 arm (vi).** The fetch was allowed, attempted, and nothing answered; the run says so before reading a chunk.
+        ProviderState::FetchSkippedOffline { id } => Resolution::FetchSkippedOffline {
+            // Cloned because this match borrows `state` mutably for the provider arm; the offline arm needs a value that
+            // outlives the borrow.
+            id: id.clone(),
+        },
     };
     #[cfg(feature = "local-model")]
     let resolution = match &mut state {
@@ -509,6 +516,11 @@ fn embed_workspace(
             Resolution::Provider(embedder.as_mut())
         }
         ProviderState::ArtifactAbsent => Resolution::ArtifactAbsent,
+        ProviderState::FetchSkippedOffline { id } => Resolution::FetchSkippedOffline {
+            // Cloned because this match borrows `state` mutably for the provider arm; the offline arm needs a value that
+            // outlives the borrow.
+            id: id.clone(),
+        },
     };
     let mut report = embed_run::embed_with_resolution(workspace, &cfg, resolution)?;
     // What was concluded about the model's bytes travels on the report rather than being printed here, so `--json`
@@ -519,6 +531,10 @@ fn embed_workspace(
     // provider was constructed** — which is not the same sentence as "nothing was embedded": a `local-model` run whose
     // notes were all current still built a provider, and its report states the count it would have used.
     report.workers = workers;
+    // **F38's machine-readable answer to "did this invocation download a model?"** — set here rather than inside the run
+    // because the transfer happened upstream, in provider resolution, and the document that must not contradict the text
+    // summary is this one object.
+    report.fetched = fetched;
     if json {
         emit_json(&serde_json::to_value(&report)?);
     } else {
@@ -588,6 +604,15 @@ fn search_workspace(
                     embed_run::install_hint(workspace)
                 )
                 .into())
+            }
+            // Unreachable while `search` passes `false` for auto-fetch (**F38** §5), and spelled anyway: a future caller that
+            // lets search fetch must find a compiler error here rather than a `_` arm that quietly answers "artifact absent"
+            // about a machine with no network.
+            ProviderState::FetchSkippedOffline { id } => {
+                return Err(format!(
+                    "offline: could not reach the pinned origin to fetch `{id}`, so the query cannot be embedded — \
+                     connect and try again, or search by keyword (`np search --mode keyword`)")
+                    .into())
             }
         };
         // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
@@ -775,12 +800,20 @@ struct Resolved {
     /// The worker-thread plan for this run, or `None` when no local-model provider was built (§6's arms and
     /// `provider = "none"` have no worker count to report).
     workers: Option<np_core::embed_run::WorkerPlan>,
+    /// What this run **transferred from an origin** before it could embed (**F38**), or `None` when nothing arrived.
+    ///
+    /// Produced where the fetch happens — provider resolution — and copied onto the report by [`embed_workspace`] for the
+    /// same reason `artifact_check` and `workers` are: the fact is decided next to the config and the filesystem, while the
+    /// document that must not contradict itself is written downstream.
+    fetched: Option<np_core::embed_run::FetchedRecord>,
 }
 
 /// What `[embeddings]` and the `models` table added up to, as one value.
 ///
-/// Three states because that is how many answers exist: a provider this run can embed with, a provider-shaped placeholder
-/// for a state that refuses before a vector is asked for, and a filesystem fact no downstream code can re-derive.
+/// Four states, which is how many answers exist: a provider this run can embed with, a provider-shaped placeholder for a
+/// state that refuses before a vector is asked for, a filesystem fact no downstream code can re-derive, and — since
+/// **F38** — a fetch that was permitted, attempted, and met no connection. The last two look alike from the filesystem
+/// (no artifact on disk) and must not share a sentence: one names a file to install, the other names a cable to plug in.
 enum ProviderState {
     /// A local provider built from the installed row. Nothing here claims its bytes verified anything — that is
     /// [`Resolved::artifact_check`]'s job, taken where the row and the path were both in hand.
@@ -795,6 +828,18 @@ enum ProviderState {
     /// The row says installed and the file is not there. Not a configuration state, and not recoverable downstream: only
     /// this function holds the row and the path at the same time (R6c1 D-2).
     ArtifactAbsent,
+    /// A fetch was permitted, attempted, and **nothing answered** (**F38**). Not a filesystem fact and not a
+    /// configuration state: the artifact is absent *and* unreachable, which is its own answer with its own remedy
+    /// (connect, re-run) and must not be dressed as either neighbour.
+    ///
+    /// Only the trigger can construct it, so a build without `local-model` + `fetch` never does — but the variant stays
+    /// compiled in rather than gated, because the matches over `ProviderState` are exactly the places a future
+    /// "search may fetch too" change must be forced to answer. Gating it would hand them a `_` arm instead of an error.
+    #[cfg_attr(not(all(feature = "local-model", feature = "fetch")), allow(dead_code))]
+    FetchSkippedOffline {
+        /// The pinned model that could not be obtained.
+        id: String,
+    },
 }
 
 /// A resolution that refuses for one of the four placeholder reasons, with the seam's own placeholder provider.
@@ -806,6 +851,7 @@ fn placeholder(reason: NoProvider) -> Resolved {
         },
         artifact_check: None,
         workers: None,
+        fetched: None,
     }
 }
 
@@ -815,6 +861,20 @@ fn artifact_absent() -> Resolved {
         state: ProviderState::ArtifactAbsent,
         artifact_check: None,
         workers: None,
+        fetched: None,
+    }
+}
+
+/// The **F38** resolution for "we asked and nothing answered": no provider, and the offline arm as the answer.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+fn fetch_offline(id: &str) -> Resolved {
+    Resolved {
+        state: ProviderState::FetchSkippedOffline { id: id.to_string() },
+        artifact_check: None,
+        workers: None,
+        // Nothing arrived, so nothing is claimed. `EmbedReport::offline` is set downstream from the arm itself, which is
+        // why this field stays `None` rather than carrying a half-populated record.
+        fetched: None,
     }
 }
 
@@ -891,16 +951,26 @@ fn embed_provider(
             // Nothing here prints in `--json` mode (`announce`), and nothing here ever names a host (§12 rule 8): the only
             // origin fact allowed out is *which kind* of origin was resolved.
             #[cfg(all(feature = "local-model", feature = "fetch"))]
+            let mut fetched_this_run: Option<np_core::embed_run::FetchedRecord> = None;
+            #[cfg(all(feature = "local-model", feature = "fetch"))]
             let attempted_fetch = auto_fetch
                 && np_core::pins::identity(id).is_some()
                 && (row.is_none() || !artifact.is_file());
             #[cfg(all(feature = "local-model", feature = "fetch"))]
             if attempted_fetch {
-                fetch_pinned_missing(cfg, &db, &models_dir, id, announce)?;
-                // The fetch records the `models` row itself, so a workspace that had neither row nor file is now a
-                // workspace with both — re-read rather than assume, and let F32's arm still answer if it somehow did not.
-                row = model_row(&db, id)?;
+                match fetch_pinned_missing(cfg, &db, &models_dir, id, announce)? {
+                    FetchStep::Offline => return Ok(fetch_offline(id)),
+                    FetchStep::Fetched(record) => {
+                        fetched_this_run = Some(record);
+                        // The fetch records the `models` row itself, so a workspace that had neither row nor file is now a
+                        // workspace with both — re-read rather than assume, and let F32's arm still answer if it somehow
+                        // did not.
+                        row = model_row(&db, id)?;
+                    }
+                }
             }
+            #[cfg(not(all(feature = "local-model", feature = "fetch")))]
+            let fetched_this_run: Option<np_core::embed_run::FetchedRecord> = None;
             #[cfg(not(all(feature = "local-model", feature = "fetch")))]
             let _ = (auto_fetch, announce, &models_dir, &artifact);
 
@@ -982,6 +1052,7 @@ fn embed_provider(
                                 state: ProviderState::Ready(Box::new(embedder)),
                                 artifact_check: Some(check),
                                 workers: Some(plan),
+                                fetched: fetched_this_run,
                             }),
                             Err(err) => Err(err.into()),
                         }
@@ -1005,6 +1076,7 @@ fn embed_provider(
                     state: ProviderState::Ready(Box::new(provider)),
                     artifact_check: None,
                     workers: None,
+                    fetched: fetched_this_run,
                 }),
                 // The row is installed and its width is the run's; only the bytes are missing. That is a fact
                 // about the filesystem, not about configuration, so it cannot be recovered downstream — hence
@@ -1172,6 +1244,15 @@ fn origin_kind_line(cfg: &Config) -> &'static str {
     }
 }
 
+/// What one auto-fetch attempt produced (**F38**).
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+enum FetchStep {
+    /// Bytes arrived and were published by digest. Carries the record `--json` will print.
+    Fetched(np_core::embed_run::FetchedRecord),
+    /// Nothing was reached. Not an error: a state, with its own report arm downstream (**F40's** lesson, one arm over).
+    Offline,
+}
+
 /// Fetch the pinned id's members that **this build can use**, because this workspace is missing them (**F38**).
 ///
 /// Called only from the trigger in [`embed_provider`], which has already decided a fetch is permitted; this function's own
@@ -1194,7 +1275,7 @@ fn fetch_pinned_missing(
     models_dir: &Path,
     id: &str,
     announce: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<FetchStep, Box<dyn Error>> {
     let members = np_core::pins::members_for_build();
     let bytes: u64 = members
         .iter()
@@ -1227,16 +1308,31 @@ fn fetch_pinned_missing(
                 }
                 emit(&free_space_line(report.free_bytes));
             }
-            Ok(())
+            Ok(FetchStep::Fetched(np_core::embed_run::FetchedRecord {
+                id: report.id.clone(),
+                // `fetch` publishes a member only after its digest matches the pin (§12 rule 6), so every member that
+                // arrives here is verified — the flag is a promise the reader can check against the type's doc, not a
+                // claim this call site makes up.
+                members: report
+                    .members
+                    .iter()
+                    .map(|member| np_core::embed_run::FetchedMember {
+                        name: member.member.clone(),
+                        bytes: member.bytes,
+                        digest_verified: true,
+                    })
+                    .collect(),
+                // A *kind*, never a host (§12 rule 8): the same distinction `origin_kind_line` prints for humans.
+                origin: if cfg.models.base_url.is_none() {
+                    "compiled-in-pin"
+                } else {
+                    "configured-mirror"
+                },
+            }))
         }
-        Err(err) if err.is_offline() => Err(std::io::Error::new(
-            std::io::ErrorKind::NotConnected,
-            format!(
-                "offline: could not reach the pinned origin to fetch `{id}`, so nothing was embedded — \
-                 connect and run `np embed` again, or search meanwhile by keyword (`np search --mode keyword`)"
-            ),
-        )
-        .into()),
+        // **Offline is a state, so it returns one.** It used to come back as an error string from here, which meant `--json`
+        // had no document to carry the fact and a caller had to read prose to learn that nothing was downloaded.
+        Err(err) if err.is_offline() => Ok(FetchStep::Offline),
         Err(err) => Err(err.into()),
     }
 }

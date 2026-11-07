@@ -79,6 +79,9 @@ impl Scratch {
         // `NP_MODELS_SHA256` must not loosen a digest check. A case that wants either says so with `.env(…)`.
         cmd.env_remove("NP_MODELS_BASE_URL");
         cmd.env_remove("NP_MODELS_SHA256");
+        // **F38**: the kill switch is removed for the same reason as the two above — a developer's shell must not decide
+        // whether these cases fetched, and a case that wants it off sets it explicitly.
+        cmd.env_remove("NP_NO_AUTO_FETCH");
         cmd.args(args);
         cmd
     }
@@ -158,6 +161,12 @@ struct Run {
 impl Run {
     fn stdout(&self) -> String {
         String::from_utf8_lossy(&self.output.stdout).into_owned()
+    }
+
+    /// Both channels as one string, for claims about **where the program reached**, which is a fact about the run rather
+    /// than about a stream. Wording assertions still name their channel; only the F38 socket tests need both at once.
+    fn combined(&self) -> String {
+        format!("{}{}", self.stdout(), self.stderr())
     }
 
     fn stderr(&self) -> String {
@@ -1979,4 +1988,138 @@ fn a_model_with_only_its_main_artifact_lists_no_members() {
         !text.contains("files "),
         "no members, no token — `files main` would duplicate this row's own state verdict:\n{text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// F38 — `np embed` asks the origin for a missing pinned artifact. Socket-level proof.
+//
+// `cli.rs` can only prove *wording* against an address where nothing listens. This file owns the stub origin, so it owns
+// the two claims wording cannot make: that a permitted fetch **opened a connection** (a request landed in the log), and
+// that an origin which **answered** was treated as an answer rather than skipped as an outage — the distinction F38 §5's
+// table turns on, and one no dead-port test can express.
+// ---------------------------------------------------------------------------
+
+/// `[embeddings]` pointing at a pinned id, so `np embed` in these cases wants a real local model. The block is written by
+/// hand rather than through the crate: this is an end-to-end claim about what the binary does with its configuration.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+fn embeddings_config(id: &str) -> String {
+    format!("[embeddings]\nprovider = \"local-model\"\nmodel = \"{id}\"\n")
+}
+
+/// A permitted fetch dials out — and an answered 404 is refused as an answer, never reported as offline.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn embed_dials_out_for_a_missing_pinned_model_and_keeps_an_answer_an_answer() {
+    let ws = Scratch::new();
+    ws.write_user_config(&embeddings_config("embeddinggemma-2"));
+    let origin = Origin::serve();
+
+    let mut cmd = ws.command(&["embed"]);
+    cmd.arg(&ws.root)
+        .env("NP_MODELS_BASE_URL", &origin.base_url);
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stdout());
+    let requests = origin.requests();
+    assert!(
+        !requests.is_empty(),
+        "a missing pinned artifact means a request to the origin; the log stayed empty:\n{}",
+        failed.combined()
+    );
+    assert!(
+        requests.iter().any(|r| r.starts_with("GET ")),
+        "the request is a GET on the pinned member: {requests:?}"
+    );
+
+    // The distinction this whole file exists for. An origin that answered 404 is a *refusal*: the run must not call itself
+    // offline, because "connect and retry" is the wrong remedy for a mirror that has nothing to give.
+    let text = failed.combined();
+    assert!(
+        !text.contains("offline"),
+        "an answered 404 is not an outage: {text}"
+    );
+    assert!(
+        text.contains("not found"),
+        "`fetch`'s own class reaches the user, unchanged: {text}"
+    );
+    // Mutation this pins: routing every fetch error through `FetchStep::Offline`, which turns a broken mirror into a
+    // permanent "offline" and hides the 404 behind a cable nobody has to plug in.
+}
+
+/// An id that is not pinned never reaches a transport — the request log stays empty, whatever `[embeddings]` says.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn an_unpinned_id_never_opens_a_connection_during_embed() {
+    let ws = Scratch::new();
+    ws.write_user_config(&embeddings_config("some-other-model"));
+    let origin = Origin::serve();
+
+    let mut cmd = ws.command(&["embed"]);
+    cmd.arg(&ws.root)
+        .env("NP_MODELS_BASE_URL", &origin.base_url);
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stdout());
+    // `requests` consumes the origin (it joins the worker to flush the log), so it is taken once and reused.
+    let requests = origin.requests();
+    assert!(
+        requests.is_empty(),
+        "the pinned set is checked before a transport is chosen: {requests:?}"
+    );
+    let text = failed.combined();
+    // The wording belongs to `embed`'s configuration arm (no `models` row for an id this build cannot fetch), and
+    // `cli.rs` pins that sentence; what this case owns is that the refusal happened **without a request** — so the exact
+    // phrasing only has to name the id, and must not blame the network.
+    assert!(
+        text.contains("some-other-model"),
+        "the refusal names the id it could not resolve: {text}"
+    );
+    assert!(
+        !text.contains("offline"),
+        "an unpinned id is a choice this build cannot make, never an outage: {text}"
+    );
+}
+
+/// `np search` is the read path (**F38** §5): no fetch, even with everything configured to allow one and every reason to
+/// want a model. The empty log is the whole point — a query that answered in milliseconds would otherwise be
+/// indistinguishable from one that downloaded 310 MB first.
+///
+/// `--mode semantic` is what makes this falsifiable rather than vacuous. Hybrid mode on a vector-less workspace answers
+/// from FTS5 and never resolves a provider at all (F36), so an empty log there would prove nothing about the fetch flag;
+/// semantic mode has to resolve one, which is exactly where a search that fetched would dial out first.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn search_never_dials_out_even_when_a_fetch_would_be_permitted() {
+    let ws = Scratch::new();
+    ws.write_user_config(&embeddings_config("embeddinggemma-2"));
+    let origin = Origin::serve();
+
+    let mut cmd = ws.command(&["search"]);
+    cmd.arg(&ws.root)
+        .arg("anything")
+        .arg("--mode")
+        .arg("semantic")
+        .env("NP_MODELS_BASE_URL", &origin.base_url);
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "semantic mode has nothing to rank with:\n{}",
+        failed.stdout()
+    );
+    let requests = origin.requests();
+    assert!(
+        requests.is_empty(),
+        "search asked an origin for a model: {requests:?}"
+    );
+    let text = failed.combined();
+    assert!(
+        !text.contains("offline"),
+        "a read command that cannot embed says the artifact is absent, not that the network failed: {text}"
+    );
+
+    // Mutation this pins: passing `true` for auto-fetch in `search`. That mutant leaves this log non-empty — a GET before
+    // the refusal — which is the difference between "your query took four milliseconds" and "your query took four minutes
+    // on a metered connection".
 }

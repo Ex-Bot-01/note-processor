@@ -133,6 +133,31 @@ sub-reports so a caller can tell which step produced which counts without runnin
 **Failure semantics.** Auto-fetch failure is reported with `fetch`'s own sentence, unchanged, at exit 1; the embed that could not proceed
 is then *not* attempted, so no partial state is written and no row is stamped.
 
+## 5b. The machine contract as built (Task 4, same day)
+
+Three refinements appeared while Task 4 was implemented. They are recorded here rather than edited into §5, because §5 is
+what a reviewer reads first and a plan that turns out slightly wrong is normal — a plan quietly rewritten after the fact is
+not.
+
++ **`offline` is a state, not an error string.** The first draft returned `io::Error(NotConnected)` from provider
+  resolution, which meant `--json` had no document to carry the fact: a caller would have read prose to learn that nothing
+  was downloaded. It is now `FetchStep::Offline` → `ProviderState::FetchSkippedOffline` →
+  `Resolution::FetchSkippedOffline` → `EmbedOutcome::Offline`, and `EmbedReport::offline` is the boolean a program reads.
++ **Arm (vi) is the first arm in `embed_run::run`, not the last.** Measured, not designed: placed beside arm (v), an
+  offline run answered **`configuration disabled`**, because arm (ii) sees no `models` row (a failed fetch creates none)
+  and fires first. Nothing about configuration or the table can outrank "we tried to reach the origin and could not", so the
+  offline check moved above them — and the test that caught it is the one asserting the *sentence*, not the one asserting
+  the JSON.
++ **`fetched` is produced where the transfer happens** (provider resolution) and copied onto the report by
+  `embed_workspace`, exactly like `artifact_check` and `workers`, for the same reason: the document that must not contradict
+  the text summary is written downstream of the fact.
++ **`search`'s "never dials out" test needs `--mode semantic`.** Hybrid mode on a vector-less workspace answers from FTS5
+  and never resolves a provider at all (F36), so an empty request log there proves nothing about the fetch flag — the first
+  version of that test passed against a mutation that *did* let search fetch. A green test on a path it never reaches is
+  the most expensive kind of green.
+
+---
+
 ## 6. Left to the builder
 
 Exact wording of the setup summary lines; whether `setup` prints per-step elapsed times; the injected-transport seam used to test the
