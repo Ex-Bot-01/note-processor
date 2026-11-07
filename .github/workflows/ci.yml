@@ -1,6 +1,30 @@
 name: CI
 
-on: [push, pull_request]
+# **Reshaped 2026-11-07 for the account's Actions allowance** — measured arithmetic in
+# `docs/ops-actions-minutes.md`, including why the earlier "option E" recommendation was wrong. The shape now is:
+#
+# * **a push to `main`** → `Test (ubuntu-latest)` and nothing else (~4.6 billed minutes). This is the row a closure
+#   paragraph has always been able to cite for fmt/clippy/rustdoc/tests, and it lands within minutes of the merge.
+# * **nightly schedule, a manual dispatch, or any pull request** → the full matrix: Windows plus both C++ feature rows
+#   (~25.4 billed minutes). This is where platform and feature-gated evidence comes from now; `gh workflow run ci.yml
+#   --ref <sha>` buys it for one specific tree before a card closes on it.
+# * **a push to any other branch** → nothing. Branch pushes were never the graded artifact here: local gates (17 rows,
+#   including the `local-model` and `vision` clippy/test rows) are the branch evidence, and they already ran before every
+#   merge this week.
+#
+# What that trades, said plainly: between a merge and the next nightly, `main` is graded on Linux only. A Windows-only
+# lint or platform answer, or a feature-gated compile break, can therefore sit on `main` for up to a day — which is what
+# the local gate rows are for in the meantime, and what a manual dispatch before a closure paragraph is for. The
+# allowance (inferred at ~2,000 billed minutes/month from two months stopping just past it) does not support anything
+# richer at this repository's November cadence: 91 runs in 6.4 days, 38 of them on `main`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 03:17 UTC, off the round hour so a queue backlog at :00 is not this repository's problem too.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
 
 # Nothing here writes back to the repository, so the token stays read-only.
 permissions:
@@ -10,14 +34,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # One job, both platforms: the two OS entries are the two rows on the run page.
+  # Which OS rows this event pays for. A job-level `if` cannot see `matrix`, so the choice is made once here and the
+  # test job matrices over it — one set of steps for both platforms rather than two near-identical jobs that drift
+  # apart (the F24 complaint, applied to YAML). Windows is dropped only for `push`; schedule, dispatch and pull
+  # requests all pay for it.
+  prepare:
+    name: Decide the matrix
+    runs-on: ubuntu-latest
+    outputs:
+      oses: ${{ steps.pick.outputs.oses }}
+    steps:
+      - name: Pick
+        id: pick
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo 'oses=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            echo "push event: ubuntu only — Windows and both C++ rows wait for the nightly or a dispatch"
+          else
+            echo 'oses=["ubuntu-latest","windows-latest"]' >> "$GITHUB_OUTPUT"
+            echo "${{ github.event_name }} event: full matrix"
+          fi
+
+  # One job, one or both platforms: the OS entries are the rows on the run page.
   test:
     name: Test (${{ matrix.os }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: ${{ fromJSON(needs.prepare.outputs.oses) }}
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain components
@@ -56,13 +103,19 @@ jobs:
   # happen - F18's mistake with a different noun. The Windows feature row lands when someone has seen it
   # green, and §2 keeps release binaries on the feature off until then.
   #
-  # Honest caveat, corrected 2026-11-05 from the Actions API: hosted jobs ran until 2026-10-29T13:11 UTC,
+  # Honest caveat, corrected 2026-11-05 from the Actions API (and note it describes the shape *before* the 2026-11-07
+  # reshaping above — since then this row runs only on schedule, dispatch and pull requests): hosted jobs ran until 2026-10-29T13:11 UTC,
   # created zero steps from 2026-10-29T14:39 through 2026-10-31T20:23, and have run on every push since
   # 2026-11-01T20:08. So this HAS run in CI — and the next 43 runs failed `Test (windows-latest)` until F34
   # landed at b2840f9, which is what reading the runs beats assuming the silence. Local gates remain the
   # primary evidence; a Windows-only lint or platform answer is visible only here.
+  # Gated to schedule / dispatch / pull_request since 2026-11-07: at November's cadence this row costs ~6.0 billed
+  # minutes per run and there were 5.9 `main` pushes a day, which is the whole monthly allowance on its own. Its checks
+  # still run locally before every merge (the `clippy-localmodel`, `rustdoc-deny-localmodel` and feature-test rows of the
+  # 17-row gate list), so what CI now adds is an independent machine rather than the first sighting.
   feature-local-model:
     name: Feature local-model (ubuntu-latest)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -220,8 +273,11 @@ jobs:
   # failure from a compile error and one no np-core row can produce. A green row proving a library builds some way says
   # nothing about whether the binary can be built that way; this job is the difference between those two claims, and it is
   # why the card could stay open while CI was green for five days.
+  # Same gating as the row above, for the same reason (~0.9 billed minutes per run; cheap next to its neighbour, but
+  # it is still a C++ build and this row is what proves `np` itself compiles with the pair).
   feature-vision:
     name: Feature local-model,vision (ubuntu-latest)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -520,3 +520,15 @@ zero-step on 2026-10-29T14:39; November had no C++ cache and spent **2,137 in si
 the first zero-step failure. A Windows job is 54.6 % of that spend, and both feature rows rebuild the vendored llama.cpp from scratch every run. So a red
 main gets one check before anything else: do the jobs have **steps**? `steps=0` on all four means the account is out, not the tree — re-triggering until it
 goes green would only teach everyone to ignore CI.
+
+**What CI grades, as of 2026-11-07 (`ci.yml` reshaped for the allowance).** A **push to `main`** runs `Test (ubuntu-latest)` — fmt, clippy, rustdoc with
+`--deny warnings`, and the whole workspace test suite including the release-only cases — and nothing else: about 4.6 billed minutes, landing within minutes of
+the merge. The **Windows row and both C++ feature rows** now run on a **nightly schedule (03:17 UTC), on any pull request, and on a manual dispatch**, which is
+where platform and feature-gated evidence comes from: `gh workflow run ci.yml --ref <sha>` buys the full matrix for one specific tree (~25.4 billed minutes) when
+a claim needs it before anyone writes it down. **Pushes to other branches run no CI at all.** That is a trade, not a saving: between a merge and the next nightly,
+`main` is graded on Linux only, so a Windows-only lint or a feature-gated compile break can sit there for up to a day. The 17-row local gate list — which includes
+the `local-model` and `local-model,vision` clippy, rustdoc and test rows — is what stands in during that window, and it is what ran before every merge this week.
+
+The arithmetic is in `docs/ops-actions-minutes.md`, including the correction it forced: at November's measured cadence (15 runs a day, 6.25 of them onto `main`)
+the earlier recommendation to keep Windows and the feature rows on every merge would still have cost ~5,900 billed minutes a month against an allowance inferred at
+~2,000. The shape above projects ~1,620.
