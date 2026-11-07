@@ -969,8 +969,8 @@ recorded file's bytes moved; and CI gained `Feature local-model,vision (ubuntu-l
 days of green runs. Evidence: branch run `42258831178`, four jobs success, its vision step reporting 15 passed / 0 failed with the artifact-backed cases
 printing `NOT COVERAGE`; merged-tree gates 17 rows exit 0 including the CLI-with-pair check, workspace 670 passed / 0 failed, `GOLDEN CHECK: pass`.
 Three mutants killed by three distinct cases (skip the digest comparison, resolve by path existence, ignore the stamp pair), none needing a model file.
-**Still open in this card:** `np models install --member`, without which an offline machine cannot place the projector that `projector-absent` now tells
-it to install; the five archive shapes measured with `strip` against §14's ~40 MB sentence; and the placement half below.
+**Still open in this card** (as filed): `np models install --member`, the five archive shapes against §14's ceiling, and the placement half. The first two
+are closed below; the placement half remains.
 
 **Step ③ landed the same day** (commit `b082272`, merged with history at `5374dc1`; branch CI `42324417379` green on all four jobs, merged-tree gates 17 rows exit 0, workspace 680 passed / 0 failed, `GOLDEN CHECK: pass`). `np models install --member <main|mmproj>`: the member name keys `model_files`, the file lands at `<id>.mmproj`
 (`member_artifact_name`), and the model row is not written — asserted as a whole-row comparison, because a projector digest copied into `models.sha256`
@@ -984,6 +984,14 @@ and np-cli five; mutants killed: skip the row check, record under the `main` mem
 `--dim` guard, drop the member-set check — the last meaning `--member audio` silently installs a projector, which is exactly the drift the shared list
 prevents. **One equivalent mutant was found and removed rather than kept**: skipping the member write when the recorded digest already matched decided
 nothing (`record_model_file`'s CASE clears a stamp only when the digest changes), so the branch is gone and the rule lives in one place.
+
+**Step ④ — sizes — measured the same day.** Five release+`strip` shapes on one host: no features **6,080,592 B**, default (`fetch`) **8,223,056 B**,
+`fetch + local-model` **14,018,104 B**, `fetch + local-model + vision` **15,957,688 B**, `--no-default-features --features fetch` **8,223,056 B**. The image
+code therefore costs **+1,939,584 B** over the text-only C++ build, attributed by symbol rather than by feature name (`nm --defined-only`: 0 `mtmd_*` /
+0 `clip_*` without `vision`, 686 / 928 with it), and §14's ≤ 40 MB ceiling survives the vision shape with ~24.8 MiB of headroom — so the sentence stays
+true and gains the row that tested it, in `docs/design-m2-local-embeddings.md` §14, next to the finding it retires. Two things this measurement refuses to
+claim: that equal sizes mean one artifact (`--no-default-features --features fetch` matches `default` at 8,223,056 B while differing in 2,192,920 of those
+bytes), and that the table describes what a user downloads to encode figures (the projector is **554,821,056 B**, ~35× the largest binary in it).
 
 **A gap this step exposes without causing:** `np models list` prints one line per model and never mentions members, so nothing tells you what the
 workspace recorded — true of fetched projectors since migration 9, so it is a reporting gap rather than an install one. The confirmation today is that

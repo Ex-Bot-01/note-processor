@@ -106,10 +106,13 @@ one relation are how drift starts.
    Red first at the CLI layer — a `--features local-model,vision` build against a scratch workspace with a planted projector must stop
    reporting `vision-unavailable`, and today it cannot even be compiled, which is F28's own measurement. The end-to-end encode is
    artifact-gated (`NP_TEST_MODEL_PATH`, `NP_TEST_MMPROJ_PATH`) and prints `NOT COVERAGE` without them; "it compiled" is never "it ran".
-2. **Sizes.** Five shapes — default, `local-model`, `local-model,vision`, each release+`strip`, plus the no-default row — measured in one
-   session on this host, with the projector's 554,821,056 bytes recorded as a *fetched* cost beside the binary's own. §14's ceiling sentence
-   gets rewritten from whatever the table says, including if `local-model,vision` breaks it: the answer then is "the vision build exceeds the
-   ceiling", not a quiet omission of the row.
+2. **Sizes — measured 2026-11-06.** Five release+`strip` shapes on one host: no features **6,080,592 B**, default (`fetch`) **8,223,056 B**,
+   `fetch + local-model` **14,018,104 B**, `fetch + local-model + vision` **15,957,688 B**, and `--no-default-features --features fetch`
+   **8,223,056 B**. So the image code costs **+1,939,584 B** over the text-only C++ build — attributed by symbol (686 `mtmd_*`, 928 `clip_*`
+   with `vision`; zero without) rather than by feature name — and §14's ≤ 40 MB ceiling survives it with ~24.8 MiB of headroom. The row lives in
+   `docs/design-m2-local-embeddings.md` §14's package-size table, beside the retired finding that this shape could not be built at all. What the
+   table cannot say is that the projector's **554,821,056 B** is ~35× the largest binary in it: a ceiling on the executable was never the cost a
+   user of image search feels.
 3. **Placement.** `linked_notes` through `Hit`, printer and JSON, README's key list and example, and the drift assertion above. Existing
    cases (`tests/search.rs:293-351`) keep their assertions — they check the smallest-linker and the count, both of which stay true — and new
    ones name the *second* linker, which is what today's renderer discards.

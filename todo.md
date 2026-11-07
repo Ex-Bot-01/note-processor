@@ -67,9 +67,14 @@ Four questions went up as human decisions; four answers came back, and one of th
   mutants killed; one **equivalent** mutant (skip the member write when the digest matches) deleted instead of defended, because
   `db::record_model_file`'s CASE already clears a stamp only on a changed digest. Recorded as exposed-not-caused: `np models list` never mentions
   members, true of fetched projectors since migration 9 — README's Option B now says what to check instead.
-* **Remaining for F28:** the five archive shapes measured with `strip`
-  against §14's ~40 MB sentence, rewritten from the table even if the vision row exceeds it; then `linked_notes`, the placement half; and (exposed by
-  step ③, not caused by it) member names in `np models list`, which needs a change to that command's pinned key set.
+* **F28 step ④ — sizes — measured (same day).** Five release+`strip` shapes: 6,080,592 / 8,223,056 / 14,018,104 / **15,957,688** (`fetch +
+  local-model + vision`) / 8,223,056 bytes. Image code = **+1,939,584 B**, attributed by symbol (686 `mtmd_*`, 928 `clip_*` with `vision`; zero without),
+  and §14's ≤ 40 MB ceiling holds with ~24.8 MiB spare — so the claim is kept *and* the row that tested it is added, in
+  `docs/design-m2-local-embeddings.md` §14, beside the retired "this shape cannot be built" finding. Declined two over-readings: equal size ≠ same artifact
+  (`--no-default-features --features fetch` equals `default` in size and differs in 2,192,920 bytes), and the table is not what a user downloads for image
+  search (projector **554,821,056 B** ≈ 35× the largest binary).
+* **Remaining for F28:** `linked_notes`, the placement half — figure → note, through `Hit` rather than a migration — and (exposed by step ③, not caused
+  by it) member names in `np models list`, which needs a change to that command's pinned key set.
 * **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
   binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
   attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.
