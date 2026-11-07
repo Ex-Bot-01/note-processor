@@ -149,6 +149,10 @@ it as "this did not take minutes", and nothing stronger.
 * ~~`media_embeddings` bytes on any corpus (blocked on F28).~~ **Measured 2026-11-07** in the section above.
 * Ranking quality at 512 or 256 — no labelled set exists (F31), and a set small enough to assert against could not support the claim.
 * Anything about a real user's vault: this is 16 fixture notes, one of which produces no chunk. Per-row figures extrapolate; totals do not.
-* FTS/index bytes for the *non-vector* tables (the 147,456 B baseline lumps them together with schema and row content on purpose — splitting
-  them needs `dbstat`, which this rusqlite build does not enable).
+* ~~FTS/index bytes for the *non-vector* tables (the 147,456 B baseline lumps them together with schema and row content on purpose — splitting
+  them needs `dbstat`, which this rusqlite build does not enable).~~ **That parenthetical was wrong when it was written** (2026-11-07): the bundled
+  SQLite is built with `SQLITE_ENABLE_DBSTAT_VTAB`, and F36's cost measurement used it directly (`SELECT name, SUM(pgsize) FROM dbstat GROUP BY
+  name`) to split the keyword index out per table. The claim was never tested — it came from reading one feature flag list and stopping there —
+  which is why it is struck through here rather than quietly deleted: a measurement note that can be wrong about whether the instrument exists
+  should stay visible. Per-table bytes for FTS5, and the before/after file sizes they came from, are in `docs/design-m3-hybrid-search.md` §6.
 * Windows page size and slack: CI runs the suites on `windows-latest`, never this measurement.

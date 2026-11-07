@@ -315,12 +315,16 @@ pub const MIGRATIONS: &[Migration] = &[
     // which means after reading the file: the work the stamp exists to skip. So the pair travels with the path it
     // describes and joins to the hash rather than guarding it (`media_path_check`).
     //
-    // Migration 10 is unreleased on this branch, so the DDL is edited in place rather than followed by a migration 11 —
-    // the same call as dropping `media_path.case_key`, and every rewind fixture already drops these tables.
+    // Migration 10 is unreleased on this branch, so the DDL is edited in place rather than given a second entry — the same
+    // call as dropping `media_path.case_key`, and every rewind fixture already drops these tables. (Migration 11 exists now:
+    // F36's keyword index. It is a separate entry because it changes nothing here, and the reasoning above was about not
+    // splitting one media shape across two versions, not about keeping the list at ten.)
     //
     // Same coupling as migration 9 warned about, now pointing forward: the eight rewind fixtures
     // (`tests/db.rs`, `tests/scan.rs`, `np-cli/tests/cli.rs`) delete version numbers and must undo what later entries
-    // created, so each one drops these three tables — child first — beside `model_files`.
+    // created, so each one drops these three tables — child first — beside `model_files`. F36 extended that duty to its own
+    // entry: the same fixtures also drop `notes_fts` and its three triggers, or re-running migration 11 fails on
+    // `table notes_fts already exists`.
     Migration::Sql(
         r#"
     CREATE TABLE media (
@@ -373,6 +377,46 @@ pub const MIGRATIONS: &[Migration] = &[
 
     ALTER TABLE model_files ADD COLUMN verified_size INTEGER;
     ALTER TABLE model_files ADD COLUMN verified_mtime INTEGER;
+    "#,
+    ),
+    // **Migration 11 — the keyword half of search** (`docs/design-m3-hybrid-search.md`). External content: the index stores
+    // terms pointing at `notes.id`, never a second copy of the prose, which is why the three triggers below are load-bearing
+    // rather than an optimisation — a shadow table cannot notice a change on its own. They are installed **after** the
+    // backfill so seeding cannot double-insert.
+    //
+    // `AFTER UPDATE OF title, body` deliberately omits `rel`: a move rewrites the path by cascade and changes no word, and
+    // the keyword row keyed on `notes.id` survives it exactly as `headings` and `links` do. The delete trigger passes the
+    // **old** text, which is what FTS5 needs to find the terms to drop — reading the new row there leaves ghost hits.
+    //
+    // No stemming (`porter` would fold `runners` onto `runner`, and this vault holds identifiers as often as prose);
+    // `remove_diacritics 2` stays, because `café`/`cafe` is one spelling rather than two words.
+    Migration::Sql(
+        r#"
+    CREATE VIRTUAL TABLE notes_fts USING fts5(
+        title,
+        body,
+        content='notes',
+        content_rowid='id',
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+
+    INSERT INTO notes_fts (rowid, title, body)
+    SELECT id, title, body FROM notes;
+
+    CREATE TRIGGER notes_fts_ai AFTER INSERT ON notes BEGIN
+        INSERT INTO notes_fts (rowid, title, body) VALUES (new.id, new.title, new.body);
+    END;
+
+    CREATE TRIGGER notes_fts_ad AFTER DELETE ON notes BEGIN
+        INSERT INTO notes_fts (notes_fts, rowid, title, body)
+        VALUES ('delete', old.id, old.title, old.body);
+    END;
+
+    CREATE TRIGGER notes_fts_au AFTER UPDATE OF title, body ON notes BEGIN
+        INSERT INTO notes_fts (notes_fts, rowid, title, body)
+        VALUES ('delete', old.id, old.title, old.body);
+        INSERT INTO notes_fts (rowid, title, body) VALUES (new.id, new.title, new.body);
+    END;
     "#,
     ),
 ];

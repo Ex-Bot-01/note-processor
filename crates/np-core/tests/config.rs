@@ -21,9 +21,10 @@ mod common;
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
     config_file_path, CatalogConfig, Config, ConfigError, EmbeddingProvider, EmbeddingsConfig,
-    MarkerConfig, ModelsConfig, ThreadCount, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS,
-    MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS,
+    MarkerConfig, ModelsConfig, SearchConfig, ThreadCount, WorkspaceRegistry,
+    DEFAULT_EMBEDDING_TOKENS, MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS,
 };
+use np_core::search::SearchMode;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -983,8 +984,9 @@ fn an_invented_section_is_refused_naming_the_section_and_its_line() {
     // `[catalogg]` keeps loading whole.
 }
 
-/// The two remaining containers, asserted separately so a struct added later cannot rejoin a lenient set by
-/// omission: an unknown key inside `[catalog]` and inside `[markers]` is refused like any other.
+/// Every container refuses a key it has never heard of, asserted one row per struct so a section added later cannot rejoin
+/// a lenient set by omission. F36 added the third row with the section: `[search]` decides how a query is ranked, and a
+/// typo there (`modee = "keyword"`) would otherwise change an answer in silence — the exact failure F35 was written against.
 #[test]
 fn every_section_refuses_an_unknown_key() {
     let _env = hold_env();
@@ -999,6 +1001,7 @@ fn every_section_refuses_an_unknown_key() {
             "[markers]\ndone = [\"done\"]\npausedd = [\"later\"]\n",
             "`pausedd`",
         ),
+        ("[search]", "[search]\nmodee = \"keyword\"\n", "`modee`"),
     ] {
         let (path, err) = root_refusal(body);
         let message = err.to_string();
@@ -1016,8 +1019,9 @@ fn every_section_refuses_an_unknown_key() {
         );
     }
 
-    // Mutations this catches: dropping `deny_unknown_fields` from `CatalogConfig` or from `MarkerConfig` — each
-    // half fails only its own row, which is why they are one test with two fixtures rather than one fixture.
+    // Mutations this catches: dropping `deny_unknown_fields` from any one of the three — each half fails only its own row,
+    // which is why they are one test with three fixtures rather than one fixture, and why a fourth section has to be added
+    // here as well as in `a_file_of_real_keys_still_loads_every_section`.
 }
 
 /// **The half a strictness change gets wrong.** Refusing everything also satisfies every assertion above, so
@@ -1032,7 +1036,8 @@ fn a_file_of_real_keys_still_loads_every_section() {
         "[catalog]\nmax_entries_per_file = 400\ncontinuation_indent = 4\n\
          [markers]\ndone = [\"done\"]\npaused = [\"on hold\"]\n\
          [embeddings]\nprovider = \"none\"\nmax_tokens = 512\n\
-         [models]\nbase_url = \"https://mirror.example\"\n",
+         [models]\nbase_url = \"https://mirror.example\"\n\
+         [search]\nmode = \"keyword\"\n",
     );
 
     let cfg = Config::load(Some(&path)).expect("a file with no unknown key must never be refused");
@@ -1044,6 +1049,11 @@ fn a_file_of_real_keys_still_loads_every_section() {
     assert_eq!(
         cfg.models.base_url.as_deref(),
         Some("https://mirror.example")
+    );
+    assert_eq!(
+        cfg.search.mode,
+        SearchMode::Keyword,
+        "the ranking choice arrives, not just the section"
     );
 
     // Mutation this catches: making the root strict by refusing *nested tables* wholesale (a visitor that only
@@ -2138,4 +2148,62 @@ fn annotated_test_bodies(source: &str) -> Vec<(&str, &str)> {
         rest = &head[end..];
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// F36: `[search] mode` (`docs/design-m3-hybrid-search.md`). Two cases, because a new section has two ways to be wrong: it
+// can refuse what it should accept, and it can accept what it should refuse.
+// ---------------------------------------------------------------------------
+
+/// The default is the answer for the reader who never opens a config file, so it is pinned rather than left to a `Default`
+/// impl nobody reads: absent section means hybrid, and an empty file loads.
+#[test]
+fn an_absent_search_section_means_hybrid() {
+    let _env = hold_env();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "");
+
+    let cfg = Config::load(Some(&path)).expect("an empty file is a valid file");
+    assert_eq!(
+        cfg.search.mode,
+        SearchMode::Hybrid,
+        "the shipped default is the ranking both lists produce"
+    );
+    assert_eq!(
+        SearchConfig::default().mode,
+        cfg.search.mode,
+        "and `Default` agrees with the parser, so no path through the code can rank differently"
+    );
+}
+
+/// A mode outside the three names is refused **by config**, not quietly downgraded to the default: a reader who writes
+/// `semantic` as `semantics` has to be told, or they search a hybrid list believing it holds only vectors. The refusal names
+/// what it expected, which is what distinguishes it from serde's bare "unknown variant".
+#[test]
+fn an_invented_search_mode_is_refused_and_names_the_three() {
+    let _env = hold_env();
+    let (path, err) = root_refusal("[search]\nmode = \"fuzzy\"\n");
+    let message = err.to_string();
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected a parse refusal, got {err:?}"
+    );
+    assert!(
+        message.contains("fuzzy"),
+        "the value the file holds must be named in: {message}"
+    );
+    for name in ["hybrid", "semantic", "keyword"] {
+        assert!(
+            message.contains(name),
+            "and each real mode has to be listed (`{name}` missing from: {message})"
+        );
+    }
+    assert!(
+        message.contains(&path.display().to_string()),
+        "and the file, in: {message}"
+    );
+
+    // Mutations this catches: adding a serde `other` arm that swallows the value into the default, and renaming a mode in
+    // one door only — `SearchMode` is the single definition behind config, `--mode` and `--json`, so a fourth spelling has
+    // nowhere to enter. The argv door is pinned by `an_invented_mode_refuses_with_claps_exit_two` in `np-cli`.
 }

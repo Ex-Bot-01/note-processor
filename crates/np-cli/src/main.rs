@@ -76,8 +76,13 @@ enum Command {
     Search {
         /// Workspace root whose index to read.
         workspace: PathBuf,
-        /// Text to embed and rank against the stored vectors.
+        /// Text to match — embedded for the vector list, tokenised for the keyword list.
         query: String,
+        /// Which lists to rank: `hybrid` (the default), `semantic` (vectors only) or `keyword` (FTS5 only).
+        /// Overrides `[search] mode`; an unknown name is refused rather than ignored.
+        /// Absent means whatever `[search] mode` says, which in turn defaults to `hybrid`.
+        #[arg(long, value_enum)]
+        mode: Option<SearchModeFlag>,
         /// Maximum number of hits to print, highest score first.
         #[arg(long, default_value_t = DEFAULT_SEARCH_LIMIT)]
         limit: usize,
@@ -90,6 +95,29 @@ enum Command {
         #[command(subcommand)]
         command: ModelsCommand,
     },
+}
+
+/// `--mode` as clap sees it. A separate `clap` enum because the value parser and the help list have to come from the same
+/// place as the names; [`SearchModeFlag::to_core`] is the only bridge, so a fourth spelling cannot appear in one door and not
+/// the other (F28's lesson about two lists of the same names).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SearchModeFlag {
+    /// Both lists, fused by rank. The default.
+    Hybrid,
+    /// Vectors only — the behaviour before FTS5 existed.
+    Semantic,
+    /// FTS5 only; answers with no model installed and never returns a figure.
+    Keyword,
+}
+
+impl SearchModeFlag {
+    fn to_core(self) -> search::SearchMode {
+        match self {
+            Self::Hybrid => search::SearchMode::Hybrid,
+            Self::Semantic => search::SearchMode::Semantic,
+            Self::Keyword => search::SearchMode::Keyword,
+        }
+    }
 }
 
 /// The three model commands of `docs/design-m2-models-install.md` §2.
@@ -187,8 +215,15 @@ fn main() -> ExitCode {
             workspace,
             query,
             limit,
+            mode,
             json,
-        } => search_workspace(&workspace, &query, limit, json),
+        } => search_workspace(
+            &workspace,
+            &query,
+            limit,
+            mode.map(SearchModeFlag::to_core),
+            json,
+        ),
         Command::Models { command } => match command {
             ModelsCommand::Install {
                 workspace,
@@ -431,56 +466,115 @@ fn search_workspace(
     workspace: &Path,
     query: &str,
     limit: usize,
+    mode: Option<search::SearchMode>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
+    // Config first, flag over it: `[search] mode` is the standing choice and `--mode` is the exception to it.
+    let mode = mode.unwrap_or(cfg.search.mode);
     let db = workspace_db(&cfg, workspace)?;
-    // One `match`, no `_` arm: adding a state to `ProviderState` has to fail to compile *here*, because the last time this
-    // call site knew only one of the five answers it printed `embeddings.provider = "none"` about a configuration that said
-    // `local-model` (F32). Every placeholder reason collapses into a single arm on purpose — §1 of the F32 design measures
-    // that no CLI invocation can reach two of them, so per-state arms here would be mapping sites nothing can test.
-    let provider = match embed_provider(&cfg, workspace)?.state {
-        ProviderState::Ready(provider) => provider,
-        ProviderState::Placeholder { reason, .. } => {
-            return Err(reason.sentence(workspace).into())
-        }
-        // One line, spelled out here rather than assembled across a wrapped literal: the first version broke mid-sentence
-        // and printed a run of twenty spaces between "be" and "embedded". The pointer is `install_hint`, the same
-        // feature-gated wording embed's arm (iii) prints — a build that compiled `fetch` out must not be sent to it.
-        ProviderState::ArtifactAbsent => {
-            return Err(format!(
-                "no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded: {}",
-                embed_run::install_hint(workspace)
-            )
-            .into())
-        }
-    };
-    // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
-    // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
-    let model = provider.model_id().to_string();
-    let vector = provider.embed_query(query)?;
-    let hits = search::search(&db, &model, &vector.to_bytes(), limit)?;
+
+    // **Which halves this query can ask about, decided before any model is loaded.** Keyword mode needs no provider at all —
+    // that is the property the human asked for when hybrid became the default: search answers on a machine that has never
+    // downloaded 310 MB. Hybrid asks the same question of the database rather than of the config, because "no vectors here"
+    // is a state to report, not a failure; and if it *does* need a provider and cannot get one, the refusal below is exactly
+    // the F32 sentence it always was.
+    let semantic_wanted = mode != search::SearchMode::Keyword;
+    let present = search::vectors_present(&db)?;
+    let mut note: Option<search::RankNote> = None;
+    let mut vector: Option<Vec<u8>> = None;
+    let mut model = String::new();
+    if semantic_wanted && (mode != search::SearchMode::Hybrid || present) {
+        // One `match`, no `_` arm: adding a state to `ProviderState` has to fail to compile *here*, because the last time this
+        // call site knew only one of the five answers it printed `embeddings.provider = "none"` about a configuration that
+        // said `local-model` (F32). Every placeholder reason collapses into a single arm on purpose — §1 of the F32 design
+        // measures that no CLI invocation can reach two of them, so per-state arms here would be mapping sites nothing can test.
+        let provider = match embed_provider(&cfg, workspace)?.state {
+            ProviderState::Ready(provider) => provider,
+            ProviderState::Placeholder { reason, .. } => {
+                return Err(reason.sentence(workspace).into())
+            }
+            // One line, spelled out here rather than assembled across a wrapped literal: the first version broke mid-sentence
+            // and printed a run of twenty spaces between "be" and "embedded". The pointer is `install_hint`, the same
+            // feature-gated wording embed's arm (iii) prints — a build that compiled `fetch` out must not be sent to it.
+            ProviderState::ArtifactAbsent => {
+                return Err(format!(
+                    "no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded: {}",
+                    embed_run::install_hint(workspace)
+                )
+                .into())
+            }
+        };
+        // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
+        // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
+        model = provider.model_id().to_string();
+        vector = Some(provider.embed_query(query)?.to_bytes());
+    } else if semantic_wanted {
+        note = Some(search::RankNote::NoVectors);
+    }
+
+    let answer = search::ranked(
+        &db,
+        mode,
+        // Hybrid asks no question of a model it did not load; `ranked` reads the id only when a vector arrives.
+        if vector.is_some() {
+            Some(model.as_str())
+        } else {
+            None
+        },
+        vector.as_deref(),
+        query,
+        limit,
+    )?;
+    let hits = answer.hits;
+    let note = note.or(answer.note);
 
     let mut out = io::stdout().lock();
     if json {
-        // One object per hit under `hits`, and nothing else on stdout (§12). The empty case is an empty array — a machine
-        // reader does not need a sentence, and a second key would be a schema change in disguise.
+        // One object per hit under `hits`, beside the two keys that say how the list was made (§12). The empty case is an
+        // empty array — a machine reader does not need a sentence, and a second key per hit would be a schema change in
+        // disguise; `mode` and `vectors` describe the *list*, so they sit beside it.
         let objects: Vec<Value> = hits.iter().map(hit_json).collect();
         drop(out);
-        emit_json(&json!({ "hits": objects }));
+        emit_json(&json!({
+            "hits": objects,
+            "mode": mode.label(),
+            "vectors": present,
+            "note": note.as_ref().map(search::RankNote::label),
+        }));
         return Ok(());
+    }
+    if let Some(reason) = note {
+        // One line on stderr for a half that was not there to answer. Stderr because stdout stays parseable; the exit code is
+        // still 0 when the keyword list answered, which is the point of the mode.
+        let _ = writeln!(io::stderr(), "{reason}");
     }
     if hits.is_empty() {
         // §12: an empty index is a fact. Written to stdout, exit 0 — the caller has nothing to fix.
         // `--limit 0` asks for no hits and gets no lines, which is not the same sentence, so it is not printed.
         if limit > 0 {
-            let _ = writeln!(out, "nothing indexed for {model}");
+            let _ = match mode {
+                search::SearchMode::Keyword => writeln!(out, "nothing matched \"{query}\""),
+                other => writeln!(out, "nothing indexed for {model} by {other}"),
+            };
         }
         return Ok(());
     }
     for hit in &hits {
-        // Score to four decimals (full precision travels in `--json`), kind padded so the paths start in one column.
-        let score = format!("{:.4}", hit.score);
+        // Score to four decimals (full precision travels in `--json`), kind padded so the paths start in one column. In
+        // hybrid the score is a fused rank sum, not a similarity — which is why the raw numbers ride beside it here too.
+        let score = number(hit.score);
+        let evidence = match (hit.cosine, hit.bm25) {
+            (Some(cosine), Some(bm25)) => format!("cos {} bm25 {}", number(cosine), number(bm25)),
+            (Some(cosine), None) => format!("cos {}", number(cosine)),
+            (None, Some(bm25)) => format!("bm25 {}", number(bm25)),
+            (None, None) => String::new(),
+        };
+        let evidence = if evidence.is_empty() {
+            String::new()
+        } else {
+            format!("  [{evidence}]")
+        };
         match &hit.source_note {
             Some(note) => {
                 // One linker gets named; more than one says so, because the count used to be invisible here and a figure
@@ -492,21 +586,47 @@ fn search_workspace(
                 };
                 let _ = writeln!(
                     out,
-                    "{score} {:<5}  {}   (from {note}{extra})",
+                    "{score} {:<5}  {}   (from {note}{extra}){evidence}",
                     hit.kind.label(),
                     hit.path
                 );
             }
             None => {
-                let _ = writeln!(out, "{score} {:<5}  {}", hit.kind.label(), hit.path);
+                let snippet = hit
+                    .snippet
+                    .as_deref()
+                    .map(|text| format!("   … {}", text.replace('\n', " ")))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "{score} {:<5}  {}{evidence}{snippet}",
+                    hit.kind.label(),
+                    hit.path
+                );
             }
         }
     }
     Ok(())
 }
+/// A number for the text channel: four decimals when that says something, scientific notation when it does not.
+///
+/// The fixed `{:.4}` this function replaced was right about cosine, which lives in `[-1, 1]`, and wrong about everything
+/// else — SQLite's `bm25()` on a two-note vault answers `-0.000001`-sized values, so a keyword hit led with `0.0000` and
+/// read as "no score computed" rather than "a real, tiny, higher-is-better number". The threshold is not tuned: it is the
+/// point below which four decimals stop carrying a digit. Full precision has always travelled in `--json`.
+fn number(value: f64) -> String {
+    if value.abs() < 5e-4 {
+        format!("{value:.2e}")
+    } else {
+        format!("{value:.4}")
+    }
+}
 
-/// One hit as JSON: **the same six keys whatever the kind** —
-/// `{score, kind, path, linked_from, source_note, linked_notes}`.
+/// One hit as JSON: **the same eleven keys whatever the kind and whatever the mode** —
+/// `{score, cosine, bm25, semantic_rank, keyword_rank, kind, path, snippet, linked_from, source_note, linked_notes}`.
+///
+/// F36 added the five evidence keys to this list rather than printing them only in the modes that produce them, for the
+/// reason below: a schema whose keys depend on a value inside the object makes every reader branch before it reads.
 ///
 /// The first version added `linked_from` and `source_note` only for image hits, which made the schema depend on a value
 /// inside the object — a reader then has to branch on `kind` before it knows whether a key is there, and a note hit whose
@@ -522,8 +642,20 @@ fn search_workspace(
 fn hit_json(hit: &Hit) -> Value {
     json!({
         "score": hit.score,
+        // The two raw numbers beside the fused score. In `hybrid` a reader cannot recover them from `score`, and F31 will
+        // need both columns to judge ranking at all; in a single-list mode one of them is `null`, which is the same
+        // present-and-null statement `source_note` already makes rather than a key that appears only in some modes.
+        "cosine": hit.cosine,
+        "bm25": hit.bm25,
+        // Which list put this hit where it is, and how far down. `null` means that half did not run — no vectors, or
+        // `--mode keyword` — which is a different fact from "rank 0".
+        "semantic_rank": hit.semantic_rank,
+        "keyword_rank": hit.keyword_rank,
         "kind": hit.kind.label(),
         "path": hit.path,
+        // A matched phrase from the note body with the hit marked, or `null` on a vector-only hit: keyword evidence is a
+        // property of the keyword half, not of a kind of note.
+        "snippet": hit.snippet.clone(),
         "linked_from": hit.linked_from,
         "source_note": match &hit.source_note {
             Some(note) => json!(note),

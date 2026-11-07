@@ -577,6 +577,25 @@ fn marker_list(markers: &[&str]) -> Vec<String> {
 /// "a typo costs one setting" and "a typo costs a subsystem", and it gives up forward compatibility with
 /// sections invented after this binary was built — a trade written down in `docs/design-f35-unknown-keys.md` §3
 /// rather than discovered later.
+/// How `np search` ranks (`docs/design-m3-hybrid-search.md`). Its own section because it changes an answer rather than what
+/// is stored: nothing here affects a scan, an embed, or a byte in the database.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Which lists a query may consult. Absent means [`SearchMode::Hybrid`](crate::search::SearchMode::Hybrid) — the default the human chose on 2026-11-07,
+    /// with `semantic` and `keyword` one key away for anyone who wants one list alone. A value outside those three words is
+    /// refused at parse time (F35's rule), naming what it expected rather than falling back.
+    pub mode: crate::search::SearchMode,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            mode: crate::search::SearchMode::Hybrid,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -593,6 +612,9 @@ pub struct Config {
     /// Fetch source and the digest override (§12 rule 7). An absent `[models]` section names neither, which is the
     /// shipped state: nothing to fetch from, and the pin stands.
     pub models: ModelsConfig,
+    /// Ranking choice for `np search`. An absent `[search]` section means hybrid, which is the default rather than a
+    /// degraded mode: with no vectors installed, the keyword half is all there is to rank by, and it still answers.
+    pub search: SearchConfig,
 }
 
 impl Default for Config {
@@ -603,6 +625,7 @@ impl Default for Config {
             markers: MarkerConfig::default(),
             embeddings: EmbeddingsConfig::default(),
             models: ModelsConfig::default(),
+            search: SearchConfig::default(),
         }
     }
 }
