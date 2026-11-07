@@ -1684,3 +1684,19 @@ rename-identity evidence flowing. Only Stage 5 (`cargo test --workspace`) genuin
 source-build instruction gains that caveat and the fix; or (b) we ship a Windows asset, at which point the card closes as "the source path
 is not universally available, so the binary is the supported one". Either way README gets an honest line about app-control-blocked machines
 rather than silently assuming everyone can compile.
+
+**Answered in part on 2026-11-08, by the operator's own hand.** The decisive experiment was not a build — it was whether a *downloaded*
+binary runs where a freshly compiled one cannot. `np.exe` from the v0.2.0 release asset (cross-built on Linux, unsigned, sha256
+`d36f3e3b…44c270`, downloaded over HTTPS and `Unblock-File`d) printed its version on the same machine that refused to run cargo's build
+scripts. So the policy governs **compiler-spawned children**, not every unknown executable, and a prebuilt binary is a real door rather
+than a consolation prize: no certificate purchase, no exclusion, no reinstall, nothing changed in Windows.
+
+What that settles for distribution, while CI minutes are gone:
+
+* the cross-built `-gnu` asset (`docs/ops-cross-build-windows-gnu.md`) is a supported way to put `np` on a locked-down Windows box —
+  with its honest limits stated beside it: no inference feature, unsigned, and carrying no gate result;
+* Stage 5 (`cargo test --workspace`) stays impossible on that machine, so any claim about the suite "on Windows" still needs CI or another
+  host. A binary answers questions about runtime behaviour; it does not grade a tree;
+* **which product owns the policy is still unnamed** — Defender's ASR rule `d4f940ab…`, third-party AV app control and WDAC all remain
+  candidates, and the ladder above is what names it. That is worth ten minutes on a quiet afternoon because it decides whether *building*
+  becomes possible there too, and until someone runs it this card stays open.
