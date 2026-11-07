@@ -1593,7 +1593,16 @@ Two real runs are quoted in `README.md` rather than paraphrased: a keyword-only 
 
 ## F37 — on Windows the index lands loose in `%LOCALAPPDATA%`, not in a `note-processor` folder
 
-**Opened 2026-11-07 by the first interactive Windows run. Needs a human decision, not a code change first.**
+**Opened 2026-11-07 by the first interactive Windows run. Ruled on 2026-11-08: option A — nest under `%LOCALAPPDATA%\note-processor` with a
+one-release read-fallback. Implementation is owed; the ruling is not.**
+
+Implementation must ship as one change, because half of it is worse than none: (1) `default_data_dir()` appends `note-processor` on Windows;
+(2) on open, if the new location holds no registry and the old one does, **read from the old one** and print where it went, so a vault never
+reports `added N` because its index moved — that false report is the worst possible first experience and is the entire reason for the fallback;
+(3) README's path table and every `%LOCALAPPDATA%` mention follow; (4) the Windows-only arms are exercised through an injectable seam so Linux CI
+runs both locations, since CI cannot create a real `%LOCALAPPDATA%` and this host cannot compile the Windows arm (`ring`, `libsqlite3-sys` need MSVC
+`lib.exe`). Verification lands on the operator's Windows box — `run-stage5-7.ps1` already captures the current layout into its log, which is the
+before-picture this migration will be checked against.
 
 ### The fact
 
