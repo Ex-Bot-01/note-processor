@@ -5792,3 +5792,201 @@ fn a_null_receipt_is_no_record_and_still_lets_the_scan_finish() {
     // fails the whole scan — the exact defect `a_null_meta_value_is_read_as_no_label_rather_than_failing_the_scan`
     // retired for the other reader, re-imported through a new door.
 }
+
+/// **F23's residue, measured — and it is smaller than the card says.** A row keyed from display text with **no recorded
+/// identity** (`file_id = NULL`), whose real path is byte-distinct and whose content changed while that path could not be
+/// read: once the obstruction clears, the note **comes back**. It indexes at its own bytes with the edited content, appears
+/// once in the catalog beside its twin, and a third scan has nothing left to do. What stays behind is one `stale` row under
+/// the display spelling — pre-edit content, never live, invisible in the catalog — which is F23's kept safety rather than a
+/// new harm: deleting an ambiguous row is how a note used to get lost.
+///
+/// So the card's phrase "the duplicate pair returns" needs correcting in both directions. It is not a *pair of live rows*:
+/// `duplicates` counts live registry rows per display path, and this leaves one live and one stale. And it is not content
+/// loss: healing needed no identity here, because the row had walked away from its own `rel_bytes` into its display
+/// spelling, so the returning path found its key unclaimed and indexed as new work. Design-a4 §8's boundary — *"the residue
+/// only stops being permanent where an id was recorded before the obstruction"* — is about not losing a note to a stranger;
+/// this fixture shows the case where nothing was recorded and the note still rejoins its path.
+///
+/// **The measurement that came out wrong first, kept because of what it taught.** An earlier version of this fixture set
+/// `rel_bytes` and `rel` and left `case_bytes` folded from the *real* bytes. The scan then refused the returning file on
+/// `files.case_bytes UNIQUE`: `(0, 0, 0, 1)`, `skipped: ["caf\u{fffd}/note.md"]`, no row at all for a note that was sitting
+/// there readable — content missing from the catalog forever. That state is unreachable from any build this program has
+/// shipped, because the four key columns are written together: [`np_core::path_keys::rel_bytes_of_display`] plus its fold and
+/// display fold are exactly what migration 4 applies, and the fixture now uses those functions instead of an impression of
+/// them. The wrong reading was an artifact of planting, not a finding about scans — so the invariant worth recording is that
+/// `rel_bytes`, `case_bytes`, `rel` and `case_key` move together or a fixture invents a collision no scan can produce.
+///
+/// What this pins, then: the note rejoins its real path with post-obstruction content; exactly one stale row remains under
+/// the display key and survives another scan without cycling; the catalog shows the edited note and its twin once each; and
+/// nothing is refused or pending afterwards. Deleting an ambiguous row instead of marking it stale, or letting a stale row be
+/// re-used as live, moves those numbers off their asserted values.
+#[cfg(unix)]
+#[test]
+fn a_migration_keyed_row_with_no_identity_rejoins_its_path_and_leaves_a_stale_row() {
+    assert_twin_dirs();
+    // `caf\u{fffd}/note.md` — both twins' display spelling, as stored bytes.
+    const DISPLAY_KEY: &str = "636166EFBFBD2F6E6F74652E6D64";
+
+    let ws = scratch(&[("top.md", "# Top Heading\n")], 600);
+    if !plant_note_dir(&ws.root, TWIN_DIR_NINE, "# Original Heading\n") {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_NINE:?}"
+        );
+        return;
+    }
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+    // The ambiguity twin appears only now, so no scan ever saw the two of them as a pairable shape.
+    if !plant_note_dir(&ws.root, TWIN_DIR_EIGHT, "# Quite Another Heading\n") {
+        eprintln!(
+            "NOT COVERAGE: this filesystem refused to create a directory named {TWIN_DIR_EIGHT:?}"
+        );
+        return;
+    }
+
+    // Rewrite the indexed row into what a pre-migration build wrote, using **migration 4's own rule** rather than an
+    // impression of one: `rel_bytes_of_display` for the key, and its fold and display fold beside it. All four columns
+    // have to move together. A first attempt here re-keyed `rel_bytes` and `rel` and left `case_bytes` folded from the real
+    // bytes, and the scan then refused the returning file on `files.case_bytes UNIQUE` — a collision this fixture invented,
+    // which measured an artifact of the planting instead of the residue. The distinction is the whole difference between a
+    // stale row nobody can rejoin and a stale row that also blocks its own path.
+    {
+        let display = "caf\u{fffd}/note.md".to_string();
+        let rel_bytes = np_core::path_keys::rel_bytes_of_display(&display);
+        // The hex constant every query below uses is this string's own bytes, checked rather than trusted.
+        assert_eq!(
+            rel_bytes, b"caf\xef\xbf\xbd/note.md",
+            "DISPLAY_KEY and `display` drifted"
+        );
+        let case_bytes = np_core::path_keys::case_fold(&rel_bytes);
+        let case_key = np_core::path_keys::display_fold(&display);
+        let db = ws.db();
+        let rewritten = db.0
+            .execute(
+                &format!(
+                    "UPDATE files SET rel_bytes = ?1, case_bytes = ?2, rel = ?3, case_key = ?4, file_id = NULL \
+                     WHERE rel_bytes = X'{TWIN_NINE_KEY}'"
+                ),
+                rusqlite::params![rel_bytes, case_bytes, display, case_key],
+            )
+            .expect("test setup: re-key the row");
+        assert_eq!(rewritten, 1, "the row to rewrite has to exist");
+        db.0.execute(
+            &format!(
+                "UPDATE notes SET rel_bytes = ?1, rel = ?2 WHERE rel_bytes = X'{TWIN_NINE_KEY}'"
+            ),
+            rusqlite::params![rel_bytes, display],
+        )
+        .expect("test setup: re-key the derived rows");
+        drop(db);
+    }
+
+    // The body changes and no scan runs before the path is hidden. At scan time the stored hash is stale and the path
+    // unreadable, which is the state F23 describes as "changed while blocked" — no scan in between means the index could
+    // not have seen the edit either way.
+    fs::write(
+        byte_name(&ws.root, TWIN_DIR_NINE).join("note.md"),
+        "# Edited While Hidden\n",
+    )
+    .expect("test setup: edit the note");
+    let blocked = deny_access(&byte_name(&ws.root, TWIN_DIR_NINE));
+    if !denied(&byte_name(&ws.root, TWIN_DIR_NINE)) {
+        eprintln!(
+            "NOT COVERAGE: 0o000 did not deny access to the note's own directory on this runner"
+        );
+        return;
+    }
+
+    let hidden = scan(&ws.root, &ws.cfg).expect("the scan while the path is hidden");
+    assert_eq!(
+        scalar_text(
+            &ws.db(),
+            &format!(
+                "SELECT text FROM headings WHERE note_id = \
+                 (SELECT id FROM notes WHERE rel_bytes = X'{DISPLAY_KEY}') LIMIT 1"
+            )
+        ),
+        "Original Heading",
+        "while the path is hidden the row keeps what it had: {hidden:?}"
+    );
+
+    drop(blocked);
+    assert!(
+        !denied(&byte_name(&ws.root, TWIN_DIR_NINE)),
+        "test setup: the obstruction has to be gone"
+    );
+    let after = scan(&ws.root, &ws.cfg).expect("the scan after the obstruction clears");
+
+    // **The note comes back.** Its real path is listed and readable and its key is unclaimed, so it indexes as new work
+    // with the edited content. No identity was needed for that: `upsert_file` resolves by `rel_bytes`, and this row had
+    // walked away from that key into its display spelling.
+    assert_eq!(
+        (after.added, after.modified, after.moved, after.removed),
+        (1, 0, 0, 1),
+        "one note indexed at its own path, one stale row discharged: {after:?}"
+    );
+    assert_eq!(
+        scalar(
+            &ws.db(),
+            &format!(
+                "SELECT COUNT(*) FROM files WHERE rel_bytes = X'{TWIN_NINE_KEY}' AND state = 'ok'"
+            ),
+        ),
+        1,
+        "the note that exists on disk has exactly one live row"
+    );
+    assert_eq!(
+        scalar_text(
+            &ws.db(),
+            &format!(
+                "SELECT text FROM headings WHERE note_id = \
+                 (SELECT id FROM notes WHERE rel_bytes = X'{TWIN_NINE_KEY}') LIMIT 1"
+            )
+        ),
+        "Edited While Hidden",
+        "and it carries the content written while the path was unreadable, not what the old row remembered"
+    );
+
+    // What remains is one **stale** row under the display spelling, holding pre-edit content. That is F23's kept safety: an
+    // ambiguous row is not deleted, because deleting it is how a note was lost. It is also why this card cannot be read as
+    // "the duplicate pair returns" — the pair is one live row and one stale one, and `duplicates` counts live rows only.
+    assert_eq!(
+        (
+            scalar(&ws.db(), &format!("SELECT COUNT(*) FROM files WHERE rel_bytes = X'{DISPLAY_KEY}'")),
+            scalar_text(&ws.db(), &format!(
+                "SELECT COALESCE(group_concat(state, '|'), '-') FROM files WHERE rel_bytes = X'{DISPLAY_KEY}'"
+            )),
+        ),
+        (1, "stale".to_string()),
+        "the display key keeps exactly one row, and it is stale — never live, so the catalog cannot show it twice"
+    );
+    let catalog =
+        fs::read_to_string(ws.root.join("INDEX.md")).expect("test setup: read the catalog");
+    assert_eq!(
+        catalog.lines().filter(|line| line.contains("caf")).count(),
+        2,
+        "the edited note and its twin appear once each; the stale row appears nowhere:\n{catalog}"
+    );
+
+    // A third scan converges: nothing pending, and the stale row stays as a permanent marker rather than cycling.
+    let third = scan(&ws.root, &ws.cfg).expect("the third scan");
+    assert_eq!(
+        (third.added, third.modified, third.moved, third.removed),
+        (0, 0, 0, 0),
+        "the state is a fixed point of *settled* work, not of stuck work: {third:?}"
+    );
+    assert!(
+        third.skipped.is_empty(),
+        "nothing is refused once the path is readable again: {third:?}"
+    );
+    assert_eq!(
+        scalar_text(&ws.db(), &format!(
+            "SELECT COALESCE(group_concat(state, '|'), '-') FROM files WHERE rel_bytes = X'{DISPLAY_KEY}'"
+        )),
+        "stale",
+        "and it does not clear on a later scan either — that is the residue, in full"
+    );
+
+    // Mutation this catches: deleting an ambiguous row instead of marking it stale (F23's original harm) empties the
+    // display key and fails the row-count tuple; letting a stale row be re-used as a live one moves the edited content onto
+    // the display key and leaves nothing at the real path.
+}

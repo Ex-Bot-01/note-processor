@@ -662,6 +662,28 @@ pre-A4 state asserted), and named as such by the healed test's own doc (`:3647-3
 “the residue only stops being permanent where an id was recorded before the obstruction”. A4's two debts ride along and are already on the
 record (roadmap §A4): no A/B/A benchmark, no whole-branch review. Windows identity remains F18's blocker.
 
+**Measured 2026-11-07 — the residue is smaller than this card says, and one sentence here is wrong.** `docs/design-f23-residue-measured.md` builds the
+Do-when's fixture faithfully (migration 4's own `rel_bytes_of_display` + `case_fold` + `display_fold`, so the legacy key is what an old build wrote rather
+than a shape that merely resembles one) and measures it. **The note comes back:** once the obstruction clears, the edited content indexes at its real bytes
+(`added 1, removed 1`, `skipped []`), the catalog lists it once beside its twin, a third scan has nothing pending, and `PARSE_VERSION` is recorded — so
+"PARSE_VERSION stays withheld" describes the configuration where the row is *unresolvable*, not this one. What remains permanently is **one `stale` row under
+the display spelling**, holding pre-edit content that exists nowhere else: F23's refused deletion, still standing, invisible in the catalog and excluded from
+`duplicates` by the `state = 'ok'` filter. The Do-when ("exactly one live `files` row and one `notes` row for that path once the obstruction is gone") is
+therefore **met**, and "the duplicate pair returns" needs correcting: it is one live row and one stale one, not two live rows. Pinned by
+`a_migration_keyed_row_with_no_identity_rejoins_its_path_and_leaves_a_stale_row` (`tests/scan.rs`, 78 passed / 0 failed, **zero `NOT COVERAGE` lines**, host
+`pi`, euid 1000).
+
+**The measurement that came out wrong first, because the lesson is worth more than the finding.** The first fixture re-keyed `rel_bytes` and `rel` and left
+`case_bytes` folded from the real bytes. The scan then refused the returning file on `files.case_bytes UNIQUE`: `(0, 0, 0, 1)`, one line in `skipped`, no row
+at all for a readable note, absence from the catalog, identical on a third scan — indistinguishable from "the note is unindexable forever", and I would have
+reported exactly that. No shipped build can produce that state: the four key columns are written together. So the invariant to carry into any F23 fixture is
+**`rel_bytes`, `case_bytes`, `rel` and `case_key` move together, or the fixture measures its own planting.**
+
+**Decision owed** (options and costs in §5 of the document): **(A)** accept the stale row and close the residue — recommended, since the harm turned out to be
+a dead row rather than a lost note; **(B)** clear such rows once their path is indexed, which is F23's original deletion question again and unsafe in the
+neighbouring configuration where the stale row is the last record that a note existed; **(C)** report the count. Under (A) this card's only remaining open item
+is Windows file identity, which stays F18's blocker. Nothing was implemented for this round beyond the test and the document: the semantics question is the one
+this card has always said must be chosen on purpose.
 ## F24 — the two merge tests carry the same assertions twice
 
 - **Where:** `crates/np-core/tests/db.rs` —
