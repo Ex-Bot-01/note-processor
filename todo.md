@@ -57,9 +57,19 @@ Four questions went up as human decisions; four answers came back, and one of th
   `MediaRefusal::ProjectorAbsent` (`projector-absent`) emitted by `embed_run`, README's class table gains a row and loses a meaning, and `local_vision`
   carries a second artifact-free case (both questions are answered before anything loads). Mutants: folding either direction into one class kills one of
   the pair; `LazyLocalEmbedder` answering `Build` kills the vision case. Two doc-link defects appeared only on the feature rustdoc rows and are fixed
-  with the reason written where someone would shorten them again. **Remaining for F28:** `np models install --member <main|mmproj>` (dim/prefixes belong
-  to the main member only) so an offline machine can place the projector this class tells it to install; the five archive shapes measured with `strip`
-  against §14's ~40 MB sentence, rewritten from the table even if the vision row exceeds it; then `linked_notes`, the placement half.
+  with the reason written where someone would shorten them again.
+* **F28 step ③ shipped (`install --member`, same day).** `--member <main|mmproj>` writes `model_files` and nothing else — pinned by a whole-row
+  comparison of `models`, since a projector digest copied into `models.sha256` leaves every file readable and silently redirects every later
+  verification. Refusals before any read: an invented member (offering the installable set from `models::INSTALLABLE_MEMBERS`, one list for parser and
+  writer), `--dim` beside a widthless member (refused, not ignored), and a projector with no model — which answers about the missing model *before*
+  hashing, deliberately out of order with `install`, whose row comparison genuinely needs that hash. Shipped-binary proof on a build with **no `fetch`
+  feature**: eleven cases, nothing dialled, `unclaimed 0`, and `models.sha256` still the main artifact's digest. Five np-core + five np-cli cases; five
+  mutants killed; one **equivalent** mutant (skip the member write when the digest matches) deleted instead of defended, because
+  `db::record_model_file`'s CASE already clears a stamp only on a changed digest. Recorded as exposed-not-caused: `np models list` never mentions
+  members, true of fetched projectors since migration 9 — README's Option B now says what to check instead.
+* **Remaining for F28:** the five archive shapes measured with `strip`
+  against §14's ~40 MB sentence, rewritten from the table even if the vision row exceeds it; then `linked_notes`, the placement half; and (exposed by
+  step ③, not caused by it) member names in `np models list`, which needs a change to that command's pinned key set.
 * **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
   binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
   attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.

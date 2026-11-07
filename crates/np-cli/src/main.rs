@@ -110,9 +110,17 @@ enum ModelsCommand {
         /// The artifact file to install. It is read and copied, never moved or truncated.
         #[arg(long)]
         path: PathBuf,
-        /// Declared vector width, 1 to 65535 — declared here, never probed.
-        #[arg(long, value_parser = parse_dim)]
-        dim: NonZeroU16,
+        /// Declared vector width, 1 to 65535 — declared here, never probed. Required unless `--member` names a member;
+        /// refused outright when it does, because only the main artifact has a width.
+        #[arg(long, value_parser = parse_dim, required_unless_present = "member")]
+        dim: Option<NonZeroU16>,
+        /// Which artifact of the model this file is: `main` (the text encoder, the default) or `mmproj` (its projector).
+        ///
+        /// A member install writes no width and no prefixes — those describe the text encoder — and it requires the model
+        /// to be installed already. It exists because a machine that cannot reach Hugging Face still has to be able to
+        /// place the 554 MB projector that `np embed` then tells it it is missing (F28).
+        #[arg(long)]
+        member: Option<String>,
         /// The digest this artifact must hash to: 64 hex characters, from `np models hash <file>`.
         #[arg(long)]
         sha256: String,
@@ -190,17 +198,38 @@ fn main() -> ExitCode {
                 sha256,
                 prefix_doc,
                 prefix_query,
+                member,
                 json,
             } => {
-                let request = Install {
-                    id,
-                    source: path,
-                    dim,
-                    sha256,
-                    prefix_doc,
-                    prefix_query,
-                };
-                models_install(&workspace, &request, json)
+                // No `--member` is the ordinary install, and it keeps its exact contract: clap has already required the
+                // width, so the `None`/`None` arm below is a guard against a future flag change rather than a state a
+                // human can reach — and it answers with a message instead of a panic. Written as a `match` because this
+                // arm's value is the program's result; `main` has no `Err` to return into.
+                match member {
+                    None => install_main(&InstallArgs {
+                        workspace,
+                        id,
+                        source: path,
+                        dim,
+                        sha256,
+                        prefix_doc,
+                        prefix_query,
+                        json,
+                    }),
+                    Some(member) => models_install_member(
+                        &InstallArgs {
+                            workspace,
+                            id,
+                            source: path,
+                            dim,
+                            sha256,
+                            prefix_doc,
+                            prefix_query,
+                            json,
+                        },
+                        &member,
+                    ),
+                }
             }
             #[cfg(feature = "fetch")]
             ModelsCommand::Fetch {
@@ -992,6 +1021,92 @@ fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(),
         // because a JSON reader of a redirected run has no argv to look at, and the same two keys are present
         // for all three outcomes — one shape per command, as §3 requires.
         emit_json(&json!({ "id": request.id, "state": outcome.state_label() }));
+    } else {
+        emit(outcome.state_label());
+    }
+    Ok(())
+}
+
+/// `np models install --member …` — one member of an already-installed model, installed from a file with no network.
+///
+/// Three refusals come before anything is opened, because each is a fact about argv that a 554 MB read would not teach:
+/// an invented member name, `--dim` on a member that has no width, and the main member's own missing width. The last one
+/// is reachable only if clap's `required_unless_present` stops working; it is a refusal rather than an `expect` so that a
+/// future flag change turns into a message instead of a panic.
+///
+/// The prefixes travel to the main path and are refused for `mmproj` by omission: they are fields of `models`, and a
+/// projector install writes no row there.
+/// What `np models install` was given, before anyone decided which member those flags describe. One carrier because the
+/// two paths read overlapping halves of it, and passing nine positional arguments turned a lint into a design question:
+/// the width is `None` exactly when the human named a member that has no width, so the pair belongs together.
+struct InstallArgs {
+    workspace: PathBuf,
+    id: String,
+    source: PathBuf,
+    /// `None` for a member install — which is why it is not a `NonZeroU16` here even though [`Install`] insists on one.
+    dim: Option<NonZeroU16>,
+    sha256: String,
+    prefix_doc: String,
+    prefix_query: String,
+    json: bool,
+}
+
+/// The default shape: `--member` absent, or spelled `main`. clap requires the width on this path; the guard below answers
+/// only if that requirement is ever loosened, and answers with a message rather than a panic.
+fn install_main(args: &InstallArgs) -> Result<(), Box<dyn Error>> {
+    let Some(dim) = args.dim else {
+        return Err(
+            "`--dim` is required when installing a model: it declares the vector width".into(),
+        );
+    };
+    models_install(
+        &args.workspace,
+        &Install {
+            id: args.id.clone(),
+            source: args.source.clone(),
+            dim,
+            sha256: args.sha256.clone(),
+            prefix_doc: args.prefix_doc.clone(),
+            prefix_query: args.prefix_query.clone(),
+        },
+        args.json,
+    )
+}
+
+fn models_install_member(args: &InstallArgs, member: &str) -> Result<(), Box<dyn Error>> {
+    if !models::INSTALLABLE_MEMBERS.contains(&member) {
+        return Err(format!(
+            "unknown member `{member}`: this command installs {} and records nothing else",
+            models::INSTALLABLE_MEMBERS.join(" or ")
+        )
+        .into());
+    }
+    if member == models::MAIN_FILE {
+        return install_main(args);
+    }
+    if args.dim.is_some() {
+        return Err(format!(
+            "`--dim` describes the width of a model's text encoder; the `{member}` member carries no width — drop the flag"
+        )
+        .into());
+    }
+    let config = load_config()?;
+    let db = workspace_db(&config, &args.workspace)?;
+    let outcome = models::install_projector(
+        &db,
+        &config,
+        &args.workspace,
+        &models::ProjectorInstall {
+            id: args.id.clone(),
+            source: args.source.clone(),
+            sha256: args.sha256.clone(),
+        },
+    )?;
+    if args.json {
+        // Three keys where the model install has two, and deliberately so: `state` alone cannot say *which* artifact this
+        // run placed, and a JSON reader of a redirected run has no argv to look back at. The main member's pinned
+        // `{id, state}` shape is untouched — adding a key to that one would be the breaking change.
+        emit_json(&json!({ "id": args.id, "member": member, "state": outcome.state_label() }));
     } else {
         emit(outcome.state_label());
     }

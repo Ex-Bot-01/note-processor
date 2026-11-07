@@ -1762,3 +1762,260 @@ fn a_marker_mid_rewrite_is_recognised_and_never_called_unclaimed() {
         listing.unclaimed
     );
 }
+
+// --- F28 step 3: installing the projector offline --------------------------------
+//
+// `projector-absent` (F28 step 1) tells an operator to install or fetch the `mmproj` member, and until this step only
+// `fetch` could place it — so a machine that cannot dial Hugging Face was sent to a command it could not run. These
+// fixtures are offline by construction: no transport exists in np-core, so "no network" is a fact about the crate rather
+// than a mock.
+
+/// The declaration of a projector install: id, file, digest. **No width and no prefixes**, which is the whole difference
+/// from [`Install`] — a projector carries neither, and recording one would invent a fact about a file that does not hold it.
+fn projector_request(id: &str, source: &Path, sha256: &str) -> models::ProjectorInstall {
+    models::ProjectorInstall {
+        id: id.to_string(),
+        source: source.to_path_buf(),
+        sha256: sha256.to_string(),
+    }
+}
+
+fn install_projector(
+    fx: &Fixture,
+    db: &Db,
+    req: &models::ProjectorInstall,
+) -> Result<InstallOutcome, ModelError> {
+    models::install_projector(db, &fx.config, &fx.workspace, req)
+}
+
+/// The path the projector of one id belongs at. Spelled through `member_artifact_name` rather than by hand, so a change to
+/// the naming rule cannot leave this file asserting a location production no longer writes.
+fn projector_path(fx: &Fixture, id: &str) -> PathBuf {
+    fx.models_dir().join(models::member_artifact_name(
+        id,
+        np_core::pins::MMPROJ_MEMBER,
+    ))
+}
+
+/// A model row installed the ordinary way, so a projector install has something to belong to.
+fn install_main(fx: &Fixture, db: &Db, id: &str, bytes: &[u8]) -> String {
+    let digest = sha256_bytes(bytes);
+    let source = fx.source("main.gguf", bytes);
+    install(fx, db, &request(id, &source, &digest, 768)).expect("test setup: main installs");
+    digest
+}
+
+/// **A projector with no model is refused, and writes nothing.** The member row's whole purpose is to describe a file that
+/// belongs to an installed identity; recording one for an id with no `models` row would teach `list` about an artifact no
+/// row claims and let `projector-absent` quietly become "recorded, unusable".
+#[test]
+fn a_projector_refuses_to_be_the_first_thing_installed() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    let bytes = b"mmproj-shaped bytes";
+    let digest = sha256_bytes(bytes);
+    let source = fx.source("mmproj.gguf", bytes);
+
+    let err = match install_projector(&fx, &db, &projector_request("alpha", &source, &digest)) {
+        Err(err) => err,
+        Ok(outcome) => panic!("a projector with no model row must not install, got {outcome:?}"),
+    };
+    assert!(
+        matches!(err, ModelError::MemberWithoutModel { .. }),
+        "the refusal is about the missing model, got {err:?}"
+    );
+    let text = err.to_string();
+    assert!(text.contains("alpha"), "the id is named: {text}");
+    assert!(
+        text.contains(np_core::pins::MMPROJ_MEMBER),
+        "and so is the member it belongs to: {text}"
+    );
+    assert!(
+        !projector_path(&fx, "alpha").exists(),
+        "a refusal writes no artifact"
+    );
+
+    // The order, pinned cheaply: with **no source file at all** the answer is still about the missing model. Swapping
+    // the row check below the source read would report a file error here — and on a real machine that swap means hashing
+    // 554 MB before discovering the model was never installed.
+    let nowhere = fx._tmp.path().join("no-such-projector.gguf");
+    match install_projector(&fx, &db, &projector_request("alpha", &nowhere, &digest)) {
+        Err(ModelError::MemberWithoutModel { .. }) => {}
+        other => panic!("the row check precedes any file access, got {other:?}"),
+    }
+
+    // Mutation this catches: recording the member before checking for the row, which leaves a `model_files` entry and a
+    // 554 MB file describing an identity nothing installed.
+}
+
+/// **The happy path, and the claim that matters most here: the model row does not move.** A projector install must not
+/// touch `dim`, either prefix, `sha256` or `installed_at` — the row says what the *text* encoder is, and a second file
+/// joining the set is a fact about `model_files`, which is where migration 9 put it for exactly this reason.
+#[test]
+fn installing_a_projector_records_the_member_and_leaves_the_model_row_alone() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    let main_bytes = b"the text encoder's bytes";
+    let main_digest = install_main(&fx, &db, "alpha", main_bytes);
+    let before = db::model_row(&db, "alpha")
+        .expect("read the row")
+        .expect("installed");
+    assert_eq!(before.sha256.as_deref(), Some(main_digest.as_str()));
+
+    let mmproj = b"mmproj-shaped bytes, longer than a stub";
+    let digest = sha256_bytes(mmproj);
+    let source = fx.source("mmproj.gguf", mmproj);
+    assert_eq!(
+        install_projector(&fx, &db, &projector_request("alpha", &source, &digest))
+            .expect("installs"),
+        InstallOutcome::Installed
+    );
+
+    let path = projector_path(&fx, "alpha");
+    assert_eq!(fs::read(&path).expect("the projector is on disk"), mmproj);
+    let members: Vec<(String, String, i64)> = db::model_files(&db, "alpha")
+        .expect("read the members")
+        .into_iter()
+        .map(|f| (f.name, f.sha256, f.size))
+        .collect();
+    // `model_files` is read `ORDER BY name`, and "main" sorts before "mmproj" — so this expected list is the order the
+    // accessor answers in, not one chosen here. Both digests are asserted separately on purpose: one row carrying the
+    // other member's digest is the failure this step could introduce and still leave every file readable.
+    assert_eq!(
+        members,
+        vec![
+            (
+                "main".to_string(),
+                main_digest,
+                i64::try_from(main_bytes.len()).expect("fixture fits i64")
+            ),
+            (
+                np_core::pins::MMPROJ_MEMBER.to_string(),
+                digest,
+                i64::try_from(mmproj.len()).expect("fixture fits i64")
+            ),
+        ],
+        "both members recorded, each with its own digest"
+    );
+    assert_eq!(
+        db::model_row(&db, "alpha")
+            .expect("read again")
+            .expect("still there"),
+        before,
+        "the projector changed no column of the model row"
+    );
+
+    // Mutation this catches: writing the member's digest into `models.sha256`, which would make every later text-encoder
+    // verification compare the wrong bytes — and it fails here on the whole-row comparison, not on one field.
+}
+
+/// **Repeating the declaration rewrites nothing** — §7 case 5's contract, extended to members. Including no stamp: like
+/// the main artifact, verification belongs at use time, so a repeat install must not leave a `model_files` stamp that
+/// saves one hash on the next embed in exchange for breaking "nothing was written".
+#[test]
+fn repeating_a_projector_install_writes_nothing_and_stamps_nothing() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    install_main(&fx, &db, "alpha", b"the text encoder's bytes");
+    let mmproj = b"mmproj-shaped bytes";
+    let digest = sha256_bytes(mmproj);
+    let source = fx.source("mmproj.gguf", mmproj);
+    install_projector(&fx, &db, &projector_request("alpha", &source, &digest))
+        .expect("first install");
+
+    assert_eq!(
+        install_projector(&fx, &db, &projector_request("alpha", &source, &digest))
+            .expect("second call"),
+        InstallOutcome::AlreadyInstalled,
+        "the same declaration twice is not a rewrite"
+    );
+    assert_eq!(
+        db::member_stamp(&db, "alpha", np_core::pins::MMPROJ_MEMBER).expect("read the stamp"),
+        None,
+        "an install that verified nothing must not leave a stamp behind"
+    );
+
+    // Mutation this catches: stamping on the already-installed arm. It would also pass every other case here, which is
+    // why this assertion exists on its own.
+}
+
+/// **A projector on disk that disagrees with the declaration refuses rather than being overwritten.** The source may
+/// happen to match the declaration; the file in the artifact directory is the evidence that something changed, and
+/// replacing it would destroy the only sign of that — the same rule the main artifact's install arm applies.
+#[test]
+fn a_projector_that_disagrees_with_its_declaration_is_not_overwritten() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    install_main(&fx, &db, "alpha", b"the text encoder's bytes");
+    let mmproj = b"mmproj-shaped bytes";
+    let digest = sha256_bytes(mmproj);
+    let source = fx.source("mmproj.gguf", mmproj);
+    install_projector(&fx, &db, &projector_request("alpha", &source, &digest)).expect("installs");
+    let path = projector_path(&fx, "alpha");
+    fs::write(&path, b"rot since the install").expect("test setup: rot the artifact");
+
+    let err = install_projector(&fx, &db, &projector_request("alpha", &source, &digest))
+        .expect_err("a disagreeing artifact must refuse");
+    assert!(
+        matches!(err, ModelError::ArtifactDisagrees { .. }),
+        "the refusal is the disagreement one, got {err:?}"
+    );
+    assert_eq!(
+        fs::read(&path).expect("re-read"),
+        b"rot since the install",
+        "the refusal left the evidence in place rather than re-copying a source that agrees with the row"
+    );
+}
+
+/// **A deleted projector re-materialises without rewriting the member row.** The row already attests the digest; what is
+/// missing is the file, and this is `Restored` for a member exactly as it is for the main artifact — no column rewritten,
+/// including the stamp, which stays absent until a use-time verification writes it.
+#[test]
+fn a_deleted_projector_is_restored_from_a_source_the_row_already_attests() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    install_main(&fx, &db, "alpha", b"the text encoder's bytes");
+    let mmproj = b"mmproj-shaped bytes";
+    let digest = sha256_bytes(mmproj);
+    let source = fx.source("mmproj.gguf", mmproj);
+    install_projector(&fx, &db, &projector_request("alpha", &source, &digest)).expect("installs");
+    let path = projector_path(&fx, "alpha");
+    // A stamp from the file that was there: half a pair would read as no stamp at all (`db::member_stamp`'s rule), so
+    // both halves are written. Whether a restore *keeps* it is the assertion below, not a precondition of this one.
+    let meta = fs::metadata(&path).expect("test setup: the artifact exists");
+    db::record_member_stamp(
+        &db,
+        "alpha",
+        np_core::pins::MMPROJ_MEMBER,
+        i64::try_from(meta.len()).expect("fixture fits i64"),
+        1_730_000_001,
+    )
+    .expect("test setup: stamp the member");
+    let stamped =
+        db::member_stamp(&db, "alpha", np_core::pins::MMPROJ_MEMBER).expect("read the stamp");
+    assert!(stamped.is_some(), "test setup: the pair is both halves");
+    fs::remove_file(&path).expect("test setup: delete the artifact");
+
+    assert_eq!(
+        install_projector(&fx, &db, &projector_request("alpha", &source, &digest))
+            .expect("restores"),
+        InstallOutcome::Restored
+    );
+    assert_eq!(
+        db::member_stamp(&db, "alpha", np_core::pins::MMPROJ_MEMBER).expect("read again"),
+        stamped,
+        "re-materialising a file whose digest the table already carries must not invalidate that verification — \
+        `db::record_model_file`'s CASE rule clears both stamp halves only when the digest changes, and this is the only \
+        case here that exercises it for a member"
+    );
+    assert_eq!(fs::read(&path).expect("back on disk"), mmproj);
+    assert_eq!(
+        db::model_files(&db, "alpha")
+            .expect("members")
+            .into_iter()
+            .filter(|f| f.name == np_core::pins::MMPROJ_MEMBER)
+            .count(),
+        1,
+        "one member row, not a second one for the same name"
+    );
+}

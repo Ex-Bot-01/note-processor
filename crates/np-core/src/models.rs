@@ -140,6 +140,25 @@ pub struct Install {
     pub prefix_query: String,
 }
 
+/// The members `np models install --member` accepts. One list rather than two, because the CLI's argument parser and
+/// this crate's write path have to agree exactly: a name the parser allows and the writer refuses is a confusing
+/// refusal, and one the parser refuses and the writer accepts is an artifact recorded under a member nothing reads.
+pub const INSTALLABLE_MEMBERS: &[&str] = &[MAIN_FILE, crate::pins::MMPROJ_MEMBER];
+
+/// Everything a projector install was asked for: which model it belongs to, the file, and the digest that file must
+/// hash to. **No width and no prefixes** — a projector has neither, and recording them would invent facts about bytes
+/// that do not hold them. The row that carries those facts is `models`, and this call does not write it.
+#[derive(Debug, Clone)]
+pub struct ProjectorInstall {
+    /// The model this projector belongs to: `models.id`, which must already exist ([`ModelError::MemberWithoutModel`]).
+    pub id: String,
+    /// The artifact the human already has — read and copied, never moved or deleted, as with [`Install::source`].
+    pub source: PathBuf,
+    /// The digest this file must hash to, as spelled by the human; validated and lowered once, the same rule as
+    /// [`Install::sha256`].
+    pub sha256: String,
+}
+
 /// What one `install` call ended as. An enum because these are three different facts about the workspace,
 /// and a caller must be able to match on them rather than parse a sentence (§3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -906,6 +925,20 @@ pub enum ModelError {
         /// The identity that has an artifact and no row.
         id: String,
     },
+    /// A projector was asked for where no model row exists — the member has nothing to belong to.
+    ///
+    /// The order this refuses on is deliberate: a `model_files` row is a statement about an installed identity, and
+    /// writing one for an id with no `models` row would leave `list` reporting an artifact no row claims while
+    /// `local_model::projector_artifact` (under `local-model,vision`) still refused to load it — the worst of both, a 554 MB file that
+    /// changes no answer. Nothing is written before this check, including the source hash: reading half a gigabyte to
+    /// learn that the model was never installed is the same waste §3 step 4's reordering exists to avoid.
+    #[error("model `{id}` is not installed in this workspace, so its `{member}` member has nothing to belong to; install the model first")]
+    MemberWithoutModel {
+        /// The identity with no row.
+        id: String,
+        /// The member that was asked for, named because the flag that reached this refusal names it too.
+        member: String,
+    },
     /// The workspace database refused one of [`crate::db`]'s model reads or the insert.
     ///
     /// A passthrough in the same spirit as [`DbError::Sqlite`]: SQLite's own text already names the file and
@@ -1077,6 +1110,121 @@ pub fn install(
             id: request.id.clone(),
         }),
     }
+}
+
+/// Install the projector member of an already-installed model from a file the human already has — offline, with no
+/// transport anywhere near it.
+///
+/// **Why this exists (F28).** Step 1 gave "this workspace has no projector" its own refusal class, and step 2 made a
+/// vision build load one; both tell an operator to install or fetch the `mmproj` member. Until now only `fetch` could
+/// place it, so the advice was impossible on a machine that cannot reach Hugging Face — which is most of the machines
+/// this artifact's 554 MB size makes offline. The digest is still mandatory: an unverified projector would encode every
+/// figure in the vault with bytes nobody vouched for, and those vectors would then be compared against pinned-model
+/// text vectors forever.
+///
+/// What it does **not** touch is the `models` row. `dim`, both prefixes, `sha256` and `installed_at` describe the text
+/// encoder; which files an identity has is what migration 9's child table exists to say, and that is where this writes.
+///
+/// The order mirrors [`install`] with one deliberate difference: the row check comes **before** the source hash. For the
+/// main artifact the row comparison needs the digest, so hashing first is forced; here the cheap question ("does this
+/// identity exist?") is answerable in microseconds, and paying a 554 MB read to discover the answer was "no" is exactly
+/// the waste §3 step 4's reordering refuses. So: workspace, id, digest format, row exists, source is a non-empty file,
+/// source hashes to the declaration, then — and only then — the artifact directory.
+pub fn install_projector(
+    db: &Db,
+    config: &Config,
+    workspace: &Path,
+    request: &ProjectorInstall,
+) -> Result<InstallOutcome, ModelError> {
+    require_workspace_dir(workspace)?;
+    validate_id(&request.id)?;
+    let declared = normalize_digest(&request.sha256)?;
+
+    if db::model_row(db, &request.id)?.is_none() {
+        return Err(ModelError::MemberWithoutModel {
+            id: request.id.clone(),
+            member: crate::pins::MMPROJ_MEMBER.to_string(),
+        });
+    }
+
+    let open_source = walk::to_open_path(&access(&request.source));
+    let meta = fs::metadata(&open_source).map_err(|source| ModelError::Source {
+        path: request.source.clone(),
+        source,
+    })?;
+    // The same kind-test as `install`, for the same reason: a directory's `len()` is 0 on Windows and not on Linux, so
+    // a length-only check would answer two different questions on two platforms.
+    if !meta.is_file() {
+        return Err(ModelError::Source {
+            path: request.source.clone(),
+            source: io::Error::new(io::ErrorKind::NotADirectory, "not a regular file"),
+        });
+    }
+    if meta.len() == 0 {
+        return Err(ModelError::EmptySource {
+            path: request.source.clone(),
+        });
+    }
+
+    let found = hash::sha256_file(&open_source).map_err(|err| ModelError::Source {
+        path: request.source.clone(),
+        source: hash_io(err),
+    })?;
+    if declared != found {
+        return Err(ModelError::DigestMismatch {
+            path: request.source.clone(),
+            declared,
+            found,
+        });
+    }
+
+    let models_dir = config.workspace_models_dir(workspace);
+    let name = member_artifact_name(&request.id, crate::pins::MMPROJ_MEMBER);
+    let target = models_dir.join(&name);
+
+    if fs::metadata(walk::to_open_path(&access(&target))).is_ok() {
+        // Verify before claiming, as the main artifact's arm does: `declared` describes `--path`, and says nothing about
+        // the bytes that have been sitting at the target since. Refusing rather than re-copying keeps the evidence.
+        let open_target = walk::to_open_path(&access(&target));
+        let on_disk = hash::sha256_file(&open_target).map_err(|err| ModelError::Artifact {
+            path: target.clone(),
+            source: hash_io(err),
+        })?;
+        if on_disk != declared {
+            return Err(ModelError::ArtifactDisagrees {
+                path: target,
+                expected: declared,
+                found: on_disk,
+            });
+        }
+        return Ok(InstallOutcome::AlreadyInstalled);
+    }
+
+    // Whether the member table already named this file decides `Installed` against `Restored`, and nothing else: an
+    // earlier draft also skipped the write when the recorded digest matched, on the theory that a repeat "rewrites
+    // nothing". That branch was **equivalent** — mutation proved it, because no test could tell the two apart. What the
+    // table actually guarantees is in `db::record_model_file`: re-recording an unchanged digest leaves both stamp halves
+    // alone and clears them only when the digest changes, which is what a changed digest means for a verification stamp.
+    // So write unconditionally and let that rule hold the contract, rather than keeping a branch that decides nothing.
+    let recorded = db::model_files(db, &request.id)?
+        .into_iter()
+        .any(|file| file.name == crate::pins::MMPROJ_MEMBER);
+
+    publish_named(&models_dir, &name, &request.source)?;
+    // This is the member table learning which file belongs to which identity — the fact `projector_artifact` reads back
+    // before it will load half a gigabyte. It is not a rewrite of the identity: `models` is untouched by this call.
+    db::record_model_file(
+        db,
+        &request.id,
+        crate::pins::MMPROJ_MEMBER,
+        &declared,
+        i64::try_from(meta.len()).unwrap_or(i64::MAX),
+    )?;
+    Ok(if recorded {
+        InstallOutcome::Restored
+    } else {
+        InstallOutcome::Installed
+    })
 }
 
 /// Report every installed model of `workspace`, any fetch in progress, and what each artifact looks like.
@@ -1353,6 +1501,12 @@ pub fn access(path: &Path) -> PathBuf {
 }
 
 fn publish_artifact(models_dir: &Path, id: &str, source: &Path) -> Result<(), ModelError> {
+    publish_named(models_dir, id, source)
+}
+
+/// [`publish_artifact`] for any file name in the artifact directory, which is what a member's spelling needs: the main
+/// artifact is `<id>` and the projector is `<id>.mmproj`, and the temp-name-and-rename discipline is identical for both.
+fn publish_named(models_dir: &Path, name: &str, source: &Path) -> Result<(), ModelError> {
     fs::create_dir_all(walk::to_open_path(&access(models_dir))).map_err(|source| {
         ModelError::ModelsDir {
             path: models_dir.to_path_buf(),
@@ -1360,8 +1514,8 @@ fn publish_artifact(models_dir: &Path, id: &str, source: &Path) -> Result<(), Mo
         }
     })?;
 
-    let temp = models_dir.join(format!("{id}.{}{TEMP_SUFFIX}", nonce()));
-    let target = models_dir.join(id);
+    let temp = models_dir.join(format!("{name}.{}{TEMP_SUFFIX}", nonce()));
+    let target = models_dir.join(name);
     fs::copy(
         walk::to_open_path(&access(source)),
         walk::to_open_path(&temp),

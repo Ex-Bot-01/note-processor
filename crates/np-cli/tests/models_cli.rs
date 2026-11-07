@@ -1745,3 +1745,165 @@ mod models {
         np_core::models::marker_path(models_dir, id)
     }
 }
+
+// --- F28 step 3: `--member`, so a machine with no network can place the projector ---
+//
+// `projector-absent` and the vision build both tell an operator to install the `mmproj` member. Until this flag existed
+// the only way to place that file was `np models fetch`, which dials out — so on the machines where a 554 MB download is
+// the reason someone installed a file by hand, the advice could not be followed. These cases run with no transport at all:
+// the `fetch` feature is off in the default test build, which makes "offline" a property of the binary under test rather
+// than of a mock.
+
+/// `np models install <workspace> --id … --member <member> --path … --sha256 …`, with **no `--dim`**: a member install
+/// declares no width, which is what separates it from [`Scratch::install`].
+fn member_install(ws: &Scratch, member: &str, source: &Path, sha256: &str) -> Command {
+    let mut cmd = ws.models(&["install", "--id", ID]);
+    cmd.arg("--member")
+        .arg(member)
+        .arg("--path")
+        .arg(source)
+        .arg("--sha256")
+        .arg(sha256);
+    cmd
+}
+
+/// **A projector cannot be the first thing installed.** The member row describes a file belonging to an installed
+/// identity, and this refusal is where an operator learns the order rather than discovering it through a database error.
+#[test]
+fn a_projector_install_without_a_model_names_the_missing_identity() {
+    let ws = Scratch::new();
+    let mmproj = ws.source("mmproj.gguf", b"projector-shaped bytes");
+    let digest = source_digest(&mmproj);
+
+    let refused = run(&mut member_install(&ws, "mmproj", &mmproj, &digest));
+    refused.assert_refused();
+    assert_eq!(refused.stdout(), "", "a refusal prints nothing on stdout");
+    let text = refused.stderr();
+    assert!(text.contains(ID), "the id is named: {text}");
+    assert!(
+        text.contains("nothing to belong to"),
+        "and so is the reason: {text}"
+    );
+    assert!(
+        !ws.models_dir().join(format!("{ID}.mmproj")).exists(),
+        "a refusal leaves no artifact behind"
+    );
+    // Mutation this catches: recording the member before checking for the row, which is a 554 MB file describing an
+    // identity nothing installed.
+}
+
+/// **The install lands, and the model row keeps saying what the text encoder is.** `dim` and `sha256` in the listing are
+/// the whole point of this assertion: a projector digest written into `models.sha256` would make every later verification
+/// compare the wrong bytes, and it would still leave both files readable. The empty `unclaimed` half is the other fact —
+/// `<id>.mmproj` is claimed by the member table, not junk in the artifact directory.
+#[test]
+fn a_projector_install_reports_installed_and_leaves_the_model_row_alone() {
+    let ws = Scratch::new();
+    // The model first, from `install_one`, so the width and digest asserted below are ones this test did not invent.
+    let (_main_source, main_digest) = install_one(&ws);
+    let mmproj = ws.source(
+        "mmproj.gguf",
+        b"projector-shaped bytes, not the model's own",
+    );
+    let digest = source_digest(&mmproj);
+
+    let installed = run(&mut member_install(&ws, "mmproj", &mmproj, &digest));
+    installed.assert_success();
+    assert_eq!(installed.stdout(), "installed\n", "one word, as §3 pins");
+    assert_eq!(
+        fs::read(ws.models_dir().join(format!("{ID}.mmproj")))
+            .expect("the projector is where the member name says"),
+        fs::read(&mmproj).expect("re-read the source"),
+        "copied, not moved: the source stays where the human put it"
+    );
+
+    let report = run(&mut ws.list(true)).json();
+    let row = &report["models"][0];
+    assert_eq!(
+        row["dim"], 384,
+        "the width still describes the text encoder"
+    );
+    assert_eq!(
+        row["sha256"],
+        main_digest.as_str(),
+        "and so does its digest"
+    );
+    assert_eq!(
+        report["unclaimed"].as_array().map(Vec::len),
+        Some(0),
+        "the projector is a member of this model, not an unclaimed leftover: {:?}",
+        report["unclaimed"]
+    );
+
+    // A second identical call repeats the §3 wording rather than rewriting anything.
+    let again = run(&mut member_install(&ws, "mmproj", &mmproj, &digest));
+    again.assert_success();
+    assert_eq!(again.stdout(), "already installed\n");
+
+    // Mutation this catches: routing a member install through the main path, which would demand a width and then compare
+    // the whole tuple against `models.sha256` — visible above as either a refusal or a changed digest.
+}
+
+/// **A projector has no width, so `--dim` alongside it is a mistake worth naming.** Silently ignoring a flag that reads
+/// like a fact about the file would be the quieter failure; this refuses and says which member the flag belongs to.
+#[test]
+fn a_projector_install_refuses_a_dim_because_a_projector_has_no_width() {
+    let ws = Scratch::new();
+    install_one(&ws);
+    let mmproj = ws.source("mmproj.gguf", b"projector-shaped bytes");
+    let digest = source_digest(&mmproj);
+
+    let mut cmd = member_install(&ws, "mmproj", &mmproj, &digest);
+    cmd.arg("--dim").arg("768");
+    let refused = run(&mut cmd);
+    refused.assert_refused();
+    let text = refused.stderr();
+    assert!(text.contains("--dim"), "the flag is named: {text}");
+    assert!(
+        text.contains("mmproj"),
+        "and so is the member that has no width: {text}"
+    );
+    assert_eq!(
+        fs::read_dir(ws.models_dir()).expect("listable").count(),
+        1,
+        "the model's own artifact only"
+    );
+}
+
+/// **A member name nothing installs is refused, and says what is installable.** The set lives in np-core
+/// (`models::INSTALLABLE_MEMBERS`) precisely so this message and the write path cannot drift into disagreeing.
+#[test]
+fn an_unknown_member_is_refused_with_the_names_that_are_installable() {
+    let ws = Scratch::new();
+    install_one(&ws);
+    let mmproj = ws.source("mmproj.gguf", b"projector-shaped bytes");
+    let digest = source_digest(&mmproj);
+
+    let refused = run(&mut member_install(&ws, "audio", &mmproj, &digest));
+    refused.assert_refused();
+    let text = refused.stderr();
+    assert!(
+        text.contains("audio"),
+        "the invented name is quoted: {text}"
+    );
+    for legal in np_core::models::INSTALLABLE_MEMBERS {
+        assert!(text.contains(legal), "`{legal}` should be offered: {text}");
+    }
+    assert_eq!(
+        fs::read_dir(ws.models_dir()).expect("listable").count(),
+        1,
+        "a refused member install writes no file"
+    );
+}
+
+/// **`--member main` is the ordinary install**, not a second code path with different rules: same flags, same word.
+#[test]
+fn naming_the_main_member_installs_the_model_exactly_as_before() {
+    let ws = Scratch::new();
+    let source = ws.source("artifact.bin", b"the bytes one model stands for\n");
+    let digest = source_digest(&source);
+    let mut cmd = member_install(&ws, "main", &source, &digest);
+    cmd.arg("--dim").arg("384");
+    run(&mut cmd).assert_success();
+    assert_eq!(run(&mut ws.list(true)).json()["models"][0]["dim"], 384);
+}
