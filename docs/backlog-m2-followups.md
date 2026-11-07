@@ -1771,3 +1771,23 @@ script expectation, not the binary, produced the red line.
 toolchain, which this machine does not have (**F39**). Also new: `%LOCALAPPDATA%\workspaces` held **40** `*.sqlite` files at 167,936 B after
 two runs, because every fresh vault path mints a workspace that nothing ever forgets. Not F18's subject; recorded here so whoever picks up
 workspace lifecycle does not have to rediscover it, and noted in **F37**'s population estimate: the layout is loose *and* growing.
+
+**Fixed on 2026-11-08 (`e361e03`), with the fifth arm §6's amendment now records.** np-cli resolves a runtime-less build to
+`Resolution::RuntimeNotBuilt`, and `embed_run` answers it **before the currency read**: label `runtime not built`, exit 1,
+`chunks_seen 0`, `errors 0`, both remedies named (`--features local-model`, and `np search --mode keyword` from **F36**). Arm (iv) is
+untouched — hand the run a provider that refuses every batch and it still reports "owed", and in a `local-model` build unloadable bytes
+genuinely are owed-and-not-produced after real work. The two cases now live in two `#[cfg]`-separated tests instead of one test choosing
+its assertion with `cfg!`.
+
+Evidence, all re-run rather than inherited: np-core `--test embed_run` **26 / 0**; np-cli default **37 / 0** including the new
+`embed_without_a_runtime_refuses_before_reading_a_note`; np-cli with `local-model` **42 / 0**; and with the real 310 MB artifact exported,
+the same suite **42 / 0** plus **39 / 0** in `models_cli`, no `NOT COVERAGE` line anywhere. Full local gate list at `e361e03`, `dirty=0`:
+**17 rows exit 0**, two artifact rows SKIPPED by unset env, `NOT COVERAGE` count **0** (`/home/agent/tmp/gates-f40`). Mutation — mapping
+`ProviderState::Ready` back to `Resolution::Provider` in a default build — FAILS the new test and passes again after revert; the core arm (v)
+test asserts the label *before* the counts, because deleting the early return leaves every count at zero and would otherwise pass on numbers.
+
+**What this card still owes:** CI has not graded any of it (out of included minutes since 2026-11-07), so no "Closed" line here — same
+withholding as **F21**, **F28** and **F36**. And the published `v0.2.0` Windows asset still answers arm (iv) for this case: it was built at
+`4c5200f`, before this fix, so its sha256 (`d36f3e3b…44c270`) is a promise about the old sentence too. Republishing under the same name would
+make the release notes' digest wrong, so the fix ships with the next asset — say the word and I will build one rather than let a stale binary
+be the only Windows download on the page.
