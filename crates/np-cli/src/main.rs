@@ -422,6 +422,21 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     //
     // `as_mut`, not `as_ref`: a provider is the thing that can open a projector, so the run holds it mutably for as long
     // as the resolution lives (`Resolution::Provider`'s note says why).
+    // **F40 splits this mapping by build shape.** In a binary that links no runtime, `ProviderState::Ready` holds the
+    // seam's placeholder — a provider whose every batch answers `RuntimeNotBuilt`. Handing it to the run is how an
+    // operator who installed a model correctly (digest verified, 295.5 MB) got `outcome owed and not produced` with
+    // `errors 1`: §6's report-integrity arm, quoting a per-batch error, after the corpus had been read. This build now
+    // refuses before any of that, naming the feature and the two ways forward. A `local-model` build keeps the original
+    // mapping untouched — there, "the bytes would not load" genuinely *is* arm (iv), and its own test says so.
+    #[cfg(not(feature = "local-model"))]
+    let resolution = match &mut state {
+        ProviderState::Ready(_) => Resolution::RuntimeNotBuilt {
+            id: cfg.embeddings.model.clone().unwrap_or_default(),
+        },
+        ProviderState::Placeholder { embedder, .. } => Resolution::Provider(embedder.as_mut()),
+        ProviderState::ArtifactAbsent => Resolution::ArtifactAbsent,
+    };
+    #[cfg(feature = "local-model")]
     let resolution = match &mut state {
         ProviderState::Ready(embedder) | ProviderState::Placeholder { embedder, .. } => {
             Resolution::Provider(embedder.as_mut())

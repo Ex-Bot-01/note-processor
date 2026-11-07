@@ -1729,17 +1729,73 @@ fn embed_with_the_artifact_file_missing_names_installing_it() {
     );
 }
 
-/// Arm (iv) as each build answers it: configured, installed, artifact present, work owed — and nothing behind the
-/// batch that can turn text into numbers. **What "nothing" means is what R6c2 split.** Without `local-model` the
-/// provider type refuses every batch unanswered (`RuntimeNotBuilt`); with it the provider *tries to load* the
-/// installed bytes and llama.cpp returns null for them, because what [`install_model`] put there is a sentence
-/// rather than a GGUF. Both are arm (iv), both exit 1, both write nothing — so everything below holds in either
-/// build, and each build's own sentence is pinned by its own arm of one `cfg!`, which is honest about being a
-/// different answer rather than pretending there is one.
+/// **F40, in the build that ships by default.** Everything is present — configured provider, installed row, artifact on
+/// disk — and this binary links no inference runtime. It used to answer §6's arm (iv), `owed and not produced`, with
+/// `errors 1`, after reading the corpus: the report-integrity arm, quoting a per-batch error, about a compile-time fact.
+/// An operator who had just installed a 295.5 MB model correctly (digest verified) was told their numbers did not arrive.
+///
+/// So this build refuses before the currency read, and everything below is that refusal: its own label, no "owed",
+/// `seen 0` because nothing was scanned for work it could not do, `errors 0` because a missing feature is not a failure
+/// count anyone can retry — and both remedies named, since the useful question after "no" is "then what".
+#[cfg(not(feature = "local-model"))]
 #[test]
-fn embed_with_everything_present_reports_the_runtime_that_is_not_built() {
+fn embed_without_a_runtime_refuses_before_reading_a_note() {
     let ws = workspace();
-    install_model(&ws); // the artifact stays where `install` put it
+    install_model(&ws); // the artifact stays where `install` put it, so this is not the artifact-absent arm
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let failed = run(&mut ws.command(&["embed"]));
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "a refusal is still exit 1:\n{}",
+        failed.stdout()
+    );
+    for channel in [failed.stdout(), failed.stderr()] {
+        assert!(channel.contains("runtime not built"), "{channel}");
+        assert!(
+            !channel.contains("owed and not produced"),
+            "F40: a build without the runtime must not borrow §6's report-integrity sentence: {channel}"
+        );
+        assert!(
+            channel.contains(EMBED_MODEL),
+            "name what stays owed: {channel}"
+        );
+        assert!(
+            channel.contains("--features local-model")
+                && channel.contains("np search --mode keyword"),
+            "and name both ways forward, one per kind of reader: {channel}"
+        );
+    }
+
+    let stdout = failed.stdout();
+    assert_eq!(
+        summary_count(&stdout, "seen"),
+        0,
+        "refusing honestly should not cost a pass over live chunks:\n{stdout}"
+    );
+    assert_eq!(summary_count(&stdout, "embedded"), 0);
+    assert_eq!(
+        summary_count(&stdout, "errors"),
+        0,
+        "a missing compile-time feature is not an error count: {stdout}"
+    );
+
+    // Mutation this catches: mapping `ProviderState::Ready` to `Resolution::Provider` in a default build — the old
+    // path — which fails on the first assertion while every count below still reads 0/0 and passes.
+}
+
+/// Arm (iv) as a `local-model` build answers it, which is **not** F40's case and stays exactly as it was. Here the
+/// runtime *is* compiled in; what [`install_model`] wrote at the artifact path is a sentence rather than a GGUF, so the
+/// provider tries to load it and llama.cpp declines. That genuinely is "vectors were owed and this run produced none",
+/// after real work — hence `seen > 0` and `errors 1`, the two counts F40's refusal must not print.
+#[cfg(feature = "local-model")]
+#[test]
+fn embed_with_unloadable_bytes_reports_owed_and_not_produced() {
+    let ws = workspace();
+    install_model(&ws);
     ws.write_user_config(&local_model_config(EMBED_MODEL));
     run(&mut ws.command(&["scan"])).assert_success();
 
@@ -1748,15 +1804,9 @@ fn embed_with_everything_present_reports_the_runtime_that_is_not_built() {
     assert_eq!(failed.code(), 1, "arm (iv) is exit 1:\n{}", failed.stdout());
     for channel in [failed.stdout(), failed.stderr()] {
         assert!(channel.contains("owed and not produced"), "{channel}");
-        let expected = if cfg!(feature = "local-model") {
-            "is not loadable as a model"
-        } else {
-            "the local embedding runtime is not built yet"
-        };
         assert!(
-            channel.contains(expected),
-            "arm (iv) has to name why nothing was produced ({expected:?} in a build with              local-model = {}), not that the corpus is empty: {channel}",
-            cfg!(feature = "local-model"),
+            channel.contains("is not loadable as a model"),
+            "arm (iv) has to name why nothing was produced, not that the corpus is empty: {channel}"
         );
         assert!(
             channel.contains(EMBED_MODEL),

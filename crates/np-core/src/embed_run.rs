@@ -126,6 +126,21 @@ pub enum EmbedOutcome {
         /// shipped, and §6's wording "run `np models fetch`" therefore names a command R7b owes.
         hint: String,
     },
+    /// Arm (v): this **binary** cannot embed at all — no inference runtime was compiled into it (**F40**).
+    ///
+    /// It exists because arm (iv) was answering here and lying about it. `(iv)` means *our accounting said vectors
+    /// were owed and none arrived*, which points at chunking, stamping or the database; a build that links no C++ is a
+    /// compile-time fact nobody can retry, re-scan or repair. Measured on two platforms before this arm existed — an
+    /// operator installed `embeddinggemma-2` correctly (digest verified) and was told `outcome owed and not produced`,
+    /// `errors 1`: a data-integrity sentence about a missing feature, after the corpus had been read.
+    ///
+    /// Decided **before the currency read**, so `seen` stays 0: refusing honestly should not cost a pass over live
+    /// chunks, and a report that says it saw nothing is a report nobody has to reconcile with an empty write.
+    RuntimeNotBuilt {
+        /// The configured model that stays owed. Same id arm (ii) would name, so the two sentences agree about what
+        /// is missing even though only one of them can be fixed by editing a file.
+        id: String,
+    },
     /// Arm (iv): chunks were owed and this run did not produce vectors for all of them. The only arm that
     /// means "gave up", and the only one whose reason can name a busy database, a token budget or a provider
     /// that refused.
@@ -143,6 +158,7 @@ impl EmbedOutcome {
             Self::Current => "nothing owed",
             Self::ConfigurationDisabled { .. } => "configuration disabled",
             Self::ArtifactAbsent { .. } => "artifact absent",
+            Self::RuntimeNotBuilt { .. } => "runtime not built",
             Self::NotProduced { .. } => "owed and not produced",
         }
     }
@@ -156,6 +172,14 @@ impl EmbedOutcome {
                 None => format!("{key} names nothing"),
             }),
             Self::ArtifactAbsent { hint, .. } => Some(hint.clone()),
+            // Two ways forward and the one fact that matters: nothing was written, so the model is still owed rather
+            // than half-embedded. Names a flag that exists (`--features local-model`) and a command that exists in this
+            // very binary (`np search --mode keyword`, F36) — the rule §6's hints follow, because arm (iii)'s first
+            // version named `np models fetch` before it shipped.
+            Self::RuntimeNotBuilt { id } => Some(format!(
+                "this binary was built without an embedding runtime: install one built with `--features local-model`, \
+                 or search by keyword (`np search --mode keyword`) — `{id}` stays owed"
+            )),
             Self::NotProduced { reason } => Some(reason.clone()),
         }
     }
@@ -446,6 +470,13 @@ enum BatchWrite {
 /// needs the reason as a value too, and re-deriving it at its print site is what made it say
 /// `embeddings.provider = "none"` about a configuration that said `local-model` (F32).
 pub enum Resolution<'a> {
+    /// This build links no inference runtime (**F40**). Carried as its own resolution rather than handed to the writer
+    /// loop as a provider that refuses every batch, because doing that reported arm (iv) — see
+    /// [`EmbedOutcome::RuntimeNotBuilt`] for what it cost an operator who had done everything right.
+    RuntimeNotBuilt {
+        /// The configured model id, so the refusal names what stays owed.
+        id: String,
+    },
     /// A provider built from the configured row — the only thing this run can write a vector from, and the only
     /// [`Embedder::dim`] §6's wrong-dim refusal may quote.
     ///
@@ -638,6 +669,16 @@ fn run(
     // needs *before* it can report an unreadable artifact, so `ArtifactAbsent` arrives only with widths that
     // already agreed.
 
+    // ---- arm (v): no runtime in this binary. Decided here, after configuration and width (both of which a person can
+    // fix by editing a file, and both of which stay more specific than "no runtime") and **before** the currency read,
+    // so nothing is scanned for work that this process could never do (**F40**).
+    if let Resolution::RuntimeNotBuilt { id } = &resolution {
+        return Ok(EmbedReport::unread(
+            Some(id.clone()),
+            EmbedOutcome::RuntimeNotBuilt { id: id.clone() },
+        ));
+    }
+
     // ---- the currency read: live chunks against this model's stored stamps.
     let stamps = db::vectors_for(&db, &model_id)?
         .into_iter()
@@ -652,7 +693,7 @@ fn run(
     // and the mutable borrow is free again for the writer loop as soon as this loop ends.
     let witness: Option<&dyn Embedder> = match &resolution {
         Resolution::Provider(provider) => Some(&**provider),
-        Resolution::ArtifactAbsent => None,
+        Resolution::ArtifactAbsent | Resolution::RuntimeNotBuilt { .. } => None,
     };
 
     let mut owed = Vec::new();
@@ -748,6 +789,16 @@ fn run(
         // fact for this run — see its doc), or the file stopped being there between that read and here. Either
         // way there is no provider to hand the owed chunks to, so §6's arm (iii) answers, and one report literal
         // means the two halves cannot grow different sentences.
+        // **F40, defensive and unreachable today** (arm (v) returns before the currency read). Spelled out rather than
+        // `unreachable!()` on purpose: if a later edit drops that early return, the reading this arm must *not* fall into
+        // is the one below it — answering "artifact absent" about a build with no runtime would name a file nobody can
+        // install to fix anything, which is the same class of wrong sentence this card was filed for.
+        Resolution::RuntimeNotBuilt { .. } => {
+            return Ok(EmbedReport::unread(
+                Some(model_id.clone()),
+                EmbedOutcome::RuntimeNotBuilt { id: model_id },
+            ));
+        }
         Resolution::Provider(_) | Resolution::ArtifactAbsent => {
             return Ok(EmbedReport {
                 model: Some(model_id.clone()),
@@ -909,7 +960,9 @@ fn media_through<'a, 'r>(
 ) -> MediaTally {
     let asked: Option<&'r mut dyn Embedder> = match resolution {
         Resolution::Provider(provider) => Some(&mut **provider),
-        Resolution::ArtifactAbsent => None,
+        // No provider means no figure can be encoded, and every image row then refuses as unavailable — which is the
+        // honest shape. Unreachable under arm (v) (**F40**), listed so it stays that way by construction.
+        Resolution::ArtifactAbsent | Resolution::RuntimeNotBuilt { .. } => None,
     };
     run_media_pass(db, root, model, asked)
 }

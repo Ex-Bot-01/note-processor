@@ -383,6 +383,25 @@ stated rather than glossed: `embeddings.model` also cascades from `models(id)` �
 migrations run with `PRAGMA foreign_keys = OFF`, so any future migration deleting parent rows must delete children by hand
 (backlog D10).
 
+> **Amendment, 2026-11-08 (F40): a fifth arm, for a build that cannot embed at all.** §6 grew from three exit states to four as
+> F32 and R6c1 landed; the fifth became necessary when the first Windows run holding a real artifact printed
+> `outcome owed and not produced` with `errors 1` — arm (iv), §6's *report-integrity* state, quoting a per-batch error about a
+> compile-time fact. That operator had installed `embeddinggemma-2` correctly (295.5 MB, digest verified) and was told their
+> vectors had not arrived; reproduced on Linux the same evening with the same binary shape, so it was never platform behaviour.
+>
+> The arm is **`runtime not built`, decided before the currency read**, which is why `chunks_seen` stays 0: an honest refusal
+> should not cost a pass over live chunks, and a report that says it saw nothing is one nobody has to reconcile with an empty
+> write. It names both remedies — `--features local-model` for whoever can install a different binary, `np search --mode keyword`
+> (**F36**) for whoever cannot — because the useful question after "no" is "then what", and this file learned that lesson once
+> already when arm (iii) named `np models fetch` a release before it existed.
+>
+> **Arm (iv) keeps its meaning, unchanged.** Handing [`embed_run`](../crates/np-core/src/embed_run.rs) a provider that refuses
+> every batch still produces it, and in a `local-model` build bytes that will not load genuinely *are* "owed and not produced",
+> after real work. Which is why the two cases now sit in two `#[cfg]`-separated tests instead of one test choosing its assertion
+> with `cfg!` — a shared assertion set is how the wrong answer started looking acceptable in the first place.
+
+
+
 ## 7. Verification: what we can prove here, and what we must not imply
 
 Determinism is not correctness — a wrong pooling implementation is perfectly deterministic. The primary checks are ones

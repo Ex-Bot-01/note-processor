@@ -962,8 +962,13 @@ fn nothing_owed_exits_zero_even_with_no_artifact() {
     assert_eq!(fake.calls(), 0);
 }
 
-/// Arm (iv): owed and not produced — the only arm that means "gave up". This is what `np embed` does today on a
-/// real `local-model` install, because the runtime still refuses; R6c2 changes the provider, not this arm.
+/// Arm (iv): owed and not produced — the only arm that means "gave up", and the one that arrives when a caller hands
+/// the run a provider that refuses every batch.
+///
+/// **Not what `np embed` does on a build without the runtime any more** (**F40**): np-cli now resolves such a build to
+/// [`Resolution::RuntimeNotBuilt`] so it answers arm (v) before reading a chunk. This case stays, because arm (iv) has to
+/// keep meaning "we owed work and did not produce it" for whoever *does* hand over a live provider — a `local-model` run
+/// whose bytes will not load is the real one.
 #[test]
 fn owed_and_not_produced_is_the_gave_up_arm() {
     assert_recorder_works();
@@ -987,6 +992,48 @@ fn owed_and_not_produced_is_the_gave_up_arm() {
     assert_eq!(report.embedded, 0);
     assert!(setup.vectors().is_empty());
     assert!(!report.succeeded());
+}
+
+/// Arm (v), **F40**: this binary links no runtime, and the run says so before it reads one chunk row. The counts are the
+/// point — `seen 0` is what separates an honest early refusal from the report this arm replaced, which scanned the corpus
+/// and then borrowed arm (iv)'s sentence about it (`errors 1`, on Windows and Linux alike, for a user who had installed the
+/// model correctly). Nothing may be written in either case, which is the one thing both arms already got right.
+#[test]
+fn runtime_not_built_refuses_before_the_currency_read() {
+    assert_recorder_works();
+    let setup = workspace_owned(&notes(3));
+    setup.install_model(FAKE_DIM as i64, "");
+    setup.touch_artifact();
+
+    let report = np_core::embed_run::embed_with_resolution(
+        &setup.root,
+        &setup.cfg(),
+        np_core::embed_run::Resolution::RuntimeNotBuilt {
+            id: MODEL_ID.into(),
+        },
+    )
+    .expect("a refusal is a report, not an error");
+
+    assert_eq!(report.outcome.label(), "runtime not built");
+    assert!(
+        !report.succeeded(),
+        "the model stays owed, so this is exit 1"
+    );
+    assert_eq!(
+        report.chunks_seen, 0,
+        "no chunk was scanned for work nobody could do"
+    );
+    assert_eq!(report.embedded, 0);
+    assert_eq!(report.errors, 0, "a missing feature is not a failure count");
+
+    let detail = report.outcome.detail().expect("arm (v) says what to do");
+    assert!(detail.contains(MODEL_ID), "{detail}");
+    assert!(detail.contains("local-model"), "{detail}");
+    assert!(setup.vectors().is_empty(), "and writes nothing");
+
+    // Mutation this catches: deleting the early return. The run then reaches the writer with no provider, answers arm
+    // (iii) `artifact absent` about a file that exists, and fails on the label — while every count above still passes,
+    // which is why the label is asserted first.
 }
 
 // ---------------------------------------------------------------------------
