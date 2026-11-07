@@ -103,6 +103,11 @@ Four questions went up as human decisions; four answers came back, and one of th
   token's scope, so the reason is inferred from timing and step counts rather than read. No further pushes or reruns were spent on it; when a run gets
   steps again, that is the recovery signal, and `main` at `e4bdba3` carries three graded commits whose code was green locally (17 rows exit 0, workspace
   680 passed / 0 failed, `GOLDEN CHECK: pass`) and whose last CI-graded tree is `5e368ac` (`42325538290`, four jobs success).
+* **`np models list` reports a model's file set** (the reporting gap F28 step ③ exposed): `ListedModel.members` = name, claimed file, present-or-absent by
+  stat only — no per-member hashing on a listing, because verification belongs at use time. Text gains `files mmproj:present` when there is one; `--json`
+  gains an eighth row key, `[]` for a single-file model. `main` stays out (its verdict is `state`). Four np-core + two CLI cases; three mutants killed — the
+  third initially looked alive because `cargo fmt` had rewrapped the line its patch searched for and the mutation had never applied: check the diff before
+  believing a survivor.
 * **F21's second half landed (`Db::recorded_upgrade_orphans` / `recorded_merged_notes`, two new `ScanReport` fields).** The durable receipt now reaches
   every scan's JSON, so "what did an upgrade delete here last month?" is answerable without `sqlite3`; the once-per-process announcement is untouched and
   stdout gained nothing — a CLI case asserts both halves on one workspace. Three np-core cases (durable merge receipt, zero receipts proving the checks ran,

@@ -244,11 +244,17 @@ const ROW_KEYS: &[&str] = &[
     "dim",
     "id",
     "installed_at",
+    "members",
     "prefix_doc",
     "prefix_query",
     "sha256",
     "state",
 ];
+
+/// The per-entry key set of a row's `members` array (**F28**'s gap closed): the member's name, the file it claims under
+/// the models directory, and whether a file is there. No digest and no per-member state on purpose — `list` answers "did
+/// the file land" by stat, and byte verification happens at use time, where reading 554 MB is already being paid for.
+const MEMBER_KEYS: &[&str] = &["file", "name", "present"];
 
 /// The pinned per-entry key set of `np models list --json`'s `fetching` array (§12 rules 4 and 12), sorted.
 ///
@@ -1906,4 +1912,71 @@ fn naming_the_main_member_installs_the_model_exactly_as_before() {
     cmd.arg("--dim").arg("384");
     run(&mut cmd).assert_success();
     assert_eq!(run(&mut ws.list(true)).json()["models"][0]["dim"], 384);
+}
+
+// --- the listing says what a model's file set is ---------------------------------
+
+/// **A projector installed offline shows up on the next `np models list`,** in both channels. Before this, the only way to
+/// confirm that install was to run `np embed` and watch `projector-absent` go away — a diagnosis standing in for a report.
+#[test]
+fn an_installed_projector_is_listed_as_a_member_of_its_model() {
+    let ws = Scratch::new();
+    install_one(&ws);
+    let mmproj = ws.source("mmproj.gguf", b"projector-shaped bytes");
+    let digest = source_digest(&mmproj);
+    run(&mut member_install(&ws, "mmproj", &mmproj, &digest)).assert_success();
+
+    let report = run(&mut ws.list(true)).json();
+    let members = report["models"][0]["members"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`members` must serialise as an array: {report}"));
+    assert_eq!(members.len(), 1, "{report}");
+    assert_eq!(keys(&members[0]), MEMBER_KEYS, "{report}");
+    assert_eq!(members[0]["name"], "mmproj", "{report}");
+    assert_eq!(members[0]["file"], format!("{ID}.mmproj"), "{report}");
+    assert_eq!(members[0]["present"], true, "{report}");
+
+    let text = run(&mut ws.list(false)).stdout();
+    assert!(
+        text.contains("files mmproj:present"),
+        "the text channel names the member too:\n{text}"
+    );
+
+    // Delete the file by hand and both channels change their answer, without any byte being hashed to decide it.
+    fs::remove_file(ws.models_dir().join(format!("{ID}.mmproj")))
+        .expect("test setup: delete the member");
+    let after = run(&mut ws.list(true)).json();
+    assert_eq!(
+        after["models"][0]["members"][0]["present"], false,
+        "{after}"
+    );
+    let text = run(&mut ws.list(false)).stdout();
+    assert!(
+        text.contains("files mmproj:absent"),
+        "a recorded member with no file has to be sayable:\n{text}"
+    );
+
+    // Mutation this catches: dropping the array from `--json` while keeping the stat, which leaves the machine reader
+    // exactly where F28 left it.
+}
+
+/// **A model with one file answers `[]`, and its text line says nothing about files.** The empty case is the common one,
+/// and it has to be a fact rather than an omission — while the main artifact stays out of the list, because this row's own
+/// `state` already gives a stronger verdict on it.
+#[test]
+fn a_model_with_only_its_main_artifact_lists_no_members() {
+    let ws = Scratch::new();
+    install_one(&ws);
+
+    let report = run(&mut ws.list(true)).json();
+    assert_eq!(
+        report["models"][0]["members"].as_array().map(Vec::len),
+        Some(0),
+        "present and empty, never absent: {report}"
+    );
+    let text = run(&mut ws.list(false)).stdout();
+    assert!(
+        !text.contains("files "),
+        "no members, no token — `files main` would duplicate this row's own state verdict:\n{text}"
+    );
 }

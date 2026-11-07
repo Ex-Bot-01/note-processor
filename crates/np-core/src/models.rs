@@ -32,7 +32,7 @@
 //!   cannot be expressed — "the directory could not be listed", which is *not* a per-row verdict — has no
 //!   representation in [`Listing`] and so leaves as [`ModelError::ModelsDir`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
@@ -227,6 +227,33 @@ pub struct ListedModel {
     pub row: ModelRow,
     /// What the artifact directory says about it.
     pub state: ArtifactState,
+    /// The other files this identity has — every `model_files` row except `main`, which [`Self::state`] already covers.
+    ///
+    /// Empty is a real answer and the common one: a model installed before F28 step 3, or one installed since without a
+    /// projector, has exactly one file. Before this field existed that state was invisible — `np models list` printed one
+    /// line per model and mentioned no other file, so confirming an offline projector install meant watching `np embed`
+    /// stop reporting `projector-absent`. That is a diagnosis, not a report.
+    pub members: Vec<ListedMember>,
+}
+
+/// One recorded member of a model, as the listing sees it: its name, the file it claims, and whether a file is **there**.
+///
+/// Deliberately no digest and no per-member hash. `list` is what someone runs to ask what the workspace believes, and
+/// answering "is the projector file present" by reading 554 MB on every listing would make the cheap question expensive —
+/// and byte verification already has a home, at use time, where the bytes are about to be trusted
+/// (`crate::local_model::projector_artifact`, which does compare digests). The main artifact is the exception with the
+/// opposite rule: [`ListedModel::state`] hashes it, because that file is small enough and its mismatch is the failure this
+/// command exists to catch. Two files, two strengths of answer, and each stated where it belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedMember {
+    /// The member name as recorded — `mmproj` for the projector (`crate::pins::MMPROJ_MEMBER`).
+    pub name: String,
+    /// The file name that member claims under the workspace's models directory: [`member_artifact_name`]'s spelling,
+    /// spelled here so a reader can compare it with `ls` without re-deriving the rule.
+    pub file: String,
+    /// Whether some file exists at that name. A directory counts as absent (`is_file`), because a directory cannot be
+    /// loaded as an artifact and reporting it as present would be a verdict this listing cannot stand behind.
+    pub present: bool,
 }
 
 /// Something under the models directory that no row names, reported under its own heading (§3).
@@ -1267,13 +1294,31 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
     // the OS spelling against them needs no lossy round trip — a name UTF-8 cannot hold is by construction
     // not an id and lands in `unclaimed`, rendered with replacements.
     let mut claimed: HashSet<OsString> = rows.iter().map(|row| OsString::from(&row.id)).collect();
+    // The same read that decides what is claimed also answers what each model has besides its main artifact, so the
+    // child table is walked once per row rather than twice for two questions about one fact.
+    let mut members_by_id: BTreeMap<String, Vec<ListedMember>> = BTreeMap::new();
     // **A fetched pair is one model, not an artifact plus junk.** Every member recorded in migration 9's child table
     // claims the file name [`member_artifact_name`] gives it, so `np models fetch` of the text encoder and its
     // projector leaves nothing in `unclaimed`. Members are read from the rows rather than guessed by prefix: a stray
     // `something.random` is still somebody else's file, and "recorded as a member" is the fact that makes a name ours.
     for row in &rows {
         for file in db::model_files(db, &row.id)? {
-            claimed.insert(OsString::from(member_artifact_name(&row.id, &file.name)));
+            let name = member_artifact_name(&row.id, &file.name);
+            claimed.insert(OsString::from(&name));
+            // `main` is the row's own artifact and already carries a stronger verdict below; listing it here as well
+            // would give one file two answers with different strengths, and readers trust the weaker one.
+            if file.name != MAIN_FILE {
+                members_by_id
+                    .entry(row.id.clone())
+                    .or_default()
+                    .push(ListedMember {
+                        name: file.name,
+                        file: name,
+                        // Resolved below, where the artifact directory is still in scope and a refusal can be reported
+                        // rather than swallowed as "absent".
+                        present: false,
+                    });
+            }
         }
     }
     let (unclaimed, marker_ids) = entries.split(&claimed);
@@ -1281,7 +1326,34 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
     let mut models = Vec::with_capacity(rows.len());
     for row in rows {
         let state = artifact_state(&models_dir, &row)?;
-        models.push(ListedModel { row, state });
+        let members = members_by_id.remove(&row.id).unwrap_or_default();
+        // Stat-only, and a refusal is a failure rather than an "absent": the same rule [`artifact_state`] applies to the
+        // main artifact, where a permission problem says nothing about whether the file is there.
+        let members = members
+            .into_iter()
+            .map(|member| {
+                let target = models_dir.join(&member.file);
+                match fs::metadata(walk::to_open_path(&access(&target))) {
+                    Ok(meta) => Ok(ListedMember {
+                        present: meta.is_file(),
+                        ..member
+                    }),
+                    Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(ListedMember {
+                        present: false,
+                        ..member
+                    }),
+                    Err(source) => Err(ModelError::Artifact {
+                        path: target,
+                        source,
+                    }),
+                }
+            })
+            .collect::<Result<Vec<_>, ModelError>>()?;
+        models.push(ListedModel {
+            row,
+            state,
+            members,
+        });
     }
 
     // Markers are read last: every failure above this point throws the whole listing away, and reading (and

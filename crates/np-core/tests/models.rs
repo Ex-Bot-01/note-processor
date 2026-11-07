@@ -138,7 +138,9 @@ fn states(listing: &models::Listing) -> Vec<(&str, ArtifactState)> {
     listing
         .models
         .iter()
-        .map(|ListedModel { row, state }| (row.id.as_str(), *state))
+        // `..` on purpose: this helper answers "which rows, in what state", and a member set is a different question —
+        // one the cases below ask directly rather than through a projection that would hide it.
+        .map(|ListedModel { row, state, .. }| (row.id.as_str(), *state))
         .collect()
 }
 
@@ -2017,5 +2019,131 @@ fn a_deleted_projector_is_restored_from_a_source_the_row_already_attests() {
             .count(),
         1,
         "one member row, not a second one for the same name"
+    );
+}
+
+// --- `list` says what a model's file set is (the gap F28 step 3 exposed) ---------
+//
+// Migration 9 put "which files does this identity have" in `model_files`, and step 3 gave the projector an offline install path — but `np models list`
+// still printed one line per model and never mentioned either. Confirming an install meant watching `np embed` stop reporting `projector-absent`, which
+// is a diagnosis, not a report. These cases ask the listing directly.
+
+/// **A recorded member appears, with a present/absent verdict and nothing else.** No digest, no per-member hash: `list` is a command someone runs to
+/// see what the workspace believes, and hashing 554 MB on every `models list` to answer "is the file there" would make the cheap question expensive. The
+/// bytes are verified where they are about to be trusted — `local_model::projector_artifact`, at use time.
+#[test]
+fn a_recorded_member_is_listed_with_a_stat_only_verdict() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    install_main(&fx, &db, "alpha", b"the text encoder's bytes");
+    let mmproj = b"mmproj-shaped bytes";
+    let digest = sha256_bytes(mmproj);
+    let source = fx.source("mmproj.gguf", mmproj);
+    install_projector(&fx, &db, &projector_request("alpha", &source, &digest)).expect("installs");
+
+    let listing = models::list(&db, &fx.config, &fx.workspace).expect("listing");
+    let members = &listing.models[0].members;
+    assert_eq!(
+        members
+            .iter()
+            .map(|m| (m.name.as_str(), m.file.as_str(), m.present))
+            .collect::<Vec<_>>(),
+        vec![("mmproj", "alpha.mmproj", true)],
+        "named, spelled where it must live, and present"
+    );
+
+    // Absent is a verdict `list` can reach without reading a byte, and the one that matters after a hand-delete.
+    fs::remove_file(projector_path(&fx, "alpha")).expect("test setup: delete the member file");
+    let after = models::list(&db, &fx.config, &fx.workspace).expect("listing after the delete");
+    assert_eq!(
+        after.models[0]
+            .members
+            .iter()
+            .map(|m| m.present)
+            .collect::<Vec<_>>(),
+        vec![false],
+        "recorded and gone is a state a listing should be able to say out loud"
+    );
+
+    // Mutation this catches: reporting only names, which cannot answer "did my install land", or hashing members here, which no assertion catches and
+    // every `models list` pays for.
+}
+
+/// **The main artifact is not listed as a member.** It already has a verdict — the row's `state`, which does hash and can say `mismatch` — and putting it
+/// in this list too would give one file two answers with different strengths, which is how a reader ends up trusting the weaker one.
+#[test]
+fn the_main_artifact_is_reported_once_and_not_as_a_member() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    install_main(&fx, &db, "alpha", b"the text encoder's bytes");
+
+    let listing = models::list(&db, &fx.config, &fx.workspace).expect("listing");
+    assert!(
+        listing.models[0].members.is_empty(),
+        "`main` is the row's own artifact, verdict already given by `state`: {:?}",
+        listing.models[0].members
+    );
+    assert_eq!(listing.models[0].state, ArtifactState::Present);
+
+    // And when a second member joins, `main` still does not appear beside it.
+    let mmproj = b"mmproj-shaped bytes";
+    let source = fx.source("mmproj.gguf", mmproj);
+    let digest = sha256_bytes(mmproj);
+    install_projector(&fx, &db, &projector_request("alpha", &source, &digest)).expect("installs");
+    let after = models::list(&db, &fx.config, &fx.workspace).expect("listing");
+    assert_eq!(
+        after.models[0]
+            .members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![np_core::pins::MMPROJ_MEMBER],
+        "one entry, and it is not the main one"
+    );
+}
+
+/// **A row whose member rows name nothing that exists still lists what the table claims.** A workspace upgraded from before migration 9 has a `models`
+/// row and no member rows at all; a hand-edited table could name a file nothing wrote. Both answers are the file's, and the listing reports them rather
+/// than silently agreeing with the artifact directory.
+#[test]
+fn a_member_row_naming_no_file_is_reported_as_absent_rather_than_dropped() {
+    let fx = Fixture::new();
+    let db = fx.db();
+    install_main(&fx, &db, "alpha", b"the text encoder's bytes");
+    // The state an upgraded workspace reaches before its first `install` re-materialises anything: the table learned a member name, and no bytes arrived.
+    db::record_model_file(
+        &db,
+        "alpha",
+        np_core::pins::MMPROJ_MEMBER,
+        &sha256_bytes(b"never written"),
+        4_096,
+    )
+    .expect("test setup: record a member with no file");
+
+    let listing = models::list(&db, &fx.config, &fx.workspace).expect("listing");
+    assert_eq!(
+        listing.models[0]
+            .members
+            .iter()
+            .map(|m| (m.name.as_str(), m.present))
+            .collect::<Vec<_>>(),
+        vec![(np_core::pins::MMPROJ_MEMBER, false)],
+        "recorded but absent is the fact; `unclaimed` cannot show it and `state` does not cover it"
+    );
+
+    // A **directory** wearing the member's name is absent too: it cannot be loaded as an artifact, so calling it present
+    // would be a verdict this listing cannot stand behind. `fs::metadata` succeeds on it either way, which is exactly why
+    // the claim needs a case rather than a sentence in a doc comment.
+    fs::create_dir(projector_path(&fx, "alpha"))
+        .expect("test setup: a directory in the member's place");
+    let directory = models::list(&db, &fx.config, &fx.workspace).expect("listing");
+    assert_eq!(
+        directory.models[0]
+            .members
+            .iter()
+            .map(|m| m.present)
+            .collect::<Vec<_>>(),
+        vec![false],
+        "a directory is not an artifact"
     );
 }

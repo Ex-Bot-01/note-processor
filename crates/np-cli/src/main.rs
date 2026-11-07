@@ -1210,7 +1210,7 @@ fn listing_json(
     })
 }
 
-/// One row under `--json`, with exactly the seven keys §3 pins — and the full digest, which the text column
+/// One row under `--json`, with exactly the eight keys §3 pins — and the full digest, which the text column
 /// shortens.
 fn model_json(model: &ListedModel) -> Value {
     json!({
@@ -1221,6 +1221,20 @@ fn model_json(model: &ListedModel) -> Value {
         "prefix_query": model.row.prefix_query,
         "installed_at": model.row.installed_at,
         "state": model.state.state_label(),
+        // Every file this identity has besides its main artifact — present/absent by stat, never hashed here. A model
+        // with only its main artifact answers `[]`, which is a fact and not an omission (**F28** exposed the gap:
+        // confirming an offline projector install used to mean watching `np embed` stop reporting `projector-absent`).
+        "members": model
+            .members
+            .iter()
+            .map(|member| {
+                json!({
+                    "name": member.name,
+                    "file": member.file,
+                    "present": member.present,
+                })
+            })
+            .collect::<Vec<Value>>(),
     })
 }
 
@@ -1283,17 +1297,38 @@ fn print_listing(listing: &Listing) {
         .unwrap_or(0);
     let _ = writeln!(out, "models     {}", listing.models.len());
     for model in &listing.models {
+        // `files` appears only when there are members to name. A line that always carried it would put
+        // `files main` — which duplicates this row's own `state` verdict — beside every model, or `files -`,
+        // which is a new token for "nothing"; either way the common line changes shape for no information.
+        let files = if model.members.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  files {}",
+                model
+                    .members
+                    .iter()
+                    .map(|member| format!(
+                        "{}:{}",
+                        member.name,
+                        if member.present { "present" } else { "absent" }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         let _ = writeln!(
-            out,
-            "{:<width$}  {}  dim {}  sha256 {}  installed_at {}  prefix_doc \"{}\"  prefix_query \"{}\"",
-            model.row.id,
-            model.state.state_label(),
-            model.row.dim,
-            text_digest(&model.row.sha256),
-            model.row.installed_at,
-            model.row.prefix_doc,
-            model.row.prefix_query,
-        );
+                out,
+                "{:<width$}  {}  dim {}  sha256 {}  installed_at {}  prefix_doc \"{}\"  prefix_query \"{}\"{}",
+                model.row.id,
+                model.state.state_label(),
+                model.row.dim,
+                text_digest(&model.row.sha256),
+                model.row.installed_at,
+                model.row.prefix_doc,
+                model.row.prefix_query,
+                files,
+            );
     }
     // One line per fetch in progress, and **no section header**: `models` and `unclaimed` print their counts even
     // when empty because "looked and found none" must not read as "printed nothing", while a fetch line is an
