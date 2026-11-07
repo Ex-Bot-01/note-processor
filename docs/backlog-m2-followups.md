@@ -972,7 +972,7 @@ Three mutants killed by three distinct cases (skip the digest comparison, resolv
 **Still open in this card:** `np models install --member`, without which an offline machine cannot place the projector that `projector-absent` now tells
 it to install; the five archive shapes measured with `strip` against §14's ~40 MB sentence; and the placement half below.
 
-**Step ③ landed the same day.** `np models install --member <main|mmproj>`: the member name keys `model_files`, the file lands at `<id>.mmproj`
+**Step ③ landed the same day** (commit `b082272`, merged with history at `5374dc1`; branch CI `42324417379` green on all four jobs, merged-tree gates 17 rows exit 0, workspace 680 passed / 0 failed, `GOLDEN CHECK: pass`). `np models install --member <main|mmproj>`: the member name keys `model_files`, the file lands at `<id>.mmproj`
 (`member_artifact_name`), and the model row is not written — asserted as a whole-row comparison, because a projector digest copied into `models.sha256`
 would leave every file readable and make each later verification compare the wrong bytes. Three refusals precede any read: an invented member names
 itself and offers what is installable (`models::INSTALLABLE_MEMBERS`, one list for the parser and the write path so they cannot drift); `--dim` beside a

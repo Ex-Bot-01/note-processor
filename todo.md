@@ -58,7 +58,7 @@ Four questions went up as human decisions; four answers came back, and one of th
   carries a second artifact-free case (both questions are answered before anything loads). Mutants: folding either direction into one class kills one of
   the pair; `LazyLocalEmbedder` answering `Build` kills the vision case. Two doc-link defects appeared only on the feature rustdoc rows and are fixed
   with the reason written where someone would shorten them again.
-* **F28 step ③ shipped (`install --member`, same day).** `--member <main|mmproj>` writes `model_files` and nothing else — pinned by a whole-row
+* **F28 step ③ shipped (`install --member`: commit `b082272`, merged at `5374dc1`; branch CI `42324417379`, merged-tree gates 17 rows exit 0, workspace 680/0).** `--member <main|mmproj>` writes `model_files` and nothing else — pinned by a whole-row
   comparison of `models`, since a projector digest copied into `models.sha256` leaves every file readable and silently redirects every later
   verification. Refusals before any read: an invented member (offering the installable set from `models::INSTALLABLE_MEMBERS`, one list for parser and
   writer), `--dim` beside a widthless member (refused, not ignored), and a projector with no model — which answers about the missing model *before*
