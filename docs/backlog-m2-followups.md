@@ -1011,6 +1011,14 @@ rather than the one it resolves to, and `linked_notes` came back empty where the
 The artifact-gated CLI case that pins `--json`'s key set was re-run with `NP_TEST_MODEL_PATH` set — 1 passed, not `NOT COVERAGE` — so the six-key schema is
 graded by a real model rather than asserted.
 
+**Merged with history at `d05a70a` (commit `f6c9eb9`), and every demand of this card is now met — but it does not close today, because CI cannot grade it.**
+GitHub Actions has failed all four jobs on every SHA since 2026-11-07T01:57Z with **zero steps created** (this merge's run is `42357863387`, four failures in
+~2 s), so "green CI" is not available as evidence for anything, and this repository closes cards on graded trees rather than on local runs. What *is*
+graded on the merged tree: 17 gate rows exit 0; workspace **684 passed / 0 failed**; `GOLDEN CHECK: pass`; and the two artifact-backed suites actually
+running — `np-cli`'s `real_model` module with `NP_TEST_MODEL_PATH` set (**5 passed / 0 failed**, including the six-key hit schema) and `np-core`'s
+`local_vision` with both ggufs present (**15 passed / 0 failed**, no `NOT COVERAGE`). The closure paragraph goes in when a run that *has steps* grades
+`main`; until then this card stays open with its work done, which is the honest state and reads differently from "nothing left".
+
 **A gap this step exposes without causing:** `np models list` prints one line per model and never mentions members, so nothing tells you what the
 workspace recorded — true of fetched projectors since migration 9, so it is a reporting gap rather than an install one. The confirmation today is that
 `np embed` stops reporting `projector-absent`; that sentence is in the README's Option B, and closing it properly means adding member names to the

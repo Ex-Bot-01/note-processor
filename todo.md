@@ -79,7 +79,11 @@ Four questions went up as human decisions; four answers came back, and one of th
   this file's own documented species caught by asserting non-emptiness (media planted at the spelled path instead of the resolved one). The artifact-gated
   CLI key-set case re-run with `NP_TEST_MODEL_PATH` set: **1 passed, not `NOT COVERAGE`**. End to end on a vision binary with both ggufs installed offline
   through step ③: `linked_from: 2`, `linked_notes: ["notes/a.md","notes/b.md"]`, and the text line above.
-* **Remaining for F28:** closure once the merged tree is graded (CI is in a zero-step incident, see above). Then, exposed by step ③ and not caused by it:
+* **F28 merged with history (`d05a70a`, commit `f6c9eb9`); closure withheld on purpose.** Merged-tree grading: 17 rows exit 0, workspace 684 passed /
+  0 failed, `GOLDEN CHECK: pass`, and the artifact suites really ran — `np-cli real_model` with `NP_TEST_MODEL_PATH` **5/0** (the six-key schema),
+  `np-core local_vision` with both ggufs **15/0**, no `NOT COVERAGE`. CI cannot grade any of it: run `42357863387`, four jobs, zero steps, ~2 s each — the
+  incident is now ~7 hours and spans markdown-only SHAs too. The closure paragraph goes in when a run with steps grades `main`.
+* **Remaining for F28:** nothing implemented; only CI grading of `main`, then the closing paragraph. Then, exposed by step ③ and not caused by it:
   member names in `np models list`, which needs a change to that command's pinned key set.
 * **CI observation (2026-11-06, on `03ef6d8`, a markdown-only commit).** All four jobs failed in ~58 s with **zero steps created**, three attempts
   (`--failed` rerun, full rerun), while the two pushes five minutes earlier (`5374dc1`, `5e368ac`) completed green on the same workflow file. That is
