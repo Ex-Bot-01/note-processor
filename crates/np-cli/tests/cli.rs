@@ -72,6 +72,12 @@ impl Workspace {
             .env("HOME", self._tmp.path())
             .env("XDG_CONFIG_HOME", self.config_dir())
             .env("APPDATA", self.config_dir());
+        // **F38 made these two load-bearing.** `NP_MODELS_BASE_URL` decides where a fetch dials and `NP_NO_AUTO_FETCH`
+        // decides whether `np embed` may dial at all, so a developer's shell must not be able to change what this suite
+        // proves — the same reason `tests/models_cli.rs:80` already removes the first. A case that wants either sets it
+        // explicitly on its own `Command`, which is also how the reader learns the case depends on it.
+        cmd.env_remove("NP_MODELS_BASE_URL");
+        cmd.env_remove("NP_NO_AUTO_FETCH");
         cmd.args(args);
         cmd
     }
@@ -1817,6 +1823,168 @@ fn embed_with_unloadable_bytes_reports_owed_and_not_produced() {
     assert!(summary_count(&stdout, "seen") > 0, "{stdout}");
     assert_eq!(summary_count(&stdout, "embedded"), 0);
     assert_eq!(summary_count(&stdout, "errors"), 1, "one batch refused");
+}
+
+/// **F38 Task 3, the trigger.** `[embeddings] model` names an id this build **pins**, the workspace has neither row nor
+/// artifact, and nothing switched fetching off — so `np embed` tries to fetch instead of refusing, and says so before byte
+/// one. The origin is pointed at port 9 (discard: nothing listens), which makes the attempt fail in the transport class
+/// that means *no connection* — so this test proves both halves at once: the dial-out really happened, and an offline
+/// result is refused as itself rather than reported as a broken vault. No network, no fixture download, no clock games.
+#[cfg(feature = "local-model")]
+#[test]
+fn embed_fetches_a_missing_pinned_model_and_refuses_honestly_when_there_is_no_connection() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config("embeddinggemma-2")); // the one id this build pins
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut cmd = ws.command(&["embed"]);
+    cmd.env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let failed = run(&mut cmd);
+
+    assert_eq!(
+        failed.code(),
+        1,
+        "no vectors were produced: \n{}",
+        failed.stdout()
+    );
+    let out = failed.stdout();
+    let err = failed.stderr();
+    assert!(
+        out.contains("fetching"),
+        "the plan is announced first:\n{out}"
+    );
+    assert!(out.contains("embeddinggemma-2"), "naming the id: {out}");
+    assert!(
+        out.contains("origin      from [models] base_url"),
+        "and the origin's *kind*: {out}"
+    );
+    assert!(
+        err.contains("offline") && err.contains("nothing was embedded"),
+        "an unreachable origin is its own answer: {err}"
+    );
+    assert!(
+        !out.contains("127.0.0.1") && !err.contains("127.0.0.1"),
+        "§12 rule 8: a class, never a host — {out}\n{err}"
+    );
+    assert!(
+        !out.contains("configuration disabled") && !err.contains("configuration disabled"),
+        "the fetch was attempted, so F32's configuration arm must not answer: {out}"
+    );
+
+    // Mutation this catches: dropping the trigger (back to `placeholder(RowMissing)`), which fails on `fetching` while
+    // every other line above still reads plausibly. The host assertion is the one that survives a refactor of the wording.
+}
+
+/// **The switch works without a config file.** Same missing pinned artifact, same dead origin — but with
+/// `NP_NO_AUTO_FETCH=1`, so this run must behave exactly as it did before F38: no announcement, no dial attempt, and
+/// §6's configuration arm naming the key that points at an uninstalled model. Every pre-F38 embed refusal has to survive
+/// this way; turning fetching on was supposed to reorder behaviour, not delete the old path.
+#[cfg(feature = "local-model")]
+#[test]
+fn the_kill_switch_leaves_the_old_refusal_word_for_word() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config("embeddinggemma-2"));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut cmd = ws.command(&["embed"]);
+    cmd.env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    cmd.env("NP_NO_AUTO_FETCH", "1");
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stdout());
+    for channel in [failed.stdout(), failed.stderr()] {
+        assert!(
+            channel.contains("configuration disabled"),
+            "the pre-F38 arm answers: {channel}"
+        );
+        assert!(
+            !channel.contains("fetching") && !channel.contains("offline"),
+            "and nothing hints at a dial-out that was forbidden: {channel}"
+        );
+    }
+}
+
+/// **Hermeticity is now load-bearing, so it gets its own test instead of staying a coincidence.** An id with no pinned
+/// bytes is refused before a transport is chosen, even with fetching allowed and a dead origin configured. This is what
+/// keeps the whole suite off the network once the default is on: fixtures name ids nobody pinned — but "the fixtures happen
+/// to use other names" is not a property, this is.
+#[cfg(feature = "local-model")]
+#[test]
+fn an_unpinned_id_is_refused_before_any_transport_is_chosen() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config("my-private-embedder"));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut cmd = ws.command(&["embed"]);
+    cmd.env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stdout());
+    for channel in [failed.stdout(), failed.stderr()] {
+        assert!(channel.contains("configuration disabled"), "{channel}");
+        assert!(
+            !channel.contains("fetching") && !channel.contains("offline"),
+            "no fetch may be planned for an id this build pins no bytes for: {channel}"
+        );
+    }
+}
+
+/// **A binary that links no inference runtime never fetches, whatever the config says.** The 310 MB would arrive on a disk
+/// and be read by nothing — F40's state, used here as a compile-time gate rather than a runtime one. This is also the proof
+/// that the default build's CI row cannot reach a network: the trigger is not merely switched off, it is not compiled in.
+#[cfg(not(feature = "local-model"))]
+#[test]
+fn a_build_without_the_runtime_does_not_fetch_a_model_it_cannot_load() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config("embeddinggemma-2"));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let mut cmd = ws.command(&["embed"]);
+    cmd.env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let failed = run(&mut cmd);
+
+    assert_eq!(failed.code(), 1, "\n{}", failed.stdout());
+    for channel in [failed.stdout(), failed.stderr()] {
+        assert!(channel.contains("configuration disabled"), "{channel}");
+        assert!(
+            !channel.contains("fetching") && !channel.contains("offline"),
+            "fetching into a build with no runtime would transfer bytes nothing can read: {channel}"
+        );
+    }
+}
+
+/// **argv beats the file, in both directions.** `[models] auto_fetch = false` with `--auto-fetch` still attempts the
+/// fetch (the operator is asking for it here and now), and the environment switch still overrides `--auto-fetch`, because
+/// a safety switch that an argument defeats is not one.
+#[cfg(feature = "local-model")]
+#[test]
+fn argv_and_the_environment_each_outrank_the_file_in_one_direction() {
+    let ws = workspace();
+    ws.write_user_config(&format!(
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"embeddinggemma-2\"\n\n[models]\nauto_fetch = false\n"
+    ));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    // argv wins over the file…
+    let mut forced = ws.command(&["embed", "--auto-fetch"]);
+    forced.env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let attempted = run(&mut forced);
+    assert!(
+        attempted.stdout().contains("fetching"),
+        "`--auto-fetch` over `[models] auto_fetch = false`: {}",
+        attempted.stdout()
+    );
+
+    // …and the environment wins over argv, one way only.
+    let mut blocked = ws.command(&["embed", "--auto-fetch"]);
+    blocked.env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    blocked.env("NP_NO_AUTO_FETCH", "1");
+    let refused = run(&mut blocked);
+    assert!(
+        !refused.stdout().contains("fetching"),
+        "NP_NO_AUTO_FETCH must beat even an explicit request to fetch: {}",
+        refused.stdout()
+    );
 }
 
 /// §6 adds no exit code: a missing operand stays clap's problem, and clap's 2 has to survive the trip from

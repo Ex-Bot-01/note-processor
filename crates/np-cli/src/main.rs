@@ -52,12 +52,24 @@ enum Command {
         json: bool,
     },
     /// Embed the notes a workspace owes, for the configured model.
+    ///
+    /// **This command may fetch** (**F38**). When `[embeddings] model` names an id this build pins and the artifact is
+    /// missing, `embed` transfers it before embedding — because the consumer of this program is increasingly another
+    /// program that wants vectors to exist rather than a person willing to sequence three commands. It is off unless you
+    /// switch it on (`--no-auto-fetch`, or `NP_NO_AUTO_FETCH=1`), it fires only for **pinned** ids, and it never happens
+    /// in a build with no inference runtime. `np search` has no such flag: reading a vault must never cost a download.
     Embed {
         /// Workspace root to embed.
         workspace: PathBuf,
         /// Print the report as JSON instead of a summary.
         #[arg(long)]
         json: bool,
+        /// Fetch the pinned artifact if this workspace is missing it (the default; see `[models] auto_fetch`).
+        #[arg(long)]
+        auto_fetch: bool,
+        /// Never dial out from this run, even where the config allows it. For air-gapped machines, metered links and CI.
+        #[arg(long, conflicts_with = "auto_fetch")]
+        no_auto_fetch: bool,
     },
     /// Rank the indexed notes and images against a text query.
     ///
@@ -210,7 +222,16 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Scan { workspace, json } => scan_workspace(&workspace, json),
-        Command::Embed { workspace, json } => embed_workspace(&workspace, json),
+        Command::Embed {
+            workspace,
+            json,
+            auto_fetch,
+            no_auto_fetch,
+        } => embed_workspace(
+            &workspace,
+            json,
+            AutoFetch::from_flags(auto_fetch, no_auto_fetch),
+        ),
         Command::Search {
             workspace,
             query,
@@ -402,7 +423,53 @@ fn print_summary(report: &ScanReport) {
 /// Three of the four arms leave as exit 1 with the arm's sentence on stderr *and* in the printed report: two
 /// channels for one fact, the posture `np models list` already takes for a directory-level failure. No new exit
 /// code is introduced — §6 says so, and clap keeps argv failures at 2.
-fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
+/// Whether this run may fetch a pinned artifact it is missing (**F38**), resolved from argv before anything else.
+///
+/// Three values rather than a `bool` because "the operator said yes" and "nobody said anything" must not collapse: the
+/// first ignores the config file, the second defers to it. Resolution order is **argv → environment+file** — argv last
+/// in the chain of authority but highest, so `--no-auto-fetch` outranks both `[models] auto_fetch = true` and an
+/// accidentally exported variable, which is what makes the flag worth having on a metered link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoFetch {
+    /// Neither flag given: ask `Config::auto_fetch_allowed`, which consults `[models] auto_fetch` and `NP_NO_AUTO_FETCH`.
+    Deferred,
+    /// `--auto-fetch`: fetch even if the file says no (the environment kill switch still wins — see [`AutoFetch::allowed`]).
+    Forced,
+    /// `--no-auto-fetch`: never fetch from this run.
+    Refused,
+}
+
+impl AutoFetch {
+    fn from_flags(on: bool, off: bool) -> Self {
+        if on {
+            Self::Forced
+        } else if off {
+            Self::Refused
+        } else {
+            Self::Deferred
+        }
+    }
+
+    /// The answer for this run. `NP_NO_AUTO_FETCH` overrides even `--auto-fetch`, in one direction only: a switch that
+    /// an argument can defeat is not a safety switch, and the person who needs it (CI, an air-gapped host) is usually
+    /// the one who does not control the argv someone else typed.
+    fn allowed(self, cfg: &Config) -> bool {
+        let file_or_env = cfg.models.auto_fetch_allowed();
+        match self {
+            Self::Refused => false,
+            Self::Deferred => file_or_env,
+            // The operator asked for this fetch here and now, so the file's "no" does not bind them — but the kill switch
+            // still does. That asymmetry is the whole design: argv may open a door, only the environment may bolt it.
+            Self::Forced => !np_core::config::ModelsConfig::env_forbids_fetch(),
+        }
+    }
+}
+
+fn embed_workspace(
+    workspace: &Path,
+    json: bool,
+    auto_fetch: AutoFetch,
+) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
     // Destructured rather than reached through the struct: the borrow below has to outlive the statement that takes it,
     // and `Resolution::Provider` needs `&mut` into the box that `state` owns.
@@ -410,7 +477,7 @@ fn embed_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
         mut state,
         artifact_check,
         workers,
-    } = embed_provider(&cfg, workspace)?;
+    } = embed_provider(&cfg, workspace, auto_fetch.allowed(&cfg), !json)?;
     // The reason a provider could not be built travels as a value — [`ProviderState::ArtifactAbsent`] for a missing file,
     // [`ProviderState::Placeholder`]'s reason for the configuration states. Handing over a bare placeholder is how R6c1 D-2
     // happened: an absent artifact became a provider that declares 0 dimensions, and the run refused with a sentence about
@@ -504,7 +571,10 @@ fn search_workspace(
         // call site knew only one of the five answers it printed `embeddings.provider = "none"` about a configuration that
         // said `local-model` (F32). Every placeholder reason collapses into a single arm on purpose — §1 of the F32 design
         // measures that no CLI invocation can reach two of them, so per-state arms here would be mapping sites nothing can test.
-        let provider = match embed_provider(&cfg, workspace)?.state {
+        // **`false`, and it stays false with no flag to change it** (F38 §5): search is a read, F36 made it answer without
+        // vectors, and "your query took four minutes because it fetched a model" on a metered laptop is the surprise this
+        // rule exists to prevent. If a future command wants the trigger, it asks for it here by name.
+        let provider = match embed_provider(&cfg, workspace, false, !json)?.state {
             ProviderState::Ready(provider) => provider,
             ProviderState::Placeholder { reason, .. } => {
                 return Err(reason.sentence(workspace).into())
@@ -764,7 +834,21 @@ fn artifact_absent() -> Resolved {
 /// The row is read through a connection that closes when this function returns, before `embed_run` opens its
 /// own: np-cli holds no SQL of its own, and one workspace's [`np_core::db::ModelRow`] is where a local provider's
 /// identity comes from (§3).
-fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Error>> {
+/// Resolve `[embeddings]` into something that can embed — or into the one refusal that explains why nothing can.
+///
+/// `auto_fetch` is **F38's trigger**, and it is a parameter rather than a global so that each call site states its
+/// permission: `np embed` passes the operator's decision, `np search` passes `false` unconditionally. Even when true, a
+/// fetch needs three more things — an id this build **pins**, a build that can run inference, and the compile-time
+/// `fetch` feature — so no configuration value alone can make a binary dial out.
+/// `announce` is text mode only: `false` under `--json`, where stdout holds exactly one document and a progress line
+/// would corrupt it. **F38**'s notice is therefore suppressed rather than smuggled onto stderr, keeping that promise the
+/// simple thing it is — Task 4 replaces the line with a `fetched` key, which is what a program should read anyway.
+fn embed_provider(
+    cfg: &Config,
+    workspace: &Path,
+    auto_fetch: bool,
+    announce: bool,
+) -> Result<Resolved, Box<dyn Error>> {
     match cfg.embeddings.provider {
         // The default. Nothing is built, nothing is contacted, and the report says *configuration disabled*
         // rather than a fault (§2, §6).
@@ -780,7 +864,47 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
                 return Ok(placeholder(NoProvider::ModelUnnamed));
             };
             let db = workspace_db(cfg, workspace)?;
-            let Some(row) = model_row(&db, id)? else {
+            let models_dir = cfg.workspace_models_dir(workspace);
+            let artifact = models_dir.join(id);
+            // `mut` only where the trigger is compiled in: a fetch records the `models` row, so that arm re-reads it
+            // below. Everywhere else the binding is read-only from birth, and the warning would be true of that build.
+            #[cfg_attr(
+                not(all(feature = "local-model", feature = "fetch")),
+                allow(unused_mut)
+            )]
+            let mut row = model_row(&db, id)?;
+
+            // ---- **F38's trigger: fetch the pinned artifact this workspace is missing.** One place, before any provider
+            // is constructed and long before any transaction opens — a download that starts mid-embed would hold a write
+            // lock through someone else's egress.
+            //
+            // Four things must all be true, and each one is a different mistake prevented:
+            //   * `auto_fetch`             — the operator said so (argv, config, or the default), and `NP_NO_AUTO_FETCH`
+            //                              has already had its veto inside [`AutoFetch::allowed`];
+            //   * `pins::identity(id)`     — this build pins bytes for the id. That is what makes a default-on fetch
+            //                              defensible: the target is one known artifact from one origin verified by
+            //                              digest, never "whatever config named";
+            //   * `feature = "local-model"`— a binary that links no inference runtime must not spend 310 MB it can never
+            //                              read. F40 gave this state a name; here it is a compile-time gate;
+            //   * `feature = "fetch"`      — a build that compiled the HTTP client out cannot advertise a dial-out.
+            //
+            // Nothing here prints in `--json` mode (`announce`), and nothing here ever names a host (§12 rule 8): the only
+            // origin fact allowed out is *which kind* of origin was resolved.
+            #[cfg(all(feature = "local-model", feature = "fetch"))]
+            let attempted_fetch = auto_fetch
+                && np_core::pins::identity(id).is_some()
+                && (row.is_none() || !artifact.is_file());
+            #[cfg(all(feature = "local-model", feature = "fetch"))]
+            if attempted_fetch {
+                fetch_pinned_missing(cfg, &db, &models_dir, id, announce)?;
+                // The fetch records the `models` row itself, so a workspace that had neither row nor file is now a
+                // workspace with both — re-read rather than assume, and let F32's arm still answer if it somehow did not.
+                row = model_row(&db, id)?;
+            }
+            #[cfg(not(all(feature = "local-model", feature = "fetch")))]
+            let _ = (auto_fetch, announce, &models_dir, &artifact);
+
+            let Some(row) = row else {
                 // F32's arm: this is the state that used to print a sentence about `provider = "none"`.
                 return Ok(placeholder(NoProvider::RowMissing { id: id.to_string() }));
             };
@@ -799,7 +923,6 @@ fn embed_provider(cfg: &Config, workspace: &Path) -> Result<Resolved, Box<dyn Er
                     declared: row.dim.to_string(),
                 }));
             };
-            let artifact = cfg.workspace_models_dir(workspace).join(id);
 
             // With the runtime compiled in, the provider is the one that loads llama.cpp **on first use**
             // (`local_model::LazyLocalEmbedder`, §14): resolving a provider happens before anyone knows whether
@@ -1040,6 +1163,90 @@ fn workspace_db(config: &Config, workspace: &Path) -> Result<Db, Box<dyn Error>>
 /// in a build log. Since 2026-11-04 an origin exists on every run — `[models] base_url` and `NP_MODELS_BASE_URL` both
 /// silent means [`np_core::pins::DEFAULT_ORIGIN`] — which makes *not* printing it the more important half of the rule.
 #[cfg(feature = "fetch")]
+/// The one sentence that says **which kind** of origin this run would dial (**F38**, §12 rule 8).
+///
+/// A *kind*, never a host: `np models fetch`'s existing line and this one share the wording so they cannot drift into
+/// disagreeing about the same config state. The distinction it draws is real and cheap to lose — `[models] base_url`
+/// unset means the origin baked into the pin table, while an empty `NP_MODELS_BASE_URL=` counts as unset too, so "no
+/// configuration" and "configuration lost to a shell" look identical from here and both spend someone's egress.
+fn origin_kind_line(cfg: &Config) -> &'static str {
+    if cfg.models.base_url.is_none() {
+        "origin      this build's compiled-in default — no [models] base_url is configured (an empty \
+         NP_MODELS_BASE_URL counts as unset)"
+    } else {
+        "origin      from [models] base_url"
+    }
+}
+
+/// Fetch the pinned id's members that **this build can use**, because this workspace is missing them (**F38**).
+///
+/// Called only from the trigger in [`embed_provider`], which has already decided a fetch is permitted; this function's own
+/// job is to be honest about the transfer and to classify its failure rather than flatten it.
+///
+/// * **Before byte one**, in text mode, it says what is about to happen: id, the members this build would load, their
+///   combined size, and the origin's *kind*. `np models fetch` prints the same pair of lines for the same reason — a
+///   silent 310 MB transfer is not a side effect anyone should discover afterwards.
+/// * **Offline is its own answer** (`FetchError::is_offline`, F38 §5): no probe was run, and none will be — this call *is*
+///   the probe, made only where the artifact was already missing, so a machine that holds its model pays nothing. The
+///   sentence says what could not be reached, that nothing was embedded, and what to re-run; it does not dress a missing
+///   network up as a broken vault, which is F40's lesson applied one arm over.
+/// * **Anything the origin actually answered** — 404, 403, a redirect, wrong bytes — propagates as `fetch`'s own refusal,
+///   unchanged. Those are not outages and must never be skipped past: an unreachable mirror behind "offline" is how a
+///   broken install becomes permanent.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+fn fetch_pinned_missing(
+    cfg: &Config,
+    db: &Db,
+    models_dir: &Path,
+    id: &str,
+    announce: bool,
+) -> Result<(), Box<dyn Error>> {
+    let members = np_core::pins::members_for_build();
+    let bytes: u64 = members
+        .iter()
+        .filter_map(|name| np_core::pins::pinned_member(id, name))
+        .map(|pin| pin.size_bytes)
+        .sum();
+
+    if announce {
+        emit(&format!(
+            "fetching     {id} ({}, {}) — this workspace has no artifact to embed with",
+            members.join(", "),
+            size_human(bytes),
+        ));
+        emit(origin_kind_line(cfg));
+    }
+
+    let origin = fetch::resolve_origin(cfg.models.base_url.as_deref());
+    let transport = fetch::HttpTransport::new(origin);
+    let requested: Vec<&str> = members.to_vec();
+    match fetch::fetch(db, models_dir, id, &requested, &transport, now_secs()) {
+        Ok(report) => {
+            if announce {
+                for member in &report.members {
+                    emit(&format!(
+                        "{FETCHED_KEY}{} ({}, sha256 {})",
+                        member.member,
+                        size_human(member.bytes),
+                        member.sha256
+                    ));
+                }
+                emit(&free_space_line(report.free_bytes));
+            }
+            Ok(())
+        }
+        Err(err) if err.is_offline() => Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            format!(
+                "offline: could not reach the pinned origin to fetch `{id}`, so nothing was embedded — \
+                 connect and run `np embed` again, or search meanwhile by keyword (`np search --mode keyword`)"
+            ),
+        )
+        .into()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn models_fetch(
     workspace: &Path,
     id: &str,
@@ -1084,12 +1291,7 @@ fn models_fetch(
     // was lost to a shell (`NP_MODELS_BASE_URL=$MIRROR` with `MIRROR` unset) would otherwise spend the operator's egress
     // budget in silence.
     if !json {
-        emit(if config.models.base_url.is_none() {
-            "origin      this build's compiled-in default — no [models] base_url is configured (an empty \
-             NP_MODELS_BASE_URL counts as unset)"
-        } else {
-            "origin      from [models] base_url"
-        });
+        emit(origin_kind_line(&config));
     }
 
     // **Fetch what this binary can use** (`docs/design-m2-image-embeddings.md` §13): with no `--member`, the plan is

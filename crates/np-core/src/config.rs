@@ -264,7 +264,17 @@ impl ModelsConfig {
     /// Any value except empty or exactly `0` forbids — including `"0 "`, which reads as a mistake someone meant to forbid
     /// with. A switch that must be spelled correctly during a network outage is a switch that does not work.
     pub fn auto_fetch_allowed(&self) -> bool {
-        self.auto_fetch && !env_flag_set("NP_NO_AUTO_FETCH")
+        self.auto_fetch && !Self::env_forbids_fetch()
+    }
+
+    /// The environment half of [`ModelsConfig::auto_fetch_allowed`], on its own because **argv needs to consult it
+    /// without the file** (**F38**): `--auto-fetch` overrides `[models] auto_fetch = false`, and nothing overrides the
+    /// kill switch — so a caller that has been explicitly asked to fetch still owes this question before it dials.
+    ///
+    /// Splitting it out is also what keeps the two halves from drifting: one reader of `NP_NO_AUTO_FETCH` answers for
+    /// both the config-shaped decision and the argv-shaped one.
+    pub fn env_forbids_fetch() -> bool {
+        env_flag_set("NP_NO_AUTO_FETCH")
     }
 }
 
