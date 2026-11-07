@@ -199,6 +199,24 @@ pub struct ModelsConfig {
     /// characters is refused naming the key. Read it through [`ModelsConfig::unpinned_digest_override`], which
     /// carries the obligation that comes with using it.
     pub sha256: Option<String>,
+    /// Whether a command that needs the pinned artifact may fetch it when it is absent (**F38**).
+    ///
+    /// **Default true**, which is a product decision rather than a serde convenience: the consumer of this program is
+    /// increasingly another program, and "call `np embed`, get vectors" beats "call three commands and interpret three
+    /// refusals". Default-on is defensible only because the surface is narrow — one id has pinned bytes
+    /// ([`crate::pins`]), from one origin, verified by digest before anything is published — so what this key permits is
+    /// never "download whatever config named". A machine that already holds its artifact pays nothing for the default:
+    /// the trigger fires only where the answer to "is it there?" was no.
+    ///
+    /// Read it through [`ModelsConfig::auto_fetch_allowed`], which also consults `NP_NO_AUTO_FETCH`. Nothing here lets
+    /// an *unpinned* id be fetched, whatever this says.
+    #[serde(default = "auto_fetch_default")]
+    pub auto_fetch: bool,
+}
+
+/// The default for [`ModelsConfig::auto_fetch`] as a function, so serde and [`Default`] state it once.
+fn auto_fetch_default() -> bool {
+    true
 }
 
 /// Hand-written so that both keys default to *unset* in one place — the state §12 rule 7 calls "the pin stands, and
@@ -208,6 +226,7 @@ impl Default for ModelsConfig {
         Self {
             base_url: None,
             sha256: None,
+            auto_fetch: auto_fetch_default(),
         }
     }
 }
@@ -227,6 +246,25 @@ impl ModelsConfig {
     /// in `docs/design-m2-local-embeddings.md` §12 rule 7 that says the override is live.
     pub fn unpinned_digest_override(&self) -> Option<&str> {
         self.sha256.as_deref()
+    }
+
+    /// Whether this process may fetch a pinned artifact: the file's answer **and** nobody having forbidden it from
+    /// outside with `NP_NO_AUTO_FETCH`.
+    ///
+    /// The environment outranks the file here, which breaks the precedence every other `[models]` key follows — and
+    /// deliberately. `base_url` and `sha256` are *declarations*, so the operator's stated intent in the file wins and the
+    /// environment only fills what the file left unset. This one is a **forbiddance**, and the people who need it are not
+    /// the people who own that file: CI, an air-gapped host, a metered link on someone else's laptop. A switch a config
+    /// file can veto is not a safety switch. It overrides in one direction only — setting `NP_NO_AUTO_FETCH=1` can turn
+    /// fetching off, never on.
+    ///
+    /// Consulted per call rather than folded into the field at load, so a long-lived `Config` (the daemon this all feeds)
+    /// can be silenced mid-life without a reload.
+    ///
+    /// Any value except empty or exactly `0` forbids — including `"0 "`, which reads as a mistake someone meant to forbid
+    /// with. A switch that must be spelled correctly during a network outage is a switch that does not work.
+    pub fn auto_fetch_allowed(&self) -> bool {
+        self.auto_fetch && !env_flag_set("NP_NO_AUTO_FETCH")
     }
 }
 
@@ -926,9 +964,19 @@ fn validate_digest(digest: &str, origin: &str) -> Result<String, ConfigError> {
     }
 }
 
-/// Non-empty environment variable as text; an empty value counts as unset, the rule [`env_path`] applies to paths.
+/// Whether `key` is set to something that means "on": present, non-empty, and not exactly `0`.
 ///
-/// A value that is not valid UTF-8 is **refused**, not skipped: both `[models]` keys are ASCII by rule (an origin,
+/// Deliberately not [`env_text`]: that one refuses non-UTF-8 because both `[models]` string keys are ASCII by rule, and
+/// refusing here would mean a machine whose environment is unparseable gets *no* answer about whether it may dial out —
+/// the exact moment a safety switch must not shrug. A non-UTF-8 value is still not empty-or-`0`, so this reads it as "on".
+fn env_flag_set(key: &str) -> bool {
+    match env::var_os(key) {
+        None => false,
+        Some(value) => !(value.is_empty() || value == "0"),
+    }
+}
+
+/// Non-empty environment variable as text; an empty value counts as unset, the rule [`env_path`] applies to paths., not skipped: both `[models]` keys are ASCII by rule (an origin,
 /// a hex digest), so such a value is a mistake in the environment someone can fix — and ignoring it would report
 /// "unset" to a person who believes they set an override.
 fn env_text(key: &str) -> Result<Option<String>, ConfigError> {

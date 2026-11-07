@@ -1002,6 +1002,11 @@ fn every_section_refuses_an_unknown_key() {
             "`pausedd`",
         ),
         ("[search]", "[search]\nmodee = \"keyword\"\n", "`modee`"),
+        (
+            "[models]",
+            "[models]\nauto_fetche = true\n",
+            "`auto_fetche`",
+        ),
     ] {
         let (path, err) = root_refusal(body);
         let message = err.to_string();
@@ -1036,7 +1041,7 @@ fn a_file_of_real_keys_still_loads_every_section() {
         "[catalog]\nmax_entries_per_file = 400\ncontinuation_indent = 4\n\
          [markers]\ndone = [\"done\"]\npaused = [\"on hold\"]\n\
          [embeddings]\nprovider = \"none\"\nmax_tokens = 512\n\
-         [models]\nbase_url = \"https://mirror.example\"\n\
+         [models]\nbase_url = \"https://mirror.example\"\nauto_fetch = false\n\
          [search]\nmode = \"keyword\"\n",
     );
 
@@ -1054,6 +1059,10 @@ fn a_file_of_real_keys_still_loads_every_section() {
         cfg.search.mode,
         SearchMode::Keyword,
         "the ranking choice arrives, not just the section"
+    );
+    assert!(
+        !cfg.models.auto_fetch,
+        "an explicit `auto_fetch = false` must arrive rather than default back to true"
     );
 
     // Mutation this catches: making the root strict by refusing *nested tables* wholesale (a visitor that only
@@ -2206,4 +2215,89 @@ fn an_invented_search_mode_is_refused_and_names_the_three() {
     // Mutations this catches: adding a serde `other` arm that swallows the value into the default, and renaming a mode in
     // one door only — `SearchMode` is the single definition behind config, `--mode` and `--json`, so a fourth spelling has
     // nowhere to enter. The argv door is pinned by `an_invented_mode_refuses_with_claps_exit_two` in `np-cli`.
+}
+
+// ---------------------------------------------------------------------------
+// F38: `[models] auto_fetch` — the pinned model may be fetched without being asked twice,
+// and there is a switch off that no config file can veto. `docs/design-f38-auto-fetch.md`.
+// ---------------------------------------------------------------------------
+
+/// **The default is the product decision.** An application calling `np embed` wants vectors to simply exist, so a
+/// machine with nothing installed fetches rather than refuses — which is only safe because the surface is one pinned
+/// id from one origin (§12 rule 7), not "the internet". A default flipped here flips first-run behaviour on every
+/// machine, so it is asserted in both directions: absent means on, and `allowed()` agrees when nothing objects.
+#[test]
+fn an_absent_auto_fetch_leaves_the_pinned_model_fetchable() {
+    let _env = hold_env();
+    env::remove_var("NP_NO_AUTO_FETCH");
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[catalog]\nmax_entries_per_file = 300\n");
+
+    let cfg = Config::load(Some(&path)).expect("a file with no [models] section must load");
+    assert!(
+        cfg.models.auto_fetch,
+        "F38: fetching the pinned artifact is on unless someone says otherwise"
+    );
+    assert!(cfg.models.auto_fetch_allowed());
+}
+
+/// Off in the file means off, and a non-boolean is refused by name rather than read as truthy. TOML has a real boolean
+/// type; accepting `"no"` would be the moment this key started lying about what it was set to.
+#[test]
+fn auto_fetch_can_be_switched_off_in_the_file_and_a_string_is_refused() {
+    let _env = hold_env();
+    env::remove_var("NP_NO_AUTO_FETCH");
+    let tmp = TempDir::new().expect("test setup: tempdir");
+
+    let off = write_config_with_data_dir(tmp.path(), "[models]\nauto_fetch = false\n");
+    let cfg = Config::load(Some(&off)).expect("[models] auto_fetch = false is a real key");
+    assert!(!cfg.models.auto_fetch);
+    assert!(
+        !cfg.models.auto_fetch_allowed(),
+        "the file said off, and nothing else may talk it back on"
+    );
+
+    let text = write_config_with_data_dir(tmp.path(), "[models]\nauto_fetch = \"no\"\n");
+    let err = Config::load(Some(&text)).expect_err("a string is not a boolean");
+    assert!(
+        err.to_string().contains("auto_fetch"),
+        "the refusal must name the key: {err}"
+    );
+}
+
+/// **The kill switch has to outrank the file, or it is not one.** `NP_MODELS_BASE_URL` *fills* a key the file left
+/// unset (`base_url` wins), and that ordering is right for an origin — the file is the operator's stated intent. It
+/// would be wrong here: CI, an air-gapped machine and a metered link all need to forbid a dial-out from outside, on a
+/// box whose config says fetching is fine. So `NP_NO_AUTO_FETCH` overrides in one direction only, and any value except
+/// empty or `0` counts — a switch you have to spell correctly under a network outage is a switch that does not work.
+#[test]
+fn the_kill_switch_works_without_a_file_to_veto_it() {
+    let _env = hold_env();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "[models]\nauto_fetch = true\n");
+    let cfg = Config::load(Some(&path)).expect("the file says fetching is allowed");
+    assert!(cfg.models.auto_fetch_allowed(), "unset env leaves the file in charge");
+
+    for on in ["1", "true", "yes", "0 "] {
+        env::set_var("NP_NO_AUTO_FETCH", on);
+        assert!(
+            !cfg.models.auto_fetch_allowed(),
+            "NP_NO_AUTO_FETCH={on:?} must forbid fetching even though the file allows it"
+        );
+    }
+
+    // Empty and `0` mean "not switched off": same unset rule as every other np environment key, so a script that
+    // exports an empty variable from a template does not silently disable the feature.
+    for off in ["", "0"] {
+        env::set_var("NP_NO_AUTO_FETCH", off);
+        assert!(
+            cfg.models.auto_fetch_allowed(),
+            "NP_NO_AUTO_FETCH={off:?} means unset, not off"
+        );
+    }
+    env::remove_var("NP_NO_AUTO_FETCH");
+
+    // Mutation this catches: reading the env var at load time and folding it into the field. That would make
+    // `auto_fetch` mean two different things depending on when `Config::load` ran, and a caller holding a long-lived
+    // Config (a daemon) could never turn fetching off mid-life.
 }
