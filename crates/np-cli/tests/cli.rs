@@ -2282,6 +2282,61 @@ fn search_without_a_model_answers_from_keywords_and_says_the_half_that_ran() {
     );
 }
 
+/// **An empty result says which half ran, and never prints a model name that does not exist.** The first interactive Windows
+/// run (2026-11-07) hit `nothing indexed for  by hybrid` on the most likely first invocation of all — no `[embeddings]` section,
+/// no vectors, a query nothing matches. `{model}` interpolated the empty string: a double space where a name belongs, and a claim
+/// about an index the keyword half had just finished consulting. The keyword arm is pinned beside it so the two sentences cannot
+/// quietly merge back into one.
+#[test]
+fn an_empty_result_names_the_query_and_never_an_absent_model() {
+    let ws = workspace();
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    // Hybrid, no vectors: the sentence names the query and says the vectors are missing.
+    let mut hybrid = ws.command_without_operand(&["search"]);
+    hybrid.arg(&ws.root).arg("zzz nothing in this vault");
+    let ok = run(&mut hybrid);
+    assert_eq!(
+        ok.code(),
+        0,
+        "an empty result is a fact, not an error:\n{}",
+        ok.stderr()
+    );
+    let line = ok.stdout().trim_end().to_string();
+    assert_eq!(
+        line,
+        r#"nothing matched "zzz nothing in this vault" by hybrid: this workspace holds no vectors"#,
+        "this is the sentence a reader gets"
+    );
+
+    // Keyword mode keeps its own shorter sentence: it never consulted a vector list, so saying one is missing would be noise.
+    let mut keyword = ws.command_without_operand(&["search"]);
+    keyword
+        .arg(&ws.root)
+        .arg("--mode")
+        .arg("keyword")
+        .arg("zzz");
+    let ok = run(&mut keyword);
+    assert_eq!(ok.code(), 0, "\n{}", ok.stderr());
+    assert_eq!(
+        ok.stdout().trim_end(),
+        r#"nothing matched "zzz""#,
+        "keyword mode names the query and nothing else"
+    );
+
+    // The regression itself, asserted as an absence: no double space anywhere, and no `for  by` with a hole in it.
+    for text in [line, ok.stdout()] {
+        assert!(
+            !text.contains("  ") && !text.contains("for  by"),
+            "a sentence with a hole where a model name should be: {text:?}"
+        );
+    }
+
+    // Mutation this catches: interpolating `{model}` unconditionally (both assertions above fail on the first run), and
+    // collapsing the two arms into one, which loses the keyword sentence. The third arm — a real model id with nothing embedded
+    // yet — needs a provider that can embed, so it is pinned in `mod real_model` below.
+}
+
 #[test]
 fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
     // `--json` gains three keys beside `hits`, and they describe the **list**, not one hit: which mode ran, whether this
@@ -2612,6 +2667,38 @@ mod real_model {
             ordered,
             "the array arrives ranked:\n{}",
             json.stdout()
+        );
+    }
+
+    /// The third empty-result arm: a workspace whose model **is** configured and installed, with nothing embedded yet, asks for
+    /// the semantic half and gets an honest `nothing indexed for <id> by semantic` — the sentence that predates F36, kept because
+    /// here a real id exists to name. Gated on `local-model` + artifact because a default build cannot reach it: with no runtime
+    /// compiled in, embedding the query is itself the refusal.
+    #[test]
+    fn an_unembedded_workspace_names_its_model_in_the_empty_result() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        run(&mut ws.command(&["scan"])).assert_success();
+        link_artifact(&ws, &artifact, "query for note search: ");
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+        // Deliberately no `np embed`: the row exists, the vectors do not.
+
+        let mut cmd = ws.command_without_operand(&["search"]);
+        cmd.arg(&ws.root)
+            .arg("--mode")
+            .arg("semantic")
+            .arg("anything");
+        let ok = run(&mut cmd);
+        assert_eq!(
+            ok.code(),
+            0,
+            "no rows yet is a fact, not a refusal:\n{}",
+            ok.stderr()
+        );
+        assert_eq!(
+            ok.stdout().trim_end(),
+            format!("nothing indexed for {EMBED_MODEL} by semantic"),
+            "with a real id in hand, the sentence names it"
         );
     }
 

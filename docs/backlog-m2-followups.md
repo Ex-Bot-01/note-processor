@@ -402,6 +402,42 @@ installed either). CI's compile is therefore the only Windows-compile evidence t
 Linux host cannot even type-check the arm it describes. Related, and consistent with design-a4 §6.5: A4's `file_identity` returns `None` off
 Unix (`walk.rs:501-506`), so file identity is *inert* on Windows by design, not supported.
 
+
+**First interactive run on real Windows hardware — 2026-11-07.** Supplied by the operator as an artifact bundle (`np-win-run.zip`:
+`REPORT.md`, four `.ps1` scripts, five logs, and a read-only `db-inspect.log`); the tree tested was an unpacked GitHub ZIP, so it had no
+`.git` and **its commit cannot be named** — future stages should run from `git clone`. Host: Windows 11 `10.0.26100`, Windows PowerShell
+`5.1.26100.9711`, MSVC Build Tools 17.14.44, rustup 1.29.3. Binary from
+`cargo build --release --locked -p np-cli` in 54.75 s; `np 0.2.0`; four subcommands.
+
+What passed there for the first time anywhere:
+
+* **The default build compiles and runs on MSVC.** Until this run, the only Windows-compile evidence was CI's hosted job — and
+  `cargo check --target x86_64-pc-windows-msvc` exits 101 on this Linux box (`ring` and `libsqlite3-sys` need MSVC `lib.exe`), so the card's
+  own claim that CI is unreachable evidence was correct and is now superseded.
+* **All eleven migrations applied natively**, FTS5 shadow tables present, WAL sidecars cleaned, `notes.encoding = "utf-8"`,
+  `title_source = heading`, headings captured, and every integrity counter zero: `fk_orphans = headings=0,tags=0,items=0,links_src=0,links_dst_null=0`,
+  `paths_lossy = files=0,notes=0`, `unindexable = unreadable=0`.
+* **The F36 headline property holds with nothing installed**: `search <ws> "broker migration"` answered `kafka.md` at exit 0 with the one-line
+  caveat on stderr; `--mode keyword` answered with no caveat; `--mode semantic` refused with F32's sentence at exit 1; `--mode fuzzy` gave clap's
+  usage error listing the three names at exit 2.
+* **A path with spaces and non-ASCII** (`C:\Users\chris\Meine Notizen äöü`) indexed `added 1`, then `unchanged 1` — so Windows path keying survived
+  that shape. It is *not* the surrogate collision F18 wants, so the card stays open.
+
+Two findings came out of it, and neither is Windows-specific behaviour:
+
+* **A sentence with a hole in it.** With no `[embeddings]` section and no vectors, `np search <ws> "anything"` printed
+  `nothing indexed for  by hybrid` — `{model}` interpolated the empty string (double space), about an index the keyword half had just consulted.
+  Reproduced on Linux in minutes; fixed with three arms (`keyword` names the query; no-vectors hybrid says the workspace holds no vectors; a real
+  id keeps the old sentence), pinned by `an_empty_result_names_the_query_and_never_an_absent_model` and, for the third arm,
+  `real_model::an_unembedded_workspace_names_its_model_in_the_empty_result`. The Windows box found in one evening what six feature-matrix CI rows had
+  never surfaced, because no CI row ever ran the binary against an empty vault.
+* **The `%LOCALAPPDATA%` surprise is a real product question** — see **F37**.
+
+Still open on this card, unchanged: byte identity for names differing only in unpaired surrogates (WTF-8 and a migration), the ASCII-only identity
+fold that stopped following `Ämli.md` → `ämli.md` renames on Windows, and a human-run `cargo test -p np-core --test walk` that does *not* print
+`NOT COVERAGE`. Not yet run on that machine: Stage 4's config-strictness check, the full suite (Stage 5), inference with an artifact (Stage 6),
+and the rename experiments (Stage 7).
+
 ## F19 — a legacy duplicate note pair re-parses the whole corpus forever
 
 - **Where:** `crates/np-core/src/scan.rs`'s `Indexed::Duplicate` arm charging `written.uncovered` on every
@@ -1552,3 +1588,47 @@ Two real runs are quoted in `README.md` rather than paraphrased: a keyword-only 
   carries its negation so ordering reads consistently; nobody should read either as a probability.
 - **No stemming, and no `OR` mode.** `runner` does not find `runners` (measured, and asserted); a query whose words never co-occur returns
   nothing rather than some. Both are choices (§8 of the design note) that a future card may reverse with data this one does not have.
+
+---
+
+## F37 — on Windows the index lands loose in `%LOCALAPPDATA%`, not in a `note-processor` folder
+
+**Opened 2026-11-07 by the first interactive Windows run. Needs a human decision, not a code change first.**
+
+### The fact
+
+`default_data_dir()` (`crates/np-core/src/config.rs:1059-1062`) returns `%LOCALAPPDATA%` **untouched** on Windows —
+`dir_from(env_path("LOCALAPPDATA"), None, None)` appends nothing — while `config_file_path()` (line 960) does append
+`note-processor`. So a Windows user ends up with:
+
+```text
+C:\Users\<user>\AppData\Local\workspaces\e51b164fc7471791.sqlite     the index for one vault (measured: 167,936 B)
+C:\Users\<user>\AppData\Local\workspaces.sqlite                       the workspace registry (measured: 12,288 B)
+C:\Users\<user>\AppData\Roaming\note-processor\config.toml           config, correctly nested
+```
+
+Observed directly on Windows 11: `dir "$env:LOCALAPPDATA\note-processor\workspaces"` returned `PathNotFound` and the operator concluded the tool
+had written nothing. It had — two directories earlier. README is consistent with the binary (`<data_dir>` is `%LOCALAPPDATA%`), so this is not a
+documentation slip; it is the layout.
+
+### Why it is worth changing
+
+* **Two generically-named entries** (`workspaces`, `workspaces.sqlite`) sit in the directory every application shares. Anything else may create
+  either name; nothing here can tell its own files from theirs, and the registry file has no marker a human would recognise as ours.
+* **The two halves disagree.** Config nests under `%APPDATA%\note-processor`, data does not nest at all — so "where does `np` keep things" has two
+  answers on one platform, and the guide-writing mistake above was downstream of exactly that.
+* Linux and macOS land in `~/.local/share`, where an unqualified `workspaces/` is far less exposed. So this is a Windows-only shape, which is also why
+  six CI rows and every measurement in this repository never noticed it.
+
+### Options, with their cost
+
+| | Change | Cost | Notes |
+| --- | --- | --- | --- |
+| **A** | `default_data_dir()` returns `%LOCALAPPDATA%\note-processor` on Windows | breaks any existing Windows index: the DB is keyed by path hash, so a moved directory reads as an empty workspace until it is re-scanned. Needs a one-time relocation (or a read-fallback to the old location for one release) **and** a README rewrite | cleanest end state; matches config; the fallback keeps it from being a data-loss trap |
+| **B** | Leave the layout, name the files distinctly (`note-processor-workspaces.sqlite`, `note-processor/`) | still a migration for existing files; two names in a shared directory is still not containment | half-measure |
+| **C** | Document it loudly and change nothing | free | leaves the confusion that produced this card, and Windows is about to get more users from the F36 keyword-search story |
+
+**Recommendation: A with a read-fallback for one release.** The population affected today is tiny — the binaries that could produce those paths are
+weeks old, and `v0.1.0`'s shipped asset had no `scan`-adjacent persistence to speak of beyond that same layout — so this is cheap now and expensive
+after Windows users arrive. Do not do it silently: a workspace that suddenly reports `added N` because its index moved elsewhere is the worst possible
+first experience, which is what the fallback exists to prevent.

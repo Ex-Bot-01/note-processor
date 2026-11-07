@@ -57,7 +57,11 @@ row_or_skip() {
   row "$name" "$@"
 }
 
-echo "# tree $(git rev-parse HEAD 2>/dev/null || echo 'not a git checkout') on $(uname -srm)"
+# A log that names a commit while the working tree differs from it is a log that will mislead someone later, so say plainly how many
+# tracked files differ from the named commit. `dirty=0` is what a graded tree looks like.
+tree=$(git rev-parse HEAD 2>/dev/null || echo 'not-a-checkout')
+dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+echo "# tree $tree dirty=$dirty on $(uname -srm)"
 echo "# cmake  ${CMAKE:-none} (local-model rows need it)"
 ram='?'
 [ -r /proc/meminfo ] && ram=$(awk '/^MemTotal:/ { printf "%.1f GB", $2 / 1048576 }' /proc/meminfo)
