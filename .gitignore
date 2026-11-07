@@ -10,3 +10,8 @@ tests/fixtures/corpus/INDEX*.tmp
 # The pinned llama.cpp source, fetched once by scripts/vendor-llama-cpp.sh (§14). Never committed,
 # and never fetched by cargo: build.rs only ever reads a directory that already exists.
 /.vendor
+
+# Release archives built by .github/scripts/package-assets.sh. They belong on a GitHub Release, not in
+# history: `git add -A` swept the v0.2.0 tarball into f75dc97 (3.9 MB of binary), which is the mistake this rule closes.
+# The published bytes are unchanged — same sha256 as `dist/SHA256SUMS.txt` and as the asset on the release.
+dist/
