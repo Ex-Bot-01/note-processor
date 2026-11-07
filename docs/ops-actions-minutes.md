@@ -131,3 +131,28 @@ on a plain branch push, this change regressed.
 Option D's build cache is still not done, and it is now less valuable than it looked: the two feature jobs that rebuild llama.cpp every run are the ones that no
 longer run per merge, so the remaining spend is mostly Rust compilation on `main` pushes plus one nightly full matrix. The cache key would be maintained for a saving
 on ~30 runs a month rather than ~450.
+
+### What the outage still lets you check (2026-11-07, after the reshaping)
+
+A zero-step run answers "is the account able to provision a runner", and nothing else — but it does answer that, which is enough to test the *trigger* half of the
+reshaped workflow without spending a minute. Pushing an empty commit on a throwaway branch `ci-trigger-probe` at ~15:20Z produced **no run at all** in the 85 seconds
+after it (checked twice, and the branch was then deleted), while the two `main` pushes either side of it — `8f78a2d` at 15:15:54Z and `d162754` at 15:18:04Z — each
+created one. So `on.push.branches: [main]` is doing what it says, on GitHub's side, with the account out of minutes.
+
+The same run shows what an outage looks like under the new shape:
+
+```
+Decide the matrix: failure steps=0
+Test (${{ matrix.os }}): skipped steps=0
+Feature local-model (ubuntu-latest): skipped steps=0
+Feature local-model,vision (ubuntu-latest): skipped steps=0
+```
+
+Two things to read carefully. **The literal `${{ matrix.os }}` in the second line is not a broken `name:`** — the matrix is built from `needs.prepare.outputs.oses`,
+and when `prepare` dies with zero steps that output never exists, so there is no value to interpolate and the raw expression is what the run page prints. It resolves
+to `Test (ubuntu-latest)` / `Test (windows-latest)` on any run where `prepare` actually runs; if a future reader sees the literal string on a run whose `prepare` job
+*succeeded*, that is a defect, and this paragraph is the place that predicted it. Second: **the gating conditions were evaluated correctly even in the outage** — the
+two feature rows show `skipped`, which is `github.event_name != 'push'` doing its job on a push event, not a provisioning failure (those would read `failure steps=0`
+like the first line). A skipped job and an unprovisioned job are different statements, and only one of them means the account.
+
+The command that separates "the account" from "the tree" is the one quoted at the end of **Options, with the arithmetic attached** — count the steps before believing anything about the code.
