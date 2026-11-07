@@ -553,9 +553,18 @@ fn search_workspace(
         // §12: an empty index is a fact. Written to stdout, exit 0 — the caller has nothing to fix.
         // `--limit 0` asks for no hits and gets no lines, which is not the same sentence, so it is not printed.
         if limit > 0 {
-            let _ = match mode {
-                search::SearchMode::Keyword => writeln!(out, "nothing matched \"{query}\""),
-                other => writeln!(out, "nothing indexed for {model} by {other}"),
+            // Three sentences, because the old two printed a lie on Windows' most likely first run. With no `[embeddings]`
+            // section and no vectors, `model` is the empty string — and the hybrid arm interpolated it, producing
+            // `nothing indexed for  by hybrid`: a double space where a model name should be, and a claim about an index that
+            // the keyword half had just consulted. When there is no model to name, the sentence names the query and says the
+            // vectors are missing instead (found by the first interactive Windows run, 2026-11-07).
+            let _ = match (mode, model.is_empty()) {
+                (search::SearchMode::Keyword, _) => writeln!(out, "nothing matched \"{query}\""),
+                (_, true) => writeln!(
+                    out,
+                    "nothing matched \"{query}\" by {mode}: this workspace holds no vectors"
+                ),
+                (_, false) => writeln!(out, "nothing indexed for {model} by {mode}"),
             };
         }
         return Ok(());
