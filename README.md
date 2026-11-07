@@ -2,8 +2,9 @@
 
 A local-first indexer for a folder of markdown notes. `np` walks a workspace, keeps an incremental index of every note in a
 SQLite database, resolves the `[[wikilinks]]` and `[text](target)` links between them, regenerates a human-readable catalog
-(`INDEX.md`) in the vault itself, and — when you opt in — embeds notes and the images they link with a small local model so
-`np search` can rank both by meaning rather than by keyword.
+(`INDEX.md`) in the vault itself, and — when you opt in — embeds notes and the images they link with a small local model.
+`np search` ranks by words and meaning together by default, so it answers a query about `GGML_DEFAULT_N_THREADS` on a machine
+that has never downloaded a model, and ranks prose by sense once one is installed.
 
 Nothing here is a service. No daemon, no server, no account: one binary, one database per workspace, all on disk. The
 indexing path never opens a socket; the only command that can dial out is `np models fetch`, and it says so before it transfers
@@ -35,8 +36,8 @@ where a number is host-specific. Where something has *not* been measured, this f
 | **Writes a catalog** | `INDEX.md` at the workspace root, sharded into `INDEX-<a>-<z>.md` when it grows past the configured entry budget. Generated files carry a fingerprint header, so a scan only ever replaces files it owns |
 | **Embeds locally** | With the `local-model` feature and an installed artifact, vectors are computed in-process by llama.cpp from the sha256-pinned source. Default builds contain no inference runtime at all |
 | **Embeds images too** | A `.png`/`.jpg`/`.jpeg` linked from a note is content-hashed, de-duplicated across notes, and (in a build with image support) encoded to a 768-component unit vector. See [Images in the index](#images-in-the-index) |
-| **Searches both kinds** | `np search <workspace> <query>` embeds the query and prints the top hits — notes and figures — with cosine scores, ordered deterministically |
-| **Does not** | Sync, serve, or watch. No OCR, no PDF/audio support, no vector-format rasterising ([F29](docs/backlog-m2-followups.md)), no full-text keyword search (semantic only), and no cloud calls outside `models fetch`. Image encoding needs a build made with `--features local-model,vision` plus an installed projector: the release binaries are text-only by default, and say so per figure rather than silently skipping |
+| **Searches three ways** | `np search <workspace> <query> [--mode hybrid\|semantic\|keyword]`. `hybrid` (the default) fuses SQLite's FTS5 `bm25()` over titles and bodies with the vector list by reciprocal rank fusion; `keyword` needs no model at all and never returns a figure; `semantic` is vectors alone, the behaviour before FTS5. Hits are ordered deterministically and carry their raw evidence (`cosine`, `bm25`, each list's rank) so a fused score is never unexplained |
+| **Does not** | Sync, serve, or watch. No OCR, no PDF/audio support, no vector-format rasterising ([F29](docs/backlog-m2-followups.md)), no stemming (`runner` does not match `runners`, because this vault holds identifiers), and no cloud calls outside `models fetch`. Image encoding needs a build made with `--features local-model,vision` plus an installed projector: the release binaries are text-only by default, and say so per figure rather than silently skipping |
 
 ## Quick start
 
@@ -255,6 +256,7 @@ a value in the file always wins, and an empty environment value counts as unset 
 | `models.base_url` | the compiled-in origin | Where `models fetch` may go. Mirrors are one line away; refusals never name a host |
 | `models.sha256` | unset | Read into config (`NP_MODELS_SHA256` fills it when the file omits the key). Nothing in the fetch path consults it today, so it does **not** replace a pin — see `docs/design-m2-local-embeddings.md` §12 rule 7's note |
 | `markers.done`, `markers.paused` | built-in lists | Strings that classify checklist items when the catalog renders them |
+| `search.mode` | `hybrid` | Which lists `np search` ranks by: `hybrid`, `semantic` or `keyword`. `--mode` overrides it for one run; a fourth spelling is refused, naming the three (**F35**'s rule) |
 
 ```toml
 [embeddings]
@@ -266,6 +268,9 @@ model = "embeddinggemma-2"
 
 [catalog]
 max_entries_per_file = 600
+
+# [search]
+# mode = "hybrid"          # hybrid | semantic | keyword — `np search --mode` overrides it per run
 ```
 
 ## Using it day to day
@@ -273,7 +278,7 @@ max_entries_per_file = 600
 ```sh
 np scan <workspace> [--json]              # index + regenerate the catalog
 np embed <workspace> [--json]             # embed what the index says is owed
-np search <workspace> <query> [--limit N] [--json]     # --limit defaults to 10
+np search <workspace> <query> [--limit N] [--mode M] [--json]   # --limit defaults to 10, --mode defaults to config's `hybrid`
 np models install|fetch|hash|list …
 ```
 
@@ -284,33 +289,82 @@ np models install|fetch|hash|list …
 - **Incremental both ways.** A note whose bytes have not moved keeps its vector; a figure's vectors are keyed to its *content
   hash*, so the same image linked from six notes is encoded once, and deleting the last link to it prunes the row and its
   vectors on the next run.
-- **`search` writes nothing.** It prepares only `SELECT`s — no vector, no stamp, no note row. (Opening a brand-new workspace's
-  database still creates it, like every other command: "read-only" describes what search changes about the index.) Which kinds
-  are indexed is never a refusal: a notes-only corpus searches fine, so does an images-only one, and an index with no vectors
-  prints `nothing indexed for <id>` and exits **0**.
+- **`search` writes nothing.** It prepares only `SELECT`s — no vector, no stamp, no note row. The keyword half is the same
+  database's FTS5 index, kept current by three triggers on `notes`, so a query costs a read and never a rebuild. (Opening a
+  brand-new workspace's database still creates it, like every other command: "read-only" describes what search changes about
+  the index.) Which kinds are indexed is never a refusal: a notes-only corpus searches fine, so does an images-only one, and an
+  index with no vectors prints `nothing indexed for <id>` and exits **0**.
+- **`np search` answers before any model exists.** That is what hybrid as the default bought (**F36**,
+  `docs/design-m3-hybrid-search.md`): a workspace with no artifact and no vectors returns its keyword hits, prints one line on
+  stderr naming the half that was missing, and exits **0**. Nothing dials out to fetch a model because a config key named one —
+  the download stays an explicit `np models fetch`. Ask for `--mode semantic` in that same workspace and you get the F32 refusal
+  at exit 1 instead, because a request for one list that cannot run is not answerable by the other.
 - **A schema upgrade's record outlives the run that made it.** The scan whose open cleaned up orphan rows says so on stdout, once — a permanent
   one-line warning would train everyone to ignore it. The record itself lives in the workspace database and reaches every later report as
   `recorded_upgrade_orphans` and `recorded_merged_notes`, so "what did an upgrade delete here last month?" is a question `np scan --json` answers instead of
   one that needs a database shell (**F21**). A `null` means the file holds no such record; the all-zero string means the check ran and removed nothing, and
   those two states are never collapsed into an empty string.
-- **`--json` is the machine interface.** stdout carries exactly one JSON document (`scan`, `embed`, `search`, `models list`);
-  search hits always carry the same six keys — `score`, `kind`, `path`, `linked_from`, `source_note`, `linked_notes` — because
-  an absent key and a zero would be two different claims. The last one is F28's: **every** live note linking a figure,
-  byte-ordered, where the other two were its head and its length. A note hit and an orphaned figure both get `[]`, never
-  `null` — "this hit has no live linker" is one true statement about either, and telling them apart is what `kind` is for.
+- **`--json` is the machine interface.** stdout carries exactly one JSON document (`scan`, `embed`, `search`, `models list`).
+  Search's document is `{hits, mode, note, vectors}`: the list, the mode that ran, a sentence about a half that could not run
+  (`null` when nothing was missing), and whether this workspace holds vectors at all — so "no semantic hits" and "no model
+  installed" stay two different reports. Every hit carries the same **eleven** keys whatever the kind and whatever the mode —
+  `score`, `cosine`, `bm25`, `semantic_rank`, `keyword_rank`, `kind`, `path`, `snippet`, `linked_from`, `source_note`,
+  `linked_notes` — because an absent key and a null are two different claims. The five evidence keys are F36's, and they exist so
+  a fused score can be argued with: in `keyword` mode `cosine` and `semantic_rank` are `null`, in `semantic` mode the reverse.
+  The last three are F28's: **every** live note linking a figure, byte-ordered, where the other two were its head and its length.
+  A note hit and an orphaned figure both get `[]`, never `null` — "this hit has no live linker" is one true statement about
+  either, and telling them apart is what `kind` is for.
 
 ```sh
 np search ~/Notes "vision projector" --limit 2 --json
 ```
 
+A two-note vault with no model installed — the whole document one real run printed, `--mode keyword` so the numbers are the
+keyword half's alone:
+
+```sh
+np search ./notes retro --mode keyword --json
+```
+
 ```json
 {
   "hits": [
-    { "kind": "note", "linked_from": 0, "linked_notes": [], "path": "projects/brief.md", "score": 0.6496769175575762, "source_note": null },
-    { "kind": "note", "linked_from": 0, "linked_notes": [], "path": "projects/timeline.md", "score": 0.6416128848890479, "source_note": null }
-  ]
+    {
+      "bm25": -1.1139240506329113e-6,
+      "cosine": null,
+      "keyword_rank": 1,
+      "kind": "note",
+      "linked_from": 0,
+      "linked_notes": [],
+      "path": "retro.md",
+      "score": 1.1139240506329113e-6,
+      "semantic_rank": null,
+      "snippet": "# Weekly\n\n[Retro]: the demo went well, migration postponed.\n",
+      "source_note": null
+    }
+  ],
+  "mode": "keyword",
+  "note": null,
+  "vectors": false
 }
 ```
+
+`bm25` is SQLite's own number, unremapped (better is more negative, so `score` carries its negation to keep "higher first"
+true across modes), and the text channel prints small magnitudes in scientific notation rather than `-0.0000`. With a hybrid
+list whose semantic half could not run, `note` holds the sentence that stderr got and `cosine`/`semantic_rank` hold nulls.
+
+And with vectors present, `hybrid` fuses both lists. The same two-note vault after `np embed`, queried `"broker lag"` — one
+real run, both channels, on a `--features local-model` build:
+
+```text
+0.0328 note   kafka.md  [cos 0.8143 bm25 -1.97e-6]   … # Kafka  Consumer [lag] and the migration plan for the [broker] fleet.
+0.0161 note   retro.md  [cos 0.7090]
+```
+
+`kafka.md` is first because **both lists put it first** (fused `1/61 + 1/61`); `retro.md` appears on its cosine alone, with no
+`bm25` and no keyword rank to show. That is the whole argument for fusion in two lines: a note that agrees in both lists beats a
+note that leads one, and you can see why from the bracket rather than taking the score on faith — which matters because a fused
+rank sum is not a similarity and must never be read as one.
 
 A figure linked from two notes, from a `--features local-model,vision` build whose projector was installed offline
 (`np models install --member mmproj`) — the whole output of one real run, including what the text channel makes of it:
@@ -395,7 +449,8 @@ figure they belonged to.
 | What you saw | What it means |
 | --- | --- |
 | `np: configuration disabled: embeddings.provider = "none"` from `np embed` | No provider chosen. Either write `[embeddings] provider = "local-model"` into the config, or accept that this build indexes only |
-| `np: embedding disabled: embeddings.provider = "none" — set it to "local-model" and name an installed model with embeddings.model, then run np embed` from `np search` | Same state, seen from the command that needs a vector. The sentence ends with the two keys to edit (F32 made `search` say its own cause instead of borrowing this one) |
+| `np: embedding disabled: embeddings.provider = "none" — set it to "local-model" and name an installed model with embeddings.model, then run np embed` from `np search` | Same state, seen from the command that needs a vector. The sentence ends with the two keys to edit (F32 made `search` say its own cause instead of borrowing this one). **Only `--mode semantic` reaches it now**: the default answers with keywords and caveats on stderr instead (**F36**) |
+| `no vectors in this workspace: ranked by keyword only — np models fetch or np embed adds the semantic half` on stderr, exit **0** | Not an error. The keyword list answered; the vector list had nothing to rank against. Fetch a model and run `np embed` for the other half, or write `[search] mode = "keyword"` if you never want the sentence (builds without `fetch` word this line as install-then-embed, because they have no fetch command) |
 | You want to know what an old schema upgrade removed — headings, tags, checklist items or links that predated the constraints | `np scan <workspace> --json`, and read `recorded_upgrade_orphans` / `recorded_merged_notes`. They carry the same strings the run that did the work printed once, out of the database rather than off a stream (**F21**). `null` means this file never recorded one; `headings=0,tags=0,…` means the sweep ran and removed nothing |
 | `np: no model row for "embeddinggemma-2" in this workspace: fetch it with … or install bytes you already hold with …` | The config names a model this **workspace** has never been given — the usual state after editing `config.toml` by hand. The tail is the argv to run, and it lists only commands this build has (`np models fetch` appears in builds compiled with `fetch`) |
 | `np: no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded: …` | The row exists but the file under `<key>.models/` does not. Same argv tail, same reason it is printed |

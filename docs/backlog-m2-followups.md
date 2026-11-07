@@ -1434,3 +1434,118 @@ On the merged tree: the 14-row gate list exits 0 (`cargo test --workspace` 669 p
 rustdoc `--deny warnings` on all three feature sets), and CI run `42223491720` is success on all three jobs. One gate-list correction came out of this
 round and belongs to every future one: the `local-model` rows need `CMAKE=$HOME/tools/cmake/bin/cmake`, or `crates/np-core/build.rs:125` panics and
 three rows fail for a reason that reads like a code defect.
+
+---
+
+## F36 — `np search` can only rank by meaning, so the first query anyone types in a vault has no answer
+
+**Implemented on 2026-11-08; closure withheld.** The card closes when a CI run with steps grades it — see the note under
+*Evidence* for why this round could not cite one. Design and rulings: `docs/design-m3-hybrid-search.md`.
+
+### What was asked, by whom
+
+Two rulings from the human on 2026-11-07, recorded rather than inferred: **hybrid becomes the default**, and **the mode is
+user-configurable** across embeddings-only, FTS5-only, and both. A third question — what `np search` does on first start, when
+config names a model that has never been fetched — was answered with this assistant's recommendation and adopted: **nothing dials
+out**. A command that needs vectors refuses and names `fetch`/`install`; the keyword half works with no model at all.
+
+### Why the default was the interesting part
+
+Before this change there was no FTS table anywhere (`grep -c fts5 crates/np-core/src/db.rs` → 0), while `build.rs` already compiles
+the bundled SQLite with `-DSQLITE_ENABLE_FTS5`. So `np search ~/Notes "GGML_DEFAULT_N_THREADS"` — a query whose target is one exact
+string — needed ~310 MB of artifact, an embed pass, and a cosine comparison that ranks identifiers no better than prose. Hybrid by
+default means **search answers on a machine that has never downloaded anything**, which is also what makes the PoC demonstrable on
+Windows and macOS, where feature builds refuse to compile inference at all (`build.rs`, F18).
+
+### What shipped
+
+- **Migration 11** — `notes_fts`, an FTS5 **external-content** index over `notes(title, body)` with
+  `tokenize = 'unicode61 remove_diacritics 2'`, backfilled once, then three triggers (`AFTER INSERT`/`DELETE`/`UPDATE OF title, body`)
+  keep it current. External content is why the triggers are load-bearing rather than an optimisation: a shadow table cannot notice
+  a change on its own. `UPDATE OF` deliberately omits `rel`, so a move changes no word and the row survives exactly as `headings`
+  and `links` do. The delete trigger passes the **old** text, which is what FTS5 needs to find terms to drop.
+- **Three modes, named once** in `search::SearchMode` — `hybrid` (default), `semantic`, `keyword` — with one `FromStr`, one
+  `label()`, one serde rename feeding config, and a clap `ValueEnum` bridged by `SearchModeFlag::to_core`. F28's split-refusal lesson:
+  one list of names behind every door, so a fourth spelling cannot enter through argv and not through TOML.
+- **Fusion by reciprocal rank fusion**, `k = 60`, un-tuned and stated as un-tuned: there is no labelled set (F31), so inventing a
+  constant this repository cannot measure would be the worse invention. Keyword-only mode orders by SQLite's own `bm25()` negated, so
+  "higher first" holds in every mode.
+- **Query text is data, not grammar.** `match_expression` splits on non-word characters, doubles inner quotes, wraps each token as an
+  FTS5 phrase and joins with `AND`, capped at 32 terms. `"kafka`, `-foo OR (bar): "baz*"` and `":()*-` are all answerable queries;
+  none reaches SQLite's parser as syntax.
+- **Two evidence channels.** `Hit` gained `cosine`, `bm25`, `semantic_rank`, `keyword_rank`, `snippet`; `--json`'s document became
+  `{hits, mode, note, vectors}` and each hit carries the same **eleven** keys in every mode, null where a half did not run. The text
+  channel prints `[cos … bm25 …]` beside the score and a `snippet()` excerpt, and small magnitudes print as `1.97e-6` rather than
+  `-0.0000`.
+- **`vectors_present` is a question about the database, not about config.** Hybrid skips the vector read entirely when the workspace
+  holds none; `semantic` still runs it, because "no vectors at all" (empty answer) and "vectors under another model id" (refusal) are
+  different states and only asking tells them apart.
+
+### What this changed for cards that were already closed
+
+- **F32's refusals survive, but they have to be asked for.** Four pinned CLI cases (`search_with_embedding_disabled_refuses_and_names_the_setting`,
+  `search_with_no_row_names_the_missing_row_and_says_what_to_run`, `searching_without_the_runtime_names_the_model_that_stayed_owed`,
+  `search_with_the_artifact_file_missing_says_the_query_cannot_be_embedded`) now pass `--mode semantic`. Under the new default those four
+  workspaces answer from keywords and exit 0, which is the point of the change — so each case asks for the one list that genuinely cannot run.
+  The sentences themselves are untouched, and a fifth case (`config_can_owe_the_semantic_half_alone_and_says_so`) reaches the same refusal
+  through `[search] mode = "semantic"` instead of argv.
+- **The schema pin grew by five names**: `notes_fts` plus FTS5's four shadow tables (`_config`, `_data`, `_docsize`, `_idx`), pinned by name so
+  they read as one index's implementation rather than four forgotten tables.
+- **Rewinding past migration 11 is now part of three test files.** A fixture that stamps `schema_version` back to 4 must delete what later
+  entries created — the rule `tests/db.rs` already followed for migrations 6, 7 and 9. Six rewind sites across `tests/db.rs`, `tests/scan.rs`
+  and `np-cli/tests/cli.rs` now drop the three triggers and `notes_fts`; without that, the next open fails on `table notes_fts already exists`.
+  The const is duplicated in those three files because integration tests cannot share a private helper; each copy names the other two and
+  points at `db::MIGRATIONS` as the thing to keep up with. **A fourth migration will need the same edit**, and that is the debt this round
+  accepted knowingly.
+
+### Evidence
+
+New cases: `crates/np-core/tests/search_modes.rs` (9) — `a_keyword_query_finds_an_exact_identifier_with_no_model_installed`,
+`diacritics_fold_and_word_endings_do_not`, `the_keyword_index_follows_an_edit_and_survives_a_move`,
+`a_hit_found_by_both_lists_outranks_one_found_by_either_alone`, `keyword_mode_returns_no_images_and_hybrid_still_does`,
+`no_vectors_is_a_state_and_the_report_says_which_half_answered`, `mode_names_parse_refuse_and_round_trip`,
+`fts5_operators_are_words_not_grammar`, `a_query_beyond_the_term_cap_searches_its_first_terms`.
+Config (2): `an_absent_search_section_means_hybrid`, `an_invented_search_mode_is_refused_and_names_the_three`, plus `[search]` rows added to
+`every_section_refuses_an_unknown_key` and `a_file_of_real_keys_still_loads_every_section`.
+CLI (5): `search_without_a_model_answers_from_keywords_and_says_the_half_that_ran`,
+`search_json_names_the_mode_that_ran_and_the_half_that_was_missing`, `keyword_mode_answers_where_the_semantic_half_would_refuse`,
+`config_can_owe_the_semantic_half_alone_and_says_so`, `an_invented_mode_refuses_with_claps_exit_two`.
+
+Three production mutations, each applied and diffed before its result was believed:
+
+| Mutation | Killed by |
+| --- | --- |
+| hybrid overwrites the fused score with the keyword rank (`score += rrf` → `score = rrf`) | `a_hit_found_by_both_lists_outranks_one_found_by_either_alone` |
+| the raw query reaches `MATCH` as FTS5 grammar | `fts5_operators_are_words_not_grammar` (2 cases fail) |
+| the update trigger deletes the old row and never adds the new one | `the_keyword_index_follows_an_edit_and_survives_a_move`, on "and the new word is findable in the same row" |
+
+Gates on the working tree: **all 17 rows exit 0** (`fmt`, four clippy rows across default / `local-model` / `local-model,vision` /
+`--no-default-features`, workspace tests, three feature test rows, hermetic config row, rustdoc `--deny warnings` on three feature sets,
+`check_cfg_dead_code.py`, `check_attr_displacement.py`, `verify_catalog_goldens.py` → `GOLDEN CHECK: pass`, no golden touched).
+Artifact-enabled: `cargo test -p np-cli --features local-model` with `NP_TEST_MODEL_PATH` set is **40 passed / 0 failed**, which includes
+`searching_a_real_index_answers_in_both_channels` — re-pinned to the four top-level keys and eleven hit keys, and to `note: null`,
+`vectors: true` on a healthy run.
+
+Cost, measured the same day (full table in §6 of the design note): on a 500-note vault holding 556,210 B of prose, migration 11 adds
+**217,088 bytes — 39% of the prose it indexes, 12.2% of the file**, and `notes_fts_data` is smaller than the `chunks` table beside it. A full
+re-parse of those 500 notes costs **431 ms without the three triggers and 515 ms with them (+84 ms, +19.5%, ≈0.17 ms per note)**; an ordinary
+scan re-parses only what changed. The measurement also corrected another card: `docs/measurement-f30-vector-surface.md` asserted that splitting
+per-table bytes needed `dbstat`, "which this rusqlite build does not enable" — the bundled SQLite is built with `SQLITE_ENABLE_DBSTAT_VTAB` and
+this round's numbers came out of `dbstat`. The claim is struck through in place, because a measurement note wrong about whether its instrument
+exists is worth leaving visible.
+
+Two real runs are quoted in `README.md` rather than paraphrased: a keyword-only JSON document from a vault with no model
+(`mode: "keyword"`, `note: null`, `vectors: false`, cosine null), and a hybrid text listing from the same vault after `np embed` on a
+`--features local-model` build, where the note both lists ranked first prints `[cos 0.8143 bm25 -1.97e-6]` and the vector-only hit prints
+`[cos 0.7090]` with no keyword evidence at all.
+
+### What this card does not claim
+
+- **No retrieval-quality claim.** Hybrid is a recall argument, not a precision one: nothing here says hybrid finds *better* results than
+  `semantic`, because that needs the labelled set F31 still owes. The fusion constant is un-tuned for the same reason.
+- **No Windows or macOS measurement.** "search now works where inference cannot be built" is a statement about which code paths need a
+  runtime, not a run on those platforms (F18).
+- **`bm25()` is SQLite's number, unremapped** — negative, better-is-more-negative, magnitude meaningless on a two-note vault. `score`
+  carries its negation so ordering reads consistently; nobody should read either as a probability.
+- **No stemming, and no `OR` mode.** `runner` does not find `runners` (measured, and asserted); a query whose words never co-occur returns
+  nothing rather than some. Both are choices (§8 of the design note) that a future card may reverse with data this one does not have.
