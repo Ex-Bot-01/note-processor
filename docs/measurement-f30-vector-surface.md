@@ -1,8 +1,9 @@
 # F30 — what a stored vector actually costs, text rows and figure rows
 
 Measurement, not design. F30's card says the first thing it owes is index bytes for a corpus with figures. **Both halves are now measured:** the text half on
-2026-11-06 from the shipped binary, the figure half on 2026-11-07 once F28 handed the CLI a projector (`docs/design-f28-image-embedding-in-np.md`). No decision is
-taken here — the 512 question stays the human's, which is what these numbers are for. The figure half ends with the comparison this document thinks that decision
+2026-11-06 from the shipped binary, the figure half on 2026-11-07 once F28 handed the CLI a projector (`docs/design-f28-image-embedding-in-np.md`). **Decided 2026-11-07: keep 768**, by the
+human, on the comparison at the end of the figure half (~4.9 MB saved per 5,000 figures at 512 is 0.9% of the projector file, against a migration and a model-identity
+change). The numbers below are what that ruling was made from, and F30's card carries the closure paragraph. The figure half ends with the comparison this document thinks that decision
 should be made against.
 
 Measured 2026-11-06 on this host (16 CPUs, 7,419 MB RAM), `np` built `--features local-model`, artifact

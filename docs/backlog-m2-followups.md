@@ -25,8 +25,10 @@ and F27 holds a deliberate do-not-implement stance that an audit does not overtu
 
 **[2026-11-07]** Of the four that stayed open above, **F23 now carries a Closed on paragraph**: its residue was driven through its own "do when" and turned out to be
 one stale registry row rather than a lost note, and the human accepted option A (accept and document) over clearing such rows. **F25** and **F35** were already ruled
-and closed below. Still open at this writing: **F18** (needs real Windows hardware), **F21** (its second half is merged; the closure paragraph waits on a graded tree),
-**F28** (same — implemented through step ⑤, waiting on CI to be graded), and **F30**/**F31**, which have not been audited as far as this file knows.
+and closed below. Audited the same day: **F30 closed** — both halves of the storage measurement are in (`docs/measurement-f30-vector-surface.md`) and the human ruled
+to **keep 768**, with the numbers that decided it written into the card; **F31 stays open and blocked**, needing about twenty labelled queries from a real vault or a
+recorded decline, and it is also what keeps F30's ranking question unanswerable. Still open: **F18** (needs real Windows hardware), **F21** and **F28** (both
+implemented; their closure paragraphs wait on a graded tree — see `docs/ops-actions-minutes.md` for what CI grades now and how to buy a full grade for one SHA).
 
 
 These are not new features. They are the items the Milestone 1 reviews judged *correct enough to ship* but
@@ -1213,6 +1215,28 @@ numbered from a different order: four appends hit real notes, four created new o
 media rows. The fixture now keys off filenames that exist and asserts both that the corpus gained no files and that exactly eight notes carry a figure *before*
 measuring. One timing observation, not a measurement (§8 wants ≥2 runs and a spread): phase-2 embed — 8 image encodes plus 8 text re-encodes with a projector open —
 took 33.8 s wall in one run on this host.
+
+**Closed on 2026-11-07 by the human's ruling on the recommendation this card asked for: keep 768, no re-store.** The measurement that made the question answerable is
+`docs/measurement-f30-vector-surface.md`, both halves now in — payload **3,072 B per vector** in `embeddings` and `media_embeddings` alike, and vector surface of
+**4,608 B per stored figure against 4,096 B per stored chunk**, measured by deleting one table and `VACUUM`ing a copy rather than inferred from payload. Slack came out
+at 1,536 B around a media vector and 1,024 B around a text one, which is what turns "−33% at 512" (payload arithmetic) into **−22.2%** on the row that actually gets
+stored.
+
+The ruling rests on two numbers beside each other: a 5,000-figure vault holds ~22.0 MB of media surface at 768 and would save **~4.9 MB** at 512 — **0.9% of the
+554,821,056 B projector file** that must be downloaded and read before any figure row can exist — while the cost of re-storing is not a config value but a migration,
+a model-identity change (`docs/design-m2-local-embeddings.md` §4), a re-normalisation on write and a refusal when a query's width disagrees with the stored one. Bought
+against a ranking question that **cannot** be answered before F31's labelled set exists. Paying a migration to buy an unmeasurable quality risk for 0.9% of an artifact
+the feature already requires is not a trade this repository takes.
+
+**What closing here does *not* claim:** that 512 would rank worse, or better — no labelled set exists (**F31**), and the card's "re-normalise or degrade silently" rule
+and its "query and corpus must share a dimension" rule stay unimplemented and unexercised, now by decision rather than by oversight. If F31's set ever arrives and says
+something surprising about width, this closure is the paragraph to reopen, and §5 of the measurement document holds the arithmetic it would start from (including the
+one thing still untested: that slack stays put when the payload shrinks — nothing here can write a non-768 row).
+
+Verified as measurement, not as CI grading: 17 local gate rows exit 0, workspace **693 passed / 0 failed**, `GOLDEN CHECK: pass`, and the figure half was produced by
+the real release+`vision` binary against both artifacts installed through `np models install [--member mmproj]`. Actions minutes are exhausted
+(`docs/ops-actions-minutes.md`), so nothing about this tree was graded remotely; the last CI-graded tree remains `5e368ac`. No code changed — this card's remaining
+deliverable was a decision, and the card says so rather than inventing work.
 
 ## F31 — nothing can be said about whether search finds the right diagram, because there is no labelled set
 
