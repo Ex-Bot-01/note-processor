@@ -217,6 +217,25 @@ pub struct ScanReport {
     ///
     /// **Null, not absent**, for the reason [`Self::upgrade_orphans`] gives: one JSON shape for every scan.
     pub merged_notes: Option<String>,
+    /// What this **file records** under [`crate::db::FK_ORPHANS_KEY`], written by this open or by any earlier one —
+    /// `None` only when no such record exists.
+    ///
+    /// **The other half of F21, and the question it existed for.** [`Self::upgrade_orphans`] answers "what did this run
+    /// delete" and is quiet from then on; someone asking a month later had to open `sqlite3`. This field is that record
+    /// read back through `np scan`, so the durable receipt stops being readable only by whoever brings a database shell.
+    /// It changes no announcement, clears nothing, and prints nothing new on stdout: an old fact stays available without
+    /// any run becoming louder for it, which is the balance F21 §3 struck and this field keeps.
+    ///
+    /// **Null means no record, not a zero receipt.** A file created at the current schema carries
+    /// `headings=0,tags=0,…` — proof the sweep ran — and that string reaches here verbatim; only a workspace whose file
+    /// never went through migration 3 has nothing to report. Substituting `Some("")` would make an audited fact and an
+    /// absent one read alike.
+    ///
+    /// **Null, not absent**, for the reason [`Self::upgrade_orphans`] gives: one JSON shape for every scan.
+    pub recorded_upgrade_orphans: Option<String>,
+    /// What this **file records** under [`crate::db::NOTE_MERGE_KEY`], same contract as
+    /// [`Self::recorded_upgrade_orphans`]: written by any open, `None` only when the file holds no such record.
+    pub recorded_merged_notes: Option<String>,
     /// What this scan could not index, and what the registry duplicates — counted by kind, which is the
     /// diagnosis [`ScanReport::skipped`] cannot give because it merges every cause into one list of paths
     /// (F22 §1). `None` when every count is zero, so a workspace that lost nothing keeps a clean report.
@@ -627,6 +646,10 @@ fn scan_inner(
         index_files: rendered.iter().map(|(name, _)| name.clone()).collect(),
         upgrade_orphans,
         merged_notes,
+        // Read from `meta` rather than from the handle, so a receipt written by an open in September reaches a scan in
+        // December. A read of one indexed row each; a failure here is a database failure like any other in this path.
+        recorded_upgrade_orphans: db.recorded_upgrade_orphans()?,
+        recorded_merged_notes: db.recorded_merged_notes()?,
         // `None` when nothing was lost, so the common report stays clean while its JSON still carries the
         // key as `null` — one shape for every scan, which is what [`ScanReport::upgrade_orphans`] argues.
         unindexable: (!losses.is_empty()).then_some(losses),

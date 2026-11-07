@@ -103,6 +103,11 @@ Four questions went up as human decisions; four answers came back, and one of th
   token's scope, so the reason is inferred from timing and step counts rather than read. No further pushes or reruns were spent on it; when a run gets
   steps again, that is the recovery signal, and `main` at `e4bdba3` carries three graded commits whose code was green locally (17 rows exit 0, workspace
   680 passed / 0 failed, `GOLDEN CHECK: pass`) and whose last CI-graded tree is `5e368ac` (`42325538290`, four jobs success).
+* **F21's second half landed (`Db::recorded_upgrade_orphans` / `recorded_merged_notes`, two new `ScanReport` fields).** The durable receipt now reaches
+  every scan's JSON, so "what did an upgrade delete here last month?" is answerable without `sqlite3`; the once-per-process announcement is untouched and
+  stdout gained nothing — a CLI case asserts both halves on one workspace. Three np-core cases (durable merge receipt, zero receipts proving the checks ran,
+  a hand-poked `NULL` reading as no record instead of failing every later scan) and one mutant killed at two levels after I noticed my first durability case
+  only asserted a field the same open also wrote. Closure withheld on F28's ground: CI cannot grade it (`docs/ops-actions-minutes.md`).
 * **F29 closed (2026-11-07, docs-only):** README's "Images in the index" now states the limit — `.svg`/`.drawio`/`.excalidraw`/`.pdf` out by decision, with
   the rasteriser's real cost named (external references and DTDs, a dependency, an attack surface, a per-encode measurement §8 demands) — answers "what will
   `np` encode" as PNG and JPEG by extension *and* signature, points the `unsupported-format` row at that paragraph, and says what a refused figure does not

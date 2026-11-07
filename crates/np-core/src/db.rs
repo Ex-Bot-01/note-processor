@@ -580,6 +580,50 @@ impl Db {
     pub fn merged_notes(&self) -> Option<&str> {
         self.1.merges.as_deref()
     }
+
+    /// The receipt this **file holds** under [`FK_ORPHANS_KEY`], whoever wrote it — including an open that only
+    /// arrived at an already-migrated schema. `None` means no record exists, which is a different fact from the
+    /// all-zero receipt and stays distinguishable from it.
+    ///
+    /// **Why this exists when [`Db::upgrade_orphans`] does.** The carried value answers "what did *this* process
+    /// delete", and it is deliberately `None` forever after, because a permanent one-line warning trains a reader to
+    /// ignore it (F21 §3). That left the other question — what did an upgrade delete here, months ago, which is the
+    /// question someone asks when notes look shorter than they remember — answerable only with `sqlite3`. Reading
+    /// `meta` is the same record through a different door: nothing echoes, nothing clears, and no run becomes louder
+    /// for a fact it did not produce.
+    pub fn recorded_upgrade_orphans(&self) -> Result<Option<String>, DbError> {
+        stored_receipt(&self.0, FK_ORPHANS_KEY)
+    }
+
+    /// The receipt this **file holds** under [`NOTE_MERGE_KEY`], with the same contract and the same reason for
+    /// existing as [`Db::recorded_upgrade_orphans`].
+    pub fn recorded_merged_notes(&self) -> Result<Option<String>, DbError> {
+        stored_receipt(&self.0, NOTE_MERGE_KEY)
+    }
+}
+
+/// One `meta` value, or `None` when the key was never written.
+///
+/// [`read_receipt`] is the migration-time reader and refuses to tolerate a missing key — inside a transaction, an
+/// absent receipt means a step that should have written one did not, and that is a bug worth a failed open. This is the
+/// opposite question: an absent key is an ordinary state of a file that never ran that step, so `QueryReturnedNoRows`
+/// is an answer rather than a failure. Keeping both spellings is what stops one of them being "fixed" into the other.
+fn stored_receipt(conn: &Connection, key: &str) -> Result<Option<String>, DbError> {
+    match conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        params![key],
+        // `Option<String>` on purpose: a `meta` row holding SQL NULL is a state this program already tolerates
+        // elsewhere (`a_null_meta_value_is_read_as_no_label_rather_than_failing_the_scan`), and a receipt reader that
+        // asked for `String` would turn one into a failed scan. Absent key and null value arrive as the same honest
+        // answer — there is no record to report — while an empty string stays distinguishable from both.
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        // A SQL NULL arrives here as `None` because the column is read as `Option<String>`, which is the whole point of
+        // that choice: no second arm, and no InvalidColumnType on somebody's hand-edited row.
+        Ok(value) => Ok(value),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => Err(DbError::from(err)),
+    }
 }
 
 /// Apply every migration whose version is above what the file recorded, returning the receipts of the

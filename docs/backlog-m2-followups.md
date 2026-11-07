@@ -535,6 +535,24 @@ the echo dropped its `.expect` and moved after the commit (`src/db.rs:676` → `
 month still needs `sqlite3`. F22's shape — a bounded `meta` record whose one string is printed on stdout and in `--json` — now exists for
 refusals; applying that shape to upgrade receipts is the rest of this card, and it needs no new exit code and no second echo.
 
+**Second half landed 2026-11-07 — the record is readable without `sqlite3`, and no run got louder for it.** `Db::recorded_upgrade_orphans` and
+`Db::recorded_merged_notes` read `meta` on any open, and `ScanReport` carries both as `recorded_upgrade_orphans` / `recorded_merged_notes`. The announcement
+stays exactly where F21 put it — once per process, on the run that did the deleting — because a permanent one-line warning is how real signals die; what
+changed is that the *record* now reaches anyone who asks later, through `np scan --json` rather than a database shell. Nothing echoes twice, nothing clears,
+and stdout gained no line: `only_the_scan_that_removed_the_orphans_announces_them` still asserts the printed report says nothing about orphans, alongside the
+new assertion that the same workspace's JSON carries the receipt byte for byte on every scan after it.
+
+Three np-core cases and one CLI extension: a migration-5 merge reported by its own run and then carried by the next (`merged=1;paths=dup.md`, while
+`merged_notes` is `null`); a fresh file answering with the zero receipts that prove the checks ran, rather than nulls or empty strings; and a hand-poked SQL
+`NULL` in `meta.value` reading as no record instead of failing every later scan — the same defect class `a_null_meta_value_is_read_as_no_label_rather_than_failing_the_scan`
+retired for the other reader, which my first draft re-imported through this new door and that case caught. One mutant died twice: reading the carried handle
+instead of `meta` fails the CLI case immediately and, once the np-core case gained its orphan-receipt assertion, fails there too — which is worth recording
+because that assertion was missing at first, and a durability test that only checks the field this open also wrote proves nothing.
+
+**Still not closed, on the same ground as F28: CI cannot grade it.** Actions has been out of included minutes since `2026-11-07T01:57Z`
+(`docs/ops-actions-minutes.md`). What is graded locally: 17 gate rows exit 0, workspace tests green, `GOLDEN CHECK: pass`, plus the CLI case through argv.
+The closure paragraph goes in when a run that has steps grades `main`. **No new exit code and no second echo**, as this card's own "Do when" required.
+
 ## F22 — a refusal exists only as one report line, with no reason attached
 
 - **Where:** `scan.rs` puts refused names in `report.skipped` and nowhere durable — the `meta` receipt carries the

@@ -5669,3 +5669,126 @@ fn a_refused_note_gets_no_chunk_work() {
         "and the rows that exist keep what an earlier scan wrote"
     );
 }
+
+// --- F21's second half: an old upgrade's receipt, readable without sqlite3 -------
+//
+// F21 shipped durable-first, echoed-second: the `meta` receipt is the record, and the run that did the deleting is the
+// one that says so out loud. That left a question with no answer for anyone who missed that run — "what did an upgrade
+// delete here last month?" — because `ScanReport::upgrade_orphans` is `Some` only on the open that performed the cleanup,
+// and reading the stored value meant opening `sqlite3`. These cases ask the same question of `np scan`, months later.
+
+/// **A receipt written by one open is carried by the next.** Migration 5 folds a duplicate note pair and reports it on
+/// the run that did it; the scan after that reports nothing said-out-loud, and now carries what the file records instead.
+#[test]
+fn a_later_scan_carries_the_receipt_an_earlier_upgrade_wrote() {
+    let ws = scratch(
+        &[
+            (
+                "dup.md",
+                "---\n# Dup Heading\n---\n\n#dup-tag\n\n- [ ] task\n",
+            ),
+            ("other.md", "# Other Heading\n"),
+        ],
+        600,
+    );
+    scan(&ws.root, &ws.cfg).expect("test: first scan creates the database");
+
+    let db = ws.db();
+    plant_legacy_pair(&db, "dup.md");
+    rewind_past_the_merge(&db);
+    drop(db);
+
+    let merged = scan(&ws.root, &ws.cfg).expect("this open runs migration 5");
+    assert_eq!(
+        merged.merged_notes.as_deref(),
+        Some("merged=1;paths=dup.md"),
+        "the run that merged is the run that says so: {merged:?}"
+    );
+
+    let later = scan(&ws.root, &ws.cfg).expect("test: a later scan");
+    assert!(
+        later.merged_notes.is_none(),
+        "the announcement stays once-per-process, or it becomes a permanent warning: {later:?}"
+    );
+    assert_eq!(
+        later.recorded_merged_notes.as_deref(),
+        Some("merged=1;paths=dup.md"),
+        "and the durable receipt reaches anyone who asks afterwards, without `sqlite3`: {later:?}"
+    );
+    // The orphan receipt too, and it is not a second copy of the same assertion: this open migrated nothing, so the
+    // value carried on the handle is `None` while the file holds migration 3's zero record. A reader that reaches for
+    // the handle answers "nothing", which is exactly the answer F21 left unreadable without a database shell.
+    assert_eq!(
+        later.recorded_upgrade_orphans.as_deref(),
+        Some("headings=0,tags=0,items=0,links_src=0,links_dst_null=0"),
+        "the other receipt reads back the same way: {later:?}"
+    );
+
+    // Mutation this catches: reporting the carried value (`Db::merged_notes`, which is `None` on a later open) instead of
+    // reading `meta`, which leaves this field null exactly when someone needs it.
+}
+
+/// **A file created at the current schema still answers, and answers with what ran.** Both receipts are written even
+/// when they remove nothing — `headings=0,…` and `merged=0` exist precisely as proof the check happened (F21 §2's lesson).
+/// So a workspace that never lost a row reports those records rather than nulls, and reports no empty string anywhere:
+/// `""` would read like "an upgrade removed nothing" while being a claim the file does not make.
+#[test]
+fn a_workspace_that_lost_nothing_reports_the_records_that_prove_the_checks_ran() {
+    let ws = scratch(&[("a.md", "# A\n"), ("b.md", "# B\n")], 600);
+    let report = scan(&ws.root, &ws.cfg).expect("test: first scan");
+
+    let orphans = report
+        .recorded_upgrade_orphans
+        .as_deref()
+        .expect("a file created at the current schema records that the orphan sweep ran");
+    assert!(
+        orphans.starts_with("headings=0") && !orphans.is_empty(),
+        "the zero receipt, spelled as migration 3 writes it: {orphans:?}"
+    );
+    let merges = report
+        .recorded_merged_notes
+        .as_deref()
+        .expect("and the merge check records itself the same way");
+    assert!(
+        merges.starts_with("merged=0"),
+        "no duplicate was folded, and the file says so rather than saying nothing: {merges:?}"
+    );
+
+    // Mutation this catches: substituting `Some(String::new())` for a missing key, or dropping the zero receipts on the
+    // floor as "nothing to report" — both make an audited fact indistinguishable from an absent one.
+}
+
+/// **A hand-edited NULL reads as no record, and costs nobody their scan.** `meta.value` is reachable by anyone with a
+/// database shell, and this program already treats a null there as "nothing this build can trust" rather than an error —
+/// the receipt readers inherit that rule, so one poked column cannot turn every later scan into a failure.
+#[test]
+fn a_null_receipt_is_no_record_and_still_lets_the_scan_finish() {
+    let ws = scratch(&[("a.md", "# A\n")], 600);
+    scan(&ws.root, &ws.cfg).expect("test setup: create the file with both receipts");
+    {
+        let db = ws.db();
+        db.0.execute(
+            "UPDATE meta SET value = NULL WHERE key = ?1",
+            [db::FK_ORPHANS_KEY],
+        )
+        .expect("test setup: null the orphan receipt");
+    }
+
+    let report = scan(&ws.root, &ws.cfg).expect("a poked NULL must not fail a scan");
+    assert_eq!(
+        report.recorded_upgrade_orphans, None,
+        "no record, and not an empty string either: {:?}",
+        report.recorded_upgrade_orphans
+    );
+    assert!(
+        report
+            .recorded_merged_notes
+            .as_deref()
+            .is_some_and(|value| value.starts_with("merged=0")),
+        "the receipt nobody touched still reads: {report:?}"
+    );
+
+    // Mutation this catches: reading the column as a plain `String`, which raises InvalidColumnType on the NULL and
+    // fails the whole scan — the exact defect `a_null_meta_value_is_read_as_no_label_rather_than_failing_the_scan`
+    // retired for the other reader, re-imported through a new door.
+}
