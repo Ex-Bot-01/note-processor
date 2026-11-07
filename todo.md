@@ -75,6 +75,10 @@ Four questions went up as human decisions; four answers came back, and one of th
   search (projector **554,821,056 B** ≈ 35× the largest binary).
 * **Remaining for F28:** `linked_notes`, the placement half — figure → note, through `Hit` rather than a migration — and (exposed by step ③, not caused
   by it) member names in `np models list`, which needs a change to that command's pinned key set.
+* **CI observation (2026-11-06, on `03ef6d8`, a markdown-only commit).** All four jobs failed in ~58 s with **zero steps created**, three attempts
+  (`--failed` rerun, full rerun), while the two pushes five minutes earlier (`5374dc1`, `5e368ac`) completed green on the same workflow file. That is
+  F34's signature returning — a job that never reaches a step cannot be a code defect, because nothing ran — and it is recorded here rather than
+  papered over with a re-trigger until the shape is known: the next push (this one) is the probe that separates "this SHA" from "the platform right now".
 * **F29 — vector formats stay out**, written into README as a product limit rather than left as a format accident. Follows from F28: once a shipped
   binary encodes figures, "what does it encode" needs an answer, and the answer is raster formats until someone wants a rasteriser's dependency and
   attack surface ("an SVG is a file that asks to fetch things"). README wording not yet written.
