@@ -1791,3 +1791,41 @@ withholding as **F21**, **F28** and **F36**. And the published `v0.2.0` Windows 
 `4c5200f`, before this fix, so its sha256 (`d36f3e3b…44c270`) is a promise about the old sentence too. Republishing under the same name would
 make the release notes' digest wrong, so the fix ships with the next asset — say the word and I will build one rather than let a stale binary
 be the only Windows download on the page.
+
+## F41 — a fresh workspace with fetching switched off is refused as *configuration disabled*, and the sentence names no remedy
+
+**Filed 2026-11-08, found while writing `np setup`'s tests (F38).** Not fixed by that commit; deliberately not fixed there, because
+the wording below is pinned in fourteen places and changing it is a ruling, not a drive-by.
+
+The state: `[embeddings] provider = "local-model"`, `model = "embeddinggemma-2"`, and nothing installed in this workspace yet — the
+ordinary first run on an air-gapped machine, or any run under `NP_NO_AUTO_FETCH=1`. What comes back, on both channels, exit 1:
+
+```
+np: configuration disabled: embeddings.model = "embeddinggemma-2"
+```
+
+**Why it reads wrong.** The configuration is correct. It names a provider and an id that this very build pins; what is missing is a
+310 MB file. `configuration disabled` points the reader at a key they already set, and no line tells them to place a file — while the
+neighbouring arms do: arm (iii) (`artifact-absent`) carries [`install_hint`](../crates/np-core/src/embed_run.rs) with both remedies
+spelled out, and F38's `offline` arm names re-running and keyword search. The one state where a person most needs the command line is
+the one that omits it.
+
+**Where it comes from.** `embed_run::run`'s arm (ii) re-reads the `models` row after np-cli already looked: no row ⇒
+`EmbedOutcome::ConfigurationDisabled { key: "embeddings.model", id }` (`crates/np-core/src/embed_run.rs`, arm (ii)). That pre-empts
+np-cli's own `NoProvider::RowMissing`, which *does* carry the install hint — so the program contains a correct sentence for this state
+and prints a different one. F32 chose the "this is a configuration state" label on purpose (§6 of that design), and 14 assertions across
+`crates/np-cli/tests/cli.rs` (from line 1619) pin both channels; `setup_with_fetching_switched_off_…` pins it for `np setup` too.
+
+**The question for whoever rules on it:** now that F38 made fetching the default, is "no row" still best described as disabled
+configuration — or is it the artifact-absent state seen from before the first install? Three options, cheapest first:
+
+- **A.** Keep the label; append `install_hint(workspace)` to arm (ii)'s detail. One line plus test updates at the fourteen sites; no new
+  state, and the reader gets a command in both cases.
+- **B.** Give the state its own outcome (`model-not-installed`) with the hint as its payload, and let `configuration disabled` mean only
+  "no provider configured" — cleaner taxonomy, bigger diff, and F32's card would need an amendment paragraph.
+- **C.** Leave it. Defensible if one holds that a workspace where nothing was ever installed *is* unconfigured; the cost is that the
+  air-gapped first run — the exact audience for the kill switch — has to find `np models install` from the README.
+
+**Done when:** a ruling is recorded here, and a fresh-workspace refusal either names a remedy or this card says why it should not. Until
+then the wording stays as pinned, and `setup_with_fetching_switched_off_indexes_and_refuses_without_blaming_the_network` asserts today's
+sentence so that a future change fails loudly rather than silently.

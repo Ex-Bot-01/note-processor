@@ -2788,6 +2788,185 @@ fn an_invented_mode_refuses_with_claps_exit_two() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `np setup` (**F38**): one command for a caller that wants vectors to exist.
+//
+// Three claims, each with a different reason to exist. The **offline** case is the product decision: indexing still
+// happens, the exit code is 0, and the document says `vectors:false, offline:true` rather than pretending nothing occurred
+// or crying failure. The **kill-switch** case is the safety property: refusing to dial out must not stop setup from doing
+// its useful half, and must not be reported as an outage. And the **artifact-gated** case (in `mod real_model`) is the only
+// one that can say `vectors:true` means anything.
+// ---------------------------------------------------------------------------
+
+/// The command exists, parses, and leaves argument errors to clap — the same exit-2 contract every other operand has.
+#[test]
+fn setup_is_a_command_and_clap_owns_its_argument_errors() {
+    let ws = workspace();
+    let help = run(&mut ws.command_without_operand(&["setup", "--help"]));
+    assert_eq!(help.code(), 0, "\n{}", help.stderr());
+    // The help text is the documentation a first-time user reads, so it has to carry the two facts that make this command
+    // different from `scan`: that it fetches, and that offline still indexes.
+    let text = help.stdout();
+    assert!(
+        text.contains("fetch") && text.contains("vectors"),
+        "the long help has to say what this command does beyond indexing:\n{text}"
+    );
+
+    let mut bad = ws.command_without_operand(&["setup"]);
+    bad.arg("--auto-fetch").arg("--no-auto-fetch").arg(&ws.root);
+    let failed = run(&mut bad);
+    assert_eq!(
+        failed.code(),
+        2,
+        "clap owns this refusal:\n{}",
+        failed.stderr()
+    );
+    assert!(
+        failed.stderr().contains("cannot be used with"),
+        "and it has to name the conflict: {}",
+        failed.stderr()
+    );
+}
+
+/// **The offline contract.** No connection: setup indexes anyway, exits 0, and reports the exact place it stopped. A
+/// caller that only reads the exit code sees success — which is right, because search works from this moment — and a
+/// caller that reads the document sees `vectors:false` and knows not to try semantic search.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn setup_offline_indexes_anyway_and_says_vectors_were_skipped() {
+    let ws = workspace();
+    fs::write(
+        ws.root.join("alpha.md"),
+        "# Alpha\n\nThe quick brown fox jumps over the mat.\n",
+    )
+    .expect("test setup: write a note");
+    ws.write_user_config(&local_model_config("embeddinggemma-2"));
+
+    let mut cmd = ws.command_without_operand(&["setup"]);
+    cmd.arg(&ws.root)
+        .arg("--json")
+        .env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let ok = run(&mut cmd);
+    assert_eq!(
+        ok.code(),
+        0,
+        "offline still indexes, so this succeeds:\n{}",
+        ok.stderr()
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&ok.stdout()).expect("setup --json prints one object");
+    assert_eq!(
+        json_keys(&doc),
+        vec![
+            "embed",
+            "fetched",
+            "offline",
+            "scan",
+            "vectors",
+            "workspace"
+        ],
+        "setup's document is its own contract: {doc}"
+    );
+    assert_eq!(
+        doc["vectors"], false,
+        "no vectors exist, and the document says so"
+    );
+    assert_eq!(doc["offline"], true, "and it names why");
+    assert_eq!(
+        doc["fetched"],
+        serde_json::Value::Null,
+        "nothing transferred"
+    );
+    // The fixture workspace ships a corpus, so the claim is "my note went in", not a magic count; the keyword search
+    // below proves this particular file is findable.
+    assert!(
+        doc["scan"]["added"].as_u64().unwrap_or(0) >= 1,
+        "the note was indexed regardless: {doc}"
+    );
+    assert_eq!(
+        doc["embed"]["offline"], true,
+        "one fact, one value, both levels"
+    );
+
+    // The claim behind the exit code: keyword search really does answer now, with no model anywhere on the machine.
+    let mut search = ws.command_without_operand(&["search"]);
+    search.arg(&ws.root).arg("fox").arg("--mode").arg("keyword");
+    let hits = run(&mut search);
+    assert_eq!(hits.code(), 0, "\n{}", hits.stderr());
+    assert!(
+        hits.stdout().contains("alpha.md"),
+        "the indexed note has to be findable by word: {}",
+        hits.stdout()
+    );
+
+    // The text channel's closing sentence is what a person reads; it is spelled in the design and pinned here.
+    let mut plain = ws.command_without_operand(&["setup"]);
+    plain
+        .arg(&ws.root)
+        .env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let text = run(&mut plain);
+    assert_eq!(text.code(), 0, "\n{}", text.stderr());
+    assert!(
+        text.stdout()
+            .lines()
+            .any(|line| line.trim_end() == "setup      indexed; vectors skipped — offline"),
+        "the verdict line is the sentence the design names:\n{}",
+        text.stdout()
+    );
+
+    // Mutation this pins: making setup exit 1 when offline (a caller then retries forever on a condition that needs no
+    // fix), or letting it report `vectors:true` because scan succeeded.
+}
+
+/// **The kill switch is not an outage.** With fetching forbidden, setup indexes and then refuses at exit 1 naming the
+/// install remedy — `offline:false`, because nothing was ever attempted and a reader must not be sent to check a cable.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn setup_with_fetching_switched_off_indexes_and_refuses_without_blaming_the_network() {
+    let ws = workspace();
+    fs::write(
+        ws.root.join("beta.md"),
+        "# Beta\n\nA vault with no model and no permission to fetch one.\n",
+    )
+    .expect("test setup: write a note");
+    ws.write_user_config(&local_model_config("embeddinggemma-2"));
+
+    let mut cmd = ws.command_without_operand(&["setup"]);
+    cmd.arg(&ws.root)
+        .arg("--json")
+        .env("NP_NO_AUTO_FETCH", "1")
+        .env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let failed = run(&mut cmd);
+    assert_eq!(failed.code(), 1, "\n{}", failed.stdout());
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&failed.stdout()).expect("a refusal still prints its document");
+    assert_eq!(doc["vectors"], false);
+    assert_eq!(
+        doc["offline"], false,
+        "nothing was attempted, so nothing timed out — this is a switch, not an outage"
+    );
+    // The fixture workspace ships a corpus, so the claim is "my note went in", not a magic count; the keyword search
+    // above proves this particular file is findable.
+    assert!(
+        doc["scan"]["added"].as_u64().unwrap_or(0) >= 1,
+        "the index still got the note"
+    );
+    let err = failed.stderr();
+    // **Today's sentence, asserted rather than endorsed — see F41.** A workspace where nothing was ever installed answers
+    // `configuration disabled: embeddings.model = "…"`, which names a key the operator already set and no remedy. This
+    // assertion exists so that F41's eventual ruling changes this line *on purpose*, with the card updated beside it.
+    assert!(
+        err.contains("configuration disabled") && err.contains("embeddinggemma-2"),
+        "the refusal is arm (ii)'s, and it has to name the id: {err}"
+    );
+    assert!(
+        !err.contains("127.0.0.1"),
+        "and it stays free of hosts whatever it says (§12 rule 8): {err}"
+    );
+}
+
 #[cfg(feature = "local-model")]
 mod real_model {
     use super::*;
@@ -2964,6 +3143,49 @@ mod real_model {
     /// the semantic half and gets an honest `nothing indexed for <id> by semantic` — the sentence that predates F36, kept because
     /// here a real id exists to name. Gated on `local-model` + artifact because a default build cannot reach it: with no runtime
     /// compiled in, embedding the query is itself the refusal.
+    /// **The success path, with a real model on disk.** `vectors:true` has to mean what it says, so this runs against the
+    /// artifact rather than a fixture: after `setup`, semantic search answers from vectors that did not exist a moment
+    /// before, and `fetched` stays null because the bytes were already here.
+    #[test]
+    fn setup_with_an_installed_artifact_ends_with_vectors() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        // `scan` first, because `link_artifact` writes the `models` row into a database that only exists once a command
+        // has opened it — the same order every other case in this module uses. Setup's own scan then reports the notes as
+        // unchanged, which is why the assertion below counts `notes` rather than `added`.
+        run(&mut ws.command(&["scan"])).assert_success();
+        link_artifact(&ws, &artifact, "task: search result | query: ");
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+        let ok = run(&mut ws.command(&["setup", "--json"]));
+        assert_eq!(ok.code(), 0, "{}\n{}", ok.stdout(), ok.stderr());
+        let doc: serde_json::Value = serde_json::from_str(&ok.stdout()).expect("one JSON object");
+        assert_eq!(doc["vectors"], true, "the whole point: {doc}");
+        assert_eq!(doc["offline"], false);
+        assert_eq!(
+            doc["fetched"],
+            serde_json::Value::Null,
+            "the artifact was already here, so nothing was downloaded"
+        );
+        assert!(doc["scan"]["notes"].as_u64().unwrap_or(0) >= 1, "{doc}");
+        assert!(doc["embed"]["embedded"].as_u64().unwrap_or(0) >= 1, "{doc}");
+
+        // And the vectors are usable, which is the only proof that `vectors:true` was not a claim about intent.
+        let mut search = ws.command_without_operand(&["search"]);
+        search
+            .arg(&ws.root)
+            .arg("the cat sits on the warm mat")
+            .arg("--mode")
+            .arg("semantic");
+        let hits = run(&mut search);
+        assert_eq!(hits.code(), 0, "\n{}", hits.stderr());
+        assert!(
+            hits.stdout().contains("a.md"),
+            "a semantic query over the index setup just built: {}",
+            hits.stdout()
+        );
+    }
+
     #[test]
     fn an_unembedded_workspace_names_its_model_in_the_empty_result() {
         let artifact = artifact_or_not_coverage!();

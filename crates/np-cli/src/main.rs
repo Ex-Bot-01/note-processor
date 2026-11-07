@@ -6,7 +6,7 @@
 //! ([`np_core::hash::sha256_file`] is the one digest in the program, and `np models hash` calls it).
 
 use std::error::Error;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -101,6 +101,34 @@ enum Command {
         /// Print the hits as JSON instead of one line each.
         #[arg(long)]
         json: bool,
+    },
+    /// Index a workspace, fetch its pinned model if this build can, embed it — one command that ends with vectors or says
+    /// exactly where it stopped (**F38**).
+    ///
+    /// Built for an application that wants vectors to exist and does not want to sequence three commands and interpret
+    /// three exit codes. The order is deliberate: **scan first**, because keyword search works the moment indexing
+    /// finishes (F36) and a download must not stand between a person and their first results; fetch and embed second.
+    ///
+    /// Exit codes are split by *kind* of stopping place, which is the one judgement in this command worth reading twice:
+    /// offline exits **0** with `vectors: false, offline: true` — the vault is indexed, search answers, and the missing
+    /// thing is a cable rather than a mistake to fix — while every other refusal on the vector half (no provider, an
+    /// artifact absent with fetching switched off, a binary built without inference) exits **1**, because those need
+    /// someone to change something. `np embed` keeps its own stricter contract: it asked for vectors and got none.
+    Setup {
+        /// Workspace root to index and embed.
+        workspace: PathBuf,
+        /// Print one composed report as JSON instead of the step lines.
+        #[arg(long)]
+        json: bool,
+        /// Fetch the pinned artifact if this workspace is missing it (the default; see `[models] auto_fetch`).
+        #[arg(long)]
+        auto_fetch: bool,
+        /// Never dial out from this run, even where the config allows it. For air-gapped machines, metered links and CI.
+        #[arg(long, conflicts_with = "auto_fetch")]
+        no_auto_fetch: bool,
+        /// Start a transfer without asking. Implied whenever stdin is not a terminal, which is every app's case.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Install and inspect the model artifacts of one workspace.
     Models {
@@ -231,6 +259,18 @@ fn main() -> ExitCode {
             &workspace,
             json,
             AutoFetch::from_flags(auto_fetch, no_auto_fetch),
+        ),
+        Command::Setup {
+            workspace,
+            json,
+            auto_fetch,
+            no_auto_fetch,
+            yes,
+        } => setup_workspace(
+            &workspace,
+            json,
+            AutoFetch::from_flags(auto_fetch, no_auto_fetch),
+            yes,
         ),
         Command::Search {
             workspace,
@@ -465,11 +505,16 @@ impl AutoFetch {
     }
 }
 
-fn embed_workspace(
+/// Runs the embed half and hands back its report, printing nothing about the outcome.
+///
+/// Split out of [`embed_workspace`] for `np setup`, which needs the report as a **value** to compose one document from two
+/// steps — the alternative was to print JSON and parse it back, which is how two representations of one fact start to
+/// disagree. Exit-code decisions stay with the command that owns the caller's expectation.
+fn embed_report(
     workspace: &Path,
-    json: bool,
     auto_fetch: AutoFetch,
-) -> Result<(), Box<dyn Error>> {
+    announce: bool,
+) -> Result<EmbedReport, Box<dyn Error>> {
     let cfg = load_config()?;
     // Destructured rather than reached through the struct: the borrow below has to outlive the statement that takes it,
     // and `Resolution::Provider` needs `&mut` into the box that `state` owns.
@@ -478,7 +523,7 @@ fn embed_workspace(
         artifact_check,
         workers,
         fetched,
-    } = embed_provider(&cfg, workspace, auto_fetch.allowed(&cfg), !json)?;
+    } = embed_provider(&cfg, workspace, auto_fetch.allowed(&cfg), announce)?;
     // The reason a provider could not be built travels as a value — [`ProviderState::ArtifactAbsent`] for a missing file,
     // [`ProviderState::Placeholder`]'s reason for the configuration states. Handing over a bare placeholder is how R6c1 D-2
     // happened: an absent artifact became a provider that declares 0 dimensions, and the run refused with a sentence about
@@ -535,6 +580,29 @@ fn embed_workspace(
     // because the transfer happened upstream, in provider resolution, and the document that must not contradict the text
     // summary is this one object.
     report.fetched = fetched;
+    Ok(report)
+}
+
+/// The sentence for an embed run that did not succeed. `np embed` prints it on stderr; `np setup` reuses it **verbatim** so
+/// the two commands cannot describe one stopped state in two voices.
+///
+/// `detail()` is `None` only for arm (i), which returns above; the empty fallback keeps this from being a second place that
+/// has to know which arms carry a sentence.
+fn embed_refusal(report: &EmbedReport) -> String {
+    format!(
+        "{}: {}",
+        report.outcome.label(),
+        report.outcome.detail().unwrap_or_default()
+    )
+}
+
+/// `np embed`: run the half, print it in the channel the caller asked for, and turn a stopped run into exit 1.
+fn embed_workspace(
+    workspace: &Path,
+    json: bool,
+    auto_fetch: AutoFetch,
+) -> Result<(), Box<dyn Error>> {
+    let report = embed_report(workspace, auto_fetch, !json)?;
     if json {
         emit_json(&serde_json::to_value(&report)?);
     } else {
@@ -543,14 +611,165 @@ fn embed_workspace(
     if report.succeeded() {
         return Ok(());
     }
-    // `detail()` is `None` only for arm (i), which returned above; the empty fallback keeps this from being a
-    // second place that has to know which arms carry a sentence.
-    Err(format!(
-        "{}: {}",
-        report.outcome.label(),
-        report.outcome.detail().unwrap_or_default()
-    )
-    .into())
+    Err(embed_refusal(&report).into())
+}
+
+/// `np setup`: index first, then embed (which may fetch), then say in one place how far this got.
+///
+/// Scan runs **before** anything network-facing on purpose: keyword search works the moment indexing finishes (F36), so a
+/// 310 MB transfer — or the four seconds spent discovering there is no network — must not stand between a person and their
+/// first results. The embed half is [`embed_report`] unchanged, which means its arm order, its fetch trigger, and its
+/// report fields are the same code `np embed` runs; setup adds an ordering and a verdict, not a second implementation.
+///
+/// Exit codes split by kind of stopping place: **offline exits 0** (indexed, searchable, waiting for a cable — nothing for
+/// anyone to fix), every other vector-half refusal exits 1 with embed's own sentence. `vectors` is the machine-readable
+/// verdict either way, so a caller never has to infer it from an exit code.
+fn setup_workspace(
+    workspace: &Path,
+    json: bool,
+    auto_fetch: AutoFetch,
+    yes: bool,
+) -> Result<(), Box<dyn Error>> {
+    // ---- step 1: index. No `--json` forwarding here: setup composes one document at the end, and a summary printed on
+    // the way would be a second, partial account of the same run.
+    let cfg = load_config()?;
+    let indexed = scan(workspace, &cfg)?;
+
+    if !json {
+        // Printed before step 3 so the lines arrive in the order the work happened: index counts, then any fetch
+        // announcement, then the embed outcome. `--json` prints nothing here and composes one document at the end.
+        print_summary(&indexed);
+    }
+
+    // ---- step 2: the courtesy, if anyone is there to be asked.
+    let auto_fetch = if consent_to_fetch(&cfg, workspace, &auto_fetch, yes)? {
+        auto_fetch
+    } else {
+        // "No" from a person is exactly as binding as `--no-auto-fetch`, and travels by the same value rather than by a
+        // flag re-parse — one representation of "this run must not dial out".
+        AutoFetch::Refused
+    };
+
+    // ---- step 3: embed, through the same function `np embed` calls.
+    let embedded = embed_report(workspace, auto_fetch, !json)?;
+
+    if json {
+        emit_json(&json!({
+            "workspace": workspace.display().to_string(),
+            "scan": serde_json::to_value(&indexed)?,
+            "embed": serde_json::to_value(&embedded)?,
+            // The two verdicts a caller branches on, spelled at the top level so nobody has to know that `vectors` lives
+            // inside embed's report or that `offline` is a field of it: setup's contract is one question — "do I have
+            // vectors now, and if not, is that because of the network?"
+            "vectors": embedded.succeeded(),
+            "offline": embedded.offline,
+            "fetched": serde_json::to_value(&embedded.fetched)?,
+        }));
+    } else {
+        print_embed_summary(&embedded);
+        let verdict = if embedded.offline {
+            // The sentence the design names, kept short because it is the line a person reads and an app may match.
+            "setup      indexed; vectors skipped — offline"
+        } else if embedded.succeeded() {
+            "setup      indexed and embedded — semantic search is ready"
+        } else {
+            // Not offline, not done: state which, in the same words `np embed` would have used, and let the exit code agree.
+            "setup      indexed; no vectors — see the outcome above"
+        };
+        emit(verdict);
+    }
+
+    if embedded.offline {
+        // Indexed and searchable is a result, not a failure: exiting 1 here would tell an app to retry forever over a
+        // condition that needs no code change, and F36 already answers queries meanwhile.
+        return Ok(());
+    }
+    if embedded.succeeded() {
+        return Ok(());
+    }
+    Err(embed_refusal(&embedded).into())
+}
+
+/// Ask before transferring, when a person could answer — and never ask when one cannot (**F38**).
+///
+/// Returns `true` when the fetch may proceed. It can only ever **veto**: if this predicate and the trigger in
+/// [`embed_provider`] ever disagree, the worst outcome is a question that did not need asking, or no question before a
+/// transfer that was always permitted. That asymmetry is deliberate — the trigger stays the single authority on *whether*
+/// bytes may be fetched, and this function borrows its conditions only to put a byte count in front of someone.
+///
+/// Silent (so: proceeds) when `--yes` was passed, when stdin is not a terminal — which is every app's case, and the reason
+/// the default cannot be "ask" — or when the kill switch already forbids the transfer, in which case there is nothing to
+/// ask about.
+fn consent_to_fetch(
+    cfg: &Config,
+    workspace: &Path,
+    auto_fetch: &AutoFetch,
+    yes: bool,
+) -> Result<bool, Box<dyn Error>> {
+    if yes || !auto_fetch.allowed(cfg) || !io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    let Some(id) = pending_pinned_fetch(cfg, workspace)? else {
+        return Ok(true);
+    };
+    let bytes: u64 = np_core::pins::members_for_build()
+        .iter()
+        .filter_map(|name| np_core::pins::pinned_member(&id, name))
+        .map(|pin| pin.size_bytes)
+        .sum();
+    emit(&format!(
+        "about to fetch {id} ({}) from {}",
+        size_human(bytes),
+        origin_kind(cfg)
+    ));
+    emit("this downloads a model into this workspace's data dir. proceed? [y/N] ");
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// The pinned id whose artifact this workspace is missing, or `None` when nothing is pending. Mirrors the trigger's
+/// condition in [`embed_provider`]; see [`consent_to_fetch`] for why a mirror that drifts fails safe.
+fn pending_pinned_fetch(cfg: &Config, workspace: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    let db = workspace_db(cfg, workspace)?;
+    let Some(id) = cfg.embeddings.model.clone() else {
+        return Ok(None);
+    };
+    if np_core::pins::identity(&id).is_none() {
+        return Ok(None);
+    }
+    // The same path and the same existence test as the trigger two functions up: `models_dir.join(id)`, no extension.
+    let artifact = cfg.workspace_models_dir(workspace).join(&id);
+    if model_row(&db, &id)?.is_some() && artifact.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(id))
+}
+
+/// Which *kind* of origin a fetch would go to — the half of [`origin_kind_line`] that fits in a sentence. One source for
+/// both, so the prompt and the announcement can never disagree about where bytes come from, and neither says a host.
+fn origin_kind(cfg: &Config) -> &'static str {
+    if cfg.models.base_url.is_none() {
+        "this build's compiled-in default"
+    } else {
+        "[models] base_url"
+    }
+}
+
+/// The same fact as [`origin_kind`] in the stable token `--json` carries (`fetched.origin`). Distinct from the human
+/// wording on purpose — a program keys on this, a person reads that — and defined next to it so one `match` decides both.
+///
+/// Only the fetch path reads it, so a build with no fetch has nothing to use it for.
+#[cfg_attr(not(all(feature = "local-model", feature = "fetch")), allow(dead_code))]
+fn origin_kind_token(cfg: &Config) -> &'static str {
+    if cfg.models.base_url.is_none() {
+        "compiled-in-pin"
+    } else {
+        "configured-mirror"
+    }
 }
 
 /// Rank `query` against `workspace`'s index and print the hits.
@@ -1323,11 +1542,7 @@ fn fetch_pinned_missing(
                     })
                     .collect(),
                 // A *kind*, never a host (§12 rule 8): the same distinction `origin_kind_line` prints for humans.
-                origin: if cfg.models.base_url.is_none() {
-                    "compiled-in-pin"
-                } else {
-                    "configured-mirror"
-                },
+                origin: origin_kind_token(cfg),
             }))
         }
         // **Offline is a state, so it returns one.** It used to come back as an error string from here, which meant `--json`
