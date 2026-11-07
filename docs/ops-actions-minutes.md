@@ -53,7 +53,7 @@ zero steps plus a 1–2 second lifetime rather than quoted from GitHub.
 
 ## Options, with the arithmetic attached
 
-Nothing below has been done. Changing CI shape trades evidence for money, and the account is the human's.
+[**One of these was shipped on 2026-11-07** — a gating variant of C/E/D, with corrected arithmetic, in the last section.] Nothing else below has been done. Changing CI shape trades evidence for money, and the account is the human's.
 
 | Option | Effect on minutes | What it costs this repository |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ Nothing below has been done. Changing CI shape trades evidence for money, and th
 | **D. C plus cache the vendored llama.cpp build** | the two feature jobs drop from 63 % of spend toward their Rust half; plausibly ≈ 1,200–1,800/month, inside the allowance | Same as C, plus a cache key to maintain (the vendor tree's content hash) and a slow first run after any llama.cpp bump |
 | **E. D plus ubuntu-only on every push** | `Test (ubuntu-latest)` alone is ~1,830/month at today's push rate — under the allowance with little headroom | Per-push signal survives; Windows and C++ grading happen at merge time |
 
-The recommendation is **E**, because it keeps a per-push gate that catches the class of defect this repository has actually been bitten
+**[Superseded 2026-11-07 — see "What was done on 2026-11-07, and why not option E" at the end: E's minute figure assumed merges are rare, and they are 42 % of runs here.]** The recommendation was **E**, because it keeps a per-push gate that catches the class of defect this repository has actually been bitten
 by (a lint or a link that only exists on one platform, or a feature-gated item rustdoc sees and clippy does not), while moving the two
 expensive-to-build rows to the moment where they decide whether `main` is graded. If money is not the constraint, **B** needs no change
 here at all and everything keeps working as documented.
@@ -78,3 +78,56 @@ gh api repos/Ex-Bot-01/note-processor/actions/runs/<run-id>/jobs \
 ```
 
 `steps=0` on every job means the account, not the tree.
+
+## What was done on 2026-11-07, and why not option E
+
+**Option E's arithmetic was wrong, and the mistake is worth keeping.** It read "`Test (ubuntu-latest)` alone is ~1,830/month", which treats every run as a branch
+push needing only Linux — i.e. it assumed merges are rare. Measured over the days this month when minutes existed (`2026-11-01T00:00Z` → `2026-11-07T01:57Z`,
+**6.08 days**, 91 runs): **6.25 pushes a day land on `main`** and 8.72 land on branches — 42% of runs are merges, because this week was F28's five steps each
+merged with history. Grading every merge with the full matrix is therefore not the cheap end of the curve.
+
+Per-run billed cost, from the same job durations as the table above (84 runs that actually executed):
+
+| Job | Billed minutes per run |
+| --- | --- |
+| `Test (ubuntu-latest)` | **4.56** |
+| `Test (windows-latest)` | 13.89 (≈6.9 wall × the private-repo ×2) |
+| `Feature local-model (ubuntu-latest)` | 6.04 |
+| `Feature local-model,vision (ubuntu-latest)` | 0.94 |
+| all four | **25.43** |
+
+Projected at November's cadence, against an allowance inferred at ~2,000 billed minutes/month:
+
+| Shape | Billed minutes/month | Inside the allowance? |
+| --- | --- | --- |
+| as it was (all four jobs, every push) | 14.97 × 25.43 × 30 ≈ **11,420** | no — 5.7× |
+| option E as written (ubuntu per push, full matrix at merge) | (8.72×4.56 + 6.25×25.43) × 30 ≈ **5,960** | **no — 3.0×**, not the ~1,830 the table above claimed |
+| **shipped shape:** ubuntu on `main` pushes; Windows + both feature rows nightly / dispatch / PR | (6.25×4.56 × 30) + (25.43 × 30) ≈ **1,617** | yes, ~19% headroom |
+| the same without the nightly | ≈ **855**, leaving room for ~45 manual full runs | yes, wide |
+
+Branch pushes cost nothing in either row: they trigger no workflow now.
+
+**What shipped.** `ci.yml` runs `Test (ubuntu-latest)` on a push to `main`, and adds Windows plus both C++ feature rows on a **nightly schedule at 03:17 UTC**, on
+**pull requests**, and on **`workflow_dispatch`**. Nothing else about the jobs changed — same steps, same `NOT COVERAGE` floor, same link-identity probes. The OS
+list is decided by a two-second `prepare` job because a job-level `if` cannot see `matrix`, and duplicating the seven test steps into a Linux job and a Windows job
+is how two definitions drift apart.
+
+**What it trades.** Between a merge and the next nightly, `main` is graded on Linux only: a Windows-only lint or a feature-gated compile break can sit there for up
+to a day. The 17-row local gate list — which contains the `local-model` and `local-model,vision` clippy, rustdoc and test rows — is what stands in during that
+window, and to be honest about which is which: it is what has been run before every merge this week, and CI's feature rows have not caught anything locally-missed
+since they landed. A claim that needs Windows or feature grading on a specific tree should buy it deliberately:
+
+```sh
+gh workflow run ci.yml --ref <sha>     # ~25.4 billed minutes, one tree, all four jobs
+```
+
+**Verification status of this change, stated before it runs rather than after.** `actionlint 1.7.12` reports nothing on the file; the YAML parses and carries the
+four expected jobs with the gating conditions above; the `prepare` job's shell was exercised locally for both branches of its `if`, printing
+`["ubuntu-latest"]` and `["ubuntu-latest","windows-latest"]`. **No run has executed this workflow** — the account is still out of minutes, so pushing it produced
+the same zero-step failure as everything since `2026-11-07T01:57Z`. The falsifiable check when minutes return: a push to `main` must show exactly two jobs
+(`Decide the matrix`, `Test (ubuntu-latest)`) with **no** Windows row, and a dispatch on the same SHA must show all four. If a future reader finds Windows running
+on a plain branch push, this change regressed.
+
+Option D's build cache is still not done, and it is now less valuable than it looked: the two feature jobs that rebuild llama.cpp every run are the ones that no
+longer run per merge, so the remaining spend is mostly Rust compilation on `main` pushes plus one nightly full matrix. The cache key would be maintained for a saving
+on ~30 runs a month rather than ~450.
