@@ -1641,3 +1641,46 @@ documentation slip; it is the layout.
 weeks old, and `v0.1.0`'s shipped asset had no `scan`-adjacent persistence to speak of beyond that same layout — so this is cheap now and expensive
 after Windows users arrive. Do not do it silently: a workspace that suddenly reports `added N` because its index moved elsewhere is the worst possible
 first experience, which is what the fallback exists to prevent.
+
+## F39 — an application-control policy on the operator's Windows box refuses to run anything cargo just built, and "build it from source" stops being an option
+
+**Filed 2026-11-08 from the operator's own transcript** (`error.md`, verbatim below). `cargo build --release --locked -p np-cli` on
+Windows 11 stops at *build-script execution*, twice over, on two unrelated crates:
+
+```
+error: failed to run custom build command for `icu_normalizer_data v2.4.0`
+Caused by:  could not execute process `…\target\release\build\icu_normalizer_data-f1572f0d67db13fc\build-script-build` (never executed)
+Caused by:  Eine Anwendungssteuerungsrichtlinie hat diese Datei blockiert. (os error 4551)
+error: failed to run custom build command for `thiserror v2.0.21`      … same refusal, same shape
+```
+
+German message = *"An application control policy has blocked this file."*
+
+**This is not a code defect and must not be chased as one.** There is no rustc error, no linker error, no `build.rs` panic and no
+`np` source in the path: cargo compiled fine and then asked Windows to *run* a freshly written `.exe`, and Windows said no. Two
+unrelated crates fail identically, and the blocked files were created on that disk seconds earlier — nothing was downloaded, so this is
+not Mark-of-the-Web either. A zero-line compile failure is not a defect; check what the OS was asked to do before believing red.
+
+**Why it belongs in this repository at all:** while hosted CI minutes are exhausted, our entire cross-platform story is *"build from
+source"* — README tells Windows users `cargo install --git …`. On a machine with this policy that sentence is not an instruction, it is a
+dead end, and the only remaining supported path to `np` on Windows is a **prebuilt release asset we cannot produce** (no CI minutes, no
+second machine). F39 is therefore what turns a Windows asset from a nicety into the only door: roughly one user in the field cannot use
+the alternative.
+
+| cause | how to tell it apart | what it allows |
+| --- | --- | --- |
+| **Smart App Control** on | `Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name VerifiedAndReputablePolicyState` → `2` | nothing; SAC honours no exclusions and Microsoft's rule is that it cannot be turned off once enabled without reinstalling |
+| **WDAC / Device Guard** policy in force | `Get-CimInstance Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard` → non-zero `UsermodeCodeIntegrityPolicyEnforcementStatus`; `citool.exe /lp` (admin) prints the rules | an signed-script path, or a policy exception from whoever owns the policy |
+| **Defender ASR rule** `d4f940ab-401b-4efc-aadc-ad5f3ff50688` ("block executables unless they meet a prevalence, age, or trusted-list criterion") | `Get-MpPreference \| Select-Object AttackSurfaceReductionRules_Ids, AttackSurfaceReductionRules_Actions` — this is the classic compiler-breaker on a home PC | an exclusion for the dev folder: `Add-MpPreference -AttackSurfaceReductionOnlyExclusions "D:\test_project\note-processor-main\target"` (admin) |
+| **Third-party AV app control** (ESET/Bitdefender/Kaspersky "enhanced"/"aggressive" tiers) | which product owns `Get-MpComputerStatus`'s reporting, and its own block log in the same minute as the failure | a per-folder allowance inside that product; Defender exclusions will not satisfy it |
+| path- or volume-scoped policy | build a throwaway crate on `C:` (`cargo new hello; cargo build`) — if that succeeds, the trigger is the `D:` location, not the toolchain | move the workspace to the unpoliced volume |
+
+**Evidence still obtainable while the build is blocked.** A binary built *before* the policy tightened still runs: Stages 4b, 6 and 7 of
+the Windows guide need no compiler, only `np.exe`, so `run-stage5-7.ps1 -SkipTests` keeps the config-strictness, fetch/embed/search and
+rename-identity evidence flowing. Only Stage 5 (`cargo test --workspace`) genuinely needs a working toolchain — check
+`Test-Path D:\test_project\note-processor-main\target\release\np.exe` before concluding the machine is useless for testing.
+
+**Done when** either (a) the build is graded on a Windows box and this card names which policy owned the refusal — in which case README's
+source-build instruction gains that caveat and the fix; or (b) we ship a Windows asset, at which point the card closes as "the source path
+is not universally available, so the binary is the supported one". Either way README gets an honest line about app-control-blocked machines
+rather than silently assuming everyone can compile.
