@@ -113,7 +113,10 @@ one relation are how drift starts.
    `docs/design-m2-local-embeddings.md` §14's package-size table, beside the retired finding that this shape could not be built at all. What the
    table cannot say is that the projector's **554,821,056 B** is ~35× the largest binary in it: a ceiling on the executable was never the cost a
    user of image search feels.
-3. **Placement.** `linked_notes` through `Hit`, printer and JSON, README's key list and example, and the drift assertion above. Existing
+3. **Placement — landed 2026-11-06.** `Hit::linked_notes` (byte-ordered, every live linker), one constructor computing head and length from it so the
+   three fields are one fact, `--json`'s sixth key as an empty array rather than a null, and the text line's `(from notes/a.md +1 more)`. The drift
+   assertion is a case, not a comment (`a_hits_linker_fields_cannot_disagree_with_each_other`), and it runs over a corpus that must contain both a
+   two-linker figure and an orphan or the case fails. Proved end to end through a vision binary with both artifacts installed offline. Existing
    cases (`tests/search.rs:293-351`) keep their assertions — they check the smallest-linker and the count, both of which stay true — and new
    ones name the *second* linker, which is what today's renderer discards.
 

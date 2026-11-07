@@ -73,8 +73,14 @@ Four questions went up as human decisions; four answers came back, and one of th
   `docs/design-m2-local-embeddings.md` §14, beside the retired "this shape cannot be built" finding. Declined two over-readings: equal size ≠ same artifact
   (`--no-default-features --features fetch` equals `default` in size and differs in 2,192,920 bytes), and the table is not what a user downloads for image
   search (projector **554,821,056 B** ≈ 35× the largest binary).
-* **Remaining for F28:** `linked_notes`, the placement half — figure → note, through `Hit` rather than a migration — and (exposed by step ③, not caused
-  by it) member names in `np models list`, which needs a change to that command's pinned key set.
+* **F28 step ⑤ — placement — landed.** `Hit::linked_notes`: every live linker, byte-ordered, with `source_note` its head and `linked_from` its length, all
+  three computed in one private constructor so they cannot disagree. Sixth JSON key as an empty array (never null) for note hits and orphans alike; text
+  line `(from notes/a.md +1 more)`. Four np-core cases, three mutants killed (first-linker-only, head-from-the-end, count-as-boolean), two fixture bugs of
+  this file's own documented species caught by asserting non-emptiness (media planted at the spelled path instead of the resolved one). The artifact-gated
+  CLI key-set case re-run with `NP_TEST_MODEL_PATH` set: **1 passed, not `NOT COVERAGE`**. End to end on a vision binary with both ggufs installed offline
+  through step ③: `linked_from: 2`, `linked_notes: ["notes/a.md","notes/b.md"]`, and the text line above.
+* **Remaining for F28:** closure once the merged tree is graded (CI is in a zero-step incident, see above). Then, exposed by step ③ and not caused by it:
+  member names in `np models list`, which needs a change to that command's pinned key set.
 * **CI observation (2026-11-06, on `03ef6d8`, a markdown-only commit).** All four jobs failed in ~58 s with **zero steps created**, three attempts
   (`--failed` rerun, full rerun), while the two pushes five minutes earlier (`5374dc1`, `5e368ac`) completed green on the same workflow file. That is
   F34's signature returning — a job that never reaches a step cannot be a code defect, because nothing ran — and it is recorded here rather than

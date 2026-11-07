@@ -602,3 +602,145 @@ fn searching_writes_nothing() {
         .expect("a read-only connection must serve a search");
     assert_eq!(scores(&hits), vec!["note:notes/a.md", "image:x.png"]);
 }
+
+// --- F28 step 5: a figure names every note it belongs to -------------------------
+//
+// §6 chose the smallest live linker for `source_note` because one column can hold one path, and `linked_from` counted the
+// rest. Together they answer "how many" and "open this one", and discard everything between: a figure linked from four
+// notes renders as one note and the number 4, so the three notes nobody named are invisible to the reader who is trying to
+// work out why this hit came back. These cases ask for the whole set, in the order the bytes give, with the two existing
+// fields redefined as its head and its length rather than as independent choices.
+
+/// **Every linker is named, in byte order, and insertion order is still not the answer.** The same three notes as
+/// [`an_image_names_its_smallest_live_linker_and_counts_every_one`], linked `z`, `m`, `a`: the list is `a, m, z`.
+#[test]
+fn a_figure_linked_from_several_notes_names_every_one_of_them() {
+    let f = Fixture::new();
+    for note in ["notes/z.md", "notes/a.md", "notes/m.md"] {
+        f.note(note, vec![vec![0.0, 1.0]]);
+    }
+    f.link("notes/z.md", "diagrams/kafka.png");
+    f.link("notes/m.md", "./diagrams/../diagrams/kafka.png");
+    f.link("notes/a.md", "diagrams/kafka.png");
+    f.image(22, &["notes/diagrams/kafka.png"], vec![1.0, 0.0]);
+
+    let hits = f.search(QUERY, 10).expect("search: ok");
+    let image = &hits[0];
+    assert_eq!(
+        image.linked_notes,
+        vec!["notes/a.md", "notes/m.md", "notes/z.md"],
+        "all three linkers, byte-ordered — the two that today's renderer throws away included"
+    );
+    assert_eq!(
+        image.source_note.as_deref(),
+        Some("notes/a.md"),
+        "unchanged"
+    );
+    assert_eq!(image.linked_from, 3, "unchanged");
+
+    // Mutation this catches: returning `vec![smallest]` from `media_report`, which keeps both existing fields exactly
+    // right and quietly makes the new one a duplicate of `source_note`.
+}
+
+/// **The three fields are one fact.** Asserted across a corpus that holds every shape a hit can be — a figure with two
+// linkers, an orphaned figure, and note hits — because two fields describing one relation is how drift starts, and a
+// single-case assertion would pass on the case where they happen to agree.
+#[test]
+fn a_hits_linker_fields_cannot_disagree_with_each_other() {
+    let f = Fixture::new();
+    for note in ["notes/a.md", "notes/b.md", "notes/c.md"] {
+        f.note(note, vec![vec![0.0, 1.0]]);
+    }
+    f.link("notes/a.md", "diagrams/one.png");
+    f.link("notes/b.md", "diagrams/one.png");
+    // `c` links a figure nobody embedded: it is a note hit here and not a linker of anything.
+    f.link("notes/c.md", "diagrams/unembedded.png");
+    // Both figures planted at the paths those links **resolve to** (a link from `notes/a.md` reaches
+    // `notes/diagrams/one.png`); planting them where they were spelled would test a corpus with no linkers at all, and
+    // every assertion in the loop below would pass on emptiness.
+    f.image(7, &["notes/diagrams/one.png"], vec![1.0, 0.0]);
+    // A media row with paths and no live linker: `source_note` is `None`, so the list has to be empty rather than a
+    // one-element list holding a null.
+    f.image(8, &["diagrams/orphan.png"], vec![1.0, 0.0]);
+
+    for hit in f.search(QUERY, 10).expect("search: ok") {
+        assert_eq!(
+            hit.linked_from,
+            hit.linked_notes.len(),
+            "`linked_from` is the length of the list, not a second count: {hit:?}"
+        );
+        assert_eq!(
+            hit.source_note.as_deref(),
+            hit.linked_notes.first().map(String::as_str),
+            "`source_note` is the head of the list — and null exactly when the list is empty: {hit:?}"
+        );
+        if hit.kind == HitKind::Note {
+            assert!(
+                hit.linked_notes.is_empty(),
+                "a note hit links nothing and belongs to nothing: {hit:?}"
+            );
+        }
+    }
+
+    // And the corpus really did hold both shapes, or the loop above would have proved nothing.
+    let kinds: Vec<(HitKind, usize)> = f
+        .search(QUERY, 10)
+        .expect("search: ok")
+        .iter()
+        .map(|hit| (hit.kind, hit.linked_notes.len()))
+        .collect();
+    assert!(
+        kinds.contains(&(HitKind::Image, 2)) && kinds.contains(&(HitKind::Image, 0)),
+        "a two-linker figure and an orphan are both required: {kinds:?}"
+    );
+}
+
+/// **A linker's bytes come from every path the figure sits at**, not only the one the hit names. The count already worked
+/// this way (`every_path_of_one_figure_contributes_its_linkers`); this is the same claim about the list, where the two
+/// notes are attached to different spellings and a per-path shortcut would report one of them.
+#[test]
+fn linkers_come_from_every_path_one_figure_is_stored_at() {
+    let f = Fixture::new();
+    f.note("notes/b.md", vec![vec![0.0, 1.0]]);
+    f.note("notes/a.md", vec![vec![0.0, 1.0]]);
+    f.link("notes/b.md", "../img/copy.png");
+    f.link("notes/a.md", "orig.png");
+    f.image(3, &["img/copy.png", "notes/orig.png"], vec![1.0, 0.0]);
+
+    let hits = f.search(QUERY, 10).expect("search: ok");
+    assert_eq!(
+        hits[0].path, "img/copy.png",
+        "the hit names the smaller path"
+    );
+    assert_eq!(
+        hits[0].linked_notes,
+        vec!["notes/a.md", "notes/b.md"],
+        "and belongs to both notes, whichever folder each reached it in"
+    );
+}
+
+/// **Deleting a linker leaves the list, not just the number.** §6's liveness rule is what makes `linked_from` mean
+/// *live*, so the same rule has to be visible in the names.
+#[test]
+fn a_deleted_linker_disappears_from_the_list() {
+    let f = Fixture::new();
+    for note in ["notes/a.md", "notes/m.md", "notes/z.md"] {
+        f.note(note, vec![vec![0.0, 1.0]]);
+    }
+    f.link("notes/a.md", "diagrams/kafka.png");
+    f.link("notes/m.md", "diagrams/kafka.png");
+    f.link("notes/z.md", "diagrams/kafka.png");
+    // Resolved, not as written: a link from `notes/a.md` reaches `notes/diagrams/kafka.png`, and planting the row under
+    // `diagrams/kafka.png` would leave this case with no linker to lose — the trap this file's own copy-of-a-figure
+    // fixture records. The count assertion below would then have been satisfied by an empty set.
+    f.image(22, &["notes/diagrams/kafka.png"], vec![1.0, 0.0]);
+
+    f.make_stale("notes/m.md");
+    let hits = f.search(QUERY, 10).expect("search: ok");
+    assert_eq!(
+        hits[0].linked_notes,
+        vec!["notes/a.md", "notes/z.md"],
+        "`m` is gone from the names as well as from the count"
+    );
+    assert_eq!(hits[0].linked_from, 2);
+}
