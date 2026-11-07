@@ -23,6 +23,11 @@ the tree, and the same rule is what caught the miscount above. Not audited as fa
 reasons an audit did not have to discover: F26 carries its own Closed on paragraph (2026-11-03), so it is closed rather than awaiting a check,
 and F27 holds a deliberate do-not-implement stance that an audit does not overturn.
 
+**[2026-11-07]** Of the four that stayed open above, **F23 now carries a Closed on paragraph**: its residue was driven through its own "do when" and turned out to be
+one stale registry row rather than a lost note, and the human accepted option A (accept and document) over clearing such rows. **F25** and **F35** were already ruled
+and closed below. Still open at this writing: **F18** (needs real Windows hardware), **F21** (its second half is merged; the closure paragraph waits on a graded tree),
+**F28** (same — implemented through step ⑤, waiting on CI to be graded), and **F30**/**F31**, which have not been audited as far as this file knows.
+
 
 These are not new features. They are the items the Milestone 1 reviews judged *correct enough to ship* but
 worth fixing before the code carries embeddings, clustering or a UI on top of it. Each entry lists what was
@@ -684,6 +689,35 @@ a dead row rather than a lost note; **(B)** clear such rows once their path is i
 neighbouring configuration where the stale row is the last record that a note existed; **(C)** report the count. Under (A) this card's only remaining open item
 is Windows file identity, which stays F18's blocker. Nothing was implemented for this round beyond the test and the document: the semantics question is the one
 this card has always said must be chosen on purpose.
+**Closed on 2026-11-07 by measuring the "do when" and finding one dead row where the card expected a lost note — option A, accepted by the human.** The residue is
+now driven end to end (`a_migration_keyed_row_with_no_identity_rejoins_its_path_and_leaves_a_stale_row`, `tests/scan.rs`) with the legacy key built by migration 4's
+own rule rather than an impression of it, and the answer is in `docs/design-f23-residue-measured.md`: once the obstruction clears, the note **rejoins its real path**
+with the content written while it was unreadable (`added 1, removed 1`, nothing skipped), the catalog lists it once beside its twin, a third scan has nothing pending,
+and `PARSE_VERSION` is recorded. The permanent remainder is one `stale` row under the display spelling holding pre-edit content found nowhere else — this card's
+refused deletion, still standing and still doing the job it was kept for, invisible in the catalog and excluded from `duplicates` by the `state = 'ok'` filter. So the
+"Do when" above is **met**, and two of its sentences needed correcting: "the duplicate pair returns" describes one live row and one stale one, not two live rows; and
+"`PARSE_VERSION` stays withheld" belongs to the configuration where the row cannot be resolved at all, not to this one.
+
+**What was ruled.** Of the three candidates in §5 of the document — (A) accept the stale row and close, (B) clear such rows once their path is indexed, (C) report the
+count — the human took **A**. B is this card's original question in a new hat: deleting a display-derived row needs proof that no note is behind it, and in the
+neighbouring configuration that stale row *is* the last record that a note ever existed, which is the harm F23 was opened to stop. C buys visibility for a state now
+known not to cost anything, at the price of another pinned `ScanReport` field. No code changed for this closure: the deliverable was the measurement and the wording,
+which is why nothing here waits on a capability.
+
+**How this was verified, and why that is not a CI claim.** `cargo test -p np-core --test scan` → **78 passed / 0 failed**, with **zero `NOT COVERAGE` lines**, on host
+`pi`, euid 1000 — the runner condition this card's own caveat demands be named, because these fixtures build their obstruction with `chmod 000` and latin-1 directory
+names and print `NOT COVERAGE` instead of passing quietly where the filesystem or a privileged account declines. Full local gates: 17 rows exit 0, workspace **693
+passed / 0 failed**, `GOLDEN CHECK: pass`. Actions minutes are exhausted (`docs/ops-actions-minutes.md`), so no run graded this tree and the last CI-graded tree stays
+`5e368ac`. That is disclosed rather than papered over, and it is also the weaker argument here than it usually is: by this card's own caveat a green CI run is *not*
+proof these cases executed, so naming the host and the euid carries more than a job that might have skipped them. The closure rests on measurement plus text, as F29's
+did, and says so in the same breath.
+
+**What this leaves open, elsewhere.** Windows file identity — whether `VolumeSerialNumber` + `FileId` behaves as design-a4 §5 expects — stays **F18**'s blocker, and no
+claim about it is made here. Fix candidate (i) above ("durable file identity", listed here as a future step) was overtaken by A4 (`cbcb12a`) and retired in the audit
+paragraph before this one; this closure retires nothing else. The invariant worth keeping from the measurement that came out wrong first (§3 of the document):
+`rel_bytes`, `case_bytes`, `rel` and `case_key` move together in a fixture, or the fixture invents a `files.case_bytes UNIQUE` collision no shipped build can produce
+and starts measuring its own planting.
+
 ## F24 — the two merge tests carry the same assertions twice
 
 - **Where:** `crates/np-core/tests/db.rs` —

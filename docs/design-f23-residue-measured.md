@@ -1,6 +1,7 @@
 # F23's residue, measured — what is actually left when the obstruction clears
 
-Status: **measurement, no code change.** It narrows what `docs/backlog-m2-followups.md` F23 calls "the residue" and asks for one
+Status: **measurement, no code change — and the ruling it asked for has been given.** On 2026-11-07 the human accepted **option A** (§5): the stale row stays, F23
+closed with this document as its evidence, and neither (B) nor (C) was taken. It narrows what `docs/backlog-m2-followups.md` F23 calls "the residue" and asks for one
 ruling: accept what is left and close, or spend on clearing it. Fixture:
 `crates/np-core/tests/scan.rs::a_migration_keyed_row_with_no_identity_rejoins_its_path_and_leaves_a_stale_row`. Prior art: F23 §1–§4
 (the scoping clause and the `matched` exclusion), `docs/design-a4-file-identity.md` §3 and §8 (identity may add a match, never remove
@@ -82,9 +83,10 @@ is a spec change to what the registry may forget, not a hardening round.
 that no longer spells any file". Cost: another field in `ScanReport`, whose JSON keys are pinned by CLI tests, buying visibility for a
 state that is now known to be harmless. Only worth doing if (B) is declined *and* someone wants the number on screen.
 
-**Recommendation: (A)**, with this fixture as the fence. The residue's harm turned out to be a dead row rather than a lost note, and both
-alternatives spend the thing F23 was opened to protect. If (A) is taken, F23's remaining open item becomes only what was already outside
-this measurement: Windows identity, which stays F18's blocker.
+**Recommendation: (A)**, with this fixture as the fence — **taken on 2026-11-07**, and F23's card carries the closure paragraph. The residue's harm turned out to be a dead row rather than a lost note, and both
+alternatives spend the thing F23 was opened to protect. Since (A) was taken, F23's remaining open item is only what was already outside this
+measurement: Windows identity, which stays F18's blocker. B and C are recorded above rather than deleted, because the reason they were declined is the argument a later
+reader needs before reopening either — particularly B, whose neighbour case is the harm F23 exists to prevent.
 
 ## 6. How to re-run it
 

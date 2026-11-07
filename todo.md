@@ -103,7 +103,7 @@ Four questions went up as human decisions; four answers came back, and one of th
   token's scope, so the reason is inferred from timing and step counts rather than read. No further pushes or reruns were spent on it; when a run gets
   steps again, that is the recovery signal, and `main` at `e4bdba3` carries three graded commits whose code was green locally (17 rows exit 0, workspace
   680 passed / 0 failed, `GOLDEN CHECK: pass`) and whose last CI-graded tree is `5e368ac` (`42325538290`, four jobs success).
-* **F23's residue measured, not implemented** (`docs/design-f23-residue-measured.md`): the Do-when fixture built with migration 4's own key rule shows the note
+* **F23 closed 2026-11-07 — residue measured, option A taken by the human** (`docs/design-f23-residue-measured.md`): the Do-when fixture built with migration 4's own key rule shows the note
   **rejoining its real path** with post-obstruction content; what stays is one `stale` row under the display spelling (F23's refused deletion, invisible in the
   catalog, not counted by `duplicates`). "The duplicate pair returns" was wrong — one live row and one stale. `PARSE_VERSION` is *not* withheld in this shape.
   Recommendation A (accept and close) awaits a ruling; B is F23's original deletion question wearing a hat. Fence:
