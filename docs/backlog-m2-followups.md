@@ -1184,6 +1184,36 @@ which needs F31's labelled set. What remains here is the human's decision, now w
   (`docs/design-m2-local-embeddings.md` §4), so it needs its own migration and `models` row, a re-normalisation on write, and a
   refusal rather than a blend when a query's width disagrees with the stored one.
 
+**Second half measured 2026-11-07 — the blocker was this card's own dependency, and F28 cleared it.** `np-cli` now calls `LocalEmbedder::with_mmproj`
+(`main.rs:693`, one call site, reached only when the workspace recorded a projector whose digest or stamp matches), so an ordinary `np embed` writes
+`media_embeddings` rows and they can be weighed. Numbers, on a 20-note corpus with **eight distinct PNGs** (1,092–11,083 B on disk, 24×24 through 80×80), release+
+`vision` binary, both artifacts installed through the CLI:
+
+* payload per stored vector: **3,072 B in both tables**, exact (`sum(length(vector))/count(*)` = 24,576/8 and 61,440/20) — one 768-component `f32`, no wide column
+  hiding in the media table;
+* **vector surface per figure row: 4,608 B. Per text chunk row: 4,096 B.** Isolated by deleting one table and `VACUUM`ing a *copy* (299,008 → 262,144 → 180,224 B),
+  the same trick as the first half; a media row is about **12.5% dearer** than a text row, which payload arithmetic cannot see — same vector width, more periphery;
+* `phase2 − phase1` (40,960 B) is *not* quoted as the media surface: appending a figure line re-parses and re-encodes those eight notes' chunks, so that delta mixes
+  two things. The deletion pair above is the clean isolation;
+* slack per row is therefore measured — 1,536 B around a media vector, 1,024 B around a text one — which turns the first half's guessed "roughly −23% at 512" into
+  **−22.2%** on the media row (4,608 → ~3,584) and −25.0% on a chunk. Still arithmetic in one respect: nothing can write a non-768 row, so "slack stays put when the
+  payload shrinks" is untested.
+
+**The comparison this document thinks the decision should be made against:** a 5,000-figure vault holds ~22.0 MB of media surface at 768 and would save **~4.9 MB**
+at 512 — **0.9% of the 554,821,056 B projector file** that has to be downloaded and read for any of those rows to exist. That is not an argument that 512 is worthless;
+it is an argument about which side of the ledger a migration, a model-identity change (`docs/design-m2-local-embeddings.md` §4), a re-normalisation on write and a
+width-disagreement refusal are worth buying against.
+
+**Recommendation: keep 768 and close this card by decision.** The saving is under 1% of the artifact the feature already requires, the quality question cannot be
+answered without F31's labelled set, and the cost is not a config value but a migration plus identity rules for vectors already stored. If the human agrees, the card
+closes with that ruling rather than with code; if not, the numbers above are what the re-store proposal starts from.
+
+**Nearly got this wrong on the fixture, recorded because nothing failed.** The first attempt appended figures by a hand-written name list while the corpus files were
+numbered from a different order: four appends hit real notes, four created new ones, and the run reported `images links 4 · embedded 4` cheerfully on its way to four
+media rows. The fixture now keys off filenames that exist and asserts both that the corpus gained no files and that exactly eight notes carry a figure *before*
+measuring. One timing observation, not a measurement (§8 wants ≥2 runs and a spread): phase-2 embed — 8 image encodes plus 8 text re-encodes with a projector open —
+took 33.8 s wall in one run on this host.
+
 ## F31 — nothing can be said about whether search finds the right diagram, because there is no labelled set
 
 Filed 2026-11-04 by R7c Task 8, as the retrieval-quality half of design §14.4. What exists is a **sanity check**: four generated

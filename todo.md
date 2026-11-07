@@ -103,6 +103,12 @@ Four questions went up as human decisions; four answers came back, and one of th
   token's scope, so the reason is inferred from timing and step counts rather than read. No further pushes or reruns were spent on it; when a run gets
   steps again, that is the recovery signal, and `main` at `e4bdba3` carries three graded commits whose code was green locally (17 rows exit 0, workspace
   680 passed / 0 failed, `GOLDEN CHECK: pass`) and whose last CI-graded tree is `5e368ac` (`42325538290`, four jobs success).
+* **F30's second half measured** (both halves now in `docs/measurement-f30-vector-surface.md`): a stored **figure costs 4,608 B of database and a stored chunk
+  4,096 B** — payload 3,072 B exact in both tables, so a media row is ~12.5% dearer than a text row, which payload arithmetic cannot see. Slack per row is measured now
+  (1,536 / 1,024 B), turning the earlier guessed "−23% at 512" into **−22.2%** on a figure row. Recommendation to the human: **keep 768** — a 5,000-figure vault saves
+  ~4.9 MB at 512, which is **0.9% of the projector file** the feature already requires, and the cost is a migration plus model-identity rules, not a config value;
+  ranking at 512 stays unmeasurable until F31. Fixture lesson: appending figures by a name list that didn't match the numbered files sent four of eight appends into
+  new notes and the run reported `links 4 · embedded 4` without failing — now keyed off real filenames with assertions before any measurement.
 * **F23 closed 2026-11-07 — residue measured, option A taken by the human** (`docs/design-f23-residue-measured.md`): the Do-when fixture built with migration 4's own key rule shows the note
   **rejoining its real path** with post-obstruction content; what stays is one `stale` row under the display spelling (F23's refused deletion, invisible in the
   catalog, not counted by `duplicates`). "The duplicate pair returns" was wrong — one live row and one stale. `PARSE_VERSION` is *not* withheld in this shape.
