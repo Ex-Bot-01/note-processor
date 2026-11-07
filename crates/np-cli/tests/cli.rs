@@ -1960,9 +1960,9 @@ fn a_build_without_the_runtime_does_not_fetch_a_model_it_cannot_load() {
 #[test]
 fn argv_and_the_environment_each_outrank_the_file_in_one_direction() {
     let ws = workspace();
-    ws.write_user_config(&format!(
-        "[embeddings]\nprovider = \"local-model\"\nmodel = \"embeddinggemma-2\"\n\n[models]\nauto_fetch = false\n"
-    ));
+    ws.write_user_config(
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"embeddinggemma-2\"\n\n[models]\nauto_fetch = false\n",
+    );
     run(&mut ws.command(&["scan"])).assert_success();
 
     // argv wins over the file…

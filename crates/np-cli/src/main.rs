@@ -1152,23 +1152,17 @@ fn workspace_db(config: &Config, workspace: &Path) -> Result<Db, Box<dyn Error>>
 
 /// `np models install` — verify the human's file against their declaration, then record it.
 ///
-/// Nothing is printed before [`models::install`] returns: §3 step 7 and F21 both say the durable record comes
-/// first and the echo second, so a refusal cannot leave a success line behind on stdout.
-/// Fetch `id`'s pinned members into `workspace` and record the model.
-///
-/// **The origin is read, never printed.** §12 rule 8 bounds what a report may say about where bytes came from, and a
-/// success line lands in CI logs as readily as a refusal does — so the report says an origin was configured and names
-/// the members, sizes and digests, which is everything a person can act on. The one thing that must not appear is the
-/// URL, because a mirror's hostname is someone's infrastructure detail and this program has no business publishing it
-/// in a build log. Since 2026-11-04 an origin exists on every run — `[models] base_url` and `NP_MODELS_BASE_URL` both
-/// silent means [`np_core::pins::DEFAULT_ORIGIN`] — which makes *not* printing it the more important half of the rule.
-#[cfg(feature = "fetch")]
 /// The one sentence that says **which kind** of origin this run would dial (**F38**, §12 rule 8).
+///
+/// Gated on `fetch` because both doors that print it — `np models fetch` and F38's trigger — are gated on the same feature: a build with
+/// no HTTP client has no origin to describe, and an ungated helper there is a dead-function warning in the default CI row for
+/// `--no-default-features`.
 ///
 /// A *kind*, never a host: `np models fetch`'s existing line and this one share the wording so they cannot drift into
 /// disagreeing about the same config state. The distinction it draws is real and cheap to lose — `[models] base_url`
 /// unset means the origin baked into the pin table, while an empty `NP_MODELS_BASE_URL=` counts as unset too, so "no
 /// configuration" and "configuration lost to a shell" look identical from here and both spend someone's egress.
+#[cfg(feature = "fetch")]
 fn origin_kind_line(cfg: &Config) -> &'static str {
     if cfg.models.base_url.is_none() {
         "origin      this build's compiled-in default — no [models] base_url is configured (an empty \
@@ -1247,6 +1241,17 @@ fn fetch_pinned_missing(
     }
 }
 
+/// Nothing is printed before [`models::install`] returns: §3 step 7 and F21 both say the durable record comes
+/// first and the echo second, so a refusal cannot leave a success line behind on stdout.
+/// Fetch `id`'s pinned members into `workspace` and record the model.
+///
+/// **The origin is read, never printed.** §12 rule 8 bounds what a report may say about where bytes came from, and a
+/// success line lands in CI logs as readily as a refusal does — so the report says an origin was configured and names
+/// the members, sizes and digests, which is everything a person can act on. The one thing that must not appear is the
+/// URL, because a mirror's hostname is someone's infrastructure detail and this program has no business publishing it
+/// in a build log. Since 2026-11-04 an origin exists on every run — `[models] base_url` and `NP_MODELS_BASE_URL` both
+/// silent means [`np_core::pins::DEFAULT_ORIGIN`] — which makes *not* printing it the more important half of the rule.
+#[cfg(feature = "fetch")]
 fn models_fetch(
     workspace: &Path,
     id: &str,
