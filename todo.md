@@ -103,6 +103,13 @@ Four questions went up as human decisions; four answers came back, and one of th
   token's scope, so the reason is inferred from timing and step counts rather than read. No further pushes or reruns were spent on it; when a run gets
   steps again, that is the recovery signal, and `main` at `e4bdba3` carries three graded commits whose code was green locally (17 rows exit 0, workspace
   680 passed / 0 failed, `GOLDEN CHECK: pass`) and whose last CI-graded tree is `5e368ac` (`42325538290`, four jobs success).
+* **F23's residue measured, not implemented** (`docs/design-f23-residue-measured.md`): the Do-when fixture built with migration 4's own key rule shows the note
+  **rejoining its real path** with post-obstruction content; what stays is one `stale` row under the display spelling (F23's refused deletion, invisible in the
+  catalog, not counted by `duplicates`). "The duplicate pair returns" was wrong — one live row and one stale. `PARSE_VERSION` is *not* withheld in this shape.
+  Recommendation A (accept and close) awaits a ruling; B is F23's original deletion question wearing a hat. Fence:
+  `a_migration_keyed_row_with_no_identity_rejoins_its_path_and_leaves_a_stale_row`. **Trap recorded:** the first fixture left `case_bytes` folded from the real
+  bytes while re-keying `rel_bytes`, so the scan refused the file on `case_bytes UNIQUE` and looked like permanent content loss — a planting artifact, not a
+  finding. The four key columns move together.
 * **`np models list` reports a model's file set** (the reporting gap F28 step ③ exposed): `ListedModel.members` = name, claimed file, present-or-absent by
   stat only — no per-member hashing on a listing, because verification belongs at use time. Text gains `files mmproj:present` when there is one; `--json`
   gains an eighth row key, `[]` for a single-file model. `main` stays out (its verdict is `state`). Four np-core + two CLI cases; three mutants killed — the
