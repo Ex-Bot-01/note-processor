@@ -217,12 +217,17 @@ extra key because `state` alone cannot say which artifact the run placed; the pl
 
 ```text
 models     1
-embeddinggemma-2  present  dim 768  sha256 2188ac1deca4  installed_at 1793893791  prefix_doc ""  prefix_query ""
+embeddinggemma-2  present  dim 768  sha256 2188ac1deca4  installed_at 1793893791  prefix_doc ""  prefix_query ""  files mmproj:present
 unclaimed  0
 ```
 
 `state` is `present`, or `missing` when the row exists and its file does not — a deleted artifact is reported rather than
-forgotten. Re-declaring an id with a different width is refused outright, because that would silently change what every stored
+forgotten. `files` names the model's **other** members (a projector, fetched or installed offline) and whether each file is
+there; it appears only when there is one to name, and `--json` carries the same set as `members`
+(`{"name", "file", "present"}`, empty for a model with a single file). It answers by stat, never by hashing — byte
+verification happens at use time, where reading 554 MB is already being paid for — so it tells you *a file is there*, not
+*those are the right bytes*. Before this field, confirming an offline projector install meant running `np embed` and watching
+`projector-absent` go away: a diagnosis standing in for a report. Re-declaring an id with a different width is refused outright, because that would silently change what every stored
 vector means; see [Troubleshooting](#troubleshooting) for the sentence it prints.
 
 ## Configuration
@@ -491,10 +496,9 @@ Repository layout: `crates/np-core` (discovery, parsing, links, catalog, databas
 build's corpus lands in `vision-unavailable`. A build made with `--features local-model,vision` does encode them — the passthrough **F28** was is
 in place, and the run hands over only a projector this workspace has recorded and whose digest (or stamp) matches. What that build needs from you is
 the file itself, and either door is open now: `np models fetch --member mmproj`, or `np models install --member mmproj` from a
-file you copied there yourself (**F28** step 3, offline, digest verified). What neither tells you yet is what the workspace
-recorded: `np models list` prints one line per model and never mentions members — true of fetched projectors too, so it is a
-reporting gap rather than an install one — which means the way to confirm a projector landed is that `np embed` stops
-reporting `projector-absent`. Image throughput, resident-set growth with a projector open, cross-worker bit-identity and
+file you copied there yourself (**F28** step 3, offline, digest verified). And `np models list` now shows what landed:
+`files mmproj:present` on the row, or `members` in `--json` (**F28**'s reporting gap, closed — it was a listing gap, not an
+install one, and fetched projectors were invisible too). Image throughput, resident-set growth with a projector open, cross-worker bit-identity and
 retrieval quality have **not** been measured — the list is in `docs/design-m2-image-embeddings.md` §14. Windows and macOS get a
 written refusal from `build.rs` for feature builds and have never been executed here.
 

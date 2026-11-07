@@ -1037,10 +1037,16 @@ running — `np-cli`'s `real_model` module with `NP_TEST_MODEL_PATH` set (**5 pa
 `local_vision` with both ggufs present (**15 passed / 0 failed**, no `NOT COVERAGE`). The closure paragraph goes in when a run that *has steps* grades
 `main`; until then this card stays open with its work done, which is the honest state and reads differently from "nothing left".
 
-**A gap this step exposes without causing:** `np models list` prints one line per model and never mentions members, so nothing tells you what the
-workspace recorded — true of fetched projectors since migration 9, so it is a reporting gap rather than an install one. The confirmation today is that
-`np embed` stops reporting `projector-absent`; that sentence is in the README's Option B, and closing it properly means adding member names to the
-listing's pinned key set, which is its own change.
+**A gap this step exposed without causing — closed the same day.** `np models list` printed one line per model and never mentioned members, so nothing told
+you what the workspace recorded (true of fetched projectors since migration 9, hence a reporting gap rather than an install one), and the only confirmation
+was watching `np embed` stop reporting `projector-absent`. `ListedModel` now carries `members`: name, claimed file name, present-or-absent — **by stat, never
+by hashing**, because `list` is the cheap question and byte verification already has a home at use time, where 554 MB is being read anyway. Text gains
+`files mmproj:present` only when there is a member to name; `--json` gains an eighth per-row key holding `[]` for a single-file model, since empty is a fact
+and absence is not. The main artifact stays out of the list: its verdict is the row's own `state`, which does hash and can say `mismatch`, and one file with
+two answers of different strength is how readers end up trusting the weaker one. Four np-core cases and two CLI ones; mutants killed for listing `main` as a
+member, treating any `metadata()` success as present (a directory in the member's place is absent — the claim that needed a case rather than a doc sentence),
+and never populating the set at all. The third mutant initially "survived" only because `cargo fmt` had rewrapped the line the patch searched for, so the
+mutation never applied — checked before believing it, the same trap as an earlier no-diff mutant this round.
 
 **Ruled in the same turn: the link is figure → note.** Not a coordinate inside the note — so the edge is one row per (note, figure), with no line,
 heading or chunk column. That settles the shape question this card ended on and leaves two to measure rather than debate: what the `vision`
