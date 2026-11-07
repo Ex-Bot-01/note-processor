@@ -483,9 +483,16 @@ fn search_workspace(
         let score = format!("{:.4}", hit.score);
         match &hit.source_note {
             Some(note) => {
+                // One linker gets named; more than one says so, because the count used to be invisible here and a figure
+                // belonging to four notes should not read as though it belongs to the one printed (F28). The note that is
+                // printed is `source_note` — the head of the same list `--json` carries in full.
+                let extra = match hit.linked_notes.len() {
+                    0 | 1 => String::new(),
+                    n => format!(" +{} more", n - 1),
+                };
                 let _ = writeln!(
                     out,
-                    "{score} {:<5}  {}   (from {note})",
+                    "{score} {:<5}  {}   (from {note}{extra})",
                     hit.kind.label(),
                     hit.path
                 );
@@ -498,13 +505,20 @@ fn search_workspace(
     Ok(())
 }
 
-/// One hit as JSON: **the same five keys whatever the kind** — `{score, kind, path, linked_from, source_note}`.
+/// One hit as JSON: **the same six keys whatever the kind** —
+/// `{score, kind, path, linked_from, source_note, linked_notes}`.
 ///
 /// The first version added `linked_from` and `source_note` only for image hits, which made the schema depend on a value
 /// inside the object — a reader then has to branch on `kind` before it knows whether a key is there, and a note hit whose
 /// linker field is simply absent reads differently from one that has none. Absent and zero are different statements, so this
 /// emits both keys always: `source_note: null` and `linked_from: 0` for a hit that has no linking note (every note hit, and
 /// an orphaned figure). Same rule `EmbedReport::artifact_check` already follows — present and null, not missing.
+///
+/// `linked_notes` follows the same rule in list form: **an empty array, never `null`** (F28). It is the whole relation — every
+/// live note linking a figure, byte-ordered — where `source_note` was its head and `linked_from` its length, so the three
+/// cannot tell different stories about one hit. An empty array means "this hit has no live linker", which is true of both a
+/// note hit and an orphaned figure; distinguishing those two is what `kind` is for, and giving the list a null on one kind
+/// and an empty array on the other would put the schema back where `kind`-dependent keys left it.
 fn hit_json(hit: &Hit) -> Value {
     json!({
         "score": hit.score,
@@ -515,6 +529,7 @@ fn hit_json(hit: &Hit) -> Value {
             Some(note) => json!(note),
             None => Value::Null,
         },
+        "linked_notes": hit.linked_notes,
     })
 }
 

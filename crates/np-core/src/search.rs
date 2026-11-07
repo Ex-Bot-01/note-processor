@@ -67,14 +67,63 @@ pub struct Hit {
     /// For an image this is the lexicographically smallest `media_path.rel_bytes` holding those bytes, so one figure
     /// copied to three folders names one path and answers once (§6's content-identity rule).
     pub path: String,
-    /// For an image hit, the note to open: the lexicographically smallest **live** note linking that path (§6).
+    /// The note to open: the lexicographically smallest **live** note linking that path (§6) — which is to say,
+    /// [`Hit::linked_notes`]`[0]`, assembled by the one constructor that builds an image hit and never chosen
+    /// independently. (That constructor is private on purpose, so this says what it is rather than linking to it.)
     ///
     /// `None` for a note hit, and for an image whose linkers no live note row names — which happens when the only
     /// spelling of a figure's name in `links.target` is a lossy decode of bytes that never round-trip. Undercounting a
     /// linker is a reportable fact; inventing one is not.
     pub source_note: Option<String>,
-    /// How many live notes link this image; always `0` for a note hit.
+    /// Every live note linking this image, byte-ordered — the relation itself rather than a sample of it (F28).
+    ///
+    /// **Why this exists next to the two fields above.** §6 picked one note because a text line has one column, and
+    /// `linked_from` counted the rest; together they answered "how many" and "open this", and discarded everything in
+    /// between. A figure linked from four notes rendered as one name and the number 4, so the three nobody named were
+    /// invisible to the reader trying to work out why the hit came back. This is the set; `source_note` is its head and
+    /// `linked_from` its length, both built in one place so they cannot disagree, and
+    /// `tests/search.rs`'s `a_hits_linker_fields_cannot_disagree_with_each_other` fails if that ever stops being true.
+    ///
+    /// Empty for a note hit and for an orphaned figure — never a one-element list holding a null.
+    pub linked_notes: Vec<String>,
+    /// How many live notes link this image, always `0` for a note hit: [`Hit::linked_notes`]`().len()`.
     pub linked_from: usize,
+}
+
+impl Hit {
+    /// One hit for a figure, with its linker set. The only place `source_note`, `linked_notes` and `linked_from` are
+    /// written together, which is what makes them one fact rather than three that happen to agree — the head and the
+    /// length of a list cannot drift from it while there is one statement computing all three.
+    fn image(score: f64, path: String, notes: &[Vec<u8>]) -> Hit {
+        // Lossy-decoded on the way out for the same reason `path` is (F20: bytes are the identity, text is a rendering).
+        let linked_notes: Vec<String> = notes
+            .iter()
+            .map(|note| String::from_utf8_lossy(note).to_string())
+            .collect();
+        let source_note = linked_notes.first().cloned();
+        let linked_from = linked_notes.len();
+        Hit {
+            score,
+            kind: HitKind::Image,
+            path,
+            source_note,
+            linked_notes,
+            linked_from,
+        }
+    }
+
+    /// One hit for a note. Takes no linker arguments at all: a note links things, it is not linked *by* things, so the
+    /// three fields above are empty here by construction rather than by each caller remembering to zero them.
+    fn note(score: f64, path: String) -> Hit {
+        Hit {
+            score,
+            kind: HitKind::Note,
+            path,
+            source_note: None,
+            linked_notes: Vec::new(),
+            linked_from: 0,
+        }
+    }
 }
 
 /// Why a search could not answer.
@@ -362,13 +411,7 @@ fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Ranked>, Sear
     Ok(best
         .into_iter()
         .map(|(key, score)| Ranked {
-            hit: Hit {
-                score,
-                kind: HitKind::Note,
-                path: String::from_utf8_lossy(&key).to_string(),
-                source_note: None,
-                linked_from: 0,
-            },
+            hit: Hit::note(score, String::from_utf8_lossy(&key).to_string()),
             key,
         })
         .collect())
@@ -409,29 +452,32 @@ fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Ranked>, Sea
         // The width check above is what makes this decode total; the arm stays because a row written by a future
         // migration is not this reader's problem to guess at.
         let stored = stored_vector(&bytes, dim, model)?;
-        let Some((key, source_note, linked_from)) = media_report(conn, media_id, &linkers)? else {
+        let Some((key, notes)) = media_report(conn, media_id, &linkers)? else {
             // A media row with no path row is a row `prune_unlinked_media` has not reached yet (a run that skipped its
             // sweep). There is no workspace path to name, so there is nothing a reader could open: report nothing rather
             // than a hit whose path column is empty.
             continue;
         };
         hits.push(Ranked {
-            hit: Hit {
-                score: cosine(query.components(), stored.components()),
-                kind: HitKind::Image,
-                path: String::from_utf8_lossy(&key).to_string(),
-                source_note,
-                linked_from,
-            },
+            hit: Hit::image(
+                cosine(query.components(), stored.components()),
+                String::from_utf8_lossy(&key).to_string(),
+                &notes,
+            ),
             key,
         });
     }
     Ok(hits)
 }
 
-/// `(smallest stored path, smallest live linker, linker count)` for one media row, or `None` when it holds no path.
+/// `(smallest stored path, every live linker)` for one media row, or `None` when it holds no path.
 ///
-/// Both the path and the note are chosen by **smallest bytes**, not by insertion order: `media_path` is keyed by
+/// The linkers come back as the **whole set**, byte-ordered, and it is up to [`Hit::image`] to decide what a reader sees:
+/// the head becomes `source_note`, the length becomes `linked_from`. This function used to do that narrowing itself —
+/// returning one note and a count — which is where F28's information went missing: the set was assembled here, complete,
+/// and then reduced before any caller could use it.
+///
+/// Both the path and the notes are chosen by **smallest bytes**, not by insertion order: `media_path` is keyed by
 /// `rel_bytes` and `links` by note id, and either could come back in a different sequence after a rename or a re-scan.
 /// The path comes back as bytes rather than rendered text because [`search`] needs the un-lossy form to break ties.
 fn media_report(
@@ -462,11 +508,9 @@ fn media_report(
             notes.extend(holders.iter().cloned());
         }
     }
-    let source_note = notes
-        .first()
-        .map(|note| String::from_utf8_lossy(note).to_string());
-    let linked_from = notes.len();
-    Ok(Some((smallest.clone(), source_note, linked_from)))
+    // `notes` is a `BTreeSet`, so this is already byte-ordered — the same order `source_note` was chosen from, which is
+    // what lets the head of this list be the old answer rather than a new decision.
+    Ok(Some((smallest.clone(), notes.into_iter().collect())))
 }
 
 /// Which live notes link each workspace figure path.
@@ -515,7 +559,7 @@ fn linker_index(conn: &Db) -> Result<Linkers, SearchError> {
 /// Every live note that links one workspace figure path, by path.
 type Linkers = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 
-/// What one media row reports: its smallest **stored** path bytes, the smallest live note that links it, and how many live
-/// notes link it. A name for this pair-of-pairs because [`media_report`]'s bare return type trips `clippy::type_complexity`,
-/// and a reader of that signature deserves the words anyway.
-type MediaReport = (Vec<u8>, Option<String>, usize);
+/// What one media row reports: its smallest **stored** path bytes, and every live note that links it, byte-ordered.
+/// A name for this pair because [`media_report`]'s bare return type trips `clippy::type_complexity`, and a reader of that
+/// signature deserves the words anyway.
+type MediaReport = (Vec<u8>, Vec<Vec<u8>>);

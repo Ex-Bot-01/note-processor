@@ -284,8 +284,10 @@ np models install|fetch|hash|list …
   are indexed is never a refusal: a notes-only corpus searches fine, so does an images-only one, and an index with no vectors
   prints `nothing indexed for <id>` and exits **0**.
 - **`--json` is the machine interface.** stdout carries exactly one JSON document (`scan`, `embed`, `search`, `models list`);
-  search hits always carry the same five keys — `score`, `kind`, `path`, `linked_from`, `source_note` — because an absent key
-  and a zero would be two different claims.
+  search hits always carry the same six keys — `score`, `kind`, `path`, `linked_from`, `source_note`, `linked_notes` — because
+  an absent key and a zero would be two different claims. The last one is F28's: **every** live note linking a figure,
+  byte-ordered, where the other two were its head and its length. A note hit and an orphaned figure both get `[]`, never
+  `null` — "this hit has no live linker" is one true statement about either, and telling them apart is what `kind` is for.
 
 ```sh
 np search ~/Notes "vision projector" --limit 2 --json
@@ -294,11 +296,35 @@ np search ~/Notes "vision projector" --limit 2 --json
 ```json
 {
   "hits": [
-    { "kind": "note", "linked_from": 0, "path": "projects/brief.md", "score": 0.6496769175575762, "source_note": null },
-    { "kind": "note", "linked_from": 0, "path": "projects/timeline.md", "score": 0.6416128848890479, "source_note": null }
+    { "kind": "note", "linked_from": 0, "linked_notes": [], "path": "projects/brief.md", "score": 0.6496769175575762, "source_note": null },
+    { "kind": "note", "linked_from": 0, "linked_notes": [], "path": "projects/timeline.md", "score": 0.6416128848890479, "source_note": null }
   ]
 }
 ```
+
+A figure linked from two notes, from a `--features local-model,vision` build whose projector was installed offline
+(`np models install --member mmproj`) — the whole output of one real run, including what the text channel makes of it:
+
+```json
+{
+  "kind": "image",
+  "linked_from": 2,
+  "linked_notes": ["notes/a.md", "notes/b.md"],
+  "path": "img/fig.png",
+  "score": 0.5161576999208495,
+  "source_note": "notes/a.md"
+}
+```
+
+```text
+0.8208 note   notes/a.md
+0.7350 note   notes/b.md
+0.5162 image  img/fig.png   (from notes/a.md +1 more)
+```
+
+Before F28 that image line was `(from notes/a.md)` and `notes/b.md` existed only as the number 2 in a JSON key nobody read.
+The note printed is still `source_note`, because it is `linked_notes[0]` — one list, assembled once, and a test that fails
+if head-or-count ever stops matching it.
 
 - **Exit codes.** `0` success (including "nothing to do" and "nothing indexed"), `1` anything the runtime refused — disabled
   provider, missing artifact, a model mismatch — and `2` for argv errors, which is clap's doing. No command invents a code.

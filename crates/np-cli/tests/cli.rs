@@ -2271,11 +2271,26 @@ mod real_model {
         );
         assert_eq!(
             json_keys(&hits[0]),
-            vec!["kind", "linked_from", "path", "score", "source_note"],
-            "§12's five fields, no extras"
+            vec![
+                "kind",
+                "linked_from",
+                "linked_notes",
+                "path",
+                "score",
+                "source_note",
+            ],
+            "§12's hit fields plus F28's linker list, no extras"
         );
         assert_eq!(hits[0]["path"].as_str(), Some("a.md"));
         assert_eq!(hits[0]["kind"].as_str(), Some("note"));
+        // A note hit carries the linker list **empty**, not absent and not null: "no live linker" is one true statement
+        // about both a note and an orphaned figure, and `kind` is what says which (F28's schema rule).
+        assert_eq!(
+            hits[0]["linked_notes"].as_array().map(Vec::len),
+            Some(0),
+            "a note hit belongs to no note: {}",
+            json.stdout()
+        );
         let scores: Vec<f64> = hits
             .iter()
             .map(|hit| hit["score"].as_f64().expect("score is a number"))

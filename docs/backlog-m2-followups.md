@@ -969,8 +969,8 @@ recorded file's bytes moved; and CI gained `Feature local-model,vision (ubuntu-l
 days of green runs. Evidence: branch run `42258831178`, four jobs success, its vision step reporting 15 passed / 0 failed with the artifact-backed cases
 printing `NOT COVERAGE`; merged-tree gates 17 rows exit 0 including the CLI-with-pair check, workspace 670 passed / 0 failed, `GOLDEN CHECK: pass`.
 Three mutants killed by three distinct cases (skip the digest comparison, resolve by path existence, ignore the stamp pair), none needing a model file.
-**Still open in this card** (as filed): `np models install --member`, the five archive shapes against §14's ceiling, and the placement half. The first two
-are closed below; the placement half remains.
+**Still open in this card** (as filed): `np models install --member`, the five archive shapes against §14's ceiling, and the placement half. All three are
+closed below — the card closes at the end of this section once the merged tree is graded.
 
 **Step ③ landed the same day** (commit `b082272`, merged with history at `5374dc1`; branch CI `42324417379` green on all four jobs, merged-tree gates 17 rows exit 0, workspace 680 passed / 0 failed, `GOLDEN CHECK: pass`). `np models install --member <main|mmproj>`: the member name keys `model_files`, the file lands at `<id>.mmproj`
 (`member_artifact_name`), and the model row is not written — asserted as a whole-row comparison, because a projector digest copied into `models.sha256`
@@ -992,6 +992,24 @@ code therefore costs **+1,939,584 B** over the text-only C++ build, attributed b
 true and gains the row that tested it, in `docs/design-m2-local-embeddings.md` §14, next to the finding it retires. Two things this measurement refuses to
 claim: that equal sizes mean one artifact (`--no-default-features --features fetch` matches `default` at 8,223,056 B while differing in 2,192,920 of those
 bytes), and that the table describes what a user downloads to encode figures (the projector is **554,821,056 B**, ~35× the largest binary in it).
+
+**Step ⑤ — placement — landed the same day, and it needed no migration.** `Hit` gains `linked_notes`: every live note linking a figure, byte-ordered,
+assembled once inside one constructor whose head becomes `source_note` and whose length becomes `linked_from`. The card's own wording ("an occurrence edge
+(migration 11) from a note to the figure it references") was corrected earlier the same day by the ruling that the link is figure → note, so what was
+missing was never an edge — it was that `media_report` already assembled the whole set and then reduced it to one name and a count before any caller could
+read it. Four np-core cases: all three linkers named in byte order with insertion order still wrong on purpose; the three fields unable to disagree across
+a corpus holding a two-linker figure, an orphan and note hits (the loop asserts the corpus contained both shapes, or it would prove nothing by emptiness);
+linkers gathered from every path one figure is stored at; and a deleted linker leaving the list as well as the count. Three mutants killed — return only
+the first linker, take `source_note` from the end of the list, count "any" instead of length — each dying on several cases including pre-existing ones.
+Two fixture bugs of this file's own documented species were caught by asserting non-emptiness: both planted media rows under the path a link *spells*
+rather than the one it resolves to, and `linked_notes` came back empty where the count had been quietly satisfiable at 0.
+
+**End-to-end, with real artifacts and no mocks:** a vision build (`--features local-model,vision`), both gguf files installed offline through step ③'s
+`install --member`, one 463-byte PNG linked from two notes, then `np embed` (image encoded) and `np search`. The JSON hit carries
+`linked_from: 2`, `linked_notes: ["notes/a.md","notes/b.md"]`, `source_note: "notes/a.md"`; the text line reads
+`0.5162 image img/fig.png (from notes/a.md +1 more)`. Before this step that second note existed only as a number in a key nobody reads on a terminal.
+The artifact-gated CLI case that pins `--json`'s key set was re-run with `NP_TEST_MODEL_PATH` set — 1 passed, not `NOT COVERAGE` — so the six-key schema is
+graded by a real model rather than asserted.
 
 **A gap this step exposes without causing:** `np models list` prints one line per model and never mentions members, so nothing tells you what the
 workspace recorded — true of fetched projectors since migration 9, so it is a reporting gap rather than an install one. The confirmation today is that
