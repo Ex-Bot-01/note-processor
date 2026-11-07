@@ -1,8 +1,9 @@
-# F30 (first half) — what a stored vector actually costs
+# F30 — what a stored vector actually costs, text rows and figure rows
 
-Measurement, not design. F30's card says the first thing it owes is index bytes for a corpus with figures; this measures the half that is
-reachable from the shipped binary today and states precisely why the other half is not. No decision is taken here — the 512 question stays
-the human's, which is what these numbers are for.
+Measurement, not design. F30's card says the first thing it owes is index bytes for a corpus with figures. **Both halves are now measured:** the text half on
+2026-11-06 from the shipped binary, the figure half on 2026-11-07 once F28 handed the CLI a projector (`docs/design-f28-image-embedding-in-np.md`). No decision is
+taken here — the 512 question stays the human's, which is what these numbers are for. The figure half ends with the comparison this document thinks that decision
+should be made against.
 
 Measured 2026-11-06 on this host (16 CPUs, 7,419 MB RAM), `np` built `--features local-model`, artifact
 `embeddinggemma-2-Q8_0.gguf` (309,855,456 B, sha256 `2188ac1d…`), a fresh data directory, and the repository's own fixture corpus at
@@ -24,7 +25,7 @@ populated database and agree between runs, because the second run changed nothin
 the same corpus, and pretending otherwise would be theatre. What *was* measured twice with different results is stderr volume, in the last
 section — that one genuinely varies, with work rather than with randomness.
 
-## The half that is blocked, and by what
+## The half that was blocked, and by what  *(superseded 2026-11-07 — see "The second half, measured" below; kept because it is what was true when written)*
 
 `media_embeddings` stayed empty because **the shipped binary cannot reach image code**: `np-cli` never calls
 `LocalEmbedder::with_mmproj` (`grep -c with_mmproj crates/np-cli/src/main.rs` → 0), which is exactly F28. The projector path exists in
@@ -60,9 +61,91 @@ The second run, which loaded nothing, wrote 0 bytes. README and F33's §5 said "
 now say what was measured instead. Silencing that line means `log_level = "error"`, which also silences a real load failure — the trade F33
 took deliberately, in the other direction, and still does.
 
+
+## The second half, measured 2026-11-07 — a corpus with figures
+
+F28 landed the hand-off this half was waiting on: `np-cli` calls `LocalEmbedder::with_mmproj` (`crates/np-cli/src/main.rs:693`,
+one call site, reached only when the workspace has recorded a projector whose digest or stamp matches), so an ordinary
+`np embed` now writes `media_embeddings` rows and they can be weighed. The paragraph above about the shipped binary being unable
+to reach image code is **superseded**; it stayed in place because it is what was true on 2026-11-06, and the sentence that ages
+should say when it aged.
+
+Measured on this host with the release+`vision` binary (`--features local-model,vision`, `mtmd_*` symbols present), both real
+artifacts installed through the CLI — main via `models install`, projector via `models install --member mmproj`, digests computed
+from the files rather than typed. Two phases in **one** workspace, so the text population is the same in both measurements:
+
+| | notes / chunks / vectors | whole database | how |
+| --- | --- | --- | --- |
+| phase 1 — text only | 20 notes → 20 rows, 0 media rows | **258,048 B** (63 pages × 4,096) | `np scan`, then `np embed` on a fresh data directory |
+| phase 2 — same corpus, eight **distinct** PNGs appended to eight of those notes | 20 rows + **8 media rows** | **299,008 B** (73 pages) | figures 1,092–11,083 B on disk, sizes 24×24 through 80×80 |
+| phase 2 copy, `media_embeddings` deleted and `VACUUM`ed | 20 rows, 0 media rows | **262,144 B** (64 pages) | run on a copy; the measured database was never mutated |
+| phase 2 copy, both vector tables deleted and `VACUUM`ed | 0 rows | **180,224 B** (44 pages) | the non-vector baseline for this corpus |
+
+Exact payload, straight from the table: `sum(length(vector)) / count(*)` = 24,576 / 8 = **3,072 B per media row**, identical to
+the note rows' 61,440 / 20 = 3,072 B — one 768-component `f32` each, as §1.2's locked decision says, with no extra wide column
+hiding in the media table.
+
+**So a stored figure costs 4,608 B of database and a stored chunk 4,096 B.** Both are the vector surface — payload plus its index
+and page slack — isolated by deletion-and-`VACUUM` on copies: (299,008 − 262,144) / 8 = **4,608 B per media row**, and
+(262,144 − 180,224) / 20 = **4,096 B per note row**. The media row is about **12.5% dearer** than a text row, which arithmetic on
+the payload alone could not have shown: same vector width, more periphery (its own table, its own key, its path and digest
+columns). The first half measured 4,369 B per note row on a different corpus; 4,096 B here is the same quantity landing in the
+same ballpark with a different page fill, and neither is a constant anyone should quote as *the* per-row cost.
+
+`phase2 − phase1` (40,960 B) is **not** the media surface and is not quoted as such: appending a figure line also changes those
+eight notes' bodies, so their chunks re-parse and re-encode. The deletion-and-`VACUUM` pair above is the clean isolation, which is
+why the first half used it too.
+
+### What the 512 arithmetic looks like with a measured slack constant
+
+Slack per row is now a measured quantity rather than an unknown: 4,608 − 3,072 = **1,536 B** around a media vector, 4,096 − 3,072 =
+**1,024 B** around a text vector. Re-storing at 512 keeps the slack and cuts the payload to 2,048 B:
+
+| | 768 (measured) | 512 (arithmetic on measured slack) | saving |
+| --- | --- | --- | --- |
+| per figure | 4,608 B | ~3,584 B | **−22.2%** |
+| per chunk | 4,096 B | ~3,072 B | −25.0% |
+| a vault with 5,000 figures | ~22.0 MB of media surface | ~17.1 MB | **~4.9 MB** |
+
+The first half guessed "roughly −23%" from the text-row ratio; the measured media-row figure is −22.2%, so the guess holds and is
+now not a guess about the *ratio* — only about slack staying put when the payload shrinks, which nothing here has tested, because
+nothing here can write a 512-wide row.
+
+Put beside what else an image index needs, though: the projector artifact this feature loads is **554,821,056 B**. The ~4.9 MB a
+5,000-figure vault would save at 512 is **0.9%** of that file. That is the comparison the decision should be made against, and it
+is arithmetic too — but both sides of it are measured bytes, not estimates.
+
+Re-running it: the script is deliberately **not** in the tree — it names this host's artifact paths and a scratch directory, and would only rot. The sequence is
+above: build `--features local-model,vision`, `models install` the main file and `models install --member mmproj` the projector, embed a text-only corpus and weigh
+it, append one distinct PNG to each of eight notes, scan, embed, weigh again, then delete-one-table-and-`VACUUM` on **copies**. The assertion that keeps a rerun honest
+is `media_rows == 8`: a measurement taken from a corpus that is not the corpus described arrives wearing evidence.
+
+### What this measurement nearly got wrong
+
+The first attempt appended figures by a hand-written name list (`kafka`, `ledger`, …) while the corpus files were numbered from a
+*different* list order, so four appends landed on real notes and four created brand-new ones — and the run reported
+`images links 4 · embedded 4` on its way to four media rows. Nothing failed. The fix is in the fixture: figures are now keyed off
+the filenames that actually exist, and it asserts both that the corpus did not gain files and that exactly eight notes carry a
+figure before anything is measured. A size measurement taken from a corpus that isn't the corpus described is worse than no
+measurement, because it arrives wearing evidence.
+
+One timing observation, deliberately **not** a measurement: the phase-2 embed — 8 image encodes plus 8 text re-encodes with a
+projector open — took 33.8 s wall on this host in one run. §8's rule (≥2 runs and a spread) is not satisfied by one run, so treat
+it as "this did not take minutes", and nothing stronger.
+
+### Still not measured
+
+* Ranking quality at 512 or 256 — no labelled set exists (**F31**), and the storage case above is not an argument about relevance.
+* Whether slack really stays put at a narrower slice: no code path writes a non-768 row, so the 512 column above is arithmetic.
+* A real vault. Twenty fixture notes and eight synthetic 24×24-to-80×80 rasters; a vault's figures are photographs and screenshots
+  at sizes this table has not seen, and per-row figures extrapolate while totals do not.
+* Two figures with identical bytes linked from two notes (content-addressed dedupe) — the row count claim is F28's, pinned in tests,
+  not weighed here.
+* Windows page size and slack: never run there.
+
 ## Not measured here, stated so it is not mistaken for covered
 
-* `media_embeddings` bytes on any corpus (blocked on F28).
+* ~~`media_embeddings` bytes on any corpus (blocked on F28).~~ **Measured 2026-11-07** in the section above.
 * Ranking quality at 512 or 256 — no labelled set exists (F31), and a set small enough to assert against could not support the claim.
 * Anything about a real user's vault: this is 16 fixture notes, one of which produces no chunk. Per-row figures extrapolate; totals do not.
 * FTS/index bytes for the *non-vector* tables (the 147,456 B baseline lumps them together with schema and row content on purpose — splitting
