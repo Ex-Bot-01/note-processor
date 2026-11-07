@@ -21,12 +21,23 @@ mkdir -p "$logs"
 fail=0
 vacuous=0
 have_cmake=0
-if [ -n "${CMAKE:-}" ] && command -v "${CMAKE%%/*}" >/dev/null 2>&1; then
+# Two shapes of "$CMAKE" have to work: an absolute path (which `command -v` answers for, but `${CMAKE%%/*}` on a leading slash
+# is the empty string — the first version of this check therefore reported "no cmake" on a box where cmake was installed and
+# $CMAKE pointed at it) and a bare name on PATH.
+if [ -n "${CMAKE:-}" ] && { [ -x "${CMAKE:-}" ] || command -v "$CMAKE" >/dev/null 2>&1; }; then
   have_cmake=1
 elif command -v cmake >/dev/null 2>&1; then
   CMAKE="$(command -v cmake)"; export CMAKE; have_cmake=1
 fi
 export TMPDIR="${TMPDIR:-/tmp}"
+
+# **Linking is the memory-bound step on this class of box, and cargo does not know that.** `nproc` here says 16 while RAM says
+# 7.4 GB, and an uncapped `cargo test --workspace` links up to sixteen debug test binaries at once — each with full debuginfo —
+# which on 2026-11-07 made `rust-lld` die with `ld terminated with signal 7 [Bus error]` on three rows and left the three
+# python checks exiting 120 (CPython's "could not flush stdout at exit" status) with empty logs. All six passed on a re-run, so
+# the red was resource pressure, not the tree. Four concurrent link jobs fit; the number is this box's, not a universal one, and
+# `CARGO_BUILD_JOBS` in the environment overrides it.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
 row() {
   name="$1"; shift
@@ -48,6 +59,9 @@ row_or_skip() {
 
 echo "# tree $(git rev-parse HEAD 2>/dev/null || echo 'not a git checkout') on $(uname -srm)"
 echo "# cmake  ${CMAKE:-none} (local-model rows need it)"
+ram='?'
+[ -r /proc/meminfo ] && ram=$(awk '/^MemTotal:/ { printf "%.1f GB", $2 / 1048576 }' /proc/meminfo)
+echo "# jobs   CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS  ram=$ram"
 
 row fmt cargo fmt --all -- --check
 row clippy-default cargo clippy --workspace --all-targets -- -D warnings

@@ -33,6 +33,34 @@ CMAKE=$HOME/tools/cmake/bin/cmake .github/scripts/gates.sh   # with the local-mo
 .github/scripts/package-assets.sh dist                       # then read the printed sha256
 ```
 
+### 2.1 What the first local grading run of `v0.2.0` reported, and what was wrong with the script
+
+The first run of `.github/scripts/gates.sh` on the tagged tree came back **red on six rows** — three cargo rows at exit 101 and
+the three python checks at exit 120 with empty logs. Reading the logs before believing them:
+
+* `ld terminated with signal 7 [Bus error]`, inside `rust-lld`, while linking `np-cli`'s test binaries.
+* CPython's exit status **120 means "failed to flush stdout at interpreter exit"**, which is what a process does when the machine
+  is out of memory rather than out of ideas.
+* This box reports `nproc` = 16 and `MemTotal` = 7.2 GB; an uncapped `cargo test --workspace` links up to sixteen debug binaries
+  with full debuginfo at once. All six rows passed on a plain re-run, so the tree was never implicated.
+
+Two script bugs came out of the same run and are fixed in `.github/scripts/gates.sh`: cmake detection used `${CMAKE%%/*}`, which is
+the empty string for an absolute path, so the four `local-model` rows reported **SKIPPED on a box where cmake was installed and
+`$CMAKE` pointed at it** — a skip that would have quietly shrunk every future local grade; and rows now run with
+`CARGO_BUILD_JOBS=4` (overridable), which is this box's fit, not a universal number. The header prints the tree sha, the job cap and
+RAM so a log says what it was graded on.
+
+Re-graded after the fixes, same tree `4c5200f`: **17 rows exit 0**, artifact rows skipped because no artifact paths were exported,
+`NOT COVERAGE` count 0 across all logs. The asset published for `v0.2.0` is `np-0.2.0-x86_64-unknown-linux-gnu.tar.gz`,
+3,948,871 bytes, sha256 `51644f639801364eb2b82999511c720309007dc4598fc7eb293f05784619c1d2`, built from the tagged tree by
+`.github/scripts/package-assets.sh` and smoke-tested out of the archive (`np 0.2.0`; four subcommands; `scan`; a keyword hit at exit 0
+with the F36 caveat on stderr; `--mode semantic` refusing at exit 1). The tag stays where the binary was built; this paragraph's fixes
+touch only the scripts and this file.
+
+One loose end from the earlier dispatch experiments: GitHub also holds a release object named **`61dbd85`** — an accidental release
+created on a raw-SHA tag by a `workflow_dispatch` test, with no assets. It has been converted to a **draft** rather than deleted, so it
+disappears from the releases page and stays recoverable; deleting it outright is one `gh release delete 61dbd85` away if that is wanted.
+
 ## 3. What this token can and cannot do (measured 2026-11-07, fine-grained PAT)
 
 | Endpoint | Result | Consequence |
