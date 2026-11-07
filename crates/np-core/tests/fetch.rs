@@ -1251,3 +1251,119 @@ fn a_fetched_model_is_the_artifact_list_already_looks_for() {
         "the marker went with completion"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F38: offline is a fact about how the fetch failed, never a probe we ran first.
+// `docs/design-f38-auto-fetch.md` §5.
+// ---------------------------------------------------------------------------
+
+/// **The line auto-fetch walks on.** Fetching by default means every failure now decides whether a command degrades or
+/// refuses, and the two must never collapse into one outcome:
+///
+/// * nothing reached an origin → **offline** → skip the fetch, index what can be indexed, say so;
+/// * the origin answered and said no, or handed back bytes that do not hash right → a real error, refused loudly.
+///
+/// The right-hand column is what a caller does next, so it is asserted from the *raw client text* rather than from an
+/// already-summarised class: that is the string `HttpTransport` actually sees, and a classifier change that quietly
+/// reclassifies "connection refused" as a server answer would be caught here instead of in someone's outage.
+#[test]
+fn a_missing_connection_is_a_skip_and_a_wrong_answer_is_a_refusal() {
+    for (raw, offline) in [
+        // Nothing out there: name would not resolve, no route, nothing listening, the read stalled.
+        ("getaddrinfo name or service not known", true),
+        ("dns error: no records", true),
+        ("connection refused", true),
+        ("network is unreachable", true),
+        ("operation timed out", true),
+        ("io error: BrokenPipe", true),
+        // The origin is alive and told us something. Skipping here would hide a broken mirror behind "offline".
+        (
+            "https://mirror.invalid/models/main.gguf: status code 404",
+            false,
+        ),
+        ("status code 403 forbidden", false),
+        ("status code 503 service unavailable", false),
+        ("redirect to another host refused", false),
+        // TLS is deliberately NOT offline. A captive portal does produce this string — and so does a network that
+        // wants the fetch to fail quietly. "Skip it" would let anyone on the path suppress vector creation, so this
+        // stays a refusal a human sees.
+        ("tls handshake failure: certificate unknown", false),
+    ] {
+        let class = fetch::failure_class(raw);
+        assert_eq!(
+            fetch::class_kind(&class).is_offline(),
+            offline,
+            "{raw:?} summarised to {class:?} and must be offline={offline}"
+        );
+    }
+}
+
+/// The transport variant is what a caller holds mid-command, so the same judgement has to answer through it — and only
+/// through it. An interrupted transfer, a digest mismatch or a refusal about local files is never "offline": those
+/// arrived *here*, from somewhere reachable, and calling them offline would let a corrupt artifact masquerade as an
+/// outage forever (`np embed` would then skip fetching the replacement that would fix it).
+#[test]
+fn only_a_transport_failure_can_be_offline() {
+    let offline = FetchError::Transport {
+        id: "embeddinggemma-2".into(),
+        member: "main".into(),
+        class: fetch::failure_class("connection refused"),
+    };
+    assert!(offline.is_offline());
+
+    let answered = FetchError::Transport {
+        id: "embeddinggemma-2".into(),
+        member: "main".into(),
+        class: fetch::failure_class("status code 404 not found"),
+    };
+    assert!(
+        !answered.is_offline(),
+        "an origin that answered is not an outage"
+    );
+
+    let short = FetchError::Interrupted {
+        id: "embeddinggemma-2".into(),
+        member: "main".into(),
+        got: 1_000,
+        expected: 2_000,
+    };
+    assert!(
+        !short.is_offline(),
+        "a transfer that got bytes and lost them is not 'no connection'"
+    );
+
+    let io = FetchError::Io {
+        path: std::path::PathBuf::from("/tmp/np-f38.part"),
+        source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only volume"),
+    };
+    assert!(
+        !io.is_offline(),
+        "a local file that would not open is about the volume, not the network"
+    );
+}
+
+/// **Tripwire for the classifier's own table.** Every class this module can print must be placed on one side of the
+/// offline line deliberately: the round trip through [`fetch::ClassKind::ALL`] catches a variant whose string was added
+/// to the summariser but never wired into `class_kind`, and distinctness catches two variants sharing a spelling — which
+/// would silently merge "server error" into some other decision.
+///
+/// A new class string that skips `ClassKind::ALL` entirely is a review question, not a compile error; what the compiler
+/// does enforce is that adding a variant forces you to name its string and say whether it means offline.
+#[test]
+fn every_class_string_round_trips_through_its_kind() {
+    let mut seen: Vec<&str> = Vec::new();
+    for kind in fetch::ClassKind::ALL {
+        let class = kind.class();
+        assert_eq!(
+            fetch::class_kind(class),
+            *kind,
+            "{class:?} must map back to {kind:?}; add the arm in `class_kind`"
+        );
+        assert!(
+            !seen.contains(&class),
+            "two class kinds spell themselves {class:?} — a report could not tell them apart"
+        );
+        seen.push(class);
+    }
+    assert!(seen.len() >= 8, "the classifier's table shrank: {seen:?}");
+}

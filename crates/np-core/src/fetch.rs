@@ -1049,6 +1049,17 @@ pub trait FailureClass {
     fn class(&self) -> String;
 }
 
+impl FetchError {
+    /// Whether this failure means **no connection**, so a caller may skip an automatic fetch and carry on with what does not
+    /// need one (**F38**). Only [`FetchError::Transport`] can say that; see [`ClassKind`] for why the rest must not.
+    pub fn is_offline(&self) -> bool {
+        match self {
+            FetchError::Transport { class, .. } => class_kind(class).is_offline(),
+            _ => false,
+        }
+    }
+}
+
 impl FailureClass for FetchError {
     fn class(&self) -> String {
         match self {
@@ -1070,6 +1081,98 @@ impl FailureClass for FetchError {
 /// The classes are deliberately coarse: "not found" and "forbidden" change what a human does next (fix the member name,
 /// or fix the mirror's ACL), while "server error" and "transport failure" both mean try again. Distinguishing a 500
 /// from a 503 would buy nothing and cost a number in a message that must stay class-shaped.
+/// What a failure says about **whether there is a connection at all** (**F38**).
+///
+/// This exists because fetching became automatic. Before that, every failure ended the command and printed one sentence, so
+/// the *shape* of the failure was decoration; now it decides whether `np setup` degrades to index-plus-keyword-search or
+/// stops and refuses. Two rules keep that honest:
+///
+/// * **Only a transport failure can mean offline.** A digest mismatch, a truncated transfer, or a volume that would not
+///   open are all about bytes that got here or files that did not — calling those "offline" would let a corrupt artifact
+///   pose as an outage indefinitely, because the command that would re-fetch it would keep skipping.
+/// * **TLS is not offline.** A captive portal does produce a TLS error, and so does a network that would prefer the fetch
+///   failed quietly. Treating it as an outage hands anyone on the path the ability to suppress vector creation, so it stays
+///   a refusal a human has to look at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassKind {
+    /// The origin answered and does not have that member.
+    NotFound,
+    /// The origin answered and will not authorise us: a mirror's ACL, a token, a private repo.
+    RefusedByServer,
+    /// The origin answered badly (5xx). Reachable, unhealthy — try again, but do not call it an outage.
+    ServerError,
+    /// A redirect that would change origin; refused rather than followed (§12 rule 7's pin is per-origin by shape).
+    RedirectRefused,
+    /// The name would not resolve: no DNS, wrong spelling, or a network with nothing behind it.
+    Unresolved,
+    /// A connect or read that ran out its clock.
+    TimedOut,
+    /// TLS negotiation failed — see the rule above about why this is not offline.
+    Tls,
+    /// Everything else the transport said: connection refused, network unreachable, a broken pipe mid-request.
+    TransportFailure,
+    /// Not a transport class at all — a local `io` kind, or one of this module's own refusals.
+    Other,
+}
+
+impl ClassKind {
+    /// Every class the summariser can print, for the round-trip test in `tests/fetch.rs`. **Adding a variant means adding
+    /// it here, naming its string, and deciding in `is_offline` whether it means no connection.** The test enforces the
+    /// second and third of those; the first is a review question, which is why this sentence is here rather than a comment.
+    pub const ALL: &'static [ClassKind] = &[
+        ClassKind::NotFound,
+        ClassKind::RefusedByServer,
+        ClassKind::ServerError,
+        ClassKind::RedirectRefused,
+        ClassKind::Unresolved,
+        ClassKind::TimedOut,
+        ClassKind::Tls,
+        ClassKind::TransportFailure,
+    ];
+
+    /// The exact string [`failure_class`] prints for this kind. Kept as a table beside the summariser rather than derived
+    /// from it, and pinned by a round-trip test rather than by trust: if the two ever disagree, `class_kind` would answer
+    /// `Other` for a class that means something specific, and `Other` never degrades.
+    pub fn class(self) -> &'static str {
+        match self {
+            ClassKind::NotFound => "not found",
+            ClassKind::RefusedByServer => "refused by the server (authentication or permissions)",
+            ClassKind::ServerError => "server error",
+            ClassKind::RedirectRefused => "redirect refused",
+            ClassKind::Unresolved => "could not resolve the configured host",
+            ClassKind::TimedOut => "timed out",
+            ClassKind::Tls => "TLS failure",
+            ClassKind::TransportFailure => "transport failure",
+            ClassKind::Other => "refused",
+        }
+    }
+
+    /// Whether this class means "nothing was reached", the only judgement [`crate::config::ModelsConfig::auto_fetch_allowed`]
+    /// callers act on by skipping a fetch.
+    pub fn is_offline(self) -> bool {
+        matches!(
+            self,
+            ClassKind::Unresolved | ClassKind::TimedOut | ClassKind::TransportFailure
+        )
+    }
+}
+
+/// Place a class string on the map above. Unknown strings are [`ClassKind::Other`] **on purpose**: the safe side of this
+/// decision is the one that refuses rather than skips, so a class nobody thought about degrades nothing.
+pub fn class_kind(class: &str) -> ClassKind {
+    match class {
+        "not found" => ClassKind::NotFound,
+        "refused by the server (authentication or permissions)" => ClassKind::RefusedByServer,
+        "server error" => ClassKind::ServerError,
+        "redirect refused" => ClassKind::RedirectRefused,
+        "could not resolve the configured host" => ClassKind::Unresolved,
+        "timed out" => ClassKind::TimedOut,
+        "TLS failure" => ClassKind::Tls,
+        "transport failure" => ClassKind::TransportFailure,
+        _ => ClassKind::Other,
+    }
+}
+
 pub fn failure_class(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     // Status codes are matched as words with their neighbours, because a URL can contain `404` as part of a path or

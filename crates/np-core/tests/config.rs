@@ -2276,7 +2276,10 @@ fn the_kill_switch_works_without_a_file_to_veto_it() {
     let tmp = TempDir::new().expect("test setup: tempdir");
     let path = write_config_with_data_dir(tmp.path(), "[models]\nauto_fetch = true\n");
     let cfg = Config::load(Some(&path)).expect("the file says fetching is allowed");
-    assert!(cfg.models.auto_fetch_allowed(), "unset env leaves the file in charge");
+    assert!(
+        cfg.models.auto_fetch_allowed(),
+        "unset env leaves the file in charge"
+    );
 
     for on in ["1", "true", "yes", "0 "] {
         env::set_var("NP_NO_AUTO_FETCH", on);
