@@ -2363,7 +2363,41 @@ distinguish real installs from stubs by looking inside — which is exactly the 
 
 **Options.** A: create the directory lazily, only where something is written into it (`fetch`, `install`), so its existence means what its name
 says. B: keep creating it and document that emptiness is normal, then fix consumers (my script now counts `.models` directories *containing
-files* and prints both numbers). A is the smaller lie; B is the smaller change. **Owed:** ruling plus, either way, a test that `scan` on a fresh
+files* and prints both numbers). A is the smaller lie; B is the smaller change. **Owed:** ruling plus, either way, a test that `scan` on a fresh workspace never makes one.
+
+**Ruled 2026-12-08: option A**, on the implementer's recommendation ("directory existence should mean a model is there"), and implemented the same
+day. One correction to the premise first, because it changed where the fix went.
+
+**What actually reproduces, and what does not.** The card says the stub appeared "during a plain `np scan`", attributed to
+`models.rs:1582`. That line is inside `publish_named`, which runs only when an artifact is being written — and measured on Linux with this build,
+**no read-only path creates the directory**: `scan`, `models list --json` and `embed --json` on a fresh vault left no `.models` anywhere, and they
+still did not after I installed a row and then deleted the directory out from under them (so "row present, artifact dir gone" is not a trigger
+either). What *does* reproduce is **`np models fetch` against an origin that never answers**: `fetch.rs:557` calls `create_dir_all` after the disk
+preflight and before the first byte, the transport fails on open, and the empty folder stays. That is the defect fixed here. Whether Windows also
+creates one from a plain `scan` is **unverified** — it was observed there and cannot be reproduced here; Stage 13 of the harness now asserts no
+empty stub exists at the end of a run, which would catch it on that platform if something else makes one.
+
+**The fix.** `fetch_with_table` is now a thin wrapper over `fetch_attempt` (the old body, unchanged) that samples whether `<key>.models` existed
+*before* the call and, on any error, removes it — with two guards doing the safety work. Existence must be sampled first because `create_dir_all`
+reports success for a directory that was already there and so cannot answer "did we make this?" afterwards. And removal is `remove_dir`, which
+fails on a non-empty path: a fetch interrupted mid-transfer leaves its `.fetching` marker, the directory is therefore not empty, nothing is
+removed, and §12 rule 4's marker survives untouched. Cleanup errors are dropped deliberately — a stub we could not delete is untidiness next to
+the refusal the caller is about to print.
+
+**Tests** (`crates/np-core/tests/fetch.rs`, 2026-12-08): `a_transport_that_never_opens_leaves_no_directory_at_all`,
+`a_truncated_transfer_also_leaves_no_directory_behind`, `a_directory_this_call_did_not_create_is_never_removed`, and
+`an_empty_directory_this_call_did_not_create_survives_a_failed_fetch`. All four were written red first — the two "leaves no directory" cases failed
+against the old code, which is the point of filing the card.
+
+**A mutant that survived, and what it taught.** Deleting `&& !existed_before` left the suite green: the "never removed" test has a file in the
+directory, so `remove_dir` fails on its own and the assertion was measuring the operating system rather than the flag. The fourth test exists for
+exactly that gap — an *empty* pre-existing directory, where the guard is the only thing between us and deleting somebody else's folder. It kills
+the mutant; the fix is now falsifiable in both directions. Worth keeping in mind as a general rule: a safety check backed by an OS error needs a
+case where the OS would *not* have saved us.
+
+**Also worth recording:** `assert_nothing_left`, the helper the existing suite used to prove "left nothing behind", tolerates an empty directory —
+its own comment says "no directory at all is the cleanest outcome" and then reads the directory and complains only about names inside it. That
+tolerance is how this survived a suite with 28 refusal cases in it; the new `assert_no_stub` states the stricter claim.
 workspace does not leave a directory claiming a model exists — or a doc line saying it may.
 
 **Ruled and shipped 2026-11-09 — option A, plus the operator's amendment.** *"For the F45: A, but when the program has it first install on a

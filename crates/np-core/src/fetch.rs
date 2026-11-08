@@ -445,7 +445,41 @@ pub fn fetch(
 /// holds a few dozen bytes per member whose digests the test computed, which is what makes the mismatch and
 /// interruption cases reachable at all. `T` is generic rather than `dyn` so the production call keeps the concrete
 /// `PinnedModel` slice it already has.
+/// Fetch the named members of `id`, then take back the directory if nothing ever landed (**F46**).
+///
+/// The body lives in [`fetch_attempt`]; this wrapper exists for one cleanup. `<key>.models` is created on the way to publishing an artifact —
+/// after the disk preflight, which must stay before creation or a "not enough room" refusal would itself create the folder it is refusing
+/// about — and until now nothing undid that. A fetch whose transport failed on the first open therefore left an **empty** model directory
+/// behind, and every tool that reads a data root interprets `<something>.models` as "a model lives here": the operator's harness counted these
+/// stubs and reported them as installed models, which is a worse outcome than a missing directory by exactly the amount of trust an app puts in
+/// a listing.
+///
+/// Two guards make the undo safe rather than merely tidy. First, this call has to have been the one that created the directory — and existence
+/// is sampled *before* `create_dir_all`, because that call reports success for a directory that was already there and so cannot answer the
+/// question afterwards. Second, removal uses `remove_dir`, which fails on a non-empty path: "leave alone anything you did not make" is enforced
+/// by the operating system instead of by care, which is the property worth having given this module also runs next to someone's real artifacts.
+/// The cleanup is best-effort and its error dropped — a stub we could not remove is untidiness, while the refusal the caller is about to print
+/// is the fact that matters.
 pub fn fetch_with_table<T: MemberPin>(
+    db: &crate::db::Db,
+    models_dir: &Path,
+    id: &str,
+    requested: &[&str],
+    transport: &dyn Transport,
+    now: i64,
+    plan: &Expectation<'_, T>,
+) -> Result<FetchReport, FetchError> {
+    // `try_exists` rather than `metadata`: the difference shows up only for a path we cannot stat, and "someone else's problem, do not remove it"
+    // is the answer that errs toward leaving data alone.
+    let existed_before = models_dir.try_exists().unwrap_or(true);
+    let attempt = fetch_attempt(db, models_dir, id, requested, transport, now, plan);
+    if attempt.is_err() && !existed_before {
+        let _ = fs::remove_dir(models_dir);
+    }
+    attempt
+}
+
+fn fetch_attempt<T: MemberPin>(
     db: &crate::db::Db,
     models_dir: &Path,
     id: &str,

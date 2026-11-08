@@ -1367,3 +1367,151 @@ fn every_class_string_round_trips_through_its_kind() {
     }
     assert!(seen.len() >= 8, "the classifier's table shrank: {seen:?}");
 }
+
+// ---------------------------------------------------------------- F46: a fetch that never wrote a byte leaves no stub behind
+//
+// `assert_nothing_left` above says in its own comment that "no directory at all is the cleanest outcome" and then accepts one, because
+// `read_dir` on an empty directory yields nothing to complain about. That tolerance is how F46 survived: a fetch whose transport fails on the
+// first open creates `<key>.models`, publishes nothing, and walks away — and the operator's harness then counted that empty folder as "a model
+// directory", which is exactly how a careful reader concludes a model is installed when nothing is. These cases assert the stricter thing, and
+// they assert its two halves separately: absence after a failure this call caused, and *non*-removal of a directory this call did not create.
+
+/// The strict form. Not `read_dir` returning nothing: **the path must not exist**, because an empty `<id>.models` is the artefact F46 is about.
+fn assert_no_stub(models: &Path) {
+    assert!(
+        !models.exists(),
+        "a fetch that published nothing left a directory at {}: an empty model directory reads as an installed model",
+        models.display()
+    );
+}
+
+#[test]
+fn a_transport_that_never_opens_leaves_no_directory_at_all() {
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    // The round-seven Windows shape: origin resolves, the request never completes. Nothing is ever written, so nothing may remain.
+    fake.serve("main", Serve::Fail("transport failure".into()));
+
+    let err = fetch::fetch_with_table(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        1_730_000_040,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
+    )
+    .expect_err("a transport that cannot open is not a fetch");
+    assert!(
+        matches!(
+            err,
+            FetchError::Interrupted { .. } | FetchError::Transport { .. }
+        ),
+        "the refusal class matters less than what it leaves: {err:?}"
+    );
+    assert_no_stub(&models);
+}
+
+#[test]
+fn a_truncated_transfer_also_leaves_no_directory_behind() {
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Truncated(MAIN.to_vec()));
+
+    let _ = fetch::fetch_with_table(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        1_730_000_041,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
+    )
+    .expect_err("a short stream is refused");
+
+    // Same rule one step further along: bytes were held in a temp file and cleaned up, so the directory that held them is now empty — and an
+    // empty model directory is the stub this card exists to stop.
+    assert_no_stub(&models);
+}
+
+/// The other half, and the reason the cleanup cannot be unconditional: a directory that already existed belongs to the workspace, not to this
+/// call. A preflight refusal (disk too full) runs *before* anything is created, so this uses a directory with a file in it and asks that the
+/// file survive a failed fetch — because `remove_dir` on a non-empty path fails, and failing is the correct behaviour here.
+#[test]
+fn a_directory_this_call_did_not_create_is_never_removed() {
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    fs::create_dir_all(&models).expect("test setup: pre-existing models dir");
+    let other = models.join("someone-elses-file");
+    fs::write(&other, b"not mine to delete").expect("test setup: write the file");
+
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Fail("transport failure".into()));
+    let _ = fetch::fetch_with_table(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        1_730_000_042,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
+    )
+    .expect_err("refused");
+
+    assert!(
+        models.exists(),
+        "we did not create it, so we do not remove it"
+    );
+    assert!(other.exists(), "and nothing inside it is touched either");
+}
+
+/// The guard's own case, added because a mutant proved it needed one. Dropping `existed_before` from the cleanup left this file's sibling test
+/// green: with a file inside, `remove_dir` fails anyway, so that test measures the operating system rather than the flag. An **empty** directory
+/// is where the two differ — and an empty directory somebody else made (a script that pre-provisioned the data root, a tool that cleans up by
+/// removing artifacts and leaves the folder) is still not this fetch's to delete.
+#[test]
+fn an_empty_directory_this_call_did_not_create_survives_a_failed_fetch() {
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    fs::create_dir_all(&models).expect("test setup: pre-existing, empty");
+
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Fail("transport failure".into()));
+    let _ = fetch::fetch_with_table(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        1_730_000_043,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
+    )
+    .expect_err("refused");
+
+    assert!(
+        models.is_dir(),
+        "the cleanup may remove only what its own call created; this directory was here first"
+    );
+}
