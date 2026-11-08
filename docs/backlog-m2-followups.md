@@ -1933,6 +1933,45 @@ withholding as **F21**, **F28** and **F36**. And the published `v0.2.0` Windows 
 make the release notes' digest wrong, so the fix ships with the next asset — say the word and I will build one rather than let a stale binary
 be the only Windows download on the page.
 
+## F42 — a workspace can hold a pinned model whose declared prefixes differ from the pin, and only `fetch` ever notices
+
+Filed 2026-11-08 from round four's Windows log (`prefix_doc "" prefix_query ""` under an id whose pin declares two prefixes), reproduced on Linux
+the same evening. Not a corruption bug: a **silent quality drift with no repair path**.
+
+**The state.** `np models install --id embeddinggemma-2 --path … --dim 768 --sha256 …` without `--prefix-doc`/`--prefix-query` succeeds and records
+empty prefixes for an id this build *pins*, where the pin declares `"represent this sentence for retrieval: "` / `"query for note search: "`. The
+flags default to empty — documented as "Empty when omitted" — and nothing compares them against the pin, because `install` exists for artifacts
+the human holds and cannot assume the pin describes them.
+
+**What happens next, measured on Linux with a real runtime (`np 0.2.x`, feature `local-model`, one note):**
+
+| step | result |
+| --- | --- |
+| `models list` | `embeddinggemma-2 present dim 768 sha256 2188ac1deca4 … prefix_doc "" prefix_query ""` — the drift is visible if you look |
+| `np embed` | `outcome nothing owed`, `embedded 1`, `errors 0`. **No warning.** Vectors written with no instruction prefix |
+| `np search "broker migration"` | a hit, `cos 0.8120` — versus `cos 0.8013` for the same note and same bytes installed **with** the pinned prefixes |
+
+That pair of cosines is deliberately *not* offered as a quality number: one note, one query, and a higher score on the un-prefixed side proves
+nothing (the asymmetry between document and query prefixes is what matters, and it shows up with distractors — which is F31's labelled set, not
+this table). What it does establish is that **the two states produce different vectors**, silently.
+
+**Why it sticks.** Once the row exists, both doors close on the correct declaration: `models install` refuses to change what an installed model
+means (no `--force`, by design — replacing an identity invalidates every vector), and `models fetch` compares the stored declaration with the pin
+and returns `IdentityDisagrees` **before transferring a byte**. So the honest commands refuse, and no command repairs it. The only way out today is
+SQL against the workspace database, which is not something to tell a user who did nothing wrong but omitted two flags.
+
+- **Option A — say something.** When embedding a **pinned** id whose row declares prefixes different from the pin's, print one line (and a JSON
+  field) naming the mismatch, and keep going. Cheap, no new state; costs a warning that is arguably noise for people who installed deliberately.
+- **Option B — a repair command.** `np models redeclare <ws> --id …` that verifies the artifact hashes to the pin, rewrites the declaration, and
+  drops that model's vectors in the same transaction so they are recomputed under the meaning now on file. Honest about invalidation; new surface.
+- **Option C — leave it** and document the two flags as load-bearing. Costs nothing here and leaves someone's search quietly worse.
+
+**Blocks:** nothing mechanically. It weakens any sentence of the form "vectors for a pinned model mean what the pin says they mean" — which is a
+sentence §12 leans on when arguing that a default-on fetch is safe.
+
+**Done when:** a ruling is recorded and either the warning, the command, or the documentation carries a dated test; and `models list`'s empty
+prefixes under a pinned id are no longer a state a careful user can enter without a word of warning.
+
 ## F41 — a fresh workspace with fetching switched off is refused as *configuration disabled*, and the sentence names no remedy
 
 **Filed 2026-11-08, found while writing `np setup`'s tests (F38).** Not fixed by that commit; deliberately not fixed there, because
