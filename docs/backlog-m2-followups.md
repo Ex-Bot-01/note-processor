@@ -2234,10 +2234,22 @@ because taking a lock creates a file and a typo'd vault path must not leave a da
 `--discard-marker`, refining that flag's documented "happens first, depends on nothing": what it must not do is delete a marker while another
 process is mid-fetch in the same workspace, which is exactly the situation the lock detects.
 
-**Measured on Linux** (debug binary, 30-note vault): five concurrent `np scan --json` all exit 0 with `added 0` and no child printed SQLite's
-sentence — the bounded wait absorbing ordinary overlap, which is what it is for. Deterministic refusal is measured by holding the lock from a
-separate process (POSIX record locks are per *process*, so an in-process second connection would not contend and a test written that way would
-pass whether or not exclusion works).
+**Measured on Linux, twice, because the first measurement proved nothing.** A 30-note vault scans in tens of milliseconds, so five concurrent
+`np scan --json` all exited 0 with `added 0` and no child printed SQLite's sentence — the wait absorbing overlap. That is the intended outcome for
+ordinary typing, but as evidence it is worth nothing: no writer was ever refused, so nothing about exclusion had been observed. The measurement
+that counts came from making the work long enough to contend (same binary, 4 000 notes, one scan alone takes **2.6 s**, twelve started together):
+
+| outcome | count | what each printed |
+| --- | --- | --- |
+| succeeded | 5 | the normal report — `added 0`, `unchanged 4000` |
+| refused as a state | **7** | exit 1, stdout `{"command":"scan","locked":true,"waited_ms":2000}` (63 bytes), stderr the sentence naming `np search` and `np models list` |
+| SQLite's raw sentence | 0 | — |
+
+Seven losers each printed a machine-readable document instead of nothing, which is the exact thing this card was filed for. Deterministic refusal
+is separately measured in tests by holding the lock from another process (POSIX record locks are per *process*, so an in-process second connection
+would not contend and a test written that way would pass whether or not exclusion works). Stage 13 of the operator harness now builds a
+2 000-note vault for the same reason and prints an un-contended scan's duration beside the counts, because "nobody was refused" means something
+different on a box where a scan takes 200 ms than on one where it takes 2 s.
 
 **Tests** (`crates/np-cli/tests/cli.rs`, 2026-12-08): `a_second_writer_refuses_as_a_state_and_still_prints_one_document` (all five mutating
 commands, plus text mode printing nothing on stdout), `readers_answer_while_a_writer_holds_the_workspace`,
