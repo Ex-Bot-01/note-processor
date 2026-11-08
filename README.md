@@ -173,8 +173,13 @@ run at all (`docs/ops-actions-minutes.md`). A release produced by `.github/scrip
 platform the packager was standing on**, and its notes say so. Source builds need no CI and no minutes:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.2.2 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.2.3 -p np-cli --locked
 ```
+
+**Current release: `v0.2.3`** — one fix on top of v0.2.2, and it is a Windows one. An upgraded machine whose index still sat at the
+pre-F37 location was correctly *read* from there (nothing re-indexed, no duplicate), but printed none of the `reading your index from …` notice
+that release promised: `Config::load` asked a merged struct whether the operator had declared a directory, and a resolved default always looks
+like an instruction. Found by a field run on real Windows; graded on Linux through the same injectable-platform seam F37 already used.
 
 **`v0.2.2` is where `np setup` and auto-fetch (F38) arrive**, along with the Windows data folder moving under
 `%LOCALAPPDATA%\note-processor` (F37). Its assets are built locally, not by CI: Linux (`x86_64-unknown-linux-gnu`, by
