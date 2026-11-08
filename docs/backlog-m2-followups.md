@@ -1717,6 +1717,28 @@ false CHECKs is that the assertion was aimed at something that should have happe
 a nested-first install** (a machine where the nested folder holds the registry and the old one also exists). Stage 9b manufactures that shape; it
 skipped itself on their box because a real legacy directory is present, which is the right call but leaves the case open.
 
+**Closed on evidence, pending CI only — round six (2026-11-08, `test_win_0.2.3.zip`).** v0.2.3 on the operator's machine printed the sentence
+that v0.2.2 owed:
+
+```text
+np: reading your index from C:\Users\chris\AppData\Local — where it was written before this release nested its data folder. nothing to do: …
+```
+
+…with `added 0` on a vault whose index predates the nesting, and **zero `CHECK` lines in the whole run log** for the first time in six rounds.
+
+The operator then wrote their own probe (`probe-f37-nested.ps1`, `probe-stream-split.ps1`) that reached the case my Stage 9b must skip: it points
+`LOCALAPPDATA` at a scratch directory, so nothing touches the real 45-index root, and builds each layout from nothing.
+
+| state built in the sandbox | what `np 0.2.3` did | why it matters |
+| --- | --- | --- |
+| **A** — empty data root, first scan | nested under `note-processor\workspaces`, registry beside it, and **no fallback line** | a fresh install gets the new layout *and* is not falsely told its index was found in an old place |
+| **B** — that same index moved to the pre-F37 shape | reads legacy, announces it, `added 0`, **no second index appeared nested** | the false-`added N` report this bridge exists to prevent, prevented; and no split-brain |
+| **C** — nested folder *and* legacy index both present | still reads legacy, still announces | the rule is "nested wins when it holds **our** registry", not "when it exists" — the distinction a directory check would get wrong |
+| **D** — same state C, captured with `Start-Process -RedirectStandardOutput/-RedirectStandardError` | notice on **stderr only**; `search --json` and `setup --json` stdout parsed as one document on its own handle | §"stdout carries exactly one JSON document" proven on Windows under real handle redirection — my `cmd /c 2>&1` capture merges the channels and structurally could not show this |
+
+Their probe is folded into the operator script as **Stage 9c** (sandboxed A/B/C) and **Stage 10** (stream separation), so a future run covers
+nested-first without anyone hand-writing it — and Stage 9b's refusal to move live data stays, because that refusal was correct.
+
 **What this card still owes.**
 
 + **Windows, in the field.** Stage 9 of the operator script (sha256 `db75c546…494345`, uploaded on v0.2.1) scans a fresh vault twice and
