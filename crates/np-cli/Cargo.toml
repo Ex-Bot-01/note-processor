@@ -2,6 +2,7 @@
 name = "np-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "note-processor command line interface"
 
 [[bin]]

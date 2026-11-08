@@ -1,9 +1,8 @@
 # Third-party code in `np`
 
-**What this file covers.** The licenses of code that is *compiled into a binary you download or build*. It is not np's own license, and np does
-not have one yet: the repository has no `LICENSE` file at its root, and none is invented here. That gap is recorded in
-[`docs/backlog-m2-followups.md`](docs/backlog-m2-followups.md) as a release-blocking item for any public release, because adding a license to a
-project that has been published without one is a decision for the owner rather than an edit a contributor makes on their behalf.
+**What this file covers.** The licenses of code that is *compiled into a binary you download or build*. `np`'s own terms are MIT and live in
+[`LICENSE`](LICENSE); this file is about everybody else's code inside the artefact. (Until 2026-12-08 there was no `LICENSE` at the root at all,
+which is **F47** — three releases went out under no stated terms before anyone noticed while writing this page.)
 
 Why this file exists now and not earlier: through `v0.2.3`, published binaries contained no C/C++ at all — `build.rs` refused every non-Linux
 target and the release assets were built without `local-model`. From `v0.3.0` the shipped Windows and Linux binaries embed llama.cpp's inference

@@ -141,17 +141,20 @@ archive="$out/$name.zip"
 # inside the zip, not merely in the repository the zip came from. The listing is then read back from the archive, because "we meant to add it" and
 # "the downloader receives it" are different claims.
 notices="$repo_root/THIRD_PARTY_NOTICES.md"
+licence="$repo_root/LICENSE"
 test -s "$notices" || { echo "refusing to package: THIRD_PARTY_NOTICES.md is missing or empty" >&2; exit 1; }
-python3 - "$exe" "$archive" "$notices" <<'PY'
+test -s "$licence" || { echo "refusing to package: LICENSE is missing or empty" >&2; exit 1; }
+python3 - "$exe" "$archive" "$notices" "$licence" <<'PY'
 import sys, zipfile
-exe, archive, notices = sys.argv[1], sys.argv[2], sys.argv[3]
+exe, archive, notices, licence = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
     z.write(exe, "np.exe")
     z.write(notices, "THIRD_PARTY_NOTICES.md")
+    z.write(licence, "LICENSE")
 with zipfile.ZipFile(archive) as z:
     names = z.namelist()
-assert "THIRD_PARTY_NOTICES.md" in names, f"asset lacks the notice file: {names}"
-assert "np.exe" in names, f"asset lacks the binary: {names}"
+for want in ("np.exe", "THIRD_PARTY_NOTICES.md", "LICENSE"):
+    assert want in names, f"asset lacks {want}: {names}"
 PY
 test -s "$archive"
 

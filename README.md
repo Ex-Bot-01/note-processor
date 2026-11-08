@@ -595,9 +595,12 @@ only (the unix `statvfs` arm compiles), its number never read here.
 
 ## Licensing and third-party code
 
-**`np` itself has no license file.** The repository ships no `LICENSE`, and this section does not invent one: adding a license to a project
-published without one is the owner's decision, and it blocks calling any release final. The gap is tracked as **F47** in
-[`docs/backlog-m2-followups.md`](docs/backlog-m2-followups.md).
+**`np` is MIT**, in [`LICENSE`](LICENSE) — ruled on 2026-12-08, which closed **F47**. The copyright line reads
+`Copyright (c) 2026 The note-processor authors` because no personal or organisational name was given to put there; it is a placeholder in the
+sense that it is yours to replace with whatever you want credited, not in the sense that the grant is provisional. MIT was chosen to match what
+this binary already statically links (llama.cpp and ggml are MIT), so nothing we ask of a downstream user is stricter than an obligation we are
+already satisfying ourselves: keep the notices attached. Both crates declare it (`license = "MIT"` in `[workspace.package]`, inherited by
+`np-core` and `np-cli`), and both release assets carry `LICENSE` next to the binary.
 
 What *is* settled is the obligation that arrived with `v0.3.0`. Published binaries now statically link llama.cpp's and ggml's inference runtime
 (MIT, `Copyright (c) 2023-2026 The ggml authors`), and MIT's condition — ship the copyright notice and license text with the distribution —

@@ -2,6 +2,7 @@
 name = "np-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 # `local-model` is the gate the local inference runtime lives behind
 # (`docs/design-m2-local-embeddings.md` §2, §6, §14). It still declares no dependency crate — §14 chose

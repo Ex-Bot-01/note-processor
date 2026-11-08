@@ -67,9 +67,12 @@ else
   # `-C target/x86_64-unknown-linux-gnu/release` a following `-C .` means *that* directory, and the notice file is not there —
   # `tar: THIRD_PARTY_NOTICES.md: Cannot stat`, exit 2, no asset. The listing check below never even ran, because the failure was
   # loud enough to stop the script; a quieter tar would have published an asset missing its license text.
-  tar -C "target/$target/release" -czf "$archive" "$binary" -C "$repo_root" THIRD_PARTY_NOTICES.md
-  if ! { tar -tzf "$archive" | { grep -c 'THIRD_PARTY_NOTICES\.md' || true; }; } | grep -qv '^0$'; then
-    echo "refusing to publish: the asset does not contain THIRD_PARTY_NOTICES.md" >&2
+  tar -C "target/$target/release" -czf "$archive" "$binary" -C "$repo_root" THIRD_PARTY_NOTICES.md LICENSE
+  # Both files, counted: the MIT notice for the code we link and the licence for our own. A count rather than one grep per name because a single
+  # missing member must still fail, and `grep -c` over the listing answers "did both land" in one pass without SIGPIPE-ing tar (see above).
+  listed=$(tar -tzf "$archive" | { grep -cE '(THIRD_PARTY_NOTICES\.md|^LICENSE$)' || true; })
+  if [ "$listed" -lt 2 ]; then
+    echo "refusing to publish: the asset carries $listed of 2 required licence files" >&2
     exit 1
   fi
 fi

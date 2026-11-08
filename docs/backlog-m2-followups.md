@@ -2334,6 +2334,22 @@ card is the reason printed in the release notes rather than a footnote here.
 be a list that is wrong more often than right, so the item is tooling — and the reason it is written down rather than dropped is that a copyleft
 crate in the tree would need stronger treatment than disclosure, which is exactly what a generated report catches and prose does not.
 
+**Closed 2026-12-08: the operator chose MIT**, on the question of what to put in the copyright line giving no name, I wrote
+`Copyright (c) 2026 The note-processor authors` and said so out loud rather than inventing a person — it is theirs to replace, and README's
+licensing section says exactly that, so nobody has to guess whether the grant is provisional. It is not.
+
+What shipped: `LICENSE` at the root (MIT text verbatim); `license = "MIT"` in `[workspace.package]`, inherited by both members — put there rather
+than per-crate so a member cannot drift from it, and deliberately **not** `"MIT OR Apache-2.0"`, because an option nobody granted is worse than no
+option; README's licensing section rewritten from "no license exists" to what MIT asks and why MIT specifically (it matches the code we statically
+link, so we never demand of a downstream user something we do not satisfy ourselves); `THIRD_PARTY_NOTICES.md`'s opening corrected; and both
+packaging scripts now put `LICENSE` beside the binary inside the asset and refuse to publish if either licence file is missing — the Linux guard
+counts two required members rather than grepping one name, so a single omission still fails.
+
+Verified: `cargo metadata --no-deps` reports `MIT` for both `np-core` and `np-cli`; both packaging scripts pass `bash -n`; the asset-content claim
+is checked by reading the archive listing back at build time rather than asserted here. **Closure basis:** documentation and metadata, with no code
+path to grade — so this closes on local inspection plus the packaging guards, not on CI, which has graded nothing since `5e368ac`. The remaining
+item on this card (generated Rust crate notices via `cargo about`) stays open and is tooling work, not a legal gap.
+
 ## F46 — `np` creates an empty `<id>.models` directory for a workspace with nothing installed, and tooling reads it as "a model is here"
 
 **Filed 2026-11-08 from round seven.** Observed on Windows at 18:15:18 during a plain `np scan`: a sibling directory
