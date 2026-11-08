@@ -2476,6 +2476,10 @@ fn the_unix_shape_has_no_legacy_location_at_all() {
 /// field run hit — which matters, because the note itself can only ever print on Windows.
 #[test]
 fn a_file_that_never_names_data_dir_does_not_get_to_claim_one() {
+    // Installed environment, not the one cargo happened to hand us. The `test-config-nohome` gate row runs this binary with `$HOME` and
+    // `$XDG_CONFIG_HOME` unset — which is its whole point — and an assertion that "the default resolves *some* directory" means nothing in
+    // an environment that names none: it failed there on the night it was written, for exactly the reason that row exists.
+    let _env = TestEnv::install();
     let tmp = TempDir::new().expect("test setup: tempdir");
     let file = tmp.path().join("config.toml");
 
