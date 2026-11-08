@@ -20,6 +20,7 @@ pub mod items;
 // The log-level vocabulary behind `[embeddings] log_level` (F33): names, gate and precedence, deliberately ungated so a build with no
 // runtime still parses the same config as one with it. Installing anything is `local_model`'s business, not this file's.
 pub mod links;
+pub mod lock;
 pub mod loglevel;
 // Media discovery is pure Rust over bytes with no runtime behind it, so it carries no feature gate: the resolver
 // runs on every `np embed` and refuses with a class, never with a model (`docs/design-m2-image-embeddings.md` §7).

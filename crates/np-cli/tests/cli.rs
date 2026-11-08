@@ -4198,3 +4198,212 @@ fn embedding_a_pinned_model_with_undeclared_prefixes_notes_the_drift_and_still_r
         "and the JSON reports the halves separately here too"
     );
 }
+
+// ---------------------------------------------------------------- F44: one writer per workspace
+//
+// Measured on the packaged 0.2.3 binary before any of this existed: two `np scan` processes on one vault produced `added 1` and
+// `np: workspace database: sqlite: database is locked` after 5 ms, and the loser under `--json` wrote **zero bytes** to stdout. The raw error
+// was the smaller half. `scan` renders `INDEX.md` inside its write transaction, so a loser can stop between "the database committed" and "the
+// files were written", and SQLite cannot roll back a file. Hence a lock taken before the first statement, held for the whole command — and
+// hence these four cases, one per claim the design makes:
+//
+//   * a second writer refuses as a **state** (`locked`, exit 1) and still prints exactly one document;
+//   * readers are not refused by a held lock, which is the asymmetry that makes the lock usable;
+//   * the lock is per workspace, so one vault's `embed` cannot freeze another;
+//   * concurrency never emits the raw SQLite sentence again.
+//
+// The lock is held from **this test process** rather than from a second `np`: POSIX record locks are per process, so an in-process second
+// connection would not contend, and a test that "measures" exclusion that way passes whether or not the code works. A child `np` is a different
+// process, which is what makes these assertions real.
+
+/// Hold this workspace's write lock for the duration of one test, waiting briefly so a bug that never releases fails fast instead of hanging.
+fn hold_writer(ws: &Workspace) -> np_core::lock::WorkspaceLock {
+    let db = ws.db_path();
+    let dir = db
+        .parent()
+        .expect("test setup: the database has a parent directory");
+    let stem = db
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("test setup: the database has a utf-8 stem");
+    np_core::lock::WorkspaceLock::acquire(dir, stem, std::time::Duration::from_millis(300))
+        .expect("test setup: take the workspace lock the way a running `np` would")
+}
+
+#[test]
+fn a_second_writer_refuses_as_a_state_and_still_prints_one_document() {
+    let ws = workspace();
+    run(&mut ws.command(&["scan"])).assert_success();
+    let _held = hold_writer(&ws);
+
+    // Every command that changes state, because the lock is only worth having if none of them can slip past it. `models install` needs real
+    // argv; the digest is of a file that exists, so the refusal under test is the lock and not an argument problem.
+    let artifact = ws._tmp.path().join("artifact.bin");
+    fs::write(&artifact, b"bytes to install while locked\n")
+        .expect("test setup: write the artifact");
+    let digest = np_core::hash::sha256_file(&artifact).expect("test setup: digest");
+    let cases: Vec<Vec<String>> = vec![
+        vec!["scan".into(), "--json".into()],
+        vec!["embed".into(), "--json".into()],
+        vec!["setup".into(), "--json".into()],
+        vec![
+            "models".into(),
+            "install".into(),
+            "--id".into(),
+            EMBED_MODEL.into(),
+            "--path".into(),
+            artifact.to_str().expect("test setup: utf-8 path").into(),
+            "--dim".into(),
+            EMBED_DIM.into(),
+            "--sha256".into(),
+            digest,
+            "--json".into(),
+        ],
+    ];
+
+    for argv in cases {
+        // `Workspace::command` appends the vault last, which is where each of these subcommands wants it.
+        let refused = run(&mut ws.command(&argv.iter().map(String::as_str).collect::<Vec<_>>()));
+        let label = argv.join(" ");
+        assert_eq!(
+            refused.code(),
+            1,
+            "`np {label}` must exit 1 while locked:\n{}",
+            refused.stderr()
+        );
+        assert!(
+            !refused.stdout().is_empty(),
+            "F44's actual defect: a locked `np {label} --json` printed nothing at all, leaving an app to infer contention from silence"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&refused.stdout()).expect("a locked run prints one JSON object");
+        assert_eq!(
+            doc["locked"], true,
+            "`np {label}` must say the state: {doc}"
+        );
+        assert!(
+            doc["waited_ms"].as_u64().map(|ms| ms > 0) == Some(true),
+            "and how long it waited, so a caller can tell 'busy' from 'broken': {doc}"
+        );
+        let err = refused.stderr();
+        assert!(
+            err.contains("locked:") && err.contains("np search"),
+            "the sentence names the state and the way around it: {err}"
+        );
+        assert!(
+            !err.contains("database is locked"),
+            "and never leaks the SQLite string a user can do nothing with: {err}"
+        );
+    }
+
+    // Text mode keeps stdout clean, like every other refusal: the sentence belongs on stderr.
+    let text = run(&mut ws.command(&["scan"]));
+    assert_eq!(text.code(), 1, "a locked `np scan` still exits 1");
+    assert_eq!(
+        text.stdout(),
+        "",
+        "and prints nothing on stdout:\n{}",
+        text.stderr()
+    );
+    assert!(text.stderr().contains("locked:"), "{}", text.stderr());
+}
+
+#[test]
+fn readers_answer_while_a_writer_holds_the_workspace() {
+    let ws = workspace();
+    run(&mut ws.command(&["scan"])).assert_success();
+    let _held = hold_writer(&ws);
+
+    // The asymmetry is the design: writers wait, readers never do. A lock that also blocked reading would turn a five-minute `embed` into five
+    // minutes during which nobody can ask a question — and an app driving `np` asks questions continuously.
+    // `<workspace>` then `<query>`, so this cannot go through `Workspace::command` (it appends the root last).
+    let mut search_cmd = ws.command_without_operand(&["search"]);
+    search_cmd.arg(ws.root.as_path()).arg("demo").arg("--json");
+    let search = run(&mut search_cmd);
+    assert_eq!(search.code(), 0, "{}", search.stderr());
+    let doc: serde_json::Value = serde_json::from_str(&search.stdout()).expect("one document");
+    assert!(
+        doc["hits"].as_array().map(|h| !h.is_empty()) == Some(true),
+        "and answers with results rather than an empty list: {doc}"
+    );
+
+    let listed = run(&mut ws.command(&["models", "list", "--json"]));
+    assert_eq!(listed.code(), 0, "{}", listed.stderr());
+}
+
+#[test]
+fn one_workspace_being_written_does_not_stop_another_being_written() {
+    let ws = workspace();
+    run(&mut ws.command(&["scan"])).assert_success();
+    let _held = hold_writer(&ws);
+
+    // A second vault **inside the same data directory**, so this proves per-workspace scoping rather than two unrelated directories that were
+    // never going to contend. Same config, same `XDG_DATA_HOME`, different workspace path — and therefore a different lock file.
+    let other = ws._tmp.path().join("other-vault");
+    fs::create_dir_all(&other).expect("test setup: second vault");
+    fs::write(other.join("one.md"), "# One\n\nalone.\n").expect("test setup: note");
+
+    let scanned = run(&mut ws.command_without_operand(&[
+        "scan",
+        other.to_str().expect("test setup: utf-8 path"),
+        "--json",
+    ]));
+    assert_eq!(scanned.code(), 0, "{}", scanned.stderr());
+    let doc: serde_json::Value = serde_json::from_str(&scanned.stdout()).expect("one document");
+    assert_ne!(
+        doc["locked"].as_bool(),
+        Some(true),
+        "a different vault is not this lock: {doc}"
+    );
+    assert_eq!(doc["added"], 1, "and it did the work: {doc}");
+}
+
+#[test]
+fn concurrent_writers_never_emit_the_raw_sqlite_error() {
+    let ws = workspace();
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    // Six real processes, started together. Whether they contend depends on scheduling; what must be true either way is that no child ever says
+    // SQLite's sentence and no child ever prints an empty stdout — the two properties F44 was filed for. A run where all six succeed is a pass,
+    // not a missed test: the bounded wait exists precisely so that ordinary overlap resolves instead of refusing.
+    let mut children: Vec<(String, std::process::Child)> = Vec::new();
+    for i in 0..6 {
+        let child = ws
+            .command(&["scan", "--json"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("test setup: spawn a concurrent scan");
+        children.push((format!("writer-{i}"), child));
+    }
+    for (label, child) in children {
+        let out = child
+            .wait_with_output()
+            .expect("test setup: reap the writer");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            !stdout.is_empty(),
+            "{label} exited {} with an empty stdout:\n{stderr}",
+            out.status.code().unwrap_or(-1)
+        );
+        let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("{label} printed something that is not one JSON document: {e}\n{stdout}")
+        });
+        assert!(
+            doc.get("locked").is_some() || doc.get("added").is_some(),
+            "{label} reported neither work nor the locked state: {doc}"
+        );
+        if out.status.code() != Some(0) {
+            assert_eq!(
+                doc["locked"].as_bool(),
+                Some(true),
+                "{label} failed, so it must have said why as a state: {doc}"
+            );
+        }
+        assert!(
+            !stderr.contains("database is locked"),
+            "{label} leaked the SQLite sentence F44 exists to replace:\n{stderr}"
+        );
+    }
+}

@@ -2211,6 +2211,46 @@ Three things worth naming before anyone fixes it:
 release binary has no runtime, so `embed` refuses before touching the database. Reproduce with: two concurrent `np scan <vault>` in a loop,
 capturing exit codes and stdout byte counts separately.
 
+**Ruled 2026-12-08: the coarse advisory lock, default on, no flag** (the implementer's recommendation, adopted). Implemented the same day.
+
+**What shipped.** `np_core::lock::WorkspaceLock` ([`crates/np-core/src/lock.rs`](../crates/np-core/src/lock.rs)) is a `BEGIN IMMEDIATE`
+transaction on `<data-dir>/<workspace-key>.lock.db`, opened and left uncommitted for the life of the command, released by `Drop`. Five commands
+take it before their first statement — `scan`, `embed`, `setup`, `models install`, `models fetch` — through one np-cli helper, `writer_lock`, and
+no reader does. A second writer waits [`WorkspaceLock::DEFAULT_WAIT`](crates/np-core/src/lock.rs) (2 s, bounded) and then refuses as a **state**:
+exit 1, one sentence on stderr naming the way around it, and under `--json` one document `{"command":…,"locked":true,"waited_ms":2000}`. That
+document is the half this card was filed for: the loser used to write zero bytes.
+
+**Why a second file rather than the workspace database.** Taking the write lock on `<key>.db` would be one fewer file and would read better in
+the error. It cannot work: `scan` and `embed` write through their own connections, so the holder would contend with *itself* and refuse its own
+work after 2 s. A side file excludes processes without contending with the work being protected. **Why not a lock file with a PID and a
+timestamp in it:** that design's failure mode is the stale lock, and the whole reason to use SQLite here is that its write lock is released by the
+operating system when a process dies — so there is nothing to detect, expire, or delete. **Why the rollback journal stays on:** a held-but-unwritten
+transaction creates no `-wal`/`-shm` pair, so the cost is one zero-byte file per workspace that has ever been written to, sitting beside the
+database it belongs to (copy a workspace's data and its lock travels with it; two workspaces never contend).
+
+**Two ordering decisions worth their own sentences.** `writer_lock` runs §3 step 0 (`require_workspace_dir`) *before* deriving a lock name,
+because taking a lock creates a file and a typo'd vault path must not leave a data directory and a `.lock.db` under a hash no scan will ever read
+— the failure §3 step 0 exists to prevent, which this change would have re-opened through a new door. And `models fetch` takes the lock *before*
+`--discard-marker`, refining that flag's documented "happens first, depends on nothing": what it must not do is delete a marker while another
+process is mid-fetch in the same workspace, which is exactly the situation the lock detects.
+
+**Measured on Linux** (debug binary, 30-note vault): five concurrent `np scan --json` all exit 0 with `added 0` and no child printed SQLite's
+sentence — the bounded wait absorbing ordinary overlap, which is what it is for. Deterministic refusal is measured by holding the lock from a
+separate process (POSIX record locks are per *process*, so an in-process second connection would not contend and a test written that way would
+pass whether or not exclusion works).
+
+**Tests** (`crates/np-cli/tests/cli.rs`, 2026-12-08): `a_second_writer_refuses_as_a_state_and_still_prints_one_document` (all five mutating
+commands, plus text mode printing nothing on stdout), `readers_answer_while_a_writer_holds_the_workspace`,
+`one_workspace_being_written_does_not_stop_another_being_written` (second vault *inside the same data directory*, so it proves scoping rather than
+unrelated paths), `concurrent_writers_never_emit_the_raw_sqlite_error`; and in np-core, `acquiring_and_dropping_leaves_the_workspace_lockable_again`
+plus `a_wait_is_a_bound_and_not_a_suggestion` (child-process holder; asserts the wait was honoured *and* stayed bounded). Two mutants, one per
+direction: skipping `BEGIN IMMEDIATE` kills the refusal test and the bounded-wait test; making `search` take the lock kills the readers test.
+
+**Still not claimed, and it needs the operator's machine:** that this excludes anything on **Windows**. SQLite uses `LockFileEx` there rather
+than POSIX record locks, and the semantics are believed equivalent but unmeasured — Stage 13 of the harness is the two-writer test that would
+measure it. Also unmeasured: two genuinely long overlapping runs (`embed` against a real corpus while `scan` waits), which the fixture corpus is
+too small to produce, and anything on macOS.
+
 ## F45 — `np search` refuses outright when the index has vectors but the config has no provider, instead of answering by keyword
 
 **Filed 2026-11-08 from round seven.** The operator tripped it with my own harness: Stages 6, 8 and 11 delete the config on their way out, so

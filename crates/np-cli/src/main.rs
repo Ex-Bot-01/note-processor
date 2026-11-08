@@ -369,8 +369,71 @@ fn main() -> ExitCode {
 /// descriptor that refuses writes must not cost the caller the exit code (see the call site in `main`). A
 /// configuration that names no data dir is reported as the missing value it is by [`load_config`], because
 /// [`Config::load`] refuses rather than deriving `workspaces/<hash>.sqlite` next to the current directory.
+/// Take this workspace's write lock (**F44**), or report that somebody else holds it and stop.
+///
+/// Every command that changes state calls this before it touches anything, because the defect it closes is not two writers arguing inside
+/// SQLite — that argument ends in `database is locked` in 5 ms, which is ugly but survivable. It is that `scan` renders `INDEX.md` *inside*
+/// its write transaction: a loser can stop between "the database committed" and "the files were written", leaving an index that describes
+/// notes the vault does not contain, and no rollback reaches a file. Exclusion has to happen before the first statement, which is what this
+/// returns instead of a boolean: a guard held for the whole command, released by being dropped.
+///
+/// The refusal is a **state**, reported the way `offline` is: exit 1, one sentence on stderr naming what to do, and — under `--json`, which is
+/// how an app asks — one machine-readable object on stdout. Before this, a losing `np scan --json` printed *nothing at all* and an app had to
+/// infer contention from an empty document plus exit 1. Readers (`search`, `models list`) never call this function, so
+/// a long `embed` cannot lock anybody out of reading: that asymmetry is the whole design, and `crates/np-cli/tests/cli.rs` pins both halves.
+fn writer_lock(
+    cfg: &Config,
+    workspace: &Path,
+    command: &str,
+    json: bool,
+) -> Result<np_core::lock::WorkspaceLock, Box<dyn Error>> {
+    // **§3 step 0 comes first, and it belongs here rather than in each caller**: taking the lock creates a file, and a typo'd workspace path
+    // must not leave one behind. `Config::workspace_db` happily derives a name for a directory that does not exist, so a lock taken before
+    // this check would create a data directory and a `<hash>.lock.db` for a vault nobody has — the exact failure §3 step 0 exists to prevent,
+    // re-opened through a new door. Every mutating command requires an existing workspace directory anyway, so nothing loses coverage.
+    models::require_workspace_dir(workspace)?;
+    let db_path = cfg.workspace_db(workspace);
+    // The lock is named after the workspace database rather than recomputing an id, so there is no second derivation to drift from the first:
+    // same directory, same stem, `.lock.db`. Copy a workspace's data somewhere else and its lock comes with it; two workspaces never contend.
+    let dir = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let stem = db_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("cannot name the workspace lock for {}", db_path.display()))?;
+    match np_core::lock::WorkspaceLock::acquire(
+        dir,
+        stem,
+        np_core::lock::WorkspaceLock::DEFAULT_WAIT,
+    ) {
+        Ok(held) => Ok(held),
+        Err(np_core::lock::LockError::Held { waited }) => {
+            if json {
+                emit_json(&json!({
+                    "command": command,
+                    // The state, spelled for a machine because an app should not have to recognise a sentence. `locked` sits beside `offline`
+                    // and `fetched` as the third thing that can stop a mutating command without being anybody's bug.
+                    "locked": true,
+                    "waited_ms": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                }));
+            }
+            Err(format!(
+                "locked: another process is writing this workspace ({} ms) — try again once it finishes; \
+                 `np search` and `np models list` answer while a writer runs",
+                waited.as_millis()
+            )
+            .into())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
 fn scan_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
+    // Held for the whole command, including the `INDEX.md` rendering that SQLite cannot roll back.
+    let _writer = writer_lock(&cfg, workspace, "scan", json)?;
     let report = scan(workspace, &cfg)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -674,6 +737,9 @@ fn embed_workspace(
     json: bool,
     auto_fetch: AutoFetch,
 ) -> Result<(), Box<dyn Error>> {
+    // The lock spans the run: an `embed` writes vectors and re-renders `INDEX.md`, and a second writer in the same vault is what F44 measured.
+    let cfg_for_lock = load_config()?;
+    let _writer = writer_lock(&cfg_for_lock, workspace, "embed", json)?;
     let report = embed_report(workspace, auto_fetch, !json)?;
     // Read the row that was actually used rather than re-deriving from argv: `[embeddings] model` is what `embed_run` embedded for, and a
     // config naming something other than the installed row is exactly the disagreement worth noticing.
@@ -713,6 +779,10 @@ fn setup_workspace(
     // ---- step 1: index. No `--json` forwarding here: setup composes one document at the end, and a summary printed on
     // the way would be a second, partial account of the same run.
     let cfg = load_config()?;
+    // One lock for the whole composed run. It is taken before the consent prompt in step 2 and held through it, which is deliberate: by then
+    // this process has decided it intends to write, and a second writer that started while a human was reading the question would land in the
+    // gap between this command's index and its embed. Readers are unaffected — `np status` answers over a held lock, and the tests say so.
+    let _writer = writer_lock(&cfg, workspace, "setup", json)?;
     let indexed = scan(workspace, &cfg)?;
 
     if !json {
@@ -1844,6 +1914,11 @@ fn models_fetch(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let config = load_config()?;
+    // **F44**, and it comes before the discard below rather than after it. `--discard-marker` is documented as an action that does not depend on
+    // the rest of the run, and that stays true of its *failures*; what it must not do is delete a marker while another process is mid-fetch in
+    // this same workspace — which is exactly the situation the lock detects, and exactly what §12 rule 4's marker exists to make visible. A
+    // refusal here therefore leaves the marker where it is, for the other run to finish with.
+    let _writer = writer_lock(&config, workspace, "models fetch", json)?;
     let db = workspace_db(&config, workspace)?;
     let models_dir = config.workspace_models_dir(workspace);
 
@@ -1975,6 +2050,10 @@ fn free_space_line(free: Option<u64>) -> String {
 
 fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(), Box<dyn Error>> {
     let config = load_config()?;
+    // An install writes a row and copies an artifact into the per-workspace model directory. Neither is in the transaction that `scan` would
+    // open, so a concurrent index can observe a half-installed model — which is why this command is inside the same lock as everything else
+    // that changes state (**F44**), not merely next to it.
+    let _writer = writer_lock(&config, workspace, "models install", json)?;
     let db = workspace_db(&config, workspace)?;
     let outcome = models::install(&db, &config, workspace, request, now_secs())?;
     if json {
