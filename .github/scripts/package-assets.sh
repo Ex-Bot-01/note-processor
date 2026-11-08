@@ -18,6 +18,9 @@
 set -euo pipefail
 
 out="${1:-dist}"
+# Absolute, because tar's `-C` composes against the directory it is already in (see the packaging line below for what that costs when it is a
+# relative `.`), and because the script may be run from anywhere.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
 target=$(rustc -vV | sed -n 's/^host: //p')
 binary=np
@@ -59,8 +62,12 @@ else
   # statically linked into this binary, and an MIT notice that lives only in the repository satisfies nobody: the obligation attaches to the
   # artefact a person downloads. So it goes inside the tarball, and the listing is checked rather than assumed — with `grep -c` rather than
   # `grep -q`, because `-q` exits on first match and can SIGPIPE `tar` into a failure that pipefail then reports as ours.
-  test -s THIRD_PARTY_NOTICES.md || { echo "refusing to package: THIRD_PARTY_NOTICES.md is missing or empty" >&2; exit 1; }
-  tar -C "target/$target/release" -czf "$archive" "$binary" -C . THIRD_PARTY_NOTICES.md
+  test -s "$repo_root/THIRD_PARTY_NOTICES.md" || { echo "refusing to package: THIRD_PARTY_NOTICES.md is missing or empty" >&2; exit 1; }
+  # **An absolute `-C`, not `-C .`.** Measured on the first run of this line: `tar` applies `-C` in order, so after
+  # `-C target/x86_64-unknown-linux-gnu/release` a following `-C .` means *that* directory, and the notice file is not there —
+  # `tar: THIRD_PARTY_NOTICES.md: Cannot stat`, exit 2, no asset. The listing check below never even ran, because the failure was
+  # loud enough to stop the script; a quieter tar would have published an asset missing its license text.
+  tar -C "target/$target/release" -czf "$archive" "$binary" -C "$repo_root" THIRD_PARTY_NOTICES.md
   if ! { tar -tzf "$archive" | { grep -c 'THIRD_PARTY_NOTICES\.md' || true; }; } | grep -qv '^0$'; then
     echo "refusing to publish: the asset does not contain THIRD_PARTY_NOTICES.md" >&2
     exit 1
