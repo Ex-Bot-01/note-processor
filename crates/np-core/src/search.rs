@@ -674,6 +674,30 @@ pub enum RankNote {
     /// The workspace holds no vectors at all, so hybrid's semantic half had nothing to read. A state, not an error: this is a
     /// machine that has not downloaded an artifact yet. Vectors under some *other* model id stay a refusal — see [`SearchError::NoVectorsForModel`].
     NoVectors,
+    /// **F45 (A).** Configuration names no provider (`embeddings.provider = "none"`, or no `[embeddings]` section at all), so
+    /// there is nothing that could turn the query into a vector. This is an instruction, not a gap: the answer came from FTS5,
+    /// and the note says what would add the other half. It used to be a refusal at exit 1 with **zero bytes on stdout**, which
+    /// a caller could not tell apart from "search is broken" while `--mode keyword` answered fine in the same state.
+    ProviderDisabled,
+    /// **F45.** Configuration names a model this workspace has never installed. Distinct from [`Self::ProviderDisabled`] because
+    /// the reader's next command differs: one edits a file, the other downloads 309 MB.
+    ModelNotInstalled,
+    /// **F45.** A row exists and its bytes do not (deleted, or a moved data folder): the artifact this build would load is absent,
+    /// and no fetch was permitted to put it back. Vectors from an earlier run may well be in the index — they are simply
+    /// unusable without a model to embed the *query* with.
+    ArtifactMissing,
+    /// **F45/F38.** A fetch was allowed and attempted, and nothing was reached. `--json` carries `offline:true` beside this note:
+    /// offline is a state, and it belongs to the machine-readable channel even when the run answered — search's exit code says
+    /// "did you get an answer", which for a keyword list is yes.
+    FetchOffline,
+    /// **F45.** The artifact is missing, this build could fetch it, and policy said no: `[models] auto_fetch = false` or
+    /// `NP_NO_AUTO_FETCH=1`. Named separately because "it did not download" and "it was not allowed to" read as the same bug to
+    /// whoever set the switch and forgot.
+    FetchDisabled,
+    /// **F45's first-install case (ruled 2026-11-09).** The artifact arrived during this search. The answer is still keyword-only,
+    /// because a model on disk writes no vectors by itself: `np embed` (or `np setup`) owes the index its rows. Saying so here is
+    /// the difference between "search downloaded 309 MB for nothing" and a reader who knows what the next call is for.
+    ArtifactFetched,
 }
 
 /// The whole sentence for a build that can fetch: which doors this reader can actually walk through. F32's rule, because a
@@ -693,12 +717,99 @@ const NO_VECTORS_SENTENCE: &str = concat!(
     "`np embed` adds the semantic half once a model is installed"
 );
 
+// **F45's sentences, one pair per state that names a command.** Same rule `NO_VECTORS_SENTENCE` follows and for the same reason:
+// a build that compiled the HTTP client out must not send its reader to `np models fetch`, so each of these exists twice and the
+// wording a binary prints is wording that binary can honour. None of them names a host (§12 rule 8), and none of them tells the
+// reader to run something that would not help: `ProviderDisabled` says *configure*, never *download*.
+#[cfg(feature = "fetch")]
+const PROVIDER_DISABLED_SENTENCE: &str = concat!(
+    "embeddings are switched off (`embeddings.provider = \"none\"`): ranked by keyword only \u{2014} ",
+    "set it to `\"local-model\"` with an `embeddings.model` to add the semantic half"
+);
+#[cfg(not(feature = "fetch"))]
+const PROVIDER_DISABLED_SENTENCE: &str = concat!(
+    "embeddings are switched off (`embeddings.provider = \"none\"`): ranked by keyword only \u{2014} ",
+    "set it to `\"local-model\"` with an `embeddings.model`, then run `np embed`"
+);
+
+#[cfg(feature = "fetch")]
+const MODEL_NOT_INSTALLED_SENTENCE: &str = concat!(
+    "the configured model is not installed in this workspace: ranked by keyword only \u{2014} ",
+    "`np setup` indexes and embeds in one call, or `np models fetch <vault> --id <id>` installs the bytes"
+);
+#[cfg(not(feature = "fetch"))]
+const MODEL_NOT_INSTALLED_SENTENCE: &str = concat!(
+    "the configured model is not installed in this workspace: ranked by keyword only \u{2014} ",
+    "install it with `np models install <vault> --id <id> --path <file> --dim <width> --sha256 <digest>`, then `np embed`"
+);
+
+#[cfg(feature = "fetch")]
+const ARTIFACT_MISSING_SENTENCE: &str = concat!(
+    "the configured model's artifact is not on disk (automatic fetch is off, or this build cannot fetch): ",
+    "ranked by keyword only \u{2014} `np models fetch <vault> --id <id>` puts the bytes back"
+);
+#[cfg(not(feature = "fetch"))]
+const ARTIFACT_MISSING_SENTENCE: &str = concat!(
+    "the configured model's artifact is not on disk: ranked by keyword only \u{2014} ",
+    "`np models install <vault> --id <id> --path <file> --dim <width> --sha256 <digest>` puts the bytes back"
+);
+
+#[cfg(feature = "fetch")]
+const FETCH_OFFLINE_SENTENCE: &str = concat!(
+    "the pinned origin could not be reached, so nothing was fetched: ranked by keyword only \u{2014} ",
+    "connect and run `np embed` (or `np setup`) to add the semantic half"
+);
+#[cfg(not(feature = "fetch"))]
+const FETCH_OFFLINE_SENTENCE: &str = concat!(
+    "the pinned origin could not be reached, so nothing was fetched: ranked by keyword only \u{2014} ",
+    "this build cannot fetch, so place the artifact with `np models install` and run `np embed`"
+);
+
+#[cfg(feature = "fetch")]
+const FETCH_DISABLED_SENTENCE: &str = concat!(
+    "automatic fetching is switched off (`[models] auto_fetch = false`, or `NP_NO_AUTO_FETCH=1`): ranked by keyword only \u{2014} ",
+    "unset it, or run `np setup` / `np models fetch <vault> --id <id>` when you want the semantic half"
+);
+#[cfg(not(feature = "fetch"))]
+const FETCH_DISABLED_SENTENCE: &str = concat!(
+    "this build has no fetch command: ranked by keyword only \u{2014} ",
+    "install the artifact with `np models install` and run `np embed` to add the semantic half"
+);
+
+const ARTIFACT_FETCHED_SENTENCE: &str = concat!(
+    "the model artifact was installed by this search: ranked by keyword only \u{2014} ",
+    "run `np embed` (or `np setup`) to write the vectors, then this query has its semantic half"
+);
+
 impl RankNote {
     /// The one sentence per cause. Spelled here rather than at the print site so text output and `--json` cannot disagree
     /// about what was missing, and a future third variant has to be worded once.
     pub fn label(&self) -> &'static str {
         match self {
             Self::NoVectors => NO_VECTORS_SENTENCE,
+            Self::ProviderDisabled => PROVIDER_DISABLED_SENTENCE,
+            Self::ModelNotInstalled => MODEL_NOT_INSTALLED_SENTENCE,
+            Self::ArtifactMissing => ARTIFACT_MISSING_SENTENCE,
+            // "the pinned origin" and no host (§12's rule 8): the transport's failure is reported as a state, the way
+            // `embed_run`'s offline arm reports it, and one build's truth about fetching comes from the same const pair.
+            Self::FetchOffline => FETCH_OFFLINE_SENTENCE,
+            Self::FetchDisabled => FETCH_DISABLED_SENTENCE,
+            Self::ArtifactFetched => ARTIFACT_FETCHED_SENTENCE,
+        }
+    }
+
+    /// The stable machine token for `--json`'s `reason` key. Separate from [`Self::label`] on purpose: the sentence is prose a
+    /// human reads and may reword, and a caller that branches on "why did I get keyword results" must not be branching on
+    /// wording. Kebab-case, like every other token this program emits.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::NoVectors => "no-vectors",
+            Self::ProviderDisabled => "provider-disabled",
+            Self::ModelNotInstalled => "model-not-installed",
+            Self::ArtifactMissing => "artifact-missing",
+            Self::FetchOffline => "fetch-offline",
+            Self::FetchDisabled => "fetch-disabled",
+            Self::ArtifactFetched => "artifact-fetched",
         }
     }
 }

@@ -2229,3 +2229,57 @@ distinguish real installs from stubs by looking inside — which is exactly the 
 says. B: keep creating it and document that emptiness is normal, then fix consumers (my script now counts `.models` directories *containing
 files* and prints both numbers). A is the smaller lie; B is the smaller change. **Owed:** ruling plus, either way, a test that `scan` on a fresh
 workspace does not leave a directory claiming a model exists — or a doc line saying it may.
+
+**Ruled and shipped 2026-11-09 — option A, plus the operator's amendment.** *"For the F45: A, but when the program has it first install on a
+machine it tries to install the huggingface model, if it has no internet connection then it falls back."* That sentence supersedes F38 §5's
+"`np search` never fetches", so it is written into both design documents rather than left in a commit message: `docs/design-m3-hybrid-search.md`
+§5 and §7 (the superseded bullet kept verbatim above its replacement), and `docs/design-f38-auto-fetch.md`'s two "never fetches" lines.
+
+**The contract, as shipped.** Hybrid never refuses for a missing semantic half; it answers from FTS5 and says which half was absent — prose on
+stderr, stable token under `--json`'s new `reason`, plus `fetched` and `offline` carrying F38's meanings so one reader handles both commands.
+Seven tokens (`provider-disabled`, `model-not-installed`, `artifact-missing`, `fetch-offline`, `fetch-disabled`, `artifact-fetched`,
+`no-vectors`), each with its own sentence, each naming only commands this build has (F32's rule). **`--mode semantic` keeps every refusal it had**
+and does not fetch: degrading is what you do when you can still answer. Search writes no vectors and no catalog; the artifact cache is the only
+thing it may create.
+
+**Fetch conditions, because a read dialling out needs defending.** Hybrid mode + configuration naming a `local-model` provider + an id **this
+build pins** + runtime and HTTP client compiled in + `AutoFetch::Deferred.allowed(&cfg)` — the same call `np embed` makes, so `[models]
+auto_fetch = false` and `NP_NO_AUTO_FETCH=1` outrank search exactly as they outrank embed.
+
+**Measured on a release-shaped binary (`--features local-model,fetch`), 2026-11-09.** Fresh vault, pinned id configured, never embedded:
+
+| state | exit | what came back |
+| --- | --- | --- |
+| dead origin (`NP_MODELS_BASE_URL` → closed port) | **0** | `offline:true`, `reason:"fetch-offline"`, one keyword hit, no host in either channel |
+| `NP_NO_AUTO_FETCH=1` | 0 | `offline:false`, `reason:"fetch-disabled"`, sentence names the switch |
+| real origin | 0 | 30.7 s; `fetched:{id, members:[{bytes:309855456, digest-verified:true}], origin:"compiled-in-pin"}`, `reason:"artifact-fetched"` |
+| …then `np embed`, then `--mode semantic` | 0 | cosine **0.6859** on the right note, `reason:null`, `vectors:true` |
+
+The last row is what makes the amendment worth its bandwidth: the download was not decorative, and the note that says "run `np embed`" is the
+difference between a caller that knows what to do next and one that wonders why a search moved 310 MB.
+
+**What the new tests caught while I wrote them — both bugs were mine, both are in the code as comments.**
+
+* Gating *semantic* resolution on `present` turned F32's refusal ("vectors exist under another id") into silence and made F40's
+  `runtime is not built` disappear. Caught by `search_with_embedding_disabled_refuses_and_names_the_setting` and
+  `searching_without_the_runtime_names_the_model_that_stayed_owed`. The rule now sits in the code: **semantic always embeds the query** — that
+  call is what surfaces provider-level refusals — while hybrid may skip it when there is nothing to compare against.
+* Passing `hybrid` straight into `embed_provider` as "may fetch" **bypassed the kill switch**: with `NP_NO_AUTO_FETCH=1`, search reported
+  `offline:true` about a network it had no business touching. Caught by
+  `search_with_fetching_switched_off_says_so_instead_of_blaming_the_network` on the `local-model,fetch` row only — a default-features run
+  compiles the trigger out and would have "passed". That asymmetry (which feature row grades which claim) is why the gate list keeps both rows.
+
+**Falsified as a vocabulary, not per-case.** `every_rank_note_says_what_arrived_and_never_names_a_host` asserts across all seven notes: unique
+tokens, **unique sentences** (two states sharing prose is one state wearing two names), every sentence naming the half that *did* answer, no
+`http` anywhere (§12 rule 8), and — feature-gated both ways — a fetch-less build never advertises `np models fetch` while a build that can fetch
+advertises it somewhere. `a_note_token_is_not_its_sentence` exists because the obvious shortcut (make `reason` return the sentence) passes every
+other assertion here.
+
+**Also updated:** `an_empty_result_names_the_query_and_never_an_absent_model`, `search_json_names_the_mode_that_ran_and_the_half_that_was_missing`
+(key set is now seven, and each new key is asserted by value rather than only listed), and
+`search_without_a_model_answers_from_keywords_and_says_the_half_that_ran` — which now pins both notes apart, including that an unconfigured
+workspace must **not** be told to fetch. Stage 12 of `run-stage5-7.ps1` still measures the state on a real machine and labels it `F45 (open)`;
+its line changes to the degraded wording on the next Windows run, which is the diff this card asked for.
+
+**Still owed:** CI grading (local rows: default 42 np-cli cases, `local-model,fetch` 56 with real artifacts), and the operator's Windows run to
+confirm the first-install fetch behaves the same on a machine whose network stack they actually have.

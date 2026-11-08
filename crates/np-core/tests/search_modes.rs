@@ -589,3 +589,102 @@ fn a_query_beyond_the_term_cap_searches_its_first_terms() {
     // Mutation this catches: off-by-one at the cap (`> MAX_QUERY_TERMS` keeps 33 terms and finds nothing), and a cap that
     // truncates from the front, which would return `tail.md` instead.
 }
+
+/// **F45's vocabulary, graded without a filesystem, a model, or a network.**
+///
+/// `RankNote` grew from one variant to seven in one change, and every one of them is a state a caller has to be able to tell
+/// apart — so the properties that make the enum worth its name get asserted over *all* of them rather than per-variant:
+///
+/// * **Every note names the half you did get.** Each sentence says "ranked by keyword only", because a note that explains what
+///   is missing without saying an answer still arrived is how a degraded read starts looking like a failure.
+/// * **No two notes share a sentence.** Two states printing identical prose is one state with two names, which is how F40 spent
+///   an afternoon: `outcome owed and not produced` meant three different things at once.
+/// * **Tokens are unique, kebab-case, and stable.** `--json`'s `reason` key branches on these; the sentences above are prose and
+///   may be reworded. A token that collides with another silently merges two caller paths.
+/// * **A build never advertises a door it cannot open** (F32's rule, applied to notes): without `fetch`, no sentence may name
+///   `np models fetch`. The opposite row asserts that with `fetch` at least one does — otherwise the pair of consts for each state
+///   could collapse to the fetch-less wording and this suite would not notice.
+/// * **No host, ever** (§12 rule 8): an origin *kind* at most, so `http` must appear nowhere in a note.
+#[test]
+fn every_rank_note_says_what_arrived_and_never_names_a_host() {
+    let all = [
+        search::RankNote::NoVectors,
+        search::RankNote::ProviderDisabled,
+        search::RankNote::ModelNotInstalled,
+        search::RankNote::ArtifactMissing,
+        search::RankNote::FetchOffline,
+        search::RankNote::FetchDisabled,
+        search::RankNote::ArtifactFetched,
+    ];
+
+    let mut tokens = std::collections::BTreeSet::new();
+    let mut sentences = std::collections::BTreeSet::new();
+    let mut names_fetch = 0usize;
+
+    for note in all {
+        let token = note.token();
+        let sentence = note.label();
+
+        assert!(
+            !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "`reason` tokens are kebab-case, like every other token this program prints: {token:?}"
+        );
+        assert!(
+            tokens.insert(token),
+            "two notes share the token {token:?}, so a caller branching on `reason` cannot tell them apart"
+        );
+        assert!(
+            sentences.insert(sentence),
+            "two notes print the identical sentence ({sentence:?}); that is one state wearing two names"
+        );
+        assert!(
+            sentence.contains("keyword"),
+            "{token} has to say which half DID answer, not only which one is missing: {sentence}"
+        );
+        assert!(
+            !sentence.contains("http") && !sentence.contains('@'),
+            "a note may name an origin kind and never a host or URL (§12 rule 8): {sentence}"
+        );
+        if sentence.contains("np models fetch") {
+            names_fetch += 1;
+        }
+    }
+
+    #[cfg(not(feature = "fetch"))]
+    assert_eq!(
+        names_fetch, 0,
+        "this build compiled the HTTP client out, so no note may send a reader to `np models fetch`"
+    );
+    #[cfg(feature = "fetch")]
+    assert!(
+        names_fetch > 0,
+        "a build that CAN fetch has to say so somewhere in this vocabulary, or the fetch-less wording \
+         is being printed by a binary that could have done better"
+    );
+}
+
+/// The two halves of F45's contract, kept apart on purpose: **`reason` is a token and `note` is prose.** A mutant that makes
+/// `token()` return the sentence (the obvious shortcut when a JSON key already exists next to it) passes every assertion above
+/// and fails this one, because then the machine-readable channel changes whenever a sentence is reworded — which is precisely the
+/// coupling that made F41's wording change cost fourteen test edits.
+#[test]
+fn a_note_token_is_not_its_sentence() {
+    for note in [
+        search::RankNote::ProviderDisabled,
+        search::RankNote::ArtifactFetched,
+    ] {
+        assert_ne!(
+            note.token(),
+            note.label(),
+            "`reason` must stay a token even though it sits beside `note` in the same document"
+        );
+        assert!(
+            !note.token().contains(' '),
+            "a token with a space in it is a sentence wearing a key's name: {:?}",
+            note.token()
+        );
+    }
+}

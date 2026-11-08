@@ -89,6 +89,33 @@ matching snippet from FTS5 (`snippet()` over the body), which is the "why did th
 * `keyword` mode asked for on a workspace whose scan has not run → empty list, exit 0 (nothing indexed is a fact about the
   workspace, same as today's semantic answer with no rows).
 
+**§5 was half-implemented, and **F45** (ruled 2026-11-09, option A) closed the gap.** The rule above says hybrid degrades when a half is
+missing; the code degraded only when the *index* had no vectors. With vectors in it and the semantic half unbuildable, hybrid exited 1
+having written **zero bytes to stdout** — while `--mode keyword` answered the same query from FTS5 in the same state. An application calling
+the default mode could not distinguish "no results" from "search is broken", and the operator's own test harness produced that state on every
+run, because Stages 6/8/11 delete the config on their way out.
+
+So: **hybrid never refuses for a missing semantic half.** Every cause degrades to the keyword list, and each names itself — prose on stderr,
+a stable token under `--json`'s `reason`:
+
+| state | `reason` | what the sentence tells you to do |
+| --- | --- | --- |
+| no provider configured (`provider = "none"`, or no `[embeddings]`) | `provider-disabled` | set `embeddings.provider` / `embeddings.model`. Never "download": with embeddings switched off, a fetch would be advice you could not follow (**F41**'s lesson applied to notes) |
+| configured id has no row in this workspace | `model-not-installed` | `np setup`, or `np models fetch <vault> --id <id>` |
+| row exists, artifact bytes gone, no fetch permitted | `artifact-missing` | put the bytes back |
+| fetch allowed, attempted, nothing reached | `fetch-offline` (with `offline:true`) | connect, then `np embed` / `np setup` |
+| artifact missing and policy refused the fetch | `fetch-disabled` | names `NP_NO_AUTO_FETCH` / `[models] auto_fetch`, so nobody debugges a network they switched off |
+| artifact arrived during this search, nothing embedded yet | `artifact-fetched` | run `np embed` — a model in a cache writes no vectors |
+| provider fine, index has no vectors | `no-vectors` | unchanged from F36 |
+
+Two things did **not** change, and both are asserted rather than asserted-about:
+
+* **`--mode semantic` keeps every refusal it had.** Asking for semantics on a machine that cannot do them is a request worth refusing; the
+  pinned sentences in `crates/np-cli/tests/cli.rs` still pass word for word. Degrading is what you do when you can still answer, and hybrid
+  can. (The same reasoning keeps semantic mode from fetching: spending 309 MB to produce nothing is not a degraded answer, it is a bill.)
+* **`keyword` mode resolves no provider at all**, so it cannot reach the transport, cannot be declined, and prints no note: an explicitly
+  requested half is not a missing one.
+
 ## 6. Cost, measured on 2026-11-08
 
 FTS5's term index over prose was guessed to land "in the same order as the text itself". Measured instead, on one host (Linux x86-64,
@@ -133,6 +160,25 @@ a person willing to sequence three commands. Three parts of the ruling above sur
 
 + **`np search` still never fetches**, in any mode and whatever the config says — a read command that downloads would make "your query
   took four minutes because it fetched" possible, and this card's own contribution is that keywords already answer.
+
+**Superseded 2026-11-09 by the operator's amendment to F38 §5, for hybrid mode only.** The bullet above is kept verbatim because the objection
+in it was real and the answer to it is a set of conditions rather than a shrug: *"when the program has it first install on a machine it tries to
+install the huggingface model; if it has no internet connection then it falls back."*
+
+`np search` may now trigger the pinned fetch, and only when **all** of these hold — each one is a different mistake prevented:
+
++ the mode is **hybrid**, because that is the mode which can still answer afterwards. `keyword` never resolves a provider; `semantic` resolves
+  one with fetching off, since its honest answer when the model is missing is a refusal and a download cannot improve on that;
++ configuration names a `local-model` provider and an id **this build pins** — a name in a file still cannot make a download happen;
++ `[models] auto_fetch = false` and `NP_NO_AUTO_FETCH=1` still veto, through the same `AutoFetch::Deferred.allowed()` call `np embed` uses. The
+  first draft of this change passed the mode straight through and would have downloaded on a machine that had switched fetching off for every
+  command; the test that caught it is `search_with_fetching_switched_off_says_so_instead_of_blaming_the_network`;
++ the runtime and the HTTP client are compiled in, so a binary that could not embed never spends the bytes.
+
+Search still writes nothing to the index: no vectors, no `INDEX.md`, ever. The artifact cache is the only thing it may create, and the note that
+comes back (`artifact-fetched`) says the next command is `np embed`. Measured on 2026-11-09 with a fresh vault and the real origin: 30.7 s,
+309,855,456 B fetched and digest-verified, exit 0 with keyword hits, `"reason":"artifact-fetched"`, `origin:"compiled-in-pin"` and no host in
+either channel; then `np embed` → `--mode semantic` returned cosine 0.6859 on the right note.
 + **"Silently falling back" is still not what happens.** Offline, `np embed` exits 1 saying nothing was embedded; `np setup` indexes,
   exits 0, and reports `vectors: false, offline: true`. Keyword search remains a legitimate answer rather than a consolation.
 + **Consent still exists**, just not as a daemon-only feature: `[models] auto_fetch`, `--no-auto-fetch` / `--yes`, and

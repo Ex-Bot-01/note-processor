@@ -2568,6 +2568,22 @@ const NO_VECTORS_SENTENCE: &str = concat!(
     "`np embed` adds the semantic half once a model is installed"
 );
 
+/// **F45's sentence for "embeddings are switched off", mirrored here exactly as `NO_VECTORS_SENTENCE` is.** The test asserts the
+/// whole line rather than a substring because this is prose on a terminal and in a JSON key at once: if np-core rewords it, the
+/// row fails and someone decides whether the change was meant to reach readers. Both halves of the `fetch` pair exist for the
+/// same reason np-core's do — a build without the HTTP client must not be quoted a command it does not have.
+#[cfg(feature = "fetch")]
+const PROVIDER_DISABLED_SENTENCE: &str = concat!(
+    "embeddings are switched off (`embeddings.provider = \"none\"`): ranked by keyword only \u{2014} ",
+    "set it to `\"local-model\"` with an `embeddings.model` to add the semantic half"
+);
+
+#[cfg(not(feature = "fetch"))]
+const PROVIDER_DISABLED_SENTENCE: &str = concat!(
+    "embeddings are switched off (`embeddings.provider = \"none\"`): ranked by keyword only \u{2014} ",
+    "set it to `\"local-model\"` with an `embeddings.model`, then run `np embed`"
+);
+
 #[test]
 fn search_without_a_model_answers_from_keywords_and_says_the_half_that_ran() {
     // The property hybrid exists for: a workspace on a machine that has never downloaded 310 MB still answers a word
@@ -2608,10 +2624,43 @@ fn search_without_a_model_answers_from_keywords_and_says_the_half_that_ran() {
     );
     // The missing half is said out loud, on stderr, once, in this build's own words. Stderr so stdout stays a parseable
     // hit list; one line because the F32 refusals set that shape and a two-line caveat breaks the same readers.
+    //
+    // **Reworded by F45 (2026-11-09) on purpose.** This workspace has no `[embeddings]` section at all, and the sentence used to
+    // say "no vectors here — `np models fetch` or `np embed` adds the semantic half", sending the reader to download 309 MB with
+    // embeddings switched off: `np embed` would have refused as `configuration disabled`, so the advice could not be followed.
+    // The note now names the switch. Which is why the assertion below pins the *absence* of the fetch command too — a mutant that
+    // maps every missing-half state to one sentence passes a substring check and fails this one.
     assert_eq!(
         ok.stderr().trim_end(),
-        NO_VECTORS_SENTENCE,
+        PROVIDER_DISABLED_SENTENCE,
         "the caveat is this sentence, in full"
+    );
+    assert!(
+        !ok.stderr().contains("np models fetch"),
+        "a workspace with no provider configured must not be told to fetch a model: {}",
+        ok.stderr()
+    );
+
+    // The other half of the distinction, asserted in the same test so the two notes cannot merge: a model that IS configured and
+    // installed, with nothing embedded yet, still hears about the missing vectors. Two causes, two sentences, one enum.
+    let with_model = workspace();
+    fs::write(
+        with_model.root.join("sprint-review.md"),
+        "# Sprint review\n\ndemo on friday\n",
+    )
+    .expect("test setup: note");
+    run(&mut with_model.command(&["scan"])).assert_success();
+    install_model(&with_model);
+    with_model.write_user_config(&local_model_config(EMBED_MODEL));
+
+    let mut second = with_model.command_without_operand(&["search"]);
+    second.arg(&with_model.root).arg("demo");
+    let ok2 = run(&mut second);
+    assert_eq!(ok2.code(), 0, "\n{}", ok2.stderr());
+    assert_eq!(
+        ok2.stderr().trim_end(),
+        NO_VECTORS_SENTENCE,
+        "configured and installed but nothing embedded is still the no-vectors state"
     );
 }
 
@@ -2687,8 +2736,9 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
         serde_json::from_str(&ok.stdout()).expect("`--json` prints exactly one JSON object");
     assert_eq!(
         json_keys(&value),
-        vec!["hits", "mode", "note", "vectors"],
-        "the hit list plus the three keys that say how it was made"
+        vec!["fetched", "hits", "mode", "note", "offline", "reason", "vectors"],
+        "the hit list plus the keys that say how it was made — **F45** added `reason` (a token beside the prose), `fetched` and
+         `offline` (F38's meanings, so one reader handles embed and search)"
     );
     assert_eq!(
         value["mode"], "hybrid",
@@ -2699,8 +2749,23 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
         "this workspace has no vectors, and pretending otherwise would be the F32 mistake again"
     );
     assert_eq!(
-        value["note"], NO_VECTORS_SENTENCE,
+        value["note"], PROVIDER_DISABLED_SENTENCE,
         "the same sentence stderr carries, so the two channels cannot tell different stories"
+    );
+    // **`reason` is the token and `note` is the sentence** — asserted together because they sit in one document and a caller that
+    // had to string-match prose would be re-written every time prose changed.
+    assert_eq!(
+        value["reason"], "provider-disabled",
+        "the machine-readable cause, stable while the prose above may be reworded"
+    );
+    assert_eq!(
+        value["fetched"],
+        serde_json::Value::Null,
+        "nothing was transferred in this run"
+    );
+    assert_eq!(
+        value["offline"], false,
+        "and nothing was attempted, so offline is not a claim to make"
     );
     let hits = value["hits"].as_array().expect("hits is an array");
     assert!(!hits.is_empty(), "the keyword list answers");
@@ -3134,6 +3199,124 @@ fn setup_with_fetching_switched_off_indexes_and_refuses_without_blaming_the_netw
     );
 }
 
+// ---- **F45 + the first-install amendment to F38 §5, from the search side (2026-11-09).**
+//
+// The operator's sentence made testable: *"when the program has it first install on a machine it tries to install the model; if it
+// has no internet connection then it falls back."* Both cases need `local-model` **and** `fetch`, because the trigger is compiled
+// out without them — a default-features row would run the case, see no transport attempt, and conclude the fallback worked when the
+// download had merely been not-built. Neither needs an artifact on disk: the state under test is "the bytes are not here yet".
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn search_on_a_fresh_machine_reports_offline_and_still_answers() {
+    let ws = workspace();
+    fs::write(
+        ws.root.join("kafka.md"),
+        "# Kafka\n\nConsumer lag and the broker migration plan for the fleet.\n",
+    )
+    .expect("test setup: write a note");
+    run(&mut ws.command(&["scan"])).assert_success();
+    // Configuration names the one id this build pins, which is what makes a default-on fetch defensible (§12's premise). The
+    // origin is a closed port: the attempt *is* the probe, and nothing answers it.
+    ws.write_user_config(&local_model_config("embeddinggemma-2"));
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root)
+        .arg("broker")
+        .arg("--json")
+        .env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let ok = run(&mut cmd);
+
+    // **Exit 0.** The keyword half answered, and an exit code reports whether the command did its job — not whether the network
+    // co-operated. That is the deliberate asymmetry against `np embed`, where offline exits 1: a caller that asked for vectors must
+    // never be told they arrived.
+    assert_eq!(
+        ok.code(),
+        0,
+        "a degraded answer is still an answer; offline travels in the document:\n{}",
+        ok.stderr()
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&ok.stdout()).expect("one JSON object on stdout");
+    assert_eq!(doc["offline"], true, "the state, not a sentence about it");
+    assert_eq!(doc["reason"], "fetch-offline");
+    assert_eq!(doc["vectors"], false, "nothing was ever embedded here");
+    assert_eq!(
+        doc["fetched"],
+        serde_json::Value::Null,
+        "and nothing arrived: {}",
+        ok.stdout()
+    );
+    assert!(
+        !doc["hits"].as_array().expect("hits is an array").is_empty(),
+        "the fallback has to be a real answer, not an empty list with a nice note: {}",
+        ok.stdout()
+    );
+    for channel in [ok.stdout(), ok.stderr()] {
+        assert!(
+            !channel.contains("127.0.0.1") && !channel.contains("http"),
+            "an origin kind at most, never a host (§12 rule 8): {channel}"
+        );
+    }
+}
+
+/// The switch, asserted beside the outage, because the two read identically to anyone who forgot they set it: no download, keyword
+/// results. What separates them is `reason` — and the fact that with the switch on **nothing was attempted**, so claiming
+/// `offline:true` would be a lie about a network nobody tried to use.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn search_with_fetching_switched_off_says_so_instead_of_blaming_the_network() {
+    let ws = workspace();
+    fs::write(
+        ws.root.join("kafka.md"),
+        "# Kafka\n\nConsumer lag and the broker migration plan for the fleet.\n",
+    )
+    .expect("test setup: write a note");
+    run(&mut ws.command(&["scan"])).assert_success();
+    ws.write_user_config(&local_model_config("embeddinggemma-2"));
+
+    let mut cmd = ws.command_without_operand(&["search"]);
+    cmd.arg(&ws.root)
+        .arg("broker")
+        .arg("--json")
+        .env("NP_NO_AUTO_FETCH", "1")
+        .env("NP_MODELS_BASE_URL", "http://127.0.0.1:9");
+    let ok = run(&mut cmd);
+
+    assert_eq!(ok.code(), 0, "\n{}", ok.stderr());
+    let doc: serde_json::Value = serde_json::from_str(&ok.stdout()).expect("one JSON object");
+    assert_eq!(
+        doc["offline"], false,
+        "nothing was attempted, so nothing timed out"
+    );
+    assert_eq!(doc["reason"], "fetch-disabled");
+    assert!(
+        doc["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("NP_NO_AUTO_FETCH"),
+        "the sentence names the switch, or a reader debugs the network instead of the environment: {}",
+        doc["note"]
+    );
+
+    // And `--mode keyword` never reaches any of this: no provider is resolved, so there is nothing to decline and no note to print.
+    let mut kw = ws.command_without_operand(&["search"]);
+    kw.arg(&ws.root)
+        .arg("broker")
+        .arg("--mode")
+        .arg("keyword")
+        .arg("--json");
+    let keyword = run(&mut kw);
+    assert_eq!(keyword.code(), 0, "\n{}", keyword.stderr());
+    let kdoc: serde_json::Value = serde_json::from_str(&keyword.stdout()).expect("one JSON object");
+    assert_eq!(
+        kdoc["reason"],
+        serde_json::Value::Null,
+        "an explicitly requested half is not a missing one: {}",
+        keyword.stdout()
+    );
+    assert_eq!(kdoc["offline"], false);
+}
+
 #[cfg(feature = "local-model")]
 mod real_model {
     use super::*;
@@ -3232,7 +3415,9 @@ mod real_model {
             serde_json::from_str(&json.stdout()).expect("`--json` prints exactly one JSON object");
         assert_eq!(
             json_keys(&value),
-            vec!["hits", "mode", "note", "vectors"],
+            // **F45** added `reason`; the first-install amendment added `fetched` and `offline`. A healthy semantic run still
+            // says nothing in either: `reason` is null because no half was missing, `fetched` because nothing transferred.
+            vec!["fetched", "hits", "mode", "note", "offline", "reason", "vectors"],
             "the hit list plus F36's three keys that say how it was made — and nothing else on stdout"
         );
         // **A healthy run says so by silence.** `note` is null and `vectors` is true exactly when both halves answered, so
@@ -3378,6 +3563,82 @@ mod real_model {
             ok.stdout().trim_end(),
             format!("nothing indexed for {EMBED_MODEL} by semantic"),
             "with a real id in hand, the sentence names it"
+        );
+    }
+
+    /// **F45's own state, with real vectors in the index.** The operator reached it with my harness: an index that holds
+    /// embeddings and a `config.toml` that no longer configures a provider — a moved profile, a second machine, a model
+    /// uninstalled, or simply a test stage that cleaned up after itself. Hybrid used to exit 1 there having written **zero bytes**
+    /// to stdout, while `--mode keyword` answered the same query from FTS5. Option A says: answer, and say which half is missing.
+    ///
+    /// This case exists because the default-features rows cannot build it: without a real model nothing ever writes a vector, so a
+    /// synthetic "vectors present" fixture would be asserting against a state no release binary can reach. It prints
+    /// `NOT COVERAGE` when no artifact is supplied rather than passing quietly.
+    #[test]
+    fn vectors_in_the_index_and_no_provider_in_the_config_still_answer() {
+        let artifact = artifact_or_not_coverage!();
+        let ws = tiny_workspace();
+        run(&mut ws.command(&["scan"])).assert_success();
+        link_artifact(&ws, &artifact, "task: search result | query: ");
+        ws.write_user_config(&local_model_config(EMBED_MODEL));
+        run(&mut ws.command(&["embed"])).assert_success();
+
+        // The state arrives by taking the provider away, not by pretending the vectors are somewhere else.
+        ws.write_user_config("# the [embeddings] section is gone: provider = \"none\" again\n");
+
+        let mut hybrid = ws.command_without_operand(&["search"]);
+        hybrid
+            .arg(&ws.root)
+            .arg("the cat sits on the warm mat")
+            .arg("--json");
+        let ok = run(&mut hybrid);
+        assert_eq!(
+            ok.code(),
+            0,
+            "F45 A: a missing half degrades, it does not refuse:\n{}",
+            ok.stderr()
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&ok.stdout()).expect("one JSON object on stdout");
+        assert!(
+            !doc["hits"].as_array().expect("hits is an array").is_empty(),
+            "the keyword half has to actually answer, or this is a refusal with better manners: {}",
+            ok.stdout()
+        );
+        assert_eq!(
+            doc["vectors"], true,
+            "and the document still tells the truth about the index: vectors ARE here, unusable without a model"
+        );
+        assert_eq!(doc["reason"], "provider-disabled");
+        for hit in doc["hits"].as_array().expect("hits") {
+            assert_eq!(
+                hit["cosine"],
+                serde_json::Value::Null,
+                "no cosine may be claimed by a run that could not embed the query: {hit}"
+            );
+        }
+
+        // Explicit semantic mode keeps its refusal (**F45 changes hybrid's degradation, not the right to ask for semantics and be
+        // told the truth**). Asserted here rather than in the default rows because this is the only shape where vectors exist:
+        // refusing has to survive next to real embeddings, not merely next to an empty index.
+        let mut semantic = ws.command_without_operand(&["search"]);
+        semantic
+            .arg(&ws.root)
+            .arg("the cat sits on the warm mat")
+            .arg("--mode")
+            .arg("semantic")
+            .arg("--json");
+        let refused = run(&mut semantic);
+        assert_eq!(
+            refused.code(),
+            1,
+            "semantic still refuses: {}",
+            refused.stdout()
+        );
+        assert!(
+            refused.stdout().is_empty(),
+            "a refusal writes no document: {}",
+            refused.stdout()
         );
     }
 

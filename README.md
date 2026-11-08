@@ -116,9 +116,16 @@ it is missing: ~310 MB for the text encoder (`mmproj` adds ~555 MB in a `vision`
 origin, then verified against the compiled-in digest before it is put in place — a partial or wrong file is never used. Turn it off
 three ways: `--no-auto-fetch` for one run, `[models] auto_fetch = false` in the config file, or `NP_NO_AUTO_FETCH=1` in the
 environment, which outranks the file precisely so a daemon can be silenced without editing it. Only ids this build **pins** are ever
-fetched — a name in a config file cannot make a download happen — and `np search` never fetches at all, in any mode: reading a vault
-must not cost bandwidth. With no connection, `np embed` exits 1 and says nothing was embedded; `np setup` still indexes; and
-`np search ~/Notes "…"` answers from keywords while you wait for either.
+fetched — a name in a config file cannot make a download happen. With no connection, `np embed` exits 1 and says nothing was embedded;
+`np setup` still indexes; and `np search ~/Notes "…"` answers from keywords while you wait for either.
+
+**A first `np search` may be the download (since 2026-11-09).** Hybrid mode — the default, and what an application calls — fetches the pinned
+artifact when this workspace is missing one, so a fresh machine needs no ceremony to start becoming semantic: measured on a vault that had never
+been embedded, 30.7 s and ~310 MB, then `np embed` and semantic search works. It happens only when configuration names a model **this build
+pins**, the runtime and HTTP client are compiled in, and neither `[models] auto_fetch = false` nor `NP_NO_AUTO_FETCH=1` says otherwise.
+`--mode keyword` never resolves a provider and `--mode semantic` never fetches: refusing is that mode's answer, so it will not spend bandwidth
+to produce nothing. Search still writes no vectors and no catalog — the artifact cache is all it may create — and its document says what
+happened: `fetched`, `offline`, and a `reason` token beside the human sentence (`artifact-fetched` means "run `np embed` now").
 
 Two things that trip people up, both by design:
 
@@ -156,8 +163,10 @@ Commands:
   models  Install and inspect the model artifacts of one workspace
 ```
 
-The default build links **no** inference runtime: `np scan` is fully functional, while `np embed` reports that nothing was
-produced and `np search` refuses to turn your query into numbers — both at exit 1, with a message naming what to change. Add
+The default build links **no** inference runtime: `np scan` is fully functional; `np embed` reports that nothing was produced and
+`np search --mode semantic` refuses to turn your query into numbers — both at exit 1, naming what to change. Default (hybrid) search still
+answers, from keywords, with a note saying the semantic half is missing (**F45**): it has an answer to give either way, so the runtime complaint
+is left to the command that cannot do its job without it. Add
 `--features local-model` (and cmake) if you want the runtime in the binary; see
 [Building from source](#building-from-source-and-developing).
 

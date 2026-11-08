@@ -43,6 +43,9 @@ effect of reading a config file.
 * A dial-out for anything the build does not pin. Default-on is defensible precisely because the surface is not "the internet": today
   exactly one id (`embeddinggemma-2`) has pinned bytes, from one compiled-in origin, verified by digest before it is published.
 * A **read** command downloading anything. `np search` never fetches (§5).
+
+  *(Amended 2026-11-09: hybrid `np search` may fetch on first install, under the conditions listed in §5's amendment and
+  `docs/design-m3-hybrid-search.md` §7. Keyword and semantic modes still never do.)*
 * An app unable to tell "vectors were already fine" from "this run downloaded 310 MB".
 * A fetched artifact accepted without digest verification, or a URL printed where §12 rule 8 says only the *kind* of origin may appear.
 
@@ -116,7 +119,12 @@ disagree.*
 * `np setup` — **does its useful half and exits 0**: scan runs, index updates, keyword search works the moment scan finishes (F36), and the
   report says `vectors: false, offline: true` with a summary line reading *indexed; vectors skipped — offline*. Setup's contract is "get as far
   as you can and tell me exactly where you are", which is what an app needs to branch on.
-* `np search` — unchanged, answers from keywords, never fetches.
+* `np search` — *(amended 2026-11-09; the line below is what F38 shipped, kept because §5's reasoning is still the reason the trigger is narrow)*
+  unchanged, answers from keywords, never fetches. **Now:** hybrid mode triggers the pinned fetch when the artifact is missing and policy allows
+  it, then answers from keywords and reports `reason: artifact-fetched` — a model in a cache writes no vectors by itself. When the transport does
+  not answer, search still answers: **exit 0** with `offline:true` and `reason: fetch-offline`, because an exit code says whether the command did
+  its job, and it did. That is the deliberate asymmetry against `np embed`, where offline exits 1: a caller that asked for vectors and got none
+  must never see success.
 
 Offline therefore degrades the product into the thing it already was before M2: an indexer with exact-word search, no half-built state, no
 claim it cannot support. Nothing is stamped, published or counted while the artifact is missing, so re-running once a connection returns starts

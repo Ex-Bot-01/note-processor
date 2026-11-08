@@ -530,6 +530,9 @@ fn embed_report(
         artifact_check,
         workers,
         fetched,
+        // Not read here: `np embed` refuses when it cannot embed, so "a fetch was declined" adds nothing to a refusal that already
+        // names the command. `np search --json` is the caller that needs the distinction (**F45**), and it reads the field directly.
+        fetch_declined: _,
     } = embed_provider(&cfg, workspace, auto_fetch.allowed(&cfg), announce)?;
     // The reason a provider could not be built travels as a value — [`ProviderState::ArtifactAbsent`] for a missing file,
     // [`ProviderState::Placeholder`]'s reason for the configuration states. Handing over a bare placeholder is how R6c1 D-2
@@ -809,51 +812,155 @@ fn search_workspace(
 
     // **Which halves this query can ask about, decided before any model is loaded.** Keyword mode needs no provider at all —
     // that is the property the human asked for when hybrid became the default: search answers on a machine that has never
-    // downloaded 310 MB. Hybrid asks the same question of the database rather than of the config, because "no vectors here"
-    // is a state to report, not a failure; and if it *does* need a provider and cannot get one, the refusal below is exactly
-    // the F32 sentence it always was.
+    // downloaded 310 MB.
+    //
+    // **Two rulings rewrote this block on 2026-11-09, which is why the comments are long.**
+    //
+    // *F45 (option A).* Hybrid is the mode that always answers. Until now it degraded to keyword only when the index held no
+    // vectors; with vectors in it and the semantic half unbuildable — `embeddings.provider = "none"`, a model that was never
+    // installed here, bytes deleted after an earlier embed — it exited 1 having written **zero bytes to stdout**, while
+    // `--mode keyword` answered the same query happily. An application calling the default mode could not tell "no results" from
+    // "search is broken", and the operator's own harness produced that state on every run. So hybrid no longer refuses for a
+    // missing semantic half: it answers from FTS5 and says which half was absent, in prose on stderr and in a stable token under
+    // `reason`. `--mode semantic` keeps every refusal it had — asking for semantics and silently receiving keyword results is the
+    // exact failure F32 and F36 were built to prevent.
+    //
+    // *First install (the operator's amendment to F38 §5).* "When the program has it first install on a machine it tries to
+    // install the model; if it has no internet connection then it falls back." Hybrid may therefore trigger the pinned fetch, and
+    // offline is a state it reports rather than a failure it throws. The metered-laptop objection F38 §5 recorded is answered by
+    // the conditions rather than by a new flag: configuration must name a `local-model` provider and an id **this build pins**,
+    // the runtime and the HTTP client must be compiled in, `[models] auto_fetch = false` / `NP_NO_AUTO_FETCH=1` still veto,
+    // `--mode keyword` never dials out, and neither does `--mode semantic` — refusing *is* that mode's answer, so a download
+    // could buy nothing. Hybrid can still answer after fetching, and that is the difference. Search writes no vectors and touches
+    // no `INDEX.md`: the artifact cache is the only thing it may create, and `np embed` / `np setup` stay the commands that make a
+    // vault semantic.
     let semantic_wanted = mode != search::SearchMode::Keyword;
     let present = search::vectors_present(&db)?;
+    let hybrid = mode == search::SearchMode::Hybrid;
+    // Keyword mode never resolves a provider, so it can never reach the transport. Both other modes resolve one — and semantic
+    // resolving even when the index holds no vectors is not an oversight to be tidied away: it is how `--mode semantic` tells
+    // "this workspace has never been embedded" (empty answer, exit 0) apart from "this workspace was embedded under a different
+    // id" (`SearchError::NoVectorsForModel`, a refusal). An earlier draft of this change gated semantic mode on `present` and
+    // turned that refusal into silence; the test that caught it is `search_with_embedding_disabled_refuses_and_names_the_setting`.
+    //
+    // Semantic therefore never fetches: resolution runs with `auto_fetch = false`, so a mode whose honest answer can be "I cannot
+    // do what you asked" does not spend 309 MB first. Hybrid passes its own name in, which is what makes the first-install
+    // download happen on the mode that can still answer afterwards.
+    let resolve = semantic_wanted;
     let mut note: Option<search::RankNote> = None;
     let mut vector: Option<Vec<u8>> = None;
     let mut model = String::new();
-    if semantic_wanted && (mode != search::SearchMode::Hybrid || present) {
-        // One `match`, no `_` arm: adding a state to `ProviderState` has to fail to compile *here*, because the last time this
-        // call site knew only one of the five answers it printed `embeddings.provider = "none"` about a configuration that
-        // said `local-model` (F32). Every placeholder reason collapses into a single arm on purpose — §1 of the F32 design
-        // measures that no CLI invocation can reach two of them, so per-state arms here would be mapping sites nothing can test.
-        // **`false`, and it stays false with no flag to change it** (F38 §5): search is a read, F36 made it answer without
-        // vectors, and "your query took four minutes because it fetched a model" on a metered laptop is the surprise this
-        // rule exists to prevent. If a future command wants the trigger, it asks for it here by name.
-        let provider = match embed_provider(&cfg, workspace, false, !json)?.state {
-            ProviderState::Ready(provider) => provider,
-            ProviderState::Placeholder { reason, .. } => {
+    // `fetched` and `offline` carry F38's meanings into search's document so one caller vocabulary covers both commands: "what
+    // arrived from an origin", and "the pinned origin could not be reached". `reason` (below) says which half is missing.
+    let mut fetched: Option<Value> = None;
+    let mut offline = false;
+
+    if resolve {
+        // **The mode opens the door; only configuration and the environment bolt it.** `AutoFetch::Deferred` is the same question
+        // `np embed` asks when its caller passed neither `--auto-fetch` nor `--no-auto-fetch`: `[models] auto_fetch` first, then
+        // `NP_NO_AUTO_FETCH=1`, which outranks everything. Search has no fetch flags of its own on purpose — `--mode` is the only
+        // lever it exposes — so a search that ignored this would download 309 MB on a host whose operator had switched fetching
+        // off for every command. That is not a hypothetical: the first draft of this change passed `hybrid` straight through, and
+        // `search_with_fetching_switched_off_says_so_instead_of_blaming_the_network` failed on the `local-model,fetch` row saying
+        // `offline:true` where the switch meant "nothing was attempted".
+        let fetch_allowed = hybrid && AutoFetch::Deferred.allowed(&cfg);
+        let resolved = embed_provider(&cfg, workspace, fetch_allowed, !json)?;
+        let Resolved {
+            state,
+            fetched: arrived,
+            fetch_declined,
+            ..
+        } = resolved;
+        // Produced where the transfer happens (provider resolution), not re-derived here — the same reasoning that put
+        // `artifact_check` and `workers` on `Resolved`.
+        if let Some(record) = arrived {
+            fetched = Some(serde_json::to_value(&record)?);
+        }
+        match (mode, state) {
+            (_, ProviderState::Ready(provider)) => {
+                // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
+                // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
+                model = provider.model_id().to_string();
+                // **Semantic always embeds the query; hybrid only when there is something to compare it with.** That asymmetry is
+                // not a micro-optimisation: embedding the query is what surfaces provider-level refusals, and one of them is F40's
+                // `runtime is not built` — a build that links no inference has to say so to the mode that asked for semantics and got
+                // nothing, naming the id that stayed owed. An earlier draft skipped the call whenever the index held no vectors and
+                // turned that refusal into a silent empty answer; `searching_without_the_runtime_names_the_model_that_stayed_owed`
+                // is what caught it. Hybrid may skip, because hybrid has an answer to give either way — and when it does skip, the
+                // runtime complaint is not lost, only handed to the command that cannot do its job without it (`np embed`, arm (v)).
+                if present || !hybrid {
+                    vector = Some(provider.embed_query(query)?.to_bytes());
+                } else {
+                    // Hybrid with nothing embedded yet. The provider resolved — and may have just arrived on disk — but a model
+                    // sitting in a cache writes no vectors by itself, so say which of the two states this is: "run `np embed`" means
+                    // something different after a download than it does before one.
+                    note = Some(if fetched.is_some() {
+                        search::RankNote::ArtifactFetched
+                    } else {
+                        search::RankNote::NoVectors
+                    });
+                }
+            }
+            // ---- `--mode semantic`: every refusal below is unchanged from F32/F38, wording included. Asked for semantics, cannot
+            // do semantics: exit 1, not a keyword list with an apology attached.
+            (search::SearchMode::Semantic, ProviderState::Placeholder { reason, .. }) => {
                 return Err(reason.sentence(workspace).into())
             }
-            // One line, spelled out here rather than assembled across a wrapped literal: the first version broke mid-sentence
-            // and printed a run of twenty spaces between "be" and "embedded". The pointer is `install_hint`, the same
-            // feature-gated wording embed's arm (iii) prints — a build that compiled `fetch` out must not be sent to it.
-            ProviderState::ArtifactAbsent => {
+            // One line, spelled out here rather than assembled across a wrapped literal: the first version broke mid-sentence and
+            // printed a run of twenty spaces between "be" and "embedded". The pointer is `install_hint`, the feature-gated wording
+            // embed's arm (iii) prints — a build that compiled `fetch` out must not be sent to it.
+            (search::SearchMode::Semantic, ProviderState::ArtifactAbsent) => {
                 return Err(format!(
                     "no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded: {}",
                     embed_run::install_hint(workspace)
                 )
                 .into())
             }
-            // Unreachable while `search` passes `false` for auto-fetch (**F38** §5), and spelled anyway: a future caller that
-            // lets search fetch must find a compiler error here rather than a `_` arm that quietly answers "artifact absent"
-            // about a machine with no network.
-            ProviderState::FetchSkippedOffline { id } => {
+            (search::SearchMode::Semantic, ProviderState::FetchSkippedOffline { id }) => {
                 return Err(format!(
                     "offline: could not reach the pinned origin to fetch `{id}`, so the query cannot be embedded — \
                      connect and try again, or search by keyword (`np search --mode keyword`)")
                     .into())
             }
-        };
-        // The id the index is keyed by, taken from the provider that made those rows rather than re-read from config: a
-        // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
-        model = provider.model_id().to_string();
-        vector = Some(provider.embed_query(query)?.to_bytes());
+            // ---- Hybrid (**F45**): a half is missing and the answer is not withheld. These are separate arms rather than one `_`
+            // mapping everything to "no vectors" because each is a different reader's mistake with a different next command.
+            (_, ProviderState::FetchSkippedOffline { .. }) => {
+                offline = true;
+                note = Some(search::RankNote::FetchOffline);
+            }
+            // Policy said no, which outranks the filesystem facts below: someone who set `NP_NO_AUTO_FETCH=1` and forgot must not
+            // be told to install bytes they deliberately declined to download.
+            (_, _) if fetch_declined => note = Some(search::RankNote::FetchDisabled),
+            (
+                search::SearchMode::Hybrid,
+                ProviderState::Placeholder {
+                    reason: NoProvider::ConfigDisabled | NoProvider::ModelUnnamed,
+                    ..
+                },
+            ) => note = Some(search::RankNote::ProviderDisabled),
+            // RowMissing and RowDimUnusable both mean "the model you named is not what this workspace holds". Kept apart from
+            // `provider-disabled` because the remedy differs: one edits a file, the other fetches 309 MB.
+            (search::SearchMode::Hybrid, ProviderState::Placeholder { .. }) => {
+                note = Some(search::RankNote::ModelNotInstalled)
+            }
+            (search::SearchMode::Hybrid, ProviderState::ArtifactAbsent) => {
+                note = Some(search::RankNote::ArtifactMissing)
+            }
+            // ---- Unreachable by construction: `resolve` is false when the mode is keyword, so no provider state can arrive here.
+            // Spelled as refusals rather than `unreachable!()` or a `_` arm for two reasons. The F32 rule at this call site is
+            // "every `ProviderState` has an arm", which a wildcard would silently end; and if a future change does resolve a
+            // provider for keyword mode, a visible wrong sentence is better to debug than a panic in someone's app.
+            (_, ProviderState::Placeholder { reason, .. }) => {
+                return Err(reason.sentence(workspace).into())
+            }
+            (_, ProviderState::ArtifactAbsent) => {
+                return Err(format!(
+                    "no embedding provider for this workspace: its model artifact is absent, so the query cannot be embedded: {}",
+                    embed_run::install_hint(workspace)
+                )
+                .into())
+            }
+        }
     } else if semantic_wanted {
         note = Some(search::RankNote::NoVectors);
     }
@@ -881,11 +988,20 @@ fn search_workspace(
         // disguise; `mode` and `vectors` describe the *list*, so they sit beside it.
         let objects: Vec<Value> = hits.iter().map(hit_json).collect();
         drop(out);
+        // **F45/F38 keys, and why `reason` is not the same thing as `note`.** `note` is prose for a human and may be reworded;
+        // `reason` is the token a caller branches on when it wants to know which half answered. `fetched` and `offline` mean
+        // exactly what they mean in `np embed --json` (F38), so one reader handles both commands: an application that called
+        // `np search` first on a fresh machine can now see `fetched` arrive, `vectors:false`, and `reason:"artifact-fetched"`
+        // telling it the next call is `np embed`. Nothing here changes when the semantic half worked: `reason` is null and
+        // `note` stays null, exactly as before.
         emit_json(&json!({
             "hits": objects,
             "mode": mode.label(),
             "vectors": present,
             "note": note.as_ref().map(search::RankNote::label),
+            "reason": note.as_ref().map(search::RankNote::token),
+            "fetched": fetched,
+            "offline": offline,
         }));
         return Ok(());
     }
@@ -1041,6 +1157,14 @@ struct Resolved {
     /// same reason `artifact_check` and `workers` are: the fact is decided next to the config and the filesystem, while the
     /// document that must not contradict itself is written downstream.
     fetched: Option<np_core::embed_run::FetchedRecord>,
+    /// **F45:** the artifact is missing, this build *could* have fetched it (pinned id, `local-model` and `fetch` compiled in),
+    /// and policy said no — `[models] auto_fetch = false` or `NP_NO_AUTO_FETCH=1`.
+    ///
+    /// Carried as a fact rather than re-derived by each caller because "could this build have downloaded it" is one rule with two
+    /// callers: `np embed` refuses (it has nothing to answer with), `np search --json` degrades and must say *why* it degraded.
+    /// A second copy of the predicate in the search path would eventually disagree with the first, and the reader would see an
+    /// `artifact-missing` note about a workspace where somebody switched fetching off.
+    fetch_declined: bool,
 }
 
 /// What `[embeddings]` and the `models` table added up to, as one value.
@@ -1087,7 +1211,18 @@ fn placeholder(reason: NoProvider) -> Resolved {
         artifact_check: None,
         workers: None,
         fetched: None,
+        fetch_declined: false,
     }
+}
+
+/// Attach the **F45** "a fetch was possible and policy refused it" fact to a resolution that did not produce a provider.
+///
+/// Gated on the state on purpose: with a provider in hand nothing was declined, and letting a caller stamp `true` beside a
+/// `Ready` would be a document contradicting itself. Applied at each non-`Ready` return inside the local-model branch, which is
+/// where the facts behind it (row, artifact, pin) are all in scope.
+fn declined(mut resolved: Resolved, fetch_declined: bool) -> Resolved {
+    resolved.fetch_declined = fetch_declined && !matches!(resolved.state, ProviderState::Ready(_));
+    resolved
 }
 
 /// A resolution for the row-installed-file-absent state: no provider at all, by the reason in [`ProviderState`].
@@ -1097,6 +1232,7 @@ fn artifact_absent() -> Resolved {
         artifact_check: None,
         workers: None,
         fetched: None,
+        fetch_declined: false,
     }
 }
 
@@ -1110,6 +1246,9 @@ fn fetch_offline(id: &str) -> Resolved {
         // Nothing arrived, so nothing is claimed. `EmbedReport::offline` is set downstream from the arm itself, which is
         // why this field stays `None` rather than carrying a half-populated record.
         fetched: None,
+        // Not declined: it was *attempted*. The distinction is F45's whole point — "we asked and nothing answered" and
+        // "we were not allowed to ask" are different notes with different next commands.
+        fetch_declined: false,
     }
 }
 
@@ -1207,11 +1346,27 @@ fn embed_provider(
             #[cfg(not(all(feature = "local-model", feature = "fetch")))]
             let fetched_this_run: Option<np_core::embed_run::FetchedRecord> = None;
             #[cfg(not(all(feature = "local-model", feature = "fetch")))]
-            let _ = (auto_fetch, announce, &models_dir, &artifact);
+            let _ = (announce, &models_dir, &artifact);
+
+            // **F45:** the same facts the trigger above tests, with the operator's veto flipped — read BEFORE any fetch could have
+            // run, so it describes the state the caller walked into rather than the state a fetch left behind. This is the only
+            // place "could this build have downloaded it?" is asked: `np search` reads the answer off [`Resolved::fetch_declined`]
+            // instead of restating the predicate and drifting from it.
+            #[cfg(all(feature = "local-model", feature = "fetch"))]
+            let fetch_declined = !auto_fetch
+                && np_core::pins::identity(id).is_some()
+                && (row.is_none() || !artifact.is_file());
+            #[cfg(not(all(feature = "local-model", feature = "fetch")))]
+            let fetch_declined = false;
+            #[cfg(not(all(feature = "local-model", feature = "fetch")))]
+            let _ = auto_fetch;
 
             let Some(row) = row else {
                 // F32's arm: this is the state that used to print a sentence about `provider = "none"`.
-                return Ok(placeholder(NoProvider::RowMissing { id: id.to_string() }));
+                return Ok(declined(
+                    placeholder(NoProvider::RowMissing { id: id.to_string() }),
+                    fetch_declined,
+                ));
             };
             // The width this run needs: `[embeddings] dim`, or the row's own declaration when the config
             // declares none. `embed_run` applies the same rule and refuses a disagreement before any write, so
@@ -1222,11 +1377,15 @@ fn embed_provider(
                 .map(usize::from)
                 .or_else(|| usize::try_from(row.dim).ok())
             else {
-                // Also defensive: `--dim` bounds what can be installed (F32 §1).
-                return Ok(placeholder(NoProvider::RowDimUnusable {
-                    id: id.to_string(),
-                    declared: row.dim.to_string(),
-                }));
+                // Also defensive: `--dim` bounds what can be installed (F32 §1). Never a declined fetch — the row is here and its
+                // bytes are not in question, so stamping that fact would attach F45's note to the wrong state.
+                return Ok(declined(
+                    placeholder(NoProvider::RowDimUnusable {
+                        id: id.to_string(),
+                        declared: row.dim.to_string(),
+                    }),
+                    false,
+                ));
             };
 
             // With the runtime compiled in, the provider is the one that loads llama.cpp **on first use**
@@ -1288,12 +1447,13 @@ fn embed_provider(
                                 artifact_check: Some(check),
                                 workers: Some(plan),
                                 fetched: fetched_this_run,
+                                fetch_declined: false,
                             }),
                             Err(err) => Err(err.into()),
                         }
                     }
                     Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => {
-                        Ok(artifact_absent())
+                        Ok(declined(artifact_absent(), fetch_declined))
                     }
                     Err(err) => Err(err.into()),
                 }
@@ -1312,12 +1472,17 @@ fn embed_provider(
                     artifact_check: None,
                     workers: None,
                     fetched: fetched_this_run,
+                    fetch_declined: false,
                 }),
                 // The row is installed and its width is the run's; only the bytes are missing. That is a fact
                 // about the filesystem, not about configuration, so it cannot be recovered downstream — hence
                 // `None` here rather than a placeholder provider whose declared width would then be compared
                 // with the row's (R6c1 D-2).
-                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => Ok(artifact_absent()),
+                Err(np_core::embed::EmbedError::ArtifactUnreadable { .. }) => {
+                    // The declined-fetch fact stays reportable without `local-model` as well; a build that cannot fetch simply
+                    // never sets the flag, because its `fetch_declined` is compile-time false.
+                    Ok(declined(artifact_absent(), fetch_declined))
+                }
                 Err(err) => Err(err.into()),
             }
         }
