@@ -715,12 +715,39 @@ impl Config {
     /// every path this program derives from it would go relative — a `workspaces/` directory next
     /// to whatever directory the command happened to run in. The CLI reports it and exits 1.
     pub fn load(override_: Option<&Path>) -> Result<Config, ConfigError> {
+        Self::load_with_platform(override_, platform_of_default())
+    }
+
+    /// [`Config::load`] with the data-directory **shape** supplied rather than taken from `cfg` — the same seam
+    /// [`resolve_data_dir`] exists for (**F37**), pushed up to the entry point that actually assembles a run.
+    ///
+    /// Production never passes anything but [`platform_of_default`]; the parameter exists because the question this answers
+    /// ("did we fall back, and must we say so?") is decided by code Linux cannot reach through `load`, and a layout fix whose
+    /// wiring is only exercised on the platform nobody here can run is how **F37**'s note shipped silent. One test drives the
+    /// Windows shape end to end on this host; see `crates/np-core/tests/config.rs`.
+    pub fn load_with_platform(
+        override_: Option<&Path>,
+        platform: DataDirPlatform,
+    ) -> Result<Config, ConfigError> {
+        // Which file the values came from, so the data-dir step below can ask that file a second question — *did you name a
+        // `data_dir` yourself?* — instead of trusting the merged struct. Measured on Windows (**F37**): an upgraded machine
+        // fell back to `%LOCALAPPDATA%` exactly as designed (its new workspaces landed there) and printed no note, because
+        // [`Config::default`] had already resolved the fallback into `data_dir`, and "non-empty after merging" cannot tell an
+        // instruction from a landing place. The directory was always right; only the announcement was missing.
+        let mut source: Option<PathBuf> = None;
         let mut cfg = match override_ {
-            Some(path) => read_config(path)?,
+            Some(path) => {
+                source = Some(path.to_path_buf());
+                read_config(path)?
+            }
             None => match config_file_path() {
                 Some(path) => match read_config(&path) {
                     Err(ConfigError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
                         Config::default()
+                    }
+                    Ok(read) => {
+                        source = Some(path);
+                        read
                     }
                     other => other?,
                 },
@@ -732,8 +759,12 @@ impl Config {
             // location we moved — and only the OS default is eligible for the pre-nesting fallback. Resolving through
             // [`resolve_data_dir`] rather than branching here is what lets a Linux test assert the explicit-directory rule in
             // the *Windows* shape, where the fallback could actually have applied.
-            let explicit = (!cfg.data_dir.as_os_str().is_empty()).then(|| cfg.data_dir.clone());
-            let (dir, legacy) = os_data_dir(explicit.as_deref());
+            // Only the file's own key counts (**F37**). Reading `cfg.data_dir` here was the bug: on Windows it is non-empty by
+            // default, so every run looked like an operator instruction, the fallback was reported as absent, and the stderr
+            // note never printed on the one platform that has a fallback.
+            let declared = source.as_deref().and_then(declared_data_dir);
+            let explicit = declared.as_deref();
+            let (dir, legacy) = os_data_dir_on(explicit, platform);
             if dir.as_os_str().is_empty() {
                 // Neither the file nor the environment named a data dir. Every path derived from it would go relative — a
                 // `workspaces/` directory beside whatever directory the command happened to run in — so this refuses.
@@ -1062,6 +1093,26 @@ fn read_config(path: &Path) -> Result<Config, ConfigError> {
     })
 }
 
+/// The data directory the operator named **in the config file**, or `None` when they left it to this build.
+///
+/// A second, deliberate parse of the same text with a lenient shape (no `deny_unknown_fields`, no defaults): the question is
+/// narrow — is there a top-level `data_dir` key? — and asking it through [`Config`] would answer with whatever
+/// [`Config::default`] resolved, which is precisely the confusion **F37** shipped with. An unreadable or unparsable file yields
+/// `None`, never an error: by the time [`Config::load`] asks this question it has already parsed the file strictly and refused
+/// anything broken, so a `None` here can only mean "the key is not there".
+///
+/// Why the environment is not part of the answer: `$XDG_DATA_HOME` and `%LOCALAPPDATA%` are *inputs to the OS default*
+/// ([`data_dir_for`]), not declarations. Treating them as declarations would make every run look operator-pinned and re-open
+/// the same hole from the other side.
+pub fn declared_data_dir(path: &Path) -> Option<PathBuf> {
+    #[derive(serde::Deserialize)]
+    struct DataDirProbe {
+        data_dir: Option<PathBuf>,
+    }
+    let text = fs::read_to_string(path).ok()?;
+    toml::from_str::<DataDirProbe>(&text).ok()?.data_dir
+}
+
 /// Absolute spelling of `path`: the current directory is prepended when it is
 /// relative, symlinks are not resolved.
 ///
@@ -1271,9 +1322,12 @@ fn os_default_data_dir() -> (PathBuf, Option<PathBuf>) {
     resolve_data_dir(None, platform_of_default(), &|key| env_path(key))
 }
 
-/// The same resolution with the file's word in front of it: `explicit` is what a config file named, if anything.
-fn os_data_dir(explicit: Option<&Path>) -> (PathBuf, Option<PathBuf>) {
-    resolve_data_dir(explicit, platform_of_default(), &|key| env_path(key))
+/// The same resolution with the file's word in front of it, for whatever shape `load` was handed.
+fn os_data_dir_on(
+    explicit: Option<&Path>,
+    platform: DataDirPlatform,
+) -> (PathBuf, Option<PathBuf>) {
+    resolve_data_dir(explicit, platform, &|key| env_path(key))
 }
 
 /// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows `%LOCALAPPDATA%\note-processor` (**F37**).

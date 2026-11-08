@@ -20,11 +20,11 @@ mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
-    config_file_path, data_dir_for, legacy_data_dir_override, resolve_data_dir, CatalogConfig,
-    Config, ConfigError, DataDirPlatform, EmbeddingProvider, EmbeddingsConfig, MarkerConfig,
-    ModelsConfig, SearchConfig, ThreadCount, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS,
-    MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS, REGISTRY_FILE, WINDOWS_DATA_SUBDIR,
-    WORKSPACES_DIR,
+    config_file_path, data_dir_for, declared_data_dir, legacy_data_dir_override, resolve_data_dir,
+    CatalogConfig, Config, ConfigError, DataDirPlatform, EmbeddingProvider, EmbeddingsConfig,
+    MarkerConfig, ModelsConfig, SearchConfig, ThreadCount, WorkspaceRegistry,
+    DEFAULT_EMBEDDING_TOKENS, MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS, REGISTRY_FILE,
+    WINDOWS_DATA_SUBDIR, WORKSPACES_DIR,
 };
 use np_core::search::SearchMode;
 use rusqlite::Connection;
@@ -2462,6 +2462,121 @@ fn the_unix_shape_has_no_legacy_location_at_all() {
     assert_eq!(
         legacy, None,
         "and there is no older Unix location to fall back to"
+    );
+}
+
+/// **The bug the Windows field run found (F37, 2026-11-08).** An upgraded machine fell back to `%LOCALAPPDATA%` exactly as designed —
+/// its new workspace databases landed there — and printed no note. The reason was not in the fallback, which was right; it was in how
+/// `Config::load` decided whether the operator had *declared* a directory: it asked the merged struct, and [`Config::default`] had
+/// already resolved the fallback into `data_dir`. So every Windows run looked like an instruction, the fallback reported itself absent,
+/// and the one platform with a fallback never heard about it.
+///
+/// This case pins the distinction the fix rests on: a file that never mentions `data_dir` does not declare one, **even though the
+/// merged default's `data_dir` is non-empty**. Restore the merged-struct question and this test fails on Linux with the same shape the
+/// field run hit — which matters, because the note itself can only ever print on Windows.
+#[test]
+fn a_file_that_never_names_data_dir_does_not_get_to_claim_one() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let file = tmp.path().join("config.toml");
+
+    // A real config that says everything except where the data lives.
+    fs::write(
+        &file,
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"tiny-model\"\n",
+    )
+    .expect("write config");
+    assert_eq!(
+        declared_data_dir(&file),
+        None,
+        "a file that never mentions data_dir cannot be the thing that pinned it"
+    );
+    // The trap: the merged default DOES have a directory in it. Asking the struct instead of the file is what erased F37's note.
+    let merged = Config::default();
+    assert!(
+        !merged.data_dir.as_os_str().is_empty(),
+        "the default resolves an OS directory, which is exactly why reading it back as a declaration was wrong"
+    );
+
+    // And the honest case still works: name the key, get it back verbatim.
+    let pinned = tmp.path().join("chosen");
+    fs::write(
+        &file,
+        format!("data_dir = \"{}\"\n", pinned.display()).as_bytes(),
+    )
+    .expect("write config");
+    assert_eq!(
+        declared_data_dir(&file),
+        Some(pinned),
+        "an instruction is an instruction, and this one survives"
+    );
+
+    // Unreadable or absent names nothing rather than erroring: `load` has already parsed the file strictly by now.
+    assert_eq!(declared_data_dir(&tmp.path().join("absent.toml")), None);
+}
+
+/// **The end-to-end version, through `Config::load` itself.** The case above checks the two halves; this one checks that they are joined.
+/// It drives the **Windows** shape on Linux (`load_with_platform`, the seam F37's own "a value, not a `cfg`" argument implies all the way
+/// up to the entry point) with `%LOCALAPPDATA%` holding the pre-F37 layout and a config file that never mentions `data_dir`.
+///
+/// Why it can fail on Linux at all: under the shipped bug, `explicit` came from the merged struct, which on this host resolves through the
+/// *unix* shape to `$XDG_DATA_HOME` — a directory with no legacy index in it. So the buggy wiring answers "the operator pinned XDG, no
+/// fallback", while the fixed one answers "we are reading `%LOCALAPPDATA%` and must say so". Restore the merged-struct question and this
+/// case goes red with the exact field-run shape: an upgraded Windows vault read from a place nobody announced.
+#[test]
+fn loading_a_windows_upgrade_reaches_the_fallback_and_flags_it() {
+    let mut env = TestEnv::install();
+    // A `%LOCALAPPDATA%` of its own, holding yesterday's layout — deliberately NOT the data dir TestEnv installs, so a run that ignored
+    // the fallback lands somewhere visibly different instead of coincidentally right.
+    let local = TempDir::new().expect("test setup: %LOCALAPPDATA%");
+    fs::create_dir(local.path().join(WORKSPACES_DIR)).expect("legacy workspaces dir");
+    let legacy_local = local.path().to_path_buf();
+    let spelled = legacy_local
+        .to_str()
+        .expect("tempdir path is utf-8")
+        .to_owned();
+    env.set_var("LOCALAPPDATA", Some(&spelled));
+
+    let cfgdir = TempDir::new().expect("test setup: config dir");
+    let file = cfgdir.path().join("config.toml");
+    fs::write(&file, "[search]\nmode = \"keyword\"\n").expect("write config");
+
+    let cfg = Config::load_with_platform(Some(&file), DataDirPlatform::Windows).expect("load");
+    assert_eq!(
+        cfg.data_dir, legacy_local,
+        "the run has to read AND write the old directory — splitting the registry from its databases is worse than the layout F37 fixes"
+    );
+    assert_eq!(
+        cfg.legacy_data_dir.as_deref(),
+        Some(legacy_local.as_path()),
+        "and it has to know it fell back: `None` here is what silenced the stderr note on every upgraded Windows machine, measured 2026-11-08"
+    );
+
+    // Once the nested folder holds our registry, the same load stops falling back — and stops having anything to announce.
+    let nested = legacy_local.join(WINDOWS_DATA_SUBDIR);
+    fs::create_dir(&nested).expect("nested dir");
+    fs::write(nested.join(REGISTRY_FILE), b"").expect("nested registry");
+    let cfg = Config::load_with_platform(Some(&file), DataDirPlatform::Windows).expect("load");
+    assert_eq!(
+        cfg.data_dir, nested,
+        "the new layout wins as soon as it holds our index"
+    );
+    assert_eq!(
+        cfg.legacy_data_dir, None,
+        "nothing is being read from the old place, so nothing may be announced"
+    );
+
+    // And an operator who really did write `data_dir` still outranks both halves, with a legacy index sitting right there.
+    let pinned = cfgdir.path().join("chosen");
+    fs::write(
+        &file,
+        format!("data_dir = \"{}\"\n", pinned.display()).as_bytes(),
+    )
+    .expect("write config");
+    let cfg = Config::load_with_platform(Some(&file), DataDirPlatform::Windows).expect("load");
+    assert_eq!(cfg.data_dir, pinned, "an instruction is an instruction");
+    assert_eq!(
+        cfg.legacy_data_dir, None,
+        "and it is never treated as a location we moved"
     );
 }
 
