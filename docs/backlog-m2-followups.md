@@ -1695,6 +1695,28 @@ explicit directory ignored → `an_explicit_data_dir_in_the_file_is_never_second
 against this tree; the verdict is in the commit message beside it, since a card that cites its own green before the log exists is how F34
 got read wrong for four days.
 
+**Field-run result, round five (2026-11-08, `v0.2.2_test_windows.zip`) — the layout works, and it found a bug in its own announcement.**
+
+| what the log shows | reading |
+| --- | --- |
+| every new workspace database landed in `%LOCALAPPDATA%\workspaces` (43 → 45 files), nested folder absent | the fallback chose the old directory and **read and wrote it as a unit**, which is the design |
+| `scan` on an existing vault: `unchanged 1`, then `added 0` on the repeat | no false `added N` about notes already indexed — the lie this bridge exists to prevent did not happen |
+| **no** `reading your index from …` line anywhere, in a log whose every command merges stderr into the capture | **the announcement never fired.** A silent migration instead of a stated one |
+
+The fallback was never wrong; the question asked next to it was. `Config::load` decided whether the operator had *declared* a directory by
+testing if merged `cfg.data_dir` was non-empty — and [`Config::default`] resolves the OS default, fallback included, so that field is never
+empty and every Windows run looked like an instruction. Declaring it explicit dropped `legacy_data_dir`, the only trigger for the note. On real
+Windows the effective path stayed correct because the default had already resolved to the same place, which is why six CI rows and 68 local tests
+missed it: **nothing on a Unix host can distinguish the two states.** Fixed by asking the file (`declared_data_dir`, a lenient one-field probe)
+and pushed through `load_with_platform`, F37's own "a value, not a `cfg`" argument carried up to the entry point — so Linux now grades the Windows
+shape end to end. Restoring the old question fails the new test with the field shape in its diff. Shipped in **v0.2.3**.
+
+Two notes for whoever closes this card. First, the operator's script asserts `reading your index from` appears *if* a run fell back; on their
+machine it could not have, so that line was correctly reporting a real gap rather than a script bug — the difference between this and round four's
+false CHECKs is that the assertion was aimed at something that should have happened. Second: **the fallback still has never been exercised against
+a nested-first install** (a machine where the nested folder holds the registry and the old one also exists). Stage 9b manufactures that shape; it
+skipped itself on their box because a real legacy directory is present, which is the right call but leaves the case open.
+
 **What this card still owes.**
 
 + **Windows, in the field.** Stage 9 of the operator script (sha256 `db75c546…494345`, uploaded on v0.2.1) scans a fresh vault twice and
