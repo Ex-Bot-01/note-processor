@@ -55,9 +55,12 @@ enum Command {
     ///
     /// **This command may fetch** (**F38**). When `[embeddings] model` names an id this build pins and the artifact is
     /// missing, `embed` transfers it before embedding — because the consumer of this program is increasingly another
-    /// program that wants vectors to exist rather than a person willing to sequence three commands. It is off unless you
-    /// switch it on (`--no-auto-fetch`, or `NP_NO_AUTO_FETCH=1`), it fires only for **pinned** ids, and it never happens
-    /// in a build with no inference runtime. `np search` has no such flag: reading a vault must never cost a download.
+    /// program that wants vectors to exist rather than a person willing to sequence three commands. It is **on by
+    /// default** (the human's ruling, 2026-11-08) and switched off three ways: `--no-auto-fetch` for one run,
+    /// `[models] auto_fetch = false` in the file, `NP_NO_AUTO_FETCH=1` in the environment. It fires only for **pinned**
+    /// ids from this build's compiled-in origin, verifies the digest before publishing anything, and never happens in a
+    /// build with no inference runtime — there is nothing there to read the bytes with. `np search` has no such flag:
+    /// reading a vault must never cost a download.
     Embed {
         /// Workspace root to embed.
         workspace: PathBuf,
@@ -204,11 +207,15 @@ enum ModelsCommand {
     },
     /// Fetch a pinned model's artifacts and record them in this workspace.
     ///
-    /// The only command in this program that dials out (§12 rule 1), and it dials where `[models] base_url` says, or
-    /// `NP_MODELS_BASE_URL` when the file leaves that key out, or the one origin baked into the pin table when neither
-    /// speaks. Nothing else does: `np scan` never fetches, and `np embed` keeps refusing with
-    /// §6's *artifact absent* arm rather than starting a nine-hundred-megabyte download inside a command that then
-    /// writes rows. The automatic trigger belongs to the daemon (M4), not to a command line.
+    /// The **explicit** dial-out (§12 rule 1): it dials where `[models] base_url` says, or `NP_MODELS_BASE_URL` when the
+    /// file leaves that key out, or the one origin baked into the pin table when neither speaks. You ran it, so it runs.
+    ///
+    /// It is no longer the *only* command that transfers bytes, and this paragraph used to claim it was. **F38** (shipped
+    /// 2026-11-09) gave `np embed` and `np setup` an automatic trigger for a missing **pinned** artifact, on by default;
+    /// that trigger reuses this command's origin rules, pin, marker and digest verification rather than inventing a second
+    /// transport, which is why the surface stayed one door wide at the wire level even though a second command may now
+    /// knock. What still never fetches: `np scan`, `np search` (**F38** §5 spells that out) and any id this build does not
+    /// pin — an unpinned id is refused before a socket opens.
     #[cfg(feature = "fetch")]
     Fetch {
         /// Workspace root to fetch into. Its models directory receives the artifacts.

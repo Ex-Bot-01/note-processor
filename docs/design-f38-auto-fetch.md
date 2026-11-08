@@ -1,6 +1,13 @@
-# F38 — vectors that simply exist: `np setup`, and an opt-in automatic fetch
+# F38 — vectors that simply exist: `np setup`, and a default-on automatic fetch
 
-Status: **short design, awaiting approval.** Ruled by the human on 2026-11-08: *"I mean your app calling `np` and wanting vectors to
+> **Title amended 2026-11-09, after shipping.** It read "an opt-in automatic fetch" until the ruling below moved the default to *true*.
+> The word survived into `np embed --help` too, where it became a false statement about shipped behaviour ("it is off unless you switch it
+> on") — fixed in the same commit as this note, with a test that keeps `--help` naming both off-switches. A title is documentation; a help
+> string is a contract, which is why one of the two cost a test.
+
+Status: **shipped 2026-11-09** (`aa204e0` → `3986738`, released in v0.2.2), with closure withheld because no CI run has graded it — included
+Actions minutes ran out on 2026-11-07 and the last CI-graded tree is still `5e368ac`; local grading is `/home/agent/tmp/gates-f38t6b` and later
+runs. Ruled by the human on 2026-11-08: *"I mean your app calling `np` and wanting vectors to
 simply exist."* That sentence is the requirement this document is written against — the consumer is a program, not a person at a
 terminal, so every promise below is a machine-readable one.
 
@@ -8,8 +15,9 @@ terminal, so every promise below is a machine-readable one.
 
 Today an application that wants vectors has to orchestrate: check whether the artifact exists, run `np models fetch`, run `np scan`,
 run `np embed`, and interpret three different refusal sentences to work out which step it was allowed to skip. That is our control
-flow living inside somebody else's program. The ask is to move it home: **one command that guarantees vectors**, plus an opt-in so the
-artifact appears by itself when a command needs it — without ever turning a network call into a side effect of reading a config file.
+flow living inside somebody else's program. The ask is to move it home: **one command that guarantees vectors**, plus ~~an opt-in~~ **a trigger,
+default-on per the ruling above** so the artifact appears by itself when a command needs it — without ever turning a network call into a side
+effect of reading a config file.
 
 ## 2. Goals, non-goals, anti-goals
 

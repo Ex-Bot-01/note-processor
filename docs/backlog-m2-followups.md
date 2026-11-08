@@ -1754,6 +1754,23 @@ silenced without editing anything), and every transfer announces id, members, by
 
 ### What it still owes
 
++ **`--help` told the opposite of the ruling, and now has a test (2026-11-09).** `np embed --help` said fetching "is off unless you
+  switch it on" — true of the option-A draft, false of what shipped after *"I would [have] the default as true"* — and `np models fetch --help`
+  still called itself "the only command in this program that dials out". Both were fixed by reading the released binary's own `--help`, not the
+  code: the code was right. `embed_and_models_fetch_help_match_the_behaviour_f38_shipped` now pins the two off-switch names, the phrase "on by
+  default", and the absence of the pre-ruling sentence; it asserts over whitespace-flattened text because clap wraps at terminal width and a test
+  that breaks on a narrow console gets deleted rather than fixed. Mutated by restoring the old sentence: FAILED as it must. The design doc's title
+  ("an opt-in automatic fetch") carries a dated amendment for the same reason.
++ **What the release build shape actually prints, measured 2026-11-09 on the packaged v0.2.2 Linux binary** — recorded here because it is what the
+  Windows asset will be asked to reproduce, and because two of these three sentences are not the ones you would guess from the code:
+  | state | `np embed` says | exit | `--json` |
+  | --- | --- | --- | --- |
+  | fresh vault, no config at all | `configuration disabled: embeddings.provider = "none"` | 1 | `outcome.configuration-disabled{key:"embeddings.provider",id:"none"}`, `errors 0`, `offline:false`, `fetched:null` |
+  | fresh vault, `[embeddings] provider="local-model" model="embeddinggemma-2"`, nothing installed | `configuration disabled: embeddings.model = "embeddinggemma-2"` — **not** `runtime not built`, and **no fetch is even attempted**: the trigger is compiled out with `local-model`, so arm (ii) answers first | 1 | same shape, `key:"embeddings.model"` |
+  | after `np models install`/`fetch` puts real bytes in place | `runtime not built: … install one built with \`--features local-model\`, or search by keyword (\`np search --mode keyword\`) — \`embeddinggemma-2\` stays owed` | 1 | `outcome.runtime-not-built{id}`, `errors 0` (**F40**'s contract, holding) |
+  So on a release asset the offline path **cannot be observed at all**, and any test that expects to see it there is testing a build shape that does
+  not exist. The Windows script's Stage 8 was rewritten against this table the same day.
+
 + **CI grading.** No workflow run has had steps since the included minutes ran out at `2026-11-07T01:57:05Z`; the last CI-graded tree is
   still `5e368ac`. Local gates are not closure (`docs/ops-actions-minutes.md`), so **this card stays open** and F36/F40's closures stay
   withheld for the same reason.

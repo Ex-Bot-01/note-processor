@@ -2788,6 +2788,53 @@ fn an_invented_mode_refuses_with_claps_exit_two() {
     }
 }
 
+/// **Help text is a contract, and this one shipped lying.** `np embed --help` said fetching "is off unless you switch it
+/// on" — the exact opposite of the ruling two days earlier (default **true**) — and `np models fetch --help` still claimed to be
+/// "the only command in this program that dials out", which F38 made false while it was being shipped. Nobody would have caught
+/// that by reading the code, because the code is right; it is the *prose a user reads before running anything* that drifted.
+///
+/// Assertions run over whitespace-flattened text: clap wraps at terminal width, so any phrase long enough to matter can straddle
+/// a line break, and a test that fails on a narrow terminal is a test that gets deleted rather than fixed. It checks the two
+/// off-switches are named (the safety story a reader acts on), that the default is stated as on, and that the pre-ruling sentence
+/// does not come back.
+#[test]
+fn embed_and_models_fetch_help_match_the_behaviour_f38_shipped() {
+    let ws = workspace();
+    let flat = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let help = run(&mut ws.command_without_operand(&["embed", "--help"]));
+    assert_eq!(help.code(), 0, "\n{}", help.stderr());
+    let text = flat(help.stdout());
+    for fact in ["--no-auto-fetch", "NP_NO_AUTO_FETCH", "on by default"] {
+        assert!(
+            text.contains(fact),
+            "a reader deciding whether this command may use their metered link has to learn `{fact}` from `np embed --help`, \n\
+             and it is not in:\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("off unless you switch it on"),
+        "this sentence describes the world before the 2026-11-08 ruling, and shipping it again would tell a careful reader to \n\
+         expect nothing to download when the first `np embed` transfers ~310 MB:\n{text}"
+    );
+
+    #[cfg(feature = "fetch")]
+    {
+        let help = run(&mut ws.command_without_operand(&["models", "fetch", "--help"]));
+        assert_eq!(help.code(), 0, "\n{}", help.stderr());
+        let text = flat(help.stdout());
+        assert!(
+            !text.contains("The only command in this program that dials out"),
+            "F38 gave `embed` and `setup` a fetch trigger; leaving this sentence here means the help text contradicts the \n\
+             behaviour of a sibling command:\n{text}"
+        );
+        assert!(
+            text.contains("pinned") && text.contains("never fetches"),
+            "and it still has to say which ids may transfer bytes and which commands never do:\n{text}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `np setup` (**F38**): one command for a caller that wants vectors to exist.
 //
