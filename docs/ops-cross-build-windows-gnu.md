@@ -87,3 +87,42 @@ build answers those questions honestly.
 | buy Actions minutes or Pro | money | the same as above, keeping the repo private |
 | self-hosted runner | an Actions-scoped token (403 today) | full matrix off your own hardware |
 | code signing | a certificate purchase | a Windows binary that survives Smart App Control / ASR — needed only if the test above shows downloads are blocked too |
+
+## 2026-11-08: the asset now carries the inference runtime (this supersedes every "built without `local-model`" line above)
+
+Everything above this line describes the runtime-less build, which is what v0.2.1 through v0.2.3 shipped and why `np embed` on a downloaded
+asset answered `runtime not built`. That is no longer the shape we ship: `.github/scripts/cross-build-windows.sh` now builds
+`--features local-model,fetch`, so llama.cpp v0.8.0 is compiled and statically linked into `np.exe`. The model is still never in the asset —
+309 MB arrives only when a human runs `np setup` or `np embed`, digest-verified.
+
+The recipe, and the four facts that took measurements to find:
+
+| step | what it is | why it is not the obvious thing |
+| --- | --- | --- |
+| toolchain | mingw-w64 **win32-threading** drivers (`…-gcc-win32`, `…-g++-win32`), unpacked rootlessly from Ubuntu .debs | posix-threaded drivers produce an exe importing `libwinpthread-1.dll`, and no `-static` spelling of `-lwinpthread` removes it — mingw's static archive carries a `/DEFAULTLIB` directive for its own import library. With win32 drivers ggml's `std::mutex` rides Win32 primitives and the dependency does not exist |
+| C++ compiler | `g++-mingw-w64-x86-64-win32`, same `.deb` trick as gcc | the gcc-only set that sufficed for a Rust-only exe cannot compile llama.cpp at all |
+| cmake | the pin's own options **plus** `-DGGML_NATIVE=OFF` | `GGML_NATIVE=ON` means `-march=native`, which measures the machine running cmake: a Linux CPU deciding a Windows binary's SIMD paths |
+| archives | staged as `lib<name>.a` copies in one directory of ours | `ggml/CMakeLists.txt:80` clears the static-library prefix on Windows, and GNU ld refuses to open `ggml.a` when asked for `-l ggml` ("rename it to libggml-base.a") |
+| C++ runtime | `rustc-link-lib=static=stdc++` + `static=gcc_eh`, search dir asked out of the compiler with `-print-file-name` | as a dylib it arrives as an exe importing `libstdc++-6.dll`. rustc also searches only the `-L` paths we give it, so "could not find native static library `stdc++`" is answered by asking the compiler where its own archives live, not by hard-coding a path |
+
+Import table of the shipped exe, which is the test that decides whether this is one file or a folder of DLLs:
+
+```text
+ADVAPI32.dll  api-ms-win-core-synch-l1-2-0.dll  bcrypt.dll  bcryptprimitives.dll
+kernel32.dll  msvcrt.dll  ntdll.dll  USERENV.dll  WS2_32.dll
+```
+
+Two things that bit during packaging and are now written into the script:
+
+* **`objdump -t` is not a test of a stripped binary.** It reported 2 symbols before `strip` and 0 after, so a symbol-table check refuses every
+  properly packaged artifact. The guard reads strings instead; a runtime-less exe (v0.2.3's asset, used as the mutant) matches zero times.
+* **`grep -q` under `set -o pipefail` fails a passing check.** `-q` exits at the first match, the producer dies on SIGPIPE, and `pipefail`
+  reports 141 — the guard refused a binary containing the symbol four times before this was read rather than assumed.
+
+Sizes, both printed by the script because the notes quote the archive and a report quotes the exe: **23,297,605 B → 16,253,440 B stripped**,
+inside §14's ≤ 40 MB ceiling with room to spare. Stripping is new: every asset until today shipped unstripped while the ceiling has always
+been quoted against stripped figures (v0.2.3's exe was 14,073,097 B where a stripped one is 9,952,768 B).
+
+**What this does not claim.** The exe has never run on Windows — there is no Wine here, so `llama_model_load_from_file` has been reached on
+Linux only. F18's rule still applies to the claim "semantic search works on Windows", and the first honest form of it comes from an operator
+run. MSVC remains unbuilt and `build.rs` still refuses it, along with macOS.

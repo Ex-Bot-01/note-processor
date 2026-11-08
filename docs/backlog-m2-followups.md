@@ -2060,3 +2060,66 @@ configuration — or is it the artifact-absent state seen from before the first 
 **Done when:** a ruling is recorded here, and a fresh-workspace refusal either names a remedy or this card says why it should not. Until
 then the wording stays as pinned, and `setup_with_fetching_switched_off_indexes_and_refuses_without_blaming_the_network` asserts today's
 sentence so that a future change fails loudly rather than silently.
+
+## F43 — ship the inference runtime inside `np`, so a downloaded asset can do semantic search
+
+**Filed 2026-11-08 by the operator's question "I thought llama.cpp is shipped with my software?"** It wasn't, and the answer to why matters
+more than the fact: not a missing toolchain but a refusal at `crates/np-core/build.rs:125`, "`local-model` is built and tested on Linux only",
+citing §14's rule that no platform gets a claim without a measurement on it. Three layers of honesty had stacked up into a product gap: the
+feature was never attempted cross, `build.rs` refused it, and README:108 described the consequence as if it were a design choice.
+
+**The ruling.** Ship the runtime inside `np` (the operator's ask was "download the llama.cpp parts"; measured, that split buys nothing —
+stripped, the runtime costs **+2.18 MB** against a 310 MB model download), keep the model out of the asset, and make the model download the
+one step a user takes. `local-model` is now compiled into both release shapes.
+
+**Done, with evidence.**
+- Cross-build works: llama.cpp v0.8.0 built for `x86_64-w64-mingw32` from the pinned tree; all 30 FFI functions present in the archives; an
+  exe linked against them imports system DLLs only. Recipe and the four non-obvious facts: `docs/ops-cross-build-windows-gnu.md`.
+- `build.rs` admits `windows`/`gnu` only behind `NP_LLAMA_CMAKE_TOOLCHAIN`, refuses a posix-threaded compiler out of cmake's own records,
+  and keeps refusing macOS and MSVC. A cross build gets its own build dir and stamp lines because a warm host cache was demonstrably being
+  certified to a Windows build.
+- `.github/scripts/cross-build-windows.sh` builds `local-model,fetch`, verifies the runtime is in the artifact, strips, and prints both hashes:
+  zip 6,907,477 B (`bc3fde7e…d5bd524c`), np.exe 16,253,440 B (`1359286f…979a7de7b`).
+- Semantic search verified end to end on the Linux sibling of this shape: "who reconciled the ledger" ranks the ledger note at cosine 0.8358
+  above the pasta recipe at 0.5704, `vectors:true` in `--json`, and F38's default-on pinned fetch fired by itself (295.5 MB, digest-checked)
+  when the model was absent — which is now observable on a release asset for the first time.
+
+**Owed before this can be called shipped.**
+1. **A run on real Windows.** Nothing here has executed `llama_model_load_from_file` on Windows; there is no Wine on this host. The claim
+   "semantic search works on Windows" is F18-shaped until someone's machine says so.
+2. **README and the release notes for the *next* asset** must stop saying release binaries cannot embed (README:108 stays true of v0.2.3 and
+   stops being true at the next cut — do not edit it retroactively).
+3. **F42 becomes load-bearing**: with vectors reachable from a downloaded exe, an id installed without `--prefix-doc/--prefix-query` is no
+   longer a curiosity. Its A/B/C ruling is now blocking, not backlog.
+4. **MSVC parity** stays unmeasured and refused; `-gnu-cross` naming is where that difference is visible.
+
+## F44 — two `np` writers on one vault: one of them fails in 5 ms, and `--json` prints nothing at all
+
+**Filed 2026-11-08 from the measurement the operator asked for** ("we definitely need to test this: 2 instances try to access the same vault.
+Maybe we make a flag or something like a lock?"). Measured on Linux with the packaged v0.2.3 binary, 60-note vault, `XDG_DATA_HOME` redirected:
+
+| pair | result |
+| --- | --- |
+| `scan` + `scan` | **one fails every time** (5/5 rounds): exit 1, `np: workspace database: sqlite: database is locked`, after **5–6 ms** |
+| `search` + `search` | both succeed, identical output |
+| `scan` + `search --json` | both succeed, 10 hits each, WAL doing its job |
+| `scan` on two different vaults | both succeed |
+| immediate retry of the loser | succeeds, exit 0 |
+
+Three things worth naming before anyone fixes it:
+
+* **`busy_timeout` is not protecting this path.** `db.rs` sets `PRAGMA busy_timeout = 1800`, and a timeout wait would take ~1.8 s; the loser
+  returns in 5 ms. That signature is SQLite refusing to *wait* — a journal-mode change or a deferred transaction upgrading to write while
+  another reader holds the file — not contention that a longer timeout would absorb. So "raise the timeout" is not the fix, and anyone who
+  tries it will "fix" nothing and believe they did.
+* **The failure is invisible to the machine-readable contract.** The loser writes **zero bytes to stdout** and one line to stderr. §"stdout
+  carries exactly one JSON document" is broken for this case, and `fetched`/`offline` (F38's lesson: a state, not an error string) has no
+  sibling for "someone else is working in this vault". An app backend that fans out invocations gets an empty pipe and an exit code.
+* **A lock flag is probably the wrong first move.** `scan` renders `INDEX.md` *inside* its write transaction (documented in `scan.rs`), so two
+  writers are not merely colliding on SQLite — they are racing over files SQLite cannot roll back. The shape worth designing is a coarse
+  advisory lock around mutating commands with a bounded wait and an honest refusal (`locked`, in JSON, naming the other workspace), not a
+  `--lock` toggle that leaves the default unsafe. That is a design conversation, which is why this is a card rather than a commit.
+
+**Not claimed:** anything about Windows/macOS locking (measured on Linux only), and nothing about two writers where one is `embed` — the
+release binary has no runtime, so `embed` refuses before touching the database. Reproduce with: two concurrent `np scan <vault>` in a loop,
+capturing exit codes and stdout byte counts separately.
