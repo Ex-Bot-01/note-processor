@@ -54,13 +54,13 @@
 //!
 //! ## Portability
 //!
-//! Paths reach C through [`c_string_path`], which is per-platform on purpose. Everything else in this module is
+//! Paths reach C through `c_string_path`, which is per-platform on purpose. Everything else in this module is
 //! portable Rust plus the FFI mirror.
 //!
 //! Until 2026-11-08 this file used `std::os::unix::ffi::OsStrExt` directly and compiled on Unix only, because
 //! `build.rs` refused to build `local-model` for any target but Linux (§14). That refusal now admits
 //! `x86_64-pc-windows-gnu` behind an explicit cmake toolchain, so the conversion has to say what it does on
-//! each platform instead of assuming bytes — see [`c_string_path`] for why a lossy conversion is the failure
+//! each platform instead of assuming bytes — see `c_string_path` for why a lossy conversion is the failure
 //! this still refuses to make.
 
 use std::ffi::CString;
