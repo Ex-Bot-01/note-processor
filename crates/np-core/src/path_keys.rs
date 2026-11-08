@@ -246,7 +246,8 @@ fn push_surrogate(out: &mut Vec<u8>, value: u32) {
 /// (`U+DC00..=U+DFFF`); the two together spell one `char`. Anything else — a high with no low behind it, a
 /// low with no high in front of it — converts to no character at all, so any spelling that goes through text
 /// replaces it with U+FFFD and two different OS names collapse to one string. That is why this predicate gates
-/// indexing on Windows ([`name_is_lossless`]) and why identity no longer goes through text there: [`wtf8`] keys
+/// indexing on Windows (`name_is_lossless`, private, so a code span rather than a link — rustdoc refuses to point public documentation at an item a
+/// reader cannot open) and why identity no longer goes through text there: [`wtf8`] keys
 /// such a name exactly, and the refusal stays only because *display* and re-opening still do. Two highs in a row
 /// leave the first unpaired for exactly that reason: only the pair `high, low` is consumed together.
 ///
