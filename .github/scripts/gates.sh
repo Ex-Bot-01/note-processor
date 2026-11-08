@@ -97,6 +97,11 @@ S=.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog
 row cfg-dead-code python3 "$S/check_cfg_dead_code.py"
 row attr-displacement python3 "$S/check_attr_displacement.py"
 row catalog-goldens python3 "$S/verify_catalog_goldens.py"
+# **F31's harness arithmetic, with no binary and no model.** The metric functions are self-tested against hand-computed numbers, so
+# this row costs milliseconds and catches the one failure mode that would matter: a scoring function that quietly flatters itself (an
+# MRR computed over only the answered queries rises when recall falls). The harness's *usefulness* still needs labelled queries — see
+# `docs/design-f31-quality-harness.md`, which is written to keep that distinction visible.
+row f31-selftest python3 "$S/f31_eval.py" --self-test
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.

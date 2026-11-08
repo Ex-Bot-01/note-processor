@@ -1291,6 +1291,15 @@ knows the difference.
 - **Done when:** §14 gains a measured subsection with the set's size and provenance, or records explicitly that the measurement
   was declined and why.
 
+**The harness landed 2026-11-09; the card stays open on purpose.** `.github/scripts/f31_eval.py` takes a TSV of
+`query<TAB>expected-path[<TAB>kind]`, runs every search mode through `--json`, and prints recall@1 / recall@k / MRR / how often an image
+outranked the labelled note / how many answers never surfaced — per mode, with the run's shape above it, and `--strict` exiting 3 when a label
+names something the index does not hold. Its arithmetic is gate-graded (`f31-selftest` in `gates.sh`: hand-computed numbers, plus the
+"exclude the misses" mutant that would make MRR rise as recall falls). What is *not* here is a label file: queries generated from the same corpus
+being searched measure token overlap, not retrieval, and would put a meaningless number in a file whose name implies it means something. The ten
+minutes needed are described in `docs/design-f31-quality-harness.md`. **The ruling this card waits on is still yours**: ~20 labelled queries from
+your own vault, or a sentence saying you would rather not and why — either closes it, and only the first one buys a quality claim.
+
 ## F32 — `np search` blames `embeddings.provider = "none"` on a workspace whose config says `local-model`
 
 Filed 2026-11-05 while writing the README's troubleshooting table, which had to document the message rather than the cause.
