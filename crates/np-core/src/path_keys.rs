@@ -135,23 +135,120 @@ pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
     name.as_bytes().to_vec()
 }
 
-/// The bytes of one name or path. Windows paths are UTF-16 code units and reach this program as text, so its
-/// spelling stays lossy — the same stance [`crate::config`] takes for the workspace key (F13 §5).
+/// The bytes of one Windows name: its UTF-16 units encoded without inventing a replacement character.
 ///
-/// `not(unix)` is wider than Windows, so this is also the spelling of any other target the crate is built for;
-/// [`name_is_lossless`] is where that costs something.
-#[cfg(not(unix))]
+/// This is **exact**, in the sense that two OS names that differ produce two byte keys — which the lossy spelling this replaced could not promise,
+/// and the reason F18 had to refuse a name holding an unpaired surrogate rather than index it ([`name_is_lossless`]). Encoding lives in [`wtf8`]
+/// because only its caller can be compiled on Windows; the rule itself is pure over `u16` and tested on every host.
+///
+/// **Exactness here does not make such a name indexable yet, and that is deliberate.** Identity is bytes
+/// ([`rel_bytes`]) but display, link resolution and any later re-open go through `rel`, which stays lossy text: a reader that reconstructs the path
+/// from the key would open the wrong file. Refusal therefore stays in force, and lifting it is the part of F18 that still needs a Windows run — see
+/// the card's "what exact bytes cost" section for the two steps left.
+#[cfg(windows)]
+pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    wtf8(&name.encode_wide().collect::<Vec<u16>>())
+}
+
+/// The bytes of one name on a target that is neither Unix nor Windows.
+///
+/// Lossy, and honestly so: `encode_wide` exists only on Windows and `as_bytes` only on Unix, so a third target has no exact spelling to take.
+///
+/// **This arm is also more reachable than it looks, and the reachability is a finding rather than a nitpick.** [`name_is_lossless`] is gated
+/// `cfg(unix)` / `cfg(windows)` with no fallback, so any other target fails to build *there* long before reaching this function. Keeping `os_bytes`
+/// total anyway is the cheap half of making that asymmetry visible: one item missing an arm is a compile error to fix, where a silently different
+/// key rule would be a data defect. Recorded on F18.
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
     name.to_string_lossy().into_owned().into_bytes()
+}
+
+/// UTF-16 code units encoded as UTF-8 **plus** the three sequences UTF-8 officially forbids (WTF-8).
+///
+/// The rule is three arms, and only the third is interesting:
+///
+/// - a unit below `0xD800`, or a well-formed high+low pair, encodes as ordinary UTF-8 — one to four bytes, byte-identical to what
+///   `to_string_lossy` produced before **F18**, which is why switching to this encoder moves no existing key;
+/// - a **lone** surrogate (a high with no low behind it, or a low with no high in front) encodes as the three-byte form of its 11-bit value:
+///   `0xE0 | v >> 12`, `0x80 | (v >> 6) & 0x3F`, `0x80 | v & 0x3F`.
+///
+/// That third arm is what makes the encoding *injective*: two unit sequences that differ produce bytes that differ, so identity cannot merge two OS
+/// names. It is also reversible — a decoder recognises `ED A0..BF xx` as one code unit — which is the property a future Windows reader needs to turn
+/// a stored key back into a path (F18's remaining step). The exact bytes are pinned by test rather than left implied, because an encoder someone
+/// writes later has to agree with the ones already in a database.
+///
+/// Pure over `u16` and public for the same reason [`has_unpaired_surrogate`] is: no filesystem this test suite can reach holds an unpaired surrogate,
+/// so a rule that only Windows can exercise is a rule no CI row can otherwise check.
+pub fn wtf8(units: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        if is_high_surrogate(unit) {
+            // A pair travels together and spells one scalar value, so it is consumed as two units and encoded from the combined 21 bits.
+            if let Some(low) = units
+                .get(index + 1)
+                .copied()
+                .filter(|u| is_low_surrogate(*u))
+            {
+                let scalar =
+                    0x1_0000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
+                push_scalar(&mut out, scalar);
+                index += 2;
+                continue;
+            }
+            push_surrogate(&mut out, u32::from(unit));
+            index += 1;
+            continue;
+        }
+        if is_low_surrogate(unit) {
+            // No high in front of it: the same three-byte arm, and the reason two names differing here stay two keys.
+            push_surrogate(&mut out, u32::from(unit));
+            index += 1;
+            continue;
+        }
+        push_scalar(&mut out, u32::from(unit));
+        index += 1;
+    }
+    out
+}
+
+/// Append `scalar` as UTF-8, shortest form. The length follows from the value, which is why no branch here consults a table.
+fn push_scalar(out: &mut Vec<u8>, scalar: u32) {
+    if scalar < 0x80 {
+        out.push(scalar as u8);
+    } else if scalar < 0x800 {
+        out.push(0xC0 | (scalar >> 6) as u8);
+        out.push(0x80 | (scalar & 0x3F) as u8);
+    } else if scalar < 0x1_0000 {
+        out.push(0xE0 | (scalar >> 12) as u8);
+        out.push(0x80 | ((scalar >> 6) & 0x3F) as u8);
+        out.push(0x80 | (scalar & 0x3F) as u8);
+    } else {
+        out.push(0xF0 | (scalar >> 18) as u8);
+        out.push(0x80 | ((scalar >> 12) & 0x3F) as u8);
+        out.push(0x80 | ((scalar >> 6) & 0x3F) as u8);
+        out.push(0x80 | (scalar & 0x3F) as u8);
+    }
+}
+
+/// Append one unpaired surrogate as the sequence UTF-8 forbids and WTF-8 defines.
+fn push_surrogate(out: &mut Vec<u8>, value: u32) {
+    out.push(0xE0 | (value >> 12) as u8);
+    out.push(0x80 | ((value >> 6) & 0x3F) as u8);
+    out.push(0x80 | (value & 0x3F) as u8);
 }
 
 /// Whether a UTF-16 spelling holds a surrogate that is not part of a pair.
 ///
 /// A high surrogate (`U+D800..=U+DBFF`) is only meaningful immediately followed by a low one
 /// (`U+DC00..=U+DFFF`); the two together spell one `char`. Anything else — a high with no low behind it, a
-/// low with no high in front of it — converts to no character at all, so `os_bytes`' lossy arm replaces
-/// it with U+FFFD and two different OS names land on one byte key (F18). Two highs in a row leave the first
-/// unpaired for exactly that reason: only the pair `high, low` is consumed together.
+/// low with no high in front of it — converts to no character at all, so any spelling that goes through text
+/// replaces it with U+FFFD and two different OS names collapse to one string. That is why this predicate gates
+/// indexing on Windows ([`name_is_lossless`]) and why identity no longer goes through text there: [`wtf8`] keys
+/// such a name exactly, and the refusal stays only because *display* and re-opening still do. Two highs in a row
+/// leave the first unpaired for exactly that reason: only the pair `high, low` is consumed together.
 ///
 /// Pure over `u16`, and public so it stays testable on every platform: only Windows can reach this shape
 /// through a filesystem, and `name_is_lossless`'s Unix arm answers `true` without looking, so without a
@@ -240,7 +337,8 @@ mod tests {
     // an import used only by a gated test is an unused-import warning on the other platform, and CI builds
     // both with `-D warnings`.
     use super::{
-        case_fold, display_fold, has_unpaired_surrogate, rel_bytes, rel_bytes_of_display, RelPath,
+        case_fold, display_fold, has_unpaired_surrogate, rel_bytes, rel_bytes_of_display, wtf8,
+        RelPath,
     };
     use std::ffi::OsStr;
 
@@ -463,5 +561,99 @@ mod tests {
         assert_eq!(display_fold("ÄMLI.md"), display_fold("ämli.md"));
         // A key and its fold are comparable byte strings, which is what the CHECK on both columns asks for.
         assert_eq!(case_fold(&rel_bytes_of_display("A.md")), b"a.md".to_vec());
+    }
+
+    /// **The property F18 is about.** Two Windows names differing only where UTF-16 cannot spell a character — one unpaired surrogate — used to
+    /// reach the same byte key, because `to_string_lossy` replaced each with U+FFFD. That collision is reproduced here rather than described: it is
+    /// the reason [`name_is_lossless`] refuses such a name on Windows, and a refusal nobody can demonstrate is a refusal nobody believes.
+    #[test]
+    fn the_lossy_spelling_collapses_two_names_that_are_two_names() {
+        // Two names whose *only* difference is which unpaired surrogate sits in position one. A difference anywhere later is a legal character and
+        // survives any spelling, so it proves nothing; this is the shape that actually collapsed.
+        let first = [0xD800_u16, b'a' as u16];
+        let second = [0xD801_u16, b'a' as u16];
+        assert!(has_unpaired_surrogate(&first) && has_unpaired_surrogate(&second));
+
+        // The old rule, spelled out so the collision is visible in the test rather than asserted in prose. Both names become `\u{FFFD}a`.
+        let lossy = |units: &[u16]| String::from_utf16_lossy(units).into_bytes();
+        assert_eq!(
+            lossy(&first),
+            lossy(&second),
+            "if this stops being true, the platform's lossy rule changed and F18 needs re-reading"
+        );
+
+        // A lone high against a lone low, same letter after: also one string under the old rule.
+        let third = [0xDC00_u16, b'a' as u16];
+        assert_eq!(lossy(&first), lossy(&third));
+
+        // Exact identity keeps all three apart.
+        assert_ne!(wtf8(&first), wtf8(&second));
+        assert_ne!(wtf8(&first), wtf8(&third));
+    }
+
+    /// The exact bytes of the forbidden sequence, pinned because a database may hold it and a decoder written later has to agree with the encoder
+    /// that put it there. `U+D800` is `ED A0 80`, and a well-formed pair is ordinary four-byte UTF-8 — not three-plus-three.
+    #[test]
+    fn a_lone_surrogate_encodes_to_three_bytes_and_a_pair_to_four() {
+        assert_eq!(wtf8(&[0xD800]), vec![0xED, 0xA0, 0x80]);
+        assert_eq!(wtf8(&[0xDFFF]), vec![0xED, 0xBF, 0xBF]);
+        // A low surrogate with nothing in front is the same arm, not a dropped unit.
+        assert_eq!(wtf8(&[0xDC00]), vec![0xED, 0xB0, 0x80]);
+        // `U+1F600` (😀) as a real pair: F0 9F 98 80, the same bytes its UTF-8 spelling has.
+        assert_eq!(
+            wtf8(&[0xD83D, 0xDE00]),
+            "😀".as_bytes().to_vec(),
+            "a well-formed pair must not become two sequences"
+        );
+    }
+
+    /// **The no-migration proof.** For every name that spells only legal scalars, these bytes are exactly the ones `to_string_lossy` produced — so
+    /// switching Windows identity to [`wtf8`] moves no existing row, and the churn a key change would cause is confined to names this program
+    /// refuses today. Everything below is a name someone could actually have: ASCII, German, Cyrillic, CJK, emoji, a combining accent, RTL, a
+    /// zero-width joiner sequence, and an empty name.
+    #[test]
+    fn every_legal_name_keys_exactly_as_it_did_before() {
+        for name in [
+            "index.md",
+            "Ämli.md",
+            "große-notiz.md",
+            " Meeting 2026-01-01 .md",
+            "Привет мир.md",
+            "会議メモ.md",
+            "😀.md",
+            "e\u{301} accent.md",
+            "עברית.md",
+            "\u{200d}\u{200d}joiners.md",
+            "",
+            "nul-adjacent \u{1}.md",
+        ] {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            assert!(
+                !has_unpaired_surrogate(&units),
+                "test input `{name}` is not a legal name"
+            );
+            assert_eq!(
+                wtf8(&units),
+                name.as_bytes().to_vec(),
+                "`{name}` would re-key on the first scan after this change"
+            );
+        }
+    }
+
+    /// A pair split across the end of the input is not a pair: the trailing high has no low behind it, so it takes the forbidden arm and stays
+    /// distinct from the name that does have its partner. This is the boundary where a sloppy encoder silently merges two files.
+    #[test]
+    fn a_surrogate_pair_broken_at_the_end_stays_a_distinct_name() {
+        let whole = [0xD83D, 0xDE00];
+        let broken = [0xD83D];
+        assert_ne!(wtf8(&whole), wtf8(&broken));
+        assert_eq!(
+            wtf8(&broken).len(),
+            3,
+            "the lone high took the pair arm: {:?}",
+            wtf8(&broken)
+        );
+        // And two highs in a row are two unpaired surrogates, not one dropped unit — six bytes, both recorded.
+        assert_eq!(wtf8(&[0xD800, 0xD801]).len(), 6);
     }
 }

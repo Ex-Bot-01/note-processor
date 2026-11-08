@@ -2453,3 +2453,49 @@ its line changes to the degraded wording on the next Windows run, which is the d
 
 **Still owed:** CI grading (local rows: default 42 np-cli cases, `local-model,fetch` 56 with real artifacts), and the operator's Windows run to
 confirm the first-install fetch behaves the same on a machine whose network stack they actually have.
+## F18 — round four (2026-12-08): Windows identity now has exact bytes, and the refusal stays for a different reason
+
+Prompted by the operator's instruction to finish what of this card is reachable from Linux. Two things changed; one thing did not, and the reason it
+did not is the useful part.
+
+**Shipped: an exact byte spelling.** `path_keys::wtf8` encodes UTF-16 code units as UTF-8 plus the three-byte sequences UTF-8 forbids, so a lone
+surrogate gets bytes of its own instead of U+FFFD. Windows's `os_bytes` now calls it through `encode_wide`; the arm for targets that are neither Unix
+nor Windows keeps the old lossy spelling, because there is no exact one available there. The encoder is pure over `u16` and public for the same reason
+`has_unpaired_surrogate` already was: **no filesystem this suite can reach holds an unpaired surrogate**, so a rule only Windows can exercise is a
+rule no CI row would otherwise check.
+
+Four cases, all green on Linux (`cargo test -p np-core --lib path_keys`: 15 passed):
+
+- `the_lossy_spelling_collapses_two_names_that_are_two_names` reproduces the defect instead of describing it: `[U+D800,'a']` and `[U+D801,'a']` are two
+  NTFS names that `String::from_utf16_lossy` renders as one string, and `wtf8` keeps them — and a lone high against a lone low — three keys apart. The
+  assertion that the *old* rule collides is deliberate: if a future std changes the lossy rule, this fails and the card gets re-read. Writing this case
+  corrected a premise of mine on the way — an earlier draft compared `〈high〉a` with `〈high〉b`, which any spelling distinguishes, because the difference
+  there sits on a legal character. Only a difference *in the surrogate itself* collapses.
+- `a_lone_surrogate_encodes_to_three_bytes_and_a_pair_to_four` pins the exact bytes (`U+D800` → `ED A0 80`) and that a well-formed pair is ordinary
+  four-byte UTF-8. Pinned because a database may hold these bytes and a decoder someone writes later must agree with the encoder that put them there.
+- `every_legal_name_keys_exactly_as_it_did_before` is **the no-migration proof**: over ASCII, German, Cyrillic, CJK, emoji, a combining accent, RTL,
+  zero-width joiners, an empty name and a control character, `wtf8` output is byte-identical to what the lossy spelling produced. So switching Windows
+  identity to exact bytes re-keys **no existing row**. The only names whose keys could move are ones `np` refuses today and therefore never stored.
+- `a_surrogate_pair_broken_at_the_end_stays_a_distinct_name` covers the boundary where a careless encoder silently merges `😀.md` with a truncated name.
+
+Measured, not assumed: **`cargo check -p np-core --target x86_64-pc-windows-gnu` finishes clean** (mingw on `PATH` for `ring`'s build script), which is
+how the Windows-only arm — `encode_wide`, `std::os::windows::ffi` — is known to type-check. Its limit is stated plainly: **compile-only.** No behaviour
+on a Windows filesystem was observed here, because there is no Windows filesystem here, and this card's rule is that platform claims come from the
+platform (`cargo test -p np-core --test walk` on that machine still prints `NOT COVERAGE`, which is honest rather than failing).
+
+**Not shipped: lifting the refusal, and why not.** `name_is_lossless` still keeps a name with an unpaired surrogate out of the catalog. Identity being
+exact was never the whole requirement — **display and re-opening are text**: `RelPath::rel` is lossy by definition, links resolve against it, and a
+later reader (an image embed reopening a figure by its stored path) reconstructs the path from that text, not from `rel_bytes`. Index such a name now
+and `np` would hold a correct key beside a display string that opens the wrong file, which is the failure this card was filed about, re-opened through
+the reader instead of the writer. Two steps remain, both needing the machine:
+
+1. a Windows-only decoder from those bytes back to UTF-16 units (the format above is pinned so it can be written), and every read path that resolves a
+   stored row to an openable path switched to `rel_bytes` rather than `rel`;
+2. one NTFS experiment answering the question no Linux box can: **does the filesystem even let you create such a name** — via Win32 wide APIs, yes;
+   through Explorer or PowerShell, unknown — which decides whether this is a correctness hole or a hardening detail. Until someone runs it, the refusal
+   is cheap insurance and the exact key costs nothing to have in place underneath it.
+
+**One asymmetry found on the way.** `os_bytes` was gated `cfg(not(unix))`, while `name_is_lossless` is gated `cfg(unix)` / `cfg(windows)` with no
+fallback — so a third target would fail to build at the predicate, not at the byte rule. The arms are now `cfg(windows)` / `cfg(all(not(unix),
+not(windows)))` on `os_bytes`, which does not fix that asymmetry but makes it visible at the right item: a missing arm is a compile error to repair,
+where a silently different key rule would be a data defect. Not worth its own card; noted so nobody re-derives it.
