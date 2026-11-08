@@ -197,6 +197,41 @@ pub const PINNED_IDENTITIES: &[PinnedIdentity] = &[PinnedIdentity {
     prefix_query: "",
 }];
 
+/// Which halves of a stored declaration differ from this build's pin (**F42**).
+///
+/// Two bools rather than a message because the two halves are not symmetric and must not be reported as one fact: a document prefix changes
+/// what a *stored* vector means, while a query prefix changes only what the next query means, and a reader who is told "prefixes differ" cannot
+/// tell "my whole index is under a different meaning" from "someone typed `--prefix-query` once". The caller prints one line naming whichever
+/// halves are set; [`crate::fetch`] refuses outright on the same comparison, which is why this lives beside the pin table rather than in either
+/// command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PrefixDrift {
+    /// The stored `prefix_doc` is not what the pin declares — so every vector in this workspace was computed under a
+    /// different instruction than a fetched model would use.
+    pub doc: bool,
+    /// The stored `prefix_query` differs. No stored byte depends on it; only future queries do.
+    pub query: bool,
+}
+
+/// Does the row installed for `id` declare prefixes this build's pin does not? **F42 option A's single source of truth.**
+///
+/// `None` in three distinct cases, and the callers must not care which one they are in: the id is not pinned (there is nothing to agree with —
+/// a hand-built model is allowed its own meaning), or it is pinned and both halves match. Note what that means for the id this build ships
+/// today: `PINNED_IDENTITIES` declares **empty** prefixes, so an install that omits `--prefix-doc`/`--prefix-query` *agrees* with the pin, and
+/// drift is reached by supplying prefixes the pin does not declare. That direction is the one a careful user actually walks into — they read a
+/// paper, typed the instruction it recommended, and silently made their index non-comparable with anything `np models fetch` would install.
+///
+/// The width and digest are deliberately **not** compared here: `fetch` already refuses on those (`FetchError::IdentityDisagrees`) before a
+/// byte moves, and this function exists for the half nobody checks — `install` accepts whatever declaration it is handed, because it is the door
+/// for bytes the human holds.
+pub fn prefix_drift(id: &str, stored_doc: &str, stored_query: &str) -> Option<PrefixDrift> {
+    let pin = identity(id)?;
+    let doc = stored_doc != pin.prefix_doc;
+    let query = stored_query != pin.prefix_query;
+    (doc || query).then_some(PrefixDrift { doc, query })
+}
+
 /// The declared identity of `id`, if this build declares one.
 ///
 /// `None` means a fetch must refuse: bytes with no width to record are not a model, and guessing 768 because it is

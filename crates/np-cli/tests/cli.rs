@@ -4145,3 +4145,56 @@ mod real_model {
         dot / (norm(a) * norm(b))
     }
 }
+
+/// **F42 option A, at the moment it matters.** The install-time notice fires once; the embed-time notice is the one that reaches someone whose
+/// row arrived another way — installed by an older build, copied in with the vault, or declared before the pin said anything. It must not
+/// change the outcome (that would be option B wearing a warning's clothes): the run stops for its own reason and the note sits beside it on
+/// stderr, with `prefix_drift` in the document for whoever is reading machine-side.
+#[test]
+fn embedding_a_pinned_model_with_undeclared_prefixes_notes_the_drift_and_still_reports_its_own_outcome(
+) {
+    let ws = workspace();
+    let source = ws._tmp.path().join("artifact.bin");
+    fs::write(&source, b"bytes whose meaning the pin does not declare\n")
+        .expect("test setup: write the artifact source");
+    let digest =
+        np_core::hash::sha256_file(&source).expect("test setup: digest the artifact source");
+    // A **pinned** id, installed with a query prefix the pin does not declare. The document half is left alone on purpose: it then matches
+    // the pin's empty declaration, and a notice that says "document prefix" here would be reporting a drift this workspace does not have.
+    let installed = run(&mut ws.command(&[
+        "models",
+        "install",
+        "--id",
+        "embeddinggemma-2",
+        "--path",
+        source.to_str().expect("test setup: utf-8 tempdir path"),
+        "--dim",
+        "768",
+        "--sha256",
+        &digest,
+        "--prefix-query",
+        "query for note search: ",
+    ]));
+    installed.assert_success();
+    ws.write_user_config(&local_model_config("embeddinggemma-2"));
+
+    let out = run(&mut ws.command(&["embed", "--json"]));
+    // Whatever this build concludes about the run (no runtime by default), the note is about the row, not the run — and it does not change
+    // the outcome, which is what keeps this option A rather than a refusal in disguise.
+    let err = out.stderr();
+    assert!(
+        err.contains("query prefix") && err.contains("embeddinggemma-2"),
+        "the note names the id and says which half: {err}"
+    );
+    assert!(
+        !err.contains("document prefix"),
+        "only the half that was supplied drifted; the document half matches the pin's empty declaration: {err}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&out.stdout()).expect("embed --json stays one document");
+    assert_eq!(doc["prefix_drift"]["query"], true, "{doc}");
+    assert_eq!(
+        doc["prefix_drift"]["doc"], false,
+        "and the JSON reports the halves separately here too"
+    );
+}

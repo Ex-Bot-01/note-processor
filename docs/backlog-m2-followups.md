@@ -2016,6 +2016,43 @@ sentence §12 leans on when arguing that a default-on fetch is safe.
 **Done when:** a ruling is recorded and either the warning, the command, or the documentation carries a dated test; and `models list`'s empty
 prefixes under a pinned id are no longer a state a careful user can enter without a word of warning.
 
+**Ruled 2026-12-08: option A**, on the implementer's recommendation, and implemented in the same change. **A correction first, because this
+card's premise was wrong.** It says the drift is "empty prefixes … where the pin declares `represent this sentence for retrieval:` /
+`query for note search:`". `pins::PINNED_IDENTITIES` has declared **empty** prefixes since it was introduced (`864ef95`, and at `v0.2.3` —
+checked with `git show v0.2.3:crates/np-core/src/pins.rs` on 2026-12-08), deliberately: no instruction convention has been measured in this
+repository, and prefixes are part of an id's identity, so a measured convention must arrive as a new `@n` id rather than an edit. So the
+round-four row (`prefix_doc "" prefix_query ""`) **agreed** with the pin, and the two cosines on this card compared a pin-conformant install
+against one carrying prefixes the pin does *not* declare. Different vector bytes, yes — which was the point — but the card described the
+direction backwards, and an implementation written to it would have warned about the conformant case.
+
+**What shipped.** One predicate, `pins::prefix_drift(id, stored_doc, stored_query)`, because three commands want the same fact and only one of
+them can refuse: `fetch` already returns `IdentityDisagrees` on this comparison before transferring a byte, and now agrees with the warning by
+reading the same function. The notice prints on **stderr in both channels** (so stdout stays one word or one document) at three moments —
+`models install` (before any vector exists: the actionable moment), `embed`, and `setup` (both of which reach rows that arrived another way: an
+older build, a copied vault). `--json` carries `prefix_drift: {doc, query}` **only when there is drift**, so the key's presence is the signal
+and no existing document shape changed. The two halves are reported separately and deliberately: the document prefix is what every stored vector
+was computed under; the query prefix affects only future queries. Nothing about the outcome changes — that is what makes this A and not a
+refusal wearing a warning's clothes.
+
+Measured on a debug build, pinned id, one workspace: install with `--prefix-doc "represent this sentence: "` prints
+``np: note: `embeddinggemma-2` is recorded with a document prefix this build does not declare for that id — its vectors mean something
+different from a fetched model's, and no command rewrites them (`np models list` shows the declaration on file)`` and emits
+`"prefix_drift": {"doc": true, "query": false}`; `embed --json` in that state prints the same line *and* still reports its own outcome
+(`runtime-not-built`), with the key beside it. Omitting both flags — this build's conformant case, and the one round four recorded — prints
+nothing at all.
+
+Tests: `installing_a_pinned_model_with_an_undeclared_prefix_says_so`, `installing_a_pinned_model_without_prefixes_stays_silent`, and
+`an_unpinned_id_is_never_told_it_disagrees_with_a_pin` (np-cli `models_cli`, 2026-12-08) plus
+`embedding_a_pinned_model_with_undeclared_prefixes_notes_the_drift_and_still_reports_its_own_outcome` (np-cli `cli`). Two mutants, one per
+failure mode a warning can have: making `prefix_drift` always return `None` kills the install and embed cases; making it always claim a
+document drift kills the silent case. Neither mutant survives, which is the whole reason the silent case has its own test — a warning that
+fires on every pinned install becomes noise, and nobody reads it.
+
+**Still open, honestly:** option B (`models redeclare`) does not exist. The notice says "no command rewrites them" and points at `np models
+list`, which is true but leaves the repair as SQL. That is acceptable while drift means *non-conformant prefixes the user chose*; it stops
+being acceptable the day this build ships a pin with non-empty prefixes, because then an ordinary omitted flag produces exactly the state this
+card describes and there is still no command to fix it. Revisit B at that id change.
+
 ## F41 — a fresh workspace with fetching switched off is refused as *configuration disabled*, and the sentence names no remedy
 
 **Filed 2026-11-08, found while writing `np setup`'s tests (F38).** Not fixed by that commit; deliberately not fixed there, because

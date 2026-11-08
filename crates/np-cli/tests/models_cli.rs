@@ -2126,3 +2126,130 @@ fn search_never_dials_out_even_when_a_fetch_would_be_permitted() {
     // the refusal — which is the difference between "your query took four milliseconds" and "your query took four minutes
     // on a metered connection".
 }
+
+// ---------------------------------------------------------------- F42 option A: a pinned id that disagrees with its pin says so
+//
+// The state is not corruption and not refused: `np models install` exists for bytes a person holds, so it records the declaration it is
+// handed. What it used not to do is *mention* that the declaration differs from what this build pins for that id — prefixes change vector
+// bytes, so the workspace silently stops being comparable with anything `np models fetch` would install, and both honest commands then refuse
+// to change the row (`install` will not rewrite an installed identity; `fetch` returns `IdentityDisagrees` before transferring a byte). The
+// three cases below are one per direction the flag can point, because a mutant that always warns and a mutant that never warns each fail one
+// of them:
+//
+//   * pinned id + a prefix the pin does not declare → warning + `prefix_drift`, naming which half;
+//   * pinned id + flags omitted → **silent**: this build's pin declares empty prefixes, so omitting them is agreement. (This is the case
+//     round four's Windows log recorded; the F42 card claimed it was drift and has been corrected.)
+//   * unpinned id + prefixes supplied → silent: there is no pin to disagree with, and warning here would tell every hand-built model that it
+//     is wrong.
+
+/// The pinned id of this build, spelled locally rather than importing the pin table: a test that reads its expectation from the same constant
+/// it is checking cannot notice the day the pin grows a prefix.
+const PINNED_ID: &str = "embeddinggemma-2";
+
+fn install_pinned(ws: &Scratch, source: &Path, digest: &str, extra: &[&str]) -> Command {
+    let mut cmd = ws.models(&["install", "--id", PINNED_ID]);
+    cmd.arg("--path")
+        .arg(source)
+        .arg("--dim")
+        .arg("768")
+        .arg("--sha256")
+        .arg(digest);
+    for flag in extra {
+        cmd.arg(flag);
+    }
+    cmd
+}
+
+#[test]
+fn installing_a_pinned_model_with_an_undeclared_prefix_says_so() {
+    let ws = Scratch::new();
+    let source = ws.source("artifact.bin", b"bytes with a meaning of their own\n");
+    let digest = source_digest(&source);
+
+    let installed = run(&mut install_pinned(
+        &ws,
+        &source,
+        &digest,
+        &[
+            "--prefix-doc",
+            "represent this sentence for retrieval: ",
+            "--json",
+        ],
+    ));
+    installed.assert_success();
+
+    // The line belongs on stderr in both channels: stdout stays the one word (or the one document) it always was, and a person piping
+    // stdout to a file still reads the warning.
+    let err = installed.stderr();
+    assert!(
+        err.contains(PINNED_ID) && err.contains("document prefix"),
+        "the notice names the id and which half drifted: {err}"
+    );
+    assert!(
+        err.contains("np models list"),
+        "and points at the command that shows what is on file, because there is no command that fixes it (F42 option B would): {err}"
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&installed.stdout()).expect("one JSON object");
+    assert_eq!(
+        doc["state"], "installed",
+        "the install still succeeded (**A**, not a refusal)"
+    );
+    // Each half asserted on its own line: one comparison against a whole object would pass on `{doc:true,query:true}` for the wrong reason.
+    assert_eq!(
+        doc["prefix_drift"]["doc"], true,
+        "the document prefix differs from the pin — stored vectors mean something else"
+    );
+    assert_eq!(
+        doc["prefix_drift"]["query"], false,
+        "and the query half is reported as matching, because it was omitted and the pin's is empty too"
+    );
+}
+
+/// The agreement case, asserted because it is the one that keeps the warning honest. Both flags omitted records empty prefixes, and this
+/// build's pin declares empty prefixes — so nothing may be printed. A mutant that warns on every pinned install passes the test above and
+/// fails this one, which is exactly how a useful warning becomes noise nobody reads.
+#[test]
+fn installing_a_pinned_model_without_prefixes_stays_silent() {
+    let ws = Scratch::new();
+    let source = ws.source("artifact.bin", b"bytes that match the pin\n");
+    let digest = source_digest(&source);
+
+    let installed = run(&mut install_pinned(&ws, &source, &digest, &["--json"]));
+    installed.assert_success();
+    assert_eq!(
+        installed.stderr(),
+        "",
+        "omitting both flags agrees with the pin; a warning here would be crying wolf"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&installed.stdout()).expect("JSON");
+    assert!(
+        doc.get("prefix_drift").is_none(),
+        "and the key is absent rather than null-or-false, so its presence means something: {doc}"
+    );
+}
+
+#[test]
+fn an_unpinned_id_is_never_told_it_disagrees_with_a_pin() {
+    let ws = Scratch::new();
+    let source = ws.source("artifact.bin", b"a model this build knows nothing about\n");
+    let digest = source_digest(&source);
+
+    // `Scratch::install` uses the fixture's own unpinned id.
+    let installed = run(&mut {
+        let mut cmd = ws.install(&source, "384", &digest);
+        cmd.arg("--prefix-doc")
+            .arg("anything at all: ")
+            .arg("--json");
+        cmd
+    });
+    installed.assert_success();
+    assert_eq!(
+        installed.stderr(),
+        "",
+        "no pin, nothing to disagree with — a warning would tell every hand-built model it is wrong"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&installed.stdout()).expect("JSON");
+    assert!(doc.get("prefix_drift").is_none(), "{doc}");
+}

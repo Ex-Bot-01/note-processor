@@ -615,6 +615,59 @@ fn embed_refusal(report: &EmbedReport) -> String {
     format!("{label}: {detail}")
 }
 
+/// **F42 option A: say it out loud and keep going.** One stderr line when the model row on file declares instruction prefixes this build's
+/// pin does not, plus the value `--json` carries under `prefix_drift` (absent when there is no drift, so every existing document shape is
+/// untouched).
+///
+/// Why a warning rather than a refusal: `np models install` exists for bytes a person holds, and it cannot assume the pin describes them — a
+/// model installed from a paper's recommended instruction prefix is a deliberate act, and refusing it would close the only door that works
+/// offline. It is not nothing either: prefixes change vector *bytes*, so a drifted index silently stops being comparable with what
+/// `np models fetch` would install, and both honest commands then refuse to change the declaration (`install` will not rewrite an identity;
+/// `fetch` returns `IdentityDisagrees` before transferring a byte). Before this, the only repair was SQL.
+///
+/// Which halves differ is reported separately, because they are not symmetric: the document prefix is what every stored vector was computed
+/// under, while the query prefix affects only future queries. And the case that is *not* warned about matters as much — this build's pin
+/// declares empty prefixes (`pins::PINNED_IDENTITIES`), so an install that omits both flags agrees with it and stays silent. The operator's
+/// round-four row was that case; **F42**'s card said otherwise and has been corrected.
+fn prefix_drift_notice(
+    cfg: &Config,
+    workspace: &Path,
+    id: &str,
+) -> Result<Option<np_core::pins::PrefixDrift>, Box<dyn Error>> {
+    let db = workspace_db(cfg, workspace)?;
+    let Some(row) = model_row(&db, id)? else {
+        return Ok(None);
+    };
+    let Some(drift) = np_core::pins::prefix_drift(id, &row.prefix_doc, &row.prefix_query) else {
+        return Ok(None);
+    };
+    let halves = match (drift.doc, drift.query) {
+        (true, true) => "document and query prefix",
+        (true, false) => "document prefix",
+        (false, true) => "query prefix",
+        (false, false) => return Ok(None),
+    };
+    let _ = writeln!(
+        io::stderr(),
+        "np: note: `{id}` is recorded with a {halves} this build does not declare for that id — its vectors mean \
+         something different from a fetched model's, and no command rewrites them (`np models list` shows the \
+         declaration on file)"
+    );
+    Ok(Some(drift))
+}
+
+/// Insert `prefix_drift` into a document only when there is drift to report. A key that is usually null would be schema noise; a key that
+/// appears exactly when the reader has something to act on is a signal.
+fn insert_drift(
+    mut doc: serde_json::Value,
+    drift: Option<np_core::pins::PrefixDrift>,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    if let (Some(obj), Some(drift)) = (doc.as_object_mut(), drift) {
+        obj.insert("prefix_drift".to_string(), serde_json::to_value(drift)?);
+    }
+    Ok(doc)
+}
+
 /// `np embed`: run the half, print it in the channel the caller asked for, and turn a stopped run into exit 1.
 fn embed_workspace(
     workspace: &Path,
@@ -622,8 +675,16 @@ fn embed_workspace(
     auto_fetch: AutoFetch,
 ) -> Result<(), Box<dyn Error>> {
     let report = embed_report(workspace, auto_fetch, !json)?;
+    // Read the row that was actually used rather than re-deriving from argv: `[embeddings] model` is what `embed_run` embedded for, and a
+    // config naming something other than the installed row is exactly the disagreement worth noticing.
+    let drift = match report.model.as_deref() {
+        // `None` here means nothing was configured or named, which cannot have a drifted row: no id, nothing on file to compare.
+        Some(id) => prefix_drift_notice(&load_config()?, workspace, id)?,
+        None => None,
+    };
     if json {
-        emit_json(&serde_json::to_value(&report)?);
+        let doc = insert_drift(serde_json::to_value(&report)?, drift)?;
+        emit_json(&doc);
     } else {
         print_embed_summary(&report);
     }
@@ -672,8 +733,13 @@ fn setup_workspace(
     // ---- step 3: embed, through the same function `np embed` calls.
     let embedded = embed_report(workspace, auto_fetch, !json)?;
 
+    let drift = match embedded.model.as_deref() {
+        Some(id) => prefix_drift_notice(&cfg, workspace, id)?,
+        None => None,
+    };
     if json {
-        emit_json(&json!({
+        let doc = insert_drift(
+            json!({
             "workspace": workspace.display().to_string(),
             "scan": serde_json::to_value(&indexed)?,
             "embed": serde_json::to_value(&embedded)?,
@@ -683,7 +749,10 @@ fn setup_workspace(
             "vectors": embedded.succeeded(),
             "offline": embedded.offline,
             "fetched": serde_json::to_value(&embedded.fetched)?,
-        }));
+            }),
+            drift,
+        )?;
+        emit_json(&doc);
     } else {
         print_embed_summary(&embedded);
         let verdict = if embedded.offline {
@@ -1913,8 +1982,16 @@ fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(),
         // [`np_core::models::InstallOutcome::state_label`], not from a format string here. `id` rides along
         // because a JSON reader of a redirected run has no argv to look at, and the same two keys are present
         // for all three outcomes — one shape per command, as §3 requires.
-        emit_json(&json!({ "id": request.id, "state": outcome.state_label() }));
+        let drift = prefix_drift_notice(&config, workspace, &request.id)?;
+        let doc = insert_drift(
+            json!({ "id": request.id, "state": outcome.state_label() }),
+            drift,
+        )?;
+        emit_json(&doc);
     } else {
+        // The notice prints on stderr either way, so the text channel gets it too — a person piping stdout to a file still sees the line.
+        let drift = prefix_drift_notice(&config, workspace, &request.id)?;
+        let _ = drift;
         emit(outcome.state_label());
     }
     Ok(())
