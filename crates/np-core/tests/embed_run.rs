@@ -1408,3 +1408,82 @@ fn the_fetched_record_spells_its_keys_as_the_contract_does() {
         record.origin
     );
 }
+
+/// **A refusal must name its state exactly once.** Measured on the packaged v0.3.0 asset — the first release shape where the offline arm is
+/// reachable at all, because earlier assets had the runtime compiled out: `np embed` with no network printed
+///
+/// ```text
+/// np: offline: offline: could not reach the pinned origin to fetch `embeddinggemma-2`, …
+/// ```
+///
+/// The CLI composes that line as `"{}: {}"` of [`EmbedOutcome::label`] and [`EmbedOutcome::detail`], and arm (vi)'s sentence opened by
+/// restating its own label. np-cli now drops a leading restatement, and this pins the invariant across **every** arm rather than trusting one
+/// edited string. The two halves are asserted separately on purpose: banning an echoing detail catches today's bug, while requiring a detail
+/// for every non-`Current` arm stops the obvious wrong fix — silencing details until nothing repeats.
+#[test]
+fn a_refusal_never_prints_its_state_twice() {
+    let cases = [
+        EmbedOutcome::Current,
+        EmbedOutcome::ConfigurationDisabled {
+            key: "embeddings.model",
+            id: Some("embeddinggemma-2".to_string()),
+        },
+        EmbedOutcome::ArtifactAbsent {
+            model: "embeddinggemma-2".to_string(),
+            artifact: std::path::PathBuf::from("/data/models/embeddinggemma-2-Q8_0.gguf"),
+            hint: "run `np models install`".to_string(),
+        },
+        EmbedOutcome::RuntimeNotBuilt {
+            id: "embeddinggemma-2".to_string(),
+        },
+        EmbedOutcome::Offline {
+            id: "embeddinggemma-2".to_string(),
+        },
+        EmbedOutcome::NotProduced {
+            reason: "the provider refused a chunk over the token budget".to_string(),
+        },
+    ];
+
+    for outcome in &cases {
+        outcome
+            .refusal_names_the_state_once()
+            .unwrap_or_else(|why| panic!("{why}"));
+    }
+
+    // And the composed line, which is what a human actually reads: one label at the front, and the remedy still present.
+    let offline = EmbedOutcome::Offline {
+        id: "embeddinggemma-2".to_string(),
+    };
+    let line = format!(
+        "{}: {}",
+        offline.label(),
+        offline.detail().expect("arm (vi) owes a sentence")
+    );
+    // Exactly one mention of the state. The first version of this assertion expected two, on the theory that the sentence would still say
+    // "offline" somewhere; measured against the fixed detail it says it once, as a label, and an assertion written from the code rather than
+    // from the output would have failed a correct build.
+    assert_eq!(
+        line.matches("offline").count(),
+        1,
+        "the state is named once — as the leading label — not echoed inside the sentence: {line}"
+    );
+    assert!(
+        line.starts_with("offline: "),
+        "the state still leads: {line}"
+    );
+    assert!(
+        line.contains("np search --mode keyword"),
+        "the remedy survived: {line}"
+    );
+
+    for outcome in &cases {
+        if let Some(detail) = outcome.detail() {
+            assert!(!detail.is_empty(), "{:?} details nothing", outcome);
+        } else {
+            assert!(
+                matches!(outcome, EmbedOutcome::Current),
+                "only arm (i) may go without a sentence: {outcome:?}"
+            );
+        }
+    }
+}

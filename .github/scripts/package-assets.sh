@@ -8,8 +8,13 @@
 # where it came from — this script does **not** pretend to be the runner, and neither may the release notes that cite it.
 #
 # One platform per invocation, and only the platform you are standing on: a Windows asset needs the MSVC linker and a macOS
-# asset needs Apple's SDK, so the other two rows of the release matrix stay CI's (or their own machine's) job. That limit is
-# stated in `docs/ops-distribution-and-ci-decision.md` rather than hidden behind a script that appears to build releases.
+# asset needs Apple's SDK, so the other two rows of the release matrix stay CI's (or their own machine's) job — for Windows there is
+# also `.github/scripts/cross-build-windows.sh`, which produces the `…-gnu-cross` asset from Linux. That limit is stated in
+# `docs/ops-distribution-and-ci-decision.md` rather than hidden behind a script that appears to build releases.
+#
+# **Since 2026-11-08 this builds `local-model,fetch`**, so the asset contains the inference runtime (llama.cpp statically linked) and can
+# embed and auto-fetch. That costs cmake and a C++ compiler at *build* time — not at run time, which is the point: the user's machine needs
+# neither. §14's size ceiling (≤ 40 MB stripped) has ~24 MB of headroom on this shape, measured. The model itself is never in the asset.
 set -euo pipefail
 
 out="${1:-dist}"
@@ -18,7 +23,14 @@ target=$(rustc -vV | sed -n 's/^host: //p')
 binary=np
 [ "$(uname -s)" = Windows_NT ] && binary=np.exe
 
-cargo build --release --locked -p np-cli --target "$target"
+# `local-model` compiles llama.cpp, which needs cmake; say so before cargo's build-script panic buries it. CMAKE names the binary when
+# cmake is not on PATH (this repo's own gates set it that way).
+if ! command -v "${CMAKE:-cmake}" >/dev/null 2>&1; then
+  echo "local-model builds llama.cpp and needs cmake (set CMAKE=/path/to/cmake)." >&2
+  exit 1
+fi
+
+cargo build --release --locked -p np-cli --features local-model,fetch --target "$target"
 
 mkdir -p "$out"
 name="np-$version-$target"
@@ -27,16 +39,23 @@ if [ "$(uname -s)" = Windows_NT ]; then
   archive="$out/$name.zip"
   echo "zip packaging is left to the workflow (pwsh Compress-Archive); this script builds and checksums only" >&2
 else
-  # Strip before packaging. The size ceiling in docs/design-m2-local-embeddings.md §14 has always been quoted against **stripped** binaries,
-# while the first assets shipped unstripped (measured 2026-11-08: 10,295,048 B becomes 8,389,040 B for this target). Symbols are a
-# debugging convenience; what identifies the file for a downloader is the digest in the release notes.
-if command -v strip >/dev/null 2>&1; then
-  strip "target/$target/release/$binary"
-else
-  echo "warning: no strip on PATH — packaging an unstripped binary, larger than §14's quoted figures" >&2
-fi
+  # Strip before packaging. §14's size ceiling has always been quoted against **stripped** binaries while the first assets shipped
+  # unstripped (measured 2026-11-08: 10,295,048 B becomes 8,389,040 B for this target). Symbols are a debugging convenience; what
+  # identifies the file for a downloader is the digest in the release notes.
+  if command -v strip >/dev/null 2>&1; then
+    strip "target/$target/release/$binary"
+  else
+    echo "warning: no strip on PATH — packaging an unstripped binary, larger than §14's quoted figures" >&2
+  fi
 
-tar -C "target/$target/release" -czf "$archive" "$binary"
+  # The same promise cross-build-windows.sh makes for the Windows asset: a runtime claim that is not in the bytes is F40 all over again.
+  # Read the strings, not the symbol table — `strip` removes the latter (measured: 2 symbols before, 0 after).
+  if ! { strings -a "target/$target/release/$binary" | { grep -c 'llama_model_load_from_file' || true; }; } | grep -qv '^0$'; then
+    echo "refusing to package: the binary carries no llama_model_load_from_file, so local-model is not in it." >&2
+    exit 1
+  fi
+
+  tar -C "target/$target/release" -czf "$archive" "$binary"
 fi
 
 # The workflow's own guard, kept here too: a truncated or empty archive is worse than no release at all.

@@ -168,6 +168,27 @@ pub enum EmbedOutcome {
 
 impl EmbedOutcome {
     /// The arm's label, as the report prints it. Stable text: it is what a reader greps for.
+    /// Every arm's detail must add something to its label rather than restate it — `np embed` composes the refusal as
+    /// `"{}: {}"` of the two, and on 2026-11-08 the packaged 0.3.0 asset printed `np: offline: offline: could not reach …` because
+    /// arm (vi)'s sentence began by repeating its own label. Asserting the invariant over all arms (not just fixing that one string) is
+    /// what stops the next arm doing the same, and asserting the two halves separately keeps this falsifiable: a `label()` or `detail()`
+    /// edit that reintroduces the echo fails here, while an edit that strips labels wholesale fails the second loop.
+    pub fn refusal_names_the_state_once(&self) -> Result<(), String> {
+        let label = self.label();
+        let detail = match self.detail() {
+            Some(text) => text,
+            None => return Ok(()),
+        };
+        if detail.eq(label) || detail.starts_with(&format!("{label}: ")) {
+            return Err(format!(
+                "arm {:?} restates its own label: label={label:?} detail starts with {label:?}\n  \
+                 np embed prints \"{{label}}: {{detail}}\", so that becomes the state twice on one line.",
+                std::mem::discriminant(self)
+            ));
+        }
+        Ok(())
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Current => "nothing owed",
@@ -192,8 +213,11 @@ impl EmbedOutcome {
             // than half-embedded. Names a flag that exists (`--features local-model`) and a command that exists in this
             // very binary (`np search --mode keyword`, F36) — the rule §6's hints follow, because arm (iii)'s first
             // version named `np models fetch` before it shipped.
+            // The sentence must not open with its own label: `np embed` prints `"{}: {}"` of label and detail, and this arm's first
+            // version produced `np: offline: offline: could not reach the pinned origin …` (measured on the packaged 0.3.0 asset, the
+            // first shape where the arm is reachable in a release). Pinned by `a_refusal_never_prints_its_state_twice`.
             Self::Offline { id } => Some(format!(
-                "offline: could not reach the pinned origin to fetch `{id}`, so nothing was embedded — connect and \
+                "could not reach the pinned origin to fetch `{id}`, so nothing was embedded — connect and \
                  run `np embed` again, or search meanwhile by keyword (`np search --mode keyword`)"
             )),
             Self::RuntimeNotBuilt { id } => Some(format!(

@@ -596,11 +596,20 @@ fn embed_report(
 /// `detail()` is `None` only for arm (i), which returns above; the empty fallback keeps this from being a second place that
 /// has to know which arms carry a sentence.
 fn embed_refusal(report: &EmbedReport) -> String {
-    format!(
-        "{}: {}",
-        report.outcome.label(),
-        report.outcome.detail().unwrap_or_default()
-    )
+    let label = report.outcome.label();
+    let detail = report.outcome.detail().unwrap_or_default();
+    // **A refusal must name its state once.** `np embed` on a machine with no network printed
+    // "np: offline: offline: could not reach the pinned origin …" — measured on the packaged 0.3.0 asset, which is the first release shape
+    // where this arm is reachable at all (before v0.3.0 the runtime was compiled out, so nobody ran it). The duplication is structural:
+    // the line is `label: detail`, and one arm's detail began by restating its own label. Rather than edit that sentence and leave the
+    // next arm free to repeat the same trick, the composition drops a leading restatement. Pinned in `np-core` by an invariant over every
+    // arm's label and detail, so a future arm cannot reintroduce it either.
+    let prefix = format!("{label}: ");
+    let detail = match detail.strip_prefix(prefix.as_str()) {
+        Some(rest) => rest.to_string(),
+        None => detail,
+    };
+    format!("{label}: {detail}")
 }
 
 /// `np embed`: run the half, print it in the channel the caller asked for, and turn a stopped run into exit 1.
