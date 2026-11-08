@@ -1706,8 +1706,9 @@ silenced without editing anything), and every transfer announces id, members, by
   PowerShell: if a line throws rather than printing `CHECK`, the bug is in my script.
 + **F41**, raised by F38's own kill-switch path: refusing to fetch leaves a fresh workspace told `configuration disabled`, with no remedy
   line. Ruling owed there.
-+ **A shape test for `fetched`'s JSON keys** (member field is `digest-verified`, kebab, like every other key in the report). The real run
-  above is what found the spelling; a serialization test pins it without needing a network.
++ ~~A shape test for `fetched`'s JSON keys~~ — **done the same day** (`dc52776`): `the_fetched_record_spells_its_keys_as_the_contract_does`
+  serialises the record and pins both key sets, plus the three spellings a host could arrive under. The member field is
+  `digest-verified`, kebab-case like every other key in the report; §5b of the design doc records that §5's sketch said otherwise.
 
 ## F39 — an application-control policy on the operator's Windows box refuses to run anything cargo just built, and "build it from source" stops being an option
 
