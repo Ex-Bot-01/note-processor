@@ -1403,6 +1403,14 @@ nothing about the tree was involved, and a zero-step job spends nothing. Numbers
 have steps, and this card exists because four days of *executed-but-red* Windows runs were read as absent — a mistake in the opposite direction from
 treating an unprovisioned runner as a defect.
 
+**Amended 2026-11-08: F38's auto-fetch inherits this preflight, on every platform, and Windows answered in the field the same week.**
+`np embed`/`np setup` reaching for a missing pinned artifact go through `fetch::fetch`, which is where rule 6's free-space check lives,
+so the default-on download is space-checked exactly as the explicit command was — and a shortfall is a *refusal*, loud and specific,
+never classified as offline (F38 §5's table: an answered error stays an answer). Observed on Windows on 2026-11-07 with the v0.2.1
+cross-built binary, outside any test suite: `np models fetch` printed `free space 285.8 GB before the fetch`, transferred 295.5 MB and
+verified `2188ac1d…09135`. That is the Windows arm of this rule working on a real volume, one release after it closed on runner
+evidence at `b2840f9`.
+
 ## F35 — a misspelled or invented **top-level** config section is ignored, while a bad key inside `[embeddings]` is refused
 
 Filed 2026-11-05 while measuring F32, by catching myself doing it. `Config` (`crates/np-core/src/config.rs:543-545`) is
@@ -1641,6 +1649,65 @@ documentation slip; it is the layout.
 weeks old, and `v0.1.0`'s shipped asset had no `scan`-adjacent persistence to speak of beyond that same layout — so this is cheap now and expensive
 after Windows users arrive. Do not do it silently: a workspace that suddenly reports `added N` because its index moved elsewhere is the worst possible
 first experience, which is what the fallback exists to prevent.
+
+## F38 — `np embed` should fetch the pinned model itself, so an application gets vectors from one call
+
+**Opened 2026-11-07 as a question, ruled 2026-11-08 by the human partner: default ON.** The reason is in the ruling's own words — the
+consumer of this program is increasingly another program, and what it wants is *for vectors to simply exist*, not a sequence of three
+commands whose exit codes it has to interpret. Design `docs/design-f38-auto-fetch.md`, plan
+`docs/superpowers/plans/2026-11-08-auto-fetch-and-setup.md`; this card is the record of what shipped and what it still owes.
+
+**Default-on is defensible only because of what can be fetched, not because of who asked.** One id (`embeddinggemma-2`), from one
+origin that is compiled in unless `[models] base_url` replaces it, verified against the pinned digest before a single byte is put in
+place. An id this build does not pin is refused **before a transport is chosen** — no URL, mirror or config string can name a download
+target — and a binary built without `local-model`, or without `fetch`, cannot reach the trigger at all: those are compile-time gates,
+so "the default distribution does not dial out" is a build fact rather than a behaviour. Three switches refuse it (`--no-auto-fetch`,
+`[models] auto_fetch = false`, `NP_NO_AUTO_FETCH=1` — the environment outranks the file in that one direction, so a daemon can be
+silenced without editing anything), and every transfer announces id, members, byte count and origin *kind* before byte one.
+
+### What shipped, in which commit
+
+| piece | commit | what it is |
+| --- | --- | --- |
+| `[models] auto_fetch` (default true) + kill switch | `9f00d7f` | file key, env veto consulted per call, argv may open a door that only the environment bolts |
+| offline classification | `200f0f6` | `ClassKind` + `FetchError::is_offline()`; **only** a transport failure counts — 404/403/5xx/redirect/digest stay loud refusals, and TLS is deliberately *not* offline so a captive portal cannot suppress vectors (my call, overturnable) |
+| the trigger | `783e173`, cfg fix `e72a582` | inside provider resolution, before any transaction; pinned id + allowed + artifact or row missing; `np search` passes `false` unconditionally |
+| the machine contract | `aa204e0` | `fetched` / `offline` in every embed document; offline became a **state** (`FetchStep::Offline` → … → `EmbedOutcome::Offline`) rather than an error string, and arm (vi) moved to the top of `run` after measurement showed it reporting `configuration disabled` for an outage |
+| `np setup` | `2c56b9a` | index → fetch → embed as one command; offline exits 0 with `vectors:false, offline:true`; TTY `[y/N]` courtesy that can only veto; reuses `embed_report`, so there is one implementation of the embed half |
+| locks and the amendment trail | this commit | `NP_NO_AUTO_FETCH=1` for CI and `gates.sh`; README first-run paragraph; §7 of `docs/design-m3-hybrid-search.md` and §12 rule 1 of `docs/design-m2-local-embeddings.md` amended beside the rulings they change |
+
+### Evidence
+
++ **Gates: 19 rows, all exit 0, `NOT COVERAGE` 0**, with both real artifacts exported — `/home/agent/tmp/gates-f38t6b`, tree
+  `2c56b9a` whose only difference from the committed tree here is documentation and CI environment. No row was skipped.
++ Tests that carry the claims: `embed_fetches_a_missing_pinned_model_and_refuses_honestly_when_there_is_no_connection`,
+  `the_kill_switch_leaves_the_old_refusal_word_for_word`, `an_unpinned_id_is_refused_before_any_transport_is_chosen`,
+  `a_build_without_the_runtime_does_not_fetch_a_model_it_cannot_load`, `argv_and_the_environment_each_outrank_the_file_in_one_direction`,
+  `embed_json_says_it_was_offline_and_that_nothing_was_fetched`, `only_a_transport_failure_can_be_offline`,
+  `offline_is_its_own_arm_and_does_no_work`, `setup_offline_indexes_anyway_and_says_vectors_were_skipped`,
+  `setup_with_fetching_switched_off_indexes_and_refuses_without_blaming_the_network`, `setup_with_an_installed_artifact_ends_with_vectors`
+  (real inference), and in `models_cli`: `embed_dials_out_for_a_missing_pinned_model_and_keeps_an_answer_an_answer`,
+  `an_unpinned_id_never_opens_a_connection_during_embed`, `search_never_dials_out_even_when_a_fetch_would_be_permitted` — the last three
+  read a **stub origin's request log**, so "it dialled out", "it did not", and "an answer is not an outage" are socket facts, not wording.
++ Mutations planted and diffed, each failing a named test: offline routed back to an error; search's auto-fetch flag flipped to `true`
+  (which *survived* the first version of its test — hybrid mode never resolves a provider on a vector-less workspace — and fails the
+  corrected one run with `--mode semantic`); setup returning Err when offline; `vectors` derived from the scan half.
++ **One real-origin run, outside the gate list** (2026-11-09): fresh vault → `np setup --json` fetched 309,855,456 B in ~19 s, verified
+  `2188ac1d…09135`, embedded, exited 0 with `fetched.origin = "compiled-in-pin"` and no `http` substring anywhere in the document.
+  Numbers and the exact document are in `docs/design-f38-auto-fetch.md` §5b.
+
+### What it still owes
+
++ **CI grading.** No workflow run has had steps since the included minutes ran out at `2026-11-07T01:57:05Z`; the last CI-graded tree is
+  still `5e368ac`. Local gates are not closure (`docs/ops-actions-minutes.md`), so **this card stays open** and F36/F40's closures stay
+  withheld for the same reason.
++ **Windows, in the field.** Stage 8 of the operator script (sha256 `feadc2c7…508a7c`, uploaded on v0.2.1) asks the four questions this
+  card can only ask on Linux — including that a release asset must *not* speak of fetching at all. Written here, never executed by
+  PowerShell: if a line throws rather than printing `CHECK`, the bug is in my script.
++ **F41**, raised by F38's own kill-switch path: refusing to fetch leaves a fresh workspace told `configuration disabled`, with no remedy
+  line. Ruling owed there.
++ **A shape test for `fetched`'s JSON keys** (member field is `digest-verified`, kebab, like every other key in the report). The real run
+  above is what found the spelling; a serialization test pins it without needing a network.
 
 ## F39 — an application-control policy on the operator's Windows box refuses to run anything cargo just built, and "build it from source" stops being an option
 

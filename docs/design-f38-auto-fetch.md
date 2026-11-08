@@ -151,6 +151,26 @@ not.
 + **`fetched` is produced where the transfer happens** (provider resolution) and copied onto the report by
   `embed_workspace`, exactly like `artifact_check` and `workers`, for the same reason: the document that must not contradict
   the text summary is written downstream of the fact.
++ **The JSON spells it `digest-verified`, not `digest_verified`** — both new structs carry `rename_all = "kebab-case"`, which is
+  what every other key in an embed report does. §5's sketch above shows the snake_case spelling I wrote before the code existed;
+  the shipped document is `"members": [{ "name": "main", "bytes": 309855456, "digest-verified": true }]`. The sketch stays as
+  written so the drift is visible rather than tidied away.
++ **The whole path was then run for real, on Linux, against the compiled-in origin** (2026-11-09, 00:4x UTC): a fresh vault with
+  `[embeddings] provider = "local-model"`, no `models` row, no artifact → `np setup --json` announced
+  `fetching embeddinggemma-2 (main, 295.5 MB) — this workspace has no artifact to embed with`, printed `free space … before the
+  fetch`, transferred **309,855,456 bytes in ~19 s**, verified `sha256 2188ac1d…09135` against the pin, loaded the model, embedded
+  one chunk, and exited 0 with `"vectors": true`, `"offline": false`, and
+
+```json
+"fetched": { "id": "embeddinggemma-2",
+             "members": [ { "name": "main", "bytes": 309855456, "digest-verified": true } ],
+             "origin": "compiled-in-pin" }
+```
+
+  Total wall for index + fetch + load + embed: **30.1 s**. The document contains no `http` substring — asserted mechanically, not
+  by eye. This is the only measurement of F38's happy path that involves a real origin; every test in the suite reaches a stub or a
+  dead port, deliberately, and this run happened outside the gate list on a machine with 3.7 GB free (the preflight answered, and
+  the fetch fit).
 + **`search`'s "never dials out" test needs `--mode semantic`.** Hybrid mode on a vector-less workspace answers from FTS5
   and never resolves a provider at all (F36), so an empty request log there proves nothing about the fetch flag — the first
   version of that test passed against a mutation that *did* let search fetch. A green test on a path it never reaches is

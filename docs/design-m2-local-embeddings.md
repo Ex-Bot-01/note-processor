@@ -672,7 +672,13 @@ rather than letting a round discover it:
 ### The rules
 
 1. **Who fetches, and when.** `np models fetch <workspace> --id <id>` is the real command and the only thing that dials out in
-   this milestone. "First start" is satisfied in two halves: R7a/R7b ship the marker and the command, and **the automatic
+   this milestone. *(Amended 2026-11-08 by F38: `np embed` and `np setup` now call this same code path when a **pinned** artifact is
+   missing, on by default, with three switches to refuse and a compile-time gate for builds that could not use the bytes. The rest of
+   this rule still holds as written — `np scan` never fetches, `np search` never fetches, no unpinned id can be fetched, and nothing
+   is published without its digest matching. "No other binary starts a nine-hundred-megabyte download because it was invoked while a
+   config named a model" became false by deliberate ruling on that date; the reasoning and the guards are in
+   `docs/design-f38-auto-fetch.md`, and the reversal of §12's sibling ruling is recorded beside it in `docs/design-m3-hybrid-search.md`
+   §7.)* "First start" is satisfied in two halves: R7a/R7b ship the marker and the command, and **the automatic
    trigger belongs to the daemon (M4)** — no other binary starts a nine-hundred-megabyte download because it was invoked while
    a config named a model. `np scan` never fetches; `np embed` refuses with §6's `artifact absent — fetch first` arm rather
    than downloading inline (a nine-minute transfer inside a command that then writes rows is a transactional and UX mess at once).

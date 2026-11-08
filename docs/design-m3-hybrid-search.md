@@ -126,6 +126,23 @@ starting a download or silently falling back — and this change makes "silently
 a legitimate answer to type instead of an excuse. When a daemon exists (M4), the consent line and a `--no-fetch` belong there, not
 here.
 
+**Amended 2026-11-08 by F38 — the ruling reversed for the two commands that write vectors, and this paragraph is where that lives so
+the two documents cannot tell different stories.** `np embed` and `np setup` now fetch a *pinned* artifact when the workspace is
+missing one, default on, because the consumer of this program is increasingly another program that wants vectors to exist rather than
+a person willing to sequence three commands. Three parts of the ruling above survive untouched:
+
++ **`np search` still never fetches**, in any mode and whatever the config says — a read command that downloads would make "your query
+  took four minutes because it fetched" possible, and this card's own contribution is that keywords already answer.
++ **"Silently falling back" is still not what happens.** Offline, `np embed` exits 1 saying nothing was embedded; `np setup` indexes,
+  exits 0, and reports `vectors: false, offline: true`. Keyword search remains a legitimate answer rather than a consolation.
++ **Consent still exists**, just not as a daemon-only feature: `[models] auto_fetch`, `--no-auto-fetch` / `--yes`, and
+  `NP_NO_AUTO_FETCH=1` (which outranks the file), plus an announcement with id, member list, byte count and origin *kind* before byte
+  one, and a digest check before the bytes are put in place.
+
+What changed underneath is what makes default-on defensible: the target is **one pinned id from one compiled-in origin**, verified by
+digest — not "whatever a config value named". An unpinned id refuses before any transport is chosen, and a build without inference or
+without the HTTP client cannot reach the trigger at all (`docs/design-f38-auto-fetch.md`).
+
 ## 8. Deliberately not in this round
 
 * **Phrase/boolean syntax** (`"exact phrase"`, `NEAR`, column filters) exposed as its own mode: FTS5 supports it and users will

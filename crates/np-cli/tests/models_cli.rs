@@ -164,7 +164,10 @@ impl Run {
     }
 
     /// Both channels as one string, for claims about **where the program reached**, which is a fact about the run rather
-    /// than about a stream. Wording assertions still name their channel; only the F38 socket tests need both at once.
+    /// than about a stream. Wording assertions still name their channel; only the F38 socket tests need both at once — and
+    /// they exist only where a fetch can happen, so this helper is gated with them rather than warning as dead code on the
+    /// `--no-default-features` row.
+    #[cfg(all(feature = "local-model", feature = "fetch"))]
     fn combined(&self) -> String {
         format!("{}{}", self.stdout(), self.stderr())
     }

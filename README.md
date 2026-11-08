@@ -100,6 +100,24 @@ threads    12 of 16 available (auto)
 0.5703 note   index-notes.md
 ```
 
+`np setup ~/Notes` does those three steps as one command, and is what an application should call: it indexes **first** (keyword
+search works the moment indexing finishes), fetches the model if this workspace is missing it, embeds, and prints one report whose
+`vectors` / `offline` / `fetched` fields say exactly where it got to. Offline it exits **0** with `vectors: false` — the vault is
+searchable and nothing needs fixing but the cable — while any other stop on the vector half exits 1.
+
+On the **release binaries**, which are built without the inference feature, the vector half cannot run at all: `setup` indexes and then
+refuses with `runtime not built` at exit 1, naming `--features local-model` and keyword search. That is F40's arm and it is the correct
+answer — a binary that cannot read the model must not spend 310 MB fetching it.
+
+**The first run downloads a model, and says so before byte one.** Since F38, `np embed` and `np setup` fetch the pinned artifact when
+it is missing: ~310 MB for the text encoder (`mmproj` adds ~555 MB in a `vision` build), announced with its id, size and the *kind* of
+origin, then verified against the compiled-in digest before it is put in place — a partial or wrong file is never used. Turn it off
+three ways: `--no-auto-fetch` for one run, `[models] auto_fetch = false` in the config file, or `NP_NO_AUTO_FETCH=1` in the
+environment, which outranks the file precisely so a daemon can be silenced without editing it. Only ids this build **pins** are ever
+fetched — a name in a config file cannot make a download happen — and `np search` never fetches at all, in any mode: reading a vault
+must not cost bandwidth. With no connection, `np embed` exits 1 and says nothing was embedded; `np setup` still indexes; and
+`np search ~/Notes "…"` answers from keywords while you wait for either.
+
 Two things that trip people up, both by design:
 
 - **`np embed` reads the index, not the vault.** Edit a note and `np embed` will call it current; run `np scan` first, then
@@ -292,6 +310,7 @@ max_entries_per_file = 600
 ## Using it day to day
 
 ```sh
+np setup <workspace> [--json] [--yes]     # index, fetch the pinned model if missing, embed — one command for a caller that wants vectors
 np scan <workspace> [--json]              # index + regenerate the catalog
 np embed <workspace> [--json]             # embed what the index says is owed
 np search <workspace> <query> [--limit N] [--mode M] [--json]   # --limit defaults to 10, --mode defaults to config's `hybrid`

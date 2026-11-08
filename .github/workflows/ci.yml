@@ -32,6 +32,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # **The hermeticity lock (F38).** Since F38 a missing model artifact makes `np embed` dial out by default — which is what
+  # the product needs and what a test run must never do. Every test harness already strips this variable so its own cases
+  # decide, and this is the lock for everything else that runs a binary here (smoke checks, packaging, a future step nobody
+  # has written yet). It costs nothing and it means "the CI runner phoned home" cannot be discovered in a bill.
+  NP_NO_AUTO_FETCH: "1"
 
 jobs:
   # Which OS rows this event pays for. A job-level `if` cannot see `matrix`, so the choice is made once here and the

@@ -31,6 +31,14 @@ elif command -v cmake >/dev/null 2>&1; then
 fi
 export TMPDIR="${TMPDIR:-/tmp}"
 
+# **The second hermeticity lock (F38), and the reason this script is how local runs stay honest.** `np embed` fetches a
+# missing pinned artifact by default, so a gate row that exercises the CLI against a workspace with no artifact would, on a
+# connected machine, start a 310 MB download inside someone's test run. Every harness strips this variable and sets its own
+# value, so the lock is for whatever runs a binary outside them — and for the machine this script exists for: a laptop on a
+# metered link. Delete it deliberately (`NP_NO_AUTO_FETCH= .github/scripts/gates.sh`) if you are testing the fetch path by
+# hand; nothing in the gate list needs that.
+export NP_NO_AUTO_FETCH="${NP_NO_AUTO_FETCH-1}"
+
 # **Linking is the memory-bound step on this class of box, and cargo does not know that.** `nproc` here says 16 while RAM says
 # 7.4 GB, and an uncapped `cargo test --workspace` links up to sixteen debug test binaries at once — each with full debuginfo —
 # which on 2026-11-07 made `rust-lld` die with `ld terminated with signal 7 [Bus error]` on three rows and left the three

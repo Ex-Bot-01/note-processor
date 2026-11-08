@@ -64,28 +64,45 @@ Five things a reviewer must check that no single task's tests fully cover: (1) h
 
 **Files:** `crates/np-cli/src/main.rs`, `crates/np-cli/tests/cli.rs`, `docs/design-m2-embeddings.md` (the JSON section) if it enumerates keys
 
-- [ ] Failing test: `embed --json` always carries `"fetched"` and `"offline"`. Assert three shapes: nothing fetched → `null`/`false`; offline skip → `null`/`true`; fetched (real artifact row written, no transport — assert the *key shape* here, the real transfer is Task 6's gated test) → object with `id`, `members[].{name,bytes,digest_verified}`, `origin`.
-- [ ] Failing test: no document contains a scheme or host — assert `!text.contains("http")` and `!text.contains("huggingface")` on the offline-skip run, which is the only one that names an origin at all.
-- [ ] Implement the two keys in the embed JSON writer; text mode prints one stderr line when a fetch was skipped for being offline: `offline: could not reach the pinned origin, so nothing was embedded — connect and re-run np embed`.
-- [ ] Green; commit `feat(f38): embed's report says what it fetched and whether the world was offline`.
+- [x] Failing test: `embed --json` always carries `"fetched"` and `"offline"`. Assert three shapes: nothing fetched → `null`/`false`; offline skip → `null`/`true`; fetched (real artifact row written, no transport — assert the *key shape* here, the real transfer is Task 6's gated test) → object with `id`, `members[].{name,bytes,digest_verified}`, `origin`.
+- [x] Failing test: no document contains a scheme or host — assert `!text.contains("http")` and `!text.contains("huggingface")` on the offline-skip run, which is the only one that names an origin at all.
+- [x] Implement the two keys in the embed JSON writer; text mode prints one stderr line when a fetch was skipped for being offline: `offline: could not reach the pinned origin, so nothing was embedded — connect and re-run np embed`.
+- [x] Green; commit `feat(f38): embed's report says what it fetched and whether the world was offline`.
 
 ## Task 5 — `np setup <workspace>`: one command that ends with vectors, or says where it stopped
 
 **Files:** `crates/np-cli/src/main.rs`, `crates/np-cli/tests/cli.rs`
 
-- [ ] Failing test: `np setup <ws> --json` on a fresh vault with no artifact and a dead origin exits **0**, with `scan` counts present, `"vectors": false`, `"offline": true`, and `"fetched": null`; text output ends with `indexed; vectors skipped — offline`.
-- [ ] Failing test: `np setup --help` exists and the subcommand parses; an invented flag exits 2.
-- [ ] Failing test (gated on `local-model` + `NP_TEST_MODEL_PATH`, prints `NOT COVERAGE` otherwise): with a real artifact already installed, `setup` runs scan → embed and reports `"vectors": true`, `"offline": false`, `"fetched": null`.
-- [ ] Implement: `Setup` subcommand = ensure-artifact (Task 3's trigger) → scan → embed, each step reusing the existing command bodies rather than duplicating them. TTY courtesy: when stdin is a terminal and a transfer is about to start, ask `[y/N]` with the byte count; skip the question when `--yes`, when not a terminal, or when the kill switch is set. Use `std::io::IsTerminal` (Rust 1.70+, no new dependency).
-- [ ] Green; commit `feat(f38): np setup — index now, fetch if needed, and report exactly where it stopped`.
+- [x] Failing test: `np setup <ws> --json` on a fresh vault with no artifact and a dead origin exits **0**, with `scan` counts present, `"vectors": false`, `"offline": true`, and `"fetched": null`; text output ends with `indexed; vectors skipped — offline`.
+- [x] Failing test: `np setup --help` exists and the subcommand parses; an invented flag exits 2.
+- [x] Failing test (gated on `local-model` + `NP_TEST_MODEL_PATH`, prints `NOT COVERAGE` otherwise): with a real artifact already installed, `setup` runs scan → embed and reports `"vectors": true`, `"offline": false`, `"fetched": null`.
+- [x] Implement: `Setup` subcommand = ensure-artifact (Task 3's trigger) → scan → embed, each step reusing the existing command bodies rather than duplicating them. TTY courtesy: when stdin is a terminal and a transfer is about to start, ask `[y/N]` with the byte count; skip the question when `--yes`, when not a terminal, or when the kill switch is set. Use `std::io::IsTerminal` (Rust 1.70+, no new dependency).
+- [x] Green; commit `feat(f38): np setup — index now, fetch if needed, and report exactly where it stopped`.
 
 ## Task 6 — Locks, docs, and the amendment trail
 
 **Files:** `.github/workflows/ci.yml`, `.github/scripts/gates.sh`, `README.md`, `docs/design-m3-hybrid-search.md` §7, `docs/§12 design doc` (rule 1), `docs/backlog-m2-followups.md`
 
-- [ ] Export `NP_NO_AUTO_FETCH=1` for the test rows in CI and in `gates.sh`, with a comment saying why it is a second lock and not the first (unpinned fixture ids already refuse before a transport).
-- [ ] Failing test that proves the lock: a workspace whose `[embeddings] model` names the pinned id, run under `NP_NO_AUTO_FETCH=1`, refuses without attempting a transport. (Task 3 has the shape; keep both — one guards behaviour, one guards CI.)
-- [ ] README: first-run paragraph states plainly that `np embed` may transfer ~310 MB from the pinned origin on a machine that has nothing installed, and gives both kill switches; the "only command that dials out" sentence is amended rather than deleted.
-- [ ] `docs/design-m3-hybrid-search.md` §7: record the amendment — search still never fetches; embed and setup may.
-- [ ] Backlog: F38 card with the ruling dated 2026-11-08 (default true, offline skips), and a line in F34's card that auto-fetch inherits the Windows preflight answer rather than bypassing it.
-- [ ] Full gates `.github/scripts/gates.sh /home/agent/tmp/gates-f38` — every row 0, `NOT COVERAGE` counted; then merge with `--no-ff` and push.
+- [x] Export `NP_NO_AUTO_FETCH=1` for the test rows in CI and in `gates.sh`, with a comment saying why it is a second lock and not the first (unpinned fixture ids already refuse before a transport).
+- [x] Failing test that proves the lock: a workspace whose `[embeddings] model` names the pinned id, run under `NP_NO_AUTO_FETCH=1`, refuses without attempting a transport. (Task 3 has the shape; keep both — one guards behaviour, one guards CI.)
+- [x] README: first-run paragraph states plainly that `np embed` may transfer ~310 MB from the pinned origin on a machine that has nothing installed, and gives both kill switches; the "only command that dials out" sentence is amended rather than deleted.
+- [x] `docs/design-m3-hybrid-search.md` §7: record the amendment — search still never fetches; embed and setup may.
+- [x] Backlog: F38 card with the ruling dated 2026-11-08 (default true, offline skips), and a line in F34's card that auto-fetch inherits the Windows preflight answer rather than bypassing it.
+- [x] Full gates `.github/scripts/gates.sh /home/agent/tmp/gates-f38` — every row 0, `NOT COVERAGE` counted; then merge with `--no-ff` and push.
+
+---
+
+## Execution record (2026-11-09)
+
+Tasks 1–6 shipped on `main`: `9f00d7f`, `200f0f6`, `783e173`+`e72a582`, `aa204e0`, `2c56b9a`, and the locks/docs commit beside this
+record. Three deviations from the plan, each recorded where the ruling lives rather than by editing the plan:
+
++ Task 4's offline path became a **state**, not an error string, and arm (vi) moved to the top of `embed_run::run` after measurement
+  showed an outage being reported as `configuration disabled` (F38 design §5b).
++ Task 4's "search never dials out" test needed `--mode semantic` to be falsifiable at all; the first version passed against a mutant
+  that let search fetch (F38 design §5b, fourth bullet).
++ Task 5 found **F41** — a fresh workspace with fetching switched off is told `configuration disabled` with no remedy line. Filed, not
+  fixed: the wording is pinned in fourteen assertions and F32 chose it deliberately.
+
+Full gates (19 rows, exit 0, `NOT COVERAGE` 0, both real artifacts) at `/home/agent/tmp/gates-f38t6b`. Closure still withheld: CI has
+had no steps since the minutes ran out, so this is "graded locally", not "closed" — see the F38 card's last section.
