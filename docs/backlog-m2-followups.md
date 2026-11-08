@@ -2093,6 +2093,21 @@ one step a user takes. `local-model` is now compiled into both release shapes.
    longer a curiosity. Its A/B/C ruling is now blocking, not backlog.
 4. **MSVC parity** stays unmeasured and refused; `-gnu-cross` naming is where that difference is visible.
 
+**2026-11-08 ~18:15 UTC — owed item 1 discharged, on someone else's hardware.** The operator ran `v0.3.0-rc.1`'s `np.exe`
+(`997ce21f…66c2ffc5`, 16,254,464 B) on Windows 10.0.26300.0 with PowerShell 7.6.9 and sent the log back. Measured, from their run:
+
+* `np embed` → exit 0, `embedded 2`, `errors 0`, `threads 12 of 16 available (auto)`, artifact digest re-checked ok at 295.5 MB.
+  **The inference runtime loads and produces vectors on Windows.** That is the sentence this card existed to earn.
+* Hybrid search → cosine **0.8033** on `kafka.md` (the note that answers the query), second hit 0.7276, `mode:"hybrid"`, `vectors:true`.
+  Semantic-only run → top hit **0.7396**, correct note. Linux scores 0.85/0.80 for the same queries: same shape of answer, no Windows-specific
+  numerical collapse.
+* llama.cpp's own chatter (`load: control-looking token …`, `init: embeddings required but some input tokens were not marked as outputs`) and
+  the F37 fallback sentence both stayed on **stderr** while stdout carried exactly one JSON document under real per-handle redirection — for
+  hybrid *and* `--mode semantic`. The stdout-purity contract holds with a chatty C library linked in.
+* F38's offline arm became observable on a downloaded asset for the first time: dead origin → exit 1, `offline:true`, no host name anywhere.
+
+Still owed: item 2 (README at the next cut), item 3 (**F42's ruling is blocking**), item 4 (MSVC parity — this was mingw-built and unsigned).
+
 ## F44 — two `np` writers on one vault: one of them fails in 5 ms, and `--json` prints nothing at all
 
 **Filed 2026-11-08 from the measurement the operator asked for** ("we definitely need to test this: 2 instances try to access the same vault.
@@ -2123,3 +2138,59 @@ Three things worth naming before anyone fixes it:
 **Not claimed:** anything about Windows/macOS locking (measured on Linux only), and nothing about two writers where one is `embed` — the
 release binary has no runtime, so `embed` refuses before touching the database. Reproduce with: two concurrent `np scan <vault>` in a loop,
 capturing exit codes and stdout byte counts separately.
+
+## F45 — `np search` refuses outright when the index has vectors but the config has no provider, instead of answering by keyword
+
+**Filed 2026-11-08 from round seven.** The operator tripped it with my own harness: Stages 6, 8 and 11 delete the config on their way out, so
+the state *"workspace database holds embeddings, `config.toml` says `embeddings.provider = "none"`"* is produced by every run of the test script
+and reached by real users whenever the data folder and the config file stop travelling together — moved profile, second machine, model
+uninstalled, `NP_NO_AUTO_FETCH` box with a colleague's vault copied in.
+
+Measured matrix (vault with an index **and** vectors, query `broker`, no config on disk):
+
+| invocation | exit | what came back |
+| --- | --- | --- |
+| `np search <v> broker` (default = hybrid) | 1 | `np: embedding disabled: embeddings.provider = "none" — set it to "local-model" and name an installed model with embeddings.model, then run np embed` |
+| `np search <v> broker --json` | 1 | nothing on stdout; the same sentence on stderr |
+| `np search <v> broker --mode semantic` | 1 | same refusal |
+| `np search <v> broker --mode keyword` | **0** | hits, `mode:"keyword"`, `vectors:true` |
+
+So the keyword half demonstrably works and is not what failed. The default mode — which is the one an application calls without knowing whether
+this vault has ever been embedded — hands back a configuration error instead of results. F36's promise reads the other way: hybrid was specified
+as *both halves, degrading with a note* (`vectors:false` plus `note`) when there are no vectors, and that fallback fires correctly when the index
+has **no** vectors (`crates/np-cli/src/main.rs:820`: `if semantic_wanted && (mode != SearchMode::Hybrid || present)` — hybrid-without-vectors
+skips the provider entirely). The uncovered corner is precisely *hybrid + vectors present + provider unbuildable*: `present` is true, so we enter
+the provider branch and a `ProviderState::Placeholder` becomes a hard refusal.
+
+**Why I think it is a real defect rather than a defensible stance.** The refusal is right for `--mode semantic` — the user asked for something
+this machine cannot do. For the default mode the user asked "find me notes about this", and there is an answer available in FTS5. A caller that
+did not ask for semantics gets exit 1 and zero bytes, which is indistinguishable from "search is broken" — and `--json` printing nothing means
+the machine-readable channel carries no explanation either (same failure shape as F44's silent loser).
+
+**Options.**
+* **A — degrade with a note (my recommendation).** hybrid + vectors + provider unbuildable → keyword results, `vectors:false`, and
+  `note:"embeddings present but embeddings.provider is none: …"`. Keeps F36's contract ("hybrid never fails because one half is missing")
+  consistent regardless of *why* the semantic half is missing. Cost: a user who wanted semantics silently gets keyword — mitigated by the note,
+  and by `--mode semantic` still refusing loudly.
+* **B — keep refusing, fix the machine-readable half.** Refusal stays, but `--json` emits `{hits:[], mode:"hybrid", vectors:false, error:{…}}`
+  at exit 1 so a caller can branch. Cheaper, and honest about "you asked me for hybrid and I cannot do hybrid".
+* **C — leave it.** Costs an app integrating `np search --json` a special case for a state the harness itself creates on every run.
+
+**Owed:** ruling, then tests pinning *both* halves (the fallback results AND the note text), because F36's existing assertions cover only
+"no vectors at all". Stage 12 of `run-stage5-7.ps1` measures today's behaviour and labels it `F45 (open)` so a ruling shows up as a diff.
+
+## F46 — `np` creates an empty `<id>.models` directory for a workspace with nothing installed, and tooling reads it as "a model is here"
+
+**Filed 2026-11-08 from round seven.** Observed on Windows at 18:15:18 during a plain `np scan`: a sibling directory
+`<workspace-id>.models/`, 0 entries, next to the workspace sqlite. Nothing was fetched and nothing was installed; `np models list` correctly
+reports none. The directory is created by `crates/np-core/src/models.rs:1582` (`fs::create_dir_all(...)` on the models dir) which runs on paths
+that only *want* to know whether something is installed.
+
+Why it matters more than an empty folder: my F37 evidence line printed ``.models dirs : N  (a fetched model lands beside the index)`` and counted
+stubs, so a machine with no model at all could read as "N model directories present". Anyone debugging a "why is there no model" report has to
+distinguish real installs from stubs by looking inside — which is exactly the check the directory name was supposed to save them.
+
+**Options.** A: create the directory lazily, only where something is written into it (`fetch`, `install`), so its existence means what its name
+says. B: keep creating it and document that emptiness is normal, then fix consumers (my script now counts `.models` directories *containing
+files* and prints both numbers). A is the smaller lie; B is the smaller change. **Owed:** ruling plus, either way, a test that `scan` on a fresh
+workspace does not leave a directory claiming a model exists — or a doc line saying it may.
