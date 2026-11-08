@@ -106,8 +106,10 @@ search works the moment indexing finishes), fetches the model if this workspace 
 searchable and nothing needs fixing but the cable — while any other stop on the vector half exits 1.
 
 On the **release binaries**, which are built without the inference feature, the vector half cannot run at all: `setup` indexes and then
-refuses with `runtime not built` at exit 1, naming `--features local-model` and keyword search. That is F40's arm and it is the correct
-answer — a binary that cannot read the model must not spend 310 MB fetching it.
+refuses at exit 1 — never with a download, because a binary that cannot read the model must not spend 310 MB fetching it. What the refusal
+*says* depends on what it found first: an installed artifact gives `runtime not built`, naming `--features local-model` and keyword search
+(F40's arm); a vault with nothing installed yet gives `configuration disabled`, which names a key you set correctly and no remedy — that
+wording is a known defect (**F41**), not the behaviour to expect forever.
 
 **The first run downloads a model, and says so before byte one.** Since F38, `np embed` and `np setup` fetch the pinned artifact when
 it is missing: ~310 MB for the text encoder (`mmproj` adds ~555 MB in a `vision` build), announced with its id, size and the *kind* of
@@ -196,7 +198,11 @@ Artifacts live **per workspace**, next to that workspace's database:
 ```
 
 `<key>` is a digest of the workspace's absolute path as bytes, so two spellings of one directory share one index and two
-directories never share it. `<data_dir>` is `$XDG_DATA_HOME` else `$HOME/.local/share` (`%LOCALAPPDATA%` on Windows).
+directories never share it. `<data_dir>` is `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows it is
+`%LOCALAPPDATA%\note-processor` — nested under a folder that says whose it is, like the config file always was (**F37**). Before that
+change Windows wrote `workspaces/` and `workspaces.sqlite` straight into `%LOCALAPPDATA%`, which is where every application writes; if
+that is where your index is, this release still reads it there and says so on stderr rather than reporting your notes as new.
+An explicit `data_dir` in the config file is an instruction, not a location the program moved, and is never overridden.
 
 ### Option A — fetch it
 
@@ -204,7 +210,9 @@ directories never share it. `<data_dir>` is `$XDG_DATA_HOME` else `$HOME/.local/
 np models fetch ~/Notes --id embeddinggemma-2
 ```
 
-The **only** command in the program that opens a socket. It prints where it is about to dial, in class terms and never as a URL:
+The command you run when you want to place the model by hand. (It used to be the only thing in the program that opened a socket;
+since **F38** `np embed` and `np setup` reach the same origin themselves when the artifact is missing — see the first-run note above for
+the three ways to refuse.) Both forms print where they are about to dial, in class terms and never as a URL:
 
 ```text
 origin      this build's compiled-in default — no [models] base_url is configured (an empty NP_MODELS_BASE_URL counts as unset)

@@ -20,9 +20,11 @@ mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
-    config_file_path, CatalogConfig, Config, ConfigError, EmbeddingProvider, EmbeddingsConfig,
-    MarkerConfig, ModelsConfig, SearchConfig, ThreadCount, WorkspaceRegistry,
-    DEFAULT_EMBEDDING_TOKENS, MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS,
+    config_file_path, data_dir_for, legacy_data_dir_override, resolve_data_dir, CatalogConfig,
+    Config, ConfigError, DataDirPlatform, EmbeddingProvider, EmbeddingsConfig, MarkerConfig,
+    ModelsConfig, SearchConfig, ThreadCount, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS,
+    MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS, REGISTRY_FILE, WINDOWS_DATA_SUBDIR,
+    WORKSPACES_DIR,
 };
 use np_core::search::SearchMode;
 use rusqlite::Connection;
@@ -159,7 +161,14 @@ impl TestEnv {
     }
 
     fn data_dir_of(tmp: &TempDir) -> PathBuf {
-        tmp.path().join("data")
+        // F37 nested the Windows data dir under the program folder, while this harness installs `%LOCALAPPDATA%` itself.
+        // So on that shape the effective directory is one level deeper than the variable. Spelled out per platform rather
+        // than taken from `default_data_dir()`: this value is the expectation the product is measured against, and a test
+        // that computes its own expectation from the code under test cannot fail.
+        #[cfg(windows)]
+        return tmp.path().join("data").join(WINDOWS_DATA_SUBDIR);
+        #[cfg(not(windows))]
+        return tmp.path().join("data");
     }
 }
 
@@ -2303,4 +2312,223 @@ fn the_kill_switch_works_without_a_file_to_veto_it() {
     // Mutation this catches: reading the env var at load time and folding it into the field. That would make
     // `auto_fetch` mean two different things depending on when `Config::load` ran, and a caller holding a long-lived
     // Config (a daemon) could never turn fetching off mid-life.
+}
+
+// ---------------------------------------------------------------------------
+// F37 — where the data directory lands, and what happens to an index that predates the nesting.
+//
+// The Windows arms of this layout cannot be compiled on CI's Linux runners or on this development host (`ring` and
+// `libsqlite3-sys` need MSVC `lib.exe`), which is exactly why resolution takes a `DataDirPlatform` value instead of reading
+// `cfg` itself: the shape is chosen by production with `cfg`, and every shape is *checked* here. A layout fix whose Windows
+// half never runs would be a layout fix nobody verified — the bug this card was filed about survived six CI rows for precisely
+// that reason.
+// ---------------------------------------------------------------------------
+
+/// `%LOCALAPPDATA%` is shared by every application; config has always nested under `note-processor` and data did not, so one
+/// program had two answers to "where do you keep things" on one platform (F37). The fix nests data the same way.
+#[test]
+fn the_windows_data_dir_nests_the_program_folder_like_config_already_did() {
+    let base = PathBuf::from(r"C:\Users\ana\AppData\Local");
+    let got = data_dir_for(DataDirPlatform::Windows, &|key| match key {
+        "LOCALAPPDATA" => Some(base.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        got,
+        Some(base.join(WINDOWS_DATA_SUBDIR)),
+        "the index has to sit under a folder that says whose it is"
+    );
+    // The suffix is spelled by the library, not by this case, so README and code cannot drift apart quietly.
+    assert_eq!(WINDOWS_DATA_SUBDIR, "note-processor");
+}
+
+/// A Windows shell with no `%LOCALAPPDATA%` gets a refusal, not a path built beside the current directory — the same rule
+/// `Config::load` enforces on every platform.
+#[test]
+fn a_windows_environment_naming_nothing_still_refuses_rather_than_guessing() {
+    assert_eq!(data_dir_for(DataDirPlatform::Windows, &|_key| None), None);
+    // An empty variable is "unset" here, the way it already is for `XDG_DATA_HOME`: `env_path` filters it.
+    // This case pins the *shape's* behaviour with a lookup that returns nothing; the empty-string filter is
+    // `env_path`'s own contract, unchanged by F37.
+}
+
+/// Unix is untouched: `$XDG_DATA_HOME` as-is, else `$HOME/.local/share`, else nothing. Asserting this on the same seam keeps
+/// "we fixed Windows" from becoming "and accidentally moved everybody else's index".
+#[test]
+fn the_unix_shape_is_unchanged_by_the_seam() {
+    let xdg = PathBuf::from("/srv/notes-data");
+    let home = PathBuf::from("/home/ana");
+    let both = |key: &str| match key {
+        "XDG_DATA_HOME" => Some(xdg.clone()),
+        "HOME" => Some(home.clone()),
+        _ => None,
+    };
+    assert_eq!(
+        data_dir_for(DataDirPlatform::Unix, &both),
+        Some(xdg.clone())
+    );
+
+    let home_only = |key: &str| (key == "HOME").then(|| home.clone());
+    assert_eq!(
+        data_dir_for(DataDirPlatform::Unix, &home_only),
+        Some(home.join(".local/share"))
+    );
+    assert_eq!(data_dir_for(DataDirPlatform::Unix, &|_key| None), None);
+}
+
+/// **The fallback that keeps a vault from lying about itself.** An index is keyed by workspace path, so a data directory that
+/// moved reads as an empty workspace — and a vault holding months of notes answering `added 214` is the worst first
+/// experience this migration could produce. For one release, an old index is read where it stands.
+#[test]
+fn an_index_left_where_it_was_before_f37_is_still_read_from_there() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let nested = tmp.path().join("Local").join(WINDOWS_DATA_SUBDIR);
+    let legacy = tmp.path().join("Local");
+    fs::create_dir_all(&nested).expect("test setup: nested dir");
+    fs::create_dir_all(legacy.join(WORKSPACES_DIR)).expect("test setup: legacy workspaces dir");
+    fs::write(
+        legacy.join(REGISTRY_FILE),
+        b"not a database, and this case never opens it",
+    )
+    .expect("test setup: legacy registry");
+
+    assert_eq!(
+        legacy_data_dir_override(&nested, Some(&legacy)),
+        Some(legacy.clone()),
+        "the old location holds our index, so this run reads there"
+    );
+}
+
+/// The nested location wins as soon as it holds **our** registry: a user who installed fresh after upgrading is not dragged
+/// back to whatever unrelated `workspaces.sqlite` may sit in `%LOCALAPPDATA%`.
+#[test]
+fn a_nested_directory_holding_our_registry_wins_over_the_old_one() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let nested = tmp.path().join("Local").join(WINDOWS_DATA_SUBDIR);
+    let legacy = tmp.path().join("Local");
+    fs::create_dir_all(&nested).expect("test setup: nested dir");
+    fs::create_dir_all(legacy.join(WORKSPACES_DIR)).expect("test setup: legacy workspaces dir");
+    fs::write(nested.join(REGISTRY_FILE), b"ours").expect("test setup: nested registry");
+    fs::write(legacy.join(REGISTRY_FILE), b"the old one").expect("test setup: legacy registry");
+
+    assert_eq!(legacy_data_dir_override(&nested, Some(&legacy)), None);
+}
+
+/// An empty or absent legacy directory vetoes nothing — the ordinary fresh install. And a half-written legacy location (the
+/// `workspaces/` directory with no registry beside it, which is what an interrupted first run leaves) still counts as ours:
+/// reading the wrong directory is the failure this function exists to prevent, in both directions.
+#[test]
+fn an_empty_legacy_location_vetoes_nothing_and_a_half_written_one_still_counts() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let nested = tmp.path().join("Local").join(WINDOWS_DATA_SUBDIR);
+    let legacy = tmp.path().join("Local");
+    fs::create_dir_all(&nested).expect("test setup: nested dir");
+    fs::create_dir_all(&legacy).expect("test setup: legacy dir, empty");
+
+    assert_eq!(legacy_data_dir_override(&nested, Some(&legacy)), None);
+    // No legacy directory at all (a machine that never ran an older build): same answer, no filesystem error.
+    assert_eq!(
+        legacy_data_dir_override(&nested, Some(&legacy.join("nope"))),
+        None
+    );
+
+    fs::create_dir_all(legacy.join(WORKSPACES_DIR)).expect("test setup: legacy workspaces only");
+    assert_eq!(
+        legacy_data_dir_override(&nested, Some(&legacy)),
+        Some(legacy),
+        "a `workspaces/` directory with no registry is still our index"
+    );
+}
+
+/// There was never a pre-F37 Windows-shaped location on Unix, so there is nothing to fall back to — asserted through the one
+/// function that decides, with an environment deliberately holding both variables: on the Unix shape `%LOCALAPPDATA%` is
+/// ignored outright, and a rule that moved somebody's data dir based on a variable they set for another platform would be
+/// caught here.
+#[test]
+fn the_unix_shape_has_no_legacy_location_at_all() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let local = tmp.path().join("Local");
+    fs::create_dir_all(local.join(WORKSPACES_DIR)).expect("test setup: a legacy-looking index");
+    fs::write(local.join(REGISTRY_FILE), b"unrelated to unix").expect("test setup: registry");
+    let xdg = tmp.path().join("xdg-data");
+
+    let lookup = |key: &str| match key {
+        "LOCALAPPDATA" => Some(local.clone()),
+        "XDG_DATA_HOME" => Some(xdg.clone()),
+        _ => None,
+    };
+    let (dir, legacy) = resolve_data_dir(None, DataDirPlatform::Unix, &lookup);
+    assert_eq!(dir, xdg, "the Unix shape resolves to XDG and nothing else");
+    assert_eq!(
+        legacy, None,
+        "and there is no older Unix location to fall back to"
+    );
+}
+
+/// A `data_dir` written in a config file is an instruction, not a place we moved. The fallback applies to the OS default and
+/// nowhere else — otherwise the program would second-guess a path chosen on purpose, which is a worse bug than the layout.
+#[test]
+fn an_explicit_data_dir_in_the_file_is_never_second_guessed() {
+    let env = TestEnv::install();
+    let explicit = env._tmp.path().join("chosen-place");
+    fs::create_dir_all(&explicit).expect("test setup: explicit data dir");
+    let config_dir = env._tmp.path().join("config");
+    fs::create_dir_all(&config_dir).expect("test setup: config dir");
+    let cfg_path = write_config(
+        &config_dir,
+        &format!("data_dir = {}\n", toml_str(&explicit.display().to_string())),
+    );
+
+    let cfg = Config::load(Some(&cfg_path)).expect("the file is valid");
+    assert_eq!(cfg.data_dir, explicit);
+    assert_eq!(
+        cfg.legacy_data_dir, None,
+        "an operator-chosen directory cannot be a location we moved"
+    );
+}
+
+/// **The explicit-directory rule, asserted in the shape where it could actually have been broken.** The Unix-only version of
+/// this claim above is weak by construction: there is no pre-F37 location on this platform, so a mutant that applied the
+/// fallback to an operator's chosen directory would survive it. Here the same rule is driven through the Windows shape with a
+/// `%LOCALAPPDATA%` that exists as a tempdir and genuinely holds an index — and the file's answer still wins.
+#[test]
+fn an_operator_chosen_directory_wins_even_when_the_legacy_index_is_sitting_there() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let local = tmp.path().join("Local");
+    let chosen = tmp.path().join("chosen-by-hand");
+    fs::create_dir_all(local.join(WORKSPACES_DIR)).expect("test setup: legacy index");
+    fs::write(local.join(REGISTRY_FILE), b"ours, from before the nesting")
+        .expect("test setup: registry");
+    fs::create_dir_all(&chosen).expect("test setup: chosen dir");
+
+    let lookup = |key: &str| (key == "LOCALAPPDATA").then(|| local.clone());
+
+    // (a) The fallback really would fire here — asserted first, so (b) cannot pass because nothing was ever pending.
+    let (dir, legacy) = resolve_data_dir(None, DataDirPlatform::Windows, &lookup);
+    assert_eq!(
+        dir,
+        local
+            .join(WINDOWS_DATA_SUBDIR)
+            .parent()
+            .expect("test setup: parent")
+    );
+    assert_eq!(
+        legacy,
+        Some(local.clone()),
+        "the fallback is armed in this shape"
+    );
+
+    // (b) With the file's word in front of it, nothing moves and nothing is reported.
+    let (dir, legacy) = resolve_data_dir(Some(&chosen), DataDirPlatform::Windows, &lookup);
+    assert_eq!(dir, chosen, "an instruction is not a location we moved");
+    assert_eq!(
+        legacy, None,
+        "and there is no fallback to report about a path nobody relocated"
+    );
+
+    // (c) And on the Unix shape the whole question does not arise.
+    let lookup_unix = |key: &str| (key == "XDG_DATA_HOME").then(|| chosen.clone());
+    let (dir, legacy) = resolve_data_dir(None, DataDirPlatform::Unix, &lookup_unix);
+    assert_eq!(dir, chosen);
+    assert_eq!(legacy, None);
 }

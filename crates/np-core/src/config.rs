@@ -14,7 +14,13 @@ use crate::db::BUSY_TIMEOUT_MS;
 use crate::loglevel::{resolve_level_from_env, LogLevel};
 
 /// Name of the registry database inside the data dir.
-const REGISTRY_FILE: &str = "workspaces.sqlite";
+///
+/// Public because **F37**'s fallback has to ask a directory whether it holds our index, and a test that spells the name by
+/// hand would pass even if the two stopped agreeing.
+pub const REGISTRY_FILE: &str = "workspaces.sqlite";
+/// The directory of per-workspace databases inside the data dir — the other half of the same question (**F37**): an
+/// interrupted first run can leave one of these without a registry beside it, and that still counts as our index.
+pub const WORKSPACES_DIR: &str = "workspaces";
 /// Leading bytes of the workspace-path digest used as its database file name,
 /// i.e. 16 lowercase hex characters.
 const DB_HASH_BYTES: usize = 8;
@@ -648,8 +654,14 @@ impl Default for SearchConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// OS data dir, from `$XDG_DATA_HOME` else `$HOME/.local/share`
-    /// (Windows: `%LOCALAPPDATA%`). Empty only when the environment names none.
+    /// (Windows: `%LOCALAPPDATA%\note-processor`, nested since **F37**). Empty only when the environment names none.
     pub data_dir: PathBuf,
+    /// **F37**: set when the OS default resolved to its nested location but this program's index was found at the pre-F37
+    /// one, so `data_dir` points back at the old place for this release. A diagnostic for stderr, never part of a report
+    /// (`#[serde(skip)]`): every path a document prints is already the effective one, and a second path in the same document
+    /// would read as though two indexes existed.
+    #[serde(skip)]
+    pub legacy_data_dir: Option<PathBuf>,
     /// Catalog layout.
     pub catalog: CatalogConfig,
     /// Status markers.
@@ -667,8 +679,13 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        // One resolution, both halves (`os_default_data_dir`), so the fallback cannot be applied in one entry point and
+        // forgotten in another — which matters because `Config::default()` *is* the production path when no config file
+        // exists yet: exactly the person upgrading from an older release whose index this has to find.
+        let (data_dir, legacy_data_dir) = os_default_data_dir();
         Self {
-            data_dir: default_data_dir().unwrap_or_default(),
+            data_dir,
+            legacy_data_dir,
             catalog: CatalogConfig::default(),
             markers: MarkerConfig::default(),
             embeddings: EmbeddingsConfig::default(),
@@ -710,11 +727,20 @@ impl Config {
                 None => Config::default(),
             },
         };
-        if cfg.data_dir.as_os_str().is_empty() {
-            // A config file that does not name a data dir means the OS one, which
-            // `Config::default()` already resolved; reaching here empty means the environment
-            // named nothing either.
-            cfg.data_dir = default_data_dir().ok_or(ConfigError::MissingField("data_dir"))?;
+        {
+            // One call answers both halves (**F37**): the file's `data_dir` wins when it named one — an instruction, not a
+            // location we moved — and only the OS default is eligible for the pre-nesting fallback. Resolving through
+            // [`resolve_data_dir`] rather than branching here is what lets a Linux test assert the explicit-directory rule in
+            // the *Windows* shape, where the fallback could actually have applied.
+            let explicit = (!cfg.data_dir.as_os_str().is_empty()).then(|| cfg.data_dir.clone());
+            let (dir, legacy) = os_data_dir(explicit.as_deref());
+            if dir.as_os_str().is_empty() {
+                // Neither the file nor the environment named a data dir. Every path derived from it would go relative — a
+                // `workspaces/` directory beside whatever directory the command happened to run in — so this refuses.
+                return Err(ConfigError::MissingField("data_dir"));
+            }
+            cfg.data_dir = dir;
+            cfg.legacy_data_dir = legacy;
         }
         // Refuse an indent the renderer cannot be asked to draw, from whatever source it arrived — this runs after the
         // file and environment merge, so a future override is covered too. It travels as `Io(InvalidData)` rather than a
@@ -787,7 +813,7 @@ impl Config {
     /// database and the artifact directory cannot be placed in different directories by two format strings.
     fn workspaces_join(&self, key: &str, extension: &str) -> PathBuf {
         self.data_dir
-            .join("workspaces")
+            .join(WORKSPACES_DIR)
             .join(format!("{key}.{extension}"))
     }
 }
@@ -1111,24 +1137,159 @@ fn config_dir() -> Option<PathBuf> {
     )
 }
 
-/// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share` (Windows: `%LOCALAPPDATA%`).
-/// `None` when the environment names no data directory at all — what [`Config::load`] refuses
-/// rather than deriving paths relative to the current directory.
-#[cfg(windows)]
-pub fn default_data_dir() -> Option<PathBuf> {
-    dir_from(env_path("LOCALAPPDATA"), None, None)
+/// The folder this program nests its data files in on Windows (**F37**).
+///
+/// `config_dir()` has always appended a program folder (`%APPDATA%\note-processor`); the data side appended nothing, so a
+/// Windows user shared `%LOCALAPPDATA%` — the directory every application shares — with two generically-named entries
+/// (`workspaces`, `workspaces.sqlite`) and could not find their own index. The measurement and the ruling are F37 in
+/// `docs/backlog-m2-followups.md`.
+pub const WINDOWS_DATA_SUBDIR: &str = "note-processor";
+
+/// Which data-directory shape to resolve.
+///
+/// **A value rather than a `cfg`, on purpose** (**F37**). Production picks the platform with `cfg` below and cannot do
+/// otherwise; but CI is Linux, this development host cannot compile the Windows arm at all (`ring` and `libsqlite3-sys` need
+/// MSVC `lib.exe`), and a layout fix whose Windows half never executes is a layout fix nobody verified — which is exactly how
+/// the shape this card describes survived six CI rows. Passing the shape in lets `tests/config.rs` resolve both layouts on
+/// one machine. It chooses *paths*, nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataDirPlatform {
+    /// `$XDG_DATA_HOME`, else `$HOME/.local/share`. Unchanged by F37: an unqualified `workspaces/` inside
+    /// `~/.local/share` is far less exposed than in a shared Windows directory — which is why this is a Windows-only card.
+    Unix,
+    /// `%LOCALAPPDATA%\note-processor`: nested, as config already was.
+    Windows,
 }
 
-/// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share` (Windows: `%LOCALAPPDATA%`).
-/// `None` when the environment names no data directory at all — what [`Config::load`] refuses
-/// rather than deriving paths relative to the current directory.
+/// Resolve the OS data dir from supplied environment values: pure, touching neither the real environment nor the disk.
+///
+/// `None` when the platform's variable is unset — [`Config::load`] refuses that rather than deriving
+/// `workspaces/<hash>.sqlite` relative to the current directory.
+pub fn data_dir_for(
+    platform: DataDirPlatform,
+    lookup: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match platform {
+        // Nested since F37; `%LOCALAPPDATA%` is otherwise used as-is, with no `$HOME` fallback under it.
+        DataDirPlatform::Windows => lookup("LOCALAPPDATA").map(|dir| dir.join(WINDOWS_DATA_SUBDIR)),
+        DataDirPlatform::Unix => dir_from(
+            lookup("XDG_DATA_HOME"),
+            lookup("HOME"),
+            Some(".local/share"),
+        ),
+    }
+}
+
+/// The one-release read-fallback (**F37**): when the nested location holds no index of ours and the pre-F37 location does,
+/// this run keeps using the old directory.
+///
+/// What it prevents is a lie about the user's own files: an index is keyed by workspace path, so a moved data directory reads
+/// as an empty workspace and a vault that has held months of notes answers `added 214`. That false report is the single worst
+/// first experience this migration could produce, and it is the entire reason the fallback exists.
+///
+/// Conservative in three ways: the nested location wins as soon as it holds **our** registry file (so a fresh install after
+/// upgrading is not dragged back to whatever unrelated `workspaces.sqlite` sits in `%LOCALAPPDATA%`); an empty or absent
+/// legacy directory vetoes nothing; and either half counts as "ours" there — the registry, or the `workspaces/` directory
+/// beside it, since an interrupted first run can leave one without the other. Falling back means reading *and writing* the
+/// old place: splitting a registry into one directory and per-workspace databases into another is a worse bug than the layout
+/// this card fixes. Removing the fallback after one release is its own change with its own relocation step, recorded as owed
+/// on the card.
+pub fn legacy_data_dir_override(nested: &Path, legacy: Option<&Path>) -> Option<PathBuf> {
+    // `?` rather than a `let…else`: this function's whole answer is "no override unless every condition holds", so each
+    // early exit is the same shape and spelling it with `?` keeps the three conditions readable as one list.
+    let legacy = legacy?;
+    if nested.join(REGISTRY_FILE).exists() {
+        return None;
+    }
+    if legacy.join(REGISTRY_FILE).is_file() || legacy.join(WORKSPACES_DIR).is_dir() {
+        Some(legacy.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Which [`DataDirPlatform`] this build's [`default_data_dir`] resolves — the one place `cfg` chooses it, so the fallback and
+/// the paths can never disagree about which shape they are talking about.
+#[cfg(windows)]
+pub fn platform_of_default() -> DataDirPlatform {
+    DataDirPlatform::Windows
+}
+
+/// Which [`DataDirPlatform`] this build's [`default_data_dir`] resolves. See the Windows arm.
+#[cfg(not(windows))]
+pub fn platform_of_default() -> DataDirPlatform {
+    DataDirPlatform::Unix
+}
+
+/// Which directory a run uses, and whether it fell back: `(effective dir, legacy dir we are reading instead)`.
+///
+/// **The whole decision, in one pure function** — which is what makes the Windows shape testable on Linux (**F37**). Both
+/// questions the layout asks are here: does the operator's own `data_dir` win (it always does; it is an instruction, not a
+/// place we moved), and if we are using the OS default, is our index still sitting at the pre-nesting location? Passing the
+/// platform and the environment in — rather than reading `cfg` and `env::var_os` inside — lets `tests/config.rs` drive the
+/// Windows shape with a `%LOCALAPPDATA%` that does not exist, which is the only way this arm gets verified at all.
+///
+/// An empty first element means nothing was resolved: no explicit directory, and the environment named none.
+pub fn resolve_data_dir(
+    explicit_dir: Option<&Path>,
+    platform: DataDirPlatform,
+    lookup: &dyn Fn(&str) -> Option<PathBuf>,
+) -> (PathBuf, Option<PathBuf>) {
+    if let Some(dir) = explicit_dir {
+        return (dir.to_path_buf(), None);
+    }
+    let Some(nested) = data_dir_for(platform, lookup) else {
+        return (PathBuf::new(), None);
+    };
+    match legacy_data_dir_override(&nested, legacy_location(platform, lookup).as_deref()) {
+        Some(legacy) => (legacy.clone(), Some(legacy)),
+        None => (nested, None),
+    }
+}
+
+/// Where this program's data sat **before** F37 nested it, or `None` on a shape that never had a separate location.
+///
+/// Takes the environment as a parameter so [`resolve_data_dir`] stays pure — which is what lets the Windows arm run on Linux CI
+/// against a `%LOCALAPPDATA%` that is a tempdir rather than a registry this host cannot create. Empty counts as unset, the way
+/// `env_path` already treats it.
+fn legacy_location(
+    platform: DataDirPlatform,
+    lookup: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match platform {
+        DataDirPlatform::Windows => {
+            lookup("LOCALAPPDATA").filter(|value| !value.as_os_str().is_empty())
+        }
+        DataDirPlatform::Unix => None,
+    }
+}
+
+/// The OS default, with **F37**'s one-release fallback applied: `(effective dir, legacy dir we fell back to)`. Both halves come
+/// from one call so no entry point can apply the nesting and forget the fallback. An empty first element means the
+/// environment named nothing, which [`Config::load`] refuses.
+fn os_default_data_dir() -> (PathBuf, Option<PathBuf>) {
+    resolve_data_dir(None, platform_of_default(), &|key| env_path(key))
+}
+
+/// The same resolution with the file's word in front of it: `explicit` is what a config file named, if anything.
+fn os_data_dir(explicit: Option<&Path>) -> (PathBuf, Option<PathBuf>) {
+    resolve_data_dir(explicit, platform_of_default(), &|key| env_path(key))
+}
+
+/// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows `%LOCALAPPDATA%\note-processor` (**F37**).
+/// `None` when the environment names no data directory at all — what [`Config::load`] refuses rather than deriving paths
+/// relative to the current directory. Note this is the *nested* answer; use [`os_default_data_dir`] for the one an actual run
+/// should use, which may be the pre-F37 location for one release.
+#[cfg(windows)]
+pub fn default_data_dir() -> Option<PathBuf> {
+    data_dir_for(DataDirPlatform::Windows, &|key| env_path(key))
+}
+
+/// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share`. See the Windows arm for what F37 changed there and why this shape
+/// needed no change. `None` when the environment names nothing, which [`Config::load`] refuses.
 #[cfg(not(windows))]
 pub fn default_data_dir() -> Option<PathBuf> {
-    dir_from(
-        env_path("XDG_DATA_HOME"),
-        env_path("HOME"),
-        Some(".local/share"),
-    )
+    data_dir_for(DataDirPlatform::Unix, &|key| env_path(key))
 }
 
 /// The workspaces this program has seen, in `<data_dir>/workspaces.sqlite` —

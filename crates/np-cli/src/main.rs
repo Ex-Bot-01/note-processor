@@ -1428,7 +1428,30 @@ fn parse_dim(raw: &str) -> Result<NonZeroU16, String> {
 /// than deriving `workspaces/<hash>.sqlite` next to the current directory, and a model command that guessed a
 /// data dir would install artifacts nobody can find.
 fn load_config() -> Result<Config, Box<dyn Error>> {
-    Config::load(None).map_err(|err| format!("configuration error: {err}").into())
+    let cfg = Config::load(None).map_err(|err| format!("configuration error: {err}"))?;
+    // **F37's one-release note, on stderr.** Stdout stays exactly one document when `--json` is asked for — the fact this
+    // line carries is about *where* the run is reading from, not about the run's result, and a reader who needs it is a
+    // human standing at the machine. Nothing here is actionable: that is the point of the fallback, and saying "moved"
+    // would imply a move happened, which this release deliberately does not do.
+    if let Some(legacy) = &cfg.legacy_data_dir {
+        let _ = writeln!(io::stderr(), "np: {}", legacy_data_dir_note(legacy));
+    }
+    Ok(cfg)
+}
+
+/// The sentence [`load_config`] prints when **F37**'s fallback found an index at the pre-nesting Windows location.
+///
+/// A function rather than an inline literal for one reason: the fallback itself cannot happen on this platform or on CI
+/// (Unix has no pre-nesting shape to fall back from), so the *words* are the only part of this path that Linux can check at
+/// all. What they must do is name the directory, say no action is needed, and stay out of the report — asserted in this
+/// module's tests, while the resolution that decides whether they print is asserted in
+/// `crates/np-core/tests/config.rs` through [`np_core::config::DataDirPlatform`].
+fn legacy_data_dir_note(legacy: &Path) -> String {
+    format!(
+        "reading your index from {} — where it was written before this release nested its data folder. \
+         nothing to do: it stays there until a later release moves it",
+        legacy.display()
+    )
 }
 
 /// This workspace's database, opened in the order §3 step 0 requires.
@@ -2100,6 +2123,27 @@ fn now_secs() -> i64 {
 
 #[cfg(all(test, feature = "fetch"))]
 mod tests {
+
+    /// **F37**: the fallback note is the only part of that path a Linux machine can execute, so it is tested here — while the
+    /// decision to print it is tested in np-core, where both platform shapes resolve. Together they cover the sentence and
+    /// the condition; neither alone would be evidence about the other.
+    #[test]
+    fn the_fallback_note_names_the_index_and_asks_for_nothing() {
+        let note = legacy_data_dir_note(std::path::Path::new(r"C:\Users\ana\AppData\Local"));
+        assert!(
+            note.contains(r"C:\Users\ana\AppData\Local"),
+            "it has to name the directory it is reading: {note}"
+        );
+        assert!(
+            note.contains("nothing to do"),
+            "a person reading this must not go looking for a fix: {note}"
+        );
+        assert!(
+            !note.contains("moved"),
+            "this release reads where the index is; it does not claim to have moved anything: {note}"
+        );
+    }
+
     use super::*;
 
     /// The two arms of the fetch report's free-space line, and the column it shares with the member lines. Pinned on **both**

@@ -2828,6 +2828,83 @@ fn setup_is_a_command_and_clap_owns_its_argument_errors() {
     );
 }
 
+/// **A release binary's `np setup`, which is the shape most people will actually run.** The published assets are built without the
+/// inference feature, so the vector half cannot work at all: setup must index, then refuse with F40's arm naming the feature to build
+/// with and the search mode that still answers — exit 1, and `vectors:false` in the document. README says this in as many words, so the
+/// sentence it promises is asserted here rather than inferred from how the code reads.
+#[cfg(not(feature = "local-model"))]
+#[test]
+fn setup_on_a_build_without_inference_indexes_and_names_the_feature() {
+    let ws = workspace();
+    fs::write(
+        ws.root.join("gamma.md"),
+        "# Gamma\n\nThe ledger was audited by the broker.\n",
+    )
+    .expect("test setup: write a note");
+    // `EMBED_MODEL`, not a pinned id: this case ends with `np models install` placing bytes under that name, and the
+    // default-feature build cannot fetch anything regardless of which id is named.
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+
+    let json = run(&mut ws.command(&["setup", "--json"]));
+    assert_eq!(json.code(), 1, "\n{}", json.stdout());
+    let doc: serde_json::Value =
+        serde_json::from_str(&json.stdout()).expect("a refusal still prints its document");
+    assert_eq!(
+        doc["vectors"], false,
+        "this build cannot make vectors: {doc}"
+    );
+    assert_eq!(
+        doc["offline"], false,
+        "nothing was attempted and nothing timed out — this is a compile-time shape, not a network state"
+    );
+    assert_eq!(doc["fetched"], serde_json::Value::Null);
+    assert!(
+        doc["scan"]["added"].as_u64().unwrap_or(0) >= 1,
+        "the index half still ran: {doc}"
+    );
+
+    let err = json.stderr();
+    // **Today's wording is F41, asserted rather than endorsed.** A fresh vault has no `models` row, and embed_run's arm (ii)
+    // answers that before any build-shape question is asked — so a release binary on a new vault says `configuration
+    // disabled`, naming a config key the operator set correctly. The accurate claim here is the one the card makes: this run
+    // refuses, indexes, and points at nothing. The *installed* case below is where F40's honest arm appears.
+    assert!(
+        err.contains("configuration disabled") && err.contains(EMBED_MODEL),
+        "arm (ii) answers a workspace with no model row: {err}"
+    );
+    // No fetch was attempted, which is a *build* fact: a binary that cannot read 310 MB must not spend it. This holds for
+    // either wording, and is the F38 claim this case exists to keep.
+    assert!(
+        !err.contains("fetching") && !json.stdout().contains("fetching"),
+        "a runtime-less build does not advertise a download: {err}"
+    );
+
+    let text = run(&mut ws.command(&["setup"]));
+    assert_eq!(text.code(), 1);
+    assert!(
+        text.stdout()
+            .lines()
+            .any(|line| line.trim_end() == "setup      indexed; no vectors — see the outcome above"),
+        "the verdict line agrees with the exit code:\n{}",
+        text.stdout()
+    );
+
+    // **The same command once a model is actually installed** — which is what F40 was about, and the shape a person reaches
+    // by following `np models install`. Here the refusal names the missing feature and the search mode that still works.
+    let _installed = install_model(&ws);
+    let second = run(&mut ws.command(&["setup", "--json"]));
+    assert_eq!(second.code(), 1, "\n{}", second.stdout());
+    let doc2: serde_json::Value =
+        serde_json::from_str(&second.stdout()).expect("one document per run");
+    assert_eq!(doc2["vectors"], false);
+    assert_eq!(doc2["offline"], false, "a missing feature is not an outage");
+    let err2 = second.stderr();
+    assert!(
+        err2.contains("runtime not built") && err2.contains("--features local-model"),
+        "with the bytes in place, the build shape is the truth and gets said: {err2}"
+    );
+}
+
 /// **The offline contract.** No connection: setup indexes anyway, exits 0, and reports the exact place it stopped. A
 /// caller that only reads the exit code sees success — which is right, because search works from this moment — and a
 /// caller that reads the document sees `vectors:false` and knows not to try semantic search.

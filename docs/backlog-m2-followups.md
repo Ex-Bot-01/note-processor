@@ -1650,6 +1650,53 @@ weeks old, and `v0.1.0`'s shipped asset had no `scan`-adjacent persistence to sp
 after Windows users arrive. Do not do it silently: a workspace that suddenly reports `added N` because its index moved elsewhere is the worst possible
 first experience, which is what the fallback exists to prevent.
 
+### Implemented 2026-11-09 (this commit) — option A, as ruled, in one change
+
+**(1) The nesting.** `default_data_dir()` on Windows now returns `%LOCALAPPDATA%\note-processor`. Nothing else moved: Unix keeps
+`$XDG_DATA_HOME` / `$HOME/.local/share` exactly as it was, which is asserted rather than assumed (`the_unix_shape_is_unchanged_by_the_seam`)
+because "we fixed Windows" turning into "and relocated everybody else's index" is the obvious way to make this worse.
+
+**(2) The fallback.** `resolve_data_dir(explicit, platform, lookup)` answers both halves of the layout question in one **pure** function:
+does the config file's `data_dir` win (it always does — an instruction, not a place we moved), and if we are on the OS default, is our
+index still sitting at the pre-nesting location? When it is, this release reads and writes *there* and prints one line on stderr:
+
+```text
+np: reading your index from C:\Users\ana\AppData\Local — where it was written before this release nested its data folder. nothing to do: it stays there until a later release moves it
+```
+
+Reading and writing the old place as a unit is deliberate: a registry in one directory and per-workspace databases in another is a worse
+bug than the layout this card filed. Either half counts as "ours" out there — the registry file, or the `workspaces/` directory beside it,
+since an interrupted first run can leave one without the other.
+
+**(3) The seam, and why it is a value rather than a `cfg`.** CI is Linux; this development host cannot compile the Windows arm at all
+(`ring`, `libsqlite3-sys` need MSVC `lib.exe`). A layout fix whose Windows half never executes is a layout fix nobody verified — which is
+precisely how the shape described above survived six CI rows. So `DataDirPlatform` is chosen by `cfg` in production and *passed in*
+everywhere else, and `tests/config.rs` resolves both layouts on one machine. The test harness's own expectation
+(`TestEnv::data_dir_of`) was made platform-aware rather than derived from the code under test: a test that computes its expectation from
+the implementation cannot fail.
+
+**(4) README** follows — the `<data_dir>` paragraph now names the nested path and explains the fallback, and the same edit corrected a
+sentence **F38** had quietly invalidated: `np models fetch` is no longer "the only command in the program that opens a socket".
+
+**Evidence.** `cargo test -p np-core --test config` **68 / 0**; workspace suite green. Mutations planted, diffed, and killed by named
+tests: fallback disabled → `an_index_left_where_it_was_before_f37_is_still_read_from_there`,
+`an_empty_legacy_location_vetoes_nothing_and_a_half_written_one_still_counts`, `an_operator_chosen_directory_wins_even_when_the_legacy_index_is_sitting_there`;
+nesting removed on the Windows shape → `the_windows_data_dir_nests_the_program_folder_like_config_already_did` (+ the same third test);
+explicit directory ignored → `an_explicit_data_dir_in_the_file_is_never_second_guessed` and that third test again. The full gate list ran
+against this tree; the verdict is in the commit message beside it, since a card that cites its own green before the log exists is how F34
+got read wrong for four days.
+
+**What this card still owes.**
+
++ **Windows, in the field.** Stage 9 of the operator script (sha256 `db75c546…494345`, uploaded on v0.2.1) scans a fresh vault twice and
+  prints which root holds `*.sqlite`, then requires the second scan to report `added      0`. That line is the test: it means the run found
+  the index it had just written, wherever it happened to be. Written on Linux, never executed by PowerShell.
++ **Removing the fallback is not a deletion.** One release from now, deleting `legacy_data_dir_override` would hand every upgraded machine
+  exactly the false `added N` report this bridge exists to prevent. The removal has to *ship with* a relocation (copy the registry and
+  `workspaces/` into the nested folder by rename, verify, then stop reading the old path) or an equally honest refusal. Recorded here so
+  whoever deletes it is not surprised by their own test suite going green while users see `added 214`.
++ CI grading, in common with F36/F38/F40: no workflow run has had steps since the included minutes ran out.
+
 ## F38 — `np embed` should fetch the pinned model itself, so an application gets vectors from one call
 
 **Opened 2026-11-07 as a question, ruled 2026-11-08 by the human partner: default ON.** The reason is in the ruling's own words — the
@@ -1883,6 +1930,13 @@ the one that omits it.
 np-cli's own `NoProvider::RowMissing`, which *does* carry the install hint — so the program contains a correct sentence for this state
 and prints a different one. F32 chose the "this is a configuration state" label on purpose (§6 of that design), and 14 assertions across
 `crates/np-cli/tests/cli.rs` (from line 1619) pin both channels; `setup_with_fetching_switched_off_…` pins it for `np setup` too.
+
+**Measured again on 2026-11-09, in the release-binary shape.** A default-feature binary (what the releases ship) on a fresh vault answers
+the same `configuration disabled` — even though the true blocker there is the build shape: no inference was compiled in, and installing a
+model will not change the outcome. With an artifact actually installed, the same command says F40's `runtime not built` and names both
+remedies. So arm (ii) does not merely omit a hint; it can also **precede a more specific diagnosis**, which is the F40 mistake one level up
+and the reason this card is worth ruling on rather than leaving. Both cases are asserted in
+`setup_on_a_build_without_inference_indexes_and_names_the_feature`.
 
 **The question for whoever rules on it:** now that F38 made fetching the default, is "no row" still best described as disabled
 configuration — or is it the artifact-absent state seen from before the first install? Three options, cheapest first:
