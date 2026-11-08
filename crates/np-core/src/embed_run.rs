@@ -114,6 +114,15 @@ pub enum EmbedOutcome {
         key: &'static str,
         /// What that key currently says, or `None` when it names nothing at all.
         id: Option<String>,
+        /// **F41 option A.** A command that fixes it, present only for the half of this arm where configuration is
+        /// *correct* and the artifact has simply never been installed here — `model` naming no row. The other half,
+        /// `provider = "none"`, gets `None`: a switch that was thrown deliberately is not an invitation to download
+        /// 309 MB, and an install hint there would be a sentence about a file nobody decided to want.
+        ///
+        /// Skipped when absent so the machine-readable shape of every existing refusal is unchanged; a reader that
+        /// wants the remedy looks for `hint`, exactly as it does on [`Self::ArtifactAbsent`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
     },
     /// Arm (iii): the configured model's row exists but its artifact is not there to load. `hint` names a
     /// command that **exists** in this build.
@@ -204,10 +213,18 @@ impl EmbedOutcome {
     pub fn detail(&self) -> Option<String> {
         match self {
             Self::Current => None,
-            Self::ConfigurationDisabled { key, id } => Some(match id {
-                Some(value) => format!("{key} = \"{value}\""),
-                None => format!("{key} names nothing"),
-            }),
+            // The key and id lead, because F32 §6's reading ("this is a configuration state") is what the label carries;
+            // the hint follows after an em dash so a reader who only needs the command still finds it in one line.
+            Self::ConfigurationDisabled { key, id, hint } => {
+                let stated = match id {
+                    Some(value) => format!("{key} = \"{value}\""),
+                    None => format!("{key} names nothing"),
+                };
+                Some(match hint {
+                    Some(hint) => format!("{stated} — {hint}"),
+                    None => stated,
+                })
+            }
             Self::ArtifactAbsent { hint, .. } => Some(hint.clone()),
             // Two ways forward and the one fact that matters: nothing was written, so the model is still owed rather
             // than half-embedded. Names a flag that exists (`--features local-model`) and a command that exists in this
@@ -737,11 +754,17 @@ fn run(
         // The other half of arm (ii): a `model` naming no installed row. Naming the key and the id is what
         // makes this readable as a configuration state rather than a fault (§6).
         None => {
+            // **F41 option A.** The configuration is correct — it names a provider and an id this build pins. What is
+            // missing is 309 MB, which is arm (iii)'s problem seen from before the first install, so this refusal
+            // carries arm (iii)'s remedy. Without it the air-gapped first run (the exact audience for
+            // `NP_NO_AUTO_FETCH=1`) had to find `np models install` in the README, while two neighbouring arms named
+            // their commands.
             return Ok(EmbedReport::unread(
                 Some(model_id.clone()),
                 EmbedOutcome::ConfigurationDisabled {
                     key: "embeddings.model",
                     id: Some(model_id),
+                    hint: Some(install_hint(workspace)),
                 },
             ));
         }
@@ -1461,6 +1484,8 @@ fn configured_model(cfg: &Config) -> Result<String, EmbedOutcome> {
         EmbeddingProvider::None => Err(EmbedOutcome::ConfigurationDisabled {
             key: "embeddings.provider",
             id: Some("none".to_string()),
+            // No hint (**F41**): embeddings were switched off, which is a decision rather than a missing file.
+            hint: None,
         }),
         EmbeddingProvider::LocalModel | EmbeddingProvider::OpenAiCompatible => cfg
             .embeddings
@@ -1469,6 +1494,9 @@ fn configured_model(cfg: &Config) -> Result<String, EmbedOutcome> {
             .ok_or(EmbedOutcome::ConfigurationDisabled {
                 key: "embeddings.model",
                 id: None,
+                // The key is genuinely absent here, so there is no install that completes the configuration; the
+                // sentence stays short and F35's strict-config message is where a typo gets caught.
+                hint: None,
             }),
     }
 }
@@ -1496,9 +1524,10 @@ fn artifact_file_exists(artifact: &Path) -> bool {
 pub fn install_hint(workspace: &Path) -> String {
     format!(
         "fetch it with `np models fetch {} --id <id>`, or install bytes you already hold with \
-         `np models install {} --id <id> --path <file> --dim <width> --sha256 <digest>`",
+         `np models install {} --id <id> --path <file> --dim <width> --sha256 <digest>`{}",
         workspace.display(),
-        workspace.display()
+        workspace.display(),
+        runtime_caveat()
     )
 }
 
@@ -1508,9 +1537,27 @@ pub fn install_hint(workspace: &Path) -> String {
 pub fn install_hint(workspace: &Path) -> String {
     format!(
         "install the artifact with `np models install {} --id <id> --path <file> --dim <width> --sha256 <digest>` \
-         (this build has no fetch command)",
-        workspace.display()
+         (this build has no fetch command){}",
+        workspace.display(),
+        runtime_caveat()
     )
+}
+
+/// One clause, both shapes of [`install_hint`], for the case where the artifact is obtainable and this **binary** still
+/// cannot embed: `fetch` is default-on while `local-model` is default-off, so a `cargo install np-cli` build can download
+/// 309 MB and meet F40's arm (v) anyway. A remedy that ends in the same refusal is worse than no remedy, because the reader
+/// has now spent bandwidth to be told nothing.
+///
+/// Empty string when the runtime IS compiled in — this clause is a fact about the artifact being run, and asserting it about
+/// a build that can embed would be the F40 mistake wearing a hint. Pinned both ways by
+/// `an_install_hint_says_when_this_binary_cannot_embed_anyway`, whose two halves are graded by different gate rows.
+pub fn runtime_caveat() -> &'static str {
+    if cfg!(feature = "local-model") {
+        ""
+    } else {
+        " — and note that this binary links no embedding runtime, so `np embed` will still refuse until you run one \
+         built with `--features local-model`"
+    }
 }
 
 /// Pair each owed chunk with the vector a provider returned for it, refusing anything that cannot be stored.

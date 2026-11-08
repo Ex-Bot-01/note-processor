@@ -2061,6 +2061,41 @@ configuration — or is it the artifact-absent state seen from before the first 
 then the wording stays as pinned, and `setup_with_fetching_switched_off_indexes_and_refuses_without_blaming_the_network` asserts today's
 sentence so that a future change fails loudly rather than silently.
 
+**Ruled 2026-11-09 by the operator: option A.** "For the rest I would use your recommendation", and the recommendation was A — keep F32's
+label, append a remedy. Implemented as `EmbedOutcome::ConfigurationDisabled { hint }`, `Some(install_hint(workspace))` at arm (ii)'s row-missing
+half only, `None` for `provider = "none"` (a switch thrown deliberately is not a missing file) and for a key that names nothing at all. The field
+is `skip_serializing_if = "Option::is_none"`, so **the machine-readable shape of every existing refusal is byte-identical**; the fourteen pins
+from line 1619 of `crates/np-cli/tests/cli.rs` still pass because they assert `contains`, which is what made A cheap.
+
+Measured on a built default-feature binary (the shape `cargo install np-cli` produces), fresh vault, correct config, `NP_NO_AUTO_FETCH=1`:
+
+```
+np: configuration disabled: embeddings.model = "embeddinggemma-2" — fetch it with `np models fetch vault --id <id>`, or install bytes you
+already hold with `np models install vault --id <id> --path <file> --dim <width> --sha256 <digest>` — and note that this binary links no
+embedding runtime, so `np embed` will still refuse until you run one built with `--features local-model`
+```
+
+**One clause beyond the letter of A, stated because it was not in the ruling.** `fetch` is default-on and `local-model` is default-off, so the
+build a person gets from `cargo install` can obey the hint — download 309 MB, digest-verify it — and then meet F40's arm (v) anyway. A remedy
+that ends in the same refusal is worse than no remedy, because the reader has spent bandwidth to learn nothing. So `install_hint` now appends
+`runtime_caveat()` when the runtime is not compiled in, which also reaches arm (iii) and `np search`'s reuse of the same wording (one function,
+three callers, one truth). If you would rather have the shorter sentence, delete that one function body — nothing else reads it.
+
+**What A does not fix**, and I did not touch it because it is a ruling about outranking rather than wording: arm (ii) still *precedes* arm (v),
+so on a no-inference build with nothing installed the label remains `configuration disabled` rather than F40's `runtime not built`. The clause
+above makes the sentence honest; option B (`model-not-installed` as its own outcome, and possibly reordering) would make the taxonomy honest.
+Recommending B stay un-taken until something else forces arm order again — every reorder is a claim about which fact outranks which, and F40
+already spent that argument once.
+
+**Falsified by mutation, not by reading.** Dropping the hint append (`hint: Some(...)` → `hint: None`) fails
+`a_model_naming_no_row_names_the_command_that_fixes_it` (np-core) **and** `embed_naming_an_uninstalled_model_names_the_command_that_fixes_it`
+(np-cli). Making `runtime_caveat` always empty fails `an_install_hint_says_when_this_binary_cannot_embed_anyway` and the np-cli pin. The
+`local-model` half of that test asserts the *opposite* (no clause when the runtime is compiled in) and is graded by a different gate row, so both
+directions have an owner. `provider_none_still_refuses_without_an_install_hint` exists because a mutant that hints on *every* configuration
+refusal passes the first test: the two halves of arm (ii) are separate assertions, not one assertion about "arm (ii)".
+
+**Still owed:** CI grading, as always — this is graded by `.github/scripts/gates.sh` locally.
+
 ## F43 — ship the inference runtime inside `np`, so a downloaded asset can do semantic search
 
 **Filed 2026-11-08 by the operator's question "I thought llama.cpp is shipped with my software?"** It wasn't, and the answer to why matters

@@ -1672,6 +1672,49 @@ fn embed_naming_a_model_that_is_not_installed_names_the_id() {
     assert_eq!(summary_count(&failed.stdout(), "seen"), 0);
 }
 
+/// **F41 option A, on the channel a person actually reads.** The core-level assertion proves the sentence exists; this one
+/// proves `np` prints it. A fresh workspace with correct configuration is the first thing every new user does — and until
+/// now the answer told them their own key was the problem while two neighbouring arms named commands. Label unchanged (the
+/// fourteen existing pins survive, which is what made A worth choosing); the remedy follows the id.
+///
+/// Flattened because this is prose on a terminal: an assertion that fails when a line wraps at 80 columns gets deleted rather
+/// than fixed, and a contract you cannot afford to lose should not depend on console width.
+#[test]
+fn embed_naming_an_uninstalled_model_names_the_command_that_fixes_it() {
+    let ws = workspace();
+    ws.write_user_config(&local_model_config(EMBED_MODEL));
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let failed = run(&mut ws.command(&["embed"]));
+    assert_eq!(
+        failed.code(),
+        1,
+        "arm (ii) stays exit 1:\n{}",
+        failed.stdout()
+    );
+
+    for channel in [failed.stdout(), failed.stderr()] {
+        let flat = channel.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&format!("embeddings.model = \"{EMBED_MODEL}\"")),
+            "the key and id still lead, or F32's reading is lost: {flat}"
+        );
+        assert!(
+            flat.contains("np models install") || flat.contains("np models fetch"),
+            "a refusal a person can act on names the command that installs bytes: {flat}"
+        );
+        // The build under this test row links no inference runtime, so the hint must also say that: sending someone to
+        // download 309 MB with a binary that will refuse anyway is the F40 mistake in a friendly voice. The `local-model`
+        // gate row asserts the opposite half in np-core's copy of this test.
+        if !cfg!(feature = "local-model") {
+            assert!(
+                flat.contains("--features local-model"),
+                "a default-feature build has to admit it cannot embed even after the install: {flat}"
+            );
+        }
+    }
+}
+
 /// Arm (iii), reached from argv: the row is installed, its artifact file is not there, and the run owes work. This
 /// is D-2's regression test — the case `crates/np-core/tests/embed_run.rs` could not see because it injected a
 /// provider instead of resolving one.

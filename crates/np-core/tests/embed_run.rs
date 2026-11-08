@@ -862,13 +862,80 @@ fn provider_none_is_configuration_disabled_and_reads_nothing() {
         report.outcome,
         EmbedOutcome::ConfigurationDisabled {
             key: "embeddings.provider",
-            id: Some("none".to_string())
+            id: Some("none".to_string()),
+            hint: None
         }
     );
     assert_eq!(report.outcome.label(), "configuration disabled");
     assert_eq!(report.chunks_seen, 0, "nothing was read");
     assert_eq!(fake.calls(), 0, "nothing was asked");
     assert!(!report.succeeded(), "arm (ii) is exit 1 (§6)");
+}
+
+/// **F41 option A.** The same refusal, but read as the operator reads it: this is the first run on an air-gapped
+/// machine, and `configuration disabled: embeddings.model = "…"` sends a person to edit a key they set correctly.
+/// The label stays (F32 §6's taxonomy is not up for revision here), but the detail now carries the same remedy arm
+/// (iii) gives — a command that exists in this binary — because the state "a `model` names no row" is the artifact
+/// absent *seen from before the first install*.
+#[test]
+fn a_model_naming_no_row_names_the_command_that_fixes_it() {
+    assert_recorder_works();
+    let setup = workspace_owned(&notes(2));
+    setup.touch_artifact();
+
+    let mut fake = Fake::new();
+    let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("the arm is a report");
+    let detail = report
+        .outcome
+        .detail()
+        .expect("arm (ii) always has a detail");
+    assert!(
+        detail.starts_with(&format!("embeddings.model = \"{MODEL_ID}\"")),
+        "the key and id still lead, so F32's reading is preserved: {detail:?}"
+    );
+    assert!(
+        detail.contains("np models install") && detail.contains("--sha256"),
+        "a refusal a person can act on names the command that installs bytes: {detail:?}"
+    );
+    #[cfg(feature = "fetch")]
+    assert!(
+        detail.contains("np models fetch"),
+        "a build that can fetch says so, because telling it to install by hand when it need not is a worse sentence"
+    );
+    assert_eq!(report.outcome.label(), "configuration disabled");
+    assert_eq!(
+        fake.calls(),
+        0,
+        "the remedy costs nothing: nothing was asked of a provider"
+    );
+}
+
+/// The other half of arm (ii), asserted separately on purpose (**F41**): `provider = "none"` is an instruction,
+/// not a gap, so it gets **no** install hint. A mutant that appends the hint to every configuration refusal would
+/// pass the test above and fail this one — which is why the two halves are not one assertion about "arm (ii)".
+#[test]
+fn provider_none_still_refuses_without_an_install_hint() {
+    assert_recorder_works();
+    let setup = workspace_owned(&notes(2));
+    let cfg = np_core::config::Config {
+        embeddings: EmbeddingsConfig {
+            provider: EmbeddingProvider::None,
+            model: None,
+            dim: None,
+            max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
+            threads: np_core::config::ThreadCount::Auto,
+            log_level: None,
+        },
+        ..setup.cfg()
+    };
+
+    let mut fake = Fake::new();
+    let report = embed(&setup.root, &cfg, &mut fake).expect("the arm is a report");
+    assert_eq!(
+        report.outcome.detail(),
+        Some("embeddings.provider = \"none\"".to_string()),
+        "switching embeddings off must not be answered with advice to install a model"
+    );
 }
 
 /// Arm (ii), second half: `embeddings.model` naming no installed row names the key and the id.
@@ -880,17 +947,25 @@ fn a_model_naming_no_row_is_configuration_disabled_naming_the_id() {
 
     let mut fake = Fake::new();
     let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("the arm is a report");
-    assert_eq!(
-        report.outcome,
-        EmbedOutcome::ConfigurationDisabled {
-            key: "embeddings.model",
-            id: Some(MODEL_ID.to_string())
-        },
-        "the refusal must name the key and the id it could not find"
+    // Matched rather than compared for equality: **F41 A** put an absolute workspace path inside this arm's `hint`, so an
+    // exact-value assertion would pin a tmpdir. The taxonomy (which key, which id) is what this test owns; the hint's
+    // content belongs to `a_model_naming_no_row_names_the_command_that_fixes_it`.
+    assert!(
+        matches!(
+            &report.outcome,
+            EmbedOutcome::ConfigurationDisabled { key, id: Some(id), .. }
+                if *key == "embeddings.model" && id == MODEL_ID
+        ),
+        "the refusal must name the key and the id it could not find: {:?}",
+        report.outcome
     );
-    assert_eq!(
-        report.outcome.detail(),
-        Some(format!("embeddings.model = \"{MODEL_ID}\""))
+    assert!(
+        report
+            .outcome
+            .detail()
+            .unwrap_or_default()
+            .starts_with(&format!("embeddings.model = \"{MODEL_ID}\"")),
+        "the key and the id still lead the sentence"
     );
     assert_eq!(fake.calls(), 0);
     assert!(!report.succeeded());
@@ -1342,6 +1417,40 @@ fn the_row_missing_arm_points_at_the_same_door_as_embeds_arm_three() {
     );
 }
 
+/// **A hint must not send a reader to bytes that change nothing.** `fetch` is default-on and `local-model` is default-off,
+/// so the build someone gets from `cargo install np-cli` can download 309 MB and still be refused by F40's arm (v). That
+/// made arm (ii)'s new **F41** remedy a trap: "fetch it, or install bytes you already hold" about a binary that will refuse
+/// either way. So the hint carries the build fact beside the command.
+///
+/// Each feature row asserts only its own half, which is what makes this falsifiable in both directions: a mutant that drops
+/// the clause passes the `local-model` row and fails the default one, and a mutant that always adds it fails the
+/// `local-model` row. The gate list runs both rows (`gates.sh`), so neither half can rot unobserved.
+#[test]
+fn an_install_hint_says_when_this_binary_cannot_embed_anyway() {
+    let ws = PathBuf::from("/vault/notes");
+    let hint = np_core::embed_run::install_hint(&ws);
+
+    #[cfg(feature = "local-model")]
+    {
+        assert!(
+            !hint.contains("--features local-model"),
+            "this build CAN embed, so telling the reader it cannot is a lie about the artifact in front of them: {hint}"
+        );
+    }
+
+    #[cfg(not(feature = "local-model"))]
+    {
+        assert!(
+            hint.contains("np models install") || hint.contains("np models fetch"),
+            "the command still leads; the build fact is a clause beside it, not a substitute for it: {hint}"
+        );
+        assert!(
+            hint.contains("--features local-model"),
+            "a build that links no inference runtime has to say so where it hands out install advice: {hint}"
+        );
+    }
+}
+
 /// **The shape of `fetched`, pinned without a network.** The real-origin run that found this spelling is recorded in
 /// `docs/design-f38-auto-fetch.md` §5b — 309,855,456 bytes fetched and verified, and the document it printed said
 /// `digest-verified` where the design sketch had said `digest_verified`. A test that needs no transport is what keeps that
@@ -1424,9 +1533,17 @@ fn the_fetched_record_spells_its_keys_as_the_contract_does() {
 fn a_refusal_never_prints_its_state_twice() {
     let cases = [
         EmbedOutcome::Current,
+        // Both shapes of arm (ii): **F41 A** made the hint part of this arm's detail, so the composition invariant has to
+        // hold with and without it.
         EmbedOutcome::ConfigurationDisabled {
             key: "embeddings.model",
             id: Some("embeddinggemma-2".to_string()),
+            hint: None,
+        },
+        EmbedOutcome::ConfigurationDisabled {
+            key: "embeddings.model",
+            id: Some("embeddinggemma-2".to_string()),
+            hint: Some("install it with `np models install`".to_string()),
         },
         EmbedOutcome::ArtifactAbsent {
             model: "embeddinggemma-2".to_string(),
