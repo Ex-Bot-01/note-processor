@@ -436,18 +436,18 @@ pub fn fetch(
     fetch_with_table(db, models_dir, id, requested, transport, now, &plan)
 }
 
-/// [`fetch`] against an explicit pin table.
-///
-/// **The table is a parameter; the values are not.** Production calls this through [`fetch`], which passes the
-/// compiled-in [`crate::pins::PINNED`], so nothing at runtime can swap an expectation. The seam exists because every
-/// rule below — digest mismatch, short stream, progress marker, preflight — has to be *tested*, and testing them
-/// against a 310 MB pinned artifact would mean downloading 310 MB per case on a host with 2.8 GB free. A test table
-/// holds a few dozen bytes per member whose digests the test computed, which is what makes the mismatch and
-/// interruption cases reachable at all. `T` is generic rather than `dyn` so the production call keeps the concrete
-/// `PinnedModel` slice it already has.
 /// Fetch the named members of `id`, then take back the directory if nothing ever landed (**F46**).
 ///
-/// The body lives in [`fetch_attempt`]; this wrapper exists for one cleanup. `<key>.models` is created on the way to publishing an artifact —
+/// [`fetch`] against an explicit pin table. **The table is a parameter; the values are not.** Production calls this
+/// through [`fetch`], which passes the compiled-in [`crate::pins::PINNED`], so nothing at runtime can swap an
+/// expectation. The seam exists because every rule below — digest mismatch, short stream, progress marker, preflight —
+/// has to be *tested*, and testing them against a 310 MB pinned artifact would mean downloading 310 MB per case on a
+/// host with 2.8 GB free. A test table holds a few dozen bytes per member whose digests the test computed, which is
+/// what makes the mismatch and interruption cases reachable at all. `T` is generic rather than `dyn` so the production
+/// call keeps the concrete `PinnedModel` slice it already has.
+///
+/// The body lives in `fetch_attempt` (private, hence a code span rather than a link: rustdoc refuses to point public
+/// documentation at an item a reader cannot open); this wrapper exists for one cleanup. `<key>.models` is created on the way to publishing an artifact —
 /// after the disk preflight, which must stay before creation or a "not enough room" refusal would itself create the folder it is refusing
 /// about — and until now nothing undid that. A fetch whose transport failed on the first open therefore left an **empty** model directory
 /// behind, and every tool that reads a data root interprets `<something>.models` as "a model lives here": the operator's harness counted these
