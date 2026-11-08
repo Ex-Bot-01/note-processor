@@ -27,7 +27,16 @@ if [ "$(uname -s)" = Windows_NT ]; then
   archive="$out/$name.zip"
   echo "zip packaging is left to the workflow (pwsh Compress-Archive); this script builds and checksums only" >&2
 else
-  tar -C "target/$target/release" -czf "$archive" "$binary"
+  # Strip before packaging. The size ceiling in docs/design-m2-local-embeddings.md §14 has always been quoted against **stripped** binaries,
+# while the first assets shipped unstripped (measured 2026-11-08: 10,295,048 B becomes 8,389,040 B for this target). Symbols are a
+# debugging convenience; what identifies the file for a downloader is the digest in the release notes.
+if command -v strip >/dev/null 2>&1; then
+  strip "target/$target/release/$binary"
+else
+  echo "warning: no strip on PATH — packaging an unstripped binary, larger than §14's quoted figures" >&2
+fi
+
+tar -C "target/$target/release" -czf "$archive" "$binary"
 fi
 
 # The workflow's own guard, kept here too: a truncated or empty archive is worse than no release at all.

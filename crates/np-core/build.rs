@@ -95,6 +95,21 @@ const ARCHIVES: [&str; 4] = ["llama", "ggml", "ggml-cpu", "ggml-base"];
 /// this configuration, and the link of the version/system-info probe confirmed it.
 const SYSTEM_LIBS: [&str; 4] = ["stdc++", "m", "pthread", "dl"];
 
+/// The Windows set, and the difference is measured rather than translated: a `x86_64-w64-mingw32` link of
+/// these same four archives resolved with `ws2_32` and `bcrypt`, needed no `pthread` (ggml's threading rides
+/// the Win32 API under the win32 threading model) and no `dl`. `stdc++` stays because llama.cpp is C++.
+/// Measured 2026-11-08 in the cross-build spike: `ADVAPI32`, `KERNEL32`, `msvcrt` and nothing else in the
+/// import table of an exe that references `llama_model_load_from_file`.
+const WINDOWS_SYSTEM_LIBS: [&str; 3] = ["m", "ws2_32", "bcrypt"];
+
+/// Set this to a cmake toolchain file to build `local-model` for a target that is not the host. Its existence
+/// is the whole opt-in: without it, a non-Linux target still meets the refusal below rather than a half-built
+/// C++ tree. Read from a cross recipe (`docs/ops-cross-build-windows-gnu.md`), never guessed at here.
+const TOOLCHAIN_ENV: &str = "NP_LLAMA_CMAKE_TOOLCHAIN";
+
+/// Where [`stage_prefixed_archives`] puts the archives a cross build links against.
+const LINK_STAGE_DIR: &str = "llama-link-windows-gnu";
+
 /// OpenMP is not in [`SYSTEM_LIBS`] because it is conditional: `libggml-cpu.a` and `libggml-base.a`
 /// reference `GOMP_*` only when the tree was configured with OpenMP on. `ggml-config.cmake` gates its
 /// own `OpenMP::OpenMP_C` interface on `GGML_OPENMP_ENABLED`, so we read that same cache entry rather
@@ -208,18 +223,48 @@ fn link_pinned_llama(shape: &Shape) -> Result<(), String> {
         println!("cargo::rerun-if-env-changed={name}");
     }
 
-    // §14 claims nothing about Windows or macOS, so say that instead of letting a stranger meet `-l stdc++`
-    // cannot find (macOS) or four wrong archive names (MSVC). A refusal that names the design section is a
-    // scope statement; a linker error is a mystery.
+    println!("cargo::rerun-if-env-changed={TOOLCHAIN_ENV}");
+
+    // §14 claimed nothing about Windows or macOS, so this refused every non-Linux target: better a refusal
+    // naming the design section than a stranger meeting `-l stdc++` cannot find (macOS) or four wrong archive
+    // names (MSVC). That scope still stands for anything not spelled out below. What changed on 2026-11-08 is
+    // that `windows` + `gnu` stopped being a claim and became a measurement: llama.cpp v0.8.0 configures and
+    // builds with mingw-w64 from this Linux host, all 30 functions in `llama_ffi.rs` are defined by the
+    // resulting archives, and an exe linked against them imports only system DLLs. It stays opt-in, because a
+    // cross build of C++ must never happen as a side effect of someone typing `--target`.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os != "linux" {
-        return Err(format!(
-            "`local-model` is built and tested on Linux only. This target is {target_os:?}.\n  \
-             design-m2-local-embeddings.md §14: the C++ build has been measured on one host and no claim \n  \
-             exists for any other platform — F18's rule. The system library set here (`stdc++`, `m`, \n  \
-             `pthread`, `dl`) and these static-archive names are GNU/Linux's; see §14 for what Windows needs.",
-        ));
-    }
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let cross = match (target_os.as_str(), target_env.as_str()) {
+        ("linux", _) => None,
+        ("windows", "gnu") => match env::var_os(TOOLCHAIN_ENV) {
+            Some(file) => {
+                let path = PathBuf::from(&file);
+                if !path.is_file() {
+                    return Err(format!(
+                        "{TOOLCHAIN_ENV}={file:?} is not a file. A cmake toolchain file is what makes this \n  \
+                         cross build mean `windows-gnu`: point it at one that names the mingw-w64 compilers.",
+                    ));
+                }
+                Some(path)
+            }
+            None => {
+                return Err(format!(
+                    "building `local-model` for windows-gnu needs {TOOLCHAIN_ENV} to name a cmake toolchain \n  \
+                     file. Nothing is built without it: §14 measured this feature on Linux, and a Windows cross \n  \
+                     build that happens by accident would put an unmeasured C++ tree into a release asset. See \n  \
+                     docs/ops-cross-build-windows-gnu.md for the recipe this variable expects.",
+                ))
+            }
+        },
+        _ => {
+            return Err(format!(
+                "`local-model` is built for Linux and for windows-gnu (with {TOOLCHAIN_ENV}). This target is \n  \
+                 {target_os:?}/{target_env:?}. design-m2-local-embeddings.md §14 keeps its rule: no platform claim \n  \
+                 without a build measured on it — macOS has no `libstdc++` to name and MSVC wants different archive \n  \
+                 names, so both still get a refusal rather than a linker error.",
+            ))
+        }
+    };
 
     let manifest = path_env("CARGO_MANIFEST_DIR")?;
     // crates/np-core -> the workspace root, which is where `.vendor/` and `third_party/` live.
@@ -267,10 +312,44 @@ fn link_pinned_llama(shape: &Shape) -> Result<(), String> {
     check_that_this_is_the_pin(&source, &pin)?;
 
     let cmake = cmake_command()?;
-    let build_dir = choose_build_dir(&source, &out_dir, shape);
-    configure(&cmake, &source, &build_dir, &out_dir, &pin)?;
+    // A cross build gets its own directory and never reuses `<source>/build`: cmake caches the compiler it was
+    // first configured with and refuses another, and `choose_build_dir` would hand a host cache to a windows
+    // build the moment anyone had run the Linux feature once in that tree — an error naming neither cause nor cure.
+    let build_dir = match &cross {
+        Some(_) => out_dir.join(format!("{}-windows-gnu", shape.build_dir_name())),
+        None => choose_build_dir(&source, &out_dir, shape),
+    };
+    configure(
+        &cmake,
+        &source,
+        &build_dir,
+        &out_dir,
+        &pin,
+        cross.as_deref(),
+    )?;
     compile(&cmake, &build_dir, shape.targets())?;
-    emit_link_flags(&build_dir, shape)
+    // `ggml/CMakeLists.txt:80` clears `CMAKE_STATIC_LIBRARY_PREFIX` on Windows for its own targets — measured
+    // 2026-11-08: the build tree came out `libllama.a`, `ggml.a`, `ggml-cpu.a`, `ggml-base.a`, and no `-D` of
+    // ours overrides a subdirectory's own `set()`. GNU ld will not look at `ggml.a` for `-l ggml` ("rename it to
+    // libggml-base.a", it says), so the cross link gets prefixed copies in one directory of ours. Copies, not
+    // renames: the cmake tree keeps owning its build directory, and a re-run of cmake below must find what it
+    // expects to have built.
+    let link_dir = match &cross {
+        Some(_) => stage_prefixed_archives(&build_dir, &out_dir, shape)?,
+        None => build_dir.clone(),
+    };
+    if cross.is_some() {
+        // rustc only searches the `-L native=` paths we hand it, and the mingw sysroot is not one of them: the
+        // first attempt failed with "could not find native static library `stdc++`" (measured 2026-11-08). Ask
+        // the compiler that actually built the archives where its own runtime archives live, rather than
+        // hard-coding a path that belongs to whoever installed this toolchain.
+        let compiler = configured_compiler(&build_dir)
+            .ok_or_else(|| format!("no compiler is recorded under {}", build_dir.display()))?;
+        for dir in windows_runtime_search_dirs(Path::new(&compiler))? {
+            println!("cargo::rustc-link-search=native={}", dir.display());
+        }
+    }
+    emit_link_flags(&link_dir, shape, cross.is_some())
 }
 
 /// The C++ source to build: `NP_LLAMA_CPP_SRC` if set (offline work, CI caches, and the case where a
@@ -477,6 +556,7 @@ fn configure(
     build_dir: &Path,
     out_dir: &Path,
     pin: &Pin,
+    cross: Option<&Path>,
 ) -> Result<(), String> {
     let mut cache = read_cache(&build_dir.join("CMakeCache.txt"));
 
@@ -537,9 +617,22 @@ fn configure(
     // of pinned options the warm path below finds every cached value still matching and returns without configuring,
     // certifying a build directory for inputs cmake never saw. Naming the file in `rerun-if-changed` is worth doing
     // only if something acts on it; this line is that something.
+    // The cross arguments belong in the stamp even though they come from this invocation rather than the pin.
+    // Left out — as they were on the first attempt — a warm **host** cache is certified to a windows build:
+    // measured 2026-11-08, "already configured for the pin's options; skipping configure" followed by an archive
+    // set built with the host compiler and no `lib` prefix. Same reasoning as the CMakeLists digest above: name
+    // an input only if something acts on it.
+    let extras = match cross {
+        Some(toolchain) => format!(
+            "toolchain={}\nGGML_NATIVE=OFF\nCMAKE_STATIC_LIBRARY_PREFIX=lib\n",
+            toolchain.display()
+        ),
+        None => String::new(),
+    };
     let wanted = format!(
-        "{}cmakelists-sha256={}\n",
+        "{}{}cmakelists-sha256={}\n",
         pin.option_stamp(),
+        extras,
         sha256_hex(
             &fs::read(source.join("CMakeLists.txt")).map_err(|e| format!(
                 "cannot read {} to stamp the configure: {e}",
@@ -560,6 +653,11 @@ fn configure(
         // Warm cache: still verify it understood our options. A cache that filed half of them as UNINITIALIZED
         // is exactly the state a reuse path must not certify as fresh.
         verify_options_understood(build_dir, pin)?;
+        // And on a cross build, re-check the threading model: the stamp proves the same toolchain file was named,
+        // not that its compilers still are win32 drivers — someone edits that file between builds.
+        if cross.is_some() {
+            require_win32_threading(build_dir)?;
+        }
         eprintln!(
             "np-core: {} already configured for the pin's options; skipping configure",
             build_dir.display()
@@ -630,6 +728,20 @@ fn configure(
         "-B".to_string(),
         build_dir.display().to_string(),
     ];
+    if let Some(toolchain) = cross {
+        args.push(format!("-DCMAKE_TOOLCHAIN_FILE={}", toolchain.display()));
+        // `GGML_NATIVE` defaults to ON, which means `-march=native`: measured **on the machine running cmake**.
+        // Left on across a cross build it produces a Windows binary whose SIMD paths were chosen by a Linux CPU,
+        // so it is switched off and ggml falls back to runtime dispatch. Deliberately outside the pin's option
+        // set: this is a fact about the target being built, not about the pinned tree.
+        args.push("-DGGML_NATIVE=OFF".to_string());
+        // mingw gives a static library **no prefix**: the build tree came out as `ggml.a`, `ggml-cpu.a`,
+        // `ggml-base.a`, `libllama.a` (measured 2026-11-08), and GNU ld only ever searches `lib<name>.a` for
+        // `-l <name>`. Asking cmake for the Unix prefix keeps one archive spelling across both targets, so
+        // [`find_archive`]'s "this target stopped producing that library" check stays a real check instead of
+        // firing on every Windows build — and rustc's `static=` flags resolve without link-arg gymnastics.
+        args.push("-DCMAKE_STATIC_LIBRARY_PREFIX=lib".to_string());
+    }
     for (key, value) in &pin.options {
         args.push(format!("-D{key}={value}"));
     }
@@ -645,6 +757,9 @@ fn configure(
     );
     run(cmake, &args, "configure")?;
     verify_options_understood(build_dir, pin)?;
+    if cross.is_some() {
+        require_win32_threading(build_dir)?;
+    }
 
     fs::write(&option_stamp, wanted)
         .map_err(|e| format!("cannot write {}: {e}", option_stamp.display()))?;
@@ -758,7 +873,7 @@ fn indent(text: &str) -> String {
 }
 
 /// Emit the link instructions: the shape's static archives from our build, then the libraries they need.
-fn emit_link_flags(build_dir: &Path, shape: &Shape) -> Result<(), String> {
+fn emit_link_flags(build_dir: &Path, shape: &Shape, windows: bool) -> Result<(), String> {
     let archives = shape.archives();
     let built = shape.targets().join(", ");
     let mut searched: Vec<PathBuf> = Vec::new();
@@ -783,8 +898,22 @@ fn emit_link_flags(build_dir: &Path, shape: &Shape) -> Result<(), String> {
         println!("cargo::rustc-link-lib=static={name}");
     }
 
-    for name in SYSTEM_LIBS {
+    let system = if windows {
+        &WINDOWS_SYSTEM_LIBS[..]
+    } else {
+        &SYSTEM_LIBS[..]
+    };
+    for name in system {
         println!("cargo::rustc-link-lib=dylib={name}");
+    }
+    if windows {
+        // The C++ runtime, and the *spelling* is a measurement: emitted as `dylib=stdc++` the linker produced an
+        // exe importing **`libstdc++-6.dll`** — a mingw runtime file that is not on anyone's clean Windows
+        // machine, found by reading the import table rather than by watching the link fail (measured 2026-11-08).
+        // Named as a static archive it links `libstdc++.a` in and the import table drops to system DLLs. `gcc_eh`
+        // joins it because C++ exceptions need the unwinder, and dynamic would break the same promise.
+        println!("cargo::rustc-link-lib=static=stdc++");
+        println!("cargo::rustc-link-lib=static=gcc_eh");
     }
 
     let cache = read_cache(&build_dir.join("CMakeCache.txt"));
@@ -809,7 +938,16 @@ fn emit_link_flags(build_dir: &Path, shape: &Shape) -> Result<(), String> {
 /// `built` names the target set inside a refusal, so a missing `libmtmd.a` reads as "this shape asked for mtmd and the
 /// build did not produce it" rather than as a search-path mystery.
 fn find_archive(build_dir: &Path, name: &str, built: &str) -> Result<PathBuf, String> {
-    let names = [format!("lib{name}.a"), format!("{name}.lib")];
+    // Three spellings, because two build systems and one upstream `set()` are involved: Unix cmake writes
+    // `libggml.a`, MSVC would write `ggml.lib`, and mingw writes `ggml.a` — `ggml/CMakeLists.txt:80` clears the
+    // static prefix for its own targets on Windows (measured 2026-11-08, while [`stage_prefixed_archives`] exists
+    // to hand the linker a name it will actually open). A tree carrying two of these for one library still
+    // refuses below rather than choosing by spelling.
+    let names = [
+        format!("lib{name}.a"),
+        format!("{name}.lib"),
+        format!("{name}.a"),
+    ];
     let mut found: Vec<PathBuf> = Vec::new();
     let mut queue: Vec<PathBuf> = vec![build_dir.to_path_buf()];
     while let Some(dir) = queue.pop() {
@@ -1137,4 +1275,136 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{word:08x}"));
     }
     out
+}
+
+/// A posix-threaded mingw-w64 produces an exe that imports `libwinpthread-1.dll`, and that DLL is not on a
+/// Windows machine. Measured 2026-11-08: `-Wl,-Bstatic -lwinpthread` keeps the import, and so does naming
+/// `libwinpthread.a` by full path, because mingw's static archive carries a `/DEFAULTLIB` directive for its own
+/// import library. The only recipe that produced a clean import table built with the `-win32` compiler drivers,
+/// where ggml's `std::mutex` rides Win32 primitives and no pthread runtime exists at all.
+///
+/// So the cache is read back after configuring: if the compiler cmake actually used is not a win32-threading
+/// driver, this refuses now rather than shipping an exe that dies at the loader on someone's laptop.
+fn require_win32_threading(build_dir: &Path) -> Result<(), String> {
+    let compiler = configured_compiler(build_dir);
+    match compiler {
+        Some(value) if value.contains("win32") => Ok(()),
+        Some(value) => Err(format!(
+            "the cross toolchain built these archives with {value}, which is not a win32-threading driver.\n  \
+             Measured: an exe linked against them imports `libwinpthread-1.dll`, and no `-static` spelling of \n  \
+             `-lwinpthread` removes it (mingw's static archive carries a /DEFAULTLIB for its own import library). \n  \
+             Use the `…-gcc-win32` / `…-g++-win32` compilers."
+        )),
+        None => Err(format!(
+            "no compiler is recorded under {}, so the threading model of these archives cannot be checked. \n  \
+             A cross build that cannot prove which runtime it linked is not one to ship.",
+            build_dir.display()
+        )),
+    }
+}
+
+/// Which C/C++ compiler cmake actually used, read from where it records that fact.
+///
+/// Not from `CMakeCache.txt`: a toolchain file that sets `CMAKE_C_COMPILER` with a plain `set()` — the usual
+/// spelling — keeps it an internal variable, and the cache then holds only the derived `_AR`/`_RANLIB` entries
+/// (measured 2026-11-08: the file has `CMAKE_C_COMPILER_AR` and no `CMAKE_C_COMPILER`). cmake writes the real
+/// answer into `CMakeFiles/<version>/CMakeCXXCompiler.cmake`, so that is read first, with the cache as a
+/// fallback for toolchain files that do use `set(... CACHE ...)`.
+fn configured_compiler(build_dir: &Path) -> Option<String> {
+    let files = std::fs::read_dir(build_dir.join("CMakeFiles")).ok()?;
+    for entry in files.flatten() {
+        for name in ["CMakeCXXCompiler.cmake", "CMakeCCompiler.cmake"] {
+            let candidate = entry.path().join(name);
+            let Ok(text) = fs::read_to_string(&candidate) else {
+                continue;
+            };
+            for prefix in ["set(CMAKE_CXX_COMPILER \"", "set(CMAKE_C_COMPILER \""] {
+                if let Some(rest) = text.lines().find(|l| l.starts_with(prefix)) {
+                    if let Some(value) = rest[prefix.len()..].split('"').next() {
+                        if !value.is_empty() {
+                            return Some(value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let cache = read_cache(&build_dir.join("CMakeCache.txt"));
+    ["CMAKE_CXX_COMPILER", "CMAKE_C_COMPILER"]
+        .iter()
+        .filter_map(|key| cache.get(*key))
+        .find(|value| !value.is_empty())
+        .cloned()
+}
+
+/// Copy the shape's archives into one directory under `OUT_DIR`, each named `lib<name>.a`.
+///
+/// See the call site: upstream gives ggml no prefix on Windows and GNU ld requires one. Staging them together
+/// also means the link line's **order** stays a statement about our archive list rather than about cmake's
+/// directory layout — which is what [`emit_link_flags`]'s comment insists on.
+fn stage_prefixed_archives(
+    build_dir: &Path,
+    out_dir: &Path,
+    shape: &Shape,
+) -> Result<PathBuf, String> {
+    let stage = out_dir.join(LINK_STAGE_DIR);
+    // A stale stage would link an archive this build did not produce — the same failure the deleted-tree check
+    // exists for, one directory over. Remove it before filling it.
+    if stage.exists() {
+        fs::remove_dir_all(&stage).map_err(|e| format!("cannot clear {}: {e}", stage.display()))?;
+    }
+    fs::create_dir_all(&stage).map_err(|e| format!("cannot create {}: {e}", stage.display()))?;
+    let built = shape.targets().join(", ");
+    for name in shape.archives() {
+        let from = find_archive(build_dir, name, &built)?;
+        let to = stage.join(format!("lib{name}.a"));
+        fs::copy(&from, &to)
+            .map_err(|e| format!("cannot copy {} to {}: {e}", from.display(), to.display()))?;
+    }
+    eprintln!(
+        "np-core: staged {} archives as lib*.a in {} (mingw names them without the prefix)",
+        shape.archives().len(),
+        stage.display()
+    );
+    Ok(stage)
+}
+
+/// Ask a mingw compiler where its own static runtime archives live, and return the directories to search.
+///
+/// `-print-file-name` is the question gcc answers with a path (or with the bare name it was given, meaning "not
+/// found" — which is why the result is checked rather than trusted). The two archives are the C++ standard
+/// library and the exception unwinder: both must be linked **statically** into a shipped Windows binary, because
+/// their dynamic forms arrive as `libstdc++-6.dll`, a file that is not on a clean machine.
+fn windows_runtime_search_dirs(compiler: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for wanted in ["libstdc++.a", "libgcc_eh.a"] {
+        let output = std::process::Command::new(compiler)
+            .arg(format!("-print-file-name={wanted}"))
+            .output()
+            .map_err(|e| format!("cannot run {} to locate {wanted}: {e}", compiler.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} exited {} while asked for {wanted}",
+                compiler.display(),
+                output.status
+            ));
+        }
+        let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let found = PathBuf::from(&printed);
+        if !found.is_absolute() || !found.is_file() {
+            return Err(format!(
+                "{} reports no static archive for {wanted} (it answered {printed:?}).\n  \
+                 A cross build that cannot link the C++ runtime statically would ship an exe needing a DLL nobody \n  \
+                 installed, so nothing is linked here.",
+                compiler.display()
+            ));
+        }
+        let dir = found
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", found.display()))?;
+        if !dirs.iter().any(|seen: &PathBuf| seen == dir) {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    Ok(dirs)
 }

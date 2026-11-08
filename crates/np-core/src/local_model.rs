@@ -54,16 +54,19 @@
 //!
 //! ## Portability
 //!
-//! This module converts paths with [`std::os::unix::ffi::OsStrExt`], i.e. it compiles on Unix only. That is
-//! not an oversight to fix here: `build.rs` refuses to build `local-model` on any target but Linux (§14), so
-//! there is no configuration in which a Windows or macOS build ever type-checks this file — and a lossy UTF-8
-//! conversion would hand C a path that does not exist, which is a worse failure than the one it avoids.
+//! Paths reach C through [`c_string_path`], which is per-platform on purpose. Everything else in this module is
+//! portable Rust plus the FFI mirror.
+//!
+//! Until 2026-11-08 this file used `std::os::unix::ffi::OsStrExt` directly and compiled on Unix only, because
+//! `build.rs` refused to build `local-model` for any target but Linux (§14). That refusal now admits
+//! `x86_64-pc-windows-gnu` behind an explicit cmake toolchain, so the conversion has to say what it does on
+//! each platform instead of assuming bytes — see [`c_string_path`] for why a lossy conversion is the failure
+//! this still refuses to make.
 
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::SystemTime;
@@ -1563,14 +1566,7 @@ pub fn load_with_options(
     // prefix a platform needs.
     let open_path = walk::to_open_path(&models::access(path));
 
-    // A NUL inside a path cannot reach C at all. Checked before the stat because it costs no syscall, which is
-    // the ordering argument `LocalModelProvider::new` uses for its own cheapest refusal.
-    let c_path = CString::new(open_path.as_os_str().as_bytes()).map_err(|_| {
-        EmbedError::ArtifactUnreadable {
-            path: path.to_path_buf(),
-            source: io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"),
-        }
-    })?;
+    let c_path = c_string_path(path, &open_path)?;
 
     let meta = fs::metadata(&open_path).map_err(|source| EmbedError::ArtifactUnreadable {
         path: path.to_path_buf(),
@@ -1843,6 +1839,53 @@ fn positive(value: i32, label: &'static str) -> Result<usize, EmbedError> {
     match usize::try_from(value) {
         Ok(count) if count > 0 => Ok(count),
         _ => Err(EmbedError::Unavailable(label.to_string())),
+    }
+}
+
+/// Hand a path to C in the spelling that platform's C runtime reads.
+///
+/// **Unix:** the raw OS bytes, unchanged. A Unix path is a byte string, and any "cleaning" here would make a
+/// loadable file unloadable — this is the only conversion that can be lossless.
+///
+/// **Windows:** UTF-8, or a refusal. An `OsStr` there is WTF-16, and llama.cpp v0.8.0 does its own UTF-8 →
+/// UTF-16 conversion before `_wfopen_s`, so UTF-8 is the spelling it wants. A path that is not valid UTF-8 —
+/// an unpaired surrogate, which F18 established a note can legitimately carry in its name — has no faithful
+/// UTF-8 form at all, so this refuses rather than `to_string_lossy()`-ing a filename that does not exist and
+/// reporting a real file as unreadable. The refusal is the same shape as every other "this path cannot be
+/// opened" answer: [`EmbedError::ArtifactUnreadable`], naming the path the user can act on.
+///
+/// A NUL byte is refused on both platforms, before any syscall: it costs nothing, which is the ordering
+/// argument `LocalModelProvider::new` uses for its own cheapest refusal.
+fn c_string_path(display: &Path, open_path: &Path) -> Result<CString, EmbedError> {
+    let refuse = |why: &'static str| EmbedError::ArtifactUnreadable {
+        path: display.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, why),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        CString::new(open_path.as_os_str().as_bytes())
+            .map_err(|_| refuse("path contains a NUL byte"))
+    }
+    #[cfg(windows)]
+    {
+        match open_path.as_os_str().to_str() {
+            Some(text) => {
+                CString::new(text).map_err(|_| refuse("path contains a NUL byte"))
+            }
+            None => Err(refuse(
+                "path is not valid Unicode, so the inference runtime cannot open it; rename the file",
+            )),
+        }
+    }
+    // No third platform builds this feature: `build.rs` refuses before the crate is compiled. The arm exists so
+    // that a future target fails at load with a sentence rather than failing to link with a mystery.
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = open_path;
+        Err(refuse(
+            "this platform has no path spelling for the inference runtime",
+        ))
     }
 }
 
