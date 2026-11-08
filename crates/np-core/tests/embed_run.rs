@@ -1341,3 +1341,70 @@ fn the_row_missing_arm_points_at_the_same_door_as_embeds_arm_three() {
         "and reuse the one existing remedy wording rather than paraphrase it: {row_missing}"
     );
 }
+
+/// **The shape of `fetched`, pinned without a network.** The real-origin run that found this spelling is recorded in
+/// `docs/design-f38-auto-fetch.md` §5b — 309,855,456 bytes fetched and verified, and the document it printed said
+/// `digest-verified` where the design sketch had said `digest_verified`. A test that needs no transport is what keeps that
+/// class of drift on the *type* from coming back: both structs are `rename_all = "kebab-case"`, which is how every other key
+/// in an embed report is spelled, and this asserts the consequence rather than trusting the attribute.
+///
+/// The second claim is the one §12 rule 8 cares about: there is no field here that *could* carry a host, so no future change
+/// can leak one without adding it to this document — which is what makes the assertion below a tripwire instead of a wish.
+#[test]
+fn the_fetched_record_spells_its_keys_as_the_contract_does() {
+    let record = np_core::embed_run::FetchedRecord {
+        id: "embeddinggemma-2".to_string(),
+        members: vec![np_core::embed_run::FetchedMember {
+            name: "main".to_string(),
+            bytes: 309_855_456,
+            digest_verified: true,
+        }],
+        origin: "compiled-in-pin",
+    };
+
+    let value = serde_json::to_value(&record).expect("a report card always serialises");
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["id", "members", "origin"],
+        "the record's own key set: {value}"
+    );
+
+    let member = &value["members"][0];
+    let mut mkeys: Vec<&str> = member
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    mkeys.sort_unstable();
+    assert_eq!(
+        mkeys,
+        ["bytes", "digest-verified", "name"],
+        "kebab-case, like every other key in this report: {member}"
+    );
+    assert_eq!(member["bytes"], 309_855_456, "bytes are exact, not rounded");
+    assert_eq!(member["digest-verified"], true);
+    assert_eq!(value["origin"], "compiled-in-pin");
+
+    let text = serde_json::to_string(&record).expect("serialises");
+    // The three spellings a host arrives under. Not `.` or `/`: those appear in legitimate places elsewhere, so forbidding
+    // them would forbid the wrong thing while making the rule look stricter than it is.
+    for forbidden in ["http", "://", "huggingface"] {
+        assert!(
+            !text.contains(forbidden),
+            "`{forbidden}` has no business in this record: {text}"
+        );
+    }
+    assert!(
+        matches!(record.origin, "compiled-in-pin" | "configured-mirror"),
+        "origin is a closed set of kinds, not a string someone assembled: {}",
+        record.origin
+    );
+}

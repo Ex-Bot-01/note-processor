@@ -51,6 +51,10 @@ walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Only tests need this one: `embed_run`'s report is a *contract*, and a contract about key spellings can only be pinned by
+# serialising it. The library itself never builds JSON — np-cli does that (`crates/np-cli/Cargo.toml`), which is why this is
+# a dev-dependency and not a dependency.
+serde_json = { workspace = true }
 
 # `fetch`'s disk preflight asks the filesystem how much room it has. Only unix exposes `statvfs`, so only unix gets this
 # dependency: Windows answers from `GetDiskFreeSpaceExW` with no dependency at all (`src/fetch.rs`), and a target that is
