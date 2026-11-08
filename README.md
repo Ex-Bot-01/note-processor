@@ -6,9 +6,12 @@ SQLite database, resolves the `[[wikilinks]]` and `[text](target)` links between
 `np search` ranks by words and meaning together by default, so it answers a query about `GGML_DEFAULT_N_THREADS` on a machine
 that has never downloaded a model, and ranks prose by sense once one is installed.
 
-Nothing here is a service. No daemon, no server, no account: one binary, one database per workspace, all on disk. The
-indexing path never opens a socket; the only command that can dial out is `np models fetch`, and it says so before it transfers
-a byte.
+Nothing here is a service you have to install. No daemon, no port, no account: one binary, one database per workspace, all on disk.
+The indexing path never opens a socket; the only thing that dials out is a model download, and it says so before it transfers a byte.
+
+An application that wants `np` as its backend starts one on demand and talks to it over its **pipes** — `np serve`, newline-delimited
+JSON-RPC, no listener and nothing for a firewall to allow. It exists because a fresh process per question pays for itself in
+model reloads, not because `np` wanted to be a server.
 
 **Everything measured in this file was measured on one host** — Linux x86-64, 16 CPUs, 7.4 GB RAM, 2026-11-05 — and says so
 where a number is host-specific. Where something has *not* been measured, this file says that too rather than guessing.
@@ -22,6 +25,7 @@ where a number is host-specific. Where something has *not* been measured, this f
 - [Configuration](#configuration)
 - [Using it day to day](#using-it-day-to-day)
 - [Reading the report](#reading-the-report)
+- [Driving `np` from a program (`np serve`)](#driving-np-from-a-program-np-serve)
 - [Images in the index](#images-in-the-index)
 - [Troubleshooting](#troubleshooting)
 - [Building from source, and developing](#building-from-source-and-developing)
@@ -469,6 +473,40 @@ if head-or-count ever stops matching it.
 | `verify` | Whether this run re-hashed the artifact or took its stamp at face value |
 | `digest` | The same claim in words, with the size it saw and what that check can and cannot detect |
 | `threads` | Workers llama.cpp used, and whether `"auto"` or you chose it |
+
+## Driving `np` from a program (`np serve`)
+
+`np serve` reads one JSON-RPC 2.0 request per line from stdin and writes one response per line to stdout until stdin closes. It is
+the same work as the commands, on a channel that does not fork: **every `result` is exactly the document `np <verb> --json` prints**,
+because both channels call one builder — a test compares them value for value rather than trusting that intent.
+
+```console
+$ np serve
+{"jsonrpc":"2.0","id":1,"method":"initialize"}
+{"jsonrpc":"2.0","id":1,"result":{"np":"0.3.0","protocol":1,"features":{"local_model":false,"vision":false,"fetch":true},"methods":["initialize","search","scan","embed","models.list","shutdown"],"data_dir":"/home/you/.local/share/note-processor"}}
+{"jsonrpc":"2.0","id":2,"method":"search","params":{"workspace":"/home/you/Notes","query":"timeline"}}
+{"jsonrpc":"2.0","id":2,"result":{"hits":[…],"mode":"hybrid","vectors":false,"note":"embeddings are switched off (…)","reason":"provider-disabled","fetched":null,"offline":false}}
+```
+
+Six methods: `initialize`, `search`, `scan`, `embed`, `models.list`, `shutdown`. A workspace is named in every request rather than remembered at
+startup, so one server answers for several vaults and a stale session cannot report on a directory you moved.
+
+Three rules make this safe to build against, and each is a rule the CLI already had:
+
+- **stdout is the protocol.** Every sentence — progress, llama.cpp's own warnings, a drift notice — goes to stderr. A client never has to strip
+  prose out of a parse.
+- **States come back as results, not faults.** `locked` (another writer holds this workspace, **F44**), `offline`, `reason` (**F45**) and
+  `prefix_drift` (**F42**) are keys in the document, so an app branches on data instead of matching strings. A fault means the *request* was wrong
+  (`-32700` unparseable, `-32601` unknown method, `-32602` bad parameters) or `np` refused before doing any work (`-32000`, carrying the same
+  sentence you would have read on stderr).
+- **Requests run one at a time.** A long `embed` really does hold up the next request on that connection — and readers are not held: `search` and
+  `models.list` take no write lock, so a second process (or this server's next question, once the embed returns) keeps answering. Run two servers if
+  you want an embed in the background; they contend through the workspace lock exactly as two `np` processes do.
+
+`np serve` exits **0** when stdin closes, which is how every stdio client says it is finished. Nothing listens on a port, so there is no address to
+bind, no token to store and nothing for another user on the machine to connect to: whoever can write to the process's stdin already owns the files it
+can read. The loopback HTTP API, the file watcher and autostart are M4 (`docs/roadmap-2026-10-27.md`) and will be a separate design; `serve` is not
+a preview of them and pre-implements none of them.
 
 ## Images in the index
 

@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod serve;
+
 use clap::{Parser, Subcommand};
 use np_core::catalog::size_human;
 use np_core::config::{Config, EmbeddingProvider};
@@ -105,6 +107,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Answer JSON-RPC 2.0 requests on stdin/stdout until stdin closes — the backend surface for an app.
+    ///
+    /// One process, no port, no daemon: stdout carries exactly one JSON object per line and nothing else, every human sentence goes to stderr, and
+    /// each method's `result` is the same document `np <verb> --json` prints. A workspace is named per request rather than remembered, so one
+    /// server can serve several vaults and a stale session cannot answer for a directory you moved. Design:
+    /// `docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md`.
+    Serve,
     /// Index a workspace, fetch its pinned model if this build can, embed it — one command that ends with vectors or says
     /// exactly where it stopped (**F38**).
     ///
@@ -279,6 +288,9 @@ fn main() -> ExitCode {
             AutoFetch::from_flags(auto_fetch, no_auto_fetch),
             yes,
         ),
+        // No `--json` flag to honour here, because there is no other channel to choose: stdout *is* the protocol. The global flag is ignored
+        // rather than rejected, so a client that sets it out of habit gets the same stream either way.
+        Command::Serve => serve::serve(),
         Command::Search {
             workspace,
             query,
@@ -385,13 +397,12 @@ fn writer_lock(
     cfg: &Config,
     workspace: &Path,
     command: &str,
-    json: bool,
-) -> Result<np_core::lock::WorkspaceLock, Box<dyn Error>> {
+) -> Result<np_core::lock::WorkspaceLock, LockFailure> {
     // **§3 step 0 comes first, and it belongs here rather than in each caller**: taking the lock creates a file, and a typo'd workspace path
     // must not leave one behind. `Config::workspace_db` happily derives a name for a directory that does not exist, so a lock taken before
     // this check would create a data directory and a `<hash>.lock.db` for a vault nobody has — the exact failure §3 step 0 exists to prevent,
     // re-opened through a new door. Every mutating command requires an existing workspace directory anyway, so nothing loses coverage.
-    models::require_workspace_dir(workspace)?;
+    models::require_workspace_dir(workspace).map_err(|source| LockFailure::Other(source.into()))?;
     let db_path = cfg.workspace_db(workspace);
     // The lock is named after the workspace database rather than recomputing an id, so there is no second derivation to drift from the first:
     // same directory, same stem, `.lock.db`. Copy a workspace's data somewhere else and its lock comes with it; two workspaces never contend.
@@ -402,38 +413,109 @@ fn writer_lock(
     let stem = db_path
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("cannot name the workspace lock for {}", db_path.display()))?;
+        .ok_or_else(|| {
+            LockFailure::Other(
+                format!("cannot name the workspace lock for {}", db_path.display()).into(),
+            )
+        })?;
     match np_core::lock::WorkspaceLock::acquire(
         dir,
         stem,
         np_core::lock::WorkspaceLock::DEFAULT_WAIT,
     ) {
         Ok(held) => Ok(held),
-        Err(np_core::lock::LockError::Held { waited }) => {
-            if json {
-                emit_json(&json!({
-                    "command": command,
-                    // The state, spelled for a machine because an app should not have to recognise a sentence. `locked` sits beside `offline`
-                    // and `fetched` as the third thing that can stop a mutating command without being anybody's bug.
-                    "locked": true,
-                    "waited_ms": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
-                }));
-            }
-            Err(format!(
-                "locked: another process is writing this workspace ({} ms) — try again once it finishes; \
-                 `np search` and `np models list` answer while a writer runs",
-                waited.as_millis()
-            )
-            .into())
-        }
-        Err(other) => Err(other.into()),
+        Err(np_core::lock::LockError::Held { waited }) => Err(LockFailure::Locked {
+            command: command.to_string(),
+            waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        }),
+        Err(other) => Err(LockFailure::Other(other.into())),
     }
+}
+
+impl LockFailure {
+    /// The machine-readable form of a refusal, built once for every channel (**F44**).
+    ///
+    /// `locked` sits beside `offline` and `fetched` as the third thing that can stop a mutating command without being anybody's bug. It is a
+    /// function rather than a literal at a print site because `np serve` has to put *this same object* in a JSON-RPC result: two places building
+    /// it is two chances for a screen and a terminal to disagree about what contention means.
+    fn document(&self) -> Option<Value> {
+        match self {
+            Self::Locked { command, waited_ms } => Some(json!({
+                "command": command,
+                "locked": true,
+                "waited_ms": waited_ms,
+            })),
+            Self::Other(_) => None,
+        }
+    }
+
+    /// The CLI's shape of a refusal: under `--json` the document goes to stdout first, then the sentence travels the error channel and decides the
+    /// exit code — two channels, one fact. Other channels render [`Self::document`] their own way, which is why this takes the channel as an
+    /// argument instead of the lock helper taking a boolean.
+    fn report_cli(self, json: bool) -> Box<dyn Error> {
+        // Printed before `self` is consumed below: a JSON caller that gets only a sentence on stderr is the exact F44 defect this type exists to
+        // prevent (before it, a losing `np scan --json` printed nothing at all).
+        if json {
+            if let Some(doc) = self.document() {
+                emit_json(&doc);
+            }
+        }
+        match self {
+            Self::Locked { waited_ms, .. } => format!(
+                "locked: another process is writing this workspace ({waited_ms} ms) — try again once it finishes; \
+                 `np search` and `np models list` answer while a writer runs"
+            )
+            .into(),
+            Self::Other(source) => source,
+        }
+    }
+}
+
+/// Whether the server may work, as three outcomes rather than two.
+///
+/// **F44 says contention is a state, and a state must survive every channel.** A JSON-RPC *fault* would fire an app's generic "the backend refused"
+/// handler on something it is meant to retry, so `np serve` turns contention back into the very document `np scan --json` prints under contention
+/// ([`LockFailure::document`]) and lets the caller branch on `locked`.
+enum LockGrant {
+    /// Ours to work under; the guard drops once the request's document is built.
+    Held(np_core::lock::WorkspaceLock),
+    /// Somebody else is writing, and this is the document that says so.
+    Contended(Value),
+}
+
+fn server_writer_lock(
+    cfg: &Config,
+    workspace: &Path,
+    command: &str,
+) -> Result<LockGrant, Box<dyn Error>> {
+    match writer_lock(cfg, workspace, command) {
+        Ok(guard) => Ok(LockGrant::Held(guard)),
+        Err(LockFailure::Locked { waited_ms, command }) => Ok(LockGrant::Contended(
+            LockFailure::Locked { command, waited_ms }
+                .document()
+                .expect("a locked refusal always has a document"),
+        )),
+        Err(LockFailure::Other(source)) => Err(source),
+    }
+}
+
+/// Why a mutating command could not take the workspace, as data rather than as a printed sentence.
+///
+/// The distinction that matters is between *contention* — a state, retry it, and readers keep answering — and *everything else*, which is a
+/// refusal that needs somebody to change something. Collapsing both into `Box<dyn Error>` was fine while the CLI was the only channel: there was
+/// exactly one way to render either. `np serve` needs the first one's document, so the two kinds are separate arms now.
+enum LockFailure {
+    /// Another process holds the workspace. The two fields are what [`Self::document`] carries, so a caller never parses a sentence to learn this.
+    Locked { command: String, waited_ms: u64 },
+    /// Anything else that stopped us before work: no workspace directory, an unreadable data dir, a name we cannot derive from the database path.
+    Other(Box<dyn Error>),
 }
 
 fn scan_workspace(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     let cfg = load_config()?;
     // Held for the whole command, including the `INDEX.md` rendering that SQLite cannot roll back.
-    let _writer = writer_lock(&cfg, workspace, "scan", json)?;
+    let _writer =
+        writer_lock(&cfg, workspace, "scan").map_err(|failure| failure.report_cli(json))?;
     let report = scan(workspace, &cfg)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -739,7 +821,8 @@ fn embed_workspace(
 ) -> Result<(), Box<dyn Error>> {
     // The lock spans the run: an `embed` writes vectors and re-renders `INDEX.md`, and a second writer in the same vault is what F44 measured.
     let cfg_for_lock = load_config()?;
-    let _writer = writer_lock(&cfg_for_lock, workspace, "embed", json)?;
+    let _writer = writer_lock(&cfg_for_lock, workspace, "embed")
+        .map_err(|failure| failure.report_cli(json))?;
     let report = embed_report(workspace, auto_fetch, !json)?;
     // Read the row that was actually used rather than re-deriving from argv: `[embeddings] model` is what `embed_run` embedded for, and a
     // config naming something other than the installed row is exactly the disagreement worth noticing.
@@ -782,7 +865,8 @@ fn setup_workspace(
     // One lock for the whole composed run. It is taken before the consent prompt in step 2 and held through it, which is deliberate: by then
     // this process has decided it intends to write, and a second writer that started while a human was reading the question would land in the
     // gap between this command's index and its embed. Readers are unaffected — `np status` answers over a held lock, and the tests say so.
-    let _writer = writer_lock(&cfg, workspace, "setup", json)?;
+    let _writer =
+        writer_lock(&cfg, workspace, "setup").map_err(|failure| failure.report_cli(json))?;
     let indexed = scan(workspace, &cfg)?;
 
     if !json {
@@ -937,13 +1021,34 @@ fn origin_kind_token(cfg: &Config) -> &'static str {
 /// where a run that cannot embed refuses at exit 1, with the sentence for its own [`ProviderState`]: an absent artifact, an
 /// unbuilt runtime, a missing row, a switched-off provider. A query nobody can embed has no ranking to print (F32: until this
 /// round four of those five shared one sentence about `provider = "none"`).
-fn search_workspace(
+/// What one search produced, before anybody printed it.
+///
+/// **Why this type exists.** `np search` used to interleave "work out the answer" with "write bytes to stdout", which meant the only way to get a
+/// search document was to print one. `np serve` needs the same object on a different channel, and the alternative to this struct was a second
+/// implementation of provider resolution, fetch policy and note selection — two vocabularies for one state, which is the failure every card from
+/// F32 onward has been about. The CLI prints this; the server serialises it; neither can drift, because there is one of each function.
+struct SearchRun {
+    hits: Vec<search::Hit>,
+    mode: search::SearchMode,
+    /// Whether the index holds vectors at all — the truth about the workspace, which **F45** ruled must stay `true` even when this answer could
+    /// not use them, because a reader that sees `false` will go and re-fetch a model it does not need.
+    present: bool,
+    note: Option<search::RankNote>,
+    fetched: Option<Value>,
+    offline: bool,
+    /// The id whose model (if any) embedded the query — needed only by the text channel's "nothing indexed for …" sentence.
+    model: String,
+}
+
+/// Run one search. `announce` is the human channel: it lets provider resolution print what it is about to download, and is off for `--json` and
+/// for `np serve`, where the document carries those facts instead (`fetched.origin_kind`, `reason`).
+fn search_run(
     workspace: &Path,
     query: &str,
     limit: usize,
     mode: Option<search::SearchMode>,
-    json: bool,
-) -> Result<(), Box<dyn Error>> {
+    announce: bool,
+) -> Result<SearchRun, Box<dyn Error>> {
     let cfg = load_config()?;
     // Config first, flag over it: `[search] mode` is the standing choice and `--mode` is the exception to it.
     let mode = mode.unwrap_or(cfg.search.mode);
@@ -1003,7 +1108,7 @@ fn search_workspace(
         // `search_with_fetching_switched_off_says_so_instead_of_blaming_the_network` failed on the `local-model,fetch` row saying
         // `offline:true` where the switch meant "nothing was attempted".
         let fetch_allowed = hybrid && AutoFetch::Deferred.allowed(&cfg);
-        let resolved = embed_provider(&cfg, workspace, fetch_allowed, !json)?;
+        let resolved = embed_provider(&cfg, workspace, fetch_allowed, announce)?;
         let Resolved {
             state,
             fetched: arrived,
@@ -1120,30 +1225,62 @@ fn search_workspace(
     let hits = answer.hits;
     let note = note.or(answer.note);
 
-    let mut out = io::stdout().lock();
+    Ok(SearchRun {
+        hits,
+        mode,
+        present,
+        note,
+        fetched,
+        offline,
+        model,
+    })
+}
+
+/// The document `np search --json` prints, in one function so no second channel can invent its own keys.
+///
+/// One object per hit under `hits`, beside the two keys that say how the list was made (§12). The empty case is an empty array — a machine reader
+/// does not need a sentence, and a second key per hit would be a schema change in disguise; `mode` and `vectors` describe the *list*, so they sit
+/// beside it.
+///
+/// **F45/F38 keys, and why `reason` is not the same thing as `note`.** `note` is prose for a human and may be reworded; `reason` is the token a
+/// caller branches on when it wants to know which half answered. `fetched` and `offline` mean exactly what they mean in `np embed --json` (F38),
+/// so one reader handles both commands: an application that called `np search` first on a fresh machine can now see `fetched` arrive,
+/// `vectors:false`, and `reason:"artifact-fetched"` telling it the next call is `np embed`. Nothing here changes when the semantic half worked:
+/// `reason` is null and `note` stays null, exactly as before.
+fn search_document(run: &SearchRun) -> Value {
+    let objects: Vec<Value> = run.hits.iter().map(hit_json).collect();
+    json!({
+        "hits": objects,
+        "mode": run.mode.label(),
+        "vectors": run.present,
+        "note": run.note.as_ref().map(search::RankNote::label),
+        "reason": run.note.as_ref().map(search::RankNote::token),
+        "fetched": run.fetched.clone(),
+        "offline": run.offline,
+    })
+}
+
+/// `np search`: run the query, then print it in the channel the caller asked for.
+fn search_workspace(
+    workspace: &Path,
+    query: &str,
+    limit: usize,
+    mode: Option<search::SearchMode>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let run = search_run(workspace, query, limit, mode, !json)?;
     if json {
-        // One object per hit under `hits`, beside the two keys that say how the list was made (§12). The empty case is an
-        // empty array — a machine reader does not need a sentence, and a second key per hit would be a schema change in
-        // disguise; `mode` and `vectors` describe the *list*, so they sit beside it.
-        let objects: Vec<Value> = hits.iter().map(hit_json).collect();
-        drop(out);
-        // **F45/F38 keys, and why `reason` is not the same thing as `note`.** `note` is prose for a human and may be reworded;
-        // `reason` is the token a caller branches on when it wants to know which half answered. `fetched` and `offline` mean
-        // exactly what they mean in `np embed --json` (F38), so one reader handles both commands: an application that called
-        // `np search` first on a fresh machine can now see `fetched` arrive, `vectors:false`, and `reason:"artifact-fetched"`
-        // telling it the next call is `np embed`. Nothing here changes when the semantic half worked: `reason` is null and
-        // `note` stays null, exactly as before.
-        emit_json(&json!({
-            "hits": objects,
-            "mode": mode.label(),
-            "vectors": present,
-            "note": note.as_ref().map(search::RankNote::label),
-            "reason": note.as_ref().map(search::RankNote::token),
-            "fetched": fetched,
-            "offline": offline,
-        }));
+        emit_json(&search_document(&run));
         return Ok(());
     }
+    let SearchRun {
+        hits,
+        mode,
+        note,
+        model,
+        ..
+    } = run;
+    let mut out = io::stdout().lock();
     if let Some(reason) = note {
         // One line on stderr for a half that was not there to answer. Stderr because stdout stays parseable; the exit code is
         // still 0 when the keyword list answered, which is the point of the mode.
@@ -1918,7 +2055,8 @@ fn models_fetch(
     // the rest of the run, and that stays true of its *failures*; what it must not do is delete a marker while another process is mid-fetch in
     // this same workspace — which is exactly the situation the lock detects, and exactly what §12 rule 4's marker exists to make visible. A
     // refusal here therefore leaves the marker where it is, for the other run to finish with.
-    let _writer = writer_lock(&config, workspace, "models fetch", json)?;
+    let _writer = writer_lock(&config, workspace, "models fetch")
+        .map_err(|failure| failure.report_cli(json))?;
     let db = workspace_db(&config, workspace)?;
     let models_dir = config.workspace_models_dir(workspace);
 
@@ -2053,7 +2191,8 @@ fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(),
     // An install writes a row and copies an artifact into the per-workspace model directory. Neither is in the transaction that `scan` would
     // open, so a concurrent index can observe a half-installed model — which is why this command is inside the same lock as everything else
     // that changes state (**F44**), not merely next to it.
-    let _writer = writer_lock(&config, workspace, "models install", json)?;
+    let _writer = writer_lock(&config, workspace, "models install")
+        .map_err(|failure| failure.report_cli(json))?;
     let db = workspace_db(&config, workspace)?;
     let outcome = models::install(&db, &config, workspace, request, now_secs())?;
     if json {
