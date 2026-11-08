@@ -21,6 +21,12 @@ That last row is the one that decides whether the artifact is usable: no `libgcc
 `windows-gnu` link already keeps the C runtime static, so nothing has to be installed beside `np.exe`. Had those two appeared, the
 asset would have been a folder of DLLs and this document would say "not portable".
 
+**Scripted 2026-11-09: `.github/scripts/cross-build-windows.sh`.** It does the steps below, refuses if the import table grows a mingw
+runtime DLL (the check that decides whether `np.exe` is still one file), and prints both hashes because release notes quote both. Running it on
+the v0.2.2 tree reproduced the published asset byte for byte — zip `9850dc0d…720ad6`, inner `np.exe` `d7104b59…4eef75` — which is the closest
+thing here to a determinism claim: same toolchain, same tree, same bytes. The refusal path was exercised with a stubbed `objdump` that claims
+`libwinpthread-1.dll`, and it stopped before packaging. This document stays as the *why*; the script is the *how*.
+
 ## The toolchain, without root and without apt-installing anything
 
 `sudo` is not available on this host and mingw-w64 was not installed. It does not need either: Ubuntu's `.deb`s are `ar`+`tar`
