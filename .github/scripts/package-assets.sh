@@ -55,7 +55,16 @@ else
     exit 1
   fi
 
-  tar -C "target/$target/release" -czf "$archive" "$binary"
+  # **MIT travels with the distribution.** `THIRD_PARTY_NOTICES.md` carries the copyright line and license text for the llama.cpp/ggml code
+  # statically linked into this binary, and an MIT notice that lives only in the repository satisfies nobody: the obligation attaches to the
+  # artefact a person downloads. So it goes inside the tarball, and the listing is checked rather than assumed — with `grep -c` rather than
+  # `grep -q`, because `-q` exits on first match and can SIGPIPE `tar` into a failure that pipefail then reports as ours.
+  test -s THIRD_PARTY_NOTICES.md || { echo "refusing to package: THIRD_PARTY_NOTICES.md is missing or empty" >&2; exit 1; }
+  tar -C "target/$target/release" -czf "$archive" "$binary" -C . THIRD_PARTY_NOTICES.md
+  if ! { tar -tzf "$archive" | { grep -c 'THIRD_PARTY_NOTICES\.md' || true; }; } | grep -qv '^0$'; then
+    echo "refusing to publish: the asset does not contain THIRD_PARTY_NOTICES.md" >&2
+    exit 1
+  fi
 fi
 
 # The workflow's own guard, kept here too: a truncated or empty archive is worse than no release at all.

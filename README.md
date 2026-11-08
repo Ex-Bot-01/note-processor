@@ -25,6 +25,7 @@ where a number is host-specific. Where something has *not* been measured, this f
 - [Images in the index](#images-in-the-index)
 - [Troubleshooting](#troubleshooting)
 - [Building from source, and developing](#building-from-source-and-developing)
+- [Licensing and third-party code](#licensing-and-third-party-code)
 - [Where the thinking lives](#where-the-thinking-lives)
 
 ## What it does, and does not do
@@ -591,6 +592,22 @@ output is still not evidence either way, which is the rule that round wrote down
 What CI never has is the model weights, so the artifact-gated rows print their `NOT COVERAGE` there by design and every *measured* figure in these
 docs — bytes, milliseconds, vector counts — still comes from this host with those two variables set. macOS keeps its standing limit: the build fact
 only (the unix `statvfs` arm compiles), its number never read here.
+
+## Licensing and third-party code
+
+**`np` itself has no license file.** The repository ships no `LICENSE`, and this section does not invent one: adding a license to a project
+published without one is the owner's decision, and it blocks calling any release final. The gap is tracked as **F47** in
+[`docs/backlog-m2-followups.md`](docs/backlog-m2-followups.md).
+
+What *is* settled is the obligation that arrived with `v0.3.0`. Published binaries now statically link llama.cpp's and ggml's inference runtime
+(MIT, `Copyright (c) 2023-2026 The ggml authors`), and MIT's condition — ship the copyright notice and license text with the distribution —
+attaches to the artefact a person downloads, not to the repository it came from. So [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) carries
+the verbatim text plus exactly which archives are linked and which parts of the pinned tree are **not** (and therefore do not need naming), and
+both packaging scripts put that file *inside* every tarball and zip and refuse to publish an asset that lacks it.
+
+The model weights are a separate matter and are not redistributed here: `embeddinggemma-2` is fetched on your explicit action, digest-verified,
+and its own model license governs it. See [Third-party code](THIRD_PARTY_NOTICES.md) for the full statement, including the reproducible build
+commands and the open item on generated Rust crate notices.
 
 ## Where the thinking lives
 

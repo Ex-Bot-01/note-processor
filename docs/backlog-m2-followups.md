@@ -2291,6 +2291,37 @@ the machine-readable channel carries no explanation either (same failure shape a
 **Owed:** ruling, then tests pinning *both* halves (the fallback results AND the note text), because F36's existing assertions cover only
 "no vectors at all". Stage 12 of `run-stage5-7.ps1` measures today's behaviour and labels it `F45 (open)` so a ruling shows up as a diff.
 
+## F47 — a runtime-bearing release ships MIT code and the project has no license of its own
+
+Filed 2026-12-08 while writing `THIRD_PARTY_NOTICES.md`, prompted by §14's decision to own the llama.cpp build. Two separate obligations, one
+card because they land in the same change:
+
+**The third-party half is done.** Since `v0.3.0` every published asset statically links `libllama.a`, `libggml.a`, `libggml-cpu.a` and
+`libggml-base.a` from llama.cpp `v0.8.0` — MIT, `Copyright (c) 2023-2026 The ggml authors`. MIT asks for the copyright line and license text to
+accompany the distribution, so `THIRD_PARTY_NOTICES.md` carries them verbatim, names which archives are linked and which parts of the pinned tree
+are not (`common/` with its bundled nlohmann/json, the server's cpp-httplib, `gguf-py/`, examples — a notice file that lists everything in a
+vendored tree teaches readers to assume linkage that is not there), and both packaging scripts now copy it into the tarball/zip and refuse to
+publish an asset whose listing lacks it. Verified by reading the archive back, not by trusting the write.
+
+**The project's own license is missing, and it is a release blocker.** `ls LICENSE*` at the root returns nothing, which means every published
+asset — including three releases' worth of downloads — has been distributed under no stated terms. That is not a cosmetic gap: without a license
+the default is "all rights reserved", so a downloader has no permission to use, modify or redistribute `np`, and any contributor's patch arrives
+without a grant that makes shipping it safe. Naming a license is the owner's decision rather than a contributor's edit, which is why this is a
+card and not a commit.
+
+Options, cheapest first: **A — MIT**, matching llama.cpp and the crate ecosystem, one file, no CLA theatre; **B — Apache-2.0**, if patent
+exposure from a future commercial user matters more than brevity (and note it is dual-license-compatible with most of the dependency tree);
+**C — AGPL-3.0**, which would deliberately make hosted deployments contribute back — and would be a statement about the project's direction, not
+a neutral choice, since it interacts with MIT-licensed static linkage in ways that need care.
+
+**Done when:** the owner picks one; `LICENSE` exists at the root and is named in `README.md`'s licensing section (which currently says plainly
+that none exists) and in `THIRD_PARTY_NOTICES.md`; and a release is cut from that tree. Until then no release should be called final, and this
+card is the reason printed in the release notes rather than a footnote here.
+
+**Also owed by the same file:** generated Rust crate notices (`cargo about`) attached beside the C/C++ notice. Hand-maintaining ~200 entries would
+be a list that is wrong more often than right, so the item is tooling — and the reason it is written down rather than dropped is that a copyleft
+crate in the tree would need stronger treatment than disclosure, which is exactly what a generated report catches and prose does not.
+
 ## F46 — `np` creates an empty `<id>.models` directory for a workspace with nothing installed, and tooling reads it as "a model is here"
 
 **Filed 2026-11-08 from round seven.** Observed on Windows at 18:15:18 during a plain `np scan`: a sibling directory

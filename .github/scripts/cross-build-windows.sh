@@ -137,11 +137,21 @@ echo "strip    $unstripped B -> $(stat -c%s "$exe") B"
 mkdir -p "$out"
 name="np-$version-$target-cross"
 archive="$out/$name.zip"
-python3 - "$exe" "$archive" <<'PY'
+# **MIT travels with the distribution** (see `THIRD_PARTY_NOTICES.md`): the license text for the statically linked llama.cpp/ggml code has to be
+# inside the zip, not merely in the repository the zip came from. The listing is then read back from the archive, because "we meant to add it" and
+# "the downloader receives it" are different claims.
+notices="$repo_root/THIRD_PARTY_NOTICES.md"
+test -s "$notices" || { echo "refusing to package: THIRD_PARTY_NOTICES.md is missing or empty" >&2; exit 1; }
+python3 - "$exe" "$archive" "$notices" <<'PY'
 import sys, zipfile
-exe, archive = sys.argv[1], sys.argv[2]
+exe, archive, notices = sys.argv[1], sys.argv[2], sys.argv[3]
 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
     z.write(exe, "np.exe")
+    z.write(notices, "THIRD_PARTY_NOTICES.md")
+with zipfile.ZipFile(archive) as z:
+    names = z.namelist()
+assert "THIRD_PARTY_NOTICES.md" in names, f"asset lacks the notice file: {names}"
+assert "np.exe" in names, f"asset lacks the binary: {names}"
 PY
 test -s "$archive"
 
