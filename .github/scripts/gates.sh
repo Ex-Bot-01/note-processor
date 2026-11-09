@@ -126,7 +126,10 @@ row_or_skip test-cli-realmodel "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p
 [ -n "${NP_TEST_MMPROJ_PATH:-}" ] || artifacts="NP_TEST_MODEL_PATH or NP_TEST_MMPROJ_PATH unset"
 row_or_skip test-core-realvision "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-core --features local-model,vision -- --nocapture
 
-vacuous=$(grep -rho 'NOT COVERAGE' "$logs" 2>/dev/null | wc -l | tr -d ' ')
+# `--exclude=driver.log`, because this script's own summary sentence contains the phrase it counts: on 2026-12-09 the tally read
+# 14 where 13 lines were real, and the extra one was this line. The same trap bit the v0.3.0 release notes; a counter that counts
+# itself is not evidence, so exclude the file that carries the verdict rather than teaching readers to subtract one by hand.
+vacuous=$(grep -rho --exclude=driver.log 'NOT COVERAGE' "$logs" 2>/dev/null | wc -l | tr -d ' ')
 echo "vacuous  NOT COVERAGE lines across all logs: $vacuous"
 echo "OVERALL fail=$fail"
 [ "$fail" = 0 ] && echo "graded locally at $(git rev-parse --short HEAD 2>/dev/null) — logs in $logs"
