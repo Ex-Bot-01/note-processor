@@ -2147,3 +2147,114 @@ fn a_member_row_naming_no_file_is_reported_as_absent_rather_than_dropped() {
         "a directory is not an artifact"
     );
 }
+
+// ---------------------------------------------------------------------------
+// listing every marker in a directory (**F48** progress design, §5)
+// ---------------------------------------------------------------------------
+
+/// One marker's bytes, written the way `fetch` writes them.
+fn marker_bytes(nonce: &str, started_at: i64, bytes_done: u64, bytes_total: &str) -> String {
+    format!(
+        "{{\"nonce\":\"{nonce}\",\"started_at\":{started_at},\"bytes_done\":{bytes_done},\"bytes_total\":{bytes_total}}}"
+    )
+}
+
+/// The listing a GUI's "what is downloading?" panel needs: every marker in the directory, by id, without asking
+/// each id separately (which would need a catalogue of ids nobody has until a fetch ends).
+#[test]
+fn list_fetch_markers_reports_every_marker_and_keeps_them() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let dir = tmp.path();
+    fs::write(
+        models::marker_path(dir, "alpha"),
+        marker_bytes("1-1-0", 1_730_000_000, 4_194_304, "309855456"),
+    )
+    .expect("test setup: alpha marker");
+    fs::write(
+        models::marker_path(dir, "beta"),
+        marker_bytes("2-1-0", 1_730_000_500, 8_388_608, "null"),
+    )
+    .expect("test setup: beta marker");
+    // A corrupt marker is a fact about the disk, not an invitation to tidy.
+    fs::write(models::marker_path(dir, "broken"), b"{\"nonce\"")
+        .expect("test setup: broken marker");
+    // A marker mid-rewrite: named like a marker's temp file, so it must not be listed as a second download.
+    fs::write(
+        dir.join(".fetching.gamma.json.tmp7"),
+        marker_bytes("3-1-0", 1_730_000_900, 1, "10"),
+    )
+    .expect("test setup: gamma temp");
+
+    let mut listed = models::list_fetch_markers(dir);
+    listed.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let ids: Vec<&str> = listed.iter().map(|marker| marker.id.as_str()).collect();
+    assert_eq!(ids, vec!["alpha", "beta", "broken"], "{listed:?}");
+
+    let alpha = &listed[0];
+    match &alpha.state {
+        models::MarkerState::Running {
+            bytes_done,
+            bytes_total,
+            started_at,
+        } => {
+            assert_eq!(*bytes_done, 4_194_304, "{alpha:?}");
+            assert_eq!(*bytes_total, Some(309_855_456), "{alpha:?}");
+            assert_eq!(*started_at, 1_730_000_000, "{alpha:?}");
+        }
+        other => panic!("alpha's marker reads cleanly, got {other:?}"),
+    }
+    match &listed[1].state {
+        models::MarkerState::Running { bytes_total, .. } => {
+            assert_eq!(
+                *bytes_total, None,
+                "an unknown size stays unknown (§12 rule 12): {listed:?}"
+            )
+        }
+        other => panic!("beta's marker reads cleanly, got {other:?}"),
+    }
+    assert!(
+        matches!(listed[2].state, models::MarkerState::Unreadable { .. }),
+        "a truncated marker is reported as unreadable, not skipped: {:?}",
+        listed[2]
+    );
+
+    // **§12 rule 4:** reading is not deciding. Every file the setup wrote is still there, byte for byte.
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("test: read dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            ".fetching.alpha.json",
+            ".fetching.beta.json",
+            ".fetching.broken.json",
+            ".fetching.gamma.json.tmp7"
+        ],
+        "a listing that removed or rewrote a marker would be §12 rule 4 broken by a read-only command"
+    );
+}
+
+/// A directory that does not exist is not an error to report about — it is the state of a workspace nobody has
+/// fetched into yet, and `status.get` answers it with an empty list rather than a fault.
+#[test]
+fn list_fetch_markers_of_a_missing_directory_is_empty() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let missing = tmp.path().join("no-such-workspace.models");
+    assert!(
+        models::list_fetch_markers(&missing).is_empty(),
+        "a directory nobody has created holds no markers"
+    );
+    assert!(
+        !missing.exists(),
+        "asking must not create the thing being asked about"
+    );
+}

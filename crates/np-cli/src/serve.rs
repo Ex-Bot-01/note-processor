@@ -44,6 +44,9 @@ pub const PROTOCOL: u64 = 1;
 /// The methods this build answers, in the order a support screen would list them. Kept beside [`dispatch`] rather than derived from it because a
 /// client that calls something absent gets `-32601` and a support report that names what *was* available.
 pub const METHODS: &[&str] = &[
+    // `status.get` is last-but-one because it is the only method that reads state the server did not create this
+    // instant: it answers between requests, which is what a client with no request of its own in flight needs.
+    "status.get",
     "initialize",
     "search",
     "scan",
@@ -290,6 +293,7 @@ fn dispatch(
         "scan" => scan(params, request, ch),
         "embed" => embed(params, request, ch),
         "models.list" => models_list(params),
+        "status.get" => status(params, ch),
         // The client asked to be done. `serve` answers this one request and the loop exits on the following EOF; answering before exiting keeps
         // the response from racing the pipe closing.
         "shutdown" => Ok(json!({"ok": true})),
@@ -440,6 +444,60 @@ fn embed(
         None => None,
     };
     crate::insert_drift(serde_json::to_value(&report).map_err(refused)?, drift).map_err(refused)
+}
+
+/// What this connection knows, and what the disk says is being downloaded.
+///
+/// Three keys, always present — a client should be able to read `result["running"]` without first asking whether this
+/// build has it:
+///
+/// * `last`: the finished activity this connection most recently answered (`{request, command, phase, elapsed_ms, …}`),
+///   or `null` on a connection that has done nothing yet.
+/// * `fetch_markers`: every `.fetching.*` marker in this workspace's models directory, read from disk. Reported, never
+///   touched (**§12 rule 4**).
+/// * `running`: **always `null` in this design**, and documented as such. The server handles one request at a time, so by
+///   the time it can answer "what is running?", the thing that was running has finished; inventing a value here would
+///   give a client a field to trust that cannot be true. Live status arrives as notifications instead.
+///
+/// Nothing here opens a database. A status question that created `<workspace>.sqlite` would make every typo'd vault in
+/// someone's config read as an indexed workspace to the next tool that looks.
+fn status(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Value, ServeError> {
+    let workspace = workspace_of(params)?;
+    let config = crate::load_config().map_err(refused)?;
+    let models_dir = config.workspace_models_dir(&workspace);
+    let markers: Vec<Value> = np_core::models::list_fetch_markers(&models_dir)
+        .into_iter()
+        .map(|marker| match marker.state {
+            np_core::models::MarkerState::Running {
+                bytes_done,
+                bytes_total,
+                started_at,
+            } => {
+                let mut object = json!({
+                    "id": marker.id,
+                    "state": "running",
+                    "bytes_done": bytes_done,
+                    "started_at": started_at,
+                });
+                // Absent rather than null: an unannounced size is unknown, and a GUI that renders `0` for unknown shows
+                // a download that never progresses.
+                if let Some(total) = bytes_total {
+                    object["bytes_total"] = json!(total);
+                }
+                object
+            }
+            np_core::models::MarkerState::Unreadable { reason } => json!({
+                "id": marker.id,
+                "state": "unreadable",
+                "reason": reason,
+            }),
+        })
+        .collect();
+    Ok(json!({
+        "last": ch.last().cloned().unwrap_or(Value::Null),
+        "fetch_markers": markers,
+        "running": null,
+    }))
 }
 
 fn models_list(params: &Value) -> Result<Value, ServeError> {

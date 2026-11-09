@@ -147,6 +147,11 @@ impl<'a> Channel<'a> {
         self.last = Some(document);
     }
 
+    /// What finished last on this connection, for `status.get`. `None` until the first request ends.
+    pub fn last(&self) -> Option<&Value> {
+        self.last.as_ref()
+    }
+
     /// Queue the terminal notification for the request being handled.
     pub fn queue_terminal(&mut self, params: Value) {
         self.pending_terminal = Some(params);

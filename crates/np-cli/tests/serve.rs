@@ -934,3 +934,142 @@ fn a_notification_command_produces_progress_without_a_request_key() {
         }
     }
 }
+
+/// `status.get` is the one question a client can ask *while nothing of its own is running* — the push-only design means
+/// the server answers "what just finished, and what is on disk" rather than "what is happening now". Three keys, always
+/// present, so a client reads `result["running"]` without a contains-check: `last`, `fetch_markers`, `running`.
+#[test]
+fn status_get_answers_three_keys_before_anything_is_indexed() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+
+    let status = server.result("status.get", json!({"workspace": workspace}));
+    assert!(
+        status["last"].is_null(),
+        "nothing has finished on this connection yet: {status}"
+    );
+    assert_eq!(
+        status["fetch_markers"],
+        Value::Array(Vec::new()),
+        "a workspace nobody has fetched into has no markers: {status}"
+    );
+    assert!(
+        status["running"].is_null(),
+        "`running` ships as null and documented so, because a server that handles one request at a time cannot answer \
+         what is in flight while it is answering this one: {status}"
+    );
+}
+
+/// A marker another process wrote is reported **verbatim** — including an unknown size, which stays unknown (§12 rule 12)
+/// rather than becoming zero. Reading it must not touch it: §12 rule 4 gives no read command the power to end a fetch.
+#[test]
+fn status_get_reports_a_marker_another_process_left() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    let config = Config {
+        data_dir: server.data_dir(),
+        ..Config::default()
+    };
+    let models_dir = config.workspace_models_dir(&server.root);
+    fs::create_dir_all(&models_dir).expect("test setup: models dir");
+    let marker = np_core::models::marker_path(&models_dir, "embeddinggemma-2");
+    fs::write(
+        &marker,
+        r#"{"nonce":"1730000000-1-0","started_at":1730000000,"bytes_done":67108864,"bytes_total":null}"#,
+    )
+    .expect("test setup: marker");
+
+    let status = server.result("status.get", json!({"workspace": workspace}));
+    let markers = status["fetch_markers"].as_array().expect("array");
+    assert_eq!(markers.len(), 1, "{status}");
+    assert_eq!(markers[0]["id"], "embeddinggemma-2", "{status}");
+    assert_eq!(markers[0]["state"], "running", "{status}");
+    assert_eq!(markers[0]["bytes_done"], 67_108_864, "{status}");
+    assert!(
+        markers[0].get("bytes_total").is_none(),
+        "an unannounced size is absent, not zero: {status}"
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).expect("marker still readable"),
+        r#"{"nonce":"1730000000-1-0","started_at":1730000000,"bytes_done":67108864,"bytes_total":null}"#,
+        "**§12 rule 4**: a status read leaves the marker exactly as it found it"
+    );
+
+    // The last finished activity is this connection's own history: `initialize` ran before this request, so `last` names
+    // it rather than the status call still in flight.
+    assert_eq!(
+        status["last"],
+        Value::Null,
+        "first request on the connection: {status}"
+    );
+    server.result("scan", json!({"workspace": workspace}));
+    let after = server.result("status.get", json!({"workspace": workspace}));
+    assert_eq!(after["last"]["command"], "scan", "{after}");
+    assert_eq!(after["last"]["phase"], "completed", "{after}");
+    assert!(
+        after["last"]["elapsed_ms"].is_number(),
+        "a status line without its elapsed time cannot be compared with anything: {after}"
+    );
+    assert!(
+        !after.to_string().contains("http"),
+        "**§12 rule 8**: no origin in a status document: {after}"
+    );
+}
+
+/// **Review Focus 3.** A status question must not create the thing it asks about. `scan` and `embed` open (and so
+/// create) a workspace database; if `status.get` shared that path, then a GUI polling for status would litter a
+/// nonexistent vault with `.sqlite` files — and each one reads as "an indexed workspace" to every other tool.
+#[test]
+fn status_get_never_creates_a_workspace_database() {
+    let mut server = Server::new();
+    let data_dir = server.data_dir();
+    // A path that is not a directory and does not exist: the shape a typo or a deleted vault produces.
+    let missing = server
+        ._tmp
+        .path()
+        .join("no-such-vault")
+        .display()
+        .to_string();
+
+    let before = listing_of(&data_dir);
+    let status = server.result("status.get", json!({"workspace": missing}));
+    let after = listing_of(&data_dir);
+
+    assert_eq!(
+        before, after,
+        "a status read wrote something into the data dir"
+    );
+    assert!(
+        !after.iter().any(|name| name.ends_with(".sqlite")),
+        "a status read created a workspace database: {after:?}"
+    );
+    assert!(
+        status["fetch_markers"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "a vault that is not there has no markers, and says so as data: {status}"
+    );
+}
+
+/// Every entry name under `root`, sorted, with directories walked. Cheap enough for a test data dir and exact about
+/// "nothing appeared".
+fn listing_of(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        } {
+            let entry = entry.expect("test: readdir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path.clone());
+            }
+            found.push(path.display().to_string());
+        }
+    }
+    found.sort();
+    found
+}

@@ -419,6 +419,83 @@ pub enum FetchState {
     },
 }
 
+/// What one marker in a directory says about the download behind it.
+///
+/// Three shapes rather than a `Result`, because no marker condition is a fault of the reader: a fetch running, a file
+/// this build cannot parse, and nothing at all are three facts a status panel draws differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerState {
+    /// A marker that reads as §12's field set. `bytes_total` is `None` when the transfer announced no size — displayed
+    /// as "unknown", never invented (**§12 rule 12**).
+    Running {
+        /// Bytes received so far, as the fetching process last wrote them.
+        bytes_done: u64,
+        /// The expected size, if one was announced.
+        bytes_total: Option<u64>,
+        /// Whole seconds since the Unix epoch, as written. Displayed only: §12 rule 4 makes liveness a matter of
+        /// consent, so nobody may compare this with a clock and call a fetch stale.
+        started_at: i64,
+    },
+    /// A marker exists and could not be read. Reported with the parser's own sentence, kept on disk (**§12 rule 4**).
+    Unreadable {
+        /// Why this file could not be read — truncated, not UTF-8, a field of the wrong type, unopenable.
+        reason: String,
+    },
+}
+
+/// One marker found in a models directory, named by the id its file name declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchMarkerInfo {
+    /// The id the marker's own name carries (already validated by [`fetch_name`]).
+    pub id: String,
+    /// What reading it said.
+    pub state: MarkerState,
+}
+
+/// Every fetch marker in `models_dir`, in directory order.
+///
+/// This is a **directory read and nothing else**: no database handle, no artifact hashing, no clock. A caller that asks
+/// "what is downloading here?" must be able to ask it of a workspace whose index does not exist yet — and must not
+/// create one by asking (`np serve`'s `status.get` is why that distinction is written into the type rather than left to
+/// care). The ids come from [`fetch_name`], so a marker mid-rewrite (`.json.tmp<nonce>`) is not listed twice, and an id
+/// shape this program would call junk is skipped for the same reason `list` skips it.
+///
+/// Nothing here deletes, renames or repairs: **§12 rule 4** refuses a read command the power to end somebody's download,
+/// including by tidying up a file it could not read.
+pub fn list_fetch_markers(models_dir: &Path) -> Vec<FetchMarkerInfo> {
+    let entries = match fs::read_dir(walk::to_open_path(models_dir)) {
+        // A models directory that does not exist is the ordinary state of a workspace nobody has fetched into. Empty,
+        // and no error to report — `fetch_state` answers the same way for one id.
+        Err(_) => return Vec::new(),
+        Ok(entries) => entries,
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = match fetch_name(&file_name) {
+            Some(FetchName::Marker(id)) => id,
+            // Not a marker: an artifact, a `.part`, a marker mid-rewrite, or junk another command reports elsewhere.
+            _ => continue,
+        };
+        let state = match fetch_state(models_dir, name) {
+            FetchState::Present(fields) => MarkerState::Running {
+                bytes_done: fields.bytes_done,
+                bytes_total: fields.bytes_total,
+                started_at: fields.started_at,
+            },
+            FetchState::Unreadable { reason, .. } => MarkerState::Unreadable { reason },
+            // The file was named in the listing and gone by the time it was read — a fetch that finished mid-call.
+            // Reporting a marker that is no longer there would be worse than reporting nothing.
+            FetchState::Absent => continue,
+        };
+        found.push(FetchMarkerInfo {
+            id: name.to_string(),
+            state,
+        });
+    }
+    found
+}
+
 /// Read this workspace's fetch marker for `id` (§12 rule 4's "read-only" half).
 ///
 /// `models_dir` comes from [`Config::workspace_models_dir`] like every other path here, and `id` is expected to
