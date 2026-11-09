@@ -246,6 +246,80 @@ impl EmbedOutcome {
     }
 }
 
+/// The diagnostics rule, level and `what` for one arm of an embed refusal (diagnostics design §1 point 4, §4).
+///
+/// Arm (i) answers `None`: a run that produced everything it owed is not a degraded state, and an event per successful
+/// embed would be the noise §4 keeps out of the log. Everything else maps one-to-one onto a published token, with two
+/// readings worth stating:
+///
+/// * arm (ii) splits by **which key** refused — `embeddings.provider` is a switched-off feature (`provider-disabled`),
+///   while `embeddings.model` naming no row is an installation gap (`model-not-installed`). One arm, two causes, and a
+///   reader told to "install a model" by a workspace that has embeddings switched off would chase the wrong file.
+/// * arm (iii) reports the **artifact path** rather than the model id, because its diagnosis is a filesystem question
+///   (wrong data dir, unmounted volume, read-only image) and the id is in the message either way.
+///
+/// `model` is the configured id, used by the arms that carry no identity of their own — arm (iv) reports against the run.
+fn diag_of(
+    outcome: &EmbedOutcome,
+    model: Option<&str>,
+) -> Option<(&'static str, tracing::Level, String)> {
+    use crate::diagnostics::rule;
+    match outcome {
+        EmbedOutcome::Current => None,
+        EmbedOutcome::ConfigurationDisabled { key, id, .. } => {
+            let rule = if *key == "embeddings.model" {
+                rule::MODEL_NOT_INSTALLED
+            } else {
+                rule::PROVIDER_DISABLED
+            };
+            let what = match (rule, id) {
+                (rule::MODEL_NOT_INSTALLED, Some(id)) => id.clone(),
+                _ => (*key).to_string(),
+            };
+            Some((rule, tracing::Level::WARN, what))
+        }
+        EmbedOutcome::ArtifactAbsent { artifact, .. } => Some((
+            rule::ARTIFACT_MISSING,
+            tracing::Level::WARN,
+            artifact.display().to_string(),
+        )),
+        EmbedOutcome::Offline { id } => Some((rule::OFFLINE, tracing::Level::WARN, id.clone())),
+        EmbedOutcome::RuntimeNotBuilt { id } => Some((
+            rule::LOCAL_MODEL_NOT_BUILT,
+            tracing::Level::WARN,
+            id.clone(),
+        )),
+        // The failure half: something this run could have done did not happen (§4 — "a state to fix" is `warn`,
+        // "something failed" is `error`).
+        EmbedOutcome::NotProduced { .. } => Some((
+            rule::NOT_PRODUCED,
+            tracing::Level::ERROR,
+            model.unwrap_or("the configured model").to_string(),
+        )),
+    }
+}
+
+/// One refusal on the embed target, with the rule as a field rather than as prose.
+///
+/// `what` and `rule` are recorded as strings (not through `Debug`) so the file sink writes `"offline"` and not a
+/// quoted, escaped copy of it — the published JSONL keys are an interface a reader parses.
+fn emit(level: tracing::Level, rule: &'static str, what: &str, detail: &str) {
+    match level {
+        tracing::Level::ERROR => tracing::error!(
+            target: crate::diagnostics::target::EMBED,
+            rule,
+            what,
+            "{detail}"
+        ),
+        _ => tracing::warn!(
+            target: crate::diagnostics::target::EMBED,
+            rule,
+            what,
+            "{detail}"
+        ),
+    }
+}
+
 /// What this run decided about worker threads for the local model, carried on the report so a slow run can be
 /// diagnosed from its own output.
 ///
@@ -434,6 +508,16 @@ impl EmbedReport {
 
     /// A report that read nothing, for the arms that refuse before touching the corpus.
     fn unread(model: Option<String>, outcome: EmbedOutcome) -> Self {
+        // **The refusal is a diagnostic as well as a sentence** (diagnostics design §1 point 4). This constructor is the
+        // one place every arm that refuses before doing work passes through, so reporting here is what makes "every
+        // refusal names its rule" true without six copies of the same call. Arm (iv) built at the end of a partial run
+        // reports where it is assembled, for the reason [`diag_of`] gives for counting rather than arms.
+        if let Some((rule, level, what)) = diag_of(&outcome, model.as_deref()) {
+            let detail = outcome
+                .detail()
+                .unwrap_or_else(|| outcome.label().to_string());
+            emit(level, rule, &what, &detail);
+        }
         Self {
             model,
             outcome,
@@ -955,13 +1039,28 @@ fn run(
             return Ok(report);
         }
         Resolution::Provider(_) | Resolution::ArtifactAbsent => {
+            let outcome = EmbedOutcome::ArtifactAbsent {
+                model: model_id.clone(),
+                hint: install_hint(workspace),
+                artifact,
+            };
+            // Arms (ii), (v) and (vi) reach a diagnostic through [`EmbedReport::unread`]; this one and arm (iv) build
+            // their reports where the run's counts are already known, so they report at their own site. Every arm that
+            // refuses therefore reports exactly once, which is what §1 point 4 of the diagnostics design asks for.
+            if let Some((rule, level, what)) = diag_of(&outcome, Some(model_id.as_str())) {
+                emit(
+                    level,
+                    rule,
+                    &what,
+                    outcome
+                        .detail()
+                        .as_deref()
+                        .unwrap_or_else(|| outcome.label()),
+                );
+            }
             return Ok(EmbedReport {
-                model: Some(model_id.clone()),
-                outcome: EmbedOutcome::ArtifactAbsent {
-                    model: model_id,
-                    hint: install_hint(workspace),
-                    artifact,
-                },
+                model: Some(model_id),
+                outcome,
                 chunks_seen: seen,
                 current,
                 embedded: 0,
@@ -1052,6 +1151,19 @@ fn run(
                             // they survive into the arm sentence below rather than being summarised away.
                             budget_detail =
                                 Some(format!("{tokens} tokens needed, budget {budget}"));
+                            // …and the same two numbers go as fields (`token-budget`), because the sentence reaches a
+                            // person while these reach an alert. `what` is the chunk id: a batch item carries no path —
+                            // [`Owed`] holds id, text and stamp only — and an id resolves to a note in one query, which
+                            // is inside what the diagnostics design §12 allows (paths, ids, tokens, counts) where a body
+                            // never goes.
+                            tracing::warn!(
+                                target: crate::diagnostics::target::EMBED,
+                                rule = crate::diagnostics::rule::TOKEN_BUDGET,
+                                what = %item.id,
+                                expected = budget,
+                                actual = tokens,
+                                "chunk refused: over the embeddings.max_tokens budget"
+                            );
                         }
                         Err(other) => {
                             errors += 1;
@@ -1122,6 +1234,20 @@ fn run(
             reason: gaps.join("; "),
         }
     };
+    // Arm (iv) is assembled at the end of a partial run rather than by [`EmbedReport::unread`], so this is where its
+    // diagnostic is reported — and arm (i) reports nothing, because a run that produced what it owed is not a degraded
+    // state (§4: one event per refusal, none per success).
+    if let Some((rule, level, what)) = diag_of(&outcome, Some(model_id.as_str())) {
+        emit(
+            level,
+            rule,
+            &what,
+            outcome
+                .detail()
+                .as_deref()
+                .unwrap_or_else(|| outcome.label()),
+        );
+    }
 
     Ok(EmbedReport {
         model: Some(model_id),

@@ -265,6 +265,17 @@ pub fn search(
                 model: model.to_string(),
             });
         }
+        // **The empty list is reported where it is decided** (diagnostics design §1 point 4). This function is the only
+        // place that knows the difference between "this model stores nothing" and "this model was not embedded"; the
+        // second half is the error above, and the first is a state a reader acts on (`np embed`), so it goes out as
+        // `no-vectors` at `warn` — a state to fix, not a fault. A caller that never reaches this line because its build
+        // has no provider emits nothing here, and says so under its own rule (`provider-disabled`).
+        tracing::warn!(
+            target: crate::diagnostics::target::SEARCH,
+            rule = crate::diagnostics::rule::NO_VECTORS,
+            what = model,
+            "no vectors are stored for this model, so the semantic half has nothing to rank"
+        );
         return Ok(Vec::new());
     }
 
@@ -810,6 +821,59 @@ impl RankNote {
             Self::FetchOffline => "fetch-offline",
             Self::FetchDisabled => "fetch-disabled",
             Self::ArtifactFetched => "artifact-fetched",
+        }
+    }
+
+    /// This note's token on the **diagnostics** side (design §1 point 4), which is search's `rule` field.
+    ///
+    /// One spelling differs from [`Self::token`], and it is worth the sentence: the result document says
+    /// `fetch-offline` because that key names *which step of this command* declined, while a diagnostic says
+    /// `offline` because an operator's alert matches one token for an outage across every command — `np embed`,
+    /// `np models fetch` and `np search` mean the same disconnected machine. Result keys are frozen output, so the
+    /// divergence lives in this mapping rather than in either document.
+    #[must_use]
+    pub fn diag_rule(&self) -> &'static str {
+        match self {
+            Self::NoVectors => crate::diagnostics::rule::NO_VECTORS,
+            Self::ProviderDisabled => crate::diagnostics::rule::PROVIDER_DISABLED,
+            Self::ModelNotInstalled => crate::diagnostics::rule::MODEL_NOT_INSTALLED,
+            Self::ArtifactMissing => crate::diagnostics::rule::ARTIFACT_MISSING,
+            Self::FetchOffline => crate::diagnostics::rule::OFFLINE,
+            Self::FetchDisabled => crate::diagnostics::rule::FETCH_DISABLED,
+            Self::ArtifactFetched => crate::diagnostics::rule::ARTIFACT_FETCHED,
+        }
+    }
+
+    /// Report this note as a diagnostic, naming the model it is about where one is known.
+    ///
+    /// Called by whoever decided the note — np-cli's search path, at the point the note is final for this run — because
+    /// §4 asks for one event per degraded state, and that is not what emitting inside each variant's
+    /// construction site: a hybrid search can decide `NoVectors` twice over (its own branch, and [`ranked`]'s check) and
+    /// a reader should see one record.
+    ///
+    /// `ArtifactFetched` is the one note that is not a degradation — an artifact arrived — so it reports at `info`. The
+    /// rest say a half of the answer is missing, which is a state to fix: `warn` (§4).
+    pub fn report(&self, model: Option<&str>) {
+        let rule = self.diag_rule();
+        let what = model.unwrap_or("the semantic half");
+        // The sentence is this note's own label, so the event and the printed line cannot disagree about what happened;
+        // no query text travels here (§12 of the diagnostics design), only the id and the rule.
+        if matches!(self, Self::ArtifactFetched) {
+            tracing::info!(
+                target: crate::diagnostics::target::SEARCH,
+                rule,
+                what,
+                "{}",
+                self.label()
+            );
+        } else {
+            tracing::warn!(
+                target: crate::diagnostics::target::SEARCH,
+                rule,
+                what,
+                "{}",
+                self.label()
+            );
         }
     }
 }

@@ -11,6 +11,7 @@ pub mod change;
 pub mod chunk;
 pub mod config;
 pub mod db;
+pub mod diagnostics;
 pub mod embed;
 pub mod embed_run;
 pub mod fetch;

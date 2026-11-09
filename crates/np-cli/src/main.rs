@@ -464,10 +464,25 @@ fn writer_lock(
         np_core::lock::WorkspaceLock::DEFAULT_WAIT,
     ) {
         Ok(held) => Ok(held),
-        Err(np_core::lock::LockError::Held { waited }) => Err(LockFailure::Locked {
-            command: command.to_string(),
-            waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
-        }),
+        Err(np_core::lock::LockError::Held { waited }) => {
+            // Contention as a diagnostic (diagnostics design §1 point 4). `what` is the **workspace**, not the lock file:
+            // `<hash>.lock.db` names a workspace to nobody reading a log, and the path is the identity every other
+            // np diagnostic uses (§12 allows paths; this one is the user's own). The two numbers say how long this
+            // process waited and how long it was willing to — the difference between a busy vault and a broken one.
+            let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+            tracing::warn!(
+                target: np_core::diagnostics::target::LOCK,
+                rule = np_core::diagnostics::rule::LOCKED,
+                what = %workspace.display(),
+                expected = u64::try_from(np_core::lock::WorkspaceLock::DEFAULT_WAIT.as_millis()).unwrap_or(u64::MAX),
+                actual = waited_ms,
+                "another writer holds this workspace: `{command}` did not start"
+            );
+            Err(LockFailure::Locked {
+                command: command.to_string(),
+                waited_ms,
+            })
+        }
         Err(other) => Err(LockFailure::Other(other.into())),
     }
 }
@@ -849,6 +864,16 @@ fn prefix_drift_notice(
         "np: note: `{id}` is recorded with a {halves} this build does not declare for that id — its vectors mean \
          something different from a fetched model's, and no command rewrites them (`np models list` shows the \
          declaration on file)"
+    );
+    // …and the same fact as a diagnostic (diagnostics design §1 point 4), with the id as `what`. The stderr sentence
+    // above is pinned output and stays byte-for-byte; this reaches only whoever asked for diagnostics, which is why both
+    // can exist without a doubled line. Which halves drifted travels in the message rather than in `expected`/`actual`,
+    // because those keys are for numbers (§1) and "the document prefix" is not one.
+    tracing::warn!(
+        target: np_core::diagnostics::target::EMBED,
+        rule = np_core::diagnostics::rule::PREFIX_DRIFT,
+        what = id,
+        "`{id}` is stored with a {halves} this build does not declare for that id"
     );
     Ok(Some(drift))
 }
@@ -1268,6 +1293,14 @@ fn search_run(
         }
     } else if semantic_wanted {
         note = Some(search::RankNote::NoVectors);
+    }
+
+    // **The note is reported where it becomes final** (diagnostics design §1 point 4): every state decided above goes out
+    // once, with the model id this run resolved. A note that `ranked` adds instead — a hybrid search whose index holds no
+    // vectors at all — is reported by [`search`] itself, which is where that fact is decided; the two paths cannot both
+    // fire for one run, because reaching `search` needs a query vector and `ranked`'s note needs the absence of one.
+    if let Some(note) = &note {
+        note.report((!model.is_empty()).then_some(model.as_str()));
     }
 
     let answer = search::ranked(

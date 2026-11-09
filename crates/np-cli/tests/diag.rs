@@ -21,6 +21,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
+use np_core::config::Config;
 use serde_json::Value;
 
 use tempfile::TempDir;
@@ -941,4 +942,202 @@ fn deleting_the_log_file_mid_run_does_not_fail_the_command() {
         "a deleted log is recreated by the next run, not left missing"
     );
     assert_keys_are_documented(&records, &log);
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: the failure rules, on the channels a reader actually opens
+// ---------------------------------------------------------------------------
+//
+// `crates/np-core/tests/diagnostics.rs` proves each arm *emits* its rule to whatever subscriber is installed. That is
+// the seam; it is not the channel. The claims that matter to an integrator are about a file they configured and a
+// process they started, so the two states whose rules were named in the plan — a refusal and a lock — are asserted here
+// as JSONL records with real bytes in them, plus the privacy rule over a whole run at the loudest level `np` offers.
+
+/// Plan Task 3 Step 1's case, on the file channel: an embed with embeddings switched off writes one record whose `rule`
+/// is `provider-disabled`, at `warn`, on the embed target, naming the key to edit. The default level (`warn`) has to be
+/// enough — a refusal that only appears when somebody thought to ask for verbosity is the failure this feature exists to
+/// close, and every existing case above already proves the run itself stays byte-identical.
+#[test]
+fn an_embed_refusal_reaches_the_file_with_its_rule() {
+    let vault = Vault::new();
+    vault.write_notes(2);
+    let log = vault.log_config(None);
+
+    // Fetching is switched off so the run cannot depend on a network: with `provider = "none"` arm (ii) refuses before
+    // any transport is reached, and this asserts that it does so *without* dialing out.
+    let embed = {
+        let mut cmd = vault.command(&["embed"]);
+        cmd.env("NP_NO_AUTO_FETCH", "1").arg(&vault.root);
+        run(&mut cmd)
+    };
+    assert_eq!(
+        embed.code, 1,
+        "vectors were asked for and none exist: {}",
+        embed.stderr
+    );
+
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    let refusals: Vec<&Value> = records
+        .iter()
+        .filter(|record| record.get("rule").is_some())
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "one refusal, one record — a reader deduplicates nothing: {refusals:?}"
+    );
+    let refusal = refusals[0];
+    assert_eq!(
+        refusal.get("rule").and_then(Value::as_str),
+        Some("provider-disabled"),
+        "the token, not the sentence: {refusal}"
+    );
+    assert_eq!(
+        refusal.get("target").and_then(Value::as_str),
+        Some("np_core::embed")
+    );
+    assert_eq!(
+        refusal.get("level").and_then(Value::as_str),
+        Some("warn"),
+        "a state to fix is not a fault (§4 of the design): {refusal}"
+    );
+    let what = refusal
+        .get("what")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        what.contains("embeddings.provider"),
+        "the same key the stderr sentence names: {refusal}"
+    );
+}
+
+/// Plan Task 3 Step 3's lock case: `rule: "locked"` with `what` naming **the workspace**, because a log reader has to be
+/// able to tell which vault was busy. The lock is held from this test process for the reason `tests/cli.rs` gives — POSIX
+/// record locks are per process, so an in-process second connection would not contend and the case would pass either way.
+#[test]
+fn a_locked_workspace_reports_the_rule_and_its_path() {
+    let vault = Vault::new();
+    vault.write_notes(2);
+    let log = vault.log_config(None);
+    assert_eq!(vault.exec(&["scan"]).code, 0, "the vault is indexed first");
+    fs::remove_file(&log).expect("test setup: start the assertion from an empty log");
+
+    let db = Config {
+        data_dir: vault._tmp.path().join("data"),
+        ..Config::default()
+    }
+    .workspace_db(&vault.root);
+    let dir = db.parent().expect("test setup: the database has a parent");
+    let stem = db
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("test setup: utf-8 stem");
+    let _held =
+        np_core::lock::WorkspaceLock::acquire(dir, stem, std::time::Duration::from_millis(300))
+            .expect("test setup: take the lock the way a running `np` would");
+
+    let refused = vault.exec(&["--log-file", log.to_str().expect("utf-8 path"), "scan"]);
+    assert_eq!(
+        refused.code, 1,
+        "a held workspace refuses: {}",
+        refused.stderr
+    );
+
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    let locked = records
+        .iter()
+        .find(|record| record.get("rule").and_then(Value::as_str) == Some("locked"))
+        .unwrap_or_else(|| panic!("no `locked` record in {records:?}"));
+    assert_eq!(
+        locked.get("target").and_then(Value::as_str),
+        Some("np_core::lock")
+    );
+    assert_eq!(locked.get("level").and_then(Value::as_str), Some("warn"));
+    let what = locked
+        .get("what")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        what.contains(
+            vault
+                .root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("utf-8 name")
+        ),
+        "`what` must name the workspace a reader can act on: {locked}"
+    );
+    // Both numbers, so "busy" and "broken" stay distinguishable from the record alone: how long the run was prepared to
+    // wait, and how long it did.
+    let waited = locked.get("actual").and_then(Value::as_u64).unwrap_or(0);
+    let willing = locked.get("expected").and_then(Value::as_u64).unwrap_or(0);
+    assert!(
+        waited > 0 && waited >= willing,
+        "waited {waited} ms of a {willing} ms allowance: {locked}"
+    );
+}
+
+/// Plan Task 3 Step 4's privacy rule, run at `trace` with every command that can produce a diagnostic. A note's body and
+/// an origin host are the two things §12 forbids, and the vault below is built so both would be findable if either ever
+/// travelled: the body is one unusual string in every chunk, and the only link in the vault names a host that exists
+/// nowhere but in this file.
+#[test]
+fn a_diagnostic_never_carries_note_text_or_an_origin() {
+    let vault = Vault::new();
+    let body = "quixotic-vaultphrase-never-log-me";
+    fs::write(
+        vault.root.join("note-0.md"),
+        format!("# Note\n\n{body} appears twice: {body}\n\n[seen elsewhere](https://origin.invalid/secret-path)\n"),
+    )
+    .expect("test setup: write a note holding both forbidden things");
+    fs::write(
+        vault.root.join("note-1.md"),
+        "# Other\n\nnothing unusual here, only prose about indexing\n",
+    )
+    .expect("test setup: second note");
+    let log = vault.log_config(None);
+    vault.write_user_config(&format!(
+        "[log]\nfile = {}\nlevel = \"trace\"\n",
+        toml_str(&log.display().to_string())
+    ));
+
+    // Each command's own exit code, unchanged by the presence of a log: `embed` asked for vectors and got none (arm (ii),
+    // exit 1) exactly as it does with diagnostics off, and the other three answered. A diagnostic is never the reason a
+    // command fails, and never the reason it stops failing either.
+    let root = vault.root.to_str().expect("utf-8 path");
+    // Each argv is spelled in full, including the workspace, because `np search` takes its operand *before* the query and
+    // `Vault::exec` appends one last; a case that reads as four commands run the same way is worth one helper less.
+    for (argv, code) in [
+        (vec!["scan", root], 0),
+        (vec!["embed", "--no-auto-fetch", root], 1),
+        (vec!["search", root, "indexing"], 0),
+        (vec!["models", "list", root], 0),
+    ] {
+        let run_ = run(&mut vault.command(&argv));
+        assert_eq!(
+            run_.code,
+            code,
+            "`np {}` at trace exits as it does without diagnostics: {}",
+            argv.join(" "),
+            run_.stderr
+        );
+    }
+
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    assert!(
+        !records.is_empty(),
+        "a trace-level run of four commands wrote nothing at all"
+    );
+    let text = fs::read_to_string(&log).expect("test setup: read the log");
+    assert!(
+        !text.contains(body),
+        "a diagnostic quoted a note's body: {text}"
+    );
+    assert!(
+        !text.contains("origin.invalid") && !text.contains("http"),
+        "§12 rule 8: no origin host, and no URL that names one: {text}"
+    );
 }

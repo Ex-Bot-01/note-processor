@@ -6,6 +6,7 @@
 //! timeout moves both binaries together.
 
 use std::sync::mpsc;
+
 use std::thread;
 use std::time::{Duration, Instant};
 
