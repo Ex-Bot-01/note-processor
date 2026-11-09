@@ -415,6 +415,45 @@ pub fn fetch(
     transport: &dyn Transport,
     now: i64,
 ) -> Result<FetchReport, FetchError> {
+    fetch_pinned(
+        db,
+        models_dir,
+        id,
+        requested,
+        &Transfer::new(transport, now),
+    )
+}
+
+/// [`fetch`] plus a reporter, for the caller that wants checkpoints and has no pin table of its own to hand over.
+///
+/// The two share one body ([`fetch_pinned`]), so "the pinned fetch" cannot mean two different things depending on
+/// whether somebody was watching: same consent rules, same preflight, same publishing order.
+pub fn fetch_reporting(
+    db: &crate::db::Db,
+    models_dir: &Path,
+    id: &str,
+    requested: &[&str],
+    transport: &dyn Transport,
+    now: i64,
+    progress: &dyn crate::progress::Progress,
+) -> Result<FetchReport, FetchError> {
+    fetch_pinned(
+        db,
+        models_dir,
+        id,
+        requested,
+        &Transfer::new(transport, now).reporting(progress),
+    )
+}
+
+/// The pinned fetch: build the expectation from the compiled-in table and run it.
+fn fetch_pinned(
+    db: &crate::db::Db,
+    models_dir: &Path,
+    id: &str,
+    requested: &[&str],
+    transfer: &Transfer<'_>,
+) -> Result<FetchReport, FetchError> {
     // **The pin table answers first.** An id with no members is a typo or an unsupported model, and the answer it
     // needs is "this build pins nothing for that"; asking about identity first would tell someone who mistyped an id
     // that it has "pinned artifacts but no declared dim" — a sentence about a different problem, and the kind of
@@ -433,7 +472,7 @@ pub fn fetch(
         table: crate::pins::PINNED,
         declaration: &declaration,
     };
-    fetch_with_table(db, models_dir, id, requested, transport, now, &plan)
+    fetch_with_progress(db, models_dir, id, requested, &plan, transfer)
 }
 
 /// The three things a transfer needs that are not about *what* to fetch: where the bytes come from, what time it is,

@@ -33,6 +33,7 @@ use std::io::{self, Write};
 
 use serde_json::{json, Value};
 
+use np_core::progress::{Phase, ProgressEvent};
 use np_core::search::SearchMode;
 
 /// The protocol version this build speaks. A client sends its own number in `initialize` and compares; an incompatible change is a bump rather
@@ -112,7 +113,8 @@ pub fn serve() -> Result<(), Box<dyn Error>> {
     // One handle, locked for the loop's life: interleaving responses on a shared stdout is exactly the corruption a client cannot recover from.
     let stdin = io::stdin();
     let mut out = io::stdout().lock();
-    let mut ch = crate::serve_channel::Channel::new(&mut out);
+    let clock = crate::serve_channel::SystemClock::new();
+    let mut ch = crate::serve_channel::Channel::new(&mut out, &clock);
     // Every behaviour of the old inline loop lives on, now behind a sink the unit tests can drive in-process.
     crate::serve_channel::serve_loop(stdin.lock(), &mut ch)?;
     Ok(())
@@ -121,10 +123,7 @@ pub fn serve() -> Result<(), Box<dyn Error>> {
 /// One line in, at most one response out (`None` for notifications and unparseable garbage).
 ///
 /// Split from [`serve`] so the whole protocol is testable without a pipe: the tests call this with a string and read a value back.
-pub(crate) fn handle_line(
-    line: &str,
-    _ch: &mut crate::serve_channel::Channel<'_>,
-) -> Option<Value> {
+pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>) -> Option<Value> {
     if line.trim().is_empty() {
         // A blank line is not a request. Silently ignored rather than faulted, because the likely source is a client writing "\n" to flush or keep
         // the pipe warm — answering that with an error would train it to stop asking. The rule lives here rather than in the read loop so that it
@@ -167,8 +166,12 @@ pub(crate) fn handle_line(
     // A panic in a handler is the caller's bad note or my bug; either way it must cost one response, not the session. `AssertUnwindSafe` is
     // honest here rather than a shrug: the state shared between requests is configuration and an open database handle, and nothing in this module
     // reads a value a panicked handler could have left half-updated — the workspace write lock releases through `Drop` on unwind either way.
-    let outcome =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(method, &params)));
+    // The id travels with the call: a progress line names the request it belongs to, and a command that arrived as a
+    // notification has no id to name — which is a different thing from an id of `null` (**Review Focus 5**).
+    let call_id = id.clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch(method, &params, call_id.as_ref(), ch)
+    }));
     let result = match outcome {
         Ok(Ok(result)) => result,
         Ok(Err(ServeError::Fault(fault))) => {
@@ -207,12 +210,17 @@ pub(crate) fn handle_line(
 /// Route one request. Every mutating method acquires and releases the workspace write lock **inside itself** — never across requests — because a
 /// server that held it for its whole life would refuse its own next command after two seconds, which is F44 working as designed against the wrong
 /// caller.
-fn dispatch(method: &str, params: &Value) -> Result<Value, ServeError> {
+fn dispatch(
+    method: &str,
+    params: &Value,
+    request: Option<&Value>,
+    ch: &mut crate::serve_channel::Channel<'_>,
+) -> Result<Value, ServeError> {
     match method {
-        "initialize" => Ok(initialize()),
+        "initialize" => Ok(initialize(params, ch)),
         "search" => search(params),
-        "scan" => scan(params),
-        "embed" => embed(params),
+        "scan" => scan(params, request, ch),
+        "embed" => embed(params, request, ch),
         "models.list" => models_list(params),
         // The client asked to be done. `serve` answers this one request and the loop exits on the following EOF; answering before exiting keeps
         // the response from racing the pipe closing.
@@ -229,8 +237,16 @@ fn dispatch(method: &str, params: &Value) -> Result<Value, ServeError> {
 
 /// What a client can do with this binary. `features` is the compile-time truth (**F40** refuses on these same facts), so a UI decides at startup
 /// whether to draw an "embed" control at all instead of discovering the answer through a refusal.
-fn initialize() -> Value {
-    json!({
+fn initialize(params: &Value, ch: &mut crate::serve_channel::Channel<'_>) -> Value {
+    // **The only session-level fact this server keeps** (spec §1): progress is off unless this connection asked for it,
+    // and asking changes nothing else. A v0.3.0 client that never sends `notifications` sees the byte-identical stream
+    // it saw before this feature existed.
+    let wants_progress = params
+        .get("notifications")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    ch.set_notifications(wants_progress);
+    let mut result = json!({
         "np": env!("CARGO_PKG_VERSION"),
         "protocol": PROTOCOL,
         "features": {
@@ -242,7 +258,14 @@ fn initialize() -> Value {
         // Where the index and model caches live. A path rather than a host: §12 rule 8 forbids naming an *origin*, and this is the line a support
         // screenshot needs when someone asks "why does this vault have no vectors".
         "data_dir": crate::Config::default().data_dir.display().to_string(),
-    })
+    });
+    // Support is advertised by the key's presence, so a client that asks an older server gets nothing and can fall back
+    // to polling without a version check. `protocol` stays 1 either way: an optional parameter and added methods are
+    // compatible changes, and reserving the number for incompatible ones is what makes it worth reading.
+    if wants_progress {
+        result["progress"] = json!(true);
+    }
+    result
 }
 
 /// The workspace every method names for itself. No session state: a server holding three vaults open is one process, and "which vault am I on" is
@@ -299,9 +322,18 @@ fn search(params: &Value) -> Result<Value, ServeError> {
     Ok(crate::search_document(&run))
 }
 
-fn scan(params: &Value) -> Result<Value, ServeError> {
+fn scan(
+    params: &Value,
+    request: Option<&Value>,
+    ch: &mut crate::serve_channel::Channel<'_>,
+) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
     let cfg = crate::load_config().map_err(refused)?;
+    // **`locking` before the attempt, not after the grant** (spec §2): a client watching a first run needs to see that
+    // np is waiting on another writer, because from outside a blocked write and a slow scan look identical. The walk
+    // itself stays unreported until Task 8 gives scan a seam; this line is the part that needs none.
+    let progress = crate::serve_channel::ServeProgress::new(ch, request.cloned(), "scan");
+    crate::serve_channel::report(&progress, Phase::Locking, ProgressEvent::default());
     // The lock is taken and released inside this one request. A held-across-requests design would have the server refuse *itself* after 2 s,
     // which is F44 doing its job against the wrong caller.
     let _writer = match crate::server_writer_lock(&cfg, &workspace, "scan")? {
@@ -312,17 +344,26 @@ fn scan(params: &Value) -> Result<Value, ServeError> {
     serde_json::to_value(report).map_err(refused)
 }
 
-fn embed(params: &Value) -> Result<Value, ServeError> {
+fn embed(
+    params: &Value,
+    request: Option<&Value>,
+    ch: &mut crate::serve_channel::Channel<'_>,
+) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
     let cfg = crate::load_config().map_err(refused)?;
+    // Reported before the lock is attempted, for the same reason `scan` says it: waiting is the state a GUI has to draw.
+    let progress = crate::serve_channel::ServeProgress::new(ch, request.cloned(), "embed");
+    crate::serve_channel::report(&progress, Phase::Locking, ProgressEvent::default());
     let _writer = match crate::server_writer_lock(&cfg, &workspace, "embed")? {
         crate::LockGrant::Contended(document) => return Ok(document),
         crate::LockGrant::Held(guard) => guard,
     };
+    // (The reporter was built above, before the lock: `Channel::notify` is what knows whether this connection opted in,
+    // so a handler that decided for itself would be a second place where "did they ask?" can be answered wrongly.)
     // The same function `np embed` runs — arm order, fetch trigger and all — with the human channel off. F42's drift notice still prints, on
     // stderr, because it is prose about a state the document also reports in `prefix_drift`.
-    let report =
-        crate::embed_report(&workspace, crate::AutoFetch::Deferred, false).map_err(refused)?;
+    let report = crate::embed_report(&workspace, crate::AutoFetch::Deferred, false, &progress)
+        .map_err(refused)?;
     let drift = match report.model.as_deref() {
         Some(id) => {
             crate::prefix_drift_notice(&crate::load_config().map_err(refused)?, &workspace, id)
@@ -378,7 +419,8 @@ mod tests {
     /// threw its `Vec<u8>` away would still be asserting exactly what it asserted before.
     fn answer(line: &str) -> Option<Value> {
         let mut sink: Vec<u8> = Vec::new();
-        let mut ch = crate::serve_channel::Channel::new(&mut sink);
+        let clock = crate::serve_channel::SystemClock::new();
+        let mut ch = crate::serve_channel::Channel::new(&mut sink, &clock);
         handle_line(line, &mut ch)
     }
 

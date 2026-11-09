@@ -173,6 +173,30 @@ impl Server {
         value
     }
 
+    /// Nothing else on stdout, then end of file. This is how a test says "no unsolicited lines": if the server had
+    /// written a notification nobody asked for, this read finds it instead of hanging.
+    fn expect_eof(&mut self) {
+        let mut line = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut line)
+            .expect("read after hang-up");
+        assert_eq!(read, 0, "unexpected extra line on stdout: {line:?}");
+    }
+
+    /// Read until the response to `id` arrives, returning it plus every line seen first. An opted-in session may
+    /// interleave notifications; a test that read exactly one line would read a status update and call it a response.
+    fn read_until_id(&mut self, id: i64) -> (Value, Vec<Value>) {
+        let mut before = Vec::new();
+        loop {
+            let line = self.read_line();
+            if line.get("id").and_then(Value::as_i64) == Some(id) {
+                return (line, before);
+            }
+            before.push(line);
+        }
+    }
+
     fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr.lock().expect("stderr sink").clone()).into_owned()
     }
@@ -549,4 +573,138 @@ fn the_two_channels_never_swap_their_content() {
             "a panic escaped to the client's log: {line}"
         );
     }
+}
+
+/// **Review Focus 1.** Progress is a favour the client asked for. A v0.3.0 client that sends the same three requests it
+/// always sent must see three lines and nothing else — one unsolicited notification would break a parser that reads a
+/// fixed number of lines, which is exactly how a compatible-looking addition becomes someone's crash.
+#[test]
+fn a_client_that_never_opts_in_sees_exactly_one_line_per_request() {
+    let mut server = Server::new();
+    let workspace = server.root.clone();
+
+    let init = server.result("initialize", json!({}));
+    assert_eq!(init["protocol"], PROTOCOL, "{init}");
+    assert!(
+        !init.as_object().expect("object").contains_key("progress"),
+        "a client that did not ask must not be told progress exists: {init}"
+    );
+
+    let scan = server.result(
+        "scan",
+        json!({"workspace": workspace.display().to_string()}),
+    );
+    assert_eq!(
+        scan["notes"], CORPUS_NOTES,
+        "the fixture scanned the committed corpus: {scan}"
+    );
+    // `provider = "none"` is the configured default, so this is arm (ii): a degraded run reported as data, which is
+    // also the shape that must not become a notification stream for a client that did not ask.
+    let embed = server.result(
+        "embed",
+        json!({"workspace": workspace.display().to_string()}),
+    );
+    assert!(
+        embed.get("outcome").is_some(),
+        "the embed document still carries its own word for what happened: {embed}"
+    );
+
+    server.hang_up();
+    server.expect_eof();
+}
+
+/// The other half of the same claim: opting in changes **what is streamed**, never **what is answered**. Every extra
+/// line is a well-formed `np/progress` notification naming a request that was actually sent, and every response
+/// document carries the same outcome and state keys as the one the quiet session got for the same work.
+#[test]
+fn opting_in_adds_notifications_without_changing_a_single_response() {
+    let mut quiet = Server::new();
+    let quiet_ws = quiet.root.display().to_string();
+    quiet.result("initialize", json!({}));
+    let scan_quiet = quiet.result("scan", json!({"workspace": quiet_ws}));
+    let embed_quiet = quiet.result("embed", json!({"workspace": quiet_ws}));
+
+    let mut talker = Server::new();
+    let ws = talker.root.display().to_string();
+    let init = talker.result("initialize", json!({"notifications": true}));
+    assert_eq!(
+        init["progress"], true,
+        "support is advertised to the client that asked: {init}"
+    );
+
+    let mut extra: Vec<Value> = Vec::new();
+    let mut results = serde_json::Map::new();
+    for method in ["scan", "embed"] {
+        talker.id += 1;
+        let id = talker.id;
+        talker.send_raw(
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {"workspace": ws}})
+                .to_string(),
+        );
+        let (response, before) = talker.read_until_id(id);
+        assert!(
+            response.get("error").is_none(),
+            "`{method}` faulted in the opted-in session: {response}"
+        );
+        results.insert(method.to_string(), response["result"].clone());
+        extra.extend(before);
+    }
+
+    for line in &extra {
+        assert_eq!(
+            line["method"], "np/progress",
+            "an extra line must be a progress notification, never a second response: {line}"
+        );
+        assert!(
+            !line.as_object().expect("object").contains_key("id"),
+            "a notification carries no id member: {line}"
+        );
+        let params = line["params"].as_object().expect("params object");
+        for key in ["command", "phase", "since_ms"] {
+            assert!(
+                params.contains_key(key),
+                "always-present key `{key}` is missing: {line}"
+            );
+        }
+        if let Some(request) = params.get("request") {
+            assert!(
+                request.is_number(),
+                "`request` echoes a real id rather than a placeholder: {line}"
+            );
+        }
+        assert!(
+            !line.to_string().contains("http"),
+            "**§12 rule 8**: a progress line names no origin: {line}"
+        );
+    }
+
+    // Nothing about the answer depends on whether somebody is watching. The two sessions index different vaults, so
+    // paths differ by construction; what must agree is every key that describes *what happened*.
+    let scan_talker = &results["scan"];
+    for key in ["notes", "added", "updated", "removed", "unchanged"] {
+        assert_eq!(
+            scan_quiet.get(key),
+            scan_talker.get(key),
+            "`{key}` changed because a client asked for progress: {} / {}",
+            scan_quiet,
+            scan_talker
+        );
+    }
+    let embed_talker = &results["embed"];
+    for key in [
+        "outcome", "embedded", "owed", "offline", "fetched", "locked",
+    ] {
+        assert_eq!(
+            embed_quiet.get(key),
+            embed_talker.get(key),
+            "`{key}` changed because a client asked for progress: {} / {}",
+            embed_quiet,
+            embed_talker
+        );
+    }
+
+    quiet.hang_up();
+    quiet.expect_eof();
+    talker.hang_up();
+    talker.expect_eof();
 }

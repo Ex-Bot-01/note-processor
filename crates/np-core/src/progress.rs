@@ -54,6 +54,10 @@ pub struct ProgressEvent<'a> {
 
 /// The seam a long-running command reports through.
 ///
+/// A reporter is called on the thread doing the work, so there is no `Sync` bound: the honest implementation writes to
+/// a locked stdout handle, which cannot be shared anyway. A caller that ever wants to report from another thread wraps
+/// its sink in something that adds the synchronization itself.
+///
 /// **Implementations must not block and must not panic.** This is called inline — inside the transfer loop, between
 /// batches — so a reporter that takes a lock someone else holds stalls the work it is reporting on, and a reporter
 /// that panics would turn a status line into a failed command. The server's reporter serialises and writes; if the
@@ -61,7 +65,7 @@ pub struct ProgressEvent<'a> {
 ///
 /// Reporting is not accounting: a command reports where it already computed numbers for its own report, which is why
 /// the fetch hook sits beside the marker write rather than on a timer of its own.
-pub trait Progress: Sync {
+pub trait Progress {
     /// Report one checkpoint.
     fn report(&self, event: &ProgressEvent<'_>);
 }

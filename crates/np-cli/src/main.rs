@@ -667,6 +667,7 @@ fn embed_report(
     workspace: &Path,
     auto_fetch: AutoFetch,
     announce: bool,
+    progress: &dyn np_core::progress::Progress,
 ) -> Result<EmbedReport, Box<dyn Error>> {
     let cfg = load_config()?;
     // Destructured rather than reached through the struct: the borrow below has to outlive the statement that takes it,
@@ -679,7 +680,13 @@ fn embed_report(
         // Not read here: `np embed` refuses when it cannot embed, so "a fetch was declined" adds nothing to a refusal that already
         // names the command. `np search --json` is the caller that needs the distinction (**F45**), and it reads the field directly.
         fetch_declined: _,
-    } = embed_provider(&cfg, workspace, auto_fetch.allowed(&cfg), announce)?;
+    } = embed_provider(
+        &cfg,
+        workspace,
+        auto_fetch.allowed(&cfg),
+        announce,
+        progress,
+    )?;
     // The reason a provider could not be built travels as a value — [`ProviderState::ArtifactAbsent`] for a missing file,
     // [`ProviderState::Placeholder`]'s reason for the configuration states. Handing over a bare placeholder is how R6c1 D-2
     // happened: an absent artifact became a provider that declares 0 dimensions, and the run refused with a sentence about
@@ -827,7 +834,7 @@ fn embed_workspace(
     let cfg_for_lock = load_config()?;
     let _writer = writer_lock(&cfg_for_lock, workspace, "embed")
         .map_err(|failure| failure.report_cli(json))?;
-    let report = embed_report(workspace, auto_fetch, !json)?;
+    let report = embed_report(workspace, auto_fetch, !json, np_core::progress::none())?;
     // Read the row that was actually used rather than re-deriving from argv: `[embeddings] model` is what `embed_run` embedded for, and a
     // config naming something other than the installed row is exactly the disagreement worth noticing.
     let drift = match report.model.as_deref() {
@@ -889,7 +896,7 @@ fn setup_workspace(
     };
 
     // ---- step 3: embed, through the same function `np embed` calls.
-    let embedded = embed_report(workspace, auto_fetch, !json)?;
+    let embedded = embed_report(workspace, auto_fetch, !json, np_core::progress::none())?;
 
     let drift = match embedded.model.as_deref() {
         Some(id) => prefix_drift_notice(&cfg, workspace, id)?,
@@ -1112,7 +1119,13 @@ fn search_run(
         // `search_with_fetching_switched_off_says_so_instead_of_blaming_the_network` failed on the `local-model,fetch` row saying
         // `offline:true` where the switch meant "nothing was attempted".
         let fetch_allowed = hybrid && AutoFetch::Deferred.allowed(&cfg);
-        let resolved = embed_provider(&cfg, workspace, fetch_allowed, announce)?;
+        let resolved = embed_provider(
+            &cfg,
+            workspace,
+            fetch_allowed,
+            announce,
+            np_core::progress::none(),
+        )?;
         let Resolved {
             state,
             fetched: arrived,
@@ -1562,7 +1575,11 @@ fn embed_provider(
     workspace: &Path,
     auto_fetch: bool,
     announce: bool,
+    progress: &dyn np_core::progress::Progress,
 ) -> Result<Resolved, Box<dyn Error>> {
+    // A build with no fetch engine has no bytes to narrate, so the reporter is genuinely unused there. Naming it
+    // `_progress` would make the gated call site below read like a throwaway; this says which half is conditional.
+    let _ = &progress;
     match cfg.embeddings.provider {
         // The default. Nothing is built, nothing is contacted, and the report says *configuration disabled*
         // rather than a fault (§2, §6).
@@ -1612,7 +1629,7 @@ fn embed_provider(
                 && (row.is_none() || !artifact.is_file());
             #[cfg(all(feature = "local-model", feature = "fetch"))]
             if attempted_fetch {
-                match fetch_pinned_missing(cfg, &db, &models_dir, id, announce)? {
+                match fetch_pinned_missing(cfg, &db, &models_dir, id, announce, progress)? {
                     FetchStep::Offline => return Ok(fetch_offline(id)),
                     FetchStep::Fetched(record) => {
                         fetched_this_run = Some(record);
@@ -1978,6 +1995,7 @@ fn fetch_pinned_missing(
     models_dir: &Path,
     id: &str,
     announce: bool,
+    progress: &dyn np_core::progress::Progress,
 ) -> Result<FetchStep, Box<dyn Error>> {
     let members = np_core::pins::members_for_build();
     let bytes: u64 = members
@@ -1998,7 +2016,15 @@ fn fetch_pinned_missing(
     let origin = fetch::resolve_origin(cfg.models.base_url.as_deref());
     let transport = fetch::HttpTransport::new(origin);
     let requested: Vec<&str> = members.to_vec();
-    match fetch::fetch(db, models_dir, id, &requested, &transport, now_secs()) {
+    match fetch::fetch_reporting(
+        db,
+        models_dir,
+        id,
+        &requested,
+        &transport,
+        now_secs(),
+        progress,
+    ) {
         Ok(report) => {
             if announce {
                 for member in &report.members {
