@@ -43,6 +43,9 @@ rusqlite = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+# Instrumentation only: np-core emits spans and events and never installs a subscriber, so a build that asks for nothing pays a
+# level check (`docs/superpowers/specs/2026-12-10-np-diagnostics-design.md` "free when off").
+tracing = { workspace = true }
 toml = { workspace = true }
 unicode-width = { workspace = true }
 # The only network client in the workspace, and it is reachable from one module (`fetch::http`). `scan` has no

@@ -20,11 +20,12 @@ mod common;
 
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
-    config_file_path, data_dir_for, declared_data_dir, legacy_data_dir_override, resolve_data_dir,
-    CatalogConfig, Config, ConfigError, DataDirPlatform, EmbeddingProvider, EmbeddingsConfig,
-    MarkerConfig, ModelsConfig, SearchConfig, ThreadCount, WorkspaceRegistry,
-    DEFAULT_EMBEDDING_TOKENS, MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS, REGISTRY_FILE,
-    WINDOWS_DATA_SUBDIR, WORKSPACES_DIR,
+    config_file_path, data_dir_for, declared_data_dir, legacy_data_dir_override, parse_diag_spec,
+    resolve_data_dir, resolve_diag, CatalogConfig, Config, ConfigError, DataDirPlatform,
+    DiagSource, EmbeddingProvider, EmbeddingsConfig, Level, MarkerConfig, ModelsConfig,
+    SearchConfig, ThreadCount, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS, DIAG_LEVEL_NAMES,
+    MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS, REGISTRY_FILE, WINDOWS_DATA_SUBDIR,
+    WORKSPACES_DIR,
 };
 use np_core::search::SearchMode;
 use rusqlite::Connection;
@@ -2650,4 +2651,196 @@ fn an_operator_chosen_directory_wins_even_when_the_legacy_index_is_sitting_there
     let (dir, legacy) = resolve_data_dir(None, DataDirPlatform::Unix, &lookup_unix);
     assert_eq!(dir, chosen);
     assert_eq!(legacy, None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// `[log] level` / `NP_LOG` / `--log-spec`: the diagnostic level vocabulary (docs/superpowers/specs/2026-12-10-np-diagnostics-design.md).
+//
+// These cases are about *resolution*, not sinks: nothing here opens a file or writes a line. What they pin is the two things an
+// integrator can otherwise only guess at — which words mean which depth, and which source won when three of them disagreed.
+// ---------------------------------------------------------------------------------------------
+
+/// The grammar: a bare level, or `target=level` items with an optional bare level first. Unknown targets are **accepted** (a
+/// target this build does not compile still names something another build emits), and a spec of overrides alone keeps the
+/// documented default rather than inventing one.
+#[test]
+fn diag_spec_parses_levels_and_target_overrides() {
+    // Every name the published list promises parses, and prints back as itself. That is what makes `DIAG_LEVEL_NAMES` more
+    // than a comment: drop a name from the parser and this row fails instead of shipping a word the documentation promised.
+    for name in DIAG_LEVEL_NAMES {
+        let spec = parse_diag_spec(name)
+            .unwrap_or_else(|err| panic!("`{name}` is a documented level: {err}"));
+        assert_eq!(
+            spec.default.as_str(),
+            name,
+            "`{name}` prints back as itself"
+        );
+    }
+
+    let spec = parse_diag_spec("info,np_core::search=trace")
+        .expect("a bare level followed by one target override is the documented shape");
+    assert_eq!(spec.default, Level::Info, "the bare word sets the default");
+    assert_eq!(
+        spec.per_target,
+        vec![("np_core::search".to_string(), Level::Trace)],
+        "and `target=level` items are overrides, in the order written"
+    );
+
+    let bare = parse_diag_spec("debug").expect("a bare level alone is a whole spec");
+    assert_eq!(bare.default, Level::Debug);
+    assert!(bare.per_target.is_empty(), "no override was written");
+
+    let overrides_only = parse_diag_spec("np_core::db=off").expect("overrides alone are legal");
+    assert_eq!(
+        overrides_only.default,
+        Level::Warn,
+        "with no bare word the default is the documented one, not `off` and not `trace`"
+    );
+
+    let spaced = parse_diag_spec("info, np_core::fetch=off")
+        .expect("a space after a comma separates items, it is not part of a name");
+    assert_eq!(
+        spaced.per_target,
+        vec![("np_core::fetch".to_string(), Level::Off)],
+        "so the target arrives without the leading space"
+    );
+
+    let repeated = parse_diag_spec("np_core::db=off,np_core::db=trace")
+        .expect("a target written twice is a correction, not a contradiction");
+    assert_eq!(
+        repeated.per_target,
+        vec![("np_core::db".to_string(), Level::Trace)],
+        "the last spelling of one target wins, and it appears once"
+    );
+
+    let unknown_target = parse_diag_spec("np_other::thing=trace")
+        .expect("an unknown target is not a typo in this one");
+    assert_eq!(
+        unknown_target.per_target,
+        vec![("np_other::thing".to_string(), Level::Trace)],
+        "a target another build emits must survive to that build"
+    );
+}
+
+/// A value nobody can read **refuses, naming where it came from** — the `NP_LLAMA_LOG_LEVEL` rule (`loglevel.rs`), because a
+/// refusal that says "edit the file" while the environment holds the bad word wastes the one thing a refusal is for.
+#[test]
+fn diag_spec_refuses_naming_its_source() {
+    let from_env = resolve_diag(None, Some("verbose"), None)
+        .expect_err("a level nobody spelled is a refusal, not a shrug to the default");
+    assert!(
+        from_env.contains("NP_LOG"),
+        "the environment's bad word must name the environment: {from_env}"
+    );
+    assert!(
+        !from_env.contains("--log-spec"),
+        "and must not send the reader to a flag they did not type: {from_env}"
+    );
+
+    let from_flag = resolve_diag(Some("verbose"), None, None)
+        .expect_err("the same text from a flag refuses too");
+    assert!(
+        from_flag.contains("--log-spec"),
+        "a bad flag value names the flag: {from_flag}"
+    );
+    assert!(
+        !from_flag.contains("NP_LOG"),
+        "not the variable: {from_flag}"
+    );
+
+    let from_file =
+        resolve_diag(None, None, Some("verbose")).expect_err("and so does a bad file value");
+    assert!(
+        from_file.contains("log.level"),
+        "a bad file value names the key: {from_file}"
+    );
+
+    // The refusal is also the only place the six words are listed, so it has to list them.
+    for name in ["off", "error", "warn", "info", "debug", "trace"] {
+        assert!(
+            from_env.contains(name),
+            "the refusal must list {name:?} or a reader cannot fix the value: {from_env}"
+        );
+    }
+
+    // An empty spec names nothing, so it is a refusal from the parser rather than a silent trip to the default.
+    let empty = parse_diag_spec("").expect_err("a spec of nothing is not a spec");
+    assert!(
+        empty.to_string().contains("empty"),
+        "and it says so: {empty}"
+    );
+
+    // A bare level belongs first and once: two of them is a contradiction the parser will not guess a winner for.
+    let two_bare = resolve_diag(Some("info,debug"), None, None).expect_err("two defaults refuse");
+    assert!(
+        two_bare.contains("debug"),
+        "naming the second one is how it gets fixed: {two_bare}"
+    );
+
+    // A bad *override* level is as refused as a bad default, and says which item was wrong.
+    let bad_override = resolve_diag(Some("info,np_core::search=verbose"), None, None)
+        .expect_err("an override with an unreadable level refuses too");
+    assert!(
+        bad_override.contains("np_core::search"),
+        "naming the offending target is how a comma list gets fixed: {bad_override}"
+    );
+}
+
+/// **The house rule** (§12 rule 7, pinned for llama.cpp's transcript at `loglevel.rs:160` / `cli.rs:3726`): the file wins, the
+/// environment fills what the file left unset. A diagnostic hatch invents no exception, so `NP_LOG` cannot outvote a file that
+/// named a level — and the caller is told which of them won, because "the environment did nothing" is otherwise invisible.
+#[test]
+fn diag_resolution_prefers_the_file_over_the_environment() {
+    let (spec, source) =
+        resolve_diag(None, Some("trace"), Some("warn")).expect("both values are readable");
+    assert_eq!(
+        spec.default,
+        Level::Warn,
+        "the file outranks the environment"
+    );
+    assert_eq!(source, DiagSource::Config, "and says so");
+
+    // The environment answers when the file is silent…
+    let (spec, source) = resolve_diag(None, Some("trace"), None).expect("one source is enough");
+    assert_eq!(spec.default, Level::Trace);
+    assert_eq!(source, DiagSource::Env);
+
+    // …an empty environment value counts as unset rather than as a refusal (`env_text`'s rule)…
+    let (spec, source) =
+        resolve_diag(None, Some(""), Some("warn")).expect("an empty NP_LOG is silence");
+    assert_eq!(spec.default, Level::Warn);
+    assert_eq!(source, DiagSource::Config, "so the file still answers");
+
+    // …and when nobody said anything at all the default is `warn`, which is what keeps stderr as quiet as it is today.
+    let (spec, source) = resolve_diag(None, None, None).expect("no source is not an error");
+    assert_eq!(spec.default, Level::Warn);
+    assert_eq!(source, DiagSource::Default);
+
+    // A bad environment value refuses **even though the file would have won**: a typo in the hatch must be visible instead of
+    // silently meaning "whatever the file said" — the same reasoning as `resolve_level`.
+    resolve_diag(None, Some("verbose"), Some("warn")).expect_err("a refused hatch stays refused");
+}
+
+/// The flag is the loudest voice: it outvotes both file and environment, because it is the one spelling typed for this run.
+#[test]
+fn diag_flag_beats_everything() {
+    let (spec, source) = resolve_diag(
+        Some("debug,np_core::embed=trace"),
+        Some("info"),
+        Some("error"),
+    )
+    .expect("the flag is readable");
+    assert_eq!(spec.default, Level::Debug);
+    assert_eq!(
+        spec.per_target,
+        vec![("np_core::embed".to_string(), Level::Trace)],
+        "the winning source supplies the whole spec, overrides included"
+    );
+    assert_eq!(source, DiagSource::Flag);
+
+    // The four words a caller prints are one per source, and `as_str` is where they live.
+    assert_eq!(DiagSource::Default.as_str(), "default");
+    assert_eq!(DiagSource::Config.as_str(), "config.toml");
+    assert_eq!(DiagSource::Env.as_str(), "NP_LOG");
+    assert_eq!(DiagSource::Flag.as_str(), "command line");
 }

@@ -1,6 +1,7 @@
 //! Config file (`config.toml`), OS data dir, and the known-workspace registry.
 
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1344,6 +1345,300 @@ pub fn default_data_dir() -> Option<PathBuf> {
 #[cfg(not(windows))]
 pub fn default_data_dir() -> Option<PathBuf> {
     data_dir_for(DataDirPlatform::Unix, &|key| env_path(key))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The diagnostic level vocabulary: what a level is spelled, how a spec of them is written, and which
+// source won when file, environment and flag disagreed
+// (`docs/superpowers/specs/2026-12-10-np-diagnostics-design.md`).
+//
+// This section decides; it never writes. The sinks that consume a resolved [`DiagSpec`] live in np-cli, which owns the process
+// and its stderr — np-core's half is the vocabulary, so that `np`, a test harness, and a library caller embedding this crate
+// all mean the same thing by `np_core::search=trace`.
+// ---------------------------------------------------------------------------------------------
+
+/// The permitted spellings of a diagnostic level, in the order a refusal lists them.
+///
+/// One constant for the reason [`crate::loglevel::LEVEL_NAMES`] is one: this list is what a refusal promises, and
+/// `crates/np-core/tests/config.rs` parses every name in it, so dropping one from [`Level`]'s parser while leaving it here
+/// turns a green suite red instead of shipping a word the documentation promised.
+///
+/// Six where F33 has five. `[embeddings] log_level` stops at `debug` because ggml has no word above it, and the two knobs stay
+/// separate on purpose (spec point 6): asking to trace the search path must not also dump a model loader's hundred-and-twenty
+/// line transcript, which is the only reason F33 exists.
+pub const DIAG_LEVEL_NAMES: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
+
+/// The level a run captures when neither the file, the environment nor a flag named one.
+///
+/// `Warn`, which is what keeps the promise the whole design hangs on (**spec point 1**): an ordinary `np scan` prints exactly
+/// what it prints today, because at `warn` the refusals are the only things worth saying and every one of them already has its
+/// pinned sentence. Deeper than this is something a person asks for.
+pub const DIAG_DEFAULT_LEVEL: Level = Level::Warn;
+
+/// The environment variable that supplies `[log] level` when the file leaves it unset.
+///
+/// **`RUST_LOG` is deliberately not honoured**, even though every reader of this line knows it. Two variables with opposite
+/// precedence orders in one binary is a support story nobody wins: `RUST_LOG` follows the ecosystem's env-beats-file rule, and
+/// this program's house rule (§12 rule 7) is file-beats-env, pinned for the other log knob at [`crate::loglevel::resolve_level`]
+/// and by `crates/np-cli/tests/cli.rs`. One variable, one order, documented in `docs/reference-diagnostics.md`.
+pub const DIAG_ENV_VAR: &str = "NP_LOG";
+
+/// The config key this vocabulary is read from, spelled as a refusal spells it (**F35**'s habit: name the key, not the struct).
+pub const DIAG_CONFIG_KEY: &str = "log.level";
+
+/// The flag that outvotes both of them, spelled as a refusal spells it.
+pub const DIAG_FLAG: &str = "--log-spec";
+
+/// One depth of np's diagnostic channel.
+///
+/// Six names over the ten targets listed in `docs/reference-diagnostics.md`: `off` silences one target or everything, `trace`
+/// is the per-note and per-chunk depth. The declaration order below is the *speaking* order (`off < error < … < trace`) rather
+/// than a numeric protocol, and nothing in np-core compares these values — a resolved spec becomes filter directives in np-cli,
+/// where the comparison happens once per event inside the subscriber's own filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Level {
+    /// Record nothing. Legal for the whole run (`NP_LOG=off`) and for one target inside it
+    /// (`np_core::scan=off`).
+    Off,
+    /// Failures only.
+    Error,
+    /// Refusals and degraded states — the default, and the level every existing user-facing sentence already lives at.
+    #[default]
+    Warn,
+    /// Effects: what a command decided, with timing. What `-v` asks for.
+    Info,
+    /// Per-decision detail — which rule fired on which path. What `-vv` asks for.
+    Debug,
+    /// Per-item detail: one line per note, per chunk, per candidate. `-vvv`, and the level that makes the file sink worth having.
+    Trace,
+}
+
+impl Level {
+    /// The spelling this level parses from and prints as — always one of [`DIAG_LEVEL_NAMES`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A level name that is not one of [`DIAG_LEVEL_NAMES`].
+///
+/// Carries the finished sentence rather than the offending word because a spec can be wrong in three shapes — a bad bare
+/// level, a bad override (`np_core::search=verbose`, which has to name the target), and an empty item — and each sentence is
+/// written where it is discovered instead of being reassembled from parts here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDiagSpecError(String);
+
+impl fmt::Display for ParseDiagSpecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParseDiagSpecError {}
+
+/// What to record, and where to stop: one default level plus the targets that want a different one.
+///
+/// `per_target` is a list rather than a map so the order a person wrote survives a round trip — the same order np-cli hands to
+/// the subscriber, and the order a bug report quotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagSpec {
+    /// The level for every target [`DiagSpec::per_target`] does not name.
+    pub default: Level,
+    /// Per-target overrides, in the order written, each target appearing once (the last spelling wins).
+    pub per_target: Vec<(String, Level)>,
+}
+
+impl Default for DiagSpec {
+    fn default() -> Self {
+        Self {
+            default: DIAG_DEFAULT_LEVEL,
+            per_target: Vec::new(),
+        }
+    }
+}
+
+/// Parse one spec: a bare level (`debug`), or a comma list of `target=level` with an optional bare level first
+/// (`info,np_core::search=trace`).
+///
+/// Three rules worth stating because each one was someone's question:
+///
+/// * **Unknown targets are accepted.** `np_core::vision=trace` on a build without vision is not a typo in this spec — the name
+///   may belong to a target another build emits, and refusing it would make the documented set unshippable in parts.
+/// * **A bare level must come first**, because “the default is `warn`, unless you said otherwise” needs one place to say it.
+/// * **Whitespace between items is a separator.** A spec is a list of tokens, and `info, x=trace` means what it looks like;
+///   the strictness lives in the *names* (case-sensitive, exactly as [`crate::loglevel::LogLevel`] is), not in the commas.
+pub fn parse_diag_spec(raw: &str) -> Result<DiagSpec, ParseDiagSpecError> {
+    if raw.is_empty() {
+        return Err(ParseDiagSpecError(format!(
+            "an empty log spec names nothing — write one of {}",
+            DIAG_LEVEL_NAMES.join(", ")
+        )));
+    }
+    let mut spec = DiagSpec::default();
+    // `seen_bare` is what makes a second bare level a refusal instead of a coin flip: only item 0 may omit `target=`.
+    for (index, item) in raw.split(',').enumerate() {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(ParseDiagSpecError(format!(
+                "empty item {} of {raw:?} — write `target=level` or one of {}",
+                index + 1,
+                DIAG_LEVEL_NAMES.join(", ")
+            )));
+        }
+        let (target, level_text) = match item.split_once('=') {
+            // `=trace` alone has no target to attach the level to, and guessing one would invent a filter nobody wrote.
+            Some(("", _)) => {
+                return Err(ParseDiagSpecError(format!(
+                    "{raw:?} has an item with no target before `=`"
+                )))
+            }
+            Some((target, level)) => (Some(target), level),
+            None if index == 0 => (None, item),
+            None => {
+                return Err(ParseDiagSpecError(format!(
+                    "{item:?} is a bare level in position {}: only the first item may name the default \
+                     (write `{item}=…` for a target)",
+                    index + 1
+                )));
+            }
+        };
+        let level = parse_level(level_text).map_err(|err| match target {
+            // Name the offending target: in a comma list, "which one was wrong" is the whole question.
+            Some(target) => ParseDiagSpecError(format!("{target}={level_text}: {err}")),
+            None => err,
+        })?;
+        match target {
+            None => spec.default = level,
+            Some(target) => replace_target(&mut spec.per_target, target, level),
+        }
+    }
+    Ok(spec)
+}
+
+/// One level name, case-sensitively — the same strictness [`crate::loglevel::LogLevel`] shows, for the same reason: two
+/// spellings for one setting in a file where every other value is exactly as written.
+fn parse_level(text: &str) -> Result<Level, ParseDiagSpecError> {
+    // Case-sensitive on purpose, as [`crate::loglevel::LogLevel`] is: `INFO` is a different string from `info`, and accepting
+    // both would mean two spellings for one setting in a file where every other value is exactly as written.
+    match text {
+        "off" => Ok(Level::Off),
+        "error" => Ok(Level::Error),
+        "warn" => Ok(Level::Warn),
+        "info" => Ok(Level::Info),
+        "debug" => Ok(Level::Debug),
+        "trace" => Ok(Level::Trace),
+        other => Err(ParseDiagSpecError(format!(
+            "{other:?} is not a log level — write one of {}",
+            DIAG_LEVEL_NAMES.join(", ")
+        ))),
+    }
+}
+
+/// Set one target's level, replacing an earlier spelling so a target appears once and the last word wins.
+fn replace_target(per_target: &mut Vec<(String, Level)>, target: &str, level: Level) {
+    match per_target.iter_mut().find(|(name, _)| name == target) {
+        Some(slot) => slot.1 = level,
+        None => per_target.push((target.to_string(), level)),
+    }
+}
+
+/// Which source supplied this run's levels — printed on stderr when someone asked for diagnostics, because “the environment did
+/// nothing” is otherwise invisible (spec point 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiagSource {
+    /// Nobody named a level; [`DIAG_DEFAULT_LEVEL`] applies.
+    Default,
+    /// `[log] level` in the config file.
+    Config,
+    /// `NP_LOG`.
+    Env,
+    /// `-v` / `--log-spec` on this command line.
+    Flag,
+}
+
+impl DiagSource {
+    /// The word a person sees for this source, and the only place those four words are written.
+    ///
+    /// Pinned by `crates/np-cli/tests/diag.rs` through the announce line (`log level info from config.toml`), so the enum and
+    /// the sentence cannot drift apart.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Config => "config.toml",
+            Self::Env => "NP_LOG",
+            Self::Flag => "command line",
+        }
+    }
+}
+
+/// Resolve the levels from every source: **flag > file > environment > [`DIAG_DEFAULT_LEVEL`]**, and say which one won.
+///
+/// Two rules travel with the order, both inherited rather than invented here:
+///
+/// * **The file outranks the environment** (§12 rule 7, amended by the human on 2026-11-04 and already pinned for
+///   `[embeddings] log_level` at [`crate::loglevel::resolve_level`] / `crates/np-cli/tests/cli.rs`). What [`DIAG_ENV_VAR`]
+///   buys is a level without editing a file, not a way to outvote a file that named one.
+/// * **Every present value is parsed, even a losing one.** A bad `NP_LOG` refuses even when the file would have won, because a
+///   typo in the hatch must be visible rather than silently meaning “whatever the file said” — [`crate::loglevel::resolve_level`]
+///   says the same thing about its own hatch.
+///
+/// An *empty* value counts as unset, which is this file's rule for environment text everywhere (`env_text`) rather than a second
+/// opinion: `NP_LOG= np scan` gets the file's level or the default, not a refusal.
+///
+/// The winner supplies the **whole** spec, overrides included — one source, one story. Merging `[log] level`'s default with
+/// `NP_LOG`'s overrides would make the printed line (“from NP_LOG”) describe only half of what was applied, which is exactly
+/// the invisibility this feature exists to remove.
+///
+/// The failure text names the variable or key it came from, as [`crate::loglevel::resolve_level`] does: telling someone to edit
+/// a file that does not hold the value wastes the one thing a refusal is for.
+pub fn resolve_diag(
+    cli: Option<&str>,
+    env: Option<&str>,
+    config: Option<&str>,
+) -> Result<(DiagSpec, DiagSource), String> {
+    // Parsed in *reading* order so every bad value is seen; chosen in *precedence* order.
+    let from_flag = present(cli)
+        .map(|value| parse_named(value, DIAG_FLAG))
+        .transpose()?;
+    let from_env = present(env)
+        .map(|value| parse_named(value, DIAG_ENV_VAR))
+        .transpose()?;
+    let from_config = present(config)
+        .map(|value| parse_named(value, DIAG_CONFIG_KEY))
+        .transpose()?;
+
+    // Chosen in precedence order: the flag is this run's word, the file outranks the environment (§12 rule 7), and the
+    // environment speaks only where both above it are silent.
+    Ok(from_flag
+        .map(|spec| (spec, DiagSource::Flag))
+        .or_else(|| from_config.map(|spec| (spec, DiagSource::Config)))
+        .or_else(|| from_env.map(|spec| (spec, DiagSource::Env)))
+        .unwrap_or_else(|| (DiagSpec::default(), DiagSource::Default)))
+}
+
+/// Whether a source spoke: present and non-empty.
+fn present(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| !text.is_empty())
+}
+
+/// Parse one source's value, prefixing any complaint with the spelling of that source.
+fn parse_named(value: &str, source: &str) -> Result<DiagSpec, String> {
+    parse_diag_spec(value).map_err(|err| format!("{source}: {err}"))
 }
 
 /// The workspaces this program has seen, in `<data_dir>/workspaces.sqlite` —
