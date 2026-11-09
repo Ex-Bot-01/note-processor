@@ -722,7 +722,10 @@ fn embed_report(
             id: id.clone(),
         },
     };
-    let mut report = embed_run::embed_with_resolution(workspace, &cfg, resolution)?;
+    // The CLI reports nothing: `np embed` prints one summary at the end and its bytes are a contract, so this path
+    // passes the no-op reporter. `np serve` reaches the same function through `embed_report` with a real one.
+    let mut report =
+        embed_run::embed_with_resolution(workspace, &cfg, resolution, np_core::progress::none())?;
     // What was concluded about the model's bytes travels on the report rather than being printed here, so `--json`
     // and the text summary cannot disagree about whether this run verified anything (the same reason §7's caveat is a
     // field). `None` says no local artifact was involved — a `provider = "none"` run has nothing to claim.

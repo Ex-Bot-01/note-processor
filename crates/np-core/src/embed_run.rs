@@ -677,7 +677,13 @@ pub fn embed(
     cfg: &Config,
     provider: &mut dyn Embedder,
 ) -> Result<EmbedReport, EmbedRunError> {
-    embed_with_inject(workspace, cfg, provider, &mut |_| {})
+    embed_with_inject(
+        workspace,
+        cfg,
+        provider,
+        &mut |_| {},
+        crate::progress::none(),
+    )
 }
 
 /// The entry point for a caller that resolved `[embeddings]` rather than building a provider it had to invent an
@@ -690,8 +696,9 @@ pub fn embed_with_resolution(
     workspace: &Path,
     cfg: &Config,
     resolution: Resolution<'_>,
+    progress: &dyn crate::progress::Progress,
 ) -> Result<EmbedReport, EmbedRunError> {
-    run(workspace, cfg, resolution, &mut |_| {})
+    run(workspace, cfg, resolution, &mut |_| {}, progress)
 }
 
 /// The same run with a hook called **between batches**, outside every transaction.
@@ -705,12 +712,14 @@ pub fn embed_with_inject(
     cfg: &Config,
     provider: &mut dyn Embedder,
     between_batches: &mut dyn FnMut(&Path),
+    progress: &dyn crate::progress::Progress,
 ) -> Result<EmbedReport, EmbedRunError> {
     run(
         workspace,
         cfg,
         Resolution::Provider(provider),
         between_batches,
+        progress,
     )
 }
 
@@ -720,6 +729,7 @@ fn run(
     cfg: &Config,
     mut resolution: Resolution<'_>,
     between_batches: &mut dyn FnMut(&Path),
+    progress: &dyn crate::progress::Progress,
 ) -> Result<EmbedReport, EmbedRunError> {
     // The same fence `crate::scan` raises: an empty data dir would derive a database path beside the current
     // directory, possibly inside the workspace being embedded.
@@ -978,6 +988,9 @@ fn run(
 
     // ---- the writer loop: model work outside the transaction, one bounded transaction per batch.
     let mut embedded = 0usize;
+    // Chunks handed to the provider so far. Its own counter rather than `owed.len() - remaining`, because the run can
+    // leave the loop early and a progress line must describe the work that happened, not the plan.
+    let mut chunks_handed = 0usize;
     let mut refused_budget = 0usize;
     let mut busy_gap = 0usize;
     // The token numbers of the last over-budget refusal, kept for §6's report line.
@@ -986,7 +999,17 @@ fn run(
     // `EmbedError` message is input-free and secret-free by that type's own rule (§3).
     let mut reason: Option<String> = None;
 
+    // The pass says where it starts. Deliberately **no** `chunks_total` here: the only honest total is a count of owed
+    // chunks taken before the loop, which is one more query over the hottest table for a percentage nobody asked for,
+    // and an absent total means "unknown" while a zero would mean "nothing to do" (spec §"left to the builder").
+    progress.report(&crate::progress::ProgressEvent {
+        phase: crate::progress::Phase::Embedding,
+        chunks_done: 0,
+        ..Default::default()
+    });
+
     'batches: for batch in owed.chunks(EMBED_BATCH_CHUNKS) {
+        let embedded_before = embedded;
         // Raw chunk text, undressed: whatever the model is given is the provider's doing, and it is the same
         // dressing [`Embedder::model_inputs`] described when this run decided the chunk was owed.
         let texts: Vec<&str> = batch.iter().map(|item| item.text.as_str()).collect();
@@ -1041,6 +1064,22 @@ fn run(
                 break 'batches;
             }
         }
+        // One line per batch, at the same point `between_batches` fires — after the write committed or rolled back,
+        // before the next batch is handed to the model. `writing` means this batch's rows are in the database; a batch
+        // that refused, was over budget, or found the table busy says `embedding` instead, because claiming a write
+        // that did not happen is the one thing a progress line must never do.
+        chunks_handed += batch.len();
+        progress.report(&crate::progress::ProgressEvent {
+            phase: if embedded > embedded_before {
+                crate::progress::Phase::Writing
+            } else {
+                crate::progress::Phase::Embedding
+            },
+            chunks_done: chunks_handed,
+            embedded,
+            ..Default::default()
+        });
+
         between_batches(&db_path);
     }
 

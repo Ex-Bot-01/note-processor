@@ -390,6 +390,7 @@ mod corpus {
                     rss_samples.push(rss_kib("VmRSS:"));
                 }
             },
+            np_core::progress::none(),
         )
         .expect("a corpus pass over an installed model completes");
         let wall = started.elapsed();

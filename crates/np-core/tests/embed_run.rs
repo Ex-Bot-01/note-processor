@@ -1086,6 +1086,7 @@ fn runtime_not_built_refuses_before_the_currency_read() {
         np_core::embed_run::Resolution::RuntimeNotBuilt {
             id: MODEL_ID.into(),
         },
+        np_core::progress::none(),
     )
     .expect("a refusal is a report, not an error");
 
@@ -1130,6 +1131,7 @@ fn offline_is_its_own_arm_and_does_no_work() {
         np_core::embed_run::Resolution::FetchSkippedOffline {
             id: MODEL_ID.into(),
         },
+        np_core::progress::none(),
     )
     .expect("an outage is a report, not an error");
 
@@ -1229,15 +1231,21 @@ fn a_scan_can_take_the_write_lock_between_batches() {
     let cfg = setup.cfg();
     let mut scans = 0usize;
     let mut fake = Fake::new();
-    let report = embed_with_inject(&setup.root, &setup.cfg(), &mut fake, &mut |db_path| {
-        assert!(
-            db_path.exists(),
-            "the hook is handed the database an embed is writing"
-        );
-        // Count batches by how often we are called: more than once means the loop really is batched.
-        scans += 1;
-        scan(&root, &cfg).expect("a scan must succeed while an embed sits between batches");
-    })
+    let report = embed_with_inject(
+        &setup.root,
+        &setup.cfg(),
+        &mut fake,
+        &mut |db_path| {
+            assert!(
+                db_path.exists(),
+                "the hook is handed the database an embed is writing"
+            );
+            // Count batches by how often we are called: more than once means the loop really is batched.
+            scans += 1;
+            scan(&root, &cfg).expect("a scan must succeed while an embed sits between batches");
+        },
+        np_core::progress::none(),
+    )
     .expect("run");
 
     assert!(report.succeeded(), "{:?}", report.outcome);
