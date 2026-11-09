@@ -201,7 +201,7 @@ second consent mechanism to get wrong.
 
 | Claim | Evidence | Killed by this mutant |
 | --- | --- | --- |
-| stdout carries only protocol bytes | `serve.rs` 11 cases, all read via one `read_line` that parses a whole object | prose `println!` into stdout → 11/11 fail |
+| stdout carries only protocol bytes | `tests/serve.rs`: 11 cases through a real pipe (plus 10 unit cases in `src/serve.rs`; the commit message said "twenty" and miscounted by one — the totals here are from `cargo test`, not from prose) | prose `println!` into stdout → 11/11 fail |
 | `result` equals the CLI document | `a_search_response_is_the_same_document_np_search_json_prints`, `a_models_list_response_is_the_same_document_…` | extra key in the served document → identity case fails |
 | states are results, not faults | `a_contended_workspace_is_a_result_and_the_server_keeps_answering` | contention rendered as a refusal → that case fails |
 | notifications run and stay silent | `a_notification_runs_and_answers_nothing` (checks `INDEX.md` on disk *and* the line count) | answering notifications → that case fails |
