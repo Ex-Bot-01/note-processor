@@ -40,6 +40,49 @@ use tracing::{span, Event, Level as TracingLevel, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::{LookupSpan, SpanRef};
 
+/// Whether writing a diagnostic to descriptor 2 **now** would block.
+///
+/// `poll` with a zero timeout answers without waiting: for a pipe or socket whose buffer is full it says "not now", which
+/// is the client not reading — the exact situation that used to stall `np serve`. A terminal and a regular file always
+/// answer ready, so nothing about ordinary `-v` runs changes.
+///
+/// One syscall per diagnostic line, taken only on a line the level filter already passed. The alternative that looks
+/// cheaper — putting descriptor 2 into `O_NONBLOCK` for the duration of the write — is not ours to take: the flag belongs
+/// to the open file description, shared with every other writer in the process, so it would put the *pinned* user-facing
+/// sentences (the refusal lines, the announce line) at risk of vanishing into `EAGAIN`. Dropping our own line loses a
+/// diagnostic and nothing else.
+///
+/// A failed `poll` answers "would not block": an error here means the descriptor is odd rather than slow, and the write
+/// below already tolerates any error that descriptor can give.
+#[cfg(unix)]
+fn stderr_would_block() -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: io::stderr().as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: `fd` is one initialised `pollfd`, and the count passed matches it. `poll` writes only `revents`.
+    let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+    // Three answers, and only one of them means "write". `ready == 0` is the timeout — the pipe buffer is full and nobody
+    // is reading; `ready > 0` without `POLLOUT` is the same news with an error condition attached (`POLLERR`/`POLLHUP` on
+    // a closed or broken pipe). A negative return means `poll` itself failed (an odd descriptor, `EINTR`), and that one
+    // answers "would not block": the write below already tolerates any error the descriptor can give.
+    if ready < 0 {
+        return false;
+    }
+    ready == 0 || (fd.revents & libc::POLLOUT) == 0
+}
+
+/// Windows has no `poll`; a write to a full pipe there blocks as it always did, and
+/// `docs/reference-diagnostics.md` says so plainly rather than pretending otherwise. The cap still bounds how many lines
+/// reach that pipe, which bounds how long the wait can be, and `[log] file` is the answer for a client that never reads
+/// stderr at all.
+#[cfg(not(unix))]
+fn stderr_would_block() -> bool {
+    false
+}
+
 /// How many diagnostic lines one process may print to stderr before it stops (spec point 8).
 ///
 /// A normal `-v` run reaches tens of lines. The runs that blow past a thousand are trace-level loops over thousands of notes,
@@ -293,6 +336,19 @@ impl Sink {
     /// Write one line to stderr, through the cap.
     fn write_stderr(&self, line: &str) {
         if !self.take_stderr_slot() {
+            return;
+        }
+        // **A diagnostic is never the reason a command waits.** This module's third rule used to be true only of failures
+        // — an unopenable path, a full budget — and not of descriptor 2 itself: measured on this box, `np serve` with
+        // `NP_LOG=error` against a config that refuses every request stalled inside a stderr write once the client's pipe
+        // filled at ~60 KiB, so the requests behind it went unanswered. A log channel that can stop the thing it is
+        // watching is not a log channel.
+        //
+        // So: ask first, drop when the answer is "not now" (see [`stderr_would_block`] for what the question costs and why
+        // it is not `O_NONBLOCK`). A dropped line counts as suppressed exactly as one past the cap does, so the closing
+        // notice still appears and names both ways out; the file sink is unaffected, because a regular file does not fill.
+        if stderr_would_block() {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // Written through a handle with the result dropped, for the reason `np_core::scan` gives for its own stderr receipt:

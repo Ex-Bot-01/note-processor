@@ -503,6 +503,7 @@ name = "np-cli"
 version = "0.3.1"
 dependencies = [
  "clap",
+ "libc",
  "np-core",
  "rusqlite",
  "serde_json",

@@ -48,6 +48,14 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# A diagnostic must never be the reason a command waits. On unix the stderr sink asks `poll` whether descriptor 2 will take
+# a write *now* and drops the line when it will not (see `src/diag.rs`); that is one syscall, no thread, and no change to
+# the descriptor's flags — which matters, because setting `O_NONBLOCK` on fd 2 would make every *other* stderr writer in the
+# process, including the pinned user-facing sentences, lose their line to `EAGAIN`. Windows has no `poll`, so there the
+# write stays blocking and the reference says so; `[log] file` is the answer for a client that never reads stderr.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Only for `tests/cli.rs`, which has to seed a version-two workspace database by hand: no production API
 # writes an old schema, and the version-2 fixture is what makes F21's upgrade path reachable at all.

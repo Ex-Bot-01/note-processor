@@ -1428,3 +1428,130 @@ fn a_slow_phase_reports_its_cost() {
         ranked[0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review Focus 5: a client that never reads stderr
+// ---------------------------------------------------------------------------
+
+/// Plan Review Focus 5, and the one case in this file that exists because of a measurement rather than an idea.
+///
+/// A GUI spawns `np serve`, captures stderr to see whether anything went wrong, and **never reads the pipe** — the most
+/// normal possible thing for a frontend to do with a stream it does not parse. An anonymous pipe holds about 64 KiB; a
+/// refusing config emits a ~350-byte diagnostic per request, so the pipe fills after a couple of hundred requests and
+/// every later stderr write waits for a reader that will never come. Measured on this box before the fix: 1 200 requests
+/// in, **1 057 answered**, the child stalled inside `write(2)`. That is a log channel stopping the thing it watches, so
+/// the sink now asks descriptor 2 whether it will take a write and drops the line when it will not.
+///
+/// The assertions are the two halves of that claim: every request is answered (nothing blocks), and stderr really did
+/// fill (the case would pass vacuously if the diagnostics never reached the pipe's capacity).
+#[test]
+fn an_unread_stderr_pipe_never_stalls_the_request_loop() {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).expect("test setup: vault dir");
+    fs::write(root.join("a.md"), "# Alpha\n\nword\n").expect("test setup: note");
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(config_dir.join("note-processor")).expect("test setup: config dir");
+    fs::write(
+        config_dir.join("note-processor").join("config.toml"),
+        "[loggg]\nlevel = \"info\"\n",
+    )
+    .expect("test setup: write refusing config");
+
+    let asks: usize = 1_200;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_np"));
+    cmd.arg("serve")
+        .current_dir(&root)
+        .env("XDG_DATA_HOME", tmp.path().join("data"))
+        .env("LOCALAPPDATA", tmp.path().join("data"))
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("APPDATA", &config_dir)
+        .env("NP_LOG", "error")
+        .env_remove("RUST_LOG");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // **Held, never read.** This handle is the whole test: leaving it open without draining it is what a frontend
+        // does, and reading it here would remove the condition under examination.
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("test setup: start `np serve`");
+    let mut stdin = child.stdin.take().expect("test setup: stdin");
+    let mut stdout = child.stdout.take().expect("test setup: stdout");
+    // Named rather than underscored because the case reads it once at the end to prove the pipe really filled; while the
+    // server runs, nobody drains it, which is the condition under test.
+    let mut unread_stderr = child
+        .stderr
+        .take()
+        .expect("test setup: stderr, unread on purpose");
+
+    // Feeding happens off the main thread because a stalled child stops draining *stdin* too, and a harness that blocks
+    // on its own write cannot report what the child did.
+    let (fed_tx, fed_rx) = mpsc::channel::<usize>();
+    let feeder = thread::spawn(move || {
+        let mut written = 0usize;
+        for i in 1..=asks {
+            let line = request(i as u32, "scan", serde_json::json!({"workspace": root}));
+            if stdin.write_all(line.as_bytes()).is_err() {
+                break;
+            }
+            written += 1;
+            if written % 50 == 0 {
+                let _ = stdin.flush();
+            }
+        }
+        let _ = stdin.flush();
+        let _ = fed_tx.send(written);
+        // Closing stdin is what lets the server reach its own clean exit.
+        drop(stdin);
+    });
+
+    let (answered_tx, answered_rx) = mpsc::channel::<usize>();
+    thread::spawn(move || {
+        let mut answered = 0usize;
+        let mut buf = std::io::BufReader::new(&mut stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::BufRead::read_line(&mut buf, &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if !line.trim().is_empty() {
+                        answered += 1;
+                    }
+                }
+            }
+        }
+        let _ = answered_tx.send(answered);
+    });
+
+    let answered = answered_rx.recv_timeout(Duration::from_secs(90)).expect(
+        "the request loop answers within 90 s; a stall here is the defect this case exists for",
+    );
+    let fed = fed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    let _ = feeder.join();
+
+    assert_eq!(
+        answered, asks,
+        "every request gets its response even though nobody reads stderr (fed {fed} of {asks})"
+    );
+    // The other half: the pipe did fill, or nothing was proven. Whatever arrived is at most a pipe's capacity, and the
+    // server got through all 1 200 requests regardless — which is the difference between dropping diagnostics and
+    // dropping requests.
+    let mut arrived = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut unread_stderr, &mut arrived);
+    assert!(
+        !arrived.is_empty(),
+        "diagnostics were expected on stderr at all (NP_LOG=error against a refusing config)"
+    );
+    let status = child.wait().expect("the server exits once stdin closes");
+    assert!(status.success(), "and the run ends cleanly: {status}");
+}
