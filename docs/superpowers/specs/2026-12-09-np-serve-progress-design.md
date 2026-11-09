@@ -315,8 +315,9 @@ per-member byte counters with a pinned denominator, terminal line mirroring the 
 
 1. **`Progress::NONE` cannot exist.** The design wrote the no-op reporter as an associated constant of type `&dyn Progress`;
    Rust does not allow a `&dyn Trait` value to be an associated const. Shipped as the free function `progress::none()`, used by
-   every CLI call site — which is what keeps `np search --json` byte-identical (proved by the 47 pre-existing `tests/cli.rs`
-   cases passing untouched, and again under `--features local-model,fetch`).
+   every CLI call site — which is what keeps `np search --json` byte-identical (the 47 pre-existing `tests/cli.rs` cases pass
+   untouched on default features; under `--features local-model,fetch` that file runs 61 cases, because fourteen of them are
+   feature-gated additions rather than the same set re-run — the first draft of this sentence conflated the two).
 2. **`Phase::Resolving` was missing from the enum.** Search needs a phase for "deciding which provider and artifact", because
    that is the stretch where it can start downloading 309 MB without writing an answer. It is also the *default* phase, so a
    silent reporter means "still deciding", never a false claim of work in progress.
@@ -352,6 +353,25 @@ per-member byte counters with a pinned denominator, terminal line mirroring the 
     no `.sqlite` file behind. There is a test for exactly that, because "read-only" is only worth the word if something proves
     it does not write.
 
+13. **The chunk loop was unreachable for a day, and no test noticed.** `embed_report` forwarded its reporter to provider
+    resolution and then passed `progress::none()` to `embed_run::embed_with_resolution`, so `np serve embed` never emitted
+    `embedding` or `writing` while the comment above that line said it did. np-core's seam tests call `embed_with_inject`
+    directly, so they were true; the pipe tests asserted fetch and lock phases, so they were true; twenty gate rows were green.
+    A fresh review read the code rather than the ledger and found it in one pass. Fixed by forwarding the reporter, and closed
+    with `an_embed_that_works_narrates_the_chunks_it_encodes`: install the pinned artifact, scan, embed for real over a pipe,
+    and require a `writing` line whose `embedded` matches the response — plus an unindexed vault producing *no* chunk lines, so
+    the case cannot pass by having nothing to do. **The lesson is not "review helps"**: it is that a claim about a channel needs
+    a test on that channel. Seam-level proof of the same behaviour is what made twenty green rows possible while the feature was
+    off.
+14. **Throttle memory is per request, not per connection.** `begin_request` originally reset only the clock, so two searches sent
+    within a second lost the second one's `resolving`. The rule in §4 was always "at most one line per second *within a phase of
+    one request*"; carrying it across the boundary swallowed exactly the line that says what a request is about to wait for.
+15. **`shutdown` ends the session.** The design and the reference both said the loop stops; the implementation noted the request
+    and waited for EOF, so a client that obeyed the documentation hung. Answering first and then stopping reading keeps framing
+    and exit code identical.
+16. **`notifications` of the wrong type is `-32602`.** §1 said "opt-in"; it did not say what `"notifications": "yes"` means, and
+    the implementation's answer — silence — was the one answer a client cannot debug. Absent still means off.
+
 **What the tests refuse to pretend.** The fetch-narration case over a real pipe serves the pinned `Content-Length` and then hangs
 up after 12 MiB rather than completing a 309 MB download inside `cargo test`; it proves byte checkpoints, the pinned denominator,
 forward-only bytes within a member, and a terminal `refused -32000`, and its doc comment says plainly that a *verified* download
@@ -359,8 +379,12 @@ belongs to the artifact-gated rows. The origin dribbles one chunk per 1.2 s so t
 fought — asserting "many lines" against a fast loopback transfer would be asserting that the throttle is broken.
 
 **Measured, not assumed.** Mutants were run for each claim that could otherwise survive by being untested: ignoring the opt-in,
-dropping the opening bookend, deleting the `resolving` report, using the transport-announced size as the denominator, letting
-bytes run backwards between members, and reporting `writing` after a batch that wrote nothing. Each one turns a named test red.
+dropping the opening bookend, deleting the `resolving` report, using the transport-announced size as the denominator, letting bytes
+run backwards between members, reporting `writing` after a batch that wrote nothing, restoring the dropped chunk reporter, keeping
+throttle memory across requests, ignoring `shutdown`, and hand-editing a line inside a documented transcript. Each one turns a named
+test red. Two of those four were not: the chunk-reporter mutant was the shipped code (see 13), and a `shutdown` that is noted but
+ignored hung the suite instead of failing it until the case learned to poll with a deadline — both are recorded here because a list
+of kills reads like a method unless the misses are in it too.
 
 **Evidence.** `.superpowers/sdd/2026-12-09-np-serve-progress/progress.md` carries per-task commits, the rulings above at the
 moment they were made, and the gate log paths; `docs/reference-serve.md` is the interface reference with four captured
