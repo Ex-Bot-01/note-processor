@@ -756,7 +756,7 @@ rather than letting a round discover it:
    hand rule 8 something to leak — the digest alone decides acceptance, so a different host serving these bytes is
    indistinguishable from this one. **What does not exist yet, stated here because an earlier draft claimed it:**
    `[models] sha256` / `NP_MODELS_SHA256` are read, validated and retrievable through
-   [`ModelsConfig::unpinned_digest_override`](crates/np-core/src/config.rs), but **no fetch consults them** — the accessor has
+   [`ModelsConfig::unpinned_digest_override`](../crates/np-core/src/config.rs), but **no fetch consults them** — the accessor has
    no production caller — so today the door for an unpinned artifact is `np models install --sha256`, where a human names the
    digest on the command line. Whoever wires that accessor owes rule 6's loud line in the same change. `crates/np-core/tests/pins.rs` keeps
    scanning every row for host-shaped substrings, and now also pins the baked value itself plus §13's member rule: a build

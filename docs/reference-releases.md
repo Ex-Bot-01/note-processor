@@ -52,7 +52,7 @@ like an instruction. Found by a field run on real Windows; graded on Linux throu
 **`v0.2.2` is where `np setup` and auto-fetch (F38) arrive**, along with the Windows data folder moving under
 `%LOCALAPPDATA%\note-processor` (F37). Its assets are built locally, not by CI: Linux (`x86_64-unknown-linux-gnu`, by
 `package-assets.sh`) and Windows (`x86_64-pc-windows-gnu`, cross-compiled with mingw-w64 — recipe in
-[`docs/ops-cross-build-windows-gnu.md`](docs/ops-cross-build-windows-gnu.md)). Both are unsigned, and the Windows one is compiled **without**
+[`ops-cross-build-windows-gnu.md`](ops-cross-build-windows-gnu.md)). Both are unsigned, and the Windows one is compiled **without**
 the inference feature — which also means it cannot auto-fetch: F38's trigger is compiled out of a binary that could not read the bytes, so
 `np embed` and `np setup` refuse there instead of spending 310 MB. `scan`, `search` in all three modes, `models list/install/fetch` and
 everything about paths and identity do work. If you can build from source with `--features local-model`, do that instead — it is the only shape

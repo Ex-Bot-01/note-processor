@@ -163,28 +163,39 @@ are listed with defaults and refusal behaviour in [Configuration reference](docs
 
 ## Use `np` from your app
 
-`np serve` reads one JSON-RPC 2.0 request per line from stdin and writes one response per line to stdout until stdin closes — same
-work as the commands, on a channel that does not fork:
+`np serve` reads one JSON-RPC 2.0 request per line from stdin and writes one response per line to stdout until stdin closes — the
+same work as the commands, on a channel that does not fork. Ask for `notifications` in the handshake and it also narrates the slow
+parts, which is what a GUI needs while a 295 MiB model downloads:
 
 ```console
 $ np serve
-{"jsonrpc":"2.0","id":1,"method":"initialize"}
-{"jsonrpc":"2.0","id":1,"result":{"np":"0.3.0","protocol":1,"features":{"local_model":false,"vision":false,"fetch":true},"methods":["initialize","search","scan","embed","models.list","shutdown"],"data_dir":"/home/you/.local/share/note-processor"}}
-{"jsonrpc":"2.0","id":2,"method":"search","params":{"workspace":"/home/you/Notes","query":"timeline"}}
-{"jsonrpc":"2.0","id":2,"result":{"hits":[…],"mode":"hybrid","vectors":false,"note":"embeddings are switched off (…)","reason":"provider-disabled","fetched":null,"offline":false}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspace":"/home/you/Notes","notifications":true}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol":1,"np":"0.3.0","features":{…},"methods":["status.get",…],"data_dir":"/home/you/.local/share/note-processor","progress":true}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"fetching","request":2,"since_ms":61,"member":"main","bytes_done":0,"bytes_total":309855456,"members_done":0,"members_total":1}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"fetching","request":2,"since_ms":1494,"member":"main","bytes_done":8388608,"bytes_total":309855456,"members_done":0,"members_total":1}}
+{"jsonrpc":"2.0","id":2,"result":{"outcome":{…},"offline":true,"embedded":0,…}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"completed","request":2,"since_ms":68,"offline":true,"outcome":{…}}}
 ```
 
-Six methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `shutdown` — and three rules:
+Seven methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `status.get`, `shutdown` — and three rules:
 
 - **Every `result` is exactly the document `np <verb> --json` prints**, because both channels call one builder; a test compares them
   value for value rather than trusting intent.
 - **stdout is the protocol.** Every sentence goes to stderr, so a client never strips prose out of a parse.
 - **States come back as data, not faults.** `locked`, `offline`, `reason` and `prefix_drift` are keys in the document; a fault means
-  the *request* was wrong (`-32700`, `-32601`, `-32602`) or `np` refused before doing work (`-32000`).
+  the *request* was wrong (`-32700`, `-32601`, `-32602`) or `np` refused before doing work (`-32000`). Progress ends with
+  `completed` when the request produced a result — including a degraded one — and `refused` only when it produced an error.
 
-A workspace is named in every request rather than remembered at startup, so one server can answer for several vaults. It exits **0**
-when stdin closes. Nothing listens on a port: whoever can write to the process's stdin already owns the files it can read. Design and
-as-built notes: [`np serve` over stdio](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md).
+Progress is **off unless you ask**: a client built against v0.3.0 sees byte-identical responses, because notifications are opt-in
+inside protocol version 1. A workspace is named in every request rather than remembered at startup, so one server can answer for
+several vaults. It exits **0** when stdin closes. Nothing listens on a port: whoever can write to the process's stdin already owns
+the files it can read.
+
+The whole interface — every method, every phase, four captured transcripts and a Python walkthrough including what to show after a
+page reload — is in [`docs/reference-serve.md`](docs/reference-serve.md); the reasoning is in
+[`np serve` over stdio](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) and its
+[progress design](docs/superpowers/specs/2026-12-09-np-serve-progress-design.md).
 
 ## Images, briefly
 
@@ -233,6 +244,7 @@ upgrade removed something: [Troubleshooting](docs/reference-troubleshooting.md).
 | [Models: fetch and install](docs/reference-models.md) | where artifacts live per workspace, what `install` verifies, what it refuses |
 | [Configuration reference](docs/reference-config.md) | every key, default, and refusal |
 | [CLI and report reference](docs/reference-cli-and-reports.md) | `--json` fields, report lines, exit codes, measured output |
+| [`np serve` reference](docs/reference-serve.md) | the stdio protocol: methods, fault codes, progress phases, captured transcripts |
 | [Images in the index](docs/reference-images.md) | sniffing, the six refusal classes, why vector formats are out |
 | [Troubleshooting](docs/reference-troubleshooting.md) | every sentence `np` prints that makes people pause |
 | [Release archive caveats](docs/reference-releases.md) | what each version's assets do and cannot do |

@@ -1349,3 +1349,84 @@ fn a_fetch_that_reaches_its_transport_narrates_bytes_and_ends_refused() {
 fn a_fetch_that_reaches_its_transport_narrates_bytes_and_ends_refused() {
     eprintln!("NOT COVERAGE: fetch narration needs `--features local-model,fetch`");
 }
+
+/// **The document is part of the interface.** A method that exists but is not written down is a method nobody can use, and a
+/// doc that describes only the methods someone remembered to mention reads like a complete one. So the list comes from the
+/// binary's own `METHODS`, and the file is read from the repository — if they drift, this fails rather than the reader finding
+/// out.
+#[test]
+fn the_reference_documents_every_method() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = root.join("docs/reference-serve.md");
+    let doc = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("{} must exist: {err}", path.display()));
+
+    // The list comes off the wire rather than out of the source, which is the stronger claim: it is what a client is told it
+    // may call, including anything a future task adds to the handshake.
+    let mut server = Server::new();
+    let handshake = server.request(
+        "initialize",
+        json!({"workspace": server.root.display().to_string()}),
+    );
+    let methods: Vec<String> = handshake["result"]["methods"]
+        .as_array()
+        .expect("initialize reports its methods")
+        .iter()
+        .map(|value| value.as_str().expect("a method name").to_string())
+        .collect();
+    assert!(
+        methods.len() >= 7,
+        "the handshake lost methods: {methods:?}"
+    );
+    server.finish();
+
+    for method in &methods {
+        assert!(
+            doc.contains(&format!("`{method}`")),
+            "`{method}` is offered over the pipe but appears nowhere in docs/reference-serve.md"
+        );
+    }
+    // The two keys a client must find to use progress at all, and the state key that is easiest to forget documenting.
+    for needle in [
+        "`np/progress`",
+        "`notifications`",
+        "`prefix_drift`",
+        "`running`",
+    ] {
+        assert!(
+            doc.contains(needle),
+            "the reference never mentions {needle}, so a client cannot learn it exists"
+        );
+    }
+
+    // And the transcripts are transcripts: every line inside their fences parses as one JSON document, because a block with a
+    // hand-typed ellipsis in it teaches a client to expect lines that no server ever sent.
+    let mut checked = 0;
+    let mut inside = false;
+    for line in doc.lines() {
+        if line.trim_start().starts_with("```json") {
+            inside = true;
+            continue;
+        }
+        if inside && line.trim_start() == "```" {
+            inside = false;
+            continue;
+        }
+        if inside {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parsed: Result<Value, _> = serde_json::from_str(trimmed);
+            assert!(
+                parsed.is_ok(),
+                "a documented transcript line is not one JSON document: {trimmed}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 20,
+        "the reference should carry real transcripts, not prose about them (checked {checked} lines)"
+    );
+}

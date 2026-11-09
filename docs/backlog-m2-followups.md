@@ -2216,7 +2216,7 @@ capturing exit codes and stdout byte counts separately.
 **What shipped.** `np_core::lock::WorkspaceLock` ([`crates/np-core/src/lock.rs`](../crates/np-core/src/lock.rs)) is a `BEGIN IMMEDIATE`
 transaction on `<data-dir>/<workspace-key>.lock.db`, opened and left uncommitted for the life of the command, released by `Drop`. Five commands
 take it before their first statement — `scan`, `embed`, `setup`, `models install`, `models fetch` — through one np-cli helper, `writer_lock`, and
-no reader does. A second writer waits [`WorkspaceLock::DEFAULT_WAIT`](crates/np-core/src/lock.rs) (2 s, bounded) and then refuses as a **state**:
+no reader does. A second writer waits [`WorkspaceLock::DEFAULT_WAIT`](../crates/np-core/src/lock.rs) (2 s, bounded) and then refuses as a **state**:
 exit 1, one sentence on stderr naming the way around it, and under `--json` one document `{"command":…,"locked":true,"waited_ms":2000}`. That
 document is the half this card was filed for: the loser used to write zero bytes.
 

@@ -426,7 +426,7 @@ pub fn fetch(
 
 /// [`fetch`] plus a reporter, for the caller that wants checkpoints and has no pin table of its own to hand over.
 ///
-/// The two share one body ([`fetch_pinned`]), so "the pinned fetch" cannot mean two different things depending on
+/// The two share one body (`fetch_pinned`), so "the pinned fetch" cannot mean two different things depending on
 /// whether somebody was watching: same consent rules, same preflight, same publishing order.
 pub fn fetch_reporting(
     db: &crate::db::Db,
