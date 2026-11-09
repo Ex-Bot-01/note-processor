@@ -338,9 +338,14 @@ per-member byte counters with a pinned denominator, terminal line mirroring the 
    pair that lands in the same second drops the ending on every workspace that scans in under a second — which is all of them —
    and a client left with only the opening line believes a walk is still running. Throttling exists to keep long phases from
    becoming traffic, not to break sentences in half.
-9. **`chunks_total` does not ship.** The design allowed it as optional. np-core's chunk pass discovers work lazily (it counts
-   pending chunks as it walks), so any total emitted at phase start would be a guess; `chunks_done` plus `embedded` carry the
-   truth and absence means *unknown*, not zero. A client must treat a missing denominator as "cannot compute a percentage".
+9. **`chunks_total` did not ship — and the reason given for not shipping it was wrong.** This section claimed np-core's chunk pass
+   discovers work lazily, so any total at phase start would be a guess. It does not: `embed_run::run` materialises its owed list into
+   a `Vec` before the writer loop, which is why the run can batch over it — so the total was always free, and every GUI that wanted a
+   percentage was being handed an indeterminate bar on a false premise. Fixed 2026-12-09: the opening line and every batch line carry
+   `chunks_total`, fixed for the whole request (a denominator recomputed from what remains would let a bar reach 100 % with work
+   queued, and a run that stops early ends below its total — both asserted by name in `crates/np-core/tests/progress.rs`). The lesson
+   is narrower than "double-check assumptions": this claim was written because it *sounded* like the shape of an embed loop, and no
+   one read the loop before typing it.
 10. **`writing` is emitted only when something was actually written** — `embedded` increased between batch callbacks. An embed
     whose batches were all refused by budget or contention therefore ends in `embedding`, and does not claim a commit that did
     not happen. Scan never emits `writing`: it writes the catalog through its own path, and inventing a phase for it would make

@@ -544,6 +544,7 @@ impl Embedder for Provider {
 struct EmbedSeen {
     phase: Phase,
     chunks_done: usize,
+    chunks_total: Option<usize>,
     embedded: usize,
 }
 
@@ -571,6 +572,7 @@ impl Progress for EmbedRecorder {
             .push(EmbedSeen {
                 phase: event.phase,
                 chunks_done: event.chunks_done,
+                chunks_total: event.chunks_total,
                 embedded: event.embedded,
             });
     }
@@ -642,6 +644,23 @@ fn an_embed_run_reports_chunk_progress_and_ends_where_the_report_does() {
         "the closing line agrees with the report a client also receives"
     );
     assert_eq!(last.chunks_done, 40, "every chunk was handed over");
+
+    // **A denominator that is fixed at the start.** The run holds its owed list in memory before the writer loop, so the
+    // total costs nothing — and it must not be re-read per batch, because chunks leave the owed set as they are written: a
+    // shrinking denominator makes a progress bar hit 100 % while work remains. Every line therefore carries the same number,
+    // and the last line's `chunks_done` equals it.
+    for event in &seen {
+        assert_eq!(
+            event.chunks_total,
+            Some(40),
+            "the total is the plan the run started with, on every line: {seen:?}"
+        );
+    }
+    assert_eq!(
+        last.chunks_done,
+        last.chunks_total.expect("a completed run has a total"),
+        "a finished run's fraction reads 1/1, or a client that drew a bar watched it stop short"
+    );
 }
 
 #[test]
@@ -681,6 +700,21 @@ fn a_batch_that_refused_reports_no_write() {
         seen.last().expect("the run reported").phase,
         Phase::Writing,
         "the run's last progress line is the write that landed, not a claim about the batch that refused: {seen:?}"
+    );
+
+    // The denominator does not flinch when work stops early: the run owed twenty chunks, embedded eight, and every line
+    // still says twenty. A client that recomputed the total from what remained would show this run finishing at 100 %.
+    for event in &seen {
+        assert_eq!(
+            event.chunks_total,
+            Some(20),
+            "the plan is the plan: {seen:?}"
+        );
+    }
+    let last = seen.last().expect("the run reported");
+    assert!(
+        last.chunks_done < last.chunks_total.expect("a total even when work stopped"),
+        "a run that stopped early must not report its fraction as complete: {last:?}"
     );
 }
 

@@ -999,12 +999,15 @@ fn run(
     // `EmbedError` message is input-free and secret-free by that type's own rule (§3).
     let mut reason: Option<String> = None;
 
-    // The pass says where it starts. Deliberately **no** `chunks_total` here: the only honest total is a count of owed
-    // chunks taken before the loop, which is one more query over the hottest table for a percentage nobody asked for,
-    // and an absent total means "unknown" while a zero would mean "nothing to do" (spec §"left to the builder").
+    // The pass says where it starts, and how much work it starts with. `owed.len()` is free — this is the vector the run
+    // just built to decide what to embed, not another query — so a client gets a denominator from the first line instead of
+    // an indeterminate bar. The total is fixed here and never recomputed: owed chunks leave the owed set as they are
+    // written, and a shrinking denominator would make the fraction run backwards at the end.
+    let chunks_total = owed.len();
     progress.report(&crate::progress::ProgressEvent {
         phase: crate::progress::Phase::Embedding,
         chunks_done: 0,
+        chunks_total: Some(chunks_total),
         ..Default::default()
     });
 
@@ -1076,6 +1079,7 @@ fn run(
                 crate::progress::Phase::Embedding
             },
             chunks_done: chunks_handed,
+            chunks_total: Some(chunks_total),
             embedded,
             ..Default::default()
         });

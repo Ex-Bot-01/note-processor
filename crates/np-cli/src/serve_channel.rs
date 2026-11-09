@@ -357,6 +357,11 @@ pub fn progress_params(
         Phase::Embedding | Phase::Writing => {
             params.insert("chunks_done".to_string(), json!(counters.chunks_done));
             params.insert("embedded".to_string(), json!(counters.embedded));
+            // Present on every line from a run that reached its writer loop, absent otherwise. A client that treats the
+            // absence as "no percentage" rather than "zero" is the difference between an indeterminate bar and a lie.
+            if let Some(total) = counters.chunks_total {
+                params.insert("chunks_total".to_string(), json!(total));
+            }
         }
         // `locking`, `resolving` and `indexing` carry no counters of their own; the bookend lines a scan writes add
         // `files_seen` / `notes_seen` by hand, because those numbers come from the report rather than from this seam.

@@ -506,8 +506,14 @@ fn embed(
 /// * `running`: **always `null` in this design**, and documented as such. The server handles one request at a time, so by
 ///   the time it can answer "what is running?", the thing that was running has finished; inventing a value here would
 ///   give a client a field to trust that cannot be true. Live status arrives as notifications instead.
+/// * `last_scan`: unix seconds of the last scan whose rows **committed** in this workspace, or `null` when none has —
+///   including for a path that is not an indexed workspace at all. This is the question a GUI asks most often ("is what I'm
+///   showing stale?"), and until now the only way to answer it was to run a scan, which is work rather than a reading. The
+///   stamp is written inside the scan's own transaction (`np_core::scan::LAST_SCAN_KEY`), so a scan that never committed
+///   cannot leave a timestamp claiming it did.
 ///
-/// Nothing here opens a database. A status question that created `<workspace>.sqlite` would make every typo'd vault in
+/// Nothing here **creates** a database. `last_scan` is read only when the workspace's `.sqlite` file already exists, because
+/// `Db::open` mints directories and an empty file — a status question that created one would make every typo'd vault in
 /// someone's config read as an indexed workspace to the next tool that looks.
 fn status(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
@@ -545,6 +551,16 @@ fn status(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Valu
         "last": ch.last().cloned().unwrap_or(Value::Null),
         "fetch_markers": markers,
         "running": null,
+        // Tested for the file, then opened — in that order. `Db::open` creates directories and an empty database, so a
+        // check afterwards could not un-mint the thing this function promises not to make.
+        "last_scan": if config.workspace_db(&workspace).is_file() {
+            let db = crate::workspace_db(&config, &workspace).map_err(refused)?;
+            np_core::scan::last_scan(&db)
+                .map(|stamp| stamp.map_or(Value::Null, |secs| json!(secs)))
+                .map_err(refused)?
+        } else {
+            Value::Null
+        },
     }))
 }
 

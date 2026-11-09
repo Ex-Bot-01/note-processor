@@ -69,6 +69,9 @@ const ENCODING_LOSSY: &str = "lossy";
 /// `meta` key holding the index files this program has published, newline-separated. The previous list
 /// is what lets a rescan delete the shards it no longer produces.
 const INDEX_FILES_KEY: &str = "index_files";
+
+/// `meta` key holding the unix seconds of the last scan that **committed** for this workspace.
+pub const LAST_SCAN_KEY: &str = "last_scan_unix";
 /// `meta` key holding the value of [`crate::parse::PARSE_VERSION`] that this workspace's derived rows
 /// were written with. Absent means "written before this mechanism existed", which is not a version to
 /// compare against and therefore refreshes; see the comparison in `refresh_needed`.
@@ -574,6 +577,11 @@ fn scan_inner(
     // so a kill between this commit and the writes below still leaves every stranded shard named.
     let rendered = catalog::render(&entries, &cfg.catalog);
     set_index_list(&db, &rendered)?;
+    // The freshness stamp rides in the same transaction as the catalog it describes (**the same reason
+    // [`set_index_list`] is here rather than after the commit**): a scan that did not commit must not leave behind a
+    // timestamp claiming it did. A reader asks "how old is this index?" and the only honest answer is the moment the rows
+    // it describes became durable.
+    set_meta(&db, LAST_SCAN_KEY, &unix_now().to_string())?;
     // Read here, inside the transaction and after every write of this scan, so the duplicate count answers
     // what this scan leaves behind rather than what it found (F23's duplicate is *created* by a write pass).
     let duplicates = duplicated_rels(&db)?;
@@ -1965,6 +1973,24 @@ fn meta_value(db: &Db, key: &str) -> Result<Option<String>, DbError> {
 
 /// The one `meta` upsert this module writes, shared by the published index-file list and the parse rules
 /// version, so neither invents its own conflict clause.
+/// Whole seconds since the Unix epoch, for [`LAST_SCAN_KEY`]. A coarse clock is deliberate: the question this answers is
+/// "has this vault been walked in the last few minutes?", and a stamp that implied sub-second precision would invite a
+/// client to sort two workspaces by it.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        // A clock behind 1970 is not a workspace's problem to solve, and the stamp is not worth refusing a scan for:
+        // record zero and let the reader see "never", which is what a pre-epoch value would mean anyway.
+        .unwrap_or(0)
+}
+
+/// When this workspace was last scanned, in unix seconds — `None` when no scan has ever committed here, and also `None`
+/// for a value that is not a number (a hand-edited row reads as "no stamp I can trust", never as a false timestamp).
+pub fn last_scan(db: &Db) -> Result<Option<i64>, DbError> {
+    Ok(meta_value(db, LAST_SCAN_KEY)?.and_then(|value| value.parse().ok()))
+}
+
 fn set_meta(db: &Db, key: &str, value: &str) -> Result<(), DbError> {
     db.0.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)

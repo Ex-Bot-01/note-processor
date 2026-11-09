@@ -1027,6 +1027,50 @@ fn status_get_reports_a_marker_another_process_left() {
     );
 }
 
+/// **Is this index stale? Answered without doing work.** The question a GUI asks most often is whether what it is showing has
+/// gone old, and until now answering it meant running a scan — work, not a reading. `last_scan` is stamped inside the scan's own
+/// transaction, so it cannot claim a scan that never committed, and it is per workspace, because staleness is a property of one
+/// vault and never of the machine.
+#[test]
+fn status_get_says_when_this_workspace_was_last_scanned() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+
+    let before = server.result("status.get", json!({"workspace": workspace}));
+    assert_eq!(
+        before["last_scan"],
+        Value::Null,
+        "a vault nobody has indexed has no scan time — not the same sentence as 0: {before}"
+    );
+
+    let floor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_secs();
+    server.result("scan", json!({"workspace": workspace}));
+    let after = server.result("status.get", json!({"workspace": workspace}));
+    let stamp = after["last_scan"]
+        .as_u64()
+        .expect("a scan time after scanning");
+    assert!(
+        (floor..floor + 120).contains(&stamp),
+        "the stamp has to be this scan, not a leftover or a date in the future: {after}"
+    );
+
+    // A different vault answers for itself. Without this half, a stamp written into a shared place would pass every other
+    // assertion here while telling vault B that vault A is fresh.
+    let mut other = Server::new();
+    let other_path = other.root.display().to_string();
+    let untouched = other.result("status.get", json!({"workspace": other_path}));
+    assert_eq!(
+        untouched["last_scan"],
+        Value::Null,
+        "scanning vault A cannot make vault B look fresh: {untouched}"
+    );
+    server.finish();
+    other.finish();
+}
+
 /// **Review Focus 3.** A status question must not create the thing it asks about. `scan` and `embed` open (and so
 /// create) a workspace database; if `status.get` shared that path, then a GUI polling for status would litter a
 /// nonexistent vault with `.sqlite` files — and each one reads as "an indexed workspace" to every other tool.
@@ -1677,9 +1721,13 @@ fn an_embed_that_works_narrates_the_chunks_it_encodes() {
         "`embedded` is the number a progress bar reads: {}",
         embedding[0]
     );
-    assert!(
-        first.get("chunks_total").is_none(),
-        "no denominator ships, because np-core discovers pending chunks as it walks: {}",
+    // **The denominator ships.** The run holds its owed list before the writer loop, so a total is free rather than another
+    // query, and every GUI was drawing an indeterminate bar for want of it. It is the *plan* — chunks this run decided it
+    // owed — never what remains, or the fraction would creep to 1/1 with work still queued.
+    assert_eq!(
+        first["chunks_total"].as_u64(),
+        Some(1),
+        "a one-note vault owes one chunk and says so from the opening line: {}",
         embedding[0]
     );
     // A one-note vault produces one chunk, so `embedding` legitimately appears exactly once and the *next* phase carries

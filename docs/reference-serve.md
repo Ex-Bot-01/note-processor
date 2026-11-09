@@ -155,8 +155,14 @@ and one that is present **only when the request had an `id`**:
 | `resolving` | deciding which provider and artifact are needed; may lead to a fetch | — |
 | `indexing` | the file walk (`scan`) | closing line: `files_seen`, `notes_seen` |
 | `fetching` | bytes arriving for a pinned artifact | `member`, `bytes_done`, `bytes_total`, `members_done`, `members_total` |
-| `embedding` | chunks being encoded | `chunks_done`, `embedded` — and **no** `chunks_total`: np-core discovers pending chunks as it walks, so a total at phase start would be a guess, and absence means *unknown*, not zero |
+| `embedding` | chunks being encoded | `chunks_done`, `embedded`, `chunks_total` |
 | `writing` | vectors committed, **only when something was actually committed** | same as `embedding` |
+
+`chunks_total` is the number of chunks this run decided it owed, counted before the writer loop starts — the run already holds that
+list, so the total costs nothing. It is **fixed for the whole request** and never recomputed from what remains: chunks leave the owed
+set as they are written, so a denominator derived from the remainder would make a progress bar reach 100 % while work was still
+queued. A run that stopped early therefore ends with `chunks_done` < `chunks_total`, which is the honest reading of a partial
+embed. Absent means the request never reached its writer loop (a refusal, an offline arm), and absence is *unknown*, not zero.
 | `completed` | the request ended in a **result** — including degraded ones (`locked`, `offline`, an embed arm) | state keys copied from that result |
 | `refused` | the request ended in an **error object** | `code` |
 
@@ -201,13 +207,18 @@ first and use the notification only for continuity.
 {"id":3,"jsonrpc":"2.0","result":{"last":{"command":"embed","elapsed_ms":68,"phase":"completed","request":2},"fetch_markers":[{"bytes_done":8388608,"bytes_total":309855456,"id":"embeddinggemma-2","started_at":1794220456,"state":"running"}],"running":null}}
 ```
 
-All three keys are always present.
+All four keys are always present.
 
 - `last` — the finished activity of **this connection**: `{request?, command, phase, elapsed_ms}` plus `outcome` or `code`.
 - `fetch_markers` — fetch markers found on disk for this workspace, read by listing the models directory. A marker written by a
   fetch that died is reported (`state: "running"` with its last checkpoint) and **left exactly where it is**: a read-only
   command does not delete or repair another process's state. A marker that cannot be parsed is reported as
   `{state: "unreadable", reason: …}` rather than dropped, because "something is there and I cannot read it" is information.
+- `last_scan` — unix seconds of the last scan whose rows **committed** in this workspace, or `null` when none has. Written inside
+  the scan's own transaction, so a scan that did not commit cannot leave a timestamp claiming it did; read only when the
+  workspace's `.sqlite` already exists, for the same reason `status.get` never creates one. This is the answer to "is what I'm
+  showing stale?" — the question a GUI asks far more often than "what is running?", and until now the only way to answer it was to
+  run a scan, which is work rather than a reading.
 - `running` — **always `null`.** This design is push-only: the server handles one request at a time, so by construction it
   cannot answer "what are you doing right now?" while it is doing it. Live status arrives as notifications; the key exists so
   that a future pull-based answer has a shape to grow into.
@@ -226,8 +237,8 @@ Two notes on disk, a keyword search, and no `notifications` key in the handshake
 line appears in the whole session — every line carries an `id`, so a v0.3.0 client's read loop is untouched.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/A/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","protocol":1}}
-{"id":2,"jsonrpc":"2.0","result":{"added":2,"elapsed_ms":161,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.rA4ZYv/A/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","protocol":1}}
+{"id":2,"jsonrpc":"2.0","result":{"added":2,"elapsed_ms":160,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
 {"id":3,"jsonrpc":"2.0","result":{"fetched":null,"hits":[{"bm25":-1e-6,"cosine":null,"keyword_rank":1,"kind":"note","linked_from":0,"linked_notes":[],"path":"meeting.md","score":1e-6,"semantic_rank":null,"snippet":"# Meeting notes\n\nThe [rollout] window opens on Tuesday.\n","source_note":null}],"mode":"keyword","note":null,"offline":false,"reason":null,"vectors":false}}
 ```
 
@@ -237,12 +248,12 @@ Opted in, `[embeddings] provider = "local-model"`, origin unreachable. `locking`
 then the answer says **offline**, and so does the terminal line — as a state, `completed`, not `refused`.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/B/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.rA4ZYv/B/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"id":2,"jsonrpc":"2.0","result":{"artifact_check":null,"busy_gap":0,"chunks_seen":0,"current":0,"embedded":0,"errors":0,"fetched":null,"image_refusals":[],"images_embedded":0,"images_pruned":0,"images_refused":0,"images_seen":0,"images_sweep_ran":false,"images_unchecked":0,"model":"embeddinggemma-2","offline":true,"outcome":{"offline":{"id":"embeddinggemma-2"}},"refused_budget":0,"verification":"self-consistent, not verified","workers":null}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","offline":true,"outcome":{"offline":{"id":"embeddinggemma-2"}},"phase":"completed","request":2,"since_ms":66}}
-{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"command":"embed","elapsed_ms":66,"phase":"completed","request":2},"running":null}}
+{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"command":"embed","elapsed_ms":66,"phase":"completed","request":2},"last_scan":null,"running":null}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":0}}
 ```
 
@@ -253,28 +264,32 @@ Same session shape, origin reachable but the connection closes mid-body after 12
 object — because an interrupted transfer really did fail, where the session above really did not.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.rA4ZYv/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":61}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1494}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4036}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6589}}
-{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.IaDK9X/C/data/workspaces/39e6b8caca57d6ee.models/.part.embeddinggemma-2.1323809-1794227836518406938-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
-{"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7704}}
-{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7704,"phase":"refused","request":2},"running":null}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":0}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":60}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1493}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4039}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6483}}
+{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.rA4ZYv/C/data/workspaces/32ed8d1669063346.models/.part.embeddinggemma-2.1530703-179424188689490595-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
+{"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7537}}
+{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7537,"phase":"refused","request":2},"last_scan":null,"running":null}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":1}}
 ```
 
 ### Asking a second process what is in flight
+
+The `last_scan: null` here is not a gap in the stamp. This session's own `scan` ran while another process held the workspace write
+lock, so it was refused as a state (`completed`, with `locked`) and committed nothing — and a timestamp that meant "a scan was
+attempted" would be worth less than one that means "these rows are on disk".
 
 One `np serve` is mid-download; a **second** process answers `status.get` immediately, because reading markers never waits for
 the writer. This is the case `running: null` cannot cover, and it is why the marker list exists.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/marker.z1PcvU/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","protocol":1}}
-{"id":2,"jsonrpc":"2.0","result":{"fetch_markers":[{"bytes_done":8388608,"bytes_total":309855456,"id":"embeddinggemma-2","started_at":1794227855,"state":"running"}],"last":{"command":"initialize","elapsed_ms":0,"phase":"completed","request":1},"running":null}}
-{"id":3,"jsonrpc":"2.0","result":{"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/marker.678uo7/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","protocol":1}}
+{"id":2,"jsonrpc":"2.0","result":{"command":"scan","locked":true,"waited_ms":2000}}
+{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[{"bytes_done":8388608,"bytes_total":309855456,"id":"embeddinggemma-2","started_at":1794241904,"state":"running"}],"last":{"command":"scan","elapsed_ms":2006,"phase":"completed","request":2},"last_scan":null,"running":null}}
 ```
 
 ## Client walkthrough

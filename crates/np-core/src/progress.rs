@@ -46,9 +46,17 @@ pub struct ProgressEvent<'a> {
     pub members_done: usize,
     /// Members in this call, so a client can say "2 of 2" without knowing the member names.
     pub members_total: usize,
-    /// Chunks seen by the embed pass so far. No total travels with it unless one is cheap — see the spec's
-    /// "left to the builder": an absent total means unknown, and unknown is not zero.
+    /// Chunks handed to the model so far.
     pub chunks_done: usize,
+    /// How many chunks this run decided it owed, counted **before** the writer loop starts. Present on every `Embedding`
+    /// and `Writing` line from a run that reached that loop, absent before it (a refused or offline run never had a plan to
+    /// count).
+    ///
+    /// This is free, not estimated: the run materialises its owed list to decide what to do, so the total is the length of
+    /// a vector it already holds. It is deliberately *not* re-read after each batch — chunks leave the owed set as they are
+    /// written, and a denominator that shrinks makes a progress bar stall at 100 % while work remains. So `chunks_done`
+    /// climbs toward a number fixed at the start, which is what a client needs to draw a fraction.
+    pub chunks_total: Option<usize>,
     /// Chunks whose vectors are committed.
     pub embedded: usize,
 }

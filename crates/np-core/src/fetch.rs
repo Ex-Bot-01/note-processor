@@ -841,7 +841,10 @@ fn receive_member(
     // Byte zero, after the transfer exists. Reported here rather than in the caller on purpose: a member whose open
     // refused has no transfer, and a client told "0 of 309 MB" about work that never started shows a stalled download
     // until the process exits.
+    // `chunks_total` is a chunk-pass denominator and has no meaning for a byte transfer; the field exists so one event
+    // type serves both loops, and absence is what tells a client not to draw a fraction from it.
     let event = |bytes_done: u64| crate::progress::ProgressEvent {
+        chunks_total: None,
         phase: crate::progress::Phase::Fetching,
         member: Some(member.member()),
         bytes_done,

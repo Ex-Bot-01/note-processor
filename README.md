@@ -105,7 +105,7 @@ np search ~/Notes "how are moved files detected"
 as far as it can on vectors and reports exactly where it stopped. Offline, it exits **0** with `vectors: false` — the vault is
 searchable and nothing needs fixing but the cable. Any other stop on the vector half exits 1.
 
-**The first run may download ~310 MB, and says so before byte one.** Since F38, `np embed`, `np setup` and a default-mode
+**The first run may download ~310 MB, and says so before byte one.** `np embed`, `np setup` and a default-mode
 `np search` fetch the pinned artifact when it is missing, announcing id, size and the *kind* of origin, then verifying the digest
 before putting it in place — a partial or wrong file is never used. Three ways to refuse: `--no-auto-fetch` for one run,
 `[models] auto_fetch = false` in the config, or `NP_NO_AUTO_FETCH=1` in the environment (which outranks the file, so a daemon can be
@@ -225,7 +225,7 @@ text-only on the image side and say so per figure rather than silently skipping.
 | `configuration disabled: embeddings.provider = "none"` from `np embed` | No provider chosen yet — write `[embeddings] provider = "local-model"`, or accept an index-only build |
 | `no vectors in this workspace: ranked by keyword only …` on stderr, exit **0** | Not an error. Keywords answered; the vector list had nothing to rank |
 | `np embed` reports `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |
-| `locked: another process is writing this workspace (2000 ms)` | Another `np` holds this vault's write lock (**F44**). Retry; readers were never blocked. A killed process cannot leave a lock behind |
+| `locked: another process is writing this workspace (2000 ms)` | Another `np` holds this vault's write lock. Retry; readers were never blocked, and a killed process cannot leave a lock behind |
 | `offline: could not reach the pinned origin to fetch …` | Auto-fetch tried and nothing answered. `setup` still indexed and exited 0; keyword search works meanwhile; no partial state was written |
 
 The full table — including every refusal sentence, the two llama.cpp warnings that are normal, and what to read when an old schema
@@ -270,7 +270,7 @@ The decisions behind those, each with its measurements:
 | [`docs/design-m2-models-install.md`](docs/design-m2-models-install.md) | What "installed" means: rows, digests, per-workspace artifacts |
 | [`docs/design-m2-image-embeddings.md`](docs/design-m2-image-embeddings.md) | R7c: media tables, discovery and sniffing, the vision seam, §8's refusal classes, §14's measured numbers |
 | [`docs/design-m2-thread-policy.md`](docs/design-m2-thread-policy.md) | The `"auto"` worker rule and the measurements behind it |
-| [Hybrid search (F36)](docs/design-m3-hybrid-search.md) · [auto-fetch (F38)](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
+| [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
 | [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
 
 Code comments carry the local reasoning; those files carry the decisions and the measurements.
@@ -280,7 +280,7 @@ Repository layout: `crates/np-core` (discovery, parsing, links, catalog, databas
 
 ## License
 
-MIT — [`LICENSE`](LICENSE), ruled on 2026-12-08 (closing F47). Both release archives carry it next to the binary, and
+MIT — [`LICENSE`](LICENSE), adopted 2026-12-08. Both release archives carry it beside the binary, and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) carries the verbatim MIT text for the llama.cpp / ggml code statically linked in,
 plus exactly which archives are linked — because that obligation attaches to the artefact you download, not to the repository it came
 from. Model weights are a separate matter and are not redistributed: `embeddinggemma-2` is fetched on your explicit action,
