@@ -468,3 +468,224 @@ fn the_refusing_provider_produces_a_refusal_outcome() {
     );
     assert!(!report.succeeded());
 }
+
+// ---------------------------------------------------------------------------
+// Task 4: what scan decided about each file it did not index
+// ---------------------------------------------------------------------------
+
+/// Restore a mode on drop, so a case that denies access leaves the tempdir as it found it even when an assertion fails
+/// mid-case. `tests/scan.rs`'s `deny_access` does the same job there; copying the three lines is cheaper than reaching
+/// into another binary's fixture, and this one has one mode to remember.
+#[cfg(unix)]
+struct Deny(std::path::PathBuf, u32);
+
+#[cfg(unix)]
+impl Drop for Deny {
+    fn drop(&mut self) {
+        std::fs::set_permissions(
+            &self.0,
+            std::os::unix::fs::PermissionsExt::from_mode(self.1),
+        )
+        .expect("test teardown: restore the mode");
+    }
+}
+
+/// Plan Task 4 Step 1: three files, three different reasons for not being indexed, and each one's `rule` names its own
+/// cause with the path attached. Before this, all three were lines in one merged `skipped` list (or nothing at all — an
+/// unchanged note and an attachment are not *failures*, which is exactly why prose never explained them).
+#[cfg(unix)]
+#[test]
+fn a_skipped_note_says_which_rule_skipped_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let setup = workspace(0);
+    fs::write(setup.root.join("note.md"), "# Note\n\nindexed once\n").expect("setup");
+    fs::write(setup.root.join("diagram.png"), b"\x89PNG not really").expect("setup: an attachment");
+    let cfg = setup.cfg(EmbeddingProvider::None);
+    np_core::scan::scan(&setup.root, &cfg).expect("test setup: first scan indexes the note");
+
+    // A third note that this scan cannot read: written after the first pass and denied before the second, so its row
+    // does not exist and the only thing a reader can learn is that this file was looked at and not indexed.
+    let hidden = setup.root.join("secret.md");
+    fs::write(&hidden, "# Secret\n\ncannot be read\n").expect("setup");
+    let mode = fs::metadata(&hidden)
+        .expect("setup: stat")
+        .permissions()
+        .mode();
+    fs::set_permissions(&hidden, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        .expect("setup: deny the note");
+    let _restore = Deny(hidden.clone(), mode);
+
+    let (_report, events) =
+        case(|| np_core::scan::scan(&setup.root, &cfg).expect("a skip is not a scan failure"));
+    let report = _report;
+    assert!(
+        report.skipped.iter().any(|path| path == "secret.md"),
+        "the document still lists it: {:?}",
+        report.skipped
+    );
+
+    for (rule, path) in [
+        ("not-markdown", "diagram.png"),
+        ("unreadable", "secret.md"),
+        ("unchanged-content", "note.md"),
+    ] {
+        let found: Vec<&Record> = events
+            .iter()
+            .filter(|event| event.is_rule(rule))
+            .filter(|event| event.field("what") == Some(path))
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "`{rule}` must be reported once for `{path}`, with the path as `what`: {:?}",
+            events
+                .iter()
+                .filter(|event| event.field("rule").is_some())
+                .map(|event| (
+                    event.field("rule").unwrap_or_default(),
+                    event.field("what").unwrap_or_default()
+                ))
+                .collect::<Vec<_>>()
+        );
+        let event = found[0];
+        assert_eq!(event.target, "np_core::scan");
+    }
+
+    // The level split within one command: a skip is a decision worth `debug`, while "this file's bytes did not change"
+    // is the routine answer for most of a warm vault and would bury everything else at `debug` (§4).
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event.is_rule("not-markdown"))
+            .expect("rule emitted")
+            .level,
+        tracing::Level::DEBUG
+    );
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event.is_rule("unchanged-content"))
+            .expect("rule emitted")
+            .level,
+        tracing::Level::TRACE
+    );
+}
+
+/// A note that vanishes from a reader's view because its **directory** could not be read is the state `INDEX.md` gets
+/// wrong-looking: the row is live and hidden, not deleted. The event names the row's path, because the unreadable
+/// directory is already in `skipped` and the interesting half is which notes it swallowed.
+#[cfg(unix)]
+#[test]
+fn a_note_hidden_behind_an_unreadable_directory_names_its_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let setup = workspace(0);
+    let deep = setup.root.join("deep");
+    fs::create_dir_all(&deep).expect("setup: directory");
+    fs::write(deep.join("note.md"), "# Deep\n\nindexed once\n").expect("setup");
+    let cfg = setup.cfg(EmbeddingProvider::None);
+    np_core::scan::scan(&setup.root, &cfg).expect("test setup: index the note");
+
+    let mode = fs::metadata(&deep)
+        .expect("setup: stat")
+        .permissions()
+        .mode();
+    fs::set_permissions(&deep, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        .expect("setup: deny the directory");
+    let _restore = Deny(deep.clone(), mode);
+
+    let (_report, events) =
+        case(|| np_core::scan::scan(&setup.root, &cfg).expect("an unreadable dir is not fatal"));
+
+    let hidden: Vec<&Record> = events
+        .iter()
+        .filter(|event| event.is_rule("hidden-behind-unreadable"))
+        .collect();
+    assert_eq!(
+        hidden.len(),
+        1,
+        "one live row sat behind that directory: {:?}",
+        events
+            .iter()
+            .filter(|e| e.field("rule").is_some())
+            .map(|e| (
+                e.field("rule").unwrap_or_default(),
+                e.field("what").unwrap_or_default()
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(hidden[0].field("what"), Some("deep/note.md"));
+    assert_eq!(hidden[0].target, "np_core::scan");
+    assert_eq!(hidden[0].level, tracing::Level::DEBUG);
+    // The directory itself is reported once as unreadable — the two records answer different questions and neither is
+    // a restatement of the other.
+    assert!(events
+        .iter()
+        .any(|event| event.is_rule("unreadable") && event.field("what") == Some("deep")));
+}
+
+/// Plan Task 4 Step 3: the manual's list and the code's list are the same set, in both directions. The published
+/// vocabulary lives in `np_core::diagnostics`; `docs/reference-diagnostics.md` is what an integrator reads, and a
+/// document that drifts from the constant is worse than no document — it sends someone to grep for a token that was
+/// renamed, or to wait for one that never fires. Task 6 re-runs this check from np-cli's binary, where the same claim
+/// has to hold for the shipped artifact.
+#[test]
+fn the_documented_token_list_matches_the_code() {
+    let manual = documented_manual();
+    let fenced =
+        fenced_block(&manual, "diagnostic-tokens").expect("`diagnostic-tokens` fence is missing");
+    let documented: Vec<&str> = fenced
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_same_set(
+        &documented,
+        &np_core::diagnostics::RULE_TOKENS,
+        "rule token",
+    );
+
+    let fenced =
+        fenced_block(&manual, "diagnostic-targets").expect("`diagnostic-targets` fence is missing");
+    let targets: Vec<&str> = fenced
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_same_set(&targets, &np_core::diagnostics::TARGETS, "target");
+}
+
+/// The manual itself. Read from the repository rather than embedded, because a test that carries its own copy of the
+/// list proves nothing about the file a human opens.
+fn documented_manual() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/reference-diagnostics.md"
+    );
+    fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"))
+}
+
+/// The contents of the named fenced block, or `None` when no fence opens with that info string.
+fn fenced_block(manual: &str, info: &str) -> Option<String> {
+    let opener = format!("```{info}");
+    let start = manual.find(&opener)? + opener.len();
+    let rest = &manual[start..];
+    let end = rest.find("\n```")?;
+    Some(rest[..end].to_string())
+}
+
+fn assert_same_set(documented: &[&str], coded: &[&str], what: &str) {
+    let missing: Vec<&&str> = coded
+        .iter()
+        .filter(|token| !documented.contains(token))
+        .collect();
+    let invented: Vec<&&str> = documented
+        .iter()
+        .filter(|token| !coded.contains(token))
+        .collect();
+    assert!(
+        missing.is_empty() && invented.is_empty(),
+        "{what} lists disagree.\n  undocumented (emitted, not in the manual): {missing:?}\n  invented (in the manual, never emitted): {invented:?}\n  manual: {documented:?}\n  code:   {coded:?}"
+    );
+}

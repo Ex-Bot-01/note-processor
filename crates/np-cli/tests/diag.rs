@@ -117,7 +117,7 @@ impl Vault {
 
     /// The `[log]` section pointing at a fresh log file inside this tempdir, with everything else defaulted.
     fn log_config(&self, max_bytes: Option<u64>) -> PathBuf {
-        let path = self._tmp.path().join("np.jsonl");
+        let path = self.log_path();
         let mut body = String::from("[log]\n");
         body.push_str(&format!(
             "file = {}\n",
@@ -128,6 +128,12 @@ impl Vault {
         }
         self.write_user_config(&body);
         path
+    }
+
+    /// Where [`Vault::log_config`] would put the log, without writing any configuration — for a case that composes its
+    /// own `[log]` section and still has to open the same file afterwards.
+    fn log_path(&self) -> PathBuf {
+        self._tmp.path().join("np.jsonl")
     }
 }
 
@@ -1139,5 +1145,120 @@ fn a_diagnostic_never_carries_note_text_or_an_origin() {
     assert!(
         !text.contains("origin.invalid") && !text.contains("http"),
         "§12 rule 8: no origin host, and no URL that names one: {text}"
+    );
+}
+
+/// Plan Task 4's skip rules on the file channel: a vault with one note, one attachment and one unreadable note, scanned
+/// twice at `debug`, gives one record per reason with the path it is about — which is what makes `ScanReport::skipped`
+/// readable from a log instead of only from a summary line. A third pass at `trace` then shows the routine rule the
+/// `debug` level filtered out, so "absent at debug" means *filtered* rather than *never emitted*. First case here with
+/// per-file traffic in a file, which is also what gives the privacy sweep above something to inspect.
+#[cfg(unix)]
+#[test]
+fn each_skipped_file_reaches_the_file_with_its_own_rule() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let vault = Vault::new();
+    fs::write(vault.root.join("note.md"), "# Note\n\nindexed fine\n").expect("setup");
+    fs::write(vault.root.join("diagram.png"), b"\x89PNG not really").expect("setup: attachment");
+    let locked = vault.root.join("locked-down.md");
+    fs::write(&locked, "# Locked\n\ncannot be read\n").expect("setup");
+    let mode = fs::metadata(&locked)
+        .expect("setup: stat")
+        .permissions()
+        .mode();
+    fs::set_permissions(&locked, PermissionsExt::from_mode(0o000)).expect("setup: deny the note");
+
+    let log = vault.log_path();
+    vault.write_user_config(&format!(
+        "[log]\nfile = {}\nlevel = \"debug\"\n",
+        toml_str(&log.display().to_string())
+    ));
+    let first = vault.exec(&["scan"]);
+    assert_eq!(
+        first.code, 0,
+        "a skip is not a scan failure: {}",
+        first.stderr
+    );
+
+    // The second pass over the same vault is the one with something to explain — `note.md` is unchanged now rather than
+    // added — and emptying the log between them keeps "exactly one record per rule" a claim about one scan.
+    fs::remove_file(&log).expect("setup: empty the log");
+    let second = vault.exec(&["scan"]);
+    // Restore before any assertion: a failure must not leave a 0o000 file in a tempdir nobody will revisit.
+    fs::set_permissions(&locked, PermissionsExt::from_mode(mode))
+        .expect("teardown: restore the mode");
+    assert_eq!(second.code, 0, "{}", second.stderr);
+
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    // `unchanged-content` is deliberately absent at `debug`: it is a `trace` rule, and the level filter is what keeps a
+    // warm scan's 400 unchanged files out of the log somebody opened to read one thing. The third pass below raises the
+    // level and finds it, so "absent" here means filtered rather than never emitted.
+    for (rule, path) in [
+        ("not-markdown", "diagram.png"),
+        ("unreadable", "locked-down.md"),
+    ] {
+        let found: Vec<&Value> = records
+            .iter()
+            .filter(|record| record.get("rule").and_then(Value::as_str) == Some(rule))
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "`{rule}` must appear once for the file it is about: {records:?}"
+        );
+        assert_eq!(
+            found[0].get("what").and_then(Value::as_str),
+            Some(path),
+            "the path is what makes a rule actionable: {}",
+            found[0]
+        );
+        assert_eq!(
+            found[0].get("target").and_then(Value::as_str),
+            Some("np_core::scan")
+        );
+    }
+
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.get("rule").and_then(Value::as_str) == Some("unchanged-content")),
+        "debug must not carry a trace rule: {records:?}"
+    );
+
+    // Same vault, `[log] level = "trace"`: the routine rule now appears, once per unchanged file, and nothing else about
+    // the run changed.
+    fs::remove_file(&log).expect("setup: empty the log");
+    vault.write_user_config(&format!(
+        "[log]\nfile = {}\nlevel = \"trace\"\n",
+        toml_str(&log.display().to_string())
+    ));
+    let third = vault.exec(&["scan"]);
+    assert_eq!(third.code, 0, "{}", third.stderr);
+    let traced = read_records(&log);
+    assert_keys_are_documented(&traced, &log);
+    let unchanged: Vec<&Value> = traced
+        .iter()
+        .filter(|record| {
+            record.get("rule").and_then(Value::as_str) == Some("unchanged-content")
+                && record.get("what").and_then(Value::as_str) == Some("note.md")
+        })
+        .collect();
+    assert_eq!(
+        unchanged.len(),
+        1,
+        "one record for the note this scan left alone: {traced:?}"
+    );
+    assert_eq!(
+        unchanged[0].get("what").and_then(Value::as_str),
+        Some("note.md"),
+        "{}",
+        unchanged[0]
+    );
+    assert_eq!(
+        unchanged[0].get("level").and_then(Value::as_str),
+        Some("trace"),
+        "§4: a per-item routine rule is `trace`, whatever level let it through"
     );
 }

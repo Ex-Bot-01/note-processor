@@ -95,13 +95,44 @@ pub mod rule {
     /// An artifact arrived during this command. Not a degradation, so it is reported at info; it is in the list because
     /// a reader that sees vectors where it saw none last run needs to know which run made them.
     pub const ARTIFACT_FETCHED: &str = "artifact-fetched";
+
+    // ---- scan: one token per reason a file on disk was not indexed (**design §1 point 4**, plan Task 4).
+    //
+    // `ScanReport::skipped` merges several of these into one list of paths, and two of them (`not-markdown`,
+    // `unchanged-content`) were never in it at all: they are not failures, so prose had no reason to name them. The
+    // tokens exist because "which of my 400 files did not get indexed, and why" is a question with a per-file answer.
+
+    /// A discovered file that is not markdown, so nothing about it is parsed into the catalog. Its `files` row is still
+    /// current — an attachment is tracked, not skipped as a loss.
+    pub const NOT_MARKDOWN: &str = "not-markdown";
+    /// This scan could not read the file (permission denied, or it changed between the listing and the read). The rows
+    /// it already had are kept, because unknown is not absent.
+    pub const UNREADABLE: &str = "unreadable";
+    /// A name this build's byte key cannot hold — on Windows, a name carrying an unpaired surrogate (F18). Refused for
+    /// good, so re-running changes nothing; the fix is the filename.
+    pub const UNREPRESENTABLE_PATH: &str = "unrepresentable-path";
+    /// The bytes matched the stored digest, so nothing was re-parsed or rewritten. Reported at `trace`: on a warm vault
+    /// this is the answer for nearly every file, and `debug` exists to be readable.
+    pub const UNCHANGED_CONTENT: &str = "unchanged-content";
+    /// A live note row sits under a directory this scan could not read, so it is hidden from the catalog rather than
+    /// deleted. The directory is `unreadable`; this names the note it swallowed.
+    pub const HIDDEN_BEHIND_UNREADABLE: &str = "hidden-behind-unreadable";
+    /// A stored row whose path only has a lossy spelling (F23) and which no route could account for this scan, so it
+    /// stayed out of the catalog. The remedy is on disk: make the file listable with a lossless name.
+    pub const UNRESOLVED_AMBIGUITY: &str = "unresolved-ambiguity";
+    /// Another path already holds this note identity (case-folded collision), so this file kept no new rows and its
+    /// existing note was left exactly as it was.
+    pub const IDENTITY_TAKEN: &str = "identity-taken";
+    /// More than one note row sits on this path's key — the legacy duplicate F13 §7 refuses to guess about — so no note
+    /// was re-parsed and nothing about its contents was rewritten.
+    pub const DUPLICATE_ROWS: &str = "duplicate-rows";
 }
 
 /// Every published rule token.
 ///
 /// The documentation test asserts this list against `docs/reference-diagnostics.md` in both directions, so a token can
 /// be neither undocumented nor invented.
-pub const RULE_TOKENS: [&str; 13] = [
+pub const RULE_TOKENS: [&str; 21] = [
     rule::CONFIG_REFUSED,
     rule::PROVIDER_DISABLED,
     rule::LOCAL_MODEL_NOT_BUILT,
@@ -115,4 +146,12 @@ pub const RULE_TOKENS: [&str; 13] = [
     rule::MODEL_NOT_INSTALLED,
     rule::FETCH_DISABLED,
     rule::ARTIFACT_FETCHED,
+    rule::NOT_MARKDOWN,
+    rule::UNREADABLE,
+    rule::UNREPRESENTABLE_PATH,
+    rule::UNCHANGED_CONTENT,
+    rule::HIDDEN_BEHIND_UNREADABLE,
+    rule::UNRESOLVED_AMBIGUITY,
+    rule::IDENTITY_TAKEN,
+    rule::DUPLICATE_ROWS,
 ];

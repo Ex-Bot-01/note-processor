@@ -488,6 +488,26 @@ fn scan_inner(
     // its row keeps what it holds, and the path is named here too.
     skipped.extend(walked.unreadable.iter().cloned());
     skipped.extend(walked.unrepresentable.iter().cloned());
+    // **One event per hidden subtree** (diagnostics design §1 point 4). The report merges both lists into one `skipped`
+    // array, which is the right shape for a summary line and the wrong one for a diagnosis: "could not enter" and
+    // "cannot spell the name" have different remedies — one is a mount or a chmod, the other is a filename this build
+    // will refuse forever. `what` is the display spelling, because these paths are exactly what the report prints.
+    for dir in &walked.unreadable {
+        tracing::debug!(
+            target: crate::diagnostics::target::SCAN,
+            rule = crate::diagnostics::rule::UNREADABLE,
+            what = %dir.display,
+            "directory contents were not read this scan"
+        );
+    }
+    for refused in &walked.unrepresentable {
+        tracing::debug!(
+            target: crate::diagnostics::target::SCAN,
+            rule = crate::diagnostics::rule::UNREPRESENTABLE_PATH,
+            what = %refused.display,
+            "the name cannot be keyed losslessly, so nothing under it is indexed"
+        );
+    }
     let found = read_found(&walked.files, &mut skipped);
     let snapshots: Vec<Snapshot> = found.iter().map(|found| found.snapshot.clone()).collect();
 
@@ -952,6 +972,15 @@ fn known_rows(
         // double charge would be universal. Today's single `||` could not double count, and neither may this.
         if is_unknown_path(&snapshot.rel_bytes, unreadable, unrepresentable) {
             if is_note {
+                // The row is live and hidden, not deleted — the distinction a reader of a short `INDEX.md` is trying
+                // to make. The directory is reported as `unreadable`; this names the note it swallowed (§12: the stored
+                // path, never the note's text).
+                tracing::debug!(
+                    target: crate::diagnostics::target::SCAN,
+                    rule = crate::diagnostics::rule::HIDDEN_BEHIND_UNREADABLE,
+                    what = %snapshot.rel,
+                    "a live row sits under a path this scan could not read, so it is hidden rather than removed"
+                );
                 hidden += 1;
             }
             continue;
@@ -998,6 +1027,20 @@ fn known_rows(
             admitted,
             is_note,
         });
+    }
+
+    // The other half of "where did my note go": a row whose only spelling is lossy and which no route accounted for
+    // stays out of the catalog. Reported per row at `debug` with its stored path, because the remedy is on disk — give
+    // the file a name this build can key — and nothing else says which row is waiting for it.
+    for marked_row in &marked {
+        if !marked_row.admitted && marked_row.is_note {
+            tracing::debug!(
+                target: crate::diagnostics::target::SCAN,
+                rule = crate::diagnostics::rule::UNRESOLVED_AMBIGUITY,
+                what = %marked_row.rel,
+                "no route accounted for this row's path this scan, so it stayed out of the catalog"
+            );
+        }
     }
 
     // Unmarked rows enter `known` as they always did; a marked one enters only if some route accounts for it.
@@ -1285,6 +1328,15 @@ fn apply_changes(
         // An unknown path is already named in the report and contributed only its marker to
         // `classify`; there is nothing here to write, and counting it either way would be a guess.
         if is_unknown(readable) {
+            // The file was listed and then could not be read (or changed under the read). This is the state whose
+            // absence from a report once read as "the note is gone": its rows are kept precisely because the next scan
+            // may read it fine, and the diagnostic says which of the two happened to this path (§12: a path, no body).
+            tracing::debug!(
+                target: crate::diagnostics::target::SCAN,
+                rule = crate::diagnostics::rule::UNREADABLE,
+                what = %rel,
+                "the file could not be read as the walk listed it; its rows were left alone"
+            );
             // Nothing to write, but a refresh has to remember a missed note *whose rows already exist*:
             // those still hold whatever an older build wrote. An attachment, or a note that never got a
             // row, is charged never — there is nothing stale to repair, so charging it would pin the
@@ -1294,10 +1346,27 @@ fn apply_changes(
             }
             continue;
         }
+        // An attachment: discovered, digested, tracked for changes, and never parsed into the catalog. Not a failure —
+        // which is exactly why no sentence ever explained it, and why a person counting files against `INDEX.md` needs
+        // the reason at `debug` rather than at `error`.
+        if !readable.is_markdown {
+            tracing::debug!(
+                target: crate::diagnostics::target::SCAN,
+                rule = crate::diagnostics::rule::NOT_MARKDOWN,
+                what = %rel,
+                "not markdown, so nothing was indexed from it"
+            );
+        }
         // `Removed` is keyed on a path that is not in `found`, so it cannot reach this lookup.
         let change = pending.get(readable.snapshot.rel_bytes.as_slice()).copied();
         match index_file(db, readable, change, refresh, now, case_sensitive, pass)? {
             Indexed::Taken => {
+                tracing::debug!(
+                    target: crate::diagnostics::target::SCAN,
+                    rule = crate::diagnostics::rule::IDENTITY_TAKEN,
+                    what = %rel,
+                    "another path holds this note identity, so its rows were left as they were"
+                );
                 written.skipped.push(rel.to_string());
                 // A note that lost an identity conflict keeps the rows it already had, so the refresh is
                 // not finished — but only the *winner* of a collision has rows, and charging the loser
@@ -1319,6 +1388,20 @@ fn apply_changes(
             // registry row may already have moved — see [`Indexed::Duplicate`]). Its rows exist and stay
             // whatever rules wrote them, which is exactly what a refresh has to remember.
             Indexed::Duplicate => {
+                // Neither of these two rules has a case asserting on the event, and the reason is named rather than
+                // left for a reviewer to hunt down. `Taken` needs an identity conflict on a path this scan is claiming:
+                // `tests/scan.rs`'s lossy-twin cases do plant one, and assert on where the path ends up — which rows it
+                // keeps, whether a refresh stays charged — not on what was emitted. `Duplicate` needs two note rows on
+                // one key, and migration 5 folds such a pair the first time a database this program wrote is opened (see
+                // [`Indexed::Duplicate`]), so only a foreign database reaches it. NOT COVERAGE in the gate's vocabulary:
+                // what is untested is the one field added beside a decision those cases already pin.
+
+                tracing::debug!(
+                    target: crate::diagnostics::target::SCAN,
+                    rule = crate::diagnostics::rule::DUPLICATE_ROWS,
+                    what = %rel,
+                    "more than one note row sits on this key, so none of them was rewritten"
+                );
                 written.skipped.push(rel.to_string());
                 if owes_a_reparse(db, &path, readable.is_markdown)? {
                     written.uncovered += 1;
@@ -1341,7 +1424,17 @@ fn apply_changes(
                     Some(Change::Added) => written.added += 1,
                     Some(Change::Modified) => written.modified += 1,
                     Some(Change::Moved { .. }) => written.moved += 1,
-                    None | Some(Change::Removed) => written.unchanged += 1,
+                    // The warm-pass answer for most of a vault, so it is the one scan rule at `trace` (§4): turning it
+                    // on is how someone finds out that the file they edited is *not* in this set.
+                    None | Some(Change::Removed) => {
+                        tracing::trace!(
+                            target: crate::diagnostics::target::SCAN,
+                            rule = crate::diagnostics::rule::UNCHANGED_CONTENT,
+                            what = %rel,
+                            "bytes match the stored digest, so nothing was re-parsed"
+                        );
+                        written.unchanged += 1;
+                    }
                 }
             }
         }
