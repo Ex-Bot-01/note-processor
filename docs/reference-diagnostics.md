@@ -114,6 +114,21 @@ and useful (a skip event names the file it skipped); note *content* is not. `a_d
 in `crates/np-cli/tests/diag.rs` runs scan, embed, search and models at `trace` and asserts both halves on the file
 channel; `no_diagnostic_carries_a_note_body` does the same in-process for np-core.
 
+### How long a field may be
+
+A path can be long — a deep vault whose directory names say something passes 512 bytes without anybody trying — so the two
+fields that carry one, **`what` and `workspace`, are clamped to 512 bytes**, cut at a character boundary and marked with
+`…`. The clamp keeps the **front** of the path, because paths diverge at the start rather than the end: what survives is
+the vault and the directory, which is the part that identifies the file. A field is never redacted whole — "which file?"
+answered by nothing is not a diagnostic — and a value inside the bound is written exactly as it stands, with no marker
+attached.
+
+`msg` is deliberately unclamped. Its length is program-authored, and the sentence worth reading in a config refusal is the
+end of it (`unknown field \`loggg\``), so clipping would remove the remedy to keep the problem tidy. The bound lives in one
+function at the place a field enters a record, so stderr and the file cannot disagree about how the same long path was
+written; `a_long_path_is_truncated_and_still_names_the_file` asserts both fields on one record, and that a short path
+arrives whole.
+
 ## Phases report what they cost
 
 Five spans open while work happens, and each closes with an `info` record naming the phase and its wall-clock cost:

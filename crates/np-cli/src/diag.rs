@@ -639,6 +639,45 @@ struct Record {
     already_printed: bool,
 }
 
+/// The bound on one path-bearing diagnostic field, in bytes, marker included.
+///
+/// A `what` is a path and a path can be long: a deep vault whose directory names say something reaches 512 bytes without
+/// anybody trying. Unbounded, one file's name dictates the size of every record written about it and a terminal full of
+/// 4 KB lines is a log nobody reads. The tempting fix is worse — redact the field when it gets silly — because "which
+/// file?" is the whole reason the field exists.
+///
+/// So the bound clamps and **keeps the front**: paths diverge at the start rather than at the end, so what survives is the
+/// vault and the directory, and `…` says the rest exists. 512 is neither generous nor mean: it holds every path a normal
+/// vault produces (`PATH_MAX` is 4096, but real ones are tens of bytes) while keeping one record inside a screen.
+const FIELD_BOUND_BYTES: usize = 512;
+
+/// Which fields the bound applies to: the two that carry a caller's path. `msg` deliberately does **not** appear — its
+/// length is program-authored, and clipping a TOML parse error mid-sentence removes the part that names the key to fix.
+const FIELD_BOUND_KEYS: [&str; 2] = ["what", "workspace"];
+
+/// Clamp one field value to [`FIELD_BOUND_BYTES`], marking that it was clamped.
+fn clamp_field(name: &str, value: Value) -> Value {
+    if !FIELD_BOUND_KEYS.contains(&name) {
+        return value;
+    }
+    let Value::String(text) = value else {
+        return value;
+    };
+    if text.len() <= FIELD_BOUND_BYTES {
+        return Value::String(text);
+    }
+    // Byte lengths, then a step back to a character boundary: a vault on any filesystem can hold `große-notiz.md`, and a
+    // cut through the middle of one of its characters would produce a path that names nothing and invalid UTF-8 besides.
+    let mut keep = FIELD_BOUND_BYTES - '…'.len_utf8();
+    while !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut out = String::with_capacity(FIELD_BOUND_BYTES);
+    out.push_str(&text[..keep]);
+    out.push('…');
+    Value::String(out)
+}
+
 impl Record {
     fn push(&mut self, name: &str, value: Value) {
         // The published key set is a promise about an immutable format, so an undocumented field is a programming mistake —
@@ -647,7 +686,10 @@ impl Record {
             RECORD_KEYS.contains(&name),
             "`{name}` is not in np's published diagnostic keys: {RECORD_KEYS:?}"
         );
-        self.fields.push((name.to_string(), value));
+        // Clamped here, at the one place a field enters a record, so stderr and the file cannot disagree about how a long
+        // path was written — the two channels are read side by side when something is being explained.
+        self.fields
+            .push((name.to_string(), clamp_field(name, value)));
     }
 
     /// The human line for stderr: level, target, sentence, then the fields. Deliberately unfrozen — a machine parses the file.

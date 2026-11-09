@@ -137,6 +137,12 @@ impl Vault {
     }
 }
 
+/// The bound on one diagnostic field, in bytes (`docs/reference-diagnostics.md`, "What may be in a diagnostic").
+///
+/// Stated here rather than imported because the code's constant is private to np-cli and this file's job is to notice if
+/// the two disagree: raise it in `src/diag.rs` without raising this number and the cases below fail, which is the point.
+const DIAG_FIELD_BOUND_BYTES: usize = 512;
+
 /// `s` as a TOML basic string; Rust's `Debug` escapes match TOML's for `\` and `"`.
 fn toml_str(s: &str) -> String {
     format!("{:?}", s)
@@ -1622,4 +1628,144 @@ fn fenced_block(manual: &str, info: &str) -> Option<String> {
     let opener = format!("```{info}");
     let rest = &manual[manual.find(&opener)? + opener.len()..];
     Some(rest[..rest.find("\n```")?].to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Review Focus 3: a path that outgrows a log line
+// ---------------------------------------------------------------------------
+
+/// Plan Review Focus 3: **a vault path containing note-like text**, truncated at a bound and never redacted.
+///
+/// Two failure modes live here and they pull in opposite directions. A diagnostic's `what` is a path, and a path can be
+/// long — a deep vault under a name that says something (`…/the-quick-brown-fox-jumps-over-the-lazy-dog-while-…/x.png`)
+/// — so an unbounded field lets one file's name dictate the size of every record written about it, and a terminal full of
+/// 4 KB lines is a log nobody reads. The tempting fix is worse: redact the whole field when it gets silly, which throws
+/// away exactly the information that makes a rule actionable ("which file?", answered by nothing). So the bound clamps
+/// and keeps the front: paths diverge at the start, not the end, so the head of a long path identifies the vault and the
+/// directory, and a marker says the rest exists.
+///
+/// `workspace` is clamped by the same rule and asserted here because length arrives differently for the two fields —
+/// `what` is workspace-relative, while `workspace` is absolute, so a deep root blows past the bound on its own.
+#[test]
+fn a_long_path_is_truncated_and_still_names_the_file() {
+    let vault = Vault::new();
+    // Sentence-like component names on purpose: the point is that text which *looks* like content still travels as a
+    // path, because it is one, and the privacy rule is about note bodies rather than about file names.
+    let prose = "the-quick-brown-fox-jumps-over-the-lazy-dog-while-the-index-stays-exactly-as-long";
+    // Nine components **above** the vault, so `workspace` — which is absolute — is itself past the bound, and seven
+    // inside it, so `what` — which is workspace-relative, and therefore shorter by exactly the part a reader cannot see
+    // in the record — passes too. Both fields on one record, both clamped: that is what the two channels must agree on.
+    let mut root = vault.root.clone();
+    for _ in 0..9 {
+        root = root.join(prose);
+    }
+    let mut deep = root.clone();
+    for _ in 0..6 {
+        deep = deep.join(prose);
+    }
+    fs::create_dir_all(&deep).expect("test setup: deep directories");
+    let file = deep.join(format!("{prose}.png"));
+    fs::write(&file, b"\x89PNG not really").expect("test setup: attachment");
+    let (absolute, relative) = (
+        root.display().to_string(),
+        file.strip_prefix(&root)
+            .expect("test setup: inside the vault")
+            .display()
+            .to_string(),
+    );
+    assert!(
+        absolute.len() > DIAG_FIELD_BOUND_BYTES && relative.len() > DIAG_FIELD_BOUND_BYTES,
+        "test setup: this case is about two paths past the bound — workspace {} B, what {} B",
+        absolute.len(),
+        relative.len()
+    );
+
+    let log = vault.log_path();
+    vault.write_user_config(&format!(
+        "[log]\nfile = {}\nlevel = \"debug\"\n",
+        toml_str(&log.display().to_string())
+    ));
+    // `command` rather than `exec`: the workspace being scanned is the deep one, not the tempdir's own root.
+    let mut cmd = vault.command(&["scan"]);
+    cmd.arg(&root);
+    let scanned = crate::run(&mut cmd);
+    assert_eq!(
+        scanned.code, 0,
+        "a long name is not a scan failure: {}",
+        scanned.stderr
+    );
+
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    let found: Vec<&Value> = records
+        .iter()
+        .filter(|record| record.get("rule").and_then(Value::as_str) == Some("not-markdown"))
+        .collect();
+    assert_eq!(found.len(), 1, "one record for the one file: {records:?}");
+
+    let what = found[0]
+        .get("what")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "a skipped file without a `what` is a redaction, not a truncation: {}",
+                found[0]
+            )
+        });
+    assert!(
+        what.starts_with(prose),
+        "the front of the path is what identifies it, so that is what survives: {what}"
+    );
+    assert!(what.ends_with('…'), "a clamped field says so: {what}");
+    assert!(
+        what.len() <= DIAG_FIELD_BOUND_BYTES,
+        "`what` must stay inside the bound ({} bytes): {what}",
+        what.len()
+    );
+    // The same record's `workspace` is absolute, which is where a vault root adds length. It is clamped the same way:
+    // present, prefixed by the real path, marked, bounded.
+    let workspace = found[0]
+        .get("workspace")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "the scan record must still name the workspace: {}",
+                found[0]
+            )
+        });
+    assert!(
+        workspace.starts_with(&vault.root.display().to_string()),
+        "`workspace` keeps its front too: {workspace}"
+    );
+    assert!(
+        workspace.ends_with('…'),
+        "and says it was clamped: {workspace}"
+    );
+    assert!(
+        workspace.len() <= DIAG_FIELD_BOUND_BYTES,
+        "`workspace` must stay inside the bound ({} bytes): {workspace}",
+        workspace.len()
+    );
+
+    // And a short path is untouched by any of this: no marker, exact name. Without this half the case would only prove
+    // that everything gets clamped, which would be its own kind of lie.
+    vault.write_notes(1);
+    fs::write(vault.root.join("plain.png"), b"\x89PNG also not")
+        .expect("setup: short-named attachment");
+    fs::remove_file(&log).expect("setup: empty the log");
+    let second = vault.exec(&["scan"]);
+    assert_eq!(second.code, 0, "{}", second.stderr);
+    let records = read_records(&log);
+    let plain = records
+        .iter()
+        .find(|record| record.get("what").and_then(Value::as_str) == Some("plain.png"))
+        .expect("a short path must arrive whole: no marker, no ellipsis");
+    assert!(
+        !plain
+            .get("what")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .ends_with('…'),
+        "the bound clamps long values, it does not decorate every value: {plain}"
+    );
 }
