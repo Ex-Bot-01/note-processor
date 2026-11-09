@@ -126,9 +126,11 @@ row_or_skip test-cli-realmodel "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p
 [ -n "${NP_TEST_MMPROJ_PATH:-}" ] || artifacts="NP_TEST_MODEL_PATH or NP_TEST_MMPROJ_PATH unset"
 row_or_skip test-core-realvision "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-core --features local-model,vision -- --nocapture
 
-# `--exclude=driver.log`, because this script's own summary sentence contains the phrase it counts: on 2026-12-09 the tally read
-# 14 where 13 lines were real, and the extra one was this line. The same trap bit the v0.3.0 release notes; a counter that counts
-# itself is not evidence, so exclude the file that carries the verdict rather than teaching readers to subtract one by hand.
+# **`--exclude=driver.log`, and the reason it is a guard rather than a fix.** On a fresh log directory this cannot matter: the count
+# runs *before* the summary line is echoed, so the phrase is not in that file yet — measured on 2026-12-09, where the tally over
+# `/home/agent/tmp/gates-progress2` was 14 with and without the exclusion. It matters when a run reuses a directory holding an older
+# log, because the previous verdict sentence does contain the phrase; that is exactly how the v0.3.0 release notes came to publish
+# "zero" beside a tally of 1. Excluding it makes the count independent of what happened to be in the directory before.
 vacuous=$(grep -rho --exclude=driver.log 'NOT COVERAGE' "$logs" 2>/dev/null | wc -l | tr -d ' ')
 echo "vacuous  NOT COVERAGE lines across all logs: $vacuous"
 echo "OVERALL fail=$fail"
