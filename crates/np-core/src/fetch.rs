@@ -436,6 +436,36 @@ pub fn fetch(
     fetch_with_table(db, models_dir, id, requested, transport, now, &plan)
 }
 
+/// The three things a transfer needs that are not about *what* to fetch: where the bytes come from, what time it is,
+/// and who wants to be told.
+///
+/// They always arrive together — every call site has all three or none — which is what makes bundling honest rather
+/// than a lint dodge. `progress` defaults to [`crate::progress::none`], so a caller that only wants bytes says nothing
+/// about reporting and keeps the older, shorter shape.
+#[derive(Clone, Copy)]
+pub struct Transfer<'a> {
+    transport: &'a dyn Transport,
+    now: i64,
+    progress: &'a dyn crate::progress::Progress,
+}
+
+impl<'a> Transfer<'a> {
+    /// A transfer that reports nothing, on the clock reading the caller was already holding.
+    pub fn new(transport: &'a dyn Transport, now: i64) -> Self {
+        Transfer {
+            transport,
+            now,
+            progress: crate::progress::none(),
+        }
+    }
+
+    /// A transfer that tells `progress` what it is doing.
+    pub fn reporting(mut self, progress: &'a dyn crate::progress::Progress) -> Self {
+        self.progress = progress;
+        self
+    }
+}
+
 /// Fetch the named members of `id`, then take back the directory if nothing ever landed (**F46**).
 ///
 /// [`fetch`] against an explicit pin table. **The table is a parameter; the values are not.** Production calls this
@@ -469,10 +499,39 @@ pub fn fetch_with_table<T: MemberPin>(
     now: i64,
     plan: &Expectation<'_, T>,
 ) -> Result<FetchReport, FetchError> {
+    fetch_with_progress(
+        db,
+        models_dir,
+        id,
+        requested,
+        plan,
+        &Transfer::new(transport, now),
+    )
+}
+
+/// [`fetch_with_table`] plus a reporter. **This is the function that does the work**; the two above are wrappers that
+/// supply a [`Transfer`] with no reporter, which is how every existing caller keeps its signature and its bytes.
+///
+/// The reporter sees one event per checkpoint of one member: byte zero when the transfer opens, each point where this
+/// module already writes a progress marker, and the member's full size once its digest verifies. No separate accounting
+/// and no timer — a status stream that costs an extra pass over the bytes would be a reason not to turn it on.
+///
+/// The transport, the clock and the reporter travel together as [`Transfer`] rather than as three parameters. Adding a
+/// seventh parameter to this signature would have made it eight, and `clippy::too_many_arguments` refuses that at
+/// `-D warnings`; the house answer (`scan.rs`'s `WritePass`) is to bundle the arguments that always arrive together
+/// instead of writing `#[allow]`, because a list this long is a fact about the design.
+pub fn fetch_with_progress<T: MemberPin>(
+    db: &crate::db::Db,
+    models_dir: &Path,
+    id: &str,
+    requested: &[&str],
+    plan: &Expectation<'_, T>,
+    transfer: &Transfer<'_>,
+) -> Result<FetchReport, FetchError> {
     // `try_exists` rather than `metadata`: the difference shows up only for a path we cannot stat, and "someone else's problem, do not remove it"
     // is the answer that errs toward leaving data alone.
     let existed_before = models_dir.try_exists().unwrap_or(true);
-    let attempt = fetch_attempt(db, models_dir, id, requested, transport, now, plan);
+    let attempt = fetch_attempt(db, models_dir, id, requested, plan, transfer);
     if attempt.is_err() && !existed_before {
         let _ = fs::remove_dir(models_dir);
     }
@@ -484,9 +543,8 @@ fn fetch_attempt<T: MemberPin>(
     models_dir: &Path,
     id: &str,
     requested: &[&str],
-    transport: &dyn Transport,
-    now: i64,
     plan: &Expectation<'_, T>,
+    transfer: &Transfer<'_>,
 ) -> Result<FetchReport, FetchError> {
     let Expectation { table, declaration } = plan;
     // An id that names nothing cannot be fetched, and naming it wrongly is an argv fact — not a file fact, which is
@@ -613,7 +671,7 @@ fn fetch_attempt<T: MemberPin>(
         free_bytes: free,
     };
 
-    for member in &members {
+    for (index, member) in members.iter().enumerate() {
         // Every target was proved absent above, so this loop publishes into what is still an empty place.
         let target = models_dir.join(local_name(id, member.member()));
 
@@ -623,13 +681,21 @@ fn fetch_attempt<T: MemberPin>(
             &nonce,
             FetchFields {
                 nonce: nonce.clone(),
-                started_at: now,
+                started_at: transfer.now,
                 bytes_done: 0,
                 bytes_total: Some(member.size_bytes()),
             },
         )?;
 
-        let outcome = receive_member(models_dir, id, *member, transport, &nonce, now);
+        let outcome = receive_member(
+            models_dir,
+            id,
+            *member,
+            transfer,
+            &nonce,
+            index,
+            members.len(),
+        );
         let published = match outcome {
             Ok(published) => published,
             Err(err) => {
@@ -675,7 +741,7 @@ fn fetch_attempt<T: MemberPin>(
         Some(primary.sha256()),
         &declaration.prefix_doc,
         &declaration.prefix_query,
-        now,
+        transfer.now,
     )
     .map_err(|source| FetchError::Db { source })?;
     record_members(db, &report).map_err(|source| FetchError::Db { source })?;
@@ -715,9 +781,10 @@ fn receive_member(
     models_dir: &Path,
     id: &str,
     member: &dyn MemberPin,
-    transport: &dyn Transport,
+    transfer: &Transfer<'_>,
     nonce: &str,
-    now: i64,
+    index: usize,
+    members_total: usize,
 ) -> Result<Published, FetchError> {
     let fail = |class: String| FetchError::Transport {
         id: id.into(),
@@ -727,7 +794,27 @@ fn receive_member(
     // Keep the transport's **class** and drop anything else it carried: every arm of `FetchError` other than
     // `Transport` describes this module's own file work, so a member that never opened stays a transport refusal
     // (§12 rule 8).
-    let body = transport.open(member).map_err(|err| fail(err.class()))?;
+    let body = transfer
+        .transport
+        .open(member)
+        .map_err(|err| fail(err.class()))?;
+
+    // Byte zero, after the transfer exists. Reported here rather than in the caller on purpose: a member whose open
+    // refused has no transfer, and a client told "0 of 309 MB" about work that never started shows a stalled download
+    // until the process exits.
+    let event = |bytes_done: u64| crate::progress::ProgressEvent {
+        phase: crate::progress::Phase::Fetching,
+        member: Some(member.member()),
+        bytes_done,
+        // The **pinned** size, never `body.bytes_total` (§12 rule 12): a chunked transfer announces nothing, and two
+        // denominators behind one key makes the same field mean two different percentages.
+        bytes_total: Some(member.size_bytes()),
+        members_done: index,
+        members_total,
+        chunks_done: 0,
+        embedded: 0,
+    };
+    transfer.progress.report(&event(0));
 
     let temp = models_dir.join(format!(".part.{id}.{nonce}"));
     let mut file = OpenOptions::new()
@@ -768,11 +855,12 @@ fn receive_member(
                 nonce,
                 FetchFields {
                     nonce: nonce.into(),
-                    started_at: now,
+                    started_at: transfer.now,
                     bytes_done: count,
                     bytes_total: Some(member.size_bytes()),
                 },
             )?;
+            transfer.progress.report(&event(count));
         }
     }
     file.sync_all().map_err(|source| FetchError::Io {
@@ -783,6 +871,10 @@ fn receive_member(
 
     // Length before digest (§12 rule 6): "short" and "different bytes of the same length" are different facts with
     // different advice, and a mismatch message that had to guess which one it was would be the less useful of them.
+    // The member is complete and verified: this is the last line a client can treat as progress for this member, and
+    // it is why `bytes_done` on the closing line equals `bytes_total` rather than merely approaching it.
+    transfer.progress.report(&event(count));
+
     if count != member.size_bytes() {
         return Err(FetchError::Interrupted {
             id: id.into(),
