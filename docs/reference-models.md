@@ -1,0 +1,95 @@
+# Getting a model onto the machine
+
+Where artifacts live, and the two doors by which bytes get there: `np models fetch` (this build's pinned ids only, digest-verified) and
+    `np models install` (a file you already hold). Read this before editing `embeddings.model` by hand.
+
+> *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
+
+
+Embedding is opt-in twice over: a feature at build time and an artifact at run time. One model identity is pinned in this
+repository's build today — `embeddinggemma-2`, 768 components, empty document/query prefixes — and its two artifacts are a
+text encoder (309,855,456 bytes) and a vision projector (554,821,056 bytes).
+
+Artifacts live **per workspace**, next to that workspace's database:
+
+```text
+<data_dir>/workspaces/<key>.sqlite        the index for one workspace
+<data_dir>/workspaces/<key>.models/       its installed artifacts, named by model id
+<data_dir>/workspaces.sqlite              the registry of known workspaces
+```
+
+`<key>` is a digest of the workspace's absolute path as bytes, so two spellings of one directory share one index and two
+directories never share it. `<data_dir>` is `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows it is
+`%LOCALAPPDATA%\note-processor` — nested under a folder that says whose it is, like the config file always was (**F37**). Before that
+change Windows wrote `workspaces/` and `workspaces.sqlite` straight into `%LOCALAPPDATA%`, which is where every application writes; if
+that is where your index is, this release still reads it there and says so on stderr rather than reporting your notes as new.
+An explicit `data_dir` in the config file is an instruction, not a location the program moved, and is never overridden.
+
+### Option A — fetch it
+
+```sh
+np models fetch ~/Notes --id embeddinggemma-2
+```
+
+The command you run when you want to place the model by hand. (It used to be the only thing in the program that opened a socket;
+since **F38** `np embed` and `np setup` reach the same origin themselves when the artifact is missing — see the first-run note above for
+the three ways to refuse.) Both forms print where they are about to dial, in class terms and never as a URL:
+
+```text
+origin      this build's compiled-in default — no [models] base_url is configured (an empty NP_MODELS_BASE_URL counts as unset)
+```
+
+A text-only binary fetches only the text encoder; naming `--member mmproj` from such a build is refused, because transferring
+554 MB that the binary cannot load is not a service. Interrupted downloads are guarded by a marker file that no clock may
+expire — if you know no fetch is running, say so with `--discard-marker`. It will not overwrite an artifact that already
+exists:
+
+```text
+np: refusing to overwrite the existing artifact <data_dir>/workspaces/<key>.models/embeddinggemma-2
+```
+
+### Option B — install a file you already have
+
+```sh
+np models hash ~/models/embeddinggemma-2-Q8_0.gguf     # prints "<sha256>  <path>"
+np models install ~/Notes --id embeddinggemma-2 --path ~/models/embeddinggemma-2-Q8_0.gguf \
+  --dim 768 --sha256 <that digest>
+```
+
+`install` reads the file, verifies it against the digest you declared, and copies it into place — it never moves or truncates
+your original. One word on stdout: `installed`, or `already installed` when the id is recorded with the same tuple. Re-running
+with a **different** dim or prefix for an existing id is refused rather than silently re-stamping history.
+
+The projector of a model — the file that lets a vision build encode figures — installs the same way, from the same offline
+file, with `--member`:
+
+```sh
+np models hash ~/models/mmproj-embeddinggemma-2-Q8_0.gguf
+np models install ~/Notes --id embeddinggemma-2 --member mmproj \
+  --path ~/models/mmproj-embeddinggemma-2-Q8_0.gguf --sha256 <that digest>
+```
+
+Three things about that command are deliberate. **`--dim` is refused, not ignored**: a projector carries no vector width, and
+a flag that reads like a fact about the file would be a quieter failure than a refusal. **The model has to be installed
+first** — a member row describes a file belonging to an installed identity, so `--member mmproj` on a workspace with no such
+model refuses before reading anything, including the 554 MB you pointed it at. **The digest is still mandatory**: an
+unverified projector would encode every figure in your vault with bytes nobody vouched for, and those vectors would then be
+compared against pinned-model text vectors forever. `--json` on a member install prints `{"id", "member", "state"}` — the
+extra key because `state` alone cannot say which artifact the run placed; the plain model install keeps its two keys.
+
+`np models list ~/Notes` then says what the workspace believes:
+
+```text
+models     1
+embeddinggemma-2  present  dim 768  sha256 2188ac1deca4  installed_at 1793893791  prefix_doc ""  prefix_query ""  files mmproj:present
+unclaimed  0
+```
+
+`state` is `present`, or `missing` when the row exists and its file does not — a deleted artifact is reported rather than
+forgotten. `files` names the model's **other** members (a projector, fetched or installed offline) and whether each file is
+there; it appears only when there is one to name, and `--json` carries the same set as `members`
+(`{"name", "file", "present"}`, empty for a model with a single file). It answers by stat, never by hashing — byte
+verification happens at use time, where reading 554 MB is already being paid for — so it tells you *a file is there*, not
+*those are the right bytes*. Before this field, confirming an offline projector install meant running `np embed` and watching
+`projector-absent` go away: a diagnosis standing in for a report. Re-declaring an id with a different width is refused outright, because that would silently change what every stored
+vector means; see [Troubleshooting](reference-troubleshooting.md) for the sentence it prints.
