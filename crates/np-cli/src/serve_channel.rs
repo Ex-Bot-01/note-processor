@@ -105,6 +105,15 @@ pub struct Channel<'a> {
     /// The phase of the last line written, and when — the throttle's whole memory.
     emitted_phase: Option<Phase>,
     emitted_at: Duration,
+    /// When the request now being handled began, on this clock. `since_ms` is measured from here (**§2**): a client
+    /// that has had the pipe open for ten minutes wants "this fetch has run four seconds".
+    request_at: Duration,
+    /// The one slot of session memory: the last finished activity, for `status.get` (**§5**).
+    last: Option<Value>,
+    /// The terminal notification for the request being handled. It is *queued* rather than written because it has to go
+    /// out **after** the response line, and `handle_line` builds the response without writing it — so the loop writes
+    /// the answer first and flushes this after (the ordering rule the spec calls "one line, mirroring the response kind").
+    pending_terminal: Option<Value>,
 }
 
 impl<'a> Channel<'a> {
@@ -116,17 +125,56 @@ impl<'a> Channel<'a> {
             notifications: false,
             emitted_phase: None,
             emitted_at: Duration::ZERO,
+            request_at: clock.since_start(),
+            last: None,
+            pending_terminal: None,
         }
+    }
+
+    /// Mark the start of a new request. Called by the read loop before anything is parsed, so a request that turns out to
+    /// be unreadable still has an honest elapsed time.
+    pub fn begin_request(&mut self) {
+        self.request_at = self.clock.since_start();
+    }
+
+    /// Time since the request now being handled began.
+    pub fn since_request(&self) -> Duration {
+        self.clock.since_start().saturating_sub(self.request_at)
+    }
+
+    /// Remember the last finished activity for `status.get`.
+    pub fn set_last(&mut self, document: Value) {
+        self.last = Some(document);
+    }
+
+    /// Queue the terminal notification for the request being handled.
+    pub fn queue_terminal(&mut self, params: Value) {
+        self.pending_terminal = Some(params);
+    }
+
+    /// Write the response line, then the queued terminal line — the order a client reads them in.
+    pub fn response_then_terminal(&mut self, value: &Value) {
+        self.response(value);
+        self.flush_terminal();
+    }
+
+    /// Flush any queued terminal notification. Never throttled: this is the last thing a request has to say, and a client
+    /// that missed it would wait for an ending that already happened.
+    pub fn flush_terminal(&mut self) {
+        let Some(params) = self.pending_terminal.take() else {
+            return;
+        };
+        if !self.notifications {
+            return;
+        }
+        self.sink.line(
+            &json!({"jsonrpc": "2.0", "method": "np/progress", "params": params}).to_string(),
+        );
     }
 
     /// Turn the progress stream on for this connection. Only `initialize` calls it.
     pub fn set_notifications(&mut self, on: bool) {
         self.notifications = on;
-    }
-
-    /// Where this connection is in its life, for `since_ms`.
-    pub fn since_start(&self) -> Duration {
-        self.clock.since_start()
     }
 
     /// Write one `np/progress` notification, subject to the throttle (**§4**): a phase change is written immediately,
@@ -200,7 +248,7 @@ impl<'a, 'b> ServeProgress<'a, 'b> {
 
     /// Throttle-check and write one event.
     fn publish(&self, event: &ProgressEvent<'_>) {
-        let since = self.ch.borrow().since_start();
+        let since = self.ch.borrow().since_request();
         let params = progress_params(
             self.request.as_ref(),
             self.command,
@@ -290,6 +338,8 @@ pub fn phase_name(phase: Phase) -> &'static str {
 /// client closing the pipe is how it says goodbye.
 pub(crate) fn serve_loop(input: impl BufRead, ch: &mut Channel<'_>) -> io::Result<()> {
     for line in input.lines() {
+        // One clock reading per request, taken before anything is parsed.
+        ch.begin_request();
         let line = match line {
             Ok(line) => line,
             Err(source) => {
@@ -299,7 +349,7 @@ pub(crate) fn serve_loop(input: impl BufRead, ch: &mut Channel<'_>) -> io::Resul
             }
         };
         match crate::serve::handle_line(&line, ch) {
-            Some(response) => ch.response(&response),
+            Some(response) => ch.response_then_terminal(&response),
             // A notification gets no response — including for a malformed line, per JSON-RPC 2.0 §5: nothing is known about the sender's intent,
             // so there is nothing to answer and an error would be a guess.
             None => {
@@ -309,6 +359,9 @@ pub(crate) fn serve_loop(input: impl BufRead, ch: &mut Channel<'_>) -> io::Resul
                         "np: serve: ignored a line that is not a JSON object"
                     );
                 }
+                // A notification-shaped command still ends, and its ending still gets a line — with no `request` key,
+                // because none was given (**Review Focus 5**).
+                ch.flush_terminal();
             }
         }
     }
@@ -534,6 +587,47 @@ mod tests {
         assert!(
             params.contains_key("since_ms"),
             "the always-present keys are all there: {parsed}"
+        );
+    }
+
+    /// `since_ms` measures the **request**, not the connection (**§2**): a client that has been open for ten minutes and
+    /// starts an embed wants "this fetch has run four seconds", not "this process started 600 seconds ago". A shared
+    /// clock reading is the bug this pins.
+    #[test]
+    fn since_ms_measures_the_request_not_the_connection() {
+        let clock = FakeClock::default();
+        let mut buffer: Vec<u8> = Vec::new();
+        {
+            let mut ch = Channel::new(&mut buffer, &clock);
+            ch.set_notifications(true);
+            // The connection is ten minutes old when this request begins.
+            clock.set_ms(600_000);
+            ch.begin_request();
+            let reporter = ServeProgress::new(&mut ch, Some(serde_json::json!(3)), "embed");
+            report(&reporter, Phase::Fetching, ProgressEvent::default());
+            clock.set_ms(604_120);
+            report(
+                &reporter,
+                Phase::Embedding,
+                ProgressEvent {
+                    phase: Phase::Embedding,
+                    ..Default::default()
+                },
+            );
+        }
+        let lines: Vec<serde_json::Value> = String::from_utf8(buffer)
+            .expect("UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parses"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0]["params"]["since_ms"], 0,
+            "the request starts at zero"
+        );
+        assert_eq!(
+            lines[1]["params"]["since_ms"], 4_120,
+            "four seconds into the request, not ten minutes into the connection"
         );
     }
 

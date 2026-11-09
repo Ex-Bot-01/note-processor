@@ -66,6 +66,10 @@ struct Server {
     /// reads like a deadlock in the server rather than a missing reader in the test.
     stderr: Arc<Mutex<Vec<u8>>>,
     id: i64,
+    /// Every `np/progress` line this session has written, in order. A notification is not an answer to anything, so
+    /// `read_line` sets it aside instead of returning it — which keeps every existing request/response assertion true for
+    /// an opted-in session as well, and makes "what did the client see while it waited" a lookup rather than a race.
+    progress: Vec<Value>,
 }
 
 impl Server {
@@ -116,6 +120,7 @@ impl Server {
             stdout,
             stderr,
             id: 0,
+            progress: Vec::new(),
         }
     }
 
@@ -162,39 +167,66 @@ impl Server {
     }
 
     fn read_line(&mut self) -> Value {
-        let mut line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut line)
-            .expect("read a response line");
-        assert!(read > 0, "stdout closed before answering");
-        let value: Value = serde_json::from_str(line.trim_end())
-            .unwrap_or_else(|source| panic!("not one JSON object per line ({source}): {line:?}"));
-        value
-    }
-
-    /// Nothing else on stdout, then end of file. This is how a test says "no unsolicited lines": if the server had
-    /// written a notification nobody asked for, this read finds it instead of hanging.
-    fn expect_eof(&mut self) {
-        let mut line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut line)
-            .expect("read after hang-up");
-        assert_eq!(read, 0, "unexpected extra line on stdout: {line:?}");
-    }
-
-    /// Read until the response to `id` arrives, returning it plus every line seen first. An opted-in session may
-    /// interleave notifications; a test that read exactly one line would read a status update and call it a response.
-    fn read_until_id(&mut self, id: i64) -> (Value, Vec<Value>) {
-        let mut before = Vec::new();
         loop {
-            let line = self.read_line();
-            if line.get("id").and_then(Value::as_i64) == Some(id) {
-                return (line, before);
+            let mut line = String::new();
+            let read = self
+                .stdout
+                .read_line(&mut line)
+                .expect("read a response line");
+            assert!(read > 0, "stdout closed before answering");
+            let value: Value = serde_json::from_str(line.trim_end()).unwrap_or_else(|source| {
+                panic!("not one JSON object per line ({source}): {line:?}")
+            });
+            if !is_progress(&value) {
+                return value;
             }
-            before.push(line);
+            self.progress.push(value);
         }
+    }
+
+    /// Everything the server wrote after stdin closed, parsed. For an opted-out session this must be empty — that is
+    /// Review Focus 1. For an opted-in one it holds the terminal notification of the last request, which by design
+    /// follows its response and so cannot have been read before it.
+    fn finish(&mut self) -> Vec<Value> {
+        self.hang_up();
+        let mut rest = Vec::new();
+        loop {
+            let mut line = String::new();
+            match self.stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let value: Value =
+                        serde_json::from_str(line.trim_end()).unwrap_or_else(|source| {
+                            panic!("not one JSON object per line ({source}): {line:?}")
+                        });
+                    if is_progress(&value) {
+                        self.progress.push(value.clone());
+                    }
+                    rest.push(value);
+                }
+            }
+        }
+        rest
+    }
+
+    /// Flush the stream without guessing at timing.
+    ///
+    /// A terminal notification follows its response, so it is still in the pipe the moment `read_line` returns the
+    /// answer. There is no portable non-blocking read to check with, and a `sleep` here would be a test that passes on a
+    /// fast machine and flakes on the operator's box. The server handles one request at a time, so sending a cheap second
+    /// request and waiting for *its* response proves every earlier line has been written: ordering is a property of the
+    /// protocol, not of scheduling.
+    fn flush(&mut self) {
+        self.result("initialize", json!({}));
+    }
+
+    /// The progress lines that belong to `id`.
+    fn progress_for(&self, id: i64) -> Vec<Value> {
+        self.progress
+            .iter()
+            .filter(|line| line["params"].get("request").is_some_and(|r| r == id))
+            .cloned()
+            .collect()
     }
 
     fn stderr_text(&self) -> String {
@@ -609,8 +641,11 @@ fn a_client_that_never_opts_in_sees_exactly_one_line_per_request() {
         "the embed document still carries its own word for what happened: {embed}"
     );
 
-    server.hang_up();
-    server.expect_eof();
+    let rest = server.finish();
+    assert!(
+        rest.is_empty(),
+        "an opted-out client must be sent nothing it did not ask for: {rest:?}"
+    );
 }
 
 /// The other half of the same claim: opting in changes **what is streamed**, never **what is answered**. Every extra
@@ -632,24 +667,23 @@ fn opting_in_adds_notifications_without_changing_a_single_response() {
         "support is advertised to the client that asked: {init}"
     );
 
-    let mut extra: Vec<Value> = Vec::new();
     let mut results = serde_json::Map::new();
     for method in ["scan", "embed"] {
-        talker.id += 1;
-        let id = talker.id;
-        talker.send_raw(
-            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {"workspace": ws}})
-                .to_string(),
+        results.insert(
+            method.to_string(),
+            talker.result(method, json!({"workspace": ws})),
         );
-        let (response, before) = talker.read_until_id(id);
+    }
+    // The terminal notification of the last request follows its response, so it is read after hang-up rather than before.
+    let rest = talker.finish();
+    for line in &rest {
         assert!(
-            response.get("error").is_none(),
-            "`{method}` faulted in the opted-in session: {response}"
+            is_progress(line),
+            "an unexpected non-notification line: {line}"
         );
-        results.insert(method.to_string(), response["result"].clone());
-        extra.extend(before);
     }
 
+    let extra = talker.progress.clone();
     for line in &extra {
         assert_eq!(
             line["method"], "np/progress",
@@ -703,8 +737,200 @@ fn opting_in_adds_notifications_without_changing_a_single_response() {
         );
     }
 
-    quiet.hang_up();
-    quiet.expect_eof();
-    talker.hang_up();
-    talker.expect_eof();
+    let quiet_rest = quiet.finish();
+    assert!(
+        quiet_rest.is_empty(),
+        "the quiet session received unsolicited lines: {quiet_rest:?}"
+    );
+}
+
+/// A `np/progress` notification, as opposed to a response.
+fn is_progress(value: &Value) -> bool {
+    value.get("method").and_then(Value::as_str) == Some("np/progress")
+}
+
+/// The last progress line of a request, which is the one that must mirror the response kind (**spec §2's terminal rule**).
+fn last_progress(lines: &[Value]) -> Value {
+    lines
+        .last()
+        .unwrap_or_else(|| panic!("no progress line was written for this request at all"))
+        .clone()
+}
+
+/// A degraded success is **`completed` carrying the state**, not `refused`. The distinction is the whole reason a GUI can
+/// tell "someone else is writing" from "np broke": both are interruptions, and only one of them is an error object on the
+/// wire. Contention is used here because it is reachable without any feature flags — the same lock a concurrent `np embed`
+/// takes is held by this test process.
+#[test]
+fn a_contended_embed_ends_completed_with_locked_true() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+    server.result("scan", json!({"workspace": workspace}));
+
+    let config = Config {
+        data_dir: server.data_dir(),
+        ..Config::default()
+    };
+    let db_path = config.workspace_db(&server.root);
+    let held = WorkspaceLock::acquire(
+        db_path
+            .parent()
+            .expect("a workspace database sits in a directory"),
+        db_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("a lockable name"),
+        std::time::Duration::from_millis(200),
+    )
+    .expect("test setup: take the workspace write lock");
+
+    server.id += 1;
+    let id = server.id;
+    server.send_raw(
+        &json!({"jsonrpc": "2.0", "id": id, "method": "embed", "params": {"workspace": workspace}})
+            .to_string(),
+    );
+    let response = server.read_line();
+
+    assert_eq!(response["result"]["locked"], true, "{response}");
+    assert_eq!(response["result"]["command"], "embed", "{response}");
+    assert!(
+        response.get("error").is_none(),
+        "contention is a result, so its terminal line cannot be a refusal: {response}"
+    );
+
+    server.flush();
+    let last = last_progress(&server.progress_for(id));
+    assert_eq!(last["params"]["phase"], "completed", "{last}");
+    assert_eq!(last["params"]["command"], "embed", "{last}");
+    assert_eq!(
+        last["params"]["locked"], true,
+        "the state the client received travels on the terminal line: {last}"
+    );
+    for line in &server.progress_for(id) {
+        assert!(
+            !line.to_string().contains("http"),
+            "**§12 rule 8**: no origin in a progress line: {line}"
+        );
+    }
+
+    // Readers are unaffected, and the server is still itself afterwards.
+    let search = server.result(
+        "search",
+        json!({"workspace": workspace, "query": "meeting"}),
+    );
+    assert!(
+        !search["hits"].as_array().expect("hits").is_empty(),
+        "a reader was refused while a writer held the workspace: {search}"
+    );
+    drop(held);
+    server.finish();
+}
+
+/// The state keys a terminal line carries are the ones its own result carried — copied through, never invented. A search
+/// over a vault with no vectors is the reachable degraded success in a default build: `vectors: false` is data, so the
+/// phase says `completed`.
+#[test]
+fn a_search_without_vectors_ends_completed_with_its_own_state() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+    server.result("scan", json!({"workspace": workspace}));
+
+    server.id += 1;
+    let id = server.id;
+    server.send_raw(
+        &json!({"jsonrpc": "2.0", "id": id, "method": "search", "params": {"workspace": workspace, "query": "meeting"}})
+            .to_string(),
+    );
+    let response = server.read_line();
+    assert!(response.get("error").is_none(), "{response}");
+
+    server.flush();
+    let last = last_progress(&server.progress_for(id));
+    assert_eq!(last["params"]["phase"], "completed", "{last}");
+    assert_eq!(last["params"]["command"], "search", "{last}");
+    for key in ["offline", "vectors", "reason"] {
+        if let Some(value) = response["result"].get(key) {
+            assert_eq!(
+                last["params"].get(key),
+                Some(value),
+                "`{key}` was in the result and must be on the terminal line: {} / {last}",
+                response["result"]
+            );
+        }
+    }
+    server.finish();
+}
+
+/// A real error object is **`refused`**, with the code that went out. Two kinds of ending, one rule: the terminal line
+/// mirrors the response kind.
+#[test]
+fn an_unknown_method_ends_refused_with_the_code() {
+    let mut server = Server::new();
+    server.result("initialize", json!({"notifications": true}));
+
+    server.id += 1;
+    let id = server.id;
+    server.send_raw(&json!({"jsonrpc": "2.0", "id": id, "method": "nope"}).to_string());
+    let response = server.read_line();
+    assert_eq!(response["error"]["code"], -32601, "{response}");
+
+    server.flush();
+    let last = last_progress(&server.progress_for(id));
+    assert_eq!(last["params"]["phase"], "refused", "{last}");
+    assert_eq!(last["params"]["command"], "nope", "{last}");
+    assert_eq!(last["params"]["code"], -32601, "{last}");
+    server.finish();
+}
+
+/// **Review Focus 5.** A command sent as a notification still narrates itself — with no `request` key anywhere. Inventing
+/// an id would let a client believe two unrelated commands were one, and answering the command with a response line would
+/// break the rule that notifications are silent.
+#[test]
+fn a_notification_command_produces_progress_without_a_request_key() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+
+    server.send_raw(
+        &json!({"jsonrpc": "2.0", "method": "scan", "params": {"workspace": workspace}})
+            .to_string(),
+    );
+    let rest = server.finish();
+    // After hang-up the remaining lines are the id-less scan's own, plus `initialize`'s terminal line — which *does*
+    // carry a request key, because that request had an id. So the claim is about the scan's lines: they exist, and none
+    // of them names a request.
+    let scan_lines: Vec<&Value> = rest
+        .iter()
+        .filter(|line| line["params"]["command"] == "scan")
+        .collect();
+    assert!(
+        !scan_lines.is_empty(),
+        "a command that runs still narrates itself, even unanswered: {rest:?}"
+    );
+    for line in &rest {
+        assert!(
+            is_progress(line),
+            "a notification earned a response line: {line}"
+        );
+        assert!(
+            !line.as_object().expect("object").contains_key("id"),
+            "a notification carries no id member: {line}"
+        );
+    }
+    for line in &scan_lines {
+        let params = line["params"].as_object().expect("params object");
+        assert!(
+            !params.contains_key("request"),
+            "no id was sent, so no request key may appear: {line}"
+        );
+        for key in ["command", "phase", "since_ms"] {
+            assert!(
+                params.contains_key(key),
+                "always-present key `{key}`: {line}"
+            );
+        }
+    }
 }

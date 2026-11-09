@@ -30,6 +30,7 @@
 
 use std::error::Error;
 use std::io::{self, Write};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -172,39 +173,106 @@ pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         dispatch(method, &params, call_id.as_ref(), ch)
     }));
-    let result = match outcome {
-        Ok(Ok(result)) => result,
-        Ok(Err(ServeError::Fault(fault))) => {
-            return (!is_notification).then(|| fault_response(id.unwrap_or(Value::Null), fault))
-        }
+    // Every arm below ends the same way: a **fault value** or a **result**, and one terminal notification built from
+    // which of the two it was. Doing this in one place rather than per handler is the point — "did this request end well"
+    // is one question, and two places answering it is how a degraded success starts reporting itself as an error.
+    let outcome: Result<Value, Fault> = match outcome {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(ServeError::Fault(fault))) => Err(fault),
         Ok(Err(ServeError::Refused(source))) => {
             // A refusal is `-32000` with the CLI's own sentence, and nothing else: no code per sentence, because a caller that branches on an
             // error *kind* should be branching on a state key in the result (**F44**'s rule), not on a fault number.
-            return (!is_notification).then(|| {
-                fault_response(
-                    id.unwrap_or(Value::Null),
-                    Fault::new(Fault::REFUSED, source.to_string()),
-                )
-            });
+            Err(Fault::new(Fault::REFUSED, source.to_string()))
         }
         Err(_) => {
             let _ = writeln!(
                 io::stderr(),
                 "np: serve: `{method}` panicked; the server is still running"
             );
-            return (!is_notification).then(|| {
-                fault_response(
-                    id.unwrap_or(Value::Null),
-                    Fault::new(Fault::INTERNAL, "`{method}` panicked inside np"),
-                )
-            });
+            Err(Fault::new(
+                Fault::INTERNAL,
+                format!("`{method}` panicked inside np"),
+            ))
         }
     };
-    if is_notification {
-        None
-    } else {
-        Some(json!({"jsonrpc": "2.0", "id": id.unwrap(), "result": result}))
+    let elapsed = ch.since_request();
+    ch.set_last(last_document(id.as_ref(), method, &outcome, elapsed));
+    ch.queue_terminal(terminal_params(id.as_ref(), method, &outcome, elapsed));
+    match outcome {
+        Ok(result) => (!is_notification)
+            .then(|| json!({"jsonrpc": "2.0", "id": id.unwrap(), "result": result})),
+        Err(fault) => (!is_notification).then(|| fault_response(id.unwrap_or(Value::Null), fault)),
     }
+}
+
+/// The state keys a terminal notification copies from its own result (**§2**). Copied, never invented: an absent key on
+/// the response is an absent key on the line, which is how a client can tell "this run was offline" from "this run said
+/// nothing about being offline".
+const TERMINAL_STATE_KEYS: [&str; 5] = ["outcome", "locked", "offline", "reason", "vectors"];
+
+/// The last `np/progress` line of a request: `completed` when the answer was a result, `refused` when it was an error
+/// object (**spec §2's terminal rule**).
+///
+/// The names matter more than they look. `ready`/`stopped`, which an earlier draft used, imply that "stopped" went wrong;
+/// `{locked: true}` and `{offline: true}` are **results**, so a client that saw them must be told it saw a completion —
+/// otherwise every contention refusal becomes a red banner in a GUI that read the phase as a verdict.
+fn terminal_params(
+    request: Option<&Value>,
+    command: &str,
+    outcome: &Result<Value, Fault>,
+    since: Duration,
+) -> Value {
+    let mut params = serde_json::Map::new();
+    if let Some(id) = request {
+        params.insert("request".to_string(), id.clone());
+    }
+    params.insert("command".to_string(), json!(command));
+    params.insert("since_ms".to_string(), json!(since.as_millis() as u64));
+    match outcome {
+        Ok(result) => {
+            params.insert("phase".to_string(), json!("completed"));
+            for key in TERMINAL_STATE_KEYS {
+                if let Some(value) = result.get(key) {
+                    params.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        Err(fault) => {
+            params.insert("phase".to_string(), json!("refused"));
+            // Only the code travels. The fault's sentence is already in the error object the client received, and a
+            // progress line that repeated it would be a second place for prose to drift out of step with the answer.
+            params.insert("code".to_string(), json!(fault.code));
+        }
+    }
+    Value::Object(params)
+}
+
+/// The one slot of session memory `status.get` reads (**§5**): what finished, when, and how long it took.
+fn last_document(
+    request: Option<&Value>,
+    command: &str,
+    outcome: &Result<Value, Fault>,
+    elapsed: Duration,
+) -> Value {
+    let mut last = serde_json::Map::new();
+    if let Some(id) = request {
+        last.insert("request".to_string(), id.clone());
+    }
+    last.insert("command".to_string(), json!(command));
+    match outcome {
+        Ok(result) => {
+            last.insert("phase".to_string(), json!("completed"));
+            if let Some(outcome) = result.get("outcome").and_then(Value::as_str) {
+                last.insert("outcome".to_string(), json!(outcome));
+            }
+        }
+        Err(fault) => {
+            last.insert("phase".to_string(), json!("refused"));
+            last.insert("code".to_string(), json!(fault.code));
+        }
+    }
+    last.insert("elapsed_ms".to_string(), json!(elapsed.as_millis() as u64));
+    Value::Object(last)
 }
 
 /// Route one request. Every mutating method acquires and releases the workspace write lock **inside itself** — never across requests — because a
