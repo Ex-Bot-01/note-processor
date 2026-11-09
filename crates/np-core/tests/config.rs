@@ -21,11 +21,11 @@ mod common;
 use common::{contended, hold_write_lock, Contention, HOLD_MS, HOLD_PAST_TIMEOUT_MS};
 use np_core::config::{
     config_file_path, data_dir_for, declared_data_dir, legacy_data_dir_override, parse_diag_spec,
-    resolve_data_dir, resolve_diag, CatalogConfig, Config, ConfigError, DataDirPlatform,
-    DiagSource, EmbeddingProvider, EmbeddingsConfig, Level, MarkerConfig, ModelsConfig,
-    SearchConfig, ThreadCount, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS, DIAG_LEVEL_NAMES,
-    MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS, REGISTRY_FILE, WINDOWS_DATA_SUBDIR,
-    WORKSPACES_DIR,
+    peek_log_config, resolve_data_dir, resolve_diag, CatalogConfig, Config, ConfigError,
+    DataDirPlatform, DiagSource, EmbeddingProvider, EmbeddingsConfig, Level, LogPeek, MarkerConfig,
+    ModelsConfig, SearchConfig, ThreadCount, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS,
+    DEFAULT_LOG_MAX_BYTES, DIAG_LEVEL_NAMES, MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS,
+    REGISTRY_FILE, WINDOWS_DATA_SUBDIR, WORKSPACES_DIR,
 };
 use np_core::search::SearchMode;
 use rusqlite::Connection;
@@ -2843,4 +2843,111 @@ fn diag_flag_beats_everything() {
     assert_eq!(DiagSource::Config.as_str(), "config.toml");
     assert_eq!(DiagSource::Env.as_str(), "NP_LOG");
     assert_eq!(DiagSource::Flag.as_str(), "command line");
+}
+
+/// `[log]` as config vocabulary: defaulted, strict about its own keys, and with a budget whose default is a documented number
+/// rather than a magic value in the sink.
+#[test]
+fn the_log_section_defaults_and_refuses_an_unknown_key() {
+    // `[models]` reads its two environment overrides on every load, so any case that loads a config file is exposed to another
+    // thread's installed values — which is what `every_case_that_loads_a_config_holds_the_environment_lock` exists to catch.
+    let _env = hold_env();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let data = toml_str(&tmp.path().display().to_string());
+
+    // Absent means "nothing asked for": no level, no file, and the budget left unset so the sink's default is one place.
+    let quiet = config_with_data_dir(tmp.path());
+    assert_eq!(quiet.log.level, None);
+    assert_eq!(quiet.log.file, None);
+    assert_eq!(quiet.log.max_bytes, None);
+    assert_eq!(
+        DEFAULT_LOG_MAX_BYTES,
+        8 * 1024 * 1024,
+        "8 MiB, as documented"
+    );
+
+    let path = write_config(
+        tmp.path(),
+        &format!(
+            "data_dir = {data}\n[log]\nlevel = \"info\"\nfile = \"/tmp/np.jsonl\"\nmax_bytes = 4096\n"
+        ),
+    );
+    let loud = Config::load(Some(&path)).expect("the three keys are legal");
+    assert_eq!(loud.log.level.as_deref(), Some("info"));
+    assert_eq!(loud.log.file, Some(PathBuf::from("/tmp/np.jsonl")));
+    assert_eq!(loud.log.max_bytes, Some(4_096));
+
+    // **F35's rule applies to this section like every other**: an invented key inside it is a refusal naming the key, not a
+    // setting that silently did not arrive — and `[log]` is the section a reader is most likely to invent a key for, because
+    // everybody knows what logging tools call their knobs.
+    let stray = write_config(
+        tmp.path(),
+        &format!("data_dir = {data}\n[log]\nrotate = true\n"),
+    );
+    let err = Config::load(Some(&stray)).expect_err("an unknown [log] key refuses");
+    let text = err.to_string();
+    assert!(text.contains("rotate"), "the refusal names the key: {text}");
+
+    // And a level that is not one of the six fails at load, naming the key — it must not become a run that logged less than it
+    // was told to. `resolve_diag` refuses the same text from the environment; this is the file's half of that rule.
+    let bad = write_config(
+        tmp.path(),
+        &format!("data_dir = {data}\n[log]\nlevel = \"verbose\"\n"),
+    );
+    let err = Config::load(Some(&bad)).expect_err("a level nobody spelled is not a default");
+    let text = err.to_string();
+    assert!(
+        text.contains("log.level") && text.contains("verbose"),
+        "the refusal names the key and the value: {text}"
+    );
+}
+
+/// **The lenient read, and why it exists.** The sink is installed before `Config::load` runs, so a file that is about to refuse
+/// still has to answer two questions — how loud, and where — or the most common integrator failure becomes the one failure with
+/// no diagnostic (spec point 3). It is also what lets `-v` announce the level that will *actually* run: `[log] level` outranks
+/// `NP_LOG`, so announcing from flag-and-env alone would promise one thing and do another.
+#[test]
+fn the_log_table_is_readable_from_a_file_that_refuses_for_another_reason() {
+    // `TestEnv` because this reads the environment's config path, like every other case here that does: cargo gives a test
+    // process whatever `$HOME` the developer's shell holds, and a real `~/.config` would decide what an unrelated case proves.
+    let env_guard = TestEnv::install();
+    fs::create_dir_all(env_guard._tmp.path().join("config").join("note-processor"))
+        .expect("test setup: config dir");
+    let path =
+        config_file_path().expect("test setup: the installed environment names a config path");
+
+    // A file with F35's own defect — a section name one letter off — plus a correct `[log]` table.
+    fs::write(
+        &path,
+        "[loggg]\nlevel = \"info\"\n[log]\nlevel = \"debug\"\nfile = \"/tmp/np-diag.jsonl\"\nmax_bytes = 1024\n",
+    )
+    .expect("test setup: write config");
+    Config::load(None).expect_err("the file still refuses, and loading is not the peek's job");
+
+    let peek = peek_log_config();
+    assert_eq!(
+        peek.level.as_deref(),
+        Some("debug"),
+        "what it said is what it meant"
+    );
+    assert_eq!(
+        peek.file,
+        Some(PathBuf::from("/tmp/np-diag.jsonl")),
+        "and the sink it asked for"
+    );
+    assert_eq!(peek.max_bytes, Some(1_024));
+
+    // A file that is not TOML at all peeks as silence: this read reports, it never refuses — the strict path keeps that job.
+    fs::write(&path, "this is not toml = = =").expect("test setup: write junk");
+    assert_eq!(
+        peek_log_config(),
+        LogPeek::default(),
+        "unreadable means unsaid"
+    );
+
+    // A value of the wrong type is likewise unsaid rather than a crash or a guess.
+    fs::write(&path, "[log]\nmax_bytes = \"lots\"\n").expect("test setup: write typed junk");
+    let peek = peek_log_config();
+    assert_eq!(peek.max_bytes, None, "a non-integer budget is no budget");
+    drop(env_guard);
 }

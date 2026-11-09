@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod diag;
 mod serve;
 mod serve_channel;
 
@@ -40,6 +41,29 @@ const DEFAULT_SEARCH_LIMIT: usize = 10;
 // in `--version` and `--help`.
 #[command(name = "np", version, about)]
 struct Cli {
+    /// How much to say about what the command did, on stderr: `-v` info, `-vv` debug, `-vvv` trace.
+    ///
+    /// Asking is what turns stderr printing on at all — an ordinary `np scan` prints exactly what it printed before these flags
+    /// existed (design point 1), and the first line of an asked run names the effective level *and* where it came from, so a
+    /// `NP_LOG` that the config file outranks is visible rather than mysterious. Global so it reads naturally in either
+    /// position (`np -v scan …`, `np scan … -v`).
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+    /// Per-target levels instead of one dial for everything: `--log-spec info,np_core::search=trace`.
+    ///
+    /// Levels are `off`, `error`, `warn`, `info`, `debug`, `trace`; targets are the ten in `docs/reference-diagnostics.md`, and
+    /// a name this build does not emit is accepted rather than refused. A bad value refuses naming this flag, as `NP_LOG`
+    /// refuses naming itself.
+    #[arg(long = "log-spec", value_name = "SPEC", global = true)]
+    log_spec: Option<String>,
+    /// Also write every captured record to this file as JSONL, one object per line.
+    ///
+    /// The flag rather than only `[log] file`, because the config file is the thing most likely to be broken in the run you are
+    /// debugging (**F35**) — and a file that cannot load cannot configure its own sink. Human text stays on stderr; JSON goes
+    /// here and nowhere else.
+    #[arg(long = "log-file", value_name = "PATH", global = true)]
+    log_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -265,6 +289,18 @@ enum ModelsCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // **Phase one of the diagnostic sinks** (`diag`'s module header says why there are two): levels from argv and the
+    // environment, and `--log-file` opened, before anything reads a config file. The order is the point — the most common
+    // integrator failure is a `config.toml` with one section misspelled, and it must not become the one failure with no
+    // diagnostic. A value that cannot be honoured refuses here, as every other unreadable argument does: one sentence, exit 1.
+    let verbose = cli.verbose;
+    let log_spec = cli.log_spec.clone();
+    let log_file = cli.log_file.clone();
+    if let Err(err) = diag::bootstrap(verbose, log_spec.as_deref(), log_file.as_deref()) {
+        // Written through a handle with the result dropped for the reason given below, at the exit that needs it most.
+        let _ = writeln!(io::stderr(), "np: {err}");
+        return ExitCode::FAILURE;
+    }
     let result = match cli.command {
         Command::Scan { workspace, json } => scan_workspace(&workspace, json),
         Command::Embed {
@@ -359,6 +395,9 @@ fn main() -> ExitCode {
             ModelsCommand::List { workspace, json } => models_list(&workspace, json),
         },
     };
+    // What stderr swallowed, said once at the end because the notice owes a total. Before the exit paths, so a run that
+    // failed *and* was truncated reports both — the truncation is often the reason nobody saw the failure.
+    diag::finish();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -1918,7 +1957,20 @@ fn parse_dim(raw: &str) -> Result<NonZeroU16, String> {
 /// than deriving `workspaces/<hash>.sqlite` next to the current directory, and a model command that guessed a
 /// data dir would install artifacts nobody can find.
 fn load_config() -> Result<Config, Box<dyn Error>> {
-    let cfg = Config::load(None).map_err(|err| format!("configuration error: {err}"))?;
+    let cfg = match Config::load(None) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            // **The refusal is itself a diagnostic** (spec point 3): a broken config must not be the one failure that reports
+            // nothing, and this is the most common one. `error` level, on the config target, with the rule as a field rather
+            // than as prose — which is what lets a frontend log *why* without matching a sentence. It reaches stderr only if
+            // someone asked for diagnostics (spec point 1), so the pinned single-line refusal below is still exactly one line.
+            tracing::error!(target: "np_core::config", rule = "config-refused", "{err}");
+            return Err(format!("configuration error: {err}").into());
+        }
+    };
+    // **Phase two**: `[log] level` and `[log] file` now that there is a file to read them from. Idempotent, because several
+    // commands load configuration more than once per run.
+    diag::apply_config(&cfg);
     // **F37's one-release note, on stderr.** Stdout stays exactly one document when `--json` is asked for — the fact this
     // line carries is about *where* the run is reading from, not about the run's result, and a reader who needs it is a
     // human standing at the machine. Nothing here is actionable: that is the point of the fallback, and saying "moved"

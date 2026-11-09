@@ -30,6 +30,12 @@ toml = "0.9"
 # the "free when off" half of that design, and it means a caller embedding np-core keeps its own subscriber. The heavyweight half
 # (`tracing-subscriber`) belongs to np-cli alone — the global sink is the process's, and only `np` owns a process.
 tracing = "0.1"
+# The subscriber np-cli owns. `default-features = false` keeps the pieces this program does not use out of the binary: no
+# `fmt` layer (the human format here is six lines of `format!`, and pinning bytes on stderr predates tracing), no `env-filter`
+# (`NP_LOG` follows §12 rule 7's precedence, which is the *inverse* of the ecosystem's env-beats-file habit — see
+# `np_core::config::DIAG_ENV_VAR`), no ansi. `registry` is the one part that matters: it gives spans somewhere to live, which is
+# what request correlation and span durations read from in Task 5.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 # Pinned exactly, unlike the caret ranges above. `np-core::catalog` breaks a wrapped line on
 # display width (F12), so the classification of one character decides published bytes: a Unicode
 # revision that reclassified an ideograph or emoji would silently move a break point in a future

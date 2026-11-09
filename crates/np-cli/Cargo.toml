@@ -42,6 +42,11 @@ clap = { workspace = true }
 # workspace: np-cli's `fetch` is the only thing that decides whether the command exists and whether the advice may name it.
 np-core = { path = "../np-core", default-features = false }
 serde_json = { workspace = true }
+# The diagnostic sinks (`src/diag.rs`). `tracing` is here because the CLI emits on the same channel np-core does — a refusal
+# decided in np-cli's own argument handling has to be reportable the same way; `tracing-subscriber` because **this crate is the
+# only one that owns a process**, and therefore the only one allowed to install a global sink.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # Only for `tests/cli.rs`, which has to seed a version-two workspace database by hand: no production API

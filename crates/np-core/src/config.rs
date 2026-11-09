@@ -651,6 +651,45 @@ impl Default for SearchConfig {
     }
 }
 
+/// `[log]`: how loud np's diagnostics are, where they also go, and when the file stops growing.
+///
+/// Three keys because those are the three questions a person debugging actually asks — *how much*, *where*, *until when*. There
+/// is deliberately no `[log] format`: JSON appears in a file and nowhere else (a `np serve` test refuses any stderr line that
+/// starts with `{`), so a format switch would be a knob with one legal position.
+///
+/// **`deny_unknown_fields`, by F35's rule for every container in this file.**
+/// Every field is an `Option`, so "the file said nothing" is one representation and derived `Default` is the honest one: an
+/// absent `[log]` section leaves the level unresolved, the destination unopened and the budget unset (which the sink reads as
+/// [`DEFAULT_LOG_MAX_BYTES`]) rather than inventing a value for any of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// How much to record — a bare level or the full spec grammar ([`parse_diag_spec`]), **absent means unset, not `off`**.
+    ///
+    /// Held as written rather than as a parsed [`DiagSpec`], for the same reason `[embeddings] log_level` is held as a
+    /// [`LogLevel`]: the effective value is resolved *by name* through [`resolve_diag`], from three sources at once, and a field
+    /// that sometimes held the file's word and sometimes the merged answer would leave a reader unable to tell which they
+    /// edited. It is still validated at load (see `Config::load_with_platform`), so a typo cannot route around the rule.
+    pub level: Option<String>,
+    /// Where records also go, as JSONL, opened in append mode. Absent means stderr only.
+    ///
+    /// The file format is frozen and documented (`docs/reference-diagnostics.md`); the human format on stderr is not. Nothing
+    /// rotates this file — see [`DEFAULT_LOG_MAX_BYTES`] for what happens at the end of it, and why deleting it is the remedy.
+    pub file: Option<PathBuf>,
+    /// The byte budget for `[log] file`; **absent means [`DEFAULT_LOG_MAX_BYTES`]**.
+    ///
+    /// It bounds *the file*, not the run: a log already at its budget when a process opens it gets nothing more appended, which
+    /// is the only way to keep that promise without the rotation this design refuses.
+    pub max_bytes: Option<u64>,
+}
+
+/// `[log] max_bytes` when the key is absent: **8 MiB**, roughly 40 000 records.
+///
+/// More than any single debugging session reads, and small enough that a forgotten `[log] file` cannot fill a disk unnoticed.
+/// The alternative the design considered and refused is rotation: on Windows another `np` may still hold the handle, and a
+/// rename that fails halfway is a worse story than a log that stops honestly (spec point 8).
+pub const DEFAULT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -676,6 +715,9 @@ pub struct Config {
     /// Ranking choice for `np search`. An absent `[search]` section means hybrid, which is the default rather than a
     /// degraded mode: with no vectors installed, the keyword half is all there is to rank by, and it still answers.
     pub search: SearchConfig,
+    /// Diagnostics: level, destination file, and that file's budget. An absent `[log]` section means "nothing asked for":
+    /// capture at [`DIAG_DEFAULT_LEVEL`], stderr exactly as silent as it was before this section existed, and no file.
+    pub log: LogConfig,
 }
 
 impl Default for Config {
@@ -692,6 +734,7 @@ impl Default for Config {
             embeddings: EmbeddingsConfig::default(),
             models: ModelsConfig::default(),
             search: SearchConfig::default(),
+            log: LogConfig::default(),
         }
     }
 }
@@ -796,6 +839,14 @@ impl Config {
         // [`crate::loglevel::resolve_level_from_env`] by the one caller that installs a sink, so merging it into `embeddings.log_level`
         // would make that field mean "the file's word" or "the environment's word" depending on load order.
         resolve_level_from_env(cfg.embeddings.log_level).map_err(invalid_data)?;
+        // The same shape as F33's check one line above: **checked here, stored nowhere**, because the effective level arrives
+        // from three sources and is resolved by name through [`resolve_diag`]. A `[log] level` that cannot be read refuses at
+        // load rather than becoming a run that silently logged less than it was told to — and the refusal names the key, as
+        // every other value in this file does.
+        if let Some(raw) = cfg.log.level.as_deref() {
+            parse_diag_spec(raw)
+                .map_err(|err| invalid_data(format!("invalid log.level = {raw:?} — {err}")))?;
+        }
         Ok(cfg)
     }
 
@@ -1639,6 +1690,61 @@ fn present(value: Option<&str>) -> Option<&str> {
 /// Parse one source's value, prefixing any complaint with the spelling of that source.
 fn parse_named(value: &str, source: &str) -> Result<DiagSpec, String> {
     parse_diag_spec(value).map_err(|err| format!("{source}: {err}"))
+}
+
+/// What `[log]` says, read **leniently**: without validating the rest of the file, and without refusing anything.
+///
+/// This exists for one reason, and it is a real one: the sink has to be installed before `Config::load` runs (spec point 3 —
+/// "a config that refuses must not become the one failure with no diagnostic"), and the level announced at install time has to
+/// be the level that will actually run. Since `[log] level` outranks `NP_LOG`, installing from flag-and-env alone would announce
+/// a value the config file then quietly overrode. So np-cli asks this question first, gets a truthful answer even from a file
+/// that is about to refuse, and asks the strict question (`[LogConfig]`) once the file has loaded.
+///
+/// **Lenient means lenient**: no TOML at all, no `log` table, or a value of the wrong type all read as "nothing was said", never
+/// as an error. The strict path still refuses what this one ignores — a typo in `[log] level` fails the run at load with its
+/// key named — so nothing is *accepted* here that the file would not accept; only reported early.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogPeek {
+    /// `[log] level` as written, if it is a string.
+    pub level: Option<String>,
+    /// `[log] file`, if it is a string.
+    pub file: Option<PathBuf>,
+    /// `[log] max_bytes`, if it is a non-negative integer.
+    pub max_bytes: Option<u64>,
+}
+
+/// [`LogPeek`] for the file this run would read ([`config_file_path`]), or nothing when there is no such file to read.
+#[must_use]
+pub fn peek_log_config() -> LogPeek {
+    let Some(path) = config_file_path() else {
+        return LogPeek::default();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return LogPeek::default();
+    };
+    // Deserialise the **document** into a table. `text.parse::<toml::Value>()` would be wrong and quietly so: `FromStr` for
+    // `toml::Value` parses a TOML *value*, not a file, so a real config — which always opens with a key or a `[table]` header —
+    // fails to parse at column 8 and the peek reports silence about every file in the world.
+    let Ok(document) = toml::from_str::<toml::Table>(&text) else {
+        return LogPeek::default();
+    };
+    let Some(table) = document.get("log").and_then(toml::Value::as_table) else {
+        return LogPeek::default();
+    };
+    LogPeek {
+        level: table
+            .get("level")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string),
+        file: table
+            .get("file")
+            .and_then(toml::Value::as_str)
+            .map(PathBuf::from),
+        max_bytes: table
+            .get("max_bytes")
+            .and_then(toml::Value::as_integer)
+            .and_then(|bytes| u64::try_from(bytes).ok()),
+    }
 }
 
 /// The workspaces this program has seen, in `<data_dir>/workspaces.sqlite` —
