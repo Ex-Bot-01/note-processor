@@ -1,6 +1,6 @@
 # Diagnostics: a debug window into `np` for people building on it
 
-**Status: awaiting approval.** Purpose decided by the operator: *debugging while implementing the frontend* —
+**Status: approved 2026-12-10** (operator; the settled points are recorded at the end and supersede anything above that conflicts). Purpose decided by the operator: *debugging while implementing the frontend* —
 "when something fails and what fails." Everything below serves that; fleet observability is explicitly out.
 
 ## Why
@@ -77,7 +77,7 @@ slice of it survives below as an opt-in convenience for GUI authors who cannot r
 names are a documented set (a test asserts the doc lists every one) so "what can I even ask about" is answerable without
 reading source.
 
-**Choosing them.** Precedence, highest wins: CLI flag → `NP_LOG` env → config `[log] level` → default `warn`. Flag grammar
+**Choosing them.** Superseded below: precedence is default < config file < env < flag. Flag grammar
 mirrors the common shape (`-v` = info, `-vv` = debug, `-vvv` = trace; `--log-spec 'np_core::search=trace,np_cli=info'` for
 per-target). Config gains two keys: `[log] level` and `[log] file`; a path is opened append-only, created with the same
 directory rules as the data dir.
@@ -113,3 +113,65 @@ bytes (they are pinned by tests) and are emitted through the new path at `info`.
 - Exact human-format layout (prefix width, colour when a tty), as long as existing pinned lines are untouched.
 - Whether `np/diagnostic` ships in the first cut; it is separable and may be deferred without weakening anything above.
 - File rotation: none initially; document that the file grows and deleting it is safe.
+
+## Decisions settled at approval (2026-12-10)
+
+A builder check surfaced eight under-specified points. Six were settled here as the author's calls; two went to the operator and are
+recorded with their answers. Where this section conflicts with the text above, **this section wins**.
+
+**1. Two knobs, not one — stderr stays exactly as silent as today (operator's answer: as recommended).** The *capture* level defaults
+to `warn` and governs what is recorded to a configured file; stderr prints diagnostics only when asked, by `-v`/`-vv`/`-vvv`,
+`NP_LOG`, or `[log] level`. Consequence: refusal and degraded-state sentences keep their pinned bytes (`crates/np-cli/tests/cli.rs:2338,
+2634, 2868`), no existing case changes, and an offline `np search` prints what it prints now. The migration of the six direct stderr
+writes therefore keeps them unconditional at their current bytes — they move onto the channel as `info` *emissions* whose stderr printing
+is not gated, so nothing is silenced; the sixth write referred to in review is the llama.cpp gate (`local_model.rs:1544`), which stays on
+its own path (point 6).
+
+**2. Precedence follows the house rule (operator's answer: as recommended).** Default < config file < env < flag, matching §12 rule 7 and
+the pinned precedent at `loglevel.rs:160` / `cli.rs:3726`; a diagnostic hatch invents no exception. `NP_LOG` is the only variable —
+`RUST_LOG` is deliberately *not* honoured, so one binary never carries two variables with opposite orders. Because "the environment did
+nothing" is otherwise invisible, `-v` prints one first line naming the effective level **and its source**
+(`log level info from config.toml`). A bad value refuses, naming the variable, as `NP_LLAMA_LOG_LEVEL` already does (`cli.rs:2481`).
+
+**3. Bootstrap (author's call).** Two-phase: resolve flag/env before any config read so an early failure has a sink; after the first
+`load_config()`, apply `[log] level`/`file` per the order above. A config that refuses (F35 unknown key, unhonourable level) is printed
+at `error` to the already-resolved stderr sink — the most common integrator failure must not become the one failure with no diagnostic.
+For `np serve`, a bad config still starts the server and answers requests; each request reports the config error as it does today.
+
+**4. The `rule` vocabulary is diagnostics-owned (author's call).** Result documents keep their keys untouched; diagnostics publish one
+list of tokens — reusing existing spellings where they exist (`provider-disabled`, `prefix-drift`, `token-budget`, `locked`, `offline`)
+and adding the ones scan needs so Goal 1's first sentence is true: skipped notes and unrepresentable directories currently collapse into
+counters, so scan gains internal plumbing to know *which* rule fired at each site. A doc-completeness test (precedent:
+`crates/np-cli/tests/serve.rs:1404`) asserts every token in code appears in the doc and vice versa.
+
+**5. Targets close at ten names (author's call).** `np_core::scan` (includes walk), `np_core::embed` (includes chunk/change),
+`np_core::search`, `np_core::fetch`, `np_core::db` (includes lock, orphans, merges), `np_core::models`, `np_core::config`,
+`np_cli`, `np_cli::serve`, `np_cli::serve_channel`. Documented as the whole set and pinned by the same completeness test: a target name
+becomes as sticky as a wire key once published.
+
+**6. llama.cpp keeps its own knob (author's call).** `[embeddings] log_level` / `NP_LLAMA_LOG_LEVEL` (F33) stays separate and is
+documented as deliberately unrelated to `[log] level`, with the reason: F33 exists so that asking for search tracing does not dump a
+hundred-and-twenty lines of model-loader transcript nobody asked for.
+
+**7. File-sink semantics, frozen now because the format is immutable (author's call).** `request` is *omitted* when there is no id —
+never `"none"`, never `null` — matching the pipe rule in `serve_channel.rs`. One append handle per process, one JSON object per write.
+An unopenable path warns once on stderr and continues: diagnostics are never the reason a command fails, as with every other sink here
+(`scan.rs:2166`, `db.rs:912`). JSON goes only to a file; `--log-format jsonl` requires `[log] file` or `--log-file`, because a serve test
+already forbids `{` at the start of any stderr line.
+
+**8. Caps (operator's question, answered here).** Yes on stderr, no on file, and the numbers differ because their jobs do.
+- **stderr: 1 000 diagnostic lines per process run**, then one final line — `diagnostics truncated after 1000 lines; N more suppressed
+  (raise --log-spec or set [log] file)`. Not too big: a normal `-v` run reaches tens of lines, and the runs that blow past 1 000 are
+  trace-level loops over thousands of notes, which is precisely when stderr is the wrong place and the file is the right one. The cap is
+  checked *before* formatting, so suppressed lines cost a counter, not a `format!`. Pinned user-facing output is never counted or
+  suppressed — it is output, not logs.
+- **file: no line cap; a byte budget with no rotation.** `[log] max_bytes` defaults to 8 MiB; once exceeded, writing stops and one final
+  JSONL record says `{"msg":"log full","bytes":…,"action":"delete the file to continue"}`. No rename-and-continue: on Windows another np
+  may hold the handle, and a rotation that fails halfway is a worse story than a log that stops honestly. Eight mebibytes is roughly
+  40 000 records — more than any single debugging session reads, and deleting the file stays safe because the next run recreates it.
+
+**9. Cost evidence is a measurement, not a gate row (author's call).** A percentage fence would go red on this memory-tight box for
+reasons that are not the code, and the only thousands-of-notes harness (`local_corpus.rs`) is artifact-gated, so as a gate row it would
+print `NOT COVERAGE` in every default log. Instead: `docs/measurement-np-diagnostics-cost.md` records a default-level run against
+`NP_LOG=off` on the existing corpus, and the *behavioural* half — that nothing is formatted when disabled — is asserted by tests that
+count allocations-free paths rather than by wall clock.
