@@ -16,10 +16,10 @@ A partial file is fine — every key has a default. Two environment variables ex
 a value in the file always wins, and an empty environment value counts as unset rather than as a choice.
 
 The table below was checked against the structs on 2026-12-09 rather than copied from the README: every container carries
-`deny_unknown_fields` (**F35**), so `Config`, `CatalogConfig`, `MarkerConfig`, `EmbeddingsConfig`, `ModelsConfig` and `SearchConfig` in
+`deny_unknown_fields` (**F35**), so `Config`, `CatalogConfig`, `MarkerConfig`, `EmbeddingsConfig`, `ModelsConfig`, `SearchConfig` and `LogConfig` in
 `crates/np-core/src/config.rs` *are* the key list — a key not in them cannot be written at all. That audit added two rows this table had
 lost: top-level `data_dir`, and `models.auto_fetch`, which is one of the three kill switches the README names while omitting the key that
-holds it. There are **15** keys.
+holds it. Three more arrived on 2026-12-10 with `[log]`, the diagnostics section. There are **18** keys.
 
 | Key | Default | What it does |
 | --- | --- | --- |
@@ -37,6 +37,9 @@ holds it. There are **15** keys.
 | `models.sha256` | unset | Read into config (`NP_MODELS_SHA256` fills it when the file omits the key). Nothing in the fetch path consults it today, so it does **not** replace a pin — see `docs/design-m2-local-embeddings.md` §12 rule 7's note |
 | `markers.done`, `markers.paused` | built-in lists | Strings that classify checklist items when the catalog renders them |
 | `search.mode` | `hybrid` | Which lists `np search` ranks by: `hybrid`, `semantic` or `keyword`. `--mode` overrides it for one run; a fourth spelling is refused, naming the three (**F35**'s rule) |
+| `log.level` | unset, which means `warn` — and nothing on stderr | How loud diagnostics may be: `off`, `error`, `warn`, `info`, `debug`, `trace`, or the same comma grammar `NP_LOG` takes (`warn,np_core::scan=off`) with whole target names as filters. A bad level is refused naming the key. **A flag outranks this key and this key outranks `NP_LOG`**, which is the precedence every environment value here follows; whatever won says so once on stderr (`log level info from config.toml`). Levels, targets and every rule token: [`docs/reference-diagnostics.md`](reference-diagnostics.md) |
+| `log.file` | unset, so no file | Path for the JSONL log — one object per line, machine-readable, every record that passed the filter. Created if absent, appended if present, and its parent directory is created the way the data dir is. An unopenable path warns once and the command runs on: a sink that fails is not a reason for work to stop |
+| `log.max_bytes` | `8388608` (8 MiB) | The budget for **the file**, not the run, counted from the bytes already on the path — so a log that filled in an earlier run stays full instead of gaining one record per invocation. Spending it writes one final `log full` record with the size and the remedy (`delete the file to continue`) and then stops; there is no rotation, because a half-finished rename is a worse story than a log that stops honestly. A non-integer is refused at load; `0` creates the file and writes nothing to it |
 
 ```toml
 [embeddings]
@@ -51,4 +54,9 @@ max_entries_per_file = 600
 
 # [search]
 # mode = "hybrid"          # hybrid | semantic | keyword — `np search --mode` overrides it per run
+
+# [log]
+# level = "warn"           # off|error|warn|info|debug|trace, or 'warn,np_core::scan=off'
+# file = "/var/log/np.jsonl"   # JSONL; unset means no file. No `~` expansion: an absolute path is a path
+# max_bytes = 8388608      # budget for that file; when spent, one `log full` line and stop
 ```

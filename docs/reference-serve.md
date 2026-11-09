@@ -42,6 +42,25 @@ does not queue behind another *process*, only behind this connection's own work.
 **A blank line is ignored.** A line that is not valid JSON, or not an object, gets a parse or invalid-request fault with
 `id: null`, because there may be no id to echo back.
 
+**Diagnostics say which request caused them.** When diagnostics are switched on (`-v`, `NP_LOG`, `[log] level`; see
+[`docs/reference-diagnostics.md`](reference-diagnostics.md)) each request opens a span, and every record raised while that
+span is open carries **`request`** — the JSON-RPC id — plus **`workspace`** when the work is about one. A notification has
+no id, so its records carry no `request` key at all: never `null`, never `"none"`, because "this line belongs to no
+request" and "this request had a null id" are different facts an operator would otherwise have to guess between. The four
+phases (`scan`, `embed`, `search`, `fetch`) close with an `info` record carrying **`elapsed_ms`**, so a slow request can be
+attributed to a phase from the log alone.
+
+**Reading stderr is optional; your requests do not depend on it.** A client that pipes stderr and never drains it is
+normal, and np treats that as "nobody is listening": diagnostics are dropped rather than blocking the request loop, up to
+1 000 of them counted in the closing notice. Measured before that was the rule — 1 200 requests against a server whose
+stderr nobody read, **1 057 answered**, the child stalled inside `write(2)` once the pipe filled at about 64 KiB; now 1
+200 in, 1 200 out. Windows has no `poll`, so there an undrained stderr can still slow the loop: read it, discard it, or
+point `[log] file` somewhere else and leave the pipe alone.
+
+**A refused configuration does not end the session.** An unparseable `config.toml` is reported as a diagnostic on the
+channel the file itself configured and answered as a fault on every request; the loop keeps reading, because a client that
+can talk to a server it cannot configure still deserves answers.
+
 ## Methods
 
 `initialize` reports the authoritative list; `protocol` stays `1`.

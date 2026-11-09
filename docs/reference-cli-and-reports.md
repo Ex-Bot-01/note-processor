@@ -5,6 +5,7 @@ What each command writes, which keys `--json` carries and why they are always pr
 > *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
 ```sh
+# Global flags come before the subcommand: -v | -vv | -vvv, --log-spec SPEC, --log-file PATH
 np setup <workspace> [--json] [--yes]     # index, fetch the pinned model if missing, embed — one command for a caller that wants vectors
 np scan <workspace> [--json]              # index + regenerate the catalog
 np embed <workspace> [--json]             # embed what the index says is owed
@@ -34,6 +35,9 @@ np models install|fetch|hash|list …
   `recorded_upgrade_orphans` and `recorded_merged_notes`, so "what did an upgrade delete here last month?" is a question `np scan --json` answers instead of
   one that needs a database shell (**F21**). A `null` means the file holds no such record; the all-zero string means the check ran and removed nothing, and
   those two states are never collapsed into an empty string.
+- **Diagnostics never enter stdout.** `-v`, `NP_LOG` or `[log] level` puts human text on stderr; `--log-file` / `[log] file` writes
+  JSONL; both are off unless asked, and every report and exit code above is byte-identical with them on or off. The levels, the ten
+  targets, the twenty-one rule tokens and both caps are in [`docs/reference-diagnostics.md`](reference-diagnostics.md).
 - **`--json` is the machine interface.** stdout carries exactly one JSON document (`scan`, `embed`, `search`, `models list`).
   Search's document is `{hits, mode, note, vectors}`: the list, the mode that ran, a sentence about a half that could not run
   (`null` when nothing was missing), and whether this workspace holds vectors at all — so "no semantic hits" and "no model

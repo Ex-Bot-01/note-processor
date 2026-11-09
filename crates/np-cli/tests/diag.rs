@@ -1502,7 +1502,10 @@ fn an_unread_stderr_pipe_never_stalls_the_request_loop() {
                 break;
             }
             written += 1;
-            if written % 50 == 0 {
+            // Every 50 rather than every line: the point of flushing is to let a stalled child be *noticed* early, and a
+            // per-line flush would measure the harness's syscalls instead of the server's behaviour. 50 is one flush per
+            // ~17 KiB of requests — several times before the pipe's 64 KiB capacity fills on its own.
+            if written.is_multiple_of(50) {
                 let _ = stdin.flush();
             }
         }
@@ -1554,4 +1557,69 @@ fn an_unread_stderr_pipe_never_stalls_the_request_loop() {
     );
     let status = child.wait().expect("the server exits once stdin closes");
     assert!(status.success(), "and the run ends cleanly: {status}");
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: the manual and the code are one list
+// ---------------------------------------------------------------------------
+
+/// Plan Task 6 Step 2, run from the binary's own test tree. `crates/np-core/tests/diagnostics.rs` checks the same two
+/// fences against `np_core::diagnostics`, and that is the right place for the *vocabulary*; this case is the one that
+/// answers the question an integrator actually asks — whether the document shipped next to **this artifact** lists every
+/// token this artifact can emit. It therefore reads the repository's manual rather than a copy, in both directions: a
+/// token emitted and undocumented fails here, and so does a token documented that nothing emits (the failure mode a
+/// hand-written list drifts into).
+#[test]
+fn the_diagnostics_reference_documents_every_target_and_token() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/reference-diagnostics.md"
+    );
+    let manual = fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
+    for (fence, coded, what) in [
+        (
+            "diagnostic-tokens",
+            np_core::diagnostics::RULE_TOKENS.as_slice(),
+            "rule token",
+        ),
+        (
+            "diagnostic-targets",
+            np_core::diagnostics::TARGETS.as_slice(),
+            "target",
+        ),
+    ] {
+        let listed = fenced_block(&manual, fence)
+            .unwrap_or_else(|| panic!("`docs/reference-diagnostics.md` has no ```{fence} block"));
+        let documented: Vec<&str> = listed
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let missing: Vec<&&str> = coded.iter().filter(|t| !documented.contains(t)).collect();
+        let invented: Vec<&&str> = documented.iter().filter(|t| !coded.contains(t)).collect();
+        assert!(
+            missing.is_empty() && invented.is_empty(),
+            "{what}s drift between code and the manual.\n  undocumented: {missing:?}\n  invented: {invented:?}"
+        );
+    }
+    // The five phase names are a doc-side claim only — there is no code list to compare them with, and inventing one for
+    // a test would be a constant nobody reads at runtime. What this does catch is the cheap accident: renaming the
+    // `scan` span or dropping `fetch` from the manual while the other still names it.
+    for phase in ["scan", "embed", "search", "fetch", "serve.request"] {
+        let named = fenced_block(&manual, "diagnostic-spans")
+            .unwrap_or_else(|| panic!("the manual has no ```diagnostic-spans block"))
+            .lines()
+            .any(|line| line.trim() == phase);
+        assert!(
+            named,
+            "`{phase}` is a phase that reports its cost; the manual's span list must say so"
+        );
+    }
+}
+
+/// The body of the first fenced block whose info string is `info`.
+fn fenced_block(manual: &str, info: &str) -> Option<String> {
+    let opener = format!("```{info}");
+    let rest = &manual[manual.find(&opener)? + opener.len()..];
+    Some(rest[..rest.find("\n```")?].to_string())
 }

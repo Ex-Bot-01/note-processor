@@ -206,6 +206,12 @@ page reload — is in [`docs/reference-serve.md`](docs/reference-serve.md); the 
 [`np serve` over stdio](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) and its
 [progress design](docs/superpowers/specs/2026-12-09-np-serve-progress-design.md).
 
+Diagnostics stay off the protocol: `-v`, `NP_LOG` or `[log] level` puts human text on stderr, `[log] file` writes JSONL, and every
+record raised inside a request carries that request's id. You are not obliged to read stderr — np drops diagnostics rather than
+waiting for a client that will not drain the pipe.
+[`docs/reference-diagnostics.md`](docs/reference-diagnostics.md) lists the levels, the ten targets and all twenty-one rule tokens;
+[`docs/measurement-np-diagnostics-cost.md`](docs/measurement-np-diagnostics-cost.md) is what they cost when you do not ask.
+
 ## Images, briefly
 
 A note links a figure with ordinary markdown — `![alt](diagram.png)` — resolved like any other link, inside the workspace only.
@@ -227,6 +233,7 @@ text-only on the image side and say so per figure rather than silently skipping.
 | `np embed` reports `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |
 | `locked: another process is writing this workspace (2000 ms)` | Another `np` holds this vault's write lock. Retry; readers were never blocked, and a killed process cannot leave a lock behind |
 | `offline: could not reach the pinned origin to fetch …` | Auto-fetch tried and nothing answered. `setup` still indexed and exited 0; keyword search works meanwhile; no partial state was written |
+| `np` printed nothing while you were sure something went wrong | Diagnostics are off until asked for: add `-vv`, or `NP_LOG=debug`, for the per-file reasons, and `[log] file` for the JSONL version. Nothing here touches stdout — see [Diagnostics reference](docs/reference-diagnostics.md) |
 
 The full table — including every refusal sentence, the two llama.cpp warnings that are normal, and what to read when an old schema
 upgrade removed something: [Troubleshooting](docs/reference-troubleshooting.md).
@@ -254,6 +261,7 @@ upgrade removed something: [Troubleshooting](docs/reference-troubleshooting.md).
 | [Configuration reference](docs/reference-config.md) | every key, default, and refusal |
 | [CLI and report reference](docs/reference-cli-and-reports.md) | `--json` fields, report lines, exit codes, measured output |
 | [`np serve` reference](docs/reference-serve.md) | the stdio protocol: methods, fault codes, progress phases, captured transcripts |
+| [Diagnostics reference](docs/reference-diagnostics.md) | `-v`, `NP_LOG`, `[log]`: levels, targets, rule tokens, both caps, what a diagnostic may never contain |
 | [Images in the index](docs/reference-images.md) | sniffing, the six refusal classes, why vector formats are out |
 | [Troubleshooting](docs/reference-troubleshooting.md) | every sentence `np` prints that makes people pause |
 | [Release archive caveats](docs/reference-releases.md) | what each version's assets do and cannot do |
