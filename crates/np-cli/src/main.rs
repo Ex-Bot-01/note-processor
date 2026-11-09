@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod serve;
+mod serve_channel;
 
 use clap::{Parser, Subcommand};
 use np_core::catalog::size_human;

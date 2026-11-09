@@ -29,7 +29,7 @@
 //! was down; that rule cost three cards to establish and travels here unchanged.
 
 use std::error::Error;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 use serde_json::{json, Value};
 
@@ -109,49 +109,22 @@ fn refused<E: Into<Box<dyn Error>>>(source: E) -> ServeError {
 
 /// Serve until stdin closes. Returns `Ok` on EOF and on `shutdown`: a client that hung up is not a failure, and neither is one that said goodbye.
 pub fn serve() -> Result<(), Box<dyn Error>> {
-    let stdin = io::stdin();
-    let input = stdin.lock().lines();
     // One handle, locked for the loop's life: interleaving responses on a shared stdout is exactly the corruption a client cannot recover from.
+    let stdin = io::stdin();
     let mut out = io::stdout().lock();
-    for line in input {
-        let line = match line {
-            Ok(line) => line,
-            Err(source) => {
-                // "stdin unreadable" has no useful response to send (we cannot even know a request id) and the loop cannot continue.
-                let _ = writeln!(io::stderr(), "np: serve: stdin: {source}");
-                break;
-            }
-        };
-        match handle_line(&line) {
-            Some(response) => {
-                let text = serde_json::to_string(&response).unwrap_or_else(|source| {
-                    // A response that will not serialise means a document contained something JSON cannot hold. Say so on stderr with the reason,
-                    // and send the generic internal fault: the alternative is a half-written line, which breaks framing for every request after it.
-                    let _ = writeln!(io::stderr(), "np: serve: response not serialisable: {source}");
-                    r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"response could not be serialised"},"id":null}"#.to_string()
-                });
-                let _ = writeln!(out, "{text}");
-                let _ = out.flush();
-            }
-            // A notification gets no response — including for a malformed line, per JSON-RPC 2.0 §5: nothing is known about the sender's intent,
-            // so there is nothing to answer and an error would be a guess.
-            None => {
-                if !line.trim().starts_with('{') {
-                    let _ = writeln!(
-                        io::stderr(),
-                        "np: serve: ignored a line that is not a JSON object"
-                    );
-                }
-            }
-        }
-    }
+    let mut ch = crate::serve_channel::Channel::new(&mut out);
+    // Every behaviour of the old inline loop lives on, now behind a sink the unit tests can drive in-process.
+    crate::serve_channel::serve_loop(stdin.lock(), &mut ch)?;
     Ok(())
 }
 
 /// One line in, at most one response out (`None` for notifications and unparseable garbage).
 ///
 /// Split from [`serve`] so the whole protocol is testable without a pipe: the tests call this with a string and read a value back.
-fn handle_line(line: &str) -> Option<Value> {
+pub(crate) fn handle_line(
+    line: &str,
+    _ch: &mut crate::serve_channel::Channel<'_>,
+) -> Option<Value> {
     if line.trim().is_empty() {
         // A blank line is not a request. Silently ignored rather than faulted, because the likely source is a client writing "\n" to flush or keep
         // the pipe warm — answering that with an error would train it to stop asking. The rule lives here rather than in the read loop so that it
@@ -398,14 +371,25 @@ fn fault_response(id: Value, fault: Fault) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::{handle_line, Fault};
+
+    /// Drive one line through [`handle_line`] with a throwaway channel. The assertions below are the ones written
+    /// against the pure function; the channel exists because the request handler is about to need it, and a test that
+    /// threw its `Vec<u8>` away would still be asserting exactly what it asserted before.
+    fn answer(line: &str) -> Option<Value> {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut ch = crate::serve_channel::Channel::new(&mut sink);
+        handle_line(line, &mut ch)
+    }
+
     use super::*;
 
     /// A response to every request that carries an id, and to none that does not — the notification rule, which is what lets a client fire a
     /// `scan` and keep asking questions.
     #[test]
     fn a_notification_gets_no_response_at_all() {
-        assert!(handle_line(r#"{"jsonrpc":"2.0","method":"nope"}"#).is_none());
-        let reply = handle_line(r#"{"jsonrpc":"2.0","id":7,"method":"nope"}"#);
+        assert!(answer(r#"{"jsonrpc":"2.0","method":"nope"}"#).is_none());
+        let reply = answer(r#"{"jsonrpc":"2.0","id":7,"method":"nope"}"#);
         assert!(reply.is_some(), "the same call with an id must be answered");
     }
 
@@ -418,7 +402,7 @@ mod tests {
     #[test]
     fn every_unparseable_line_is_answered_with_a_null_id() {
         for line in ["{not json", "total garbage", r#"{"jsonrpc":"2.0","#] {
-            let reply = handle_line(line).unwrap_or_else(|| panic!("`{line}` went unanswered"));
+            let reply = answer(line).unwrap_or_else(|| panic!("`{line}` went unanswered"));
             assert_eq!(
                 reply["error"]["code"],
                 Fault::PARSE_ERROR,
@@ -432,16 +416,15 @@ mod tests {
     /// keepalive. Answering it would train that client to stop sending requests.
     #[test]
     fn a_blank_line_is_not_a_request() {
-        assert!(handle_line("").is_none());
-        assert!(handle_line("   ").is_none());
+        assert!(answer("").is_none());
+        assert!(answer("   ").is_none());
     }
 
     /// An unknown method names the ones this build has. A support report should be self-explanatory, and a client that typed `models.list` as
     /// `models_list` should find out in one round trip rather than by reading source.
     #[test]
     fn an_unknown_method_lists_what_this_build_answers() {
-        let reply =
-            handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"models_list"}"#).expect("answered");
+        let reply = answer(r#"{"jsonrpc":"2.0","id":3,"method":"models_list"}"#).expect("answered");
         assert_eq!(reply["error"]["code"], Fault::METHOD_NOT_FOUND);
         let message = reply["error"]["message"].as_str().expect("a message");
         assert!(message.contains("search"), "{message}");
@@ -451,8 +434,7 @@ mod tests {
     /// `initialize` is the capability answer a UI needs before it draws anything, and it must never require a workspace.
     #[test]
     fn initialize_reports_version_protocol_and_features() {
-        let reply =
-            handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).expect("answered");
+        let reply = answer(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).expect("answered");
         assert_eq!(reply["result"]["protocol"], PROTOCOL);
         assert!(reply["result"]["np"].is_string(), "{reply}");
         for key in ["local_model", "vision", "fetch"] {
@@ -479,7 +461,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"search","params":{"query":"x"}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"scan","params":{"workspace":""}}"#,
         ] {
-            let reply = handle_line(body).expect("answered");
+            let reply = answer(body).expect("answered");
             assert_eq!(
                 reply["error"]["code"],
                 Fault::INVALID_PARAMS,
