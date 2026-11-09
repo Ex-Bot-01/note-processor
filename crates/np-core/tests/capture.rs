@@ -17,6 +17,11 @@
 //! several threads. So the subscriber is installed once, and [`case`] holds a mutex around each case: clear, run,
 //! drain. Events from another case's thread cannot land inside a drained list, because that thread is blocked on the
 //! same gate.
+//!
+//! The gate serialises **cases**, not emitters: a case that runs np-core without [`case`] still emits into the one shared
+//! list, and its events surface as a duplicated rule in somebody else's assertion — which is what happened once with
+//! `not-produced`, counted twice by a case that emitted it exactly once. Every record therefore carries the thread that
+//! emitted it, and [`case`] fails loudly when a foreign one appears, naming the mistake and its fix.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::field::{Field, Visit};
@@ -33,6 +38,8 @@ pub struct Record {
     pub msg: Option<String>,
     /// Every other field, in emission order, each rendered with its `Display`.
     pub fields: Vec<(String, String)>,
+    /// Which thread emitted this. [`case`] asserts it is the case's own thread — see the header's gate.
+    pub thread: std::thread::ThreadId,
 }
 
 impl Record {
@@ -83,6 +90,7 @@ impl Subscriber for Capture {
             level: *event.metadata().level(),
             msg: visitor.msg,
             fields: visitor.fields,
+            thread: std::thread::current().id(),
         });
     }
 
@@ -154,5 +162,18 @@ pub fn case<T>(run: impl FnOnce() -> T) -> (T, Vec<Record>) {
         .lock()
         .expect("diagnostics capture: no case panics while holding it")
         .clone();
+    // **The gate holds cases; this holds emitters.** A case that runs np-core *outside* [`case`] still emits into the one
+    // shared list, and its events land inside whichever case happens to be gated — which reads as "this rule was reported
+    // twice" in a case with no connection to the first. That is exactly how `not-produced` turned up twice here once: the
+    // outcome-shape case called an embedding run without holding the gate. Foreign events are named rather than dropped,
+    // because dropping them would make "nothing else was emitted" unfalsifiable — the claim this harness exists to keep.
+    let me = std::thread::current().id();
+    let foreign: Vec<&Record> = events.iter().filter(|event| event.thread != me).collect();
+    assert!(
+        foreign.is_empty(),
+        "{} event(s) in this case's capture were emitted by another thread, which means a case ran np-core without \
+         holding the gate (wrap it in `capture::case`): {foreign:?}",
+        foreign.len()
+    );
     (value, events)
 }

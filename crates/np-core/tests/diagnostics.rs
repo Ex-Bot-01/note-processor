@@ -460,7 +460,10 @@ fn the_refusing_provider_produces_a_refusal_outcome() {
     let setup = workspace(1);
     setup.install_model();
     setup.touch_artifact();
-    let report = embed_refused(&setup, Refusal::Unavailable("nope"));
+    // Inside `case` although this case reads no events: it runs an embedding run, and an embedding run **emits**. Held
+    // outside the gate those events land in whichever case is gated at the time, which is how `not-produced` came to
+    // appear twice in a case that ran one batch. Draining them here costs nothing and makes the leak impossible.
+    let (report, _events) = case(|| embed_refused(&setup, Refusal::Unavailable("nope")));
     assert!(
         matches!(report.outcome, EmbedOutcome::NotProduced { .. }),
         "{:?}",
