@@ -293,5 +293,76 @@ A fresh reviewer read this document before the operator saw it (`delegate`, 2026
 
 ## Rollout
 
-Ships in the next release after approval and planning (v0.3.x feature versus v0.4.0 — decide at plan time by what else is in flight). Nothing here
-changes CLI behaviour, exit codes, `--json` documents, or on-disk format; a client that ignores notifications sees the v0.3.0 server as documented.
+**Status: shipped on `main`.** It rides the next release as a feature addition — protocol stays `1`, so it is a `0.3.x` bump unless something
+else in flight forces otherwise. Nothing here changes CLI behaviour, exit codes, `--json` documents, or on-disk format; a client that ignores
+notifications sees the v0.3.0 server as documented, which is asserted by a test rather than promised here (the 47 pre-existing `tests/cli.rs`
+cases pass untouched, in both feature configurations). See [As built](#as-built-2026-12-09) for the twelve places the implementation landed
+differently from this design.
+
+---
+
+## As built (2026-12-09)
+
+The implementation is shipped; this section records where it landed differently from the design, and why. Each entry names the
+commit or test that pins it, so a future reader can re-check the claim instead of trusting this prose.
+
+**Shaped as designed.** Opt-in via `initialize.params.notifications`, protocol version unchanged at `1`, notification method
+`np/progress` with **no `id` member**, always-present `command`/`phase`/`since_ms` and `request` only when the request had an id,
+per-member byte counters with a pinned denominator, terminal line mirroring the response kind, `status.get` returning exactly
+`{last, fetch_markers, running}` with `running` permanently `null`, bookended scan, search narrating `resolving`.
+
+**Where the design was wrong, and what replaced it.**
+
+1. **`Progress::NONE` cannot exist.** The design wrote the no-op reporter as an associated constant of type `&dyn Progress`;
+   Rust does not allow a `&dyn Trait` value to be an associated const. Shipped as the free function `progress::none()`, used by
+   every CLI call site — which is what keeps `np search --json` byte-identical (proved by the 47 pre-existing `tests/cli.rs`
+   cases passing untouched, and again under `--features local-model,fetch`).
+2. **`Phase::Resolving` was missing from the enum.** Search needs a phase for "deciding which provider and artifact", because
+   that is the stretch where it can start downloading 309 MB without writing an answer. It is also the *default* phase, so a
+   silent reporter means "still deciding", never a false claim of work in progress.
+3. **`Progress` is not `Sync`.** The design implied a shareable reporter. The adapter holds `&mut Channel` (stdout) through a
+   `RefCell`; requiring `Sync` would have made it impossible to compile, and the server is single-threaded by design. Removed
+   rather than worked around with locks.
+4. **Fetch reporting takes a `Transfer` struct, not eight arguments.** The planned signature tripped `clippy::too_many_arguments`
+   under `-D warnings`. `fetch::Transfer { transport, clock, progress, … }` bundles the environment; `fetch_with_progress` does
+   the work and `fetch` / `fetch_with_table` stay thin wrappers over `progress::none()`, so no existing caller changed shape.
+5. **`fetch_reporting(...)` was added to np-core.** Both embed and search reach auto-fetch through `fetch_pinned_missing`
+   (`main.rs:1971`), and rebuilding pin expectations at each call site to thread a reporter would have created a second path to
+   get wrong. One function, one reporter parameter, both commands covered.
+6. **Members are `main` and `mmproj`,** as `pins.rs` and `models::MAIN_FILE` name them — not `model`. The design's §6 prose was
+   wrong about the wire format; `docs/reference-serve.md` shows captured lines with the real spelling.
+7. **`methods` does not change on opt-in.** It lists what the build accepts, and `status.get` works either way. Advertising it
+   only to opted-in clients would understate the server: the flag that changes unsolicited traffic is `progress`.
+8. **The scan bookend's closing line bypasses the throttle** (`Channel::notify_unthrottled`). Applying one-line-per-second to a
+   pair that lands in the same second drops the ending on every workspace that scans in under a second — which is all of them —
+   and a client left with only the opening line believes a walk is still running. Throttling exists to keep long phases from
+   becoming traffic, not to break sentences in half.
+9. **`chunks_total` does not ship.** The design allowed it as optional. np-core's chunk pass discovers work lazily (it counts
+   pending chunks as it walks), so any total emitted at phase start would be a guess; `chunks_done` plus `embedded` carry the
+   truth and absence means *unknown*, not zero. A client must treat a missing denominator as "cannot compute a percentage".
+10. **`writing` is emitted only when something was actually written** — `embedded` increased between batch callbacks. An embed
+    whose batches were all refused by budget or contention therefore ends in `embedding`, and does not claim a commit that did
+    not happen. Scan never emits `writing`: it writes the catalog through its own path, and inventing a phase for it would make
+    the phase mean two different things.
+11. **Terminal ordering is response-then-notification,** deliberately: a client can read the answer as the thing that ends a
+    command and use the notification only for continuity. Reversing them would let a client see "completed" for a result it has
+    not received yet, which is the one ordering mistake that produces a stuck spinner.
+12. **`status.get` never opens or creates the workspace database.** Marker visibility comes from listing the models directory —
+    the same path F46's fetch-state read uses — so asking about a path that is not a workspace returns an empty list and leaves
+    no `.sqlite` file behind. There is a test for exactly that, because "read-only" is only worth the word if something proves
+    it does not write.
+
+**What the tests refuse to pretend.** The fetch-narration case over a real pipe serves the pinned `Content-Length` and then hangs
+up after 12 MiB rather than completing a 309 MB download inside `cargo test`; it proves byte checkpoints, the pinned denominator,
+forward-only bytes within a member, and a terminal `refused -32000`, and its doc comment says plainly that a *verified* download
+belongs to the artifact-gated rows. The origin dribbles one chunk per 1.2 s so the throttle's window is observable instead of
+fought — asserting "many lines" against a fast loopback transfer would be asserting that the throttle is broken.
+
+**Measured, not assumed.** Mutants were run for each claim that could otherwise survive by being untested: ignoring the opt-in,
+dropping the opening bookend, deleting the `resolving` report, using the transport-announced size as the denominator, letting
+bytes run backwards between members, and reporting `writing` after a batch that wrote nothing. Each one turns a named test red.
+
+**Evidence.** `.superpowers/sdd/2026-12-09-np-serve-progress/progress.md` carries per-task commits, the rulings above at the
+moment they were made, and the gate log paths; `docs/reference-serve.md` is the interface reference with four captured
+transcripts, one of which shows a *second* process reporting an in-flight download that the first process could not have
+described about itself.
