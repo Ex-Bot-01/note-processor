@@ -1012,6 +1012,9 @@ pub fn ranked(
     query_text: &str,
     limit: usize,
 ) -> Result<Answer, SearchError> {
+    // The ranking phase (diagnostics design point 7). No workspace field: this function is handed a connection, and the
+    // caller that knows the vault — np-cli, or a `np serve` request span — tags everything nested inside it anyway.
+    let _span = tracing::info_span!(target: crate::diagnostics::target::SEARCH, "search").entered();
     let mut semantic: Vec<Hit> = Vec::new();
     let mut semantic_used = false;
     if mode != SearchMode::Keyword {
@@ -1029,6 +1032,21 @@ pub fn ranked(
     }
 
     let keyword_used = mode != SearchMode::Semantic && match_expression(query_text).is_some();
+    // **Which halves actually ran**, at the level someone reaches for when nothing failed but the answer is not what they
+    // expected. No `rule`: there is no refusal here, and the states that do refuse already report `no-vectors` or
+    // `provider-disabled` where they are decided — repeating a token on a routine per-query line would hand a reader two
+    // records to reconcile for one fact.
+    tracing::debug!(
+        target: crate::diagnostics::target::SEARCH,
+        "mode {} ranked {}",
+        mode.label(),
+        match (semantic_used, keyword_used) {
+            (true, true) => "both halves",
+            (true, false) => "the vector list only",
+            (false, true) => "the keyword list only",
+            (false, false) => "nothing: neither half had anything to rank",
+        }
+    );
     let keywords = if keyword_used {
         keyword(conn, query_text, limit)?
     } else {

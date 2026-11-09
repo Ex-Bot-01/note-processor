@@ -173,6 +173,37 @@ pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>
     // The id travels with the call: a progress line names the request it belongs to, and a command that arrived as a
     // notification has no id to name — which is a different thing from an id of `null` (**Review Focus 5**).
     let call_id = id.clone();
+    // **Every diagnostic this request causes carries the request** (diagnostics design §"Serve"). The span opens here,
+    // where both facts are known and before anything can emit, and closes on every path out of this function — including
+    // the panic path, whose record is the one a reader most needs to place.
+    //
+    // Both fields are declared empty and recorded only when they exist. A notification has no id and gets no `request`
+    // key rather than a null one — the same rule `serve_channel.rs` keeps on the wire, for the same reason: `null` would
+    // make "no id", "id is null" and "not part of a request" one indistinguishable answer. A non-string, non-integer id
+    // (an object, an array) correlates on nothing, so it too leaves the key out rather than inventing a spelling.
+    let span = tracing::info_span!(
+        target: np_core::diagnostics::target::SERVE,
+        "serve.request",
+        request = tracing::field::Empty,
+        workspace = tracing::field::Empty,
+    );
+    match id.as_ref() {
+        Some(Value::String(text)) => {
+            span.record("request", text.as_str());
+        }
+        Some(Value::Number(number)) => {
+            if let Some(as_u64) = number.as_u64() {
+                span.record("request", as_u64);
+            } else if let Some(as_i64) = number.as_i64() {
+                span.record("request", as_i64);
+            }
+        }
+        _ => {}
+    }
+    if let Some(workspace) = params.get("workspace").and_then(Value::as_str) {
+        span.record("workspace", workspace);
+    }
+    let _entered = span.enter();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         dispatch(method, &params, call_id.as_ref(), ch)
     }));

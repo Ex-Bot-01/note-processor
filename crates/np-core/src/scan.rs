@@ -469,6 +469,16 @@ fn scan_inner(
     // One absolute spelling for the walk, the database key, the stored `abs` and the registry row, so
     // one folder is one workspace however it was typed (spec §11).
     let root = abs_path(root);
+    // **The phase reports itself** (diagnostics design point 7): one span for the whole pass, so every event inside it
+    // inherits the workspace and its close says what the scan cost. The name is `scan` because that is the word the CLI,
+    // `np setup`'s step line and the manual all use; the target is the published one rather than `module_path!()`, so
+    // renaming this file cannot silently rename a filter somebody wrote.
+    let _span = tracing::info_span!(
+        target: crate::diagnostics::target::SCAN,
+        "scan",
+        workspace = %root.display()
+    )
+    .entered();
     // Before the walk, not on the way out: a corpse the walk lists is a file this scan would index as an
     // attachment (see [`clear_temp_corpses`]). One that will not be removed is reported and retried by
     // the next scan; it does not end this one.

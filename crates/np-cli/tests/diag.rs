@@ -1262,3 +1262,169 @@ fn each_skipped_file_reaches_the_file_with_its_own_rule() {
         "§4: a per-item routine rule is `trace`, whatever level let it through"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 5: spans — every line knows the request that caused it, and what a phase cost
+// ---------------------------------------------------------------------------
+
+/// Plan Task 5 Step 1: two requests down one pipe, one with `id: 9` and one notification-shaped (no id at all), against
+/// a config that refuses so each request produces a diagnostic of its own. The tagged half is the correlation an
+/// integrator asked for; the untagged half is the harder half and the reason this is a test rather than a `null`: a
+/// frontend that sees `"request": null` cannot tell "this line belongs to no request" from "this request had no id",
+/// which is the same ambiguity `serve_channel.rs` refuses on the wire by omitting the key.
+#[test]
+fn a_serve_request_tags_every_line_it_causes() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).expect("test setup: vault dir");
+    fs::write(root.join("a.md"), "# Alpha\n\nword\n").expect("test setup: note");
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(config_dir.join("note-processor")).expect("test setup: config dir");
+    let log = tmp.path().join("np.jsonl");
+    // A refusing file that still names its own log: F35's failure shape, and the one combination where a per-request
+    // diagnostic exists without asking a working command to produce one.
+    fs::write(
+        config_dir.join("note-processor").join("config.toml"),
+        format!(
+            "[log]\nfile = {}\nlevel = \"error\"\n[loggg]\nlevel = \"info\"\n",
+            toml_str(&log.display().to_string())
+        ),
+    )
+    .expect("test setup: write a refusing config with a working [log]");
+
+    let requests = vec![
+        request(9, "scan", serde_json::json!({"workspace": root})),
+        // `request(0, …)` emits no `id` key at all — the notification shape.
+        request(0, "scan", serde_json::json!({"workspace": root})),
+    ];
+    let (code, _, _) = serve_with(&requests, |cmd| {
+        cmd.env("XDG_DATA_HOME", tmp.path().join("data"))
+            .env("LOCALAPPDATA", tmp.path().join("data"))
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("APPDATA", &config_dir);
+    });
+    assert_eq!(code, 0, "the server ran both requests: {code}");
+
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    let refusals: Vec<&Value> = records
+        .iter()
+        .filter(|record| record.get("rule").and_then(Value::as_str) == Some("config-refused"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        2,
+        "one refusal per request, and the file is in append order: {records:?}"
+    );
+    assert_eq!(
+        refusals[0].get("request").and_then(Value::as_u64),
+        Some(9),
+        "the first request's line carries its id: {}",
+        refusals[0]
+    );
+    assert!(
+        refusals[1].get("request").is_none(),
+        "a request with no id gets the key **omitted**, never `null` and never \"none\": {}",
+        refusals[1]
+    );
+    for record in &records {
+        assert_ne!(
+            record.get("request"),
+            Some(&Value::Null),
+            "`request` is either an id or absent: {record}"
+        );
+    }
+    // The workspace travels the same way, because a server can serve several vaults from one process and a line that
+    // cannot say which one it is about is a line nobody can act on.
+    assert!(
+        refusals[0]
+            .get("workspace")
+            .and_then(Value::as_str)
+            .is_some_and(|w| w.ends_with("vault")),
+        "every record inside a request span names its workspace: {}",
+        refusals[0]
+    );
+}
+
+/// Plan Task 5 Step 3: a phase reports what it cost, and search says which half it actually ranked.
+///
+/// The scan is over 400 notes rather than the two-note vault most cases here use for one reason: `elapsed_ms` of `0`
+/// is a legitimate measurement of a fast phase, and asserting `> 0` against a corpus that could finish inside a
+/// millisecond would make the case depend on how busy the machine running it happens to be.
+#[test]
+fn a_slow_phase_reports_its_cost() {
+    let vault = Vault::new();
+    vault.write_notes(400);
+    let log = vault.log_config(None);
+    vault.write_user_config(&format!(
+        "[log]\nfile = {}\nlevel = \"info\"\n",
+        toml_str(&log.display().to_string())
+    ));
+
+    let scan = vault.exec(&["scan"]);
+    assert_eq!(scan.code, 0, "{}", scan.stderr);
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    let timed: Vec<&Value> = records
+        .iter()
+        .filter(|record| record.get("elapsed_ms").is_some())
+        .collect();
+    assert!(
+        !timed.is_empty(),
+        "a scan at info reports what its phase cost: {records:?}"
+    );
+    let scan_span = timed
+        .iter()
+        .find(|record| record.get("target").and_then(Value::as_str) == Some("np_core::scan"))
+        .unwrap_or_else(|| panic!("no timing record on the scan target: {timed:?}"));
+    assert_eq!(
+        scan_span.get("level").and_then(Value::as_str),
+        Some("info"),
+        "timing is a state change worth reading later (§4): {scan_span}"
+    );
+    assert!(
+        scan_span
+            .get("elapsed_ms")
+            .and_then(Value::as_u64)
+            .is_some_and(|ms| ms > 0),
+        "400 notes is more than a millisecond of work: {scan_span}"
+    );
+
+    // The search half: at `debug`, the run says which lists it ranked. This is the line that answers "why did I get
+    // keyword results" when nothing failed — no rule, because there is no refusal; just the mode it was asked for and
+    // the halves it used.
+    fs::remove_file(&log).expect("setup: empty the log");
+    vault.write_user_config(&format!(
+        "[log]\nfile = {}\nlevel = \"debug\"\n",
+        toml_str(&log.display().to_string())
+    ));
+    let root = vault.root.to_str().expect("utf-8 path");
+    let search = run(&mut vault.command(&["search", root, "word"]));
+    assert_eq!(search.code, 0, "{}", search.stderr);
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    let ranked = records
+        .iter()
+        .filter(|record| record.get("target").and_then(Value::as_str) == Some("np_core::search"))
+        .filter(|record| record.get("level").and_then(Value::as_str) == Some("debug"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranked.len(),
+        1,
+        "one search, one account of what it ranked: {records:?}"
+    );
+    let msg = ranked[0]
+        .get("msg")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        msg.contains("keyword"),
+        "the sentence names the half that ran: {msg}"
+    );
+    assert!(
+        ranked[0].get("rule").is_none(),
+        "this is not a refusal, so it carries no rule: {}",
+        ranked[0]
+    );
+}

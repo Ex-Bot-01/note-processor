@@ -31,14 +31,14 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use np_core::config::{Config, DiagSource, DiagSpec, Level, DEFAULT_LOG_MAX_BYTES, DIAG_ENV_VAR};
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
-use tracing::{Event, Level as TracingLevel, Metadata, Subscriber};
+use tracing::{span, Event, Level as TracingLevel, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::registry::{LookupSpan, SpanRef};
 
 /// How many diagnostic lines one process may print to stderr before it stops (spec point 8).
 ///
@@ -660,6 +660,91 @@ impl Visit for Record {
     }
 }
 
+/// What a span hands to every record opened inside it (spec §"Serve": *each request span carries the JSON-RPC `id` (or
+/// none) and the workspace path*).
+///
+/// Only two keys are inherited — `request` and `workspace` — because those are the two a reader cannot recover from the
+/// line itself once several vaults and several requests share one process. Anything else a span carries belongs to the
+/// span's own close record, not to every event nested in it.
+///
+/// **Absent means omitted.** A notification-shaped request has no id, and `serve_channel.rs` already refuses to write
+/// `"id": null` on the wire for the same reason: a frontend that sees `null` cannot tell "no id was given" from "the id
+/// is the value null", nor either from "this line belongs to no request". So there is no `request` entry at all, and
+/// [`DiagLayer::on_event`] copies only entries that exist.
+#[derive(Debug)]
+struct SpanInfo {
+    /// The inheritable keys this span declares.
+    declared: Vec<(String, Value)>,
+    /// When the phase began, so [`DiagLayer::on_close`] can report what it cost (spec point 7).
+    started: Instant,
+}
+
+/// Whether a span field is one a nested record should carry.
+fn inherited_key(name: &str) -> bool {
+    name == "request" || name == "workspace"
+}
+
+/// The fields a span was opened with, keeping only the inheritable ones.
+#[derive(Default)]
+struct SpanFields {
+    kept: Vec<(String, Value)>,
+}
+
+impl Visit for SpanFields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if inherited_key(field.name()) {
+            // `%path.display()` arrives here as a display wrapper whose `Debug` is its `Display`, so this is the bare
+            // path rather than a quoted copy of it — which is what makes `record["workspace"]` a string worth comparing
+            // instead of a string with punctuation glued on.
+            let rendered = format!("{value:?}");
+            self.kept
+                .push((field.name().to_string(), Value::from(rendered)));
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if inherited_key(field.name()) {
+            self.kept
+                .push((field.name().to_string(), Value::from(value)));
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        if inherited_key(field.name()) {
+            self.kept
+                .push((field.name().to_string(), Value::from(value)));
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if inherited_key(field.name()) {
+            self.kept
+                .push((field.name().to_string(), Value::from(value)));
+        }
+    }
+}
+
+/// The inheritable keys of `span` and its ancestors, innermost first, duplicates dropped — so the closest spelling of
+/// `request` or `workspace` is the one that travels, and a record never carries two values for one key.
+fn inherited_from<'a, S>(span: &SpanRef<'_, S>) -> Vec<(String, Value)>
+where
+    S: for<'x> LookupSpan<'x>,
+{
+    let mut out: Vec<(String, Value)> = Vec::new();
+    for ancestor in span.scope() {
+        let extensions = ancestor.extensions();
+        let Some(info) = extensions.get::<SpanInfo>() else {
+            continue;
+        };
+        for (key, value) in &info.declared {
+            if !out.iter().any(|(seen, _)| seen == key) {
+                out.push((key.clone(), value.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// The subscriber's whole behaviour: filter by target and level, then write to whichever sinks want the record.
 struct DiagLayer {
     sink: Arc<Sink>,
@@ -673,14 +758,111 @@ where
     /// `format!`, no `Vec`, no lock. A per-target override can only raise what the ceiling check lets through, which is why the
     /// ceiling is the maximum over targets rather than the default level.
     fn enabled(&self, metadata: &Metadata<'_>, _: Context<'_, S>) -> bool {
+        // **Spans are tracked whatever the level.** A `warn`-level run still has to be able to say which request a line
+        // belonged to, and if the request span itself were filtered out at `info` the correlation key would vanish
+        // exactly for the errors a reader most needs to place. What is gated is what gets *written*: `on_close` re-checks
+        // the level before it emits a timing record, and events filter themselves above. The cost is one small extension
+        // per phase — spans here are opened once per scan, embed run, search and request, never per item.
+        if metadata.is_span() {
+            return true;
+        }
         self.sink
             .allows(metadata.target(), tracing_ordinal(metadata.level()))
     }
 
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+    /// Remember what a span declared and when it opened: the fields are read by every nested event, the instant only at
+    /// close.
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        let mut fields = SpanFields::default();
+        attrs.record(&mut fields);
+        if let Some(handle) = ctx.span(id) {
+            handle.extensions_mut().insert(SpanInfo {
+                declared: fields.kept,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    /// A closed phase reports what it cost (spec point 7). The record is the span's own — its target, a message naming
+    /// it — plus the inherited keys an event inside it would have carried, so a timing line belongs to the request that
+    /// caused the phase.
+    fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
+        let Some(handle) = ctx.span(&id) else {
+            return;
+        };
+        let (target, name, ms, inherited) = {
+            let extensions = handle.extensions();
+            let Some(info) = extensions.get::<SpanInfo>() else {
+                return;
+            };
+            // Saturating rather than overflowing: a phase that ran for six decades has the same diagnosis as one that
+            // ran for 584 million years, and a log line is not where an overflow should be discovered.
+            let ms = u64::try_from(info.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            (
+                handle.metadata().target(),
+                handle.name().to_string(),
+                ms,
+                inherited_from(&handle),
+            )
+        };
+        if !self
+            .sink
+            .allows(target, tracing_ordinal(&TracingLevel::INFO))
+        {
+            return;
+        }
+        let mut record = Record {
+            msg: format!("{name} finished"),
+            ..Record::default()
+        };
+        for (key, value) in inherited {
+            record.push(&key, value);
+        }
+        record.push("elapsed_ms", Value::from(ms));
+        if self.sink.stderr_on.load(Ordering::Relaxed) {
+            self.sink.write_stderr(&record.human("info", target));
+        }
+        if self.sink.has_file.load(Ordering::Relaxed) {
+            self.sink.write_file(&record.json("info", target));
+        }
+    }
+
+    /// A field filled in after the span opened (`request` and `workspace` are declared empty and recorded once the
+    /// request is parsed) merges into the same extension, so a nested event never sees half a correlation key.
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        let Some(handle) = ctx.span(id) else {
+            return;
+        };
+        let mut fields = SpanFields::default();
+        values.record(&mut fields);
+        if fields.kept.is_empty() {
+            return;
+        }
+        let mut extensions = handle.extensions_mut();
+        if let Some(info) = extensions.get_mut::<SpanInfo>() {
+            for (key, value) in fields.kept {
+                match info.declared.iter_mut().find(|(name, _)| *name == key) {
+                    Some(slot) => slot.1 = value,
+                    None => info.declared.push((key, value)),
+                }
+            }
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let meta = event.metadata();
         let mut record = Record::default();
         event.record(&mut record);
+        // **Correlation before formatting** (spec §"Serve"): whatever the enclosing spans declared rides on this
+        // record, innermost first, and a field the event set itself is never overwritten — an emitter that named its own
+        // workspace knows better than the span wrapped around it.
+        if let Some(current) = ctx.event_span(event) {
+            for (key, value) in inherited_from(&current) {
+                if !record.fields.iter().any(|(name, _)| name == &key) {
+                    record.push(&key, value);
+                }
+            }
+        }
         let level = level_text(meta.level());
         // The cap is checked before the line is built (spec point 8): a suppressed diagnostic costs a counter, not a `format!`.
         if self.sink.stderr_on.load(Ordering::Relaxed) && !record.already_printed {

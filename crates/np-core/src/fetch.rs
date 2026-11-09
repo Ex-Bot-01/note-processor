@@ -567,6 +567,11 @@ pub fn fetch_with_progress<T: MemberPin>(
     plan: &Expectation<'_, T>,
     transfer: &Transfer<'_>,
 ) -> Result<FetchReport, FetchError> {
+    // The transfer phase (diagnostics design point 7): one span per attempt, so a slow mirror shows up as time spent in
+    // `fetch` rather than as a command that appeared to hang. It carries no fields of its own: no origin (§12 rule 8
+    // holds as loudly here as anywhere), and the workspace is inherited from the `embed` or `setup` span wrapped around
+    // it, which is the same value spelled in one place rather than two.
+    let _span = tracing::info_span!(target: crate::diagnostics::target::FETCH, "fetch").entered();
     // `try_exists` rather than `metadata`: the difference shows up only for a path we cannot stat, and "someone else's problem, do not remove it"
     // is the answer that errs toward leaving data alone.
     let existed_before = models_dir.try_exists().unwrap_or(true);

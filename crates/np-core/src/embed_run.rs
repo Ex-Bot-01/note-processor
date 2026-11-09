@@ -821,6 +821,15 @@ fn run(
         return Err(ConfigError::MissingField("data_dir").into());
     }
     let root = abs_path(workspace);
+    // One span for the whole embed run, named `embed` for the same reason `scan` is named `scan` (diagnostics design
+    // point 7). It carries the workspace so a line from inside a batch says which vault it came from; the model id needs
+    // no field of its own, because every refusal that names an id already puts it in `what`.
+    let _span = tracing::info_span!(
+        target: crate::diagnostics::target::EMBED,
+        "embed",
+        workspace = %root.display()
+    )
+    .entered();
     let db_path = cfg.workspace_db(&root);
     let db = Db::open(&db_path)?;
 
