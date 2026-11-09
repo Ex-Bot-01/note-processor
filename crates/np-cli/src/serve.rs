@@ -686,10 +686,29 @@ mod tests {
         }
     }
 
-    /// The version string a client compares against `np --version`, from the same place both read.
+    /// **The handshake's version has to be a version.** The first version of this case asserted
+    /// `env!("CARGO_PKG_VERSION") == "0.3.0"`, which tested nothing about the program and instead failed every release bump — three
+    /// gate rows went red on 0.3.1 for a literal nobody had read. What is worth asserting is that the value a client compares against
+    /// `np --version` is shaped like one: equality with the CLI's own string is already pinned by `tests/serve.rs`, so the surviving
+    /// risk is an empty or mangled version reaching the handshake, not a number being one higher than someone expected.
     #[test]
-    fn initialize_names_the_package_version() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
+    fn initialize_names_a_version_shaped_string() {
+        let reply = answer(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).expect("answered");
+        let version = reply["result"]["np"].as_str().expect("a version string");
+        let bytes: Vec<char> = version.chars().collect();
+        let dots = bytes.iter().filter(|c| **c == '.').count();
+        assert_eq!(dots, 2, "expected major.minor.patch, got `{version}`");
+        for part in version.split('.') {
+            assert!(
+                !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()),
+                "`{version}` is not a semver-shaped release tag"
+            );
+        }
+        assert_eq!(
+            version,
+            env!("CARGO_PKG_VERSION"),
+            "the handshake and `np --version` must agree, or a client's compatibility check reads the wrong build"
+        );
     }
 
     /// **The state keys have to reach the terminal line, or a client cannot tell the endings apart.** `outcome` is the key
