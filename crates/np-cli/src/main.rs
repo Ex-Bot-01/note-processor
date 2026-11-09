@@ -1059,6 +1059,7 @@ fn search_run(
     limit: usize,
     mode: Option<search::SearchMode>,
     announce: bool,
+    progress: &dyn np_core::progress::Progress,
 ) -> Result<SearchRun, Box<dyn Error>> {
     let cfg = load_config()?;
     // Config first, flag over it: `[search] mode` is the standing choice and `--mode` is the exception to it.
@@ -1111,6 +1112,14 @@ fn search_run(
     let mut offline = false;
 
     if resolve {
+        // **`resolving` says which half of the answer is still missing** (**O2**). This is the stretch where a search can
+        // start downloading 309 MB without writing a byte to stdout, so it is the one a client needs a word about before
+        // it decides the process has hung. Keyword mode never reaches here — it resolves no provider and dials no
+        // transport — which is exactly why the phase is absent there rather than reported as instant.
+        progress.report(&np_core::progress::ProgressEvent {
+            phase: np_core::progress::Phase::Resolving,
+            ..Default::default()
+        });
         // **The mode opens the door; only configuration and the environment bolt it.** `AutoFetch::Deferred` is the same question
         // `np embed` asks when its caller passed neither `--auto-fetch` nor `--no-auto-fetch`: `[models] auto_fetch` first, then
         // `NP_NO_AUTO_FETCH=1`, which outranks everything. Search has no fetch flags of its own on purpose — `--mode` is the only
@@ -1119,13 +1128,7 @@ fn search_run(
         // `search_with_fetching_switched_off_says_so_instead_of_blaming_the_network` failed on the `local-model,fetch` row saying
         // `offline:true` where the switch meant "nothing was attempted".
         let fetch_allowed = hybrid && AutoFetch::Deferred.allowed(&cfg);
-        let resolved = embed_provider(
-            &cfg,
-            workspace,
-            fetch_allowed,
-            announce,
-            np_core::progress::none(),
-        )?;
+        let resolved = embed_provider(&cfg, workspace, fetch_allowed, announce, progress)?;
         let Resolved {
             state,
             fetched: arrived,
@@ -1285,7 +1288,14 @@ fn search_workspace(
     mode: Option<search::SearchMode>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let run = search_run(workspace, query, limit, mode, !json)?;
+    let run = search_run(
+        workspace,
+        query,
+        limit,
+        mode,
+        !json,
+        np_core::progress::none(),
+    )?;
     if json {
         emit_json(&search_document(&run));
         return Ok(());

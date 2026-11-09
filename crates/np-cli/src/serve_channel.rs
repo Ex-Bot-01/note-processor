@@ -157,6 +157,26 @@ impl<'a> Channel<'a> {
         self.pending_terminal = Some(params);
     }
 
+    /// Write one progress line **without consulting the throttle**, for a phase that is opening and closing inside the
+    /// same second.
+    ///
+    /// A bookend is one statement told in two lines — "the walk started", and "it ended with these counts". Applying the
+    /// one-per-second rule to the closing line would drop it on every workspace under a second to scan, which is most of
+    /// them, and leave a client holding an `indexing` line for work that finished. The rule exists to keep a long phase
+    /// from becoming the traffic; a phase this short was never the problem.
+    pub fn notify_unthrottled(&mut self, phase: Phase, params: Value) {
+        if !self.notifications {
+            return;
+        }
+        // Still recorded, so a later line inside the same phase is measured from the line a client actually saw.
+        let since = self.clock.since_start();
+        self.emitted_phase = Some(phase);
+        self.emitted_at = since;
+        self.sink.line(
+            &json!({"jsonrpc": "2.0", "method": "np/progress", "params": params}).to_string(),
+        );
+    }
+
     /// Write the response line, then the queued terminal line — the order a client reads them in.
     pub fn response_then_terminal(&mut self, value: &Value) {
         self.response(value);

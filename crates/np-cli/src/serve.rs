@@ -289,7 +289,7 @@ fn dispatch(
 ) -> Result<Value, ServeError> {
     match method {
         "initialize" => Ok(initialize(params, ch)),
-        "search" => search(params),
+        "search" => search(params, request, ch),
         "scan" => scan(params, request, ch),
         "embed" => embed(params, request, ch),
         "models.list" => models_list(params),
@@ -358,7 +358,11 @@ fn workspace_of(params: &Value) -> Result<std::path::PathBuf, ServeError> {
     Ok(std::path::PathBuf::from(raw))
 }
 
-fn search(params: &Value) -> Result<Value, ServeError> {
+fn search(
+    params: &Value,
+    request: Option<&Value>,
+    ch: &mut crate::serve_channel::Channel<'_>,
+) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
     let query = params.get("query").and_then(Value::as_str).ok_or_else(|| {
         ServeError::fault(Fault::INVALID_PARAMS, "params need a \"query\" string")
@@ -390,7 +394,11 @@ fn search(params: &Value) -> Result<Value, ServeError> {
     };
     // `announce` false: the facts an announcement would print are in the document (`fetched.origin_kind`, `reason`), and stderr stays quiet for a
     // request that asked for neither prose nor progress.
-    let run = crate::search_run(&workspace, query, limit, mode, false)?;
+    // **O2 brought search into scope** because hybrid may dial out: the default mode can trigger the same 309 MB pinned
+    // fetch that `np embed` does, and a client watching a search that appears to hang on nothing would otherwise have no
+    // way to learn it is downloading a model.
+    let progress = crate::serve_channel::ServeProgress::new(ch, request.cloned(), "search");
+    let run = crate::search_run(&workspace, query, limit, mode, false, &progress)?;
     Ok(crate::search_document(&run))
 }
 
@@ -412,7 +420,30 @@ fn scan(
         crate::LockGrant::Contended(document) => return Ok(document),
         crate::LockGrant::Held(guard) => guard,
     };
+    // **Bookended, not live** (spec §9): one line when the walk starts, one when it ends with its counts. A solo scan of
+    // 4 000 notes measured 2.6 s, so per-file callbacks would mean threading a reporter through the hottest loop in
+    // np-core to narrate two seconds — and `files_seen` / `notes_seen` already exist in the report the walk produces.
+    // The opening bookend: no counts yet, because none have been counted.
+    crate::serve_channel::report(&progress, Phase::Indexing, ProgressEvent::default());
     let report = crate::scan(&workspace, &cfg).map_err(refused)?;
+    let mut params = crate::serve_channel::progress_params(
+        request,
+        "scan",
+        Phase::Indexing,
+        &ProgressEvent::default(),
+        ch.since_request(),
+    );
+    // `files_seen` is the files this pass looked at — new, changed, moved and unchanged. Removed paths are not counted:
+    // they were seen by an earlier pass, and a count that mixed the two would not match the per-category numbers a
+    // reader is reading beside it.
+    let files_seen = report
+        .added
+        .saturating_add(report.modified)
+        .saturating_add(report.moved)
+        .saturating_add(report.unchanged);
+    params["files_seen"] = json!(files_seen);
+    params["notes_seen"] = json!(report.notes);
+    ch.notify_unthrottled(Phase::Indexing, params);
     serde_json::to_value(report).map_err(refused)
 }
 

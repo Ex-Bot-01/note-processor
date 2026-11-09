@@ -128,6 +128,17 @@ impl Server {
         self._tmp.path().join("data")
     }
 
+    /// Where this child reads `config.toml` from — the same package directory `np models fetch` tests write into. A case
+    /// that configures `[models] base_url` needs it, and building the path here keeps the two harnesses honest about the
+    /// one location the binary actually looks in.
+    ///
+    /// Gated with its only caller: a default-feature build has no transport to point at an origin, so an ungated helper
+    /// here would be dead code, and `-D warnings` is where dead scaffolding gets caught.
+    #[cfg(all(feature = "local-model", feature = "fetch"))]
+    fn config_dir_for_test(&self) -> PathBuf {
+        self._tmp.path().join("config").join("note-processor")
+    }
+
     /// Send one line exactly as written. The point of the raw form is that a test can send something no builder would produce — a blank line, half
     /// an object, a notification — and see what the server does with it.
     fn send_raw(&mut self, line: &str) {
@@ -1072,4 +1083,269 @@ fn listing_of(root: &Path) -> Vec<String> {
     }
     found.sort();
     found
+}
+
+/// **§9's bookends.** A scan says it started and says it ended, with counts on the closing line — and nothing in
+/// between. The measurement behind the design (a solo 4 000-note scan at 2.6 s) is why a per-file callback was refused:
+/// threading a reporter through np-core's hottest loop to narrate two seconds costs more than it tells.
+///
+/// The closing line is written **unthrottled**, and this test is the reason: on a corpus this size both lines land in the
+/// same second, so a one-per-second rule applied to the pair would drop the ending and leave a client believing the walk
+/// was still going.
+#[test]
+fn a_scan_is_bookended_by_two_indexing_lines_and_nothing_between() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+
+    server.id += 1;
+    let id = server.id;
+    server.send_raw(
+        &json!({"jsonrpc": "2.0", "id": id, "method": "scan", "params": {"workspace": workspace}})
+            .to_string(),
+    );
+    let response = server.read_line();
+    assert!(response.get("error").is_none(), "{response}");
+    server.flush();
+
+    let lines = server.progress_for(id);
+    let indexing: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["params"]["phase"] == "indexing")
+        .collect();
+    assert_eq!(
+        indexing.len(),
+        2,
+        "one line at entry, one at exit, nothing between: {lines:?}"
+    );
+    let opened = indexing[0]["params"].as_object().expect("params");
+    assert!(
+        !opened.contains_key("files_seen") && !opened.contains_key("notes_seen"),
+        "the opening line cannot know counts it has not counted: {}",
+        indexing[0]
+    );
+    let closed = indexing[1]["params"].as_object().expect("params");
+    assert_eq!(
+        closed.get("notes_seen").and_then(Value::as_i64),
+        Some(CORPUS_NOTES as i64),
+        "the closing line carries the report's own count: {}",
+        indexing[1]
+    );
+    assert!(
+        closed
+            .get("files_seen")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= CORPUS_NOTES,
+        "every fixture note is a file this pass looked at: {}",
+        indexing[1]
+    );
+    // The terminal line still comes last, after both bookends.
+    assert_eq!(
+        lines.last().expect("a terminal line")["params"]["phase"],
+        "completed",
+        "{lines:?}"
+    );
+    server.finish();
+}
+
+/// **O2's stall, narrated.** Hybrid search may resolve a provider and dial out for 309 MB before it writes a byte of an
+/// answer, so the phase that covers that stretch has to appear on the wire — otherwise a GUI shows a spinner over a
+/// request that is doing something entirely reasonable. Keyword mode never resolves anything, so `resolving` is absent
+/// there rather than reported as instant: absence carries information here.
+#[test]
+fn a_search_narrates_the_resolution_it_may_have_to_wait_for() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+    server.result("scan", json!({"workspace": workspace}));
+
+    server.id += 1;
+    let id = server.id;
+    server.send_raw(
+        &json!({"jsonrpc": "2.0", "id": id, "method": "search", "params": {"workspace": workspace, "query": "meeting"}})
+            .to_string(),
+    );
+    let response = server.read_line();
+    assert!(response.get("error").is_none(), "{response}");
+    server.flush();
+
+    let lines = server.progress_for(id);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["params"]["phase"] == "resolving"),
+        "the default mode can fetch, so it says it is deciding first: {lines:?}"
+    );
+
+    // The other half of the claim: a mode that never resolves a provider never claims to be doing so.
+    let mut quiet = Server::new();
+    let other = quiet.root.display().to_string();
+    quiet.result("initialize", json!({"notifications": true}));
+    quiet.result("scan", json!({"workspace": other}));
+    quiet.id += 1;
+    let keyword_id = quiet.id;
+    quiet.send_raw(
+        &json!({"jsonrpc": "2.0", "id": keyword_id, "method": "search", "params": {"workspace": other, "query": "meeting", "mode": "keyword"}})
+            .to_string(),
+    );
+    let keyword = quiet.read_line();
+    assert!(keyword.get("error").is_none(), "{keyword}");
+    quiet.flush();
+    assert!(
+        !quiet
+            .progress_for(keyword_id)
+            .iter()
+            .any(|line| line["params"]["phase"] == "resolving"),
+        "`--mode keyword` resolves nothing and must not claim it is: {:?}",
+        quiet.progress_for(keyword_id)
+    );
+    server.finish();
+    quiet.finish();
+}
+
+/// A fetch that really reaches its transport, narrated through the pipe (**O2's** justification for putting search in
+/// scope at all).
+///
+/// **What is served, and why.** The origin answers with the pinned `Content-Length` and then hangs up mid-body after a few
+/// MiB, so the run ends in `fetch`'s own *interrupted* refusal. That is deliberate: it exercises the byte loop over a real
+/// socket with real bytes and real digests-in-progress without transferring 309 MB inside `cargo test`, and it proves the
+/// ending that matters most — a transport interruption is reported as a **refusal**, while an outage is reported as a
+/// state. What this case cannot show is a verified download; that stays with the artifact-gated rows in
+/// `.github/scripts/gates.sh`.
+///
+/// **Why the server pauses.** The throttle allows one line per second inside a phase, so a loopback transfer that finishes
+/// in 40 ms correctly produces a single `fetching` line. Asserting "several lines" against a fast server would be asserting
+/// that the throttle is broken, so the origin dribbles: each chunk arrives more than a second after the last, and two or
+/// more checkpoints become observable rather than throttled away.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn a_fetch_that_reaches_its_transport_narrates_bytes_and_ends_refused() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    let pinned = np_core::pins::PINNED
+        .first()
+        .expect("a build with `fetch` pins something");
+    const CHUNK: usize = 4 * 1024 * 1024;
+    const CHUNKS: usize = 3;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test setup: bind a loopback origin");
+    let port = listener
+        .local_addr()
+        .expect("test setup: origin addr")
+        .port();
+    let declared = pinned.size_bytes;
+    // The origin thread owns the listener and loops until the process exits; there is no shutdown to wait for, and a
+    // `join` would hang on an `accept` nothing is coming to. Every request in this case is answered before it ends.
+    let _worker = thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut probe = [0_u8; 2048];
+            let _ = stream.read(&mut probe).unwrap_or(0);
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n");
+            if stream.write_all(head.as_bytes()).is_err() {
+                continue;
+            }
+            let body = vec![0_u8; CHUNK];
+            for _ in 0..CHUNKS {
+                if stream.write_all(&body).is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+                thread::sleep(Duration::from_millis(1_200));
+            }
+            // EOF mid-body. `fetch` calls this interrupted, not offline — and the progress lines before it are the point.
+            drop(stream);
+        }
+    });
+
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    // Written after spawn and before the request: `load_config` runs per command, so a serve session picks up a config
+    // that appeared while it was already running. The URL goes only into the child's config — never into an assertion
+    // message, which is how §12 rule 8 stays true by construction rather than by care.
+    let config_dir = server.config_dir_for_test();
+    fs::create_dir_all(&config_dir).expect("test setup: config package dir");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[embeddings]\nprovider = \"local-model\"\nmodel = \"{}\"\n[models]\nbase_url = \"http://127.0.0.1:{port}\"\n",
+            pinned.id
+        ),
+    )
+    .expect("test setup: write user config");
+
+    server.result("initialize", json!({"notifications": true}));
+    let response = server.request("embed", json!({"workspace": workspace}));
+    server.flush();
+    let lines = {
+        let mut all = server.progress.clone();
+        all.extend(server.finish());
+        all
+    };
+
+    let fetching: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["params"]["phase"] == "fetching")
+        .collect();
+    assert!(
+        fetching.len() >= 2,
+        "a dribbled transfer earns more than one byte checkpoint: {lines:?}"
+    );
+    let mut previous = None;
+    for line in &fetching {
+        let params = &line["params"];
+        assert_eq!(params["member"], pinned.member, "{line}");
+        assert_eq!(
+            params["bytes_total"], pinned.size_bytes,
+            "the denominator is the pinned size, never what the transport announced: {line}"
+        );
+        let done = params["bytes_done"].as_u64().expect("a byte count");
+        if let Some(before) = previous {
+            assert!(done >= before, "bytes move forward within a member: {line}");
+        }
+        previous = Some(done);
+    }
+
+    // The ending mirrors the response kind: an interrupted transfer is a refusal, and it carries the code that went out.
+    assert!(
+        response.get("error").is_some(),
+        "a transfer that stopped early must not be reported as a success: {response}"
+    );
+    let last = lines
+        .iter()
+        .rev()
+        .find(|line| {
+            line["params"]
+                .get("request")
+                .is_some_and(|r| *r == response["id"])
+        })
+        .expect("a terminal line for the request");
+    assert_eq!(last["params"]["phase"], "refused", "{last}");
+    assert_eq!(last["params"]["code"], -32000, "{last}");
+
+    // §12 rule 8, on both channels: the origin's URL appears nowhere in what the client was told.
+    let transcript = lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !transcript.contains("http"),
+        "a progress line named an origin: {transcript}"
+    );
+    assert!(
+        !server.stderr_text().contains(&format!("127.0.0.1:{port}")),
+        "stderr named the origin and port"
+    );
+}
+
+/// The same claim, stated as a gap when the build cannot make it: a `fetch`-less binary has no transport to narrate, and
+/// printing nothing here would let a default-feature run look like coverage it did not have.
+#[cfg(not(all(feature = "local-model", feature = "fetch")))]
+#[test]
+fn a_fetch_that_reaches_its_transport_narrates_bytes_and_ends_refused() {
+    eprintln!("NOT COVERAGE: fetch narration needs `--features local-model,fetch`");
 }
