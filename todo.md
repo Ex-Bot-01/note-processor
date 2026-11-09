@@ -556,3 +556,22 @@ what fails is not a check, because removal makes tests pass.
   verify-on-change subsection.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its
   exit codes are the evidence; nothing here is claimed on CI's behalf.
+
+## Ruled 2026-12-09 — the backend surface is `np serve`, and a license exists
+
+**A frontend can start today.** The question put to the human was what "finish the base of the backend" means, with three options; **C was chosen**:
+`np serve` — JSON-RPC 2.0 over stdin/stdout inside the existing binary. One process, no port, no token, no daemon, no watcher (those stay M4 in
+`docs/roadmap-2026-10-27.md`, with their own design ahead of them). Six methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `shutdown` —
+and every `result` is the document `np <verb> --json` prints, because both channels call one builder. States stay states across the pipe: `locked`
+(**F44**), `offline`, `reason` (**F45**) and `prefix_drift` (**F42**) are keys in a successful result; JSON-RPC `error` is reserved for a bad request
+(`-32700/-32601/-32602`) or a refusal before any work (`-32000`, carrying the CLI's own sentence). README's "Driving `np` from a program" is the
+contract; `docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md` is the reasoning, including what was *not* reviewed independently and why that
+matters.
+
+**Licensing closed: MIT** (`LICENSE` at root, `license.workspace = true` on both crates), chosen because it is what we statically link and so adds no
+downstream obligation stricter than one already met. Single-license, not `MIT OR Apache-2.0`: an option nobody granted is worse than none. With F47
+closed there is **no legal or licensing question left between rc and final** — the open items are measurements on platforms we do not have (Windows
+write-lock exclusion, MSVC parity) and CI minutes.
+
+**Two things a frontend author will otherwise discover the hard way**, both written into tests so they are facts rather than folklore: a search hit has
+**no `title` key** (`path`, `snippet`, ranks, link counts), and `snippet` can contain raw line breaks — which is why the framing test exercises it.
