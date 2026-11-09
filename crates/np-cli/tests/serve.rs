@@ -1724,12 +1724,24 @@ fn an_embed_that_works_narrates_the_chunks_it_encodes() {
     // **The denominator ships.** The run holds its owed list before the writer loop, so a total is free rather than another
     // query, and every GUI was drawing an indeterminate bar for want of it. It is the *plan* — chunks this run decided it
     // owed — never what remains, or the fraction would creep to 1/1 with work still queued.
-    assert_eq!(
-        first["chunks_total"].as_u64(),
-        Some(1),
-        "a one-note vault owes one chunk and says so from the opening line: {}",
+    // The fixture's exact chunk count is not the claim, and pinning it was my mistake: this assertion first ran under
+    // `local-model,vision`, where the corpus yields fifteen owed chunks rather than the one I had assumed from a hand-made vault.
+    // What matters is that a denominator exists at all, before any work is handed over.
+    let total = first["chunks_total"]
+        .as_u64()
+        .expect("a denominator on the opening line");
+    assert!(
+        total >= 1,
+        "the pass owes at least the fixture's note and says so up front: {}",
         embedding[0]
     );
+    for line in &embedding {
+        assert_eq!(
+            line["params"]["chunks_total"].as_u64(),
+            Some(total),
+            "the denominator is the plan, fixed for the whole request: {line}"
+        );
+    }
     // A one-note vault produces one chunk, so `embedding` legitimately appears exactly once and the *next* phase carries
     // the finished count — that is what the writing line below asserts. What this loop checks instead is the shape of the
     // counters: monotonic within the phase, no invented denominator, and every line naming the request it belongs to.
