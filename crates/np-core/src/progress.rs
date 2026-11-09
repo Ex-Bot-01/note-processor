@@ -32,7 +32,8 @@ pub enum Phase {
 pub struct ProgressEvent<'a> {
     /// The phase this event belongs to.
     pub phase: Phase,
-    /// Which artifact of the model a `Fetching` event counts bytes for — `"model"` or `"mmproj"`. Absent means the
+    /// Which artifact of the model a `Fetching` event counts bytes for — `"main"` or `"mmproj"`, spelled as the pin table
+    /// spells them (`models::MAIN_FILE`, `pins::MMPROJ_MEMBER`). Absent means the
     /// phase has no members, not that the member is unknown.
     pub member: Option<&'a str>,
     /// Bytes written for `member` so far.

@@ -52,7 +52,7 @@ does not queue behind another *process*, only behind this connection's own work.
 | `search` | `workspace`, `query`, `limit?`, `mode?` (`keyword`\|`semantic`\|`hybrid`) | the same document as `np search --json` | `search_document` | `-32602` missing/unknown key; `-32000` workspace unreadable |
 | `scan` | `workspace` | the same report as `np scan --json` | `ScanReport` | `-32602`; `-32000` |
 | `embed` | `workspace` | the same report as `np embed --json` | `embed_report` | `-32602`; `-32000` (including a build without the inference feature) |
-| `models.list` | `workspace` | installed-artifact rows | `models_list_document` | `-32602` |
+| `models.list` | `workspace` | installed-artifact rows | `listing_json`, the CLI's own builder | `-32602` |
 | `status.get` | `workspace` | `{last, fetch_markers, running}` | its own builder | `-32602` |
 | `shutdown` | none | `{protocol}` echoed, then the loop ends | its own builder | — |
 
@@ -100,14 +100,16 @@ Only protocol-level faults and genuine refusals produce an `error` object.
 | `-32601` | no such method |
 | `-32602` | `params` missing, wrong type, or containing an unknown key |
 | `-32000` | refused: the command could not be done (`message` says why) |
-| `-32603` | internal error, including a handler that panicked — one bad request never kills the session |
+| `-32603` | internal error, including a handler that panicked — one bad request never kills the session. This arm is a guard: no shipped method is known to panic, so **no test exercises it**, and a change that broke the catch would be caught by review rather than by this suite |
 
 A notification (a request with no `id`) gets **no response line at all**, per JSON-RPC. That includes `np/progress`: the server
 never answers its own notifications.
 
 ## Notifications
 
-Progress is **opt-in per connection** and off by default, so a client built against v0.3.0 sees byte-identical responses:
+Progress is **opt-in per connection** and off by default, so a client built against v0.3.0 keeps the answers it expects: no line
+arrives unsolicited, and every method's result document is unchanged. `initialize`'s own document is the exception, because it now
+lists `status.get` in `methods` (it works whether or not you opt in) and adds `"progress": true` when asked:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspace":"/vault","notifications":true}}
@@ -125,6 +127,11 @@ notification from a response by key presence):
 ```json
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"fetching","since_ms":61,"request":2}}
 ```
+
+A request the server could not read has no command to name, so it ends without a line: `-32700` (unparseable) and `-32600`
+(missing `jsonrpc` or `method`) answer their fault and stay silent otherwise. The invariant is *one terminal line per request
+whose command was identified*, not one per line of input, and the difference matters only to a client that counts lines instead of
+matching ids.
 
 `params` keys that are **always** present:
 
@@ -148,8 +155,8 @@ and one that is present **only when the request had an `id`**:
 | `resolving` | deciding which provider and artifact are needed; may lead to a fetch | — |
 | `indexing` | the file walk (`scan`) | closing line: `files_seen`, `notes_seen` |
 | `fetching` | bytes arriving for a pinned artifact | `member`, `bytes_done`, `bytes_total`, `members_done`, `members_total` |
-| `embedding` | chunks being encoded | `chunks_done`, `embedded`, sometimes `chunks_total` |
-| `writing` | vectors committed | same as `embedding` |
+| `embedding` | chunks being encoded | `chunks_done`, `embedded` — and **no** `chunks_total`: np-core discovers pending chunks as it walks, so a total at phase start would be a guess, and absence means *unknown*, not zero |
+| `writing` | vectors committed, **only when something was actually committed** | same as `embedding` |
 | `completed` | the request ended in a **result** — including degraded ones (`locked`, `offline`, an embed arm) | state keys copied from that result |
 | `refused` | the request ended in an **error object** | `code` |
 
@@ -219,7 +226,7 @@ Two notes on disk, a keyword search, and no `notifications` key in the handshake
 line appears in the whole session — every line carries an `id`, so a v0.3.0 client's read loop is untouched.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.1I3IGW/A/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/A/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","protocol":1}}
 {"id":2,"jsonrpc":"2.0","result":{"added":2,"elapsed_ms":161,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
 {"id":3,"jsonrpc":"2.0","result":{"fetched":null,"hits":[{"bm25":-1e-6,"cosine":null,"keyword_rank":1,"kind":"note","linked_from":0,"linked_notes":[],"path":"meeting.md","score":1e-6,"semantic_rank":null,"snippet":"# Meeting notes\n\nThe [rollout] window opens on Tuesday.\n","source_note":null}],"mode":"keyword","note":null,"offline":false,"reason":null,"vectors":false}}
 ```
@@ -230,12 +237,12 @@ Opted in, `[embeddings] provider = "local-model"`, origin unreachable. `locking`
 then the answer says **offline**, and so does the terminal line — as a state, `completed`, not `refused`.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.1I3IGW/B/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/B/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"id":2,"jsonrpc":"2.0","result":{"artifact_check":null,"busy_gap":0,"chunks_seen":0,"current":0,"embedded":0,"errors":0,"fetched":null,"image_refusals":[],"images_embedded":0,"images_pruned":0,"images_refused":0,"images_seen":0,"images_sweep_ran":false,"images_unchecked":0,"model":"embeddinggemma-2","offline":true,"outcome":{"offline":{"id":"embeddinggemma-2"}},"refused_budget":0,"verification":"self-consistent, not verified","workers":null}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","offline":true,"outcome":{"offline":{"id":"embeddinggemma-2"}},"phase":"completed","request":2,"since_ms":68}}
-{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"command":"embed","elapsed_ms":68,"phase":"completed","request":2},"running":null}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","offline":true,"outcome":{"offline":{"id":"embeddinggemma-2"}},"phase":"completed","request":2,"since_ms":66}}
+{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"command":"embed","elapsed_ms":66,"phase":"completed","request":2},"running":null}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":0}}
 ```
 
@@ -246,14 +253,16 @@ Same session shape, origin reachable but the connection closes mid-body after 12
 object — because an interrupted transfer really did fail, where the session above really did not.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.1I3IGW/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":61}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1494}}
-{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.1I3IGW/C/data/workspaces/c14fe6ff867a7e0a.models/.part.embeddinggemma-2.1235066-1794220420933722328-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
-{"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":3871}}
-{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":3871,"phase":"refused","request":2},"running":null}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4036}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6589}}
+{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.IaDK9X/C/data/workspaces/39e6b8caca57d6ee.models/.part.embeddinggemma-2.1323809-1794227836518406938-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
+{"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7704}}
+{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7704,"phase":"refused","request":2},"running":null}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":0}}
 ```
 
@@ -263,8 +272,9 @@ One `np serve` is mid-download; a **second** process answers `status.get` immedi
 the writer. This is the case `running: null` cannot cover, and it is why the marker list exists.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/marker.iUNlaJ/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","protocol":1}}
-{"id":2,"jsonrpc":"2.0","result":{"fetch_markers":[{"bytes_done":8388608,"bytes_total":309855456,"id":"embeddinggemma-2","started_at":1794220456,"state":"running"}],"last":{"command":"initialize","elapsed_ms":0,"phase":"completed","request":1},"running":null}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/marker.z1PcvU/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","protocol":1}}
+{"id":2,"jsonrpc":"2.0","result":{"fetch_markers":[{"bytes_done":8388608,"bytes_total":309855456,"id":"embeddinggemma-2","started_at":1794227855,"state":"running"}],"last":{"command":"initialize","elapsed_ms":0,"phase":"completed","request":1},"running":null}}
+{"id":3,"jsonrpc":"2.0","result":{"protocol":1}}
 ```
 
 ## Client walkthrough

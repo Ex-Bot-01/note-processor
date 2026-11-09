@@ -108,6 +108,9 @@ pub struct Channel<'a> {
     /// When the request now being handled began, on this clock. `since_ms` is measured from here (**§2**): a client
     /// that has had the pipe open for ten minutes wants "this fetch has run four seconds".
     request_at: Duration,
+    /// Set when a client sends `shutdown`. The loop finishes writing that response and stops reading, so a client that
+    /// asked to be done does not have to also close the pipe to be believed.
+    shutdown: bool,
     /// The one slot of session memory: the last finished activity, for `status.get` (**§5**).
     last: Option<Value>,
     /// The terminal notification for the request being handled. It is *queued* rather than written because it has to go
@@ -125,16 +128,35 @@ impl<'a> Channel<'a> {
             notifications: false,
             emitted_phase: None,
             emitted_at: Duration::ZERO,
+            shutdown: false,
             request_at: clock.since_start(),
             last: None,
             pending_terminal: None,
         }
     }
 
-    /// Mark the start of a new request. Called by the read loop before anything is parsed, so a request that turns out to
-    /// be unreadable still has an honest elapsed time.
+    /// Mark the start of a new request, and **forget the throttle**. Called by the read loop before anything is parsed, so
+    /// a request that turns out to be unreadable still has an honest elapsed time.
+    ///
+    /// Forgetting matters: the rule is "at most one line per second *within a phase of one request*", not "one line per
+    /// second per connection". Carrying the memory across requests would swallow the opening line of any request that
+    /// starts inside a second of the previous one finishing — which is exactly how a client driving two searches back to
+    /// back behaves — and the swallowed line is the one that says what the request is about to do. The victim is not the
+    /// chatty phase but the informative one.
     pub fn begin_request(&mut self) {
         self.request_at = self.clock.since_start();
+        self.emitted_phase = None;
+        self.emitted_at = Duration::ZERO;
+    }
+
+    /// Ask the loop to stop after this response is written.
+    pub fn request_shutdown(&mut self) {
+        self.shutdown = true;
+    }
+
+    /// Whether a client has asked for the session to end.
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown
     }
 
     /// Time since the request now being handled began.
@@ -388,6 +410,11 @@ pub(crate) fn serve_loop(input: impl BufRead, ch: &mut Channel<'_>) -> io::Resul
                 // because none was given (**Review Focus 5**).
                 ch.flush_terminal();
             }
+        }
+        // A client that asked to be done is believed once its answer is on the wire: exit code and framing are unchanged,
+        // and it no longer has to close stdin as well to stop the process.
+        if ch.shutdown_requested() {
+            break;
         }
     }
     Ok(())
@@ -673,7 +700,7 @@ mod tests {
                 Phase::Fetching,
                 ProgressEvent {
                     phase: Phase::Fetching,
-                    member: Some("model"),
+                    member: Some("main"),
                     bytes_done: 67_108_864,
                     bytes_total: Some(309_855_456),
                     members_done: 0,
@@ -702,7 +729,9 @@ mod tests {
         let fetch = &lines[0]["params"];
         assert_eq!(fetch["request"], 7);
         assert_eq!(fetch["phase"], "fetching");
-        assert_eq!(fetch["member"], "model");
+        // `main`, spelled as the pin table spells it (`models::MAIN_FILE`). A test that asserted `"model"` would pass on a
+        // name no build ever sends.
+        assert_eq!(fetch["member"], "main");
         assert_eq!(fetch["bytes_done"], 67_108_864);
         assert_eq!(fetch["bytes_total"], 309_855_456);
         assert_eq!(fetch["members_done"], 0);

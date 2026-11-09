@@ -1401,9 +1401,13 @@ fn the_reference_documents_every_method() {
 
     // And the transcripts are transcripts: every line inside their fences parses as one JSON document, because a block with a
     // hand-typed ellipsis in it teaches a client to expect lines that no server ever sent.
+    // README carries its own captured block, and the same rule applies to it: a composite assembled by hand from two sessions is
+    // how a document ends teaching clients a sequence no server ever sent (`since_ms` that runs backwards, a `fetching` line
+    // followed by an offline result). So both files are parsed here rather than just the reference.
+    let readme = fs::read_to_string(root.join("README.md")).expect("README must exist");
     let mut checked = 0;
     let mut inside = false;
-    for line in doc.lines() {
+    for line in doc.lines().chain(readme.lines()) {
         if line.trim_start().starts_with("```json") {
             inside = true;
             continue;
@@ -1426,7 +1430,300 @@ fn the_reference_documents_every_method() {
         }
     }
     assert!(
-        checked >= 20,
+        checked >= 25,
         "the reference should carry real transcripts, not prose about them (checked {checked} lines)"
+    );
+}
+
+/// **The throttle is per request, not per connection.** Two searches sent back to back on one pipe are two requests, and
+/// each owes its client the line that says what it is about to wait for. Carrying throttle memory across the boundary
+/// swallows the second `resolving` — a client driving a GUI's search box would see the first keystroke narrate and every
+/// later one go silent, which is precisely the "why is it not telling me anything" report this feature exists to end.
+#[test]
+fn two_requests_on_one_connection_each_open_their_own_phase() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        server.id += 1;
+        let id = server.id;
+        ids.push(id);
+        server.send_raw(
+            &json!({"jsonrpc": "2.0", "id": id, "method": "search", "params": {"workspace": workspace, "query": "meeting"}})
+                .to_string(),
+        );
+        let response = server.read_line();
+        assert!(response.get("error").is_none(), "{response}");
+    }
+    // Both requests were answered before anything was drained, so both sets of lines are in the same session and the
+    // second one starts inside a second of the first — the exact timing the leak used to eat.
+    server.flush();
+
+    for id in ids {
+        let lines = server.progress_for(id);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["params"]["phase"] == "resolving"),
+            "request {id} on a busy connection lost its opening phase: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["params"]["phase"] == "completed"),
+            "request {id} never got its ending: {lines:?}"
+        );
+    }
+    server.finish();
+}
+
+/// **`shutdown` is the request it looks like.** The client asked to be done; the answer goes out and the process stops,
+/// without the client also having to close stdin. Reading EOF here while our own write half is still open is the proof:
+/// only the server can close that pipe, and it closed it because it was told to.
+#[test]
+fn shutdown_ends_the_session_without_waiting_for_eof() {
+    let mut server = Server::new();
+    let handshake = server.request(
+        "initialize",
+        json!({"workspace": server.root.display().to_string()}),
+    );
+    assert_eq!(handshake["result"]["protocol"], 1, "{handshake}");
+
+    server.id += 1;
+    let id = server.id;
+    server.send_raw(&json!({"jsonrpc": "2.0", "id": id, "method": "shutdown"}).to_string());
+    let response = server.read_line();
+    assert_eq!(response["id"], id, "{response}");
+    assert_eq!(
+        response["result"]["protocol"], 1,
+        "the answer names the protocol it stopped speaking: {response}"
+    );
+
+    // Stdin is deliberately left open. If `shutdown` were merely noted, the next read would block forever instead of
+    // returning EOF.
+    assert!(
+        server.stdin.is_some(),
+        "this case never closed its write half"
+    );
+    // **Wait for the exit, with a deadline.** Polling `try_wait` rather than blocking on stdout means a regression — a
+    // server that notes `shutdown` and keeps reading — fails this case in ten seconds instead of hanging the suite, which is
+    // how the first version of it behaved. Stdin stays open the whole time: only the server can close *its* write half, so
+    // an exit is the proof that it stopped because it was told to.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut exited = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = server.child.try_wait().expect("test setup: poll the child") {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let status = exited.expect("ten seconds after `shutdown` the process was still running");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a shutdown that ends in an error is a bug report"
+    );
+
+    let mut leftover = String::new();
+    let read = server
+        .stdout
+        .read_line(&mut leftover)
+        .expect("test setup: read after exit");
+    assert_eq!(
+        read, 0,
+        "a process that exited cannot have more to say; the harness is reading a stale pipe: {leftover}"
+    );
+}
+
+/// **An unreadable marker is reported, not repaired** — over the pipe, not just one layer down. A marker written by a
+/// killed process can be truncated, and `status.get` has to say "something is here and I cannot read it" instead of
+/// either deleting the evidence or pretending the directory is empty.
+#[test]
+fn an_unreadable_marker_is_reported_and_left_alone() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    let config = Config {
+        data_dir: server.data_dir(),
+        ..Config::default()
+    };
+    let models_dir = config.workspace_models_dir(&server.root);
+    fs::create_dir_all(&models_dir).expect("test setup: models dir");
+    let marker = np_core::models::marker_path(&models_dir, "embeddinggemma-2");
+    // Half a JSON object: what a SIGKILL at the wrong moment leaves behind.
+    fs::write(&marker, r#"{"nonce":"1730000000-1-","#).expect("test setup: torn marker");
+
+    let status = server.result("status.get", json!({"workspace": workspace}));
+    let markers = status["fetch_markers"].as_array().expect("array");
+    assert_eq!(markers.len(), 1, "{status}");
+    assert_eq!(markers[0]["state"], "unreadable", "{status}");
+    assert_eq!(markers[0]["id"], "embeddinggemma-2", "{status}");
+    assert!(
+        markers[0]["reason"].is_string(),
+        "the reason is the only thing a reader can act on: {status}"
+    );
+    assert!(
+        !status.to_string().contains("http"),
+        "**§12 rule 8**: {status}"
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).expect("marker still there"),
+        r#"{"nonce":"1730000000-1-","#,
+        "**§12 rule 4**: a read command does not clean up after a crashed writer"
+    );
+    server.finish();
+}
+
+/// **The phase the whole feature was requested for.** A GUI asked to be able to say "embedding 118 of 412"; that sentence
+/// needs `embedding` lines on the wire, and nothing else in this suite would notice if they stopped arriving — np-core's
+/// seam tests call `embed_with_inject` directly, so they pass whatever `np serve` hands the chunk loop. This is the case
+/// that closes that gap, and it runs against a real model because an embed that writes no vectors emits no such line.
+///
+/// Gated on `local-model` **and** the artifact: without either, this prints `NOT COVERAGE` rather than passing on a path
+/// it never reached.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+#[test]
+fn an_embed_that_works_narrates_the_chunks_it_encodes() {
+    let source = match std::env::var_os("NP_TEST_MODEL_PATH").map(PathBuf::from) {
+        Some(path) => path,
+        None => {
+            eprintln!(
+                "NOT COVERAGE: NP_TEST_MODEL_PATH is unset, so no chunk was encoded and no `embedding` line was read."
+            );
+            return;
+        }
+    };
+
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    // Install through the real command: a row written by `np models install` is what makes this an embed of an artifact
+    // rather than a fetch, and keeps the digest check on the path.
+    let pinned = np_core::pins::PINNED
+        .iter()
+        .find(|pin| pin.member == "main")
+        .expect("test setup: the main member is pinned");
+    let installer = Command::new(env!("CARGO_BIN_EXE_np"))
+        .args([
+            "models",
+            "install",
+            &workspace,
+            "--id",
+            pinned.id,
+            "--path",
+            &source.display().to_string(),
+            "--dim",
+            "768",
+            "--sha256",
+            pinned.sha256,
+        ])
+        .env("XDG_DATA_HOME", server.data_dir())
+        .env("LOCALAPPDATA", server.data_dir())
+        .env("HOME", server._tmp.path())
+        .env("XDG_CONFIG_HOME", server._tmp.path().join("config"))
+        .env("APPDATA", server._tmp.path().join("config"))
+        .env_remove("NP_NO_AUTO_FETCH")
+        .output()
+        .expect("test setup: run np models install");
+    assert!(
+        installer.status.success(),
+        "install refused: {}",
+        String::from_utf8_lossy(&installer.stderr)
+    );
+
+    let config_dir = server.config_dir_for_test();
+    fs::create_dir_all(&config_dir).expect("test setup: config dir");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[embeddings]\nprovider = \"local-model\"\nmodel = \"{}\"\n",
+            pinned.id
+        ),
+    )
+    .expect("test setup: write user config");
+
+    server.result("initialize", json!({"notifications": true}));
+    // Index first. `embed` on a vault that was never scanned has nothing pending, takes the *current* arm, and writes no
+    // chunk lines — which is correct behaviour and would make this case pass by proving nothing at all.
+    let indexed = server.request("scan", json!({"workspace": workspace}));
+    assert!(indexed.get("error").is_none(), "{indexed}");
+    let response = server.request("embed", json!({"workspace": workspace}));
+    server.flush();
+    assert!(response.get("error").is_none(), "{response}");
+    let lines = {
+        let mut all = server.progress.clone();
+        all.extend(server.finish());
+        all
+    };
+
+    let embedding: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["params"]["phase"] == "embedding")
+        .collect();
+    assert!(
+        !embedding.is_empty(),
+        "an embed that encoded chunks wrote no `embedding` line: {lines:?}"
+    );
+    let first = &embedding[0]["params"];
+    assert_eq!(
+        first["chunks_done"].as_u64().expect("a count"),
+        0,
+        "the opening line says nothing is done yet: {}",
+        embedding[0]
+    );
+    assert!(
+        first.get("embedded").is_some(),
+        "`embedded` is the number a progress bar reads: {}",
+        embedding[0]
+    );
+    assert!(
+        first.get("chunks_total").is_none(),
+        "no denominator ships, because np-core discovers pending chunks as it walks: {}",
+        embedding[0]
+    );
+    // A one-note vault produces one chunk, so `embedding` legitimately appears exactly once and the *next* phase carries
+    // the finished count — that is what the writing line below asserts. What this loop checks instead is the shape of the
+    // counters: monotonic within the phase, no invented denominator, and every line naming the request it belongs to.
+    let mut previous = 0;
+    for line in &embedding {
+        let done = line["params"]["chunks_done"].as_u64().expect("a count");
+        assert!(done >= previous, "chunks move forward: {line}");
+        previous = done;
+    }
+    // **`writing` only when something was written** (as-built #10): this run embedded a chunk, so the phase has to appear.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["params"]["phase"] == "writing"),
+        "a run that wrote vectors never said `writing`: {lines:?}"
+    );
+    // The response and the line agree about how much was written.
+    let embedded = response["result"]["embedded"]
+        .as_u64()
+        .expect("the report counts what it embedded");
+    assert!(embedded > 0, "nothing was embedded: {}", response["result"]);
+    let writing = lines
+        .iter()
+        .rev()
+        .find(|line| line["params"]["phase"] == "writing")
+        .expect("a writing line");
+    assert_eq!(
+        writing["params"]["embedded"].as_u64(),
+        Some(embedded),
+        "a progress line that disagrees with its own response is worse than no line: {writing}"
+    );
+    assert!(
+        writing["params"]["chunks_done"].as_u64().unwrap_or(0) > 0,
+        "the commit phase has to show what was committed: {writing}"
+    );
+}
+
+/// The same claim, stated as a gap when the build cannot make it.
+#[cfg(not(all(feature = "local-model", feature = "fetch")))]
+#[test]
+fn an_embed_that_works_narrates_the_chunks_it_encodes() {
+    eprintln!(
+        "NOT COVERAGE: chunk narration needs `--features local-model,fetch` and NP_TEST_MODEL_PATH"
     );
 }

@@ -288,15 +288,19 @@ fn dispatch(
     ch: &mut crate::serve_channel::Channel<'_>,
 ) -> Result<Value, ServeError> {
     match method {
-        "initialize" => Ok(initialize(params, ch)),
+        "initialize" => initialize(params, ch),
         "search" => search(params, request, ch),
         "scan" => scan(params, request, ch),
         "embed" => embed(params, request, ch),
         "models.list" => models_list(params),
         "status.get" => status(params, ch),
-        // The client asked to be done. `serve` answers this one request and the loop exits on the following EOF; answering before exiting keeps
-        // the response from racing the pipe closing.
-        "shutdown" => Ok(json!({"ok": true})),
+        // The client asked to be done. Answer first, then stop reading: a response that races the pipe closing is a
+        // response nobody received. Closing stdin still works and still exits 0 — this only means `shutdown` alone is
+        // believed as the request it is, rather than as a hint the server is free to ignore until EOF.
+        "shutdown" => {
+            ch.request_shutdown();
+            Ok(json!({ "protocol": PROTOCOL }))
+        }
         other => Err(ServeError::Fault(Fault::new(
             Fault::METHOD_NOT_FOUND,
             format!(
@@ -309,14 +313,27 @@ fn dispatch(
 
 /// What a client can do with this binary. `features` is the compile-time truth (**F40** refuses on these same facts), so a UI decides at startup
 /// whether to draw an "embed" control at all instead of discovering the answer through a refusal.
-fn initialize(params: &Value, ch: &mut crate::serve_channel::Channel<'_>) -> Value {
+fn initialize(
+    params: &Value,
+    ch: &mut crate::serve_channel::Channel<'_>,
+) -> Result<Value, ServeError> {
     // **The only session-level fact this server keeps** (spec §1): progress is off unless this connection asked for it,
     // and asking changes nothing else. A v0.3.0 client that never sends `notifications` sees the byte-identical stream
     // it saw before this feature existed.
-    let wants_progress = params
-        .get("notifications")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // **A wrong type is a fault, not a silence.** `"notifications": "yes"` reads as a request for progress that was
+    // understood, and a client whose GUI stayed blank would have nothing to look at. Absent means off; present-and-wrong
+    // means the caller's intent was clear and the value was not — the same distinction F35 drew for config keys, where an
+    // unknown key is refused rather than ignored because ignoring is how a typo becomes a silent behaviour change.
+    let wants_progress = match params.get("notifications") {
+        None => false,
+        Some(Value::Bool(on)) => *on,
+        Some(other) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                format!("`notifications` needs true or false, not {other}"),
+            ))
+        }
+    };
     ch.set_notifications(wants_progress);
     let mut result = json!({
         "np": env!("CARGO_PKG_VERSION"),
@@ -337,7 +354,7 @@ fn initialize(params: &Value, ch: &mut crate::serve_channel::Channel<'_>) -> Val
     if wants_progress {
         result["progress"] = json!(true);
     }
-    result
+    Ok(result)
 }
 
 /// The workspace every method names for itself. No session state: a server holding three vaults open is one process, and "which vault am I on" is
@@ -673,5 +690,64 @@ mod tests {
     #[test]
     fn initialize_names_the_package_version() {
         assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
+    }
+
+    /// **The state keys have to reach the terminal line, or a client cannot tell the endings apart.** `outcome` is the key
+    /// an embed uses to say *which* arm it took — offline, model missing, over budget — and every existing assertion reads
+    /// it off the response document. Deleting this copy would therefore change nothing observable to those tests while
+    /// leaving a notification that says only "completed", which is the difference between a GUI that reports "no network"
+    /// and one that reports "done".
+    #[test]
+    fn a_terminal_line_copies_the_state_keys_that_were_in_the_result() {
+        let outcome = Ok(json!({
+            "outcome": {"offline": {"id": "embeddinggemma-2"}},
+            "offline": true,
+            "vectors": false,
+            "embedded": 0,
+        }));
+        let params = terminal_params(
+            Some(&json!(7)),
+            "embed",
+            &outcome,
+            std::time::Duration::from_millis(12),
+        );
+        assert_eq!(params["phase"], "completed", "{params}");
+        assert_eq!(params["request"], 7, "{params}");
+        assert_eq!(
+            params["outcome"],
+            json!({"offline": {"id": "embeddinggemma-2"}}),
+            "**§2**: the arm travels on the line too: {params}"
+        );
+        assert_eq!(params["offline"], true, "{params}");
+        assert_eq!(params["vectors"], false, "{params}");
+        // Copied, never invented: a key the response did not carry must not appear here as a guess.
+        assert!(
+            params.get("embedded").is_none(),
+            "only the state keys are copied, and `embedded` is not one: {params}"
+        );
+        assert!(
+            params.get("locked").is_none() && params.get("reason").is_none(),
+            "an absent key stays absent so a client can tell 'no' from 'unsaid': {params}"
+        );
+
+        let refused = terminal_params(
+            None,
+            "scan",
+            &Err(Fault::new(
+                Fault::REFUSED,
+                "workspace unreadable".to_string(),
+            )),
+            std::time::Duration::from_millis(3),
+        );
+        assert_eq!(refused["phase"], "refused", "{refused}");
+        assert_eq!(refused["code"], -32000, "{refused}");
+        assert!(
+            !refused.as_object().expect("params").contains_key("request"),
+            "a request with no id gets no `request` key: {refused}"
+        );
+        assert!(
+            !refused.to_string().contains("unreadable"),
+            "the fault's sentence belongs to the error object, not to two lines: {refused}"
+        );
     }
 }

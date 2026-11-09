@@ -75,6 +75,11 @@ ram='?'
 [ -r /proc/meminfo ] && ram=$(awk '/^MemTotal:/ { printf "%.1f GB", $2 / 1048576 }' /proc/meminfo)
 echo "# jobs   CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS  ram=$ram"
 
+# **`-- --nocapture` on every test row, and the reason it is not optional.** libtest captures a passing test's stdout and throws
+# it away, so the `NOT COVERAGE` lines that artifact-gated cases print when their fixture is absent never reached these logs —
+# a row could be green because nothing ran, and the vacuity counter below would read zero while lying (`ci.yml` records the same
+# discovery for the hosted jobs). Un-captured output makes "green" and "green but empty" distinguishable, which is the only way
+# the count at the bottom of this log means anything.
 row fmt cargo fmt --all -- --check
 row clippy-default cargo clippy --workspace --all-targets -- -D warnings
 cmake_missing=""
@@ -83,11 +88,18 @@ row_or_skip clippy-localmodel "$cmake_missing" cargo clippy -p np-core -p np-cli
 row_or_skip clippy-lm-vision "$cmake_missing" cargo clippy -p np-core -p np-cli --features local-model,vision --all-targets -- -D warnings
 row clippy-nodefaults cargo clippy -p np-core -p np-cli --no-default-features --all-targets -- -D warnings
 row check-cli-vision cargo check -p np-cli --features local-model,vision
-row test-workspace cargo test --workspace
-row test-cli-nodefaults cargo test -p np-cli --no-default-features
-row_or_skip test-cli-vision "$cmake_missing" cargo test -p np-cli --features local-model,vision
-row_or_skip test-core-vision "$cmake_missing" cargo test -p np-core --features local-model,vision
-row test-config-nohome env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config
+row test-workspace cargo test --workspace -- --nocapture
+row test-cli-nodefaults cargo test -p np-cli --no-default-features -- --nocapture
+row_or_skip test-cli-vision "$cmake_missing" cargo test -p np-cli --features local-model,vision -- --nocapture
+row_or_skip test-core-vision "$cmake_missing" cargo test -p np-core --features local-model,vision -- --nocapture
+# **The row that was missing until 2026-12-09.** `crates/np-cli/tests/serve.rs` gates its fetch and chunk-narration cases on
+# `all(feature = "local-model", feature = "fetch")`, because a default build has no transport to narrate and no runtime to embed
+# with. No other row compiles that pair for np-cli — `test-cli-vision` uses `vision`, `test-cli-realmodel` uses `local-model`
+# alone — so every one of those cases ran as its "NOT COVERAGE" stub in every graded log, and the wire-level claims about byte
+# checkpoints, pinned denominators and a terminal `refused -32000` had no row behind them at all. This is that row; with
+# `NP_TEST_MODEL_PATH` set it also embeds a real artifact and reads the `embedding`/`writing` lines off the pipe.
+row_or_skip test-cli-lm-fetch "$cmake_missing" cargo test -p np-cli --features local-model,fetch --test serve -- --nocapture
+row test-config-nohome env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config -- --nocapture
 
 RUSTDOCFLAGS="--deny warnings" row rustdoc-deny-default cargo doc --workspace --no-deps
 row_or_skip rustdoc-deny-localmodel "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model --no-deps
@@ -110,9 +122,9 @@ row f31-selftest python3 .github/scripts/f31_eval.py --self-test
 # failure mode F33's review named: green because nothing was loaded.
 artifacts=""
 [ -n "${NP_TEST_MODEL_PATH:-}" ] || artifacts="NP_TEST_MODEL_PATH unset"
-row_or_skip test-cli-realmodel "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-cli --features local-model
+row_or_skip test-cli-realmodel "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-cli --features local-model -- --nocapture
 [ -n "${NP_TEST_MMPROJ_PATH:-}" ] || artifacts="NP_TEST_MODEL_PATH or NP_TEST_MMPROJ_PATH unset"
-row_or_skip test-core-realvision "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-core --features local-model,vision
+row_or_skip test-core-realvision "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-core --features local-model,vision -- --nocapture
 
 vacuous=$(grep -rho 'NOT COVERAGE' "$logs" 2>/dev/null | wc -l | tr -d ' ')
 echo "vacuous  NOT COVERAGE lines across all logs: $vacuous"

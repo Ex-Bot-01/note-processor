@@ -730,10 +730,12 @@ fn embed_report(
             id: id.clone(),
         },
     };
-    // The CLI reports nothing: `np embed` prints one summary at the end and its bytes are a contract, so this path
-    // passes the no-op reporter. `np serve` reaches the same function through `embed_report` with a real one.
-    let mut report =
-        embed_run::embed_with_resolution(workspace, &cfg, resolution, np_core::progress::none())?;
+    // **The reporter travels.** Every CLI caller of `embed_report` passes `progress::none()` (its bytes are a contract), so
+    // forwarding the parameter here changes nothing for them; `np serve` is the one caller that hands in a real reporter,
+    // and this is the call that makes its `embedding` and `writing` lines exist. Handing `none()` to the run instead — which
+    // is what the first version of this line did — silences both phases on the wire while every test still passed, because
+    // np-core's own seam tests call `embed_with_inject` directly and never come through here.
+    let mut report = embed_run::embed_with_resolution(workspace, &cfg, resolution, progress)?;
     // What was concluded about the model's bytes travels on the report rather than being printed here, so `--json`
     // and the text summary cannot disagree about whether this run verified anything (the same reason §7's caveat is a
     // field). `None` says no local artifact was involved — a `provider = "none"` run has nothing to claim.

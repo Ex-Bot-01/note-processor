@@ -167,16 +167,23 @@ are listed with defaults and refusal behaviour in [Configuration reference](docs
 same work as the commands, on a channel that does not fork. Ask for `notifications` in the handshake and it also narrates the slow
 parts, which is what a GUI needs while a 295 MiB model downloads:
 
-```console
-$ np serve
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspace":"/home/you/Notes","notifications":true}}
-{"jsonrpc":"2.0","id":1,"result":{"protocol":1,"np":"0.3.0","features":{…},"methods":["status.get",…],"data_dir":"/home/you/.local/share/note-processor","progress":true}}
+```json
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"fetching","request":2,"since_ms":61,"member":"main","bytes_done":0,"bytes_total":309855456,"members_done":0,"members_total":1}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"fetching","request":2,"since_ms":1494,"member":"main","bytes_done":8388608,"bytes_total":309855456,"members_done":0,"members_total":1}}
-{"jsonrpc":"2.0","id":2,"result":{"outcome":{…},"offline":true,"embedded":0,…}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"completed","request":2,"since_ms":68,"offline":true,"outcome":{…}}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":61}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1494}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4036}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6589}}
+{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.IaDK9X/C/data/workspaces/39e6b8caca57d6ee.models/.part.embeddinggemma-2.1323809-1794227836518406938-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
+{"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7704}}
+{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7704,"phase":"refused","request":2},"running":null}}
+{"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":0}}
 ```
+
+That block is captured stdout, one interrupted download, nothing edited: `locking`, then byte checkpoints against the pinned
+size, then a refusal carrying the same code as the error object. An embed that gets to run says `embedding` and `writing` where
+this one said `fetching`.
 
 Seven methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `status.get`, `shutdown` — and three rules:
 
@@ -187,9 +194,11 @@ Seven methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `statu
   the *request* was wrong (`-32700`, `-32601`, `-32602`) or `np` refused before doing work (`-32000`). Progress ends with
   `completed` when the request produced a result — including a degraded one — and `refused` only when it produced an error.
 
-Progress is **off unless you ask**: a client built against v0.3.0 sees byte-identical responses, because notifications are opt-in
-inside protocol version 1. A workspace is named in every request rather than remembered at startup, so one server can answer for
-several vaults. It exits **0** when stdin closes. Nothing listens on a port: whoever can write to the process's stdin already owns
+Progress is **off unless you ask**, so a client built against v0.3.0 keeps the responses it expects: nothing new arrives unsolicited,
+and every method's result document is byte-for-byte what it was. The one line that did change is `initialize`'s own, which now lists
+`status.get` among the methods this build accepts and adds `"progress": true` when asked.
+
+A workspace is named in every request rather than remembered at startup, so one server can answer for several vaults. It exits **0** when stdin closes. Nothing listens on a port: whoever can write to the process's stdin already owns
 the files it can read.
 
 The whole interface — every method, every phase, four captured transcripts and a Python walkthrough including what to show after a
