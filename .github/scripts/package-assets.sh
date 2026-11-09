@@ -45,8 +45,15 @@ else
   # Strip before packaging. §14's size ceiling has always been quoted against **stripped** binaries while the first assets shipped
   # unstripped (measured 2026-11-08: 10,295,048 B becomes 8,389,040 B for this target). Symbols are a debugging convenience; what
   # identifies the file for a downloader is the digest in the release notes.
+  # **Stage, then strip the copy.** Stripping `target/.../$binary` in place makes a second run of this script re-strip an already-stripped file and
+  # emit different bytes from an unchanged build (measured across five v0.3.0 packaging runs: same compile, five archive hashes). A published digest
+  # should describe the artefact, not the number of times the packager was run.
+  stage="$out/.staging"
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  cp "target/$target/release/$binary" "$stage/$binary"
   if command -v strip >/dev/null 2>&1; then
-    strip "target/$target/release/$binary"
+    strip "$stage/$binary"
   else
     echo "warning: no strip on PATH — packaging an unstripped binary, larger than §14's quoted figures" >&2
   fi
@@ -67,7 +74,11 @@ else
   # `-C target/x86_64-unknown-linux-gnu/release` a following `-C .` means *that* directory, and the notice file is not there —
   # `tar: THIRD_PARTY_NOTICES.md: Cannot stat`, exit 2, no asset. The listing check below never even ran, because the failure was
   # loud enough to stop the script; a quieter tar would have published an asset missing its license text.
-  tar -C "target/$target/release" -czf "$archive" "$binary" -C "$repo_root" THIRD_PARTY_NOTICES.md LICENSE
+  # Deterministic archive: sorted names, numeric root ownership, a fixed mtime, and `gzip -n` so the compressor stores neither a filename nor the
+  # clock. Every one of those removes a fact that has no business being inside something whose sha256 is published for other people to check.
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 2026-01-01' \
+      -cf - -C "$stage" "$binary" -C "$repo_root" THIRD_PARTY_NOTICES.md LICENSE \
+    | gzip -n > "$archive"
   # Both files, counted: the MIT notice for the code we link and the licence for our own. A count rather than one grep per name because a single
   # missing member must still fail, and `grep -c` over the listing answers "did both land" in one pass without SIGPIPE-ing tar (see above).
   listed=$(tar -tzf "$archive" | { grep -cE '(THIRD_PARTY_NOTICES\.md|^LICENSE$)' || true; })

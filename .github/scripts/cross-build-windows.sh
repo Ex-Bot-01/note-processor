@@ -24,28 +24,35 @@
 # correctly — refuses to ship it. Measured both ways on 2026-11-08.
 #
 # Usage:  NP_LLAMA_CMAKE_TOOLCHAIN=/path/to/mingw-toolchain.cmake .github/scripts/cross-build-windows.sh [out-dir]
-# Env:    MINGW_BIN (default /home/agent/tmp/mingw/usr/bin), TARGET (default x86_64-pc-windows-gnu),
+# Env:    MINGW_BIN (default: the directory `x86_64-w64-mingw32-gcc` is found in on PATH),
+#         TARGET (default x86_64-pc-windows-gnu),
 #         NP_LLAMA_CMAKE_TOOLCHAIN (required; a cmake toolchain naming the win32 mingw drivers), CMAKE (cmake binary)
 
 set -euo pipefail
 
 out="${1:-dist-win}"
 target="${TARGET:-x86_64-pc-windows-gnu}"
-mingw_bin="${MINGW_BIN:-/home/agent/tmp/mingw/usr/bin}"
+# **No machine-specific default baked in.** This line hardcoded one operator's scratch directory, which made the script unrunnable for anybody else and
+# printed a confusing "no mingw-w64 at " (empty `$MINGW_BIN`) when they tried. The toolchain is found on PATH now; MINGW_BIN stays as the override for
+# anyone who unpacked it somewhere unusual.
+gcc_on_path="$(command -v x86_64-w64-mingw32-gcc || true)"
+mingw_bin="${MINGW_BIN:-${gcc_on_path%/*}}"
+if [ -z "${mingw_bin:-}" ] || [ "$mingw_bin" = "$gcc_on_path" ]; then mingw_bin=""; fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
 if [ ! -x "$mingw_bin/x86_64-w64-mingw32-gcc" ]; then
   cat >&2 <<EOF
-no mingw-w64 at $MINGW_BIN (set MINGW_BIN if it lives elsewhere).
+no mingw-w64 toolchain found${MINGW_BIN:+ at $MINGW_BIN}${MINGW_BIN:- on PATH as x86_64-w64-mingw32-gcc}.
+Set MINGW_BIN to the directory holding x86_64-w64-mingw32-gcc if it lives somewhere unusual.
 
 It needs no root and no apt-install — Ubuntu's .debs are ar+tar archives:
-  mkdir -p /home/agent/tmp/mingwdebs && cd /home/agent/tmp/mingwdebs
+  mkdir -p "\${TMPDIR:-/tmp}/mingwdebs" && cd "\${TMPDIR:-/tmp}/mingwdebs"
   apt-get install --print-uris -y gcc-mingw-w64-x86-64 | grep "^'" | sed "s/'\\([^']*\\)'.*/\\1/" > uris.txt
   xargs -n1 -P4 curl -sS -O < uris.txt
   mkdir -p ../mingw && for d in *.deb; do dpkg-deb -x "\$d" ../mingw; done
 Then symlink the posix build to the plain name if it is missing:
-  ln -sf x86_64-w64-mingw32-gcc-13-posix $MINGW_BIN/x86_64-w64-mingw32-gcc
+  ln -sf x86_64-w64-mingw32-gcc-13-posix <that directory>/x86_64-w64-mingw32-gcc
 Full background: docs/ops-cross-build-windows-gnu.md
 EOF
   exit 1
@@ -55,7 +62,7 @@ fi
 # refusing here as well would be polite but late — and `build.rs` checks the same fact out of cmake's own records.
 for need in x86_64-w64-mingw32-gcc-win32 x86_64-w64-mingw32-g++-win32; do
   if [ ! -x "$mingw_bin/$need" ]; then
-    echo "no $need in $MINGW_BIN — the C++ half needs g++-mingw-w64-x86-64-win32 (rootless .deb recipe in docs/ops-cross-build-windows-gnu.md)." >&2
+    echo "no $need in $mingw_bin — the C++ half needs g++-mingw-w64-x86-64-win32 (rootless .deb recipe in docs/ops-cross-build-windows-gnu.md)." >&2
     exit 1
   fi
 done
@@ -67,15 +74,20 @@ Windows instead of for this Linux host. It has to name the win32 mingw drivers; 
 
   set(CMAKE_SYSTEM_NAME Windows)
   set(CMAKE_SYSTEM_PROCESSOR x86_64)
-  set(TOOL_PREFIX /home/agent/tmp/mingw/usr/bin/x86_64-w64-mingw32-)
+  set(TOOL_PREFIX <directory holding the mingw binaries>/x86_64-w64-mingw32-)
   set(CMAKE_C_COMPILER   ${TOOL_PREFIX}gcc-win32)
   set(CMAKE_CXX_COMPILER ${TOOL_PREFIX}g++-win32)
   set(CMAKE_AR           ${TOOL_PREFIX}ar)
   set(CMAKE_RANLIB       ${TOOL_PREFIX}ranlib)
   set(CMAKE_RC_COMPILER  ${TOOL_PREFIX}windres)
+  # (replace the TOOL_PREFIX placeholder with a real directory — printed on the next line, if a toolchain was found at all)
 
 and the pinned source tree comes from scripts/vendor-llama-cpp.sh (or set NP_LLAMA_CPP_SRC at it).
 EOF
+  # Hand the caller the directory this machine resolved, so the placeholder above is a copy-paste rather than a scavenger hunt.
+  if [ -n "$mingw_bin" ]; then
+    echo "on this machine that directory is: $mingw_bin" >&2
+  fi
   exit 1
 fi
 test -f "$NP_LLAMA_CMAKE_TOOLCHAIN" || { echo "NP_LLAMA_CMAKE_TOOLCHAIN=$NP_LLAMA_CMAKE_TOOLCHAIN is not a file" >&2; exit 1; }
@@ -130,9 +142,30 @@ echo "runtime  llama.cpp present ($runtime_hits copies of the loader symbol name
 # Strip for the asset. §14's ≤ 40 MB ceiling has been quoted against **stripped** sizes since it was written, while every asset so far
 # shipped unstripped — measured 2026-11-08: this build 23,297,605 B becomes 16,253,440 B; the runtime-less v0.2.3 asset was 14,073,097 B
 # where a stripped one is 9,952,768 B. Both numbers are printed below because the release notes quote the archive and a report quotes the exe.
-unstripped=$(stat -c%s "$exe")
-x86_64-w64-mingw32-strip "$exe"
-echo "strip    $unstripped B -> $(stat -c%s "$exe") B"
+# **Strip a copy, never the build artefact.** Measured on 2026-12-09 while cutting v0.3.0: five consecutive runs of this script produced five different
+# `np.exe` hashes from a build cargo reported unchanged ("Finished in 0.04s"), and the reason turned out to be two separate things — worth separating,
+# because only one of them is ours to fix:
+#
+#   * **Ours:** the script stripped `target/.../np.exe` *in place*, so every run mutated the build artefact and the next run packaged a file that had
+#     been through strip again. Fixed by staging: copy, strip the copy, package and hash that. `target/` is now left byte-identical (verified before
+#     and after a run: `9871b857…` both times).
+#   * **Not ours:** `x86_64-w64-mingw32-strip` on this toolchain is not deterministic across invocations. Three strips of the same input inside one
+#     shell invocation produce three identical files (`cb74ea02…`, `cmp` reports zero differing bytes); repeating the same command minutes later yields
+#     a different file from the same 16,326,144-byte input (`b0b975a9…`, then `ef3b059e…`). File mtime was ruled out (two copies stamped 2020 and 2030
+#     strip identically), as was the archive layer (zip member timestamps are pinned to 1980-01-01, and `LICENSE` plus `THIRD_PARTY_NOTICES.md` hash
+#     identically across every run).
+#
+# The consequence is stated where a user can read it rather than buried here: **the Windows asset is not bit-reproducible today.** Its published sha256
+# identifies the file you downloaded — verify that, do not try to reproduce it by rebuilding. The Linux archive *is* reproducible (two runs of
+# `package-assets.sh` produced byte-identical tarballs once staging plus `--sort=name --owner=0 --group=0 --mtime` and `gzip -n` were in place).
+stage="$out/.staging"
+mkdir -p "$stage"
+staged="$stage/np.exe"
+cp "$exe" "$staged"
+unstripped=$(stat -c%s "$staged")
+x86_64-w64-mingw32-strip "$staged"
+echo "strip    $unstripped B -> $(stat -c%s "$staged") B (in a staged copy; target/ is left untouched)"
+exe="$staged"
 
 mkdir -p "$out"
 name="np-$version-$target-cross"
@@ -145,12 +178,28 @@ licence="$repo_root/LICENSE"
 test -s "$notices" || { echo "refusing to package: THIRD_PARTY_NOTICES.md is missing or empty" >&2; exit 1; }
 test -s "$licence" || { echo "refusing to package: LICENSE is missing or empty" >&2; exit 1; }
 python3 - "$exe" "$archive" "$notices" "$licence" <<'PY'
-import sys, zipfile
+import os, sys, zipfile
 exe, archive, notices, licence = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def put(z, name, path):
+    """Write one member with a FIXED timestamp.
+
+    zipfile stamps every entry with the current clock by default, so two runs over identical bytes produce different archives — which turns a
+    published sha256 into a receipt for one particular minute rather than a fact anyone can check. 1980-01-01 is zip's epoch; there is no
+    information in "when did the packager run" that belongs in an artefact a person verifies.
+    """
+    with open(path, "rb") as handle:
+        payload = handle.read()
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    # Keep the executable bit for the binary only; a zip member's mode is what an unzipper hands to chmod.
+    info.external_attr = (0o755 if name.endswith(".exe") else 0o644) << 16
+    z.writestr(info, payload)
+
 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
-    z.write(exe, "np.exe")
-    z.write(notices, "THIRD_PARTY_NOTICES.md")
-    z.write(licence, "LICENSE")
+    put(z, "np.exe", exe)
+    put(z, "THIRD_PARTY_NOTICES.md", notices)
+    put(z, "LICENSE", licence)
 with zipfile.ZipFile(archive) as z:
     names = z.namelist()
 for want in ("np.exe", "THIRD_PARTY_NOTICES.md", "LICENSE"):
