@@ -153,7 +153,22 @@ jobs:
         env:
           RUSTDOCFLAGS: "--deny warnings"
         run: cargo doc --locked -p np-core --features local-model --no-deps
-      # `--lib` alongside the link-proof test: the struct-layout pins in `src/llama_ffi.rs` only compile
+      # **The pair `np serve`'s wire tests are gated on (added 2026-12-09 after a review found it missing).**
+      # `crates/np-cli/tests/serve.rs` gates its fetch- and chunk-narration cases on `all(feature = "local-model",
+      # feature = "fetch")`, because a default build has no transport to narrate and no runtime to embed with — and no
+      # other job built that pair for np-cli: the vision job uses `vision`, and the default job's features exclude
+      # `local-model`. So in every hosted log those cases compiled as their own `NOT COVERAGE` stub, which is how a
+      # feature can be green and unread at the same time.
+      #
+      # What this step covers on a runner with no artifact: the framing of every line, that opt-in is total, the throttle's
+      # per-request reset, `shutdown` ending the session, contention and offline arriving as results rather than faults, and
+      # that `status.get` creates no database. What it cannot cover without `NP_TEST_MODEL_PATH`: byte checkpoints against a
+      # real origin and the `embedding`/`writing` lines — those print `NOT COVERAGE` here and run for real on the local
+      # `test-cli-lm-fetch` row in `.github/scripts/gates.sh`, which is the row that carries weights.
+      - name: Test `np serve` over a pipe (local-model + fetch)
+        run: cargo test --locked -p np-cli --features local-model,fetch --test serve -- --nocapture
+
+
       # with the feature on, and a wrong field order is an unsound memory bug rather than a compile
       # error. §2 step 4 wants skipped work printed as `NOT COVERAGE`. `local_runtime.rs` cannot skip at all -
       # no artifact gate, no env-var escape - so a green run there means llama.cpp was called.
