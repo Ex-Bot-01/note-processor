@@ -188,7 +188,7 @@ runs (O1).
   pub trait Progress: Sync { fn report(&self, event: &ProgressEvent); }   // must not block, must not panic
   ```
 
-  with `Progress::NONE` used by every CLI path so **the CLI's bytes do not move** (the same no-change evidence that the serve extraction produced:
+  with a shared no-op (`progress::none()` — a `&dyn` value cannot be an associated const) used by every CLI path so **the CLI's bytes do not move** (the same no-change evidence that the serve extraction produced:
   47 `tests/cli.rs` cases green untouched). Because `report(&self)` cannot write through `&mut Printer`, the emitter wraps its handle in interior
   mutability (`RefCell`/`Mutex` — plan's call) and nothing else locks it.
 - **Reuse the seams that exist** rather than widening seven signatures: `embed_run::embed_with_inject(..., between_batches: &mut dyn FnMut(&Path))`
