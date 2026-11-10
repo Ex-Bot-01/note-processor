@@ -867,6 +867,73 @@ fn concurrent_processes_never_split_a_record() {
     );
 }
 
+/// **A diagnostic on stderr is short enough for `poll`'s answer to mean what it says.** `POLLOUT` means "a write will be
+/// accepted now" — one byte is enough for that — so a line longer than the smallest pipe a client can give us (one page, on
+/// Linux) could still wait inside `write_all`, which is the exact stall the guard exists to remove. So stderr's copy of a
+/// record is bounded at a page and marked with `…`, while the file keeps the whole thing: the channel that can block is the
+/// one that gets the bound, and the reader who wants the entire TOML parse error has it in JSONL.
+#[test]
+fn a_stderr_line_is_short_enough_for_the_pipe_that_has_to_take_it() {
+    let vault = Vault::new();
+    vault.write_notes(2);
+    // A key long enough that quoting it dwarfs a page: 6 000 characters of name, which the parse error reproduces in full.
+    let giant = "k".repeat(6_000);
+    let log = vault.log_path();
+    vault.write_user_config(&format!(
+        "[log]\nfile = {}\n\n[{giant}]\nx = 1\n",
+        toml_str(&log.display().to_string())
+    ));
+
+    let scanned = vault.exec(&["-v", "scan"]);
+    assert_eq!(scanned.code, 1, "a refused configuration still refuses");
+
+    let err = &scanned.stderr;
+    let start = err
+        .find("error np_core::config:")
+        .unwrap_or_else(|| panic!("the refusal should reach an asked-for stderr: {err}"));
+    // The pinned refusal is main's own output, not a diagnostic, and keeps its bytes whatever this bound does.
+    let end = err[start..]
+        .find("np: configuration error:")
+        .map(|offset| start + offset)
+        .unwrap_or(err.len());
+    let written = err[start..end].trim_end();
+    assert!(
+        written.ends_with('…'),
+        "the stderr copy had to be cut, and a cut has to say so: {written}"
+    );
+    // The newline shares the page with the text, which is why the comparison is `<` and not `<=`.
+    assert!(
+        written.len() < PIPE_BYTES,
+        "stderr was handed {} bytes plus a newline, more than the {PIPE_BYTES}-byte pipe a client may give us",
+        written.len()
+    );
+
+    let records = read_records(&log);
+    let refused = records
+        .iter()
+        .find(|record| record.get("rule").and_then(Value::as_str) == Some("config-refused"))
+        .unwrap_or_else(|| panic!("the refusal belongs in the file too: {records:?}"));
+    let msg = refused
+        .get("msg")
+        .and_then(Value::as_str)
+        .expect("a refusal names itself");
+    assert!(
+        msg.len() > 8_000,
+        "the file keeps the whole sentence, not a page of it: {} bytes",
+        msg.len()
+    );
+    assert!(!msg.ends_with('…'), "and nothing was cut from it: {msg}");
+    let kept = written["error np_core::config:".len()..]
+        .trim_end()
+        .trim_end_matches('…')
+        .trim_start();
+    assert!(
+        msg.starts_with(kept),
+        "the two channels disagree about the same record:\nstderr: {kept}\nfile: {}",
+        &msg[..200.min(msg.len())]
+    );
+}
+
 /// **The budget belongs to the file, not to the process** (spec point 8; `docs/reference-config.md` bounds *the file*). A sink
 /// that counted only its own appends would let two `np` processes each write a whole budget and leave a log twice as long as
 /// the setting promises. Each sink re-reads the file's size before it latches and every 16 appends between times, so a writer

@@ -101,6 +101,15 @@ shrinks that pipe to its 4 KiB minimum and drains it only at the end, so the cas
 A closed or broken stderr (a reader that exited) is treated the same as a full one: `poll` reports an error condition, the
 line is dropped, and the command finishes its work instead of taking `SIGPIPE` for a log line.
 
+**One diagnostic never exceeds a pipe page (4 096 bytes) on stderr.** `POLLOUT` means "a write will be accepted now" — one
+byte would do for that — so for a line longer than the smallest pipe a client can hand us, "not now" and "yes" stop meaning
+the same thing and `write_all` would wait inside a channel whose whole contract is that it never waits. So stderr's copy of a
+record is cut at a page boundary, marked with `…`, and **the file keeps the record whole**: the channel that can block carries
+the bound, the one that cannot carries everything. Nothing this program writes comes close in ordinary use — paths are 512
+bytes each and the longest message is a TOML parse error quoting one key — so the case that pins it (`a_stderr_line_is_short_enough_for_the_pipe_that_has_to_take_it`)
+quotes a 6 000-character unknown table name to make both halves observable: stderr arrives cut and marked, the JSONL `msg`
+arrives complete, and the two agree up to the mark.
+
 Windows has no `poll`, so there a write to a full pipe still blocks as it always did; the cap bounds how many lines can
 be waiting on it, and `[log] file` is the answer for a client that will not read stderr.
 
@@ -145,11 +154,15 @@ the vault and the directory, which is the part that identifies the file. A field
 answered by nothing is not a diagnostic — and a value inside the bound is written exactly as it stands, with no marker
 attached.
 
-`msg` is deliberately unclamped. Its length is program-authored, and the sentence worth reading in a config refusal is the
-end of it (`unknown field \`loggg\``), so clipping would remove the remedy to keep the problem tidy. The bound lives in one
-function at the place a field enters a record, so stderr and the file cannot disagree about how the same long path was
-written; `a_long_path_is_truncated_and_still_names_the_file` asserts both fields on one record, and that a short path
-arrives whole.
+`msg` is deliberately unclamped **in the file**. Its length is program-authored, and the sentence worth reading in a config
+refusal is the end of it (`unknown field \`loggg\``), so clipping would remove the remedy to keep the problem tidy. The path
+bound lives in one function at the place a field enters a record, so stderr and the file cannot disagree about how the same
+long path was written; `a_long_path_is_truncated_and_still_names_the_file` asserts both fields on one record, and that a short
+path arrives whole.
+
+The two rules compose in one direction: **the file is the complete record, stderr is the readable one.** A message long
+enough to outrun a pipe page is written to the file entire and to stderr up to the page, with `…` where it stopped — see
+[What bounds stderr](#what-bounds-stderr) for why the bound sits on that channel and not this one.
 
 ## Phases report what they cost
 

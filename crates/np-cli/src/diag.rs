@@ -317,6 +317,34 @@ struct Sink {
     file_attempted: AtomicBool,
 }
 
+/// The longest line this module will put on stderr: one page, which is the smallest capacity a Linux pipe can have
+/// (`F_SETPIPE_SZ`'s minimum is a single page).
+///
+/// This is the floor under [`stderr_would_block`]'s answer, not a formatting preference. `poll` reports `POLLOUT` when a
+/// descriptor will take *a* write now — one byte is enough to make it say yes — so for a line longer than the smallest pipe
+/// that "yes" does not mean "the whole line lands without waiting", and `write_all` would wait inside a channel whose entire
+/// contract is that it never waits. Lines this program writes are nowhere near a page: paths are clamped to 512 bytes each,
+/// and the longest message is a TOML parse error quoting one key and the table names it could have been. So the bound almost
+/// never bites — and when it does, it bites only here, because the file sink writes the same record whole.
+const STDERR_LINE_MAX_BYTES: usize = 4096;
+
+/// Shorten a rendered diagnostic to [`STDERR_LINE_MAX_BYTES`], marking that it was shortened. Borrowed in the ordinary case:
+/// this runs on every line that reaches stderr, and a copy per line to discover "no change" is the wrong trade.
+fn fit_stderr_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.len() <= STDERR_LINE_MAX_BYTES {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    // The newline is written by the caller and counts against the page, so the text gets the page minus one.
+    let mut keep = STDERR_LINE_MAX_BYTES - 1 - '…'.len_utf8();
+    while !line.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut out = String::with_capacity(STDERR_LINE_MAX_BYTES);
+    out.push_str(&line[..keep]);
+    out.push('…');
+    std::borrow::Cow::Owned(out)
+}
+
 impl Sink {
     fn new() -> Self {
         Self {
@@ -425,13 +453,13 @@ impl Sink {
         true
     }
 
-    /// Write a line whose slot was claimed by [`Sink::claim_stderr_line`].
+    /// Write a line whose slot was claimed by [`Sink::claim_stderr_line`], shortened to fit one pipe page if need be.
     fn write_stderr_line(&self, line: &str) {
         // Written through a handle with the result dropped, for the reason `np_core::scan` gives for its own stderr receipt:
         // `eprintln!` panics when descriptor 2 refuses the write, which would replace a reportable failure with exit 101 and a
         // panic message that cannot be printed either.
         let mut err = io::stderr();
-        let _ = writeln!(err, "{line}");
+        let _ = writeln!(err, "{}", fit_stderr_line(line));
     }
 
     /// Whether the closing notice may be written without waiting. It is exempt from the cap — it is the line that explains the
