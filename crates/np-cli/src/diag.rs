@@ -183,14 +183,26 @@ fn level_text(level: &TracingLevel) -> &'static str {
     }
 }
 
+/// How many appends a sink may make before it asks the file how big it has become. Sixteen is the compromise: one `stat` per
+/// sixteen appends is ~6 % more syscalls on a path that only runs when someone asked for diagnostics, and it bounds what any
+/// one writer can add to a shared log after the budget is spent at fifteen records. The resync is what lets a process see the
+/// two things its own counter cannot: that another `np` is writing to the same path, and that a reader truncated the log —
+/// the remedy the `log full` record names, which then takes effect within sixteen lines rather than next run.
+const SIZE_RESYNC_RECORDS: u64 = 16;
+
 /// One file sink's state: the handle, how much has gone through it, and whether it has said its last word.
 struct FileSink {
     file: fs::File,
-    /// Bytes already on this path when the sink opened, so a log that filled its budget in an earlier run stays full instead of
-    /// gaining one more record per invocation.
+    /// Bytes on this path, as last known — seeded from the file's size when the sink opened, so a log that filled its budget
+    /// in an earlier run stays full instead of gaining one more record per invocation, and corrected from the file every
+    /// [`SIZE_RESYNC_RECORDS`] appends.
     written: u64,
     max_bytes: u64,
-    /// Set once the budget is spent: writing stops, and one `log full` record is the last line.
+    /// Appends since the last resync.
+    since_resync: u64,
+    /// Set once the budget is spent: writing stops, and one `log full` record is the last line. Latching is final **for this
+    /// process** — deleting the file frees the budget for the next run, not mid-run, which is what the stop record's own
+    /// wording says ("delete the file to continue") and cheaper than re-opening a handle per line.
     full: bool,
 }
 
@@ -212,6 +224,7 @@ impl FileSink {
         Ok(Self {
             file,
             written,
+            since_resync: 0,
             max_bytes,
             full,
         })
@@ -232,7 +245,23 @@ impl FileSink {
         if self.file.write_all(&bytes).is_err() {
             return;
         }
-        self.written += bytes.len() as u64;
+        // **The file, not the counter, decides when the budget is spent.** `[log] max_bytes` bounds *the file* (spec point 8),
+        // and a process that only ever counts its own appends cannot honour that promise twice over: two `np` processes
+        // pointing at one log would each be allowed the whole budget, and a reader who deleted the file — the remedy this
+        // sink's own final record names — would find the budget still spent. So the count is corrected from the file every
+        // `SIZE_RESYNC_RECORDS` appends, and always before latching.
+        self.since_resync += 1;
+        let crossing = self.written + bytes.len() as u64 >= self.max_bytes;
+        if self.since_resync >= SIZE_RESYNC_RECORDS || crossing {
+            self.written = self
+                .file
+                .metadata()
+                .map(|meta| meta.len())
+                .unwrap_or_else(|_| self.written + bytes.len() as u64);
+            self.since_resync = 0;
+        } else {
+            self.written += bytes.len() as u64;
+        }
         if self.written < self.max_bytes {
             return;
         }

@@ -867,6 +867,81 @@ fn concurrent_processes_never_split_a_record() {
     );
 }
 
+/// **The budget belongs to the file, not to the process** (spec point 8; `docs/reference-config.md` bounds *the file*). A sink
+/// that counted only its own appends would let two `np` processes each write a whole budget and leave a log twice as long as
+/// the setting promises. Each sink re-reads the file's size before it latches and every 16 appends between times, so a writer
+/// stops near the size the *file* reached rather than the size it personally produced. The slack is fifteen records per
+/// concurrent writer — the gap between another process's append and this one's `stat` — which is why the bound below is
+/// budget + 25 % and not budget: a counter-only implementation leaves ~240 KiB here, because each of these two runs has well
+/// over a budget's worth of records to write.
+#[test]
+fn two_processes_share_one_log_budget() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let config = tmp.path().join("config");
+    fs::create_dir_all(config.join("note-processor")).expect("test setup: config dir");
+    let log = tmp.path().join("shared.jsonl");
+    const BUDGET: u64 = 65_536;
+    // A configuration that *loads*, so `[log] max_bytes` reaches the sink through the ordinary path rather than through the
+    // lenient peek a refusing file has to fall back on.
+    fs::write(
+        config.join("note-processor").join("config.toml"),
+        format!(
+            "[log]\nlevel = \"debug\"\nfile = {}\nmax_bytes = {BUDGET}\n",
+            toml_str(&log.display().to_string())
+        ),
+    )
+    .expect("test setup: write config");
+
+    // Two vaults, because a workspace's writer lock is exactly one process deep: what is under test is two writers on the
+    // *log*, not two writers on one catalog. Non-markdown files yield one deterministic debug record each and nothing else.
+    let mut children = Vec::new();
+    for letter in ['a', 'b'] {
+        let root = tmp.path().join(format!("vault-{letter}"));
+        fs::create_dir_all(&root).expect("test setup: vault dir");
+        for i in 0..1_200 {
+            fs::write(root.join(format!("p{i}.png")), "x\n").expect("test setup: file");
+        }
+        let out = tmp.path().join(format!("scan-{letter}-out.txt"));
+        let err = tmp.path().join(format!("scan-{letter}-err.txt"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_np"));
+        cmd.arg("scan")
+            .arg(&root)
+            .env_remove("NP_LOG")
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
+            .env("LOCALAPPDATA", tmp.path().join("data"))
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("APPDATA", &config);
+        // Both streams to files, so no child can be slowed by a pipe nobody reads: the only limit that should bind is the one
+        // under test.
+        children.push(spawn_to_files(&mut cmd, &out, &err));
+    }
+    for (i, child) in children.iter_mut().enumerate() {
+        let status = child.wait().expect("child exits");
+        assert!(status.success(), "scan {i} exited {status}");
+    }
+
+    let size = fs::metadata(&log).expect("the log exists").len();
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    assert!(
+        size <= BUDGET + BUDGET / 4,
+        "two writers left {size} bytes against a {BUDGET}-byte budget: the limit is the file's, not each process's",
+    );
+    assert!(
+        records.len() >= 100,
+        "the budget should have stopped the writers after real work, not at once: {} records",
+        records.len()
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.get("msg").and_then(Value::as_str) == Some("log full")),
+        "a budget spent by two writers still ends with the record that says so: {:?}",
+        records.last()
+    );
+}
+
 /// **Deleting the log mid-run is documented as safe** (Review Focus 4): writes stop or continue, but the command does not fail,
 /// panic, or lose its report — and the next run recreates the file, which is what makes "delete it" a real remedy.
 ///

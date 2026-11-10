@@ -46,36 +46,40 @@ how to read the output is in [`docs/reference-diagnostics.md`](reference-diagnos
 
 Warm `np scan`, wall clock:
 
-| Corpus                       | setting        | min ms | median ms | stderr bytes | peak RSS KiB |
-| ---------------------------- | -------------- | ------ | --------- | ------------ | ------------ |
-| fixture corpus, 16 notes     | `off`          | 2.4    | 2.5       | 26           | 15 548       |
-| fixture corpus, 16 notes     | `trace-scan-off`| 2.4   | 2.6       | 28           | 15 548       |
-| fixture corpus, 16 notes     | `trace-stderr` | 2.5    | 2.8       | 3 050        | 15 548       |
-| fixture corpus, 16 notes     | `trace-file`   | 2.7    | 2.7       | 3 055        | 15 548       |
-| generated vault, 2 005 files | `off`          | 56.8   | 57.0      | 26           | 21 276       |
-| generated vault, 2 005 files | `trace-scan-off`| 56.6  | 56.9      | 28           | 21 276       |
-| generated vault, 2 005 files | `trace-stderr` | 63.2   | 63.8      | 165 126      | 21 276       |
-| generated vault, 2 005 files | `trace-file`   | 66.9   | 67.6      | 165 131      | 21 276       |
+Re-measured on the tree that ships this feature (`f6272c9` plus the file-budget resync), after every behaviour change on the
+reference page had landed — an earlier draft of this table carried numbers from a binary where `-vv` was inert, and those
+numbers described a run nobody could reproduce.
+
+| Corpus                       | setting         | min ms | median ms | stderr bytes | peak RSS KiB |
+| ---------------------------- | --------------- | ------ | --------- | ------------ | ------------ |
+| fixture corpus, 16 notes     | `off`           | 2.5    | 2.6       | 26           | 15 664       |
+| fixture corpus, 16 notes     | `trace-scan-off`| 2.5    | 2.6       | 28           | 15 664       |
+| fixture corpus, 16 notes     | `trace-stderr`  | 2.6    | 2.7       | 3 050        | 15 664       |
+| fixture corpus, 16 notes     | `trace-file`    | 2.7    | 2.8       | 3 055        | 15 664       |
+| generated vault, 2 005 files | `off`           | 56.5   | 57.2      | 26           | 21 276       |
+| generated vault, 2 005 files | `trace-scan-off`| 55.9   | 57.4      | 28           | 21 276       |
+| generated vault, 2 005 files | `trace-stderr`  | 61.5   | 62.4      | 165 126      | 21 276       |
+| generated vault, 2 005 files | `trace-file`    | 64.7   | 68.9      | 165 131      | 21 276       |
 
 Against `off` on the same corpus:
 
 | Setting          | 16 notes | 2 005 files |
 | ---------------- | -------- | ----------- |
-| `trace-scan-off` | −2.9 %   | −0.2 %      |
-| `trace-stderr`   | +2.1 %   | +11.3 %     |
-| `trace-file`     | +11.2 %  | +17.8 %     |
+| `trace-scan-off` | +0.6 %   | −1.0 %      |
+| `trace-stderr`   | +5.7 %   | +8.8 %      |
+| `trace-file`     | +9.7 %   | +14.5 %     |
 
 ## What the numbers say
 
-**Asking for nothing costs nothing measurable.** On the 2 005-file vault, `off` and `trace-scan-off` differ by 0.2 ms
-across a 57 ms run — less than the spread *within* either setting's nine rounds. That is the claim spec point 9 needed:
+**Asking for nothing costs nothing measurable.** On the 2 005-file vault `off` and `trace-scan-off` land in the same place
+— 56.5 ms against 55.9 ms minimum, 57.2 against 57.4 median, which is to say the faster one varies by sign between runs. That is the claim spec point 9 needed:
 a span opened, a target compared, a level checked, and the process is the same speed. It is also the shape the design
 asked for — an event whose level no filter admits formats nothing, so `trace-scan-off` is not "trace with one phase
 muted" but "the whole pipeline running, producing almost no bytes" (28 of them, and 26 of those is the announce line).
 
 **The cost is in what you asked to be written, and it scales with bytes, not with records considered.** Asking for
-`trace` everywhere writes 165 KiB on this corpus and costs 11 %; asking for the same level in a file as well costs 18 %.
-Both numbers are honest and neither is the machinery's fault: an unfiltered trace of a 2 000-file scan is roughly one
+`trace` everywhere writes 165 KiB on this corpus and costs about 9 %; asking for the same level in a file as well costs
+about 15 %. Both numbers are honest and neither is the machinery's fault: an unfiltered trace of a 2 000-file scan is roughly one
 line per file, and writing two copies of ~1 400 lines of JSONL and human text is the work being measured. A vault twice
 the size pays twice that — this is a cost per byte written, which is why stderr is capped at 1 000 lines and the file at
 a budget rather than left open-ended.
@@ -84,8 +88,13 @@ a budget rather than left open-ended.
 tables and one buffered file writer are small enough that this box's allocator does not notice; nothing in the diagnostic
 path accumulates per-note state, which is what would have shown up here.
 
-**The 16-note corpus cannot resolve any of this.** Its whole run is 2.4 ms against a ~2 ms process start-up, so its
-spread (−2.9 % to +11.2 %) is mostly the noise floor and should be read as "within measurement error", not as a ranking.
+**The 16-note corpus cannot resolve any of this.** Its whole run is 2.5 ms against a ~2 ms process start-up, so its spread
+(+0.6 % to +9.7 %) is mostly the noise floor and should be read as "within measurement error", not as a ranking.
+
+**Read these percentages as ±3 points, not as digits.** The same code measured twice on this box put `trace-stderr` at
++11.3 % once and +8.8 % next, and `trace-file` at +17.8 % then +14.5 %; what stayed fixed across both runs was the *ordering*
+(`off` ≈ `trace-scan-off` < stderr < file) and the byte counts to the byte. The percentages are this machine on this afternoon,
+and anyone repeating the run should expect the ordering, not the decimals.
 It is reported anyway because it is the corpus in the repository, and anyone can reproduce it in one command.
 
 ## Reproducing
@@ -99,7 +108,8 @@ is what it has to do for these numbers to mean what they say, in order: copy `te
 generate the 2 000 notes; give **each setting its own data directory and config file** (sharing them measures one
 setting's cache under another's name, which is exactly the bug this harness had before it produced any of the numbers
 above); warm each with an untimed scan; then run 9 interleaved rounds and report minimum and median per setting.
-`NP_NO_AUTO_FETCH=1` throughout, so no row silently depends on the network. One caution from building it: a harness that
+`NP_NO_AUTO_FETCH=1` throughout, so no row silently depends on the network. The byte counts (3 050 / 3 055 / 165 126 /
+165 131) are reproducible to the byte; the milliseconds are not. One caution from building it: a harness that
 warms a directory and then reuses the *warm* environment for the timed runs measures `off` four times and reports the
 difference as zero — which is what the first version of this table said before it was fixed.
 
