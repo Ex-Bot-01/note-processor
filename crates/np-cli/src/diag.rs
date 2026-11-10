@@ -57,19 +57,34 @@ use tracing_subscriber::registry::{LookupSpan, SpanRef};
 #[cfg(unix)]
 fn stderr_would_block() -> bool {
     use std::os::fd::AsRawFd;
+    write_would_block(io::stderr().as_raw_fd())
+}
+
+/// The same question for any descriptor, split out so the rule can be tested against a pipe this process controls instead
+/// of against its own descriptor 2 — which no test may replace without affecting every other test in the binary.
+#[cfg(unix)]
+fn write_would_block(raw: std::os::fd::RawFd) -> bool {
     let mut fd = libc::pollfd {
-        fd: io::stderr().as_raw_fd(),
+        fd: raw,
         events: libc::POLLOUT,
         revents: 0,
     };
     // SAFETY: `fd` is one initialised `pollfd`, and the count passed matches it. `poll` writes only `revents`.
     let ready = unsafe { libc::poll(&mut fd, 1, 0) };
-    // Three answers, and only one of them means "write". `ready == 0` is the timeout — the pipe buffer is full and nobody
-    // is reading; `ready > 0` without `POLLOUT` is the same news with an error condition attached (`POLLERR`/`POLLHUP` on
-    // a closed or broken pipe). A negative return means `poll` itself failed (an odd descriptor, `EINTR`), and that one
-    // answers "would not block": the write below already tolerates any error the descriptor can give.
+    // Three answers, and only one of them means "write".
+    //
+    // * `ready == 0` is the timeout: the buffer is full and nobody is reading.
+    // * An error condition — `POLLERR` on a broken pipe where the client went away, `POLLHUP`, `POLLNVAL` on a descriptor
+    //   closed under us — also answers "do not write". Linux reports `POLLERR` **together with** `POLLOUT` in that case, so
+    //   the error bits are checked first or they mean nothing. Writing anyway would only be pointless (`EPIPE` is discarded
+    //   like any other error here), but a channel with no reader is not one to keep poking.
+    // * A negative return means `poll` itself failed (an odd descriptor, or `EINTR`). That answers "would not block": the
+    //   write below tolerates any error the descriptor can give, and a diagnostic that arrives beats one lost to a signal.
     if ready < 0 {
         return false;
+    }
+    if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return true;
     }
     ready == 0 || (fd.revents & libc::POLLOUT) == 0
 }
@@ -257,6 +272,16 @@ struct Sink {
     announced: AtomicBool,
     /// Per-target overrides as ordinals, in the order written.
     overrides: RwLock<Vec<(String, u8)>>,
+    /// What `--log-spec` / `-v` asked for, kept verbatim for the second resolution.
+    ///
+    /// Levels are resolved twice — once before any configuration is read, so a run that refuses to load one still says where
+    /// its diagnostics go, and once after, because `[log] level` cannot be known before the file is opened. The second pass
+    /// has to resolve the **same three sources**, and the command line is one of them: re-resolving with `None` here silently
+    /// dropped the flag, so `-vv` announced `debug from command line` and then ran at `warn` with stderr switched off — the
+    /// flagship knob inert on every command that reads configuration, which is every command. Pinned by
+    /// `a_verbose_flag_reaches_the_records_and_not_only_the_announce` and `a_flag_outranks_the_file_that_asked_first`, both of
+    /// which assert records rather than the announce sentence for exactly that reason.
+    flag: RwLock<Option<String>>,
     /// The file sink, or `None` when nobody configured one — a failed open warns once and leaves this `None`.
     file: Mutex<Option<FileSink>>,
     /// Set once `[log] file` has been attempted, so an unopenable path warns once rather than on every reconfigure.
@@ -274,9 +299,20 @@ impl Sink {
             suppressed: AtomicUsize::new(0),
             announced: AtomicBool::new(false),
             overrides: RwLock::new(Vec::new()),
+            flag: RwLock::new(None),
             file: Mutex::new(None),
             file_attempted: AtomicBool::new(false),
         }
+    }
+
+    /// Keep what the command line asked for, verbatim, for the second resolution in [`apply_config`].
+    fn remember_flag(&self, raw: Option<&str>) {
+        *self.flag.write().expect("diagnostic flag spec lock") = raw.map(str::to_string);
+    }
+
+    /// The remembered `--log-spec` / `-v` text, if this run's command line wrote any.
+    fn flag(&self) -> Option<String> {
+        self.flag.read().expect("diagnostic flag spec lock").clone()
     }
 
     /// Whether a record at `level` on `target` is captured — the one question that decides whether anything gets formatted, so
@@ -333,29 +369,49 @@ impl Sink {
         self.default_level.store(default, Ordering::Relaxed);
     }
 
-    /// Write one line to stderr, through the cap.
-    fn write_stderr(&self, line: &str) {
-        if !self.take_stderr_slot() {
-            return;
+    /// Claim the right to print one diagnostic line on stderr, **before** anything is formatted for it.
+    ///
+    /// Two questions, in this order, neither of which touches a `String`:
+    ///
+    /// 1. Does the cap allow another line? A line past it costs a counter and nothing else — spec point 8 states that as a
+    ///    design property, and the first version of this file only half honoured it: the cap was consulted after
+    ///    [`Record::human`] had already built the line, so diagnostic thousand-and-one paid for the very formatting the cap
+    ///    exists to avoid.
+    /// 2. Will descriptor 2 take a write *now*? A client that captures stderr and never reads it is normal — a GUI that wants
+    ///    to know whether anything went wrong does not parse the stream — and an anonymous pipe holds about 64 KiB. Measured
+    ///    before this existed: 1 200 requests sent to a server whose stderr nobody read, **1 057 answered**, the child stalled
+    ///    inside `write(2)`. A log channel that can stop the thing it is watching is not a log channel (see
+    ///    [`stderr_would_block`] for what the question costs and why it is not `O_NONBLOCK`).
+    ///
+    /// A line refused by either question counts as suppressed, so the closing notice still appears and names both ways out.
+    /// The file sink is unaffected by question two: a regular file does not fill.
+    fn claim_stderr_line(&self) -> bool {
+        if !self.stderr_on.load(Ordering::Relaxed) || !self.take_stderr_slot() {
+            return false;
         }
-        // **A diagnostic is never the reason a command waits.** This module's third rule used to be true only of failures
-        // — an unopenable path, a full budget — and not of descriptor 2 itself: measured on this box, `np serve` with
-        // `NP_LOG=error` against a config that refuses every request stalled inside a stderr write once the client's pipe
-        // filled at ~60 KiB, so the requests behind it went unanswered. A log channel that can stop the thing it is
-        // watching is not a log channel.
-        //
-        // So: ask first, drop when the answer is "not now" (see [`stderr_would_block`] for what the question costs and why
-        // it is not `O_NONBLOCK`). A dropped line counts as suppressed exactly as one past the cap does, so the closing
-        // notice still appears and names both ways out; the file sink is unaffected, because a regular file does not fill.
         if stderr_would_block() {
             self.suppressed.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
+        true
+    }
+
+    /// Write a line whose slot was claimed by [`Sink::claim_stderr_line`].
+    fn write_stderr_line(&self, line: &str) {
         // Written through a handle with the result dropped, for the reason `np_core::scan` gives for its own stderr receipt:
         // `eprintln!` panics when descriptor 2 refuses the write, which would replace a reportable failure with exit 101 and a
         // panic message that cannot be printed either.
         let mut err = io::stderr();
         let _ = writeln!(err, "{line}");
+    }
+
+    /// Whether the closing notice may be written without waiting. It is exempt from the cap — it is the line that explains the
+    /// cap — but not from the pipe: writing it with a bare `writeln!` meant that a client which never drained stderr, in a run
+    /// that had already dropped diagnostics (the exact state in which the notice is owed), left `np serve` answering every
+    /// request and then **never exiting**: the last write of the process waited for a reader that would never come. Dropping
+    /// it costs one sentence about a pipe nobody read.
+    fn stderr_notice_fits(&self) -> bool {
+        self.stderr_on.load(Ordering::Relaxed) && !stderr_would_block()
     }
 
     /// Write one record to the file sink, if there is one.
@@ -502,18 +558,24 @@ pub(crate) fn apply_config(cfg: &Config) {
     if APPLIED.set(()).is_err() {
         return;
     }
-    let (spec, source) =
-        match np_core::config::resolve_diag(None, env_value().as_deref(), log_level(cfg)) {
-            Ok(resolved) => resolved,
-            // Reachable only through `NP_LOG`, and only when the value is not valid text: refusing here would make a diagnostics
-            // typo fail a command, which is the one thing this feature promises never to do. So it warns, and keeps the levels
-            // already in force from phase one — where the same value was refused or accepted by the same rule.
-            Err(err) => {
-                let mut err_out = io::stderr();
-                let _ = writeln!(err_out, "np: {err}; keeping the log level already in force");
-                return;
-            }
-        };
+    // All three sources again, flag included: `[log] level` is what this pass exists to pick up, and picking it up by
+    // dropping the command line would invert the documented precedence instead of honouring it.
+    let flag = sink().flag();
+    let (spec, source) = match np_core::config::resolve_diag(
+        flag.as_deref(),
+        env_value().as_deref(),
+        log_level(cfg),
+    ) {
+        Ok(resolved) => resolved,
+        // Reachable only through `NP_LOG`, and only when the value is not valid text: refusing here would make a diagnostics
+        // typo fail a command, which is the one thing this feature promises never to do. So it warns, and keeps the levels
+        // already in force from phase one — where the same value was refused or accepted by the same rule.
+        Err(err) => {
+            let mut err_out = io::stderr();
+            let _ = writeln!(err_out, "np: {err}; keeping the log level already in force");
+            return;
+        }
+    };
     install(
         &spec,
         cfg.log.file.as_deref(),
@@ -587,17 +649,42 @@ pub(crate) fn bootstrap(
     log_file: Option<&Path>,
 ) -> Result<DiagHandle, String> {
     let flag = flag_spec(verbose, log_spec)?;
+    // Phase two must resolve with this string or the flag is inert (see [`Sink::flag`]).
+    sink().remember_flag(flag.as_deref());
     // The `[log]` table is **peeked** here — read leniently, ignoring a file that refuses for any other reason — because the
     // level announced on stderr has to be the answer that is *final*, and the file outranks the environment (§12 rule 7).
     // Without the peek, `NP_LOG=trace` next to `[log] level = "info"` would announce `trace from NP_LOG` and then quietly run
     // at info: precisely the invisibility the announce line exists to remove. The second benefit is the one spec point 3 asks
     // for — a config that refuses for an unrelated reason still says where its diagnostics go.
     let peek = np_core::config::peek_log_config();
-    let (spec, source) = np_core::config::resolve_diag(
-        flag.as_deref(),
-        env_value().as_deref(),
-        peek.level.as_deref(),
-    )?;
+    // A `[log] level` that cannot be parsed is **not this run's exit code**. The key sits in the section whose job is
+    // reporting failures, so refusing it before the sinks exist is the one route by which a diagnostics typo stops a command:
+    // measured, `np serve` with `level = "verbose"` exited 1 without answering a request and wrote nothing to the `[log] file`
+    // the same table configured. Review Focus 1 asks for the opposite, and F33 already sets the precedent for the neighbouring
+    // key — a bad `NP_LLAMA_LOG_LEVEL` refuses *per request* through `Config::load` while the server keeps running.
+    //
+    // So an unreadable file level is treated as unsaid: the run takes the levels it does understand (flag, `NP_LOG`, default),
+    // still opens the file this table named, says once on stderr what it ignored, and lets `Config::load`'s strict refusal
+    // arrive where it always has — a fault on each request, a `config-refused` record in that file. A bad `--log-spec` or
+    // `NP_LOG` still refuses the run outright (`?` below): spec point 2 wants a mistyped command line to stop there, and only
+    // there can it be corrected before any work starts.
+    let file_level = match peek.level.as_deref() {
+        None => None,
+        Some(raw) => match np_core::config::parse_diag_spec(raw) {
+            Ok(_) => Some(raw),
+            Err(err) => {
+                let mut err_out = io::stderr();
+                let _ = writeln!(
+                    err_out,
+                    "np: {} ignored: {err}; the run continues and reports the refusal per request",
+                    np_core::config::DIAG_CONFIG_KEY
+                );
+                None
+            }
+        },
+    };
+    let (spec, source) =
+        np_core::config::resolve_diag(flag.as_deref(), env_value().as_deref(), file_level)?;
     // The flag's path outranks the file's, exactly as the flag's level does; with neither, nothing is opened.
     let path = log_file.or(peek.file.as_deref());
     Ok(install(
@@ -614,7 +701,7 @@ pub(crate) fn finish() {
         return;
     };
     let suppressed = shared.suppressed.load(Ordering::Relaxed);
-    if suppressed == 0 {
+    if suppressed == 0 || !shared.stderr_notice_fits() {
         return;
     }
     let mut err = io::stderr();
@@ -888,7 +975,7 @@ where
         let Some(handle) = ctx.span(&id) else {
             return;
         };
-        let (target, name, ms, inherited) = {
+        let (target, name, ms) = {
             let extensions = handle.extensions();
             let Some(info) = extensions.get::<SpanInfo>() else {
                 return;
@@ -896,19 +983,17 @@ where
             // Saturating rather than overflowing: a phase that ran for six decades has the same diagnosis as one that
             // ran for 584 million years, and a log line is not where an overflow should be discovered.
             let ms = u64::try_from(info.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            (
-                handle.metadata().target(),
-                handle.name().to_string(),
-                ms,
-                inherited_from(&handle),
-            )
+            (handle.metadata().target(), handle.name().to_string(), ms)
         };
+        // The level is asked before the record is assembled: `inherited_from` clones a `String` and a `Value` per correlation
+        // key, and a span closing at a level nobody captures should not pay for either.
         if !self
             .sink
             .allows(target, tracing_ordinal(&TracingLevel::INFO))
         {
             return;
         }
+        let inherited = inherited_from(&handle);
         let mut record = Record {
             msg: format!("{name} finished"),
             ..Record::default()
@@ -917,8 +1002,8 @@ where
             record.push(&key, value);
         }
         record.push("elapsed_ms", Value::from(ms));
-        if self.sink.stderr_on.load(Ordering::Relaxed) {
-            self.sink.write_stderr(&record.human("info", target));
+        if self.sink.claim_stderr_line() {
+            self.sink.write_stderr_line(&record.human("info", target));
         }
         if self.sink.has_file.load(Ordering::Relaxed) {
             self.sink.write_file(&record.json("info", target));
@@ -962,13 +1047,117 @@ where
             }
         }
         let level = level_text(meta.level());
-        // The cap is checked before the line is built (spec point 8): a suppressed diagnostic costs a counter, not a `format!`.
-        if self.sink.stderr_on.load(Ordering::Relaxed) && !record.already_printed {
+        // Claimed before the line is built (spec point 8): a diagnostic that will not be printed costs a counter and a poll,
+        // not a `format!`.
+        if !record.already_printed && self.sink.claim_stderr_line() {
             let line = record.human(level, meta.target());
-            self.sink.write_stderr(&line);
+            self.sink.write_stderr_line(&line);
         }
         if self.sink.has_file.load(Ordering::Relaxed) {
             self.sink.write_file(&record.json(level, meta.target()));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::write_would_block;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    /// A fresh pipe whose write end is non-blocking, so a test can fill it without the harness itself waiting.
+    fn pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: two ints that `pipe2` fills; close-on-exec keeps them out of any child this process spawns.
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "test setup: pipe2"
+        );
+        // SAFETY: both numbers are descriptors the call above just created, each adopted by exactly one owner here.
+        let (read_half, write_half) = unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        // SAFETY: `write_half` is live; reading its flags to add one bit changes nothing else about it.
+        let flags = unsafe { libc::fcntl(write_half.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "test setup: F_GETFL");
+        assert!(
+            unsafe {
+                libc::fcntl(
+                    write_half.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            } >= 0,
+            "test setup: O_NONBLOCK"
+        );
+        (read_half, write_half)
+    }
+
+    /// The rule the whole non-blocking stderr design rests on, measured against a pipe this test owns rather than against
+    /// descriptor 2 — whose capacity nobody may shrink from inside the process that shares it.
+    #[test]
+    fn a_pipe_with_room_is_ready_and_one_nobody_reads_is_not() {
+        let (mut read_half, write_half) = pipe();
+        let mut write_half = write_half;
+        assert!(
+            !write_would_block(write_half.as_raw_fd()),
+            "an empty pipe takes writes; a guard that says otherwise would drop every diagnostic in existence"
+        );
+
+        // Filled to whatever the kernel allows rather than to an assumed size: capacity is tunable, and a test that guessed
+        // 64 KiB would fail on a machine that permits more.
+        let filler = vec![b'x'; 8 * 1024];
+        let mut written = 0usize;
+        loop {
+            match write_half.write(&filler) {
+                Ok(n) => written += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("test setup: filling the pipe: {err}"),
+            }
+        }
+        assert!(written > 0, "test setup: a pipe that takes no bytes at all");
+        assert!(
+            write_would_block(write_half.as_raw_fd()),
+            "after {written} bytes with nobody reading, `poll` must say not-now — that answer is what keeps `np serve` moving"
+        );
+
+        // And the answer follows the reader: drain it and the same descriptor is ready again.
+        let mut drained = vec![0u8; written];
+        read_half
+            .read_exact(&mut drained)
+            .expect("test setup: draining the pipe");
+        assert!(
+            !write_would_block(write_half.as_raw_fd()),
+            "a reader that catches up must unblock the channel, not leave it permanently dropped"
+        );
+    }
+
+    /// A client that goes away entirely (the read end closed, so the pipe is broken) is answered the same way as one that
+    /// merely stopped reading: do not write. Writing would not crash — `EPIPE` is discarded like any other error here — but a
+    /// channel with no reader is not one to keep poking, and Linux reports `POLLERR` alongside `POLLOUT`, so checking the error
+    /// bits first is what makes this answer mean anything.
+    #[test]
+    fn a_broken_pipe_is_not_ready() {
+        let (read_half, write_half) = pipe();
+        drop(read_half);
+        assert!(
+            write_would_block(write_half.as_raw_fd()),
+            "a closed reader must not read as writable"
+        );
+    }
+
+    /// The everyday case must stay untouched: a terminal and `/dev/null` answer ready, so `-v` at a shell prompt never
+    /// loses a line to the guard.
+    #[test]
+    fn a_character_device_is_ready() {
+        let null = std::fs::File::open("/dev/null").expect("test setup: /dev/null");
+        assert!(
+            !write_would_block(null.as_raw_fd()),
+            "a sink that always accepts writes must never be treated as blocked"
+        );
     }
 }

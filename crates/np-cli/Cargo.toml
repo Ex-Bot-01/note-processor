@@ -56,6 +56,12 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The unread-stderr case builds its own pipe so it can make it **small** (see `pipe_small` in `tests/diag.rs`): a 4 KiB
+# pipe fills after a handful of diagnostics, which is the only way to prove that the closing notice at process exit does
+# not wait for a reader. `F_SETPIPE_SZ` is a unix call, so only unix gets the dependency — and the case is `cfg(unix)`.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Only for `tests/cli.rs`, which has to seed a version-two workspace database by hand: no production API
 # writes an old schema, and the version-2 fixture is what makes F21's upgrade path reachable at all.

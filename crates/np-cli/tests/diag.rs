@@ -137,6 +137,12 @@ impl Vault {
     }
 }
 
+/// One page: the smallest capacity `F_SETPIPE_SZ` accepts, and the size of the pipe
+/// [`small_pipe`] hands to [`an_unread_stderr_pipe_never_stalls_the_request_loop`]. Stated as a constant because three
+/// assertions read it and one `fcntl` call sets it; if they ever disagree, the case fails rather than quietly measures a
+/// different pipe.
+const PIPE_BYTES: usize = 4_096;
+
 /// The bound on one diagnostic field, in bytes (`docs/reference-diagnostics.md`, "What may be in a diagnostic").
 ///
 /// Stated here rather than imported because the code's constant is private to np-cli and this file's job is to notice if
@@ -1450,6 +1456,36 @@ fn a_slow_phase_reports_its_cost() {
 ///
 /// The assertions are the two halves of that claim: every request is answered (nothing blocks), and stderr really did
 /// fill (the case would pass vacuously if the diagnostics never reached the pipe's capacity).
+/// A pipe this case owns, sized as small as the kernel allows: `(read half, write half)`.
+///
+/// `Stdio::piped()` yields a pipe of the system default (~64 KiB on this box), and a process that drops diagnostics keeps
+/// such a pipe *nearly* full — and nearly is not full. A 90-byte closing notice can slip into whatever bytes are left, so a
+/// test hoping to catch "the notice waited for a reader that never came" would pass by luck rather than by construction.
+/// `F_SETPIPE_SZ` moves the capacity to its floor of one page: after a handful of refusals the pipe is genuinely full, every
+/// later write is refused by `poll` instead of by chance, and the leftover space is smaller than any line we print.
+#[cfg(unix)]
+fn small_pipe() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is two ints and `pipe2` fills both halves. `O_CLOEXEC` keeps the read half out of any other process
+    // this test tree may spawn.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        panic!("test setup: pipe2 failed");
+    }
+    // SAFETY: `fds[1]` is a descriptor the call above just created; `F_SETPIPE_SZ` takes an int and one page is its floor.
+    if unsafe { libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 4_096) } < 0 {
+        panic!("test setup: F_SETPIPE_SZ failed");
+    }
+    // SAFETY: each half is a fresh descriptor and this is the only place its number is adopted into an owner.
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn an_unread_stderr_pipe_never_stalls_the_request_loop() {
     use std::io::Write;
@@ -1463,9 +1499,17 @@ fn an_unread_stderr_pipe_never_stalls_the_request_loop() {
     fs::write(root.join("a.md"), "# Alpha\n\nword\n").expect("test setup: note");
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(config_dir.join("note-processor")).expect("test setup: config dir");
+    // The same table both refuses and configures: `[loggg]` makes every request a refusal (one diagnostic each), while
+    // `[log] file` gives the run somewhere that always accepts writes. That second half is what turns "stderr stayed short"
+    // from an impression into a measurement — the file holds every diagnostic this run produced, so the bytes that never
+    // reached the pipe can be counted rather than asserted.
+    let log = tmp.path().join("np.jsonl");
     fs::write(
         config_dir.join("note-processor").join("config.toml"),
-        "[loggg]\nlevel = \"info\"\n",
+        format!(
+            "[log]\nfile = {}\n\n[loggg]\nlevel = \"info\"\n",
+            toml_str(&log.display().to_string())
+        ),
     )
     .expect("test setup: write refusing config");
 
@@ -1480,25 +1524,18 @@ fn an_unread_stderr_pipe_never_stalls_the_request_loop() {
         .env("APPDATA", &config_dir)
         .env("NP_LOG", "error")
         .env_remove("RUST_LOG");
-    let mut child = cmd
-        .stdin(Stdio::piped())
+    // **Held, never read.** The write half goes to the child, the read half stays here undrained: that is what a frontend
+    // does with a stream it does not parse, and reading it would remove the condition under examination.
+    let (mut unread_stderr, stderr_write) = small_pipe();
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // **Held, never read.** This handle is the whole test: leaving it open without draining it is what a frontend
-        // does, and reading it here would remove the condition under examination.
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("test setup: start `np serve`");
+        .stderr(Stdio::from(stderr_write));
+    let mut child = cmd.spawn().expect("test setup: start `np serve`");
     let mut stdin = child.stdin.take().expect("test setup: stdin");
     let mut stdout = child.stdout.take().expect("test setup: stdout");
-    // Named rather than underscored because the case reads it once at the end to prove the pipe really filled; while the
-    // server runs, nobody drains it, which is the condition under test.
-    let mut unread_stderr = child
-        .stderr
-        .take()
-        .expect("test setup: stderr, unread on purpose");
 
-    // Feeding happens off the main thread because a stalled child stops draining *stdin* too, and a harness that blocks
-    // on its own write cannot report what the child did.
+    // Feeding happens off the main thread because a stalled child stops draining *stdin* too, and a harness that blocks on
+    // its own write cannot report what the child did.
     let (fed_tx, fed_rx) = mpsc::channel::<usize>();
     let feeder = thread::spawn(move || {
         let mut written = 0usize;
@@ -1508,9 +1545,8 @@ fn an_unread_stderr_pipe_never_stalls_the_request_loop() {
                 break;
             }
             written += 1;
-            // Every 50 rather than every line: the point of flushing is to let a stalled child be *noticed* early, and a
-            // per-line flush would measure the harness's syscalls instead of the server's behaviour. 50 is one flush per
-            // ~17 KiB of requests — several times before the pipe's 64 KiB capacity fills on its own.
+            // Every 50 rather than every line: flushing exists here so a stalled child is noticed early, and a per-line
+            // flush would measure the harness's syscalls instead of the server's behaviour.
             if written.is_multiple_of(50) {
                 let _ = stdin.flush();
             }
@@ -1552,17 +1588,100 @@ fn an_unread_stderr_pipe_never_stalls_the_request_loop() {
         answered, asks,
         "every request gets its response even though nobody reads stderr (fed {fed} of {asks})"
     );
-    // The other half: the pipe did fill, or nothing was proven. Whatever arrived is at most a pipe's capacity, and the
-    // server got through all 1 200 requests regardless — which is the difference between dropping diagnostics and
-    // dropping requests.
+
+    // **Exit first, drain second.** The closing notice is owed here — 1 200 diagnostics against a 1 000-line cap into a pipe
+    // that stopped accepting writes long ago — and it used to be written with a bare `writeln!`, which waits for a reader
+    // that will never come: the server answered every request and then never exited. Draining stderr before waiting would
+    // unblock exactly that write, so the order *is* the assertion, and the deadline is here because a hung child must fail
+    // this case rather than hang the suite behind it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("test setup: poll the child") {
+            Some(status) => break status,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                panic!(
+                    "`np serve` was still running 30 s after stdin closed with nobody reading stderr, so something on the \
+                     way out blocked on it"
+                );
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    assert!(status.success(), "and the run ends cleanly: {status}");
+
+    // Now, with the process gone: did stderr stay short because diagnostics were dropped, or because none were written? The
+    // file answers that exactly, because a regular file never refuses a write.
+    // Drained without waiting for EOF. `Stdio::from(file)` hands the child a descriptor and keeps its own copy until the
+    // `Command` is dropped, so this process may hold the pipe's write end open — which means there is no last writer to
+    // close, and `read_to_end` would sit there forever after a perfectly good run. The child has exited, so every byte it
+    // wrote is already in the pipe: read until it says "nothing more right now".
+    use std::os::fd::AsRawFd;
+    // SAFETY: `unread_stderr` is a live descriptor for the duration, and reading its flags to add one bit changes nothing
+    // else about it. This is unix-only code inside a `#[cfg(unix)]` case.
+    let flags = unsafe { libc::fcntl(unread_stderr.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0, "test setup: F_GETFL");
+    assert!(
+        unsafe {
+            libc::fcntl(
+                unread_stderr.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        } >= 0,
+        "test setup: O_NONBLOCK"
+    );
     let mut arrived = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut unread_stderr, &mut arrived);
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match std::io::Read::read(&mut unread_stderr, &mut chunk) {
+            Ok(0) => break,
+            Ok(got) => arrived.extend_from_slice(&chunk[..got]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => panic!("test setup: reading the undrained pipe: {err}"),
+        }
+    }
+    let records = read_records(&log);
+    let refused: Vec<&Value> = records
+        .iter()
+        .filter(|record| record.get("rule").and_then(Value::as_str) == Some("config-refused"))
+        .collect();
+    assert_eq!(
+        refused.len(),
+        asks,
+        "the file sink saw every refusal, one per request and none dropped: {records:?}"
+    );
+    let written: usize = refused
+        .iter()
+        .map(|record| record["msg"].as_str().unwrap_or_default().len())
+        .sum();
+    // How much arrives is the kernel's business: a pipe with no reader reports itself writable while it has a page free, so
+    // a one-page pipe takes roughly one line and then stops answering `poll` at all. What the case needs is that something
+    // reached the pipe (so nothing was proven by accident), that far less than the run produced arrived (so diagnostics were
+    // genuinely dropped), and that it never exceeded the capacity (so the writer respected "not now" instead of queueing).
     assert!(
         !arrived.is_empty(),
-        "diagnostics were expected on stderr at all (NP_LOG=error against a refusing config)"
+        "the pipe had to receive something for this to prove anything: {} bytes arrived",
+        arrived.len()
     );
-    let status = child.wait().expect("the server exits once stdin closes");
-    assert!(status.success(), "and the run ends cleanly: {status}");
+    assert!(
+        arrived.len() <= PIPE_BYTES,
+        "stderr cannot hold more than the pipe: {} bytes into a {PIPE_BYTES}-byte pipe",
+        arrived.len()
+    );
+    assert!(
+        arrived.len() * 4 < written,
+        "stderr held {} B while the run produced {written} B of refusal sentences: most of them should have been dropped, \
+         so a stderr anywhere near the file's size would mean nothing was being skipped",
+        arrived.len()
+    );
+    // And if the closing notice did make it onto the pipe, it owes the count it claims.
+    let text = String::from_utf8_lossy(&arrived);
+    assert!(
+        !text.contains("diagnostics truncated") || text.contains("suppressed"),
+        "a truncation notice on stderr has to name what it suppressed: {:?}",
+        text.lines().next_back()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,5 +1886,147 @@ fn a_long_path_is_truncated_and_still_names_the_file() {
             .unwrap_or("")
             .ends_with('…'),
         "the bound clamps long values, it does not decorate every value: {plain}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The flag has to reach the records, not only the announce line
+// ---------------------------------------------------------------------------
+
+/// `-v` is the knob an operator reaches for first, and the announce line is the one place a bug in it can hide: phase one
+/// prints `log level debug from command line` before configuration is read, so a case that stops at that sentence passes
+/// while the run resolves to something else entirely the moment `Config::load` re-resolves the levels.
+///
+/// Both channels are asserted because they are configured by different keys: `-vv` alone asks for stderr, and `-vv
+/// --log-file` asks for both, and the second phase reopens the file with whatever it just resolved.
+#[test]
+fn a_verbose_flag_reaches_the_records_and_not_only_the_announce() {
+    let vault = Vault::new();
+    vault.write_notes(1);
+    fs::write(vault.root.join("photo.png"), b"\x89PNG not markdown").expect("setup: attachment");
+    // No `[log]` in the file and no `NP_LOG`: the flag is the only thing that asked, which is the case that matters.
+
+    let plain = vault.exec(&["-vv", "scan"]);
+    assert_eq!(plain.code, 0, "{}", plain.stderr);
+    assert!(
+        plain
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("debug np_core::scan:")
+                && line.contains("rule=\"not-markdown\"")),
+        "`-vv` must put the per-file decisions on stderr, not merely announce that it will: {:?}",
+        plain.stderr
+    );
+
+    let log = vault.log_path();
+    let to_file = vault.exec(&["-vv", "--log-file", &log.display().to_string(), "scan"]);
+    assert_eq!(to_file.code, 0, "{}", to_file.stderr);
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    assert!(
+        records.iter().any(|record| {
+            record.get("rule").and_then(Value::as_str) == Some("not-markdown")
+                && record.get("level").and_then(Value::as_str) == Some("debug")
+        }),
+        "a debug-level record must reach the file the same flag enabled: {records:?}"
+    );
+}
+
+/// The precedence chain is `flag > file > environment > default`, and the manual tells a reader stuck behind a file level to
+/// override it with a flag. That advice is only true if the flag survives the second resolution — so this case pins the one
+/// combination where a wrong answer is invisible on stderr's first line: a file that asked for `warn`, a command line that
+/// asked for `trace`.
+#[test]
+fn a_flag_outranks_the_file_that_asked_first() {
+    let vault = Vault::new();
+    vault.write_notes(1);
+    fs::write(vault.root.join("photo.png"), b"\x89PNG not markdown").expect("setup: attachment");
+    vault.write_user_config("[log]\nlevel = \"warn\"\n");
+
+    let run = vault.exec(&["-vvv", "scan"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        run.stderr.starts_with("log level trace from command line"),
+        "and it must say so on its first line: {:?}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .lines()
+            .any(|line| line.starts_with("debug np_core::scan:")),
+        "`-vvv` over `[log] level = \"warn\"` runs at trace; a file that outranked the flag would print only its announce \
+         line and this case is the difference: {:?}",
+        run.stderr
+    );
+}
+
+/// Review Focus 1's second input — a **bad `[log] level`** — and the reason it is a separate case from an unknown key: this
+/// typo is in the diagnostics section itself, so the thing that fails to parse is the setting whose whole job is reporting
+/// failures. Refusing it before the sinks exist means `np serve` exits 1 without answering one request and writes nothing to
+/// the `[log] file` the same table configured: a log-level typo taking down an integrator's server, which is the one thing
+/// this feature promises never to happen.
+///
+/// The behavior asserted instead: run at the levels that *are* understood (flag, `NP_LOG`, default), open the file the table
+/// named, say once on stderr what was ignored, and let `Config::load`'s strict refusal arrive where it always has — as a
+/// fault on each request and a `config-refused` record in that file. A bad `--log-spec` or `NP_LOG` still refuses the run
+/// outright: spec point 2 wants a mistyped command line to stop there, and only there can it be fixed before work starts.
+#[test]
+fn a_bad_log_level_in_the_file_still_serves() {
+    let vault = Vault::new();
+    vault.write_notes(1);
+    let log = vault.log_path();
+    vault.write_user_config(&format!(
+        "[log]\nlevel = \"verbose\"\nfile = {}\n",
+        toml_str(&log.display().to_string())
+    ));
+    let requests = vec![
+        request(1, "initialize", serde_json::json!({"protocol": 1})),
+        request(2, "scan", serde_json::json!({"workspace": vault.root})),
+        request(3, "initialize", serde_json::json!({"protocol": 1})),
+    ];
+    let (code, out_text, err_text) = serve_with(&requests, |cmd| {
+        cmd.env("XDG_DATA_HOME", vault._tmp.path().join("data"))
+            .env("LOCALAPPDATA", vault._tmp.path().join("data"))
+            .env("HOME", vault._tmp.path())
+            .env("XDG_CONFIG_HOME", vault._tmp.path().join("config"))
+            .env("APPDATA", vault._tmp.path().join("config"));
+    });
+    assert_eq!(
+        code, 0,
+        "a diagnostics typo cannot end the session before it answers a request: {err_text:?}"
+    );
+    let answers: Vec<serde_json::Value> = out_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("stdout stays one object per line"))
+        .collect();
+    assert_eq!(answers.len(), 3, "one response per request: {out_text}");
+    assert!(answers[0].get("result").is_some(), "{}", answers[0]);
+    assert_eq!(
+        answers[1]["error"]["code"].as_i64(),
+        Some(-32000),
+        "the config is still refused, per request: {}",
+        answers[1]
+    );
+    let message = answers[1]["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("log.level") || message.contains("level"),
+        "and the fault names the key that broke: {message}"
+    );
+    assert!(answers[2].get("result").is_some(), "{}", answers[2]);
+
+    // The file the ignored table configured is still open, and it holds the refusal.
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.get("rule").and_then(Value::as_str) == Some("config-refused")),
+        "the refusal belongs in the log the same section asked for: {records:?}"
+    );
+    // And stderr says, once and plainly, that the value was ignored — a typo nobody mentions is a typo nobody finds.
+    assert!(
+        err_text.contains("log.level"),
+        "the ignored level has to be named on stderr: {err_text:?}"
     );
 }
