@@ -1997,7 +1997,11 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
             // nothing, and this is the most common one. `error` level, on the config target, with the rule as a field rather
             // than as prose — which is what lets a frontend log *why* without matching a sentence. It reaches stderr only if
             // someone asked for diagnostics (spec point 1), so the pinned single-line refusal below is still exactly one line.
-            tracing::error!(target: "np_core::config", rule = "config-refused", "{err}");
+            tracing::error!(
+                target: np_core::diagnostics::target::CONFIG,
+                rule = np_core::diagnostics::rule::CONFIG_REFUSED,
+                "{err}"
+            );
             return Err(format!("configuration error: {err}").into());
         }
     };

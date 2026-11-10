@@ -43,9 +43,14 @@ nothing: the variable was set, it did something, and "the environment did nothin
 "the environment was ignored" — which is the difference between a config question and a shell question. That line is not
 a diagnostic, so the cap neither counts it nor suppresses it.
 
-A bad level refuses before any work happens and names the source it came from (`NP_LOG`, `--log-spec`, `log.level`). A
-*config file* whose `[log] level` is bad is a different shape of failure: the run cannot load its configuration, so the
-refusal is reported as a diagnostic on the channel the file itself configured, and the command still refuses — see
+**A bad level in `NP_LOG` or `--log-spec` refuses before any work happens**, naming the source it came from: a diagnostics
+typo should cost one keystroke to find, not a debugging session.
+
+**A bad `[log] level` in the file cannot be obeyed, and must not stop the run.** The rest of the configuration is still
+understood, so `np` drops that one line to stderr naming `log.level`, keeps the levels it does understand, and carries on —
+because a typo in a *logging* setting failing real work is exactly the failure mode this feature exists to prevent. The
+strict load underneath still refuses the unknown key or bad value it always refused, so each command exits 1 with its
+pinned refusal and each `np serve` request answers with an error while the session stays open; see
 [When the configuration is the thing being reported](#when-the-configuration-is-the-thing-being-reported).
 
 ### The grammar, exactly
@@ -90,7 +95,11 @@ diagnostics truncated after 1000 lines; 101 more suppressed (raise --log-spec or
 is normal, and an anonymous pipe holds about 64 KiB. The sink asks descriptor 2 whether it will take a write *now* and
 drops the line when it will not, counting it as suppressed like any other dropped line. Measured on this box before that
 was fixed: 1 200 requests sent to a server whose stderr nobody read, **1 057 answered**, the child stalled inside
-`write(2)`. Now: 1 200 in, 1 200 out, and stderr stops at ~60 KiB.
+`write(2)`. Now: 1 200 requests in, 1 200 responses out, with the same unread pipe — `an_unread_stderr_pipe_never_stalls_the_request_loop`
+shrinks that pipe to its 4 KiB minimum and drains it only at the end, so the case cannot pass by the harness keeping up.
+
+A closed or broken stderr (a reader that exited) is treated the same as a full one: `poll` reports an error condition, the
+line is dropped, and the command finishes its work instead of taking `SIGPIPE` for a log line.
 
 Windows has no `poll`, so there a write to a full pipe still blocks as it always did; the cap bounds how many lines can
 be waiting on it, and `[log] file` is the answer for a client that will not read stderr.
@@ -103,8 +112,14 @@ so — with the size and the remedy, in the file, where the person reading the l
 ```
 
 A log path that cannot be opened warns once and the command runs on: a diagnostic sink that fails is not a reason for
-work to stop. Deleting or truncating the file mid-run is supported — the next write reopens it, and the run does not
-care.
+work to stop. **Deleting the file mid-run** is safe in the POSIX sense: the open handle keeps writing to the unlinked inode,
+so those bytes go where the filesystem no longer counts them and the *next run* recreates the path — which is why "delete
+the file" is a remedy between runs rather than a way to free space mid-command. **Truncating it** in place does reopen the
+same path for later appends, but this build re-reads its own size estimate only every 50 records, so up to 50 lines can be
+accepted while the file on disk is already under budget and dropped after. Either way no command fails, panics, or loses
+its report; `crates/np-cli/tests/diag.rs` pins that for deletion (unix-only, since Windows refuses the unlink a POSIX
+rename-over would allow), and the reason the budget is kept on an in-memory estimate is that enforcing it exactly would mean asking the file its own
+size before every line.
 
 ## What may be in a diagnostic
 
@@ -113,6 +128,13 @@ Paths, ids, rule tokens, counts and timings. **Never a note's body, never an ori
 and useful (a skip event names the file it skipped); note *content* is not. `a_diagnostic_never_carries_note_text_or_an_origin`
 in `crates/np-cli/tests/diag.rs` runs scan, embed, search and models at `trace` and asserts both halves on the file
 channel; `no_diagnostic_carries_a_note_body` does the same in-process for np-core.
+
+One thing is allowed that a reader may not expect: **a refused configuration's message, verbatim**, in the `msg` of a
+`config-refused` record. That sentence quotes the offending key and the table it sits in, so a file containing
+`[fetch] base_url = "http://intranet.example/mirror"` produces a log line naming that host. The no-origin rule binds what
+*this program* puts in a diagnostic — it cannot also censor text the user wrote into the configuration the diagnostics are
+reporting on — which is a further reason the file sink belongs where your configuration already lives and with the same
+permissions.
 
 ### How long a field may be
 
@@ -147,12 +169,23 @@ serve.request
 | `embed`         | `np_core::embed` | one embedding run, including the model load                |
 | `search`        | `np_core::search`| one ranking, both halves                                   |
 | `fetch`         | `np_core::fetch` | one model download attempt — never its origin              |
-| `serve.request` | `np_cli::serve`  | one JSON-RPC request, from line read to response written   |
+| `serve.request` | `np_cli::serve`  | one JSON-RPC request, from dispatch to response written         |
+
+When a span closes it writes that record itself: `<phase> finished`, at info, on the span's own target, carrying the fields
+it was opened with plus whatever it inherited, and `elapsed_ms`. A slow vault then reads as one long `scan` line rather
+than as a hang, which is the difference between "the model is down" and "your disk is busy". `'np_core::scan=off'` keeps
+those costs out of a log while everything else stays on, which is what the cost measurement in
+[`measurement-np-diagnostics-cost.md`](measurement-np-diagnostics-cost.md) filters with.
 
 Two keys travel on those records and are inherited by events raised inside them: **`request`** (the JSON-RPC id of the
 request that caused this) and **`workspace`**. Both are omitted when there is nothing to say — never `null`, never the
 string `"none"` — so a key's absence carries information. `np_core::models` has no span of its own: listing models is
 the sum of per-file verdicts, not a phase whose cost anyone would ask about.
+
+The four phase spans cover their whole phase. `serve.request` covers **dispatch**, not the read: it opens once a request
+line has been parsed and closes when the response has been written, so every record a request caused carries its id and the
+cost line measures the work — not the wait for the next line on stdin, which for an idle session would be the largest number
+in the log and would mean nothing.
 
 ## Levels
 
@@ -181,9 +214,14 @@ np_cli::serve_channel
 np_cli
 ```
 
-`np_cli` carries the run itself: the announce line that reaches the file, a log path that would not open, a spent
-budget. `np_cli::serve` is the request loop and its spans; `np_cli::serve_channel` is stdin/stdout framing (F25), which
-reports its own failures because they are about the pipe, not about a request.
+`np_cli` carries the run itself: its opening record in the file, and the `log full` line that ends a spent budget.
+`np_cli::serve` is the request loop and its spans. Three targets are filters rather than emitters today, and saying so is
+better than letting someone filter to silence and conclude the logging is broken: **`np_core::fetch`** carries the fetch
+phase span — its `elapsed_ms`, never an origin — while every fetch outcome a caller acts on is reported by the command that
+asked for it; **`np_core::models`** stays quiet because a listing's per-row "not installed" verdict is not a degraded state
+(the actionable version of that fact arrives as `artifact-missing` or `model-not-installed` from embed and search); and
+**`np_cli::serve_channel`** reports framing failures on the response channel they belong to, since a client that sent a
+half-line needs the fault code rather than a log line.
 
 ## Rule tokens
 
@@ -215,29 +253,35 @@ unrepresentable-path
 unresolved-ambiguity
 ```
 
-| Token                        | Level   | Target(s)                                        | `what` holds                                    |
-| ---------------------------- | ------- | ------------------------------------------------ | ----------------------------------------------- |
-| `artifact-fetched`           | info    | `np_core::fetch`                                 | the artifact path that landed                   |
-| `artifact-missing`           | warn    | `np_core::embed`, `np_core::models`              | the file that is not there                      |
-| `config-refused`             | error   | `np_core::config`                                | — (the message names the file and key)          |
-| `duplicate-rows`             | debug   | `np_core::scan`                                  | the path whose two spellings both listed        |
-| `fetch-disabled`             | warn    | `np_core::fetch`                                 | the artifact that was wanted                    |
-| `hidden-behind-unreadable`   | debug   | `np_core::scan`                                  | a live row's stored note path                   |
-| `identity-taken`             | debug   | `np_core::scan`                                  | the path whose identity belongs elsewhere       |
-| `local-model-not-built`      | warn    | `np_core::embed`                                 | — (the message names the feature)               |
-| `locked`                     | warn    | `np_core::lock`                                  | the workspace that stayed locked                |
-| `model-not-installed`        | warn    | `np_core::embed`, `np_core::models`              | the model id that has no row                    |
-| `no-vectors`                 | warn    | `np_core::search`                                | — (the message says what was searched)          |
-| `not-markdown`               | debug   | `np_core::scan`                                  | the file that was not markdown                  |
-| `not-produced`               | error   | `np_core::embed`                                 | the chunk the model gave up on                  |
-| `offline`                    | warn    | `np_core::fetch`, `np_core::search`              | what could not be reached                       |
-| `prefix-drift`               | warn    | `np_core::embed`                                 | — (the message names the pinned sentence)       |
-| `provider-disabled`          | warn    | `np_core::embed`                                 | the key that is empty                           |
-| `token-budget`               | warn    | `np_core::embed`                                 | the chunk id that was too big (`expected`/`actual` carry the counts) |
-| `unreadable`                 | debug   | `np_core::scan`                                  | the path that could not be read                 |
-| `unchanged-content`          | trace   | `np_core::scan`                                  | the file whose bytes matched the stored stamp   |
-| `unrepresentable-path`       | debug   | `np_core::scan`                                  | the name no byte path could hold                |
-| `unresolved-ambiguity`       | debug   | `np_core::scan`                                  | a lossy-keyed row no route accounted for (F23)  |
+The `Target(s)` column is machine-checked: `np_core::diagnostics::RULE_TARGETS` publishes each token's targets and both
+doc-sync cases compare this table against it, cell by cell. That exists because the first version of this table paired them
+by hand and got five rows wrong — `offline` documented under `np_core::fetch` while the embed path emits it on
+`np_core::embed`, `artifact-fetched` and `fetch-disabled` documented under fetch while both arrive from search — and an
+alert written against those rows would have silently missed every disconnected `np embed`.
+
+| Token                      | Level   | Target(s)                           | `what` holds                                                                   |
+| -------------------------- | ------- | ----------------------------------- | ------------------------------------------------------------------------------ |
+| `artifact-fetched`         | info    | `np_core::search`                   | the model id whose artifact arrived, or `the semantic half` when none is named  |
+| `artifact-missing`         | warn    | `np_core::embed`, `np_core::search` | embed: the artifact path; search: the model id whose row has no bytes           |
+| `config-refused`           | error   | `np_core::config`                   | — (the message names the file and key)                                          |
+| `duplicate-rows`           | debug   | `np_core::scan`                     | the path whose two spellings both listed                                        |
+| `fetch-disabled`           | warn    | `np_core::search`                   | the model id a fetch could have fixed                                           |
+| `hidden-behind-unreadable` | debug   | `np_core::scan`                     | a live row's stored note path                                                   |
+| `identity-taken`           | debug   | `np_core::scan`                     | the path whose identity belongs elsewhere                                       |
+| `local-model-not-built`    | warn    | `np_core::embed`                    | the model id this binary cannot run                                             |
+| `locked`                   | warn    | `np_core::lock`                     | the workspace that stayed locked (`expected`/`actual` carry the two waits in ms)|
+| `model-not-installed`      | warn    | `np_core::embed`, `np_core::search` | the model id with no row                                                        |
+| `no-vectors`               | warn    | `np_core::search`                   | the model id searched for, or `the semantic half` when none is named            |
+| `not-markdown`             | debug   | `np_core::scan`                     | the file that was not markdown                                                  |
+| `not-produced`             | error   | `np_core::embed`                    | the model id the run embedded for, or `the configured model` when none is named |
+| `offline`                  | warn    | `np_core::embed`, `np_core::search` | the model id whose fetch found nothing                                          |
+| `prefix-drift`             | warn    | `np_core::embed`                    | the model id stored under a prefix this build does not declare                   |
+| `provider-disabled`        | warn    | `np_core::embed`, `np_core::search` | embed: the key that is empty; search: the model id that had no provider          |
+| `token-budget`             | warn    | `np_core::embed`                    | the chunk id that was too big (`expected`/`actual` carry the counts)            |
+| `unreadable`               | debug   | `np_core::scan`                     | the path that could not be read                                                 |
+| `unchanged-content`        | trace   | `np_core::scan`                     | the file whose bytes matched the stored stamp                                   |
+| `unrepresentable-path`     | debug   | `np_core::scan`                     | the name no byte path could hold                                                |
+| `unresolved-ambiguity`     | debug   | `np_core::scan`                     | a lossy-keyed row no route accounted for (F23)                                  |
 
 Two of these need a word of explanation:
 
@@ -270,7 +314,9 @@ to this section:
 | `action`     | the remedy, in the `log full` record                                  |
 
 Records are written with the newline in the same append as the line, so two `np` processes pointing at one file never
-split a record each other's reader has to reject.
+split a record each other's reader has to reject. The size estimate that enforces the budget is kept in memory and re-read
+from the file every 50 records, which is what lets one writer notice a truncation without opening the file again per line;
+the trade is described under [What bounds the file](#what-bounds-stderr).
 
 ## Transcripts
 
@@ -300,7 +346,8 @@ elapsed    1 ms
 The `skipped` list is stdout, not a diagnostic: it is existing pinned output (`crates/np-cli/tests/cli.rs`), and the
 events below are what was always missing from it — *why* each file was skipped.
 
-**A run that was asked explains itself, then reports per-file decisions:**
+**A run that was asked by flag alone explains itself, then reports per-file decisions** — no `[log]` in the file for this
+one, which is the point: `-v`, `-vv` and `-vvv` set the levels themselves, not merely the line that says they did.
 
 ```console
 $ np -vv scan /tmp/diagdemo/vault 2>&1 | head -4
@@ -314,18 +361,18 @@ info np_core::scan: scan finished workspace="/tmp/diagdemo/vault" elapsed_ms=1
 explain ordering to a reader:
 
 ```json
-{"level":"debug","msg":"the file could not be read as the walk listed it; its rows were left alone","rule":"unreadable","target":"np_core::scan","ts":1794257472773,"what":"locked.md","workspace":"/tmp/diagdemo/vault"}
+{"level":"debug","msg":"the file could not be read as the walk listed it; its rows were left alone","rule":"unreadable","target":"np_core::scan","ts":1794270363087,"what":"locked.md","workspace":"/tmp/diagdemo/vault"}
 {"level":"debug","msg":"not markdown, so nothing was indexed from it","rule":"not-markdown","target":"np_core::scan","ts":1794257472773,"what":"photo.png","workspace":"/tmp/diagdemo/vault"}
-{"elapsed_ms":15,"level":"info","msg":"scan finished","target":"np_core::scan","ts":1794257472774,"workspace":"/tmp/diagdemo/vault"}
+{"elapsed_ms":1,"level":"info","msg":"scan finished","target":"np_core::scan","ts":1794270363087,"workspace":"/tmp/diagdemo/vault"}
 ```
 
 **`np serve` tags every record with the request that caused it.** Two `scan` requests, the first with `"id": 9`, the
 second a notification with no id at all, against a config that refuses:
 
 ```json
-{"level":"error","msg":"log level error from config.toml","target":"np_cli","ts":1794257499980}
-{"level":"error","msg":"config parse error in /tmp/diagdemo/config/note-processor/config.toml: TOML parse error at line 5, column 2\n  |\n5 | [loggg]\n  |  ^^^^^\nunknown field `loggg`, expected one of `data_dir`, `catalog`, `markers`, `embeddings`, `models`, `search`, `log`\n","request":9,"rule":"config-refused","target":"np_core::config","ts":1794257499980,"workspace":"/tmp/diagdemo/vault"}
-{"level":"error","msg":"config parse error in /tmp/diagdemo/config/note-processor/config.toml: TOML parse error at line 5, column 2\n  |\n5 | [loggg]\n  |  ^^^^^\nunknown field `loggg`, expected one of `data_dir`, `catalog`, `markers`, `embeddings`, `models`, `search`, `log`\n","rule":"config-refused","target":"np_core::config","ts":1794257499980,"workspace":"/tmp/diagdemo/vault"}
+{"level":"error","msg":"log level error from config.toml","target":"np_cli","ts":1794270363094}
+{"level":"error","msg":"config parse error in /tmp/diagdemo/config/note-processor/config.toml: TOML parse error at line 5, column 2\n  |\n5 | [loggg]\n  |  ^^^^^\nunknown field `loggg`, expected one of `data_dir`, `catalog`, `markers`, `embeddings`, `models`, `search`, `log`\n","request":9,"rule":"config-refused","target":"np_core::config","ts":1794270363094,"workspace":"/tmp/diagdemo/vault"}
+{"level":"error","msg":"config parse error in /tmp/diagdemo/config/note-processor/config.toml: TOML parse error at line 5, column 2\n  |\n5 | [loggg]\n  |  ^^^^^\nunknown field `loggg`, expected one of `data_dir`, `catalog`, `markers`, `embeddings`, `models`, `search`, `log`\n","rule":"config-refused","target":"np_core::config","ts":1794270363094,"workspace":"/tmp/diagdemo/vault"}
 ```
 
 The first refusal carries `"request":9`; the second has no `request` key, because a notification has no id — and nowhere
@@ -347,6 +394,27 @@ The command still exits 1 with its pinned refusal on stdout/stderr — a diagnos
 success. And `np serve` stays alive: an unparseable config makes every request fail, which is a reason to answer each one
 with an error, not a reason to stop answering.
 
+**When the bad value is the log level itself**, there is nothing to obey, so nothing gets silenced and nothing gets
+stopped. The line is dropped with a warning naming `log.level`, the strict load underneath still refuses the file for
+whatever *else* is wrong with it, and that refusal reaches both the pinned error path and the configured log file:
+
+```console
+$ np scan /tmp/diagdemo/vault; echo "exit=$?"     # [log] level = "verbose", plus an unknown [loggg] table
+np: log.level ignored: "verbose" is not a log level — write one of off, error, warn, info, debug, trace; the run continues and reports the refusal per request
+np: configuration error: config parse error in /tmp/diagdemo/config/note-processor/config.toml: TOML parse error at line 5, column 2
+```
+
+and `bad.jsonl`, the file that typo named, contains:
+
+```json
+{"level":"warn","msg":"log level warn from default","target":"np_cli","ts":1794270363141}
+{"level":"error","msg":"config parse error in /tmp/diagdemo/config/note-processor/config.toml: TOML parse error at line 5, column 2\n  |\n5 | [loggg]\n  |  ^^^^^\nunknown field `loggg`, expected one of `data_dir`, `catalog`, `markers`, `embeddings`, `models`, `search`, `log`\n","rule":"config-refused","target":"np_core::config","ts":1794270363141}
+```
+
+The announce record says *from default* because that is the truth: the file's level was ignored, so the run logged at warn.
+`crates/np-cli/tests/diag.rs::a_bad_log_level_in_the_file_still_serves` pins the serve half of this — a client that sent ten
+requests gets ten error responses, not a closed pipe.
+
 ## How these transcripts were produced
 
 Deliberately plain, so they can be reproduced by hand:
@@ -359,7 +427,9 @@ $ printf '# Locked\n\ncannot read me\n' > /tmp/diagdemo/vault/locked.md && chmod
 $ export XDG_DATA_HOME=/tmp/diagdemo/data HOME=/tmp/diagdemo XDG_CONFIG_HOME=/tmp/diagdemo/config NP_NO_AUTO_FETCH=1
 ```
 
-with `[log] file`, `[log] level` and `[log] max_bytes` in `$XDG_CONFIG_HOME/note-processor/config.toml` as each example
-states, the cap transcript using a directory of 1 100 `.png` files to get past 1 000 lines. Timestamps are the real ones
-from those runs; nothing was hand-composed, and the two tests named in
+with `$XDG_CONFIG_HOME/note-processor/config.toml` written as each example states — **absent entirely** for the "nobody
+asked" and `-vv` runs, since a `[log] level` in that file would outrank `-vv` and the announce line would then read *from
+config.toml* — and with `[log] file`, `[log] level` or `[log] max_bytes` where those examples say so. The cap transcript
+uses a directory of 1 100 `.png` files to get past 1 000 lines. Timestamps are the real ones from those runs, re-captured
+after every behaviour change on this page; nothing was hand-composed, and the tests named in
 [What may be in a diagnostic](#what-may-be-in-a-diagnostic) keep the claims they make honest.

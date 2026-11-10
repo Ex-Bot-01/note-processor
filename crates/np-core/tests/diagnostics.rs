@@ -442,6 +442,24 @@ fn every_rule_this_crate_emits_is_a_published_token() {
             np_core::diagnostics::RULE_TOKENS
         );
     }
+
+    // …and on the target its documentation promises. A token can be published, emitted once, and still arrive somewhere an
+    // integrator never thinks to look: the manual's first `Target(s)` column was hand-written and wrong five times over,
+    // which is what `RULE_TARGETS` exists to make impossible. An observed pair that is not in that list means someone moved
+    // an emission without moving its documentation.
+    for event in events.iter().filter(|event| event.field("rule").is_some()) {
+        let rule = event.field("rule").unwrap_or_default();
+        let listed = np_core::diagnostics::RULE_TARGETS
+            .iter()
+            .find(|(name, _)| *name == rule)
+            .unwrap_or_else(|| panic!("`{rule}` is emitted but has no published target list"));
+        assert!(
+            listed.1.contains(&event.target),
+            "`{rule}` was observed on `{}`, which its published targets ({:?}) do not include",
+            event.target,
+            listed.1
+        );
+    }
 }
 
 /// Little-endian f32 bytes, the encoding stored vectors use.
@@ -657,6 +675,60 @@ fn the_documented_token_list_matches_the_code() {
         .filter(|line| !line.is_empty())
         .collect();
     assert_same_set(&targets, &np_core::diagnostics::TARGETS, "target");
+
+    // The pairing, not just the two lists. `RULE_TARGETS` is what an integrator writes alert filters from, so a row that
+    // names a real token beside a target that never emits it is a silent gap in somebody's monitoring — and no amount of
+    // set comparison over the two columns catches it.
+    let documented = documented_pairs(&manual);
+    let coded: Vec<(String, Vec<String>)> = np_core::diagnostics::RULE_TARGETS
+        .iter()
+        .map(|(rule, list)| {
+            ((*rule).to_string(), {
+                let mut sorted: Vec<String> = list.iter().map(|t| (*t).to_string()).collect();
+                sorted.sort();
+                sorted
+            })
+        })
+        .collect();
+    let mut documented_sorted = documented.clone();
+    for (_, list) in &mut documented_sorted {
+        list.sort();
+    }
+    let missing: Vec<&(String, Vec<String>)> = coded
+        .iter()
+        .filter(|pair| !documented_sorted.contains(pair))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`docs/reference-diagnostics.md` does not pair these tokens with the targets that emit them: {missing:?}"
+    );
+}
+
+/// The manual's token table as `(token, targets)` rows, skipping every other table in the file by requiring the level cell
+/// to hold a level. A row whose targets are `—` contributes an empty list.
+fn documented_pairs(manual: &str) -> Vec<(String, Vec<String>)> {
+    let mut rows = Vec::new();
+    for line in manual.lines() {
+        let Some(rest) = line.trim().strip_prefix("| `") else {
+            continue;
+        };
+        let cells: Vec<&str> = rest.split('|').map(str::trim).collect();
+        if cells.len() < 3 {
+            continue;
+        }
+        let token = cells[0].split('`').next().unwrap_or_default().to_string();
+        let level = cells[1].trim_end_matches('`').trim();
+        if !["error", "warn", "info", "debug", "trace"].contains(&level) {
+            continue;
+        }
+        let targets = cells[2]
+            .split(',')
+            .map(|cell| cell.trim().trim_matches('`').to_string())
+            .filter(|cell| !cell.is_empty() && cell != "—")
+            .collect();
+        rows.push((token, targets));
+    }
+    rows
 }
 
 /// The manual itself. Read from the repository rather than embedded, because a test that carries its own copy of the

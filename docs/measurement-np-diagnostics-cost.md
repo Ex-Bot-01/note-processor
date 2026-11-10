@@ -109,8 +109,9 @@ Wall clock is one half of "free when off"; the other is that nothing is *formatt
 builds a string, and that is what would quietly cost real time in a loop. That half is asserted, not measured:
 
 * `stderr_stays_silent_at_default_level` (`crates/np-cli/tests/diag.rs`) runs a real command with nothing asked for and
-  asserts stderr holds zero bytes — not "a small amount", and the same file asserts stdout's summary is byte-identical to
-  the run before diagnostics existed.
+  asserts stderr holds zero bytes — not "a small amount". The other half of that promise, that stdout's summary is the same
+  bytes it was before diagnostics existed, is pinned where stdout is pinned: `scan_writes_the_catalog_and_reports_it` in
+  `crates/np-cli/tests/cli.rs`, which compares whole documents and counted lines against a fixture vault.
 * `verbose_prints_the_effective_level_and_its_source` pins the other edge: asking changes exactly one line plus whatever
   passed the filter, so a level cannot silently widen what a run formats.
 * Every event assertion in `crates/np-core/tests/diagnostics.rs` goes through the capture subscriber in

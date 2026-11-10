@@ -29,7 +29,9 @@ toml = "0.9"
 # `tracing` **without a subscriber**: an instrumented library that installs nothing costs a compare-and-return per event, which is
 # the "free when off" half of that design, and it means a caller embedding np-core keeps its own subscriber. The heavyweight half
 # (`tracing-subscriber`) belongs to np-cli alone — the global sink is the process's, and only `np` owns a process.
-tracing = "0.1"
+# `std` only: these crates use the `event!`/`span!` macros and the `Subscriber`/`Layer` traits, never `#[instrument]`, so the
+# default `attributes` feature would add a procedural macro and a second copy of `syn` to every build for a thing nothing calls.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The subscriber np-cli owns. `default-features = false` keeps the pieces this program does not use out of the binary: no
 # `fmt` layer (the human format here is six lines of `format!`, and pinning bytes on stderr predates tracing), no `env-filter`
 # (`NP_LOG` follows §12 rule 7's precedence, which is the *inverse* of the ecosystem's env-beats-file habit — see

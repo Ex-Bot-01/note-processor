@@ -155,3 +155,42 @@ pub const RULE_TOKENS: [&str; 21] = [
     rule::IDENTITY_TAKEN,
     rule::DUPLICATE_ROWS,
 ];
+
+/// Which targets each rule token can arrive on, as published.
+///
+/// The two lists above cannot answer the question an integrator filters on: *where* does this rule show up. Pairing them
+/// by hand in the manual is what went wrong once — `offline` documented under `np_core::fetch` while the embed path emits
+/// it on `np_core::embed`, `artifact-fetched` and `fetch-disabled` documented under fetch while both arrive from search —
+/// and an alert written against that table would silently miss every disconnected `np embed`.
+///
+/// Three things keep it honest: the manual's `Target(s)` column must equal this list in both directions (the doc-sync cases
+/// in each crate), every pair a capture case observes must appear here (`every_rule_this_crate_emits_is_a_published_token`),
+/// and each emission site names its target through [`target`] rather than a literal.
+///
+/// Two published targets carry no rule at all today — `np_core::models`, because a listing's per-row verdict is not a
+/// degraded state, and `np_cli::serve_channel`, because stdin/stdout framing failures are reported on the response channel
+/// they belong to. Both stay listed in [`TARGETS`] as filters that answer "nothing here, yet"; `np_core::fetch` carries the
+/// phase span (its cost) but no rule, since every fetch outcome a caller acts on is reported by the command that asked.
+pub const RULE_TARGETS: [(&str, &[&str]); 21] = [
+    (rule::ARTIFACT_FETCHED, &[target::SEARCH]),
+    (rule::ARTIFACT_MISSING, &[target::EMBED, target::SEARCH]),
+    (rule::CONFIG_REFUSED, &[target::CONFIG]),
+    (rule::DUPLICATE_ROWS, &[target::SCAN]),
+    (rule::FETCH_DISABLED, &[target::SEARCH]),
+    (rule::HIDDEN_BEHIND_UNREADABLE, &[target::SCAN]),
+    (rule::IDENTITY_TAKEN, &[target::SCAN]),
+    (rule::LOCAL_MODEL_NOT_BUILT, &[target::EMBED]),
+    (rule::LOCKED, &[target::LOCK]),
+    (rule::MODEL_NOT_INSTALLED, &[target::EMBED, target::SEARCH]),
+    (rule::NO_VECTORS, &[target::SEARCH]),
+    (rule::NOT_MARKDOWN, &[target::SCAN]),
+    (rule::NOT_PRODUCED, &[target::EMBED]),
+    (rule::OFFLINE, &[target::EMBED, target::SEARCH]),
+    (rule::PREFIX_DRIFT, &[target::EMBED]),
+    (rule::PROVIDER_DISABLED, &[target::EMBED, target::SEARCH]),
+    (rule::TOKEN_BUDGET, &[target::EMBED]),
+    (rule::UNREADABLE, &[target::SCAN]),
+    (rule::UNCHANGED_CONTENT, &[target::SCAN]),
+    (rule::UNREPRESENTABLE_PATH, &[target::SCAN]),
+    (rule::UNRESOLVED_AMBIGUITY, &[target::SCAN]),
+];

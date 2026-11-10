@@ -561,21 +561,29 @@ pub(crate) fn apply_config(cfg: &Config) {
     // All three sources again, flag included: `[log] level` is what this pass exists to pick up, and picking it up by
     // dropping the command line would invert the documented precedence instead of honouring it.
     let flag = sink().flag();
-    let (spec, source) = match np_core::config::resolve_diag(
-        flag.as_deref(),
-        env_value().as_deref(),
-        log_level(cfg),
-    ) {
-        Ok(resolved) => resolved,
-        // Reachable only through `NP_LOG`, and only when the value is not valid text: refusing here would make a diagnostics
-        // typo fail a command, which is the one thing this feature promises never to do. So it warns, and keeps the levels
-        // already in force from phase one — where the same value was refused or accepted by the same rule.
+    let env = match env_value() {
+        Ok(value) => value,
+        // Same shape as the refusal branch below: a diagnostics typo must not fail a run that is already past bootstrap, so
+        // it warns and keeps the levels phase one settled on.
         Err(err) => {
             let mut err_out = io::stderr();
             let _ = writeln!(err_out, "np: {err}; keeping the log level already in force");
             return;
         }
     };
+    let (spec, source) =
+        match np_core::config::resolve_diag(flag.as_deref(), env.as_deref(), log_level(cfg)) {
+            Ok(resolved) => resolved,
+            // Defensive by the time bootstrap has had its say: every source that could be unreadable (`NP_LOG` as non-text,
+            // `[log] level` as a bad spec) is screened above, and `Config::load` refuses a bad `[log] level` outright. Should a
+            // value still arrive unparseable, this is the second phase — a command already at work must not be failed by a
+            // diagnostics typo — so it warns and keeps the levels phase one settled on.
+            Err(err) => {
+                let mut err_out = io::stderr();
+                let _ = writeln!(err_out, "np: {err}; keeping the log level already in force");
+                return;
+            }
+        };
     install(
         &spec,
         cfg.log.file.as_deref(),
@@ -589,11 +597,16 @@ pub(crate) fn apply_config(cfg: &Config) {
 
 /// `NP_LOG` read the way this program reads every environment value: absent or empty is silence (`env_text`'s rule), and text
 /// that is not valid UTF-8 is a refusal naming the variable rather than a guess at it.
-fn env_value() -> Option<String> {
+fn env_value() -> Result<Option<String>, String> {
     match std::env::var_os(DIAG_ENV_VAR) {
-        None => None,
-        Some(value) if value.is_empty() => None,
-        Some(value) => value.into_string().ok(),
+        None => Ok(None),
+        Some(value) if value.is_empty() => Ok(None),
+        // Text this program cannot read is refused, naming the variable — the rule `config::env_text` and `loglevel` both
+        // follow. Treating it as unset would make "the environment did nothing" indistinguishable from "the environment was
+        // nonsense", which is the invisibility the announce line exists to remove.
+        Some(value) => value.into_string().map(Some).map_err(|_| {
+            format!("{DIAG_ENV_VAR} is set to text this program cannot read; unset it, or write one of off, error, warn, info, debug, trace")
+        }),
     }
 }
 
@@ -683,8 +696,9 @@ pub(crate) fn bootstrap(
             }
         },
     };
+    let env = env_value()?;
     let (spec, source) =
-        np_core::config::resolve_diag(flag.as_deref(), env_value().as_deref(), file_level)?;
+        np_core::config::resolve_diag(flag.as_deref(), env.as_deref(), file_level)?;
     // The flag's path outranks the file's, exactly as the flag's level does; with neither, nothing is opened.
     let path = log_file.or(peek.file.as_deref());
     Ok(install(
@@ -721,9 +735,6 @@ fn now_ms() -> u64 {
 struct Record {
     msg: String,
     fields: Vec<(String, Value)>,
-    /// A record whose sentence already reached stderr through a pinned user-facing path: it belongs in the file and must not
-    /// print a second time there.
-    already_printed: bool,
 }
 
 /// The bound on one path-bearing diagnostic field, in bytes, marker included.
@@ -824,11 +835,6 @@ impl Visit for Record {
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        // `user` is a marker for the sink rather than a published key: it says the sentence already reached stderr.
-        if field.name() == "user" {
-            self.already_printed = value;
-            return;
-        }
         self.push(field.name(), Value::from(value));
     }
 
@@ -1049,7 +1055,7 @@ where
         let level = level_text(meta.level());
         // Claimed before the line is built (spec point 8): a diagnostic that will not be printed costs a counter and a poll,
         // not a `format!`.
-        if !record.already_printed && self.sink.claim_stderr_line() {
+        if self.sink.claim_stderr_line() {
             let line = record.human(level, meta.target());
             self.sink.write_stderr_line(&line);
         }

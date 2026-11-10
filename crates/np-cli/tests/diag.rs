@@ -869,6 +869,10 @@ fn concurrent_processes_never_split_a_record() {
 
 /// **Deleting the log mid-run is documented as safe** (Review Focus 4): writes stop or continue, but the command does not fail,
 /// panic, or lose its report — and the next run recreates the file, which is what makes "delete it" a real remedy.
+///
+/// Unix-only on purpose: unlinking a file another process still holds open is what POSIX allows and Windows does not — the
+/// same asymmetry spec point 8 cites when it refuses rotation. The case would fail at setup there rather than test anything.
+#[cfg(unix)]
 #[test]
 fn deleting_the_log_file_mid_run_does_not_fail_the_command() {
     let tmp = TempDir::new().expect("test setup: tempdir");
@@ -1727,6 +1731,31 @@ fn the_diagnostics_reference_documents_every_target_and_token() {
             "{what}s drift between code and the manual.\n  undocumented: {missing:?}\n  invented: {invented:?}"
         );
     }
+    // The pairing, not merely the two lists: `RULE_TARGETS` is what an integrator writes alert filters from, and a row that
+    // sets a real token beside a target that never emits it is a monitoring gap no set comparison can see. Checked here too,
+    // from the binary's own test tree, so the document shipped beside this artifact cannot disagree with the code about
+    // where a rule appears.
+    let pairs = documented_rule_targets(&manual);
+    let mut coded: Vec<(String, Vec<String>)> = np_core::diagnostics::RULE_TARGETS
+        .iter()
+        .map(|(rule, list)| {
+            let mut targets: Vec<String> =
+                list.iter().map(|target| (*target).to_string()).collect();
+            targets.sort();
+            ((*rule).to_string(), targets)
+        })
+        .collect();
+    coded.sort();
+    let mut documented = pairs;
+    for (_, targets) in &mut documented {
+        targets.sort();
+    }
+    documented.sort();
+    assert_eq!(
+        documented, coded,
+        "`docs/reference-diagnostics.md` and `np_core::diagnostics::RULE_TARGETS` disagree about which target emits each rule"
+    );
+
     // The five phase names are a doc-side claim only — there is no code list to compare them with, and inventing one for
     // a test would be a constant nobody reads at runtime. What this does catch is the cheap accident: renaming the
     // `scan` span or dropping `fetch` from the manual while the other still names it.
@@ -1740,6 +1769,32 @@ fn the_diagnostics_reference_documents_every_target_and_token() {
             "`{phase}` is a phase that reports its cost; the manual's span list must say so"
         );
     }
+}
+
+/// The manual's token table as `(token, targets)` rows. Rows are recognised by their level cell holding a level name, which
+/// skips every other table in the file; a `—` in the targets cell contributes nothing.
+fn documented_rule_targets(manual: &str) -> Vec<(String, Vec<String>)> {
+    let mut rows = Vec::new();
+    for line in manual.lines() {
+        let Some(rest) = line.trim().strip_prefix("| `") else {
+            continue;
+        };
+        let cells: Vec<&str> = rest.split('|').map(str::trim).collect();
+        if cells.len() < 3 {
+            continue;
+        }
+        let token = cells[0].split('`').next().unwrap_or_default().to_string();
+        if !["error", "warn", "info", "debug", "trace"].contains(&cells[1]) {
+            continue;
+        }
+        let targets = cells[2]
+            .split(',')
+            .map(|cell| cell.trim().trim_matches('`').to_string())
+            .filter(|cell| !cell.is_empty() && cell != "\u{2014}")
+            .collect();
+        rows.push((token, targets));
+    }
+    rows
 }
 
 /// The body of the first fenced block whose info string is `info`.
