@@ -1,10 +1,11 @@
 //! Config file (`config.toml`), OS data dir, and the known-workspace registry.
 
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR_STR};
 
 use rusqlite::{params, Connection};
 use serde::Deserialize;
@@ -855,9 +856,10 @@ impl Config {
     /// [`Config::workspace_models_dir`] places the same workspace's model artifacts beside it, from the same
     /// private `workspace_key`, because a row and the file it names belong to one workspace or to neither.
     ///
-    /// The workspace need not exist: the absolute spelling of `workspace` (current
-    /// directory prepended when relative, no symlink resolution) is hashed as
-    /// given, so the same input always yields the same path.
+    /// The workspace need not exist: the canonical absolute spelling of `workspace`
+    /// (current directory prepended when relative, separators that carry no meaning removed,
+    /// no symlink resolution) is hashed, so the same directory always yields the same path
+    /// whatever a caller typed — see `abs_path` for what "canonical" costs and what it refuses to do.
     ///
     /// The digest covers the raw OS bytes rather than a decoded string, because lossy decoding maps
     /// two different paths onto one text: a byte that is not valid UTF-8 and a literal replacement
@@ -1165,19 +1167,93 @@ pub fn declared_data_dir(path: &Path) -> Option<PathBuf> {
     toml::from_str::<DataDirProbe>(&text).ok()?.data_dir
 }
 
-/// Absolute spelling of `path`: the current directory is prepended when it is
-/// relative, symlinks are not resolved.
+/// Absolute spelling of `path`, in the one spelling this program treats as an identity: the current
+/// directory is prepended when it is relative, separators that name nothing are dropped, and symlinks
+/// are not resolved.
 ///
 /// Shared with [`crate::scan`], which walks and writes through this same spelling so the workspace
-/// key in a database row and the name in the registry are the one absolute path.
+/// key in a database row and the name in the registry are the one absolute path — and shared with
+/// [`WorkspaceRegistry::record`] for the same reason. That is why the normalisation lives *here*
+/// rather than inside `workspace_key`: a client that spells one folder two ways (issue **#4**: a
+/// Windows folder picker returns `D:\Notes\`, a saved "recent folders" file returns `D:\Notes`) must
+/// not get two databases, two artifact directories — and therefore a second 309 MB download — *or*
+/// two rows in the recent list disagreeing about whether it has seen this vault.
+///
+/// **What is dropped** ([`canonical_spelling`], which std's own [`Path::components`] iterator defines):
+/// a trailing separator, a doubled separator, and a `.` component. All three say nothing about which
+/// directory is meant, and on Windows the separator *style* disappears with them, because a component
+/// is split on `/` and `\` alike — so `D:/Notes` and `D:\Notes` reach one key here rather than two.
+///
+/// **What is not resolved**, deliberately:
+///
+/// * **Symlinks.** [`std::fs::canonicalize`] would answer "which directory" exactly, and `workspace_key`'s
+///   note records why it was ruled out: a key that moves when a link is re-pointed makes `np scan`
+///   depend on the state of the filesystem above the vault, and every tool that spells the path through
+///   the link would disagree with the one that spelled it directly.
+/// * **`..`.** A parent component survives as itself. Collapsing `a/../b` lexically would be wrong wherever
+///   `a` is a symlink — the same refusal as above, reached from the other side — and resolving it properly
+///   is canonicalization. So `/v/a/../notes` is still a second spelling of one folder, and this is the
+///   known residual: a client that sends `..` pays the re-index **#4** is about. Every GUI examined sends
+///   a picker's path, which holds no `..`.
+///
+/// **What it costs.** A workspace first indexed under a spelling this function now rewrites — a trailing
+/// separator, or a `.` (`np scan .`) — keys elsewhere after the change, so its index and its model cache
+/// start empty: one `np scan` and, if vectors were wanted, one `np embed`. Nothing is lost (the old files
+/// stay under the old key) and a clean spelling such as `/home/ana/notes` hashes exactly as it did before,
+/// which `crates/np-core/tests/config.rs::a_clean_spelling_keys_where_it_did_before` pins by digest.
 pub(crate) fn abs_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         // `workspace_db` is infallible by contract, so an unreadable current
         // directory leaves the spelling as given instead of failing.
         env::current_dir().unwrap_or_default().join(path)
+    };
+    canonical_spelling(&absolute)
+}
+
+/// The same directory with nothing left in its name but the directories themselves.
+///
+/// Rebuilt from [`Path::components`] rather than trimmed, because the iterator already knows the three
+/// things worth knowing: `.` carries no meaning, a repeated separator carries no meaning, and Windows
+/// splits on both separator styles. Rebuilding is also what keeps this total on a path made of bytes that
+/// decode to nothing — components hand back the OS's own [`OsStr`] pieces, so no lossy text is introduced
+/// between the path and its digest (`path_bytes` still decides the byte spelling, and F13's Windows
+/// residual stays exactly where it was).
+///
+/// The separator between two pieces is inserted by this function and nowhere else, which is what keeps a
+/// prefix honest: `D:` takes no separator before a *drive-relative* name (`D:notes` is not `D:\notes`) but
+/// the root that follows a prefix supplies its own (`D:` + `\` = `D:\`). A plain `push` could not make
+/// that distinction — on Windows it replaces the whole buffer when handed `\`, turning `D:\Notes` into the
+/// UNC-shaped `\Notes`.
+fn canonical_spelling(path: &Path) -> PathBuf {
+    let mut text = OsString::new();
+    // Whether the next piece has to be preceded by a separator. False at the start, after a root (the root
+    // *is* a separator) and after a prefix, which either takes a root or takes its drive-relative name.
+    let mut needs_separator = false;
+    for component in path.components() {
+        match component {
+            // `.` names no directory: the one component with nothing to contribute.
+            Component::CurDir => {}
+            Component::RootDir => {
+                text.push(OsStr::new(MAIN_SEPARATOR_STR));
+                needs_separator = false;
+            }
+            Component::Prefix(prefix) => {
+                text.push(prefix.as_os_str());
+                needs_separator = false;
+            }
+            // `..` and an ordinary name both travel as the bytes the OS holds.
+            piece @ (Component::ParentDir | Component::Normal(_)) => {
+                if needs_separator {
+                    text.push(OsStr::new(MAIN_SEPARATOR_STR));
+                }
+                text.push(piece.as_os_str());
+                needs_separator = true;
+            }
+        }
     }
+    PathBuf::from(text)
 }
 
 /// The bytes of a path as the OS holds them, which is what makes two paths that decode to the same

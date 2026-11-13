@@ -398,6 +398,119 @@ fn relative_workspace_path_is_resolved_against_the_cwd() {
     );
 }
 
+/// **One directory is one workspace, whatever separators its caller typed** (issue #4).
+///
+/// The key used to be the digest of the path *string*, so `/a/notes` and `/a/notes/` — two spellings of one
+/// folder, and the second the shape a Windows folder picker returns — were two workspaces with two databases,
+/// two model directories and two full indexes. A client that normalises paths for its own bookkeeping therefore
+/// paid a whole re-add the first time it switched spelling. The key is now the digest of the directory's
+/// canonical spelling, which std's own component iterator defines: no trailing separator, no doubled separator,
+/// no `.`.
+#[test]
+fn every_spelling_of_one_directory_keys_one_workspace() {
+    let _env = hold_env();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let cfg = config_with_data_dir(tmp.path());
+
+    let canonical = cfg.workspace_db(Path::new("/a/notes"));
+    for spelling in [
+        "/a/notes/",  // the trailing separator a folder picker appends
+        "/a/notes//", // and two of them
+        "/a//notes",  // a doubled separator in the middle
+        "/a/./notes", // `.` says nothing a reader needs
+        "/a/./notes/",
+    ] {
+        assert_eq!(
+            cfg.workspace_db(Path::new(spelling)),
+            canonical,
+            "`{spelling}` is one directory with `{}`; it must not become a second workspace",
+            canonical.display()
+        );
+    }
+
+    // The artifact directory follows the database, because a row and the file its row names belong to one
+    // workspace or to neither (`Config::workspace_models_dir`'s reason for existing).
+    assert_eq!(
+        cfg.workspace_models_dir(Path::new("/a/notes/")),
+        cfg.workspace_models_dir(Path::new("/a/notes")),
+        "a trailing separator must not ask for a second 309 MB download"
+    );
+
+    // Relative spellings reach the same key as their absolute form, `.` included: `np scan .` and
+    // `np scan /the/same/path` named one folder all along.
+    let cwd = std::env::current_dir().expect("test: current dir");
+    assert_eq!(
+        cfg.workspace_db(Path::new("./notes")),
+        cfg.workspace_db(&cwd.join("notes")),
+        "`np scan .` and `np scan <absolute>` are one workspace"
+    );
+
+    // **The negative half, which is the half a wrong fix breaks.** Normalising must not merge two directories:
+    // a name that merely starts the same way, a sibling above it, and the filesystem root all stay apart.
+    for other in ["/a", "/a/notes-old", "/a/notes2", "/"] {
+        assert_ne!(
+            cfg.workspace_db(Path::new(other)),
+            canonical,
+            "`{other}` is not `/a/notes`, and must not share its database"
+        );
+    }
+
+    // The root's own trailing separator *is* the path: trimming it away would key the whole filesystem as an
+    // empty string, which every other tool reads as "the current directory".
+    assert_eq!(
+        cfg.workspace_db(Path::new("/")),
+        cfg.workspace_db(Path::new("///")),
+        "the root keeps a name"
+    );
+}
+
+/// **The no-migration proof for [#4].** A workspace named by a clean path — no trailing separator, no `.`,
+/// one separator between components — must hash to exactly the digest it hashed before that fix, because
+/// every index and model cache on somebody's disk is filed under that digest. Asserted as a literal rather
+/// than against the code, which would agree with itself whatever it did.
+///
+/// Unix-gated because the bytes are the platform's own: on Windows `path_bytes` is lossy text and the root
+/// of `/a/notes` acquires a drive, so the same folder spells other bytes there by design (F13's residual).
+#[cfg(unix)]
+#[test]
+fn a_clean_spelling_keys_where_it_did_before() {
+    let _env = hold_env();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let cfg = config_with_data_dir(tmp.path());
+
+    assert_eq!(
+        cfg.workspace_db(Path::new("/a/notes"))
+            .file_stem()
+            .expect("test: db has a stem")
+            .to_string_lossy(),
+        "65559a6368dab9e6",
+        "sha256(\"/a/notes\")[..16]: an existing workspace must still find its own database"
+    );
+}
+
+/// The registry keys by the same directory, so `np setup`'s recent-workspace list stops showing one folder
+/// twice — the display half of the same bug [#4] fixes in the digest.
+#[test]
+fn registry_records_one_row_for_two_spellings_of_one_directory() {
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let mut registry = WorkspaceRegistry::open(tmp.path()).expect("registry should open");
+
+    registry
+        .record(Path::new("/a/notes"), 100)
+        .expect("record /a/notes");
+    registry
+        .record(Path::new("/a/notes/"), 300)
+        .expect("re-record the same folder with its trailing separator");
+
+    let recent = registry.recent().expect("recent");
+    assert_eq!(
+        recent.len(),
+        1,
+        "two spellings must not become two rows: {recent:?}"
+    );
+    assert_eq!(recent[0].1, 300, "the later sighting still wins");
+}
+
 #[test]
 fn registry_records_and_bumps_last_seen() {
     let tmp = TempDir::new().expect("test setup: tempdir");

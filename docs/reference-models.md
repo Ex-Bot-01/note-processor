@@ -19,7 +19,13 @@ Artifacts live **per workspace**, next to that workspace's database:
 ```
 
 `<key>` is a digest of the workspace's absolute path as bytes, so two spellings of one directory share one index and two
-directories never share it. `<data_dir>` is `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows it is
+directories never share it. **Which spellings collapse** (issue **#4**, since 0.3.2): a trailing separator (`/vault` and
+`/vault/`, or `D:\Notes` and the `D:\Notes\` a Windows folder picker returns), a doubled separator, a `.` component
+(`np scan .` is the workspace `np scan <absolute>` indexes), and on Windows the separator *style*. What still keys apart is a
+path holding `..` — resolving that lexically would be wrong wherever a component is a symlink, and resolving it properly is
+canonicalization, which this key deliberately does not do (a key that moved when a link was re-pointed would make the index
+depend on the filesystem above the vault). A workspace first indexed under a spelling that 0.3.2 rewrites keeps its old
+files where they are and starts empty under the new key: one `np scan` clears it, and `np embed` re-creates the vectors. `<data_dir>` is `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows it is
 `%LOCALAPPDATA%\note-processor` — nested under a folder that says whose it is, like the config file always was (**F37**). Before that
 change Windows wrote `workspaces/` and `workspaces.sqlite` straight into `%LOCALAPPDATA%`, which is where every application writes; if
 that is where your index is, this release still reads it there and says so on stderr rather than reporting your notes as new.

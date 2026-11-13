@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use np_core::config::Config;
+use np_core::config::{Config, WORKSPACES_DIR};
 use np_core::lock::WorkspaceLock;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -1069,6 +1069,77 @@ fn status_get_says_when_this_workspace_was_last_scanned() {
     );
     server.finish();
     other.finish();
+}
+
+/// **One folder is one workspace, whichever separator its caller left on** (issue **#4**).
+///
+/// Reproduced against `np 0.3.1` by the client that reported it: `/vault` answered `unchanged: 16`, then
+/// `/vault/` answered `added: 16` — a full re-add of a whole vault, filed under a second database, because
+/// the key was the digest of the *string*. A Windows folder picker hands back `D:\Notes\` and a saved
+/// "recent folders" file hands back `D:\Notes`, so any client that normalises paths for its own bookkeeping
+/// switches identity mid-session.
+///
+/// The three assertions are the three ways one identity shows: the counts (nothing to add the second time),
+/// the data dir (one database, not two), and `status.get` (one scan stamp, because it is one workspace).
+#[test]
+fn a_trailing_separator_is_the_same_workspace_as_the_path_it_ends() {
+    let mut server = Server::new();
+    let plain = server.root.display().to_string();
+    let with_separator = format!("{plain}{}", std::path::MAIN_SEPARATOR);
+
+    let first = server.result("scan", json!({"workspace": plain}));
+    // `added` counts files, `notes` counts notes; read the first pass's own number rather than a fixture
+    // constant, so this case is about the second pass and not about how many fixtures are committed.
+    let added = first["added"]
+        .as_u64()
+        .expect("a scan reports what it added");
+    assert!(
+        added > 0 && first["notes"].as_u64() == Some(CORPUS_NOTES),
+        "the first pass has to index the corpus for this case to mean anything: {first}"
+    );
+
+    let again = server.result("scan", json!({"workspace": with_separator.clone()}));
+    assert_eq!(
+        again["added"].as_u64(),
+        Some(0),
+        "`{with_separator}` re-added a vault that was already indexed: {again}"
+    );
+    assert_eq!(
+        again["unchanged"].as_u64(),
+        Some(added),
+        "every file is the same file it just saw: {again}"
+    );
+
+    // **One database, not two.** The counts could agree by luck (two workspaces of one fresh corpus both
+    // report `added: 16`); a second `.sqlite` under `workspaces/` is the durable half of the bug — and it is
+    // the half that also mints a second model directory, which is where a client pays 309 MB for a character.
+    let databases = workspace_databases(&server.data_dir().join(WORKSPACES_DIR));
+    assert_eq!(
+        databases.len(),
+        1,
+        "two spellings minted two workspaces: {databases:?}"
+    );
+
+    // And the reading of that workspace answers once: a scan through either spelling stamped the one index.
+    let status = server.result("status.get", json!({"workspace": plain}));
+    assert!(
+        status["last_scan"].is_number(),
+        "the plain spelling sees the scan that the separated one reported: {status}"
+    );
+    server.finish();
+}
+
+/// Every workspace database filed in `workspaces/` — the registry file lives one level up, so it cannot
+/// inflate this count.
+fn workspace_databases(workspaces: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(workspaces)
+        .expect("test: the workspaces dir exists once a scan has run")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".sqlite"))
+        .collect();
+    names.sort();
+    names
 }
 
 /// **Review Focus 3.** A status question must not create the thing it asks about. `scan` and `embed` open (and so
