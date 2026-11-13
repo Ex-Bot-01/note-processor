@@ -11,6 +11,10 @@ GitHub Releases carry `np` archives named `np-<version>-<target>`. **`v0.1.0`'s 
 2026-10-28 tree, whose CLI had exactly one subcommand (`scan`) — so use them for the indexer only, never for `embed`, `search` or
 `models`.
 
+The body of a release page comes from `release-notes/<tag>.md` in this repository when one exists — so the prose a downloader reads can be
+reviewed, diffed and cited by the next release note instead of living in a browser tab. A tag cut without one gets GitHub's generated
+commit list, which is honest but says nothing about CPUs.
+
 From **`v0.2.0` onward, read the release notes before downloading**, because which machine built an asset is part of what that asset
 is. Since `v0.4.0` `.github/workflows/release.yml` builds both shipped assets by running the two scripts a human runs —
 `.github/scripts/package-assets.sh` for Linux and `.github/scripts/cross-build-windows.sh` for the Windows cross-build — so there is
@@ -75,6 +79,12 @@ in any compiler on earth.
 The symptom that started it, for the record: the first CI-built Linux asset was compiled `-march=native` for its runner, carried 14,540
 AVX-512 instructions, and answered `Illegal instruction (core dumped)` on an older x86-64 host before printing a version number. **A
 release asset is run by machines that did not build it.**
+
+**Measured on 2026-11-13, on that host, against the archive CI built in run `43522182273`**: `np --version` → `np 0.4.0`; `np scan`
+indexed a vault; `np serve` answered `initialize`, `links.list` and `models.list`; `np embed` fetched the pinned 295.5 MB artifact,
+re-checked its digest and wrote vectors with `errors 0`; hybrid search then scored a keyword-free query at `cos 0.8362`. Shipped binary:
+`%zmm 0`, `%ymm 4,940` — the same count as a local build of the same tree. **The Windows asset has not been run by anything**: it is
+cross-built and inspected, and no claim beyond that appears in its notes.
 
 **A source build stays fast on the machine that built it**: `NP_LLAMA_PORTABLE` is unset there, so upstream's `-march=native` applies,
 nothing touches `RUSTFLAGS`, and `np embed` gets the AVX2/AVX-512 paths your CPU has. That is the difference between downloading and

@@ -267,16 +267,37 @@ jobs:
             }
           done
 
-      # `--generate-notes` rather than a hand-written body: the notes are the commit list, which is
-      # the only description this repository keeps up to date.
+          # The per-asset files did their job — arriving under distinct names so neither overwrote the other, and being joined
+          # above. Leaving them on the page too would put three checksum files beside two archives and make a downloader guess
+          # which one `sha256sum -c` was told to read.
+          find assets -name 'SHA256SUMS-*.txt' -delete
+
+      # **The body of a release page is a document, so it lives where documents are.** `--generate-notes` produces the commit list,
+      # which is honest but is not what tells a user that their asset will not start on an old CPU; and prose that exists only in
+      # a browser tab cannot be reviewed, diffed or cited by a later release note. So `release-notes/<tag>.md`, when the repository
+      # carries one for this tag, is the body — and the commit list remains the fallback for any tag cut without one.
+      - name: Choose the release's body
+        id: notes
+        run: |
+          note="release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$note" ]; then
+            echo "notes_file=$note" >> "$GITHUB_OUTPUT"
+            echo "body: $note ($(wc -l < "$note") lines)"
+          else
+            echo "no $note in the tree; the page gets the generated commit list"
+          fi
+
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
           if [ "$tag" = "main" ]; then tag=$(git describe --tags --always); fi
-          gh release create "$tag" \
-            --draft=false \
-            --latest \
-            --generate-notes \
-            assets/*
+          set -- --draft=false --latest
+          # Quoted expansion, not a bare `${var:+…}` inside the argument list: a path with a space in it must stay one argument.
+          if [ -n "${{ steps.notes.outputs.notes_file }}" ]; then
+            set -- "$@" --notes-file "${{ steps.notes.outputs.notes_file }}"
+          else
+            set -- "$@" --generate-notes
+          fi
+          gh release create "$tag" "$@" assets/*
