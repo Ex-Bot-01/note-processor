@@ -52,20 +52,34 @@ now names **eight** methods.
 Both assets for `v0.4.0` are built by CI on `ubuntu-latest`, by the two scripts named above, and each carries `np` (or `np.exe`),
 `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
-**They run on any x86-64 machine, and that costs them speed.** llama.cpp is configured at the baseline floor — `GGML_NATIVE=OFF`
-*and* every `GGML_<ISA>` option off — because a static llama.cpp has no runtime dispatch: its CPUID-selected variants live in
-dynamic backend modules (`GGML_CPU_ALL_VARIANTS`, which upstream refuses to build without `GGML_BACKEND_DL`), and this project
-ships one file. Found while cutting this release, twice: the first CI-built Linux asset was compiled `-march=native` for its runner
-and contained 14,540 AVX-512 instructions, answering `Illegal instruction (core dumped)` on an older x86-64 host before it printed a
-version number; the fix attempt that only set `GGML_NATIVE=OFF` failed the same way, because on a native build that flag switches
-upstream's `INS_ENB` on and the per-ISA options arrive as `-msse4.2 … -mavx2` on the whole cpu backend (AVX references went *up*
-from 43,295 to 46,358). `build.rs` now reads every one of those keys back out of cmake's own cache and refuses a build that did not
-take them.
+**They run on any x86-64 machine, and that costs them speed.** Three things decide the instruction set of a shipped binary, and for
+three rehearsals only the first was being said out loud:
 
-**A source build stays fast on the machine that built it**: `NP_LLAMA_PORTABLE` is unset there, so upstream's `-march=native` applies
-and `np embed` gets the AVX2/AVX-512 paths your CPU has. That is the difference between downloading and building, and it is now the
-only difference. **An asset built before 2026-11-13 may carry its build machine's instruction set** — if an older release's binary
-refuses to start on yours, that is the reason. **No Windows-MSVC asset and no macOS asset exist**, and this is not a minutes decision:
+- **llama.cpp is configured at the floor**: `GGML_NATIVE=OFF` *and* every `GGML_<ISA>` option off. A static llama.cpp has no runtime
+  dispatch — its CPUID-selected variants live in dynamic backend modules (`GGML_CPU_ALL_VARIANTS`, which upstream refuses to build
+  without `GGML_BACKEND_DL`) and this project ships one file. `GGML_NATIVE=OFF` on its own *raises* the floor rather than lowering it:
+  on a native build that flag flips upstream's `INS_ENB` on, and the per-ISA options arrive as `-msse4.2 … -mavx2` across the whole cpu
+  backend.
+- **The C/C++ compiler is told the floor**: `-march=x86-64`, appended after anything `CFLAGS`/`CXXFLAGS` already carried.
+- **Rust is told the floor**: `-C target-cpu=x86-64` in `RUSTFLAGS`.
+
+The last two are the ones that mattered, and they were not what the first two explanations said. Measured on the runner with every
+llama.cpp option OFF: its `cc`, handed an empty command line, predefines `__AVX__` and `__AVX2__` — **that image's compiler defaults to
+a target above the baseline** — so 76 translation units containing no `-m` token between them still produced 36,203 wide-vector
+instructions (`ggml-quants.c` alone: 6,972; `arch/x86/repack.cpp`: 6,534; every one of those files sits at zero in a local build of the
+same pin). Options can only withdraw features something requested; nothing had requested AVX, so nothing was withdrawn. `build.rs` now
+asks the compiler directly — runs it over empty input and refuses a portable build whose predefined macros name anything above SSE2 —
+after the first version of that check read the wrong token out of `#define __AVX2__ 1` for three rehearsals and found nothing forbidden
+in any compiler on earth.
+
+The symptom that started it, for the record: the first CI-built Linux asset was compiled `-march=native` for its runner, carried 14,540
+AVX-512 instructions, and answered `Illegal instruction (core dumped)` on an older x86-64 host before printing a version number. **A
+release asset is run by machines that did not build it.**
+
+**A source build stays fast on the machine that built it**: `NP_LLAMA_PORTABLE` is unset there, so upstream's `-march=native` applies,
+nothing touches `RUSTFLAGS`, and `np embed` gets the AVX2/AVX-512 paths your CPU has. That is the difference between downloading and
+building, and it is now the only difference. **An asset built before 2026-11-13 may carry its build machine's instruction set** — if an
+older release's binary refuses to start on yours, that is the reason. **No Windows-MSVC asset and no macOS asset exist**, and this is not a minutes decision:
 `crates/np-core/build.rs` compiles llama.cpp for Linux and for `x86_64-pc-windows-gnu` with a cmake toolchain file, and refuses every
 other target rather than meeting a linker error — "no platform claim without a build measured on it". A runtime-less macOS or MSVC binary
 would arrive under a name that matches the runtime-bearing ones, which is how `F40`'s trap worked. On those platforms build from source,

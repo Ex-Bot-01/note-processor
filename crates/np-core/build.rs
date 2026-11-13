@@ -128,6 +128,30 @@ const PORTABLE_ISA_OPTIONS: [&str; 6] = [
     "GGML_BMI2",
 ];
 
+/// The instruction-set floor a portable build compiles to, spelled the way the compiler spells it. Appended **last** to
+/// whatever `CFLAGS`/`CXXFLAGS` already said, because gcc honours the rightmost `-march=`: on the release path this promise
+/// outranks an inherited environment, and [`require_portable_codegen`] says so when it does not hold.
+const PORTABLE_MARCH_FLAG: &str = "-march=x86-64";
+
+/// What a baseline x86-64 compiler must **not** predefine. Read from the compiler rather than from a flag list, because the
+/// flags were never the whole story: on 2026-11-13 a hosted runner's `cc` predefined `__AVX__` and `__AVX2__` from an empty
+/// command line — its *default* target sits above the floor — which is how a tree with every `GGML_<ISA>` option OFF and no
+/// `-m` token in any of its 76 compile commands still produced 36,203 wide-vector instructions.
+const PORTABLE_FORBIDDEN_MACROS: [&str; 12] = [
+    "__SSE3__",
+    "__SSSE3__",
+    "__SSE4_1__",
+    "__SSE4_2__",
+    "__AVX__",
+    "__AVX2__",
+    "__FMA__",
+    "__F16C__",
+    "__BMI__",
+    "__BMI2__",
+    "__POPCNT__",
+    "__LZCNT__",
+];
+
 /// Where [`stage_prefixed_archives`] puts the archives a cross build links against.
 const LINK_STAGE_DIR: &str = "llama-link-windows-gnu";
 
@@ -659,6 +683,13 @@ fn configure(
         for option in PORTABLE_ISA_OPTIONS {
             extras.push_str(&format!("{option}=OFF\n"));
         }
+        // The compiler flags belong to the configure's identity for the same reason: they, not the options above, are what
+        // decided the instruction set on 2026-11-13, so a cache that predates them must not be certified fresh.
+        extras.push_str(&format!(
+            "CMAKE_C_FLAGS={}\nCMAKE_CXX_FLAGS={}\n",
+            portable_cflags("CFLAGS"),
+            portable_cflags("CXXFLAGS")
+        ));
     }
     let wanted = format!(
         "{}{}cmakelists-sha256={}\n",
@@ -781,6 +812,16 @@ fn configure(
     // a cross build already gets because `GGML_NATIVE_DEFAULT` is OFF there and `INS_ENB` follows it. The Windows
     // asset has been baseline x86-64 since v0.2.2; this makes the Linux one say the same thing.
     //
+    // **That explanation was complete for a developer's machine and wrong about the runner**, and the third, fourth and
+    // fifth rehearsals proved it: with every option above OFF, `compile_commands.json` holding no `-m` token in any of 76
+    // commands, and `RUSTFLAGS=-C target-cpu=x86-64` set, the asset still carried the same 46,358 wide-vector instructions
+    // and still refused to start here. The census named the files (`ggml-quants.c`: 6,972; `arch/x86/repack.cpp`: 6,534;
+    // `llamafile/sgemm.cpp`: 4,028 — all of them **zero** in a local build of the same pin), and one question to the
+    // compiler named the cause: on that runner, `cc` with an empty command line predefined `__AVX__` and `__AVX2__`. Its
+    // *default* target is above the floor, so nothing had to ask for AVX — the objects were born with it. Options can only
+    // withdraw what something requested; [`PORTABLE_MARCH_FLAG`] states the floor to the compiler itself, and
+    // [`require_portable_codegen`] asks the compiler whether that worked rather than trusting that it did.
+    //
     // Deliberately opt-in rather than the default, because the cost lands on whoever builds for their own machine:
     // `cargo install` with `-march=native` is llama.cpp's fast path and the builder is the user there. The release
     // scripts set this variable; [`require_portable_codegen`] then proves from cmake's own cache that it took.
@@ -789,6 +830,10 @@ fn configure(
         for option in PORTABLE_ISA_OPTIONS {
             args.push(format!("-D{option}=OFF"));
         }
+        // **…and name the floor to the compiler as well.** Those options only withdraw features something asked for, and
+        // nothing here asked — the objects came out AVX2 anyway, because this runner's `cc` assumes AVX2 when told nothing.
+        args.push(format!("-DCMAKE_C_FLAGS={}", portable_cflags("CFLAGS")));
+        args.push(format!("-DCMAKE_CXX_FLAGS={}", portable_cflags("CXXFLAGS")));
     } else if cross.is_none() {
         // Say the quiet part where a developer will read it: this tree is being compiled for *this* machine.
         println!(
@@ -1345,6 +1390,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// The flags a portable tree hands cmake for C and C++: whatever the environment asked for, then the floor.
+///
+/// Ours goes last on purpose. gcc honours the rightmost `-march=`, so an inherited `CFLAGS=-march=native` cannot smuggle the
+/// builder's CPU into a release asset. A developer who wants their own machine's tuning leaves `{PORTABLE_ENV}` unset, where
+/// nothing here touches their flags at all.
+fn portable_cflags(env_name: &str) -> String {
+    let inherited = env::var(env_name).unwrap_or_default();
+    format!("{} {PORTABLE_MARCH_FLAG}", inherited.trim())
+        .trim()
+        .to_string()
+}
+
 /// Whether this invocation asked for a portable tree, and what it says when the answer is neither yes nor no.
 ///
 /// An unparseable value is reported rather than ignored quietly: `NP_LLAMA_PORTABLE=yes-please` falling back to
@@ -1395,18 +1452,88 @@ fn require_portable_codegen(build_dir: &Path, portable: bool) -> Result<(), Stri
             None => raised.push(format!("{option}=absent")),
         }
     }
-    if raised.is_empty() {
+    // **Then ask the compiler what it would compile for, with those options gone.** The option check above reads cmake's
+    // intentions; this one measures the toolchain's defaults, and on 2026-11-13 only this one was true: every `GGML_<ISA>`
+    // option OFF, no `-m` token in any of the tree's 76 compile commands, and a hosted runner's `cc` that predefined
+    // `__AVX__`/`__AVX2__` from an empty command line. The asset built from that "portable" configuration still refused to
+    // start on a pre-AVX machine. Options can withdraw features something asked for; they cannot withdraw the compiler's own
+    // default target, which is why `{PORTABLE_MARCH_FLAG}` goes on the command line and why its effect is measured here.
+    let mut above = Vec::new();
+    if let Some(compiler) = cache.get("CMAKE_C_COMPILER") {
+        match predefined_macros(
+            compiler,
+            cache.get("CMAKE_C_FLAGS").map(String::as_str).unwrap_or(""),
+        ) {
+            Ok(macros) => {
+                for forbidden in PORTABLE_FORBIDDEN_MACROS {
+                    if macros.iter().any(|seen| seen == forbidden) {
+                        above.push(forbidden);
+                    }
+                }
+            }
+            // Not being able to ask is not evidence of anything, and a portable build cannot rest on "probably fine".
+            Err(why) => return Err(format!("{PORTABLE_ENV} is set, but {why}")),
+        }
+    } else {
+        return Err(format!(
+            "{PORTABLE_ENV} is set, but {} records no CMAKE_C_COMPILER, so nothing here can say what it compiles for.",
+            cache_path.display()
+        ));
+    }
+
+    if raised.is_empty() && above.is_empty() {
         return Ok(());
     }
-    Err(format!(
-        "{PORTABLE_ENV} is set, but {} does not describe a portable tree: {}.\n  \
+    if !raised.is_empty() {
+        return Err(format!(
+            "{PORTABLE_ENV} is set, but {} does not describe a portable tree: {}.\n  \
          A tree configured this way is compiled for one class of CPU — measured 2026-11-13 as a release asset \n  \
          full of VEX-encoded instructions that answered `Illegal instruction` on an x86-64 host without AVX. The \n  \
          portable floor is GGML_NATIVE=OFF **and** every GGML_<ISA> option OFF: llama.cpp's runtime dispatch lives \n  \
          in dynamic backend variants (`GGML_CPU_ALL_VARIANTS`, which needs `GGML_BACKEND_DL`), not in a static build.",
+            cache_path.display(),
+            raised.join(", ")
+        ));
+    }
+    Err(format!(
+        "{PORTABLE_ENV} is set, but {}'s C compiler still defines {} when handed this build's CMAKE_C_FLAGS \
+         ({:?}) — its own default target is above baseline x86-64 and `{}` did not outrank it.\n  A release asset is run by \
+         machines that did not build it: measured 2026-11-13, an asset built with every cmake option reading OFF answered \
+         `Illegal instruction`\n  on a host whose CPU flags stop at SSE4.2, because the compiler's default — not any option — \
+         decided its instruction set.",
         cache_path.display(),
-        raised.join(", ")
+        above.join(", "),
+        PORTABLE_MARCH_FLAG,
+        cache.get("CMAKE_C_FLAGS").map(String::as_str).unwrap_or("<unset>"),
     ))
+}
+
+/// The macros `compiler` predefines for C with `flags`, as a list of names.
+///
+/// `cc -dM -E -x c -` over empty input is the cheapest question that answers "what will this compile for": it reports the
+/// target the compiler settles on when told nothing, which no amount of reading option tables or `-D` lists reveals.
+fn predefined_macros(compiler: &str, flags: &str) -> Result<Vec<String>, String> {
+    let mut cmd = Command::new(compiler);
+    cmd.args(flags.split_whitespace())
+        .args(["-E", "-dM", "-x", "c", "-"]);
+    let output = cmd
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run {compiler} to ask what it compiles for: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{compiler} exited {} when asked what it compiles for",
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        // `#define __AVX2__ 1` — the name is the **second** token. Taking the third was caught by mutation, not by the
+        // portable build: a probe that collects the values instead of the names finds nothing forbidden in any compiler.
+        .filter(|line| line.starts_with("#define "))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(str::to_string)
+        .collect())
 }
 
 /// A posix-threaded mingw-w64 produces an exe that imports `libwinpthread-1.dll`, and that DLL is not on a
