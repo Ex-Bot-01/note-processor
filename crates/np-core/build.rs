@@ -624,13 +624,16 @@ fn configure(
     // an input only if something acts on it.
     let extras = match cross {
         Some(toolchain) => format!(
-            "toolchain={}\nGGML_NATIVE=OFF\nCMAKE_STATIC_LIBRARY_PREFIX=lib\n",
+            "toolchain={}\nCMAKE_STATIC_LIBRARY_PREFIX=lib\n",
             toolchain.display()
         ),
         None => String::new(),
     };
+    // `GGML_NATIVE=OFF` is stamped for **every** configure, not only a cross one, because it stopped being a
+    // cross-only fact on 2026-11-13 (see the argument below). A host cache configured while it was ON has to be
+    // seen as changed rather than certified fresh — which is what this line does for the machine upgrading.
     let wanted = format!(
-        "{}{}cmakelists-sha256={}\n",
+        "{}{}GGML_NATIVE=OFF\ncmakelists-sha256={}\n",
         pin.option_stamp(),
         extras,
         sha256_hex(
@@ -728,13 +731,18 @@ fn configure(
         "-B".to_string(),
         build_dir.display().to_string(),
     ];
+    // **The binary you are shipping is not going to run on the machine that built it.** `GGML_NATIVE` defaults to
+    // ON, which means `-march=native` — SIMD choices made by the CPU of whoever ran cmake, applied to every
+    // translation unit rather than only the kernels ggml dispatches at runtime. Measured 2026-11-13 on the first
+    // CI-built Linux asset (`np-0.4.0-x86_64-unknown-linux-gnu.tar.gz`, built on a hosted runner): 14,540 `%zmm`
+    // and 43,295 `%ymm` instructions in `np`, and `np --version` on an x86-64 host whose flags stop at SSE4.2
+    // answers `Illegal instruction (core dumped)` before it prints anything. Off, ggml compiles its per-ISA
+    // objects with their own target flags and picks between them from CPUID at run time, so an AVX-512 machine
+    // still gets the AVX-512 path and a plain x86-64 machine gets a binary that starts. Deliberately outside the
+    // pin's option set: this is a fact about who runs the build, not about the pinned tree.
+    args.push("-DGGML_NATIVE=OFF".to_string());
     if let Some(toolchain) = cross {
         args.push(format!("-DCMAKE_TOOLCHAIN_FILE={}", toolchain.display()));
-        // `GGML_NATIVE` defaults to ON, which means `-march=native`: measured **on the machine running cmake**.
-        // Left on across a cross build it produces a Windows binary whose SIMD paths were chosen by a Linux CPU,
-        // so it is switched off and ggml falls back to runtime dispatch. Deliberately outside the pin's option
-        // set: this is a fact about the target being built, not about the pinned tree.
-        args.push("-DGGML_NATIVE=OFF".to_string());
         // mingw gives a static library **no prefix**: the build tree came out as `ggml.a`, `ggml-cpu.a`,
         // `ggml-base.a`, `libllama.a` (measured 2026-11-08), and GNU ld only ever searches `lib<name>.a` for
         // `-l <name>`. Asking cmake for the Unix prefix keeps one archive spelling across both targets, so
@@ -757,6 +765,7 @@ fn configure(
     );
     run(cmake, &args, "configure")?;
     verify_options_understood(build_dir, pin)?;
+    require_portable_codegen(build_dir)?;
     if cross.is_some() {
         require_win32_threading(build_dir)?;
     }
@@ -1275,6 +1284,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{word:08x}"));
     }
     out
+}
+
+/// That the configured tree is not tuned to the CPU that configured it.
+///
+/// `-DGGML_NATIVE=OFF` above is an argument, and an argument is a claim. The cache is the fact: cmake records what
+/// the tree was configured with, so this reads it back — the same move [`require_win32_threading`] makes about
+/// threading, for the same reason. Without it, a pin edit, a cached configure or a future refactor that drops the
+/// argument produces a binary that works on the builder and dies with `SIGILL` somewhere else, which is a class of
+/// failure no test on the build machine can observe.
+fn require_portable_codegen(build_dir: &Path) -> Result<(), String> {
+    let cache = read_cache(&build_dir.join("CMakeCache.txt"));
+    match cache.get("GGML_NATIVE") {
+        Some(value) if value.eq_ignore_ascii_case("OFF") => Ok(()),
+        Some(value) => Err(format!(
+            "{} records GGML_NATIVE={value}, not OFF.\n  \
+             A tree configured that way is compiled `-march=native` against the CPU running cmake, which \n  \
+             measured 2026-11-13 as a release asset containing 14,540 AVX-512 instructions and refusing to start \n  \
+             on an older x86-64 host. Build the portable tree and let ggml dispatch on CPUID instead.",
+            build_dir.join("CMakeCache.txt").display()
+        )),
+        None => Err(format!(
+            "{} records no GGML_NATIVE, so this script cannot tell whether these archives were \n  \
+             compiled for the building machine's CPU. Upstream renamed or removed the option: check before \n  \
+             shipping an asset that may only run on machines like the runner that made it.",
+            build_dir.join("CMakeCache.txt").display()
+        )),
+    }
 }
 
 /// A posix-threaded mingw-w64 produces an exe that imports `libwinpthread-1.dll`, and that DLL is not on a

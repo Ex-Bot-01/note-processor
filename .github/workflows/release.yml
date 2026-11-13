@@ -66,6 +66,13 @@ jobs:
       # Run what the page will ship. The script proves llama.cpp's loader symbol is in the bytes; this proves the file
       # starts, prints its version, and answers a JSON-RPC pipe — the three things a release asset can get wrong that no
       # compile error reports (v0.1.0 shipped a binary with one subcommand, and F40 was an asset whose `np embed` refused).
+      # Each script writes its checksums to `<out>/SHA256SUMS.txt`, and `download-artifact --merge-multiple` flattens every
+      # artifact onto one directory — so two files with the same name arrive at the same path and the second silently replaces the
+      # first. Renaming here, at upload time, is the only point where the two can still be told apart: on `43499590986` the
+      # release job's own combine step ran over a directory that already held one file, and its coverage guard (added in the same
+      # commit as this comment) refused to publish a checksum list naming half the assets.
+      - name: Name the checksums after the asset they describe
+        run: mv dist/SHA256SUMS.txt dist/SHA256SUMS-linux-gnu.txt
       - name: Run the packaged binary
         run: |
           set -euo pipefail
@@ -213,6 +220,9 @@ jobs:
             echo "asset — 309 MB arrives only when a human runs \`np setup\` or \`np embed\`."
           } > dist/ABOUT-windows-gnu-cross.md
           cat dist/ABOUT-windows-gnu-cross.md
+      # See the Linux job's step of the same name: two `SHA256SUMS.txt` files cannot share a directory.
+      - name: Name the checksums after the asset they describe
+        run: mv dist/SHA256SUMS.txt dist/SHA256SUMS-windows-gnu-cross.txt
       - uses: actions/upload-artifact@v4
         with:
           name: asset-windows-gnu-cross
@@ -224,7 +234,11 @@ jobs:
     # Both assets must exist. A release that ships one of the two is a page whose notes describe a file nobody uploaded,
     # so `needs` (not `if: always()`) is what decides this.
     needs: [linux, windows-gnu-cross]
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish)
+    # **`== 'true'`, not a bare truth test.** A `workflow_dispatch` boolean input reaches an expression as the *string*
+    # `"false"`, and a non-empty string is true: on `43499590986` this job ran on a rehearsal dispatched with publish=false, and
+    # only the checksum coverage guard below stopped it reaching `gh release create`. A rehearsal that rehearses publishing is
+    # not a rehearsal, so the comparison is spelled out.
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -234,14 +248,12 @@ jobs:
           path: assets
           merge-multiple: true
 
-      # Both scripts write a `SHA256SUMS.txt` into their own output directory, and `merge-multiple` flattens the two
-      # downloads onto one path — so one of them would silently overwrite the other and the release would publish a
-      # checksum file that names only half the assets. Concatenated here, with the archives themselves left alone: a
-      # downloader verifies against one file that lists everything on the page.
+      # Two `SHA256SUMS-<asset>.txt` files, one page: concatenated into the single `SHA256SUMS.txt` a downloader is told to
+      # verify against, with the archives themselves left alone. The rename in each asset job is what makes this possible at all;
+      # this step only joins what arrived under distinct names.
       - name: Combine the checksums
         run: |
-          find assets -name SHA256SUMS.txt -print0 | xargs -0 cat > assets/SHA256SUMS.txt.combined
-          find assets -name SHA256SUMS.txt -delete
+          find assets -name 'SHA256SUMS-*.txt' -print0 | xargs -0 cat > assets/SHA256SUMS.txt.combined
           mv assets/SHA256SUMS.txt.combined assets/SHA256SUMS.txt
           sort assets/SHA256SUMS.txt
           # Every archive on the page must appear in it. A checksum file that names one asset and ships two is a

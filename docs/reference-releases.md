@@ -50,7 +50,12 @@ now names **eight** methods.
   narrow query narrow.
 
 Both assets for `v0.4.0` are built by CI on `ubuntu-latest`, by the two scripts named above, and each carries `np` (or `np.exe`),
-`LICENSE` and `THIRD_PARTY_NOTICES.md`. **No Windows-MSVC asset and no macOS asset exist**, and this is not a minutes decision:
+`LICENSE` and `THIRD_PARTY_NOTICES.md`. **They run on any x86-64 machine**: llama.cpp is configured with `GGML_NATIVE=OFF`, so ggml
+chooses its SIMD path from CPUID at run time instead of compiling for the CPU of whoever built it. That changed while cutting this
+release, because the first CI-built Linux asset turned out to contain 14,540 AVX-512 instructions and answered `Illegal instruction`
+on a machine whose flags stop at SSE4.2 — an asset tuned to the runner that made it. **An asset built before 2026-11-13 by
+`package-assets.sh` may carry that build machine's instruction set**; if it refuses to start on your machine, that is why, and
+rebuilding on your own machine fixes it. **No Windows-MSVC asset and no macOS asset exist**, and this is not a minutes decision:
 `crates/np-core/build.rs` compiles llama.cpp for Linux and for `x86_64-pc-windows-gnu` with a cmake toolchain file, and refuses every
 other target rather than meeting a linker error — "no platform claim without a build measured on it". A runtime-less macOS or MSVC binary
 would arrive under a name that matches the runtime-bearing ones, which is how `F40`'s trap worked. On those platforms build from source,
