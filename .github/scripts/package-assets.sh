@@ -65,6 +65,14 @@ if [ -n "$cache" ]; then
 else
   echo "note: no CMakeCache.txt found under target/$target/release/build — nothing linked llama.cpp?" >&2
 fi
+# The cache says what cmake *intended*; `compile_commands.json` says what the compiler was told. They can disagree — an option
+# declared after its last use, a `target_compile_options` that overrides `CMAKE_C_FLAGS` — and on 2026-11-13 we spent two
+# rehearsals trusting the former while an artifact disagreed with it. One object's command line is enough to see `-mavx2`.
+cc="$(dirname "$cache")/compile_commands.json"
+if [ -n "$cache" ] && [ -f "$cc" ]; then
+  { grep -o '"command": "[^"]*ggml-cpu[^"]*"' "$cc" | head -2 | tr ' ' '\n' | grep -E '^-m' | sort -u | tr '\n' ' '; echo; } \
+    | sed 's/^/arch flags on ggml-cpu objects:  /' || true
+fi
 built="target/$target/release/$binary"
 if command -v objdump >/dev/null 2>&1 && [ -f "$built" ]; then
   { objdump -d --section=.text "$built" 2>/dev/null | awk '
