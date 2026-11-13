@@ -12,7 +12,7 @@
 // gives: `mod common;` would compile it into two other binaries that never use it.
 mod capture;
 
-use capture::{case, Record};
+use capture::{case, quiet, Record};
 use np_core::config::{Config, EmbeddingProvider, EmbeddingsConfig};
 use np_core::db::{self, Db};
 use np_core::embed::{EmbedError, Embedder, Vector};
@@ -100,8 +100,12 @@ fn workspace(n: usize) -> Setup {
         _tmp: tmp,
         root,
     };
-    np_core::scan::scan(&setup.root, &setup.cfg(EmbeddingProvider::None))
-        .expect("test setup: first scan");
+    // Held through the gate on purpose: this scan reports `not-markdown`, `unchanged-content` and friends into the one
+    // shared list, and a case that happens to be measuring elsewhere would collect them as its own.
+    quiet(|| {
+        np_core::scan::scan(&setup.root, &setup.cfg(EmbeddingProvider::None))
+            .expect("test setup: first scan")
+    });
     setup
 }
 
@@ -523,7 +527,9 @@ fn a_skipped_note_says_which_rule_skipped_it() {
     fs::write(setup.root.join("note.md"), "# Note\n\nindexed once\n").expect("setup");
     fs::write(setup.root.join("diagram.png"), b"\x89PNG not really").expect("setup: an attachment");
     let cfg = setup.cfg(EmbeddingProvider::None);
-    np_core::scan::scan(&setup.root, &cfg).expect("test setup: first scan indexes the note");
+    quiet(|| {
+        np_core::scan::scan(&setup.root, &cfg).expect("test setup: first scan indexes the note")
+    });
 
     // A third note that this scan cannot read: written after the first pass and denied before the second, so its row
     // does not exist and the only thing a reader can learn is that this file was looked at and not indexed.
@@ -606,7 +612,7 @@ fn a_note_hidden_behind_an_unreadable_directory_names_its_path() {
     fs::create_dir_all(&deep).expect("setup: directory");
     fs::write(deep.join("note.md"), "# Deep\n\nindexed once\n").expect("setup");
     let cfg = setup.cfg(EmbeddingProvider::None);
-    np_core::scan::scan(&setup.root, &cfg).expect("test setup: index the note");
+    quiet(|| np_core::scan::scan(&setup.root, &cfg).expect("test setup: index the note"));
 
     let mode = fs::metadata(&deep)
         .expect("setup: stat")
@@ -763,4 +769,41 @@ fn assert_same_set(documented: &[&str], coded: &[&str], what: &str) {
         missing.is_empty() && invented.is_empty(),
         "{what} lists disagree.\n  undocumented (emitted, not in the manual): {missing:?}\n  invented (in the manual, never emitted): {invented:?}\n  manual: {documented:?}\n  code:   {coded:?}"
     );
+}
+
+/// The gate's contract, made unfalsifiable-by-removal: an emission made **outside** the gate during a case's window lands
+/// inside that window, and [`capture`] names it rather than letting it read as a duplicated rule.
+///
+/// This is the failure a hosted run produced on `4349629200`, where a case about a missing model artifact was killed by a
+/// `not-markdown` record for a `diagram.png` that only another case's fixture writes — an un-gated setup scan that happened
+/// to run while this case held the gate. It is asserted as a panic rather than written down as prose because the alternative
+/// is a comment nobody re-tests: delete [`capture::quiet`] from the fixture and every case in this binary becomes a coin
+/// flip, which is precisely the state this test refuses to let the file return to.
+///
+/// `case` clears the shared list on entry, so an emission made *before* a case opens its window cannot pollute it — which is
+/// why the emitting thread is joined inside the closure rather than before it, and why a nine-run local loop never once
+/// reproduced what the runner hit first time.
+#[test]
+#[should_panic(expected = "emitted by another thread")]
+fn an_emission_made_outside_the_gate_is_attributed_to_the_case_holding_it() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(&root).expect("test setup: workspace dir");
+    fs::write(root.join("note.md"), "# Note\n\nbody\n").expect("test setup: note");
+    fs::write(root.join("diagram.png"), b"\x89PNG not really").expect("test setup: attachment");
+    let cfg = np_core::config::Config {
+        data_dir: tmp.path().join("data"),
+        ..Default::default()
+    };
+
+    let (_value, _events) = case(|| {
+        // A scan on a thread of its own, joining before the window closes: the only shape in which an un-gated emission can
+        // be seen by this case at all.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                np_core::scan::scan(&root, &cfg).expect("this test: the emitting scan runs")
+            });
+        });
+        1u8
+    });
 }

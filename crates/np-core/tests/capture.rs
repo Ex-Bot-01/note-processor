@@ -22,6 +22,10 @@
 //! list, and its events surface as a duplicated rule in somebody else's assertion — which is what happened once with
 //! `not-produced`, counted twice by a case that emitted it exactly once. Every record therefore carries the thread that
 //! emitted it, and [`case`] fails loudly when a foreign one appears, naming the mistake and its fix.
+//!
+//! Which leaves **setup** work — a fixture's first scan, whose events nobody is asserting on. It emits just as loudly as the
+//! measured run, so it holds the gate too, through [`quiet`]. Without that a fixture's events land inside whichever case
+//! happens to be gated, and the failure shows up in a file that never touched those bytes.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::field::{Field, Visit};
@@ -139,6 +143,38 @@ fn subscriber() -> Arc<Capture> {
             capture
         })
         .clone()
+}
+
+/// Run work whose emissions nobody is measuring — a fixture indexing itself, a warm-up pass — with the gate held, and throw
+/// the events away.
+///
+/// This is not tidiness. An un-gated emit lands in the one shared list while some other case is draining it, and that case's
+/// assertion about "nothing else was emitted" fails with a record for files it never created: measured on a hosted run on
+/// 2026-11-13, where `an_absent_artifact_is_reported_with_the_file_it_could_not_open` died on a `not-markdown` line about a
+/// `diagram.png` that only another case's fixture writes. Anything that emits holds the gate, measuring or not.
+///
+/// Nothing running **inside** a measured window may call this: the gate is not reentrant, so a thread spawned by a case and
+/// joined before that case returns would wait for a lock its own case is holding. Setup runs outside windows — that is what
+/// makes it setup.
+pub fn quiet<T>(run: impl FnOnce() -> T) -> T {
+    let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let capture = subscriber();
+    {
+        // Cleared on entry as well as exit, so an event emitted before this case's setup cannot be mistaken for one its
+        // teardown produced.
+        capture
+            .events
+            .lock()
+            .expect("diagnostics capture: no case panics while holding it")
+            .clear();
+    }
+    let value = run();
+    capture
+        .events
+        .lock()
+        .expect("diagnostics capture: no case panics while holding it")
+        .clear();
+    value
 }
 
 /// Run `run` alone and return its value with every event it emitted, oldest first.
