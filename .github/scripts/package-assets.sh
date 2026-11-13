@@ -94,6 +94,22 @@ if [ -n "${NP_LLAMA_PORTABLE:-0}" ] && [ "$NP_LLAMA_PORTABLE" != "0" ] && [ -n "
   exit 1
 fi
 
+# Everything cmake was told, not only the keys this script enforces: on 2026-11-13 the enforced eight read OFF and the artifact
+# still ran only on AVX machines, so whatever turned the code is a key nobody thought to name. `GGML_CPU_ALL_VARIANTS` and its
+# friends are exactly that kind of key — they compile extra ISA-specific objects rather than flagging the ordinary ones.
+if [ -n "$cache" ]; then
+  { grep -E '^(GGML|LLAMA)_[A-Z0-9_]+:(BOOL|STRING)=' "$cache" | sort; } | tr '\n' ' ' | fold -s -w 100 | sed 's/^/  /'; echo
+fi
+
+# **Which half of the binary carries the wide instructions.** Sum the census over the cmake objects and compare it to the linked
+# program: if the objects account for the difference, an option is at fault; if they do not, the Rust half is, and no amount of
+# `-D` here will move it. Three rehearsals of changing one side and watching the count sit still is what this spares the next
+# person. (Rust code shows up only in the total, which is why both numbers print.)
+if command -v objdump >/dev/null 2>&1 && [ -n "$cache" ]; then
+  { find "$(dirname "$cache")" -name '*.o' -print0 2>/dev/null | xargs -0 -r objdump -d 2>/dev/null | awk '
+      /%ymm/ || /%zmm/ { n++ } END { printf "codegen  wide-vector instructions inside llama.cpp objects: %d\n", n + 0 }'; } || true
+fi
+
 built="target/$target/release/$binary"
 if command -v objdump >/dev/null 2>&1 && [ -f "$built" ]; then
   { objdump -d --section=.text "$built" 2>/dev/null | awk '
