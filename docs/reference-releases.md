@@ -95,6 +95,11 @@ other target rather than meeting a linker error — "no platform claim without a
 would arrive under a name that matches the runtime-bearing ones, which is how `F40`'s trap worked. On those platforms build from source,
 with or without `--features local-model`.
 
+**One caveat specific to `v0.4.0`'s page**: the `SHA256SUMS.txt` CI first uploaded listed `np.exe`, a file that lives inside the zip, so
+`sha256sum -c SHA256SUMS.txt` printed `np.exe: FAILED open or read` next to two correct digests. Corrected the same day — the file now
+covers exactly what the page hands you, and the exe's digest moved to `ABOUT-windows-gnu-cross.md`. Both archives are untouched, and
+`.github/scripts/cross-build-windows.sh` no longer writes that line; the publish job now checks checksum coverage in both directions.
+
 **Previous release: `v0.3.1`** — `np serve` grew opt-in progress notifications (`locking`, `resolving`, `indexing`, `fetching` with byte
 counters, `embedding`, `writing`) and the `status.get` method; four defects an independent review found are listed in that release's notes.
 Its assets were packaged by hand on Linux, the Windows one cross-built — the last release whose files CI did not build.
