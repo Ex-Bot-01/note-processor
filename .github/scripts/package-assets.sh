@@ -114,7 +114,12 @@ if command -v objdump >/dev/null 2>&1 && [ -n "$cache" ]; then
   # **What the compiler assumes when nothing tells it otherwise.** Everything above this line reads OFF and every `-D` is
   # accounted for, yet these files carry AVX on a runner and none in a local build with the same pin — which leaves the default
   # target of the compiler itself, set where no build log looks: how `cc` was configured. `-Q --help=target` prints it.
-  { "${CC:-cc}" -Q --help=target 2>/dev/null | grep -E '^\s+-m(arch|tune)=' | sed 's/^/  default /'; } || true
+  # What the compiler assumes with no flags at all, read from the macros it predefines — `__AVX2__` present here means the
+  # compiler's *default* target is above the baseline and every object in the tree will be, however the options are spelled.
+  { echo | "${CC:-cc}" -dM -E -x c - 2>/dev/null | grep -oE '__[A-Z0-9_]+__' | grep -E '^__(SSE[0-9_]*|AVX[0-9A-Z_]*|FMA|F16C|BMI[0-9]*)__$' | sort | tr '\n' ' ' | sed 's/^/  cc predefined: /; s/$/\n/'; } || true
+  # The build environment a runner image may have set before this script started — cmake honours `CMAKE_TOOLCHAIN_FILE` from the
+  # environment without being told, and a toolchain in an image can carry `-march=` that no line of ours wrote.
+  { env | grep -E '^(CMAKE_|CC=|CXX=|CFLAGS|CXXFLAGS|LDFLAGS|RUST|CARGO_)' | sort | sed 's/^/  env /'; } || true
   # And the flags actually handed to each translation unit, read out of the JSON rather than grepped: cmake writes either
   # `"command"` or `"arguments"` depending on its own version, and a `grep` that matches neither prints an empty line — which
   # reads exactly like "no arch flags", as it did here for two rehearsals. A silent probe is worse than no probe.
@@ -130,6 +135,19 @@ for e in entries:
     flags.update(t for t in cmd.split() if t.startswith("-m"))
 print(f"  {len(entries)} translation units; -m flags in use: " + (", ".join(sorted(flags)) or "none"))
 PYCHK
+  } || true
+  # One command line, whole. Every summary above it has now been wrong once: a token filter that matched nothing prints like a
+  # clean build, and an option table printed nothing at all on the runner while printing fine locally. The literal argv for the
+  # file carrying the most wide instructions cannot misreport.
+  { python3 - "$cc" <<'PYCMD'
+import json, sys
+entries = json.load(open(sys.argv[1]))
+for e in entries:
+    cmd = e.get("command") or " ".join(e.get("arguments", []))
+    if "ggml-quants.c" in cmd:
+        print("  one command, verbatim:\n    " + cmd)
+        break
+PYCMD
   } || true
   { echo "compilers   cc=$(command -v "${CC:-cc}") cxx=$(command -v "${CXX:-c++}") cmake=$(command -v "${CMAKE:-cmake}")"; } || true
   { echo "flags       CFLAGS=${CFLAGS-<unset>} CXXFLAGS=${CXXFLAGS-<unset>}" \
