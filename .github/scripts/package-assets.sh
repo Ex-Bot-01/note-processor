@@ -106,8 +106,15 @@ fi
 # `-D` here will move it. Three rehearsals of changing one side and watching the count sit still is what this spares the next
 # person. (Rust code shows up only in the total, which is why both numbers print.)
 if command -v objdump >/dev/null 2>&1 && [ -n "$cache" ]; then
-  { find "$(dirname "$cache")" -name '*.o' -print0 2>/dev/null | xargs -0 -r objdump -d 2>/dev/null | awk '
-      /%ymm/ || /%zmm/ { n++ } END { printf "codegen  wide-vector instructions inside llama.cpp objects: %d\n", n + 0 }'; } || true
+  # Per file, not a sum: the sum said "the C++ half", the eight enforced options said "nothing asked for AVX", and only one of
+  # those two can be true. The file that carries them names the option, and its command line names what the compiler was told.
+  { find "$(dirname "$cache")" -name '*.o' -print0 2>/dev/null \
+      | xargs -0 -r -I{} sh -c 'printf "%s %s\n" "$(objdump -d "{}" 2>/dev/null | grep -cE "%ymm|%zmm")" "{}"' \
+      | sort -rn | awk '$1 > 0' | head -10 | sed "s|$(dirname "$cache")/||; s/^/  /"; } || true
+  { echo "compilers   cc=$(command -v "${CC:-cc}") cxx=$(command -v "${CXX:-c++}") cmake=$(command -v "${CMAKE:-cmake}")"; } || true
+  { echo "flags       CFLAGS=${CFLAGS-<unset>} CXXFLAGS=${CXXFLAGS-<unset>}" \
+             "RUSTFLAGS=${RUSTFLAGS-<unset>} CCACHE=${CCACHE:-<unset>}"; } || true
+  "${CC:-cc}" --version 2>/dev/null | head -1 | sed 's/^/  cc version  /' || true
 fi
 
 built="target/$target/release/$binary"
