@@ -111,6 +111,14 @@ rustup target list --installed 2>/dev/null | grep -qx "$target" || rustup target
 export NP_LLAMA_PORTABLE="${NP_LLAMA_PORTABLE-1}"
 echo "codegen  NP_LLAMA_PORTABLE=$NP_LLAMA_PORTABLE (baseline x86-64; checked against cmake's cache by build.rs)"
 
+# The Rust half of the same floor. A cross target already defaults to plain x86-64, but this asset is built on a machine whose
+# `RUSTFLAGS` may say otherwise — and 2026-11-13 measured exactly that on the Linux sibling: two assets with identical cmake
+# caches, one with nine times the AVX in it. State the floor instead of inheriting the host's.
+if [ "${NP_LLAMA_PORTABLE:-0}" != "0" ]; then
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=x86-64"
+  echo "codegen  RUSTFLAGS=$RUSTFLAGS"
+fi
+
 echo "build    cargo build --release --locked -p np-cli --features local-model,fetch --target $target"
 cargo build --release --locked -p np-cli --features local-model,fetch --target "$target"
 

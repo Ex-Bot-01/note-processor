@@ -47,6 +47,16 @@ fi
 export NP_LLAMA_PORTABLE="${NP_LLAMA_PORTABLE-1}"
 echo "codegen  NP_LLAMA_PORTABLE=$NP_LLAMA_PORTABLE (1 = baseline x86-64, runs on machines other than this one)"
 
+# **The Rust half of the floor, too.** `NP_LLAMA_PORTABLE=1` only speaks to llama.cpp; rustc takes its instruction set from
+# `RUSTFLAGS`, and a runner's default is not this project's promise. Measured 2026-11-13: two CI assets whose cmake caches both
+# read `GGML_AVX2=OFF` and whose ggml objects carried no `-m` flag at all, yet one held 46,358 AVX instructions against a local
+# build's 4,940 — the difference is Rust code compiled for a wider CPU than the one that will run it. So the release path states
+# the floor to both halves: `-C target-cpu=x86-64` here, `GGML_NATIVE=OFF` plus every `GGML_<ISA>` off in `build.rs`.
+if [ "${NP_LLAMA_PORTABLE:-0}" != "0" ]; then
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=x86-64"
+  echo "codegen  RUSTFLAGS=$RUSTFLAGS"
+fi
+
 cargo build --release --locked -p np-cli --features local-model,fetch --target "$target"
 
 # **Say what the binary was actually compiled for.** `build.rs` refuses a portable build whose cmake cache disagrees, so a
@@ -73,6 +83,17 @@ if [ -n "$cache" ] && [ -f "$cc" ]; then
   { grep -o '"command": "[^"]*ggml-cpu[^"]*"' "$cc" | head -2 | tr ' ' '\n' | grep -E '^-m' | sort -u | tr '\n' ' '; echo; } \
     | sed 's/^/arch flags on ggml-cpu objects:  /' || true
 fi
+# And the claim, checked rather than printed: a baseline build must not report AVX among the features rustc assumed. This is the
+# half that `build.rs`'s cmake-cache check cannot see, and it is a config query rather than an instruction count — counts move
+# with dependency versions (crates carry runtime-dispatched AVX2 of their own inside `#[target_feature]` functions), the feature
+# list does not.
+features=$(rustc --print cfg --target "$target" ${RUSTFLAGS:+$RUSTFLAGS} 2>/dev/null | grep -E 'target_feature="avx' | sort -u || true)
+if [ -n "${NP_LLAMA_PORTABLE:-0}" ] && [ "$NP_LLAMA_PORTABLE" != "0" ] && [ -n "$features" ]; then
+  { echo "portable build refused: rustc assumes these for every crate it compiles:"; sed 's/^/  /' <<<"$features"; \
+    echo "the asset would not start on a pre-AVX machine, which is what \$NP_LLAMA_PORTABLE exists to prevent."; } >&2
+  exit 1
+fi
+
 built="target/$target/release/$binary"
 if command -v objdump >/dev/null 2>&1 && [ -f "$built" ]; then
   { objdump -d --section=.text "$built" 2>/dev/null | awk '
