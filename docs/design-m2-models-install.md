@@ -157,7 +157,14 @@ subdirectory is reported as one rather than recursed; unclaimed entries never ch
 **Machine-readable output is pinned here, not left to the implementer.** `--json` emits one object whose key set is
 identical for every state — per row `{ "id", "dim", "sha256", "prefix_doc", "prefix_query", "installed_at", "state" }`,
 plus `"unclaimed": [...]`, plus `"models_dir_error"` when listing fails, plus — since R7a, on the authority of
-`design-m2-local-embeddings.md` §12 rule 3 — `"fetching": [...]`, one entry per recognised marker. **The key set is a
+`design-m2-local-embeddings.md` §12 rule 3 — `"fetching": [...]`, one entry per recognised marker, plus — since the
+issue-#3 round — `"pinned": [...]`, one entry `{ "id", "bytes_total", "members" }` for the configured id **this build**
+pins, empty when none is named or the named id is unpinned. It answers "what would a fetch cost?" from the pin table and
+nothing else: no stat, no row, no transport announcement (§12 rule 12's reason for refusing `Content-Length` applies
+just as hard to a number quoted *before* the transfer). It is the build's plan (`pins::plan_size`, the sum the terminal
+consent prompt prints), **not** §12 rule 6's preflight total (`pins::total_size`, every member of the id): on a text-only
+build those are 309,855,456 and 864,676,512 bytes, and quoting the second in a consent sentence over-promises a transfer
+that build will never make. **The key set is a
 sorted-set pin, not a byte-order pin**: `serde_json` is built without `preserve_order`, so a document prints its keys
 alphabetically and no consumer may read meaning in their order; the order that is real and pinned is the text channel's. Install's three outcomes are the strings
 `installed`, `already installed`, `restored`, in that same `state` field. `list --json` wraps those rows in a top-level `"models"` array;

@@ -71,7 +71,7 @@ can talk to a server it cannot configure still deserves answers.
 | `search` | `workspace`, `query`, `limit?`, `mode?` (`keyword`\|`semantic`\|`hybrid`) | the same document as `np search --json` | `search_document` | `-32602` missing/unknown key; `-32000` workspace unreadable |
 | `scan` | `workspace` | the same report as `np scan --json` | `ScanReport` | `-32602`; `-32000` |
 | `embed` | `workspace` | the same report as `np embed --json` | `embed_report` | `-32602`; `-32000` (including a build without the inference feature) |
-| `models.list` | `workspace` | installed-artifact rows | `listing_json`, the CLI's own builder | `-32602` |
+| `models.list` | `workspace` | `{models, fetching, unclaimed, pinned, models_dir_error}` — installed-artifact rows, any fetch in flight, and what a fetch **would** cost before one starts | `listing_json`, the CLI's own builder | `-32602` |
 | `status.get` | `workspace` | `{last, fetch_markers, running}` | its own builder | `-32602` |
 | `shutdown` | none | `{protocol}` echoed, then the loop ends | its own builder | — |
 

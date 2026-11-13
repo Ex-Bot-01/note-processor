@@ -1141,6 +1141,73 @@ fn status_get_says_when_this_workspace_was_last_scanned() {
     other.finish();
 }
 
+/// **"About N MB, into `<data_dir>`" — answered before a byte moves** (issue **#3**).
+///
+/// The app that asked for it needs to *say the price* before asking permission to download, and `models.list` was the
+/// only read it made that could have known: the id and the directory were already there, and only N was missing. So this
+/// is the request shape from the report, verbatim — one `models.list` against a workspace with nothing installed — plus
+/// the two properties that make it usable as a pre-flight question rather than a post-mortem: it answers with no
+/// artifact and no scan on disk, and answering creates nothing.
+#[test]
+fn models_list_prices_a_fetch_before_anything_starts() {
+    let mut server = Server::new();
+    // A config that names the pinned id and nothing else — no provider, so no runtime is implicated in a price.
+    fs::create_dir_all(server._tmp.path().join("config").join("note-processor"))
+        .expect("test setup: config package dir");
+    fs::write(
+        server
+            ._tmp
+            .path()
+            .join("config")
+            .join("note-processor")
+            .join("config.toml"),
+        "[embeddings]\nmodel = \"embeddinggemma-2\"\n",
+    )
+    .expect("test setup: write config");
+
+    let workspace = server.root.display().to_string();
+    let listing = server.result("models.list", json!({"workspace": workspace}));
+
+    assert_eq!(
+        listing["models"].as_array().map(Vec::len),
+        Some(0),
+        "nothing is installed in this vault: {listing}"
+    );
+    let pinned = listing["pinned"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("`pinned` is an array on every state: {listing}"));
+    assert_eq!(pinned.len(), 1, "{pinned:?}");
+    assert_eq!(pinned[0]["id"], "embeddinggemma-2", "{pinned:?}");
+    assert_eq!(
+        pinned[0]["bytes_total"].as_u64(),
+        Some(np_core::pins::plan_size("embeddinggemma-2")),
+        "the pinned size, from the table this build would fetch out of: {pinned:?}"
+    );
+    assert!(
+        pinned[0]["members"]
+            .as_array()
+            .is_some_and(|members| !members.is_empty()),
+        "a price with no line items is how a surprise download comes back: {pinned:?}"
+    );
+
+    // **Asking twice answers the same way and writes nothing extra.** Stated at exactly the strength the code has:
+    // `models.list` takes no write lock and installs nothing, but it *does* open the workspace database to read its rows,
+    // so the first call in a fresh data dir creates that file (as `np models list` has always done — see issue #3's
+    // comment for why the new key itself needs no database at all). What this pins is that the price question is not a
+    // second writer: one read, no mutation, and an embed running elsewhere never has to wait for it.
+    let data_dir = server.data_dir();
+    let before = listing_of(&data_dir);
+    let again = server.result("models.list", json!({"workspace": workspace}));
+    assert_eq!(again["pinned"], listing["pinned"], "stable across asks");
+    assert_eq!(
+        listing_of(&data_dir),
+        before,
+        "a price question wrote into the data dir"
+    );
+    server.finish();
+}
+
 /// **One folder is one workspace, whichever separator its caller left on** (issue **#4**).
 ///
 /// Reproduced against `np 0.3.1` by the client that reported it: `/vault` answered `unchanged: 16`, then

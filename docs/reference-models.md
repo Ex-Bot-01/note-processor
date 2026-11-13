@@ -91,6 +91,25 @@ embeddinggemma-2  present  dim 768  sha256 2188ac1deca4  installed_at 1793893791
 unclaimed  0
 ```
 
+`--json` adds a section beside those rows that answers a question asked **before** any of this exists: `pinned`, what a
+fetch would transfer for the id your config names — `{"id", "bytes_total", "members"}` (**issue #3**). It is there so an
+application can write *"this needs `embeddinggemma-2`, about 295 MiB, into `<data_dir>`"* and ask, instead of starting a
+transfer to discover its length or hardcoding a number that becomes a lie the day the pin moves. Three properties worth
+knowing, because each is a choice:
+
+- **the bytes are the pin's**, never a transport's `Content-Length` — §12 rule 12 refuses an announced length while a
+  download is running for good reason, and a number quoted *before* the download has fewer excuses; an unannounced size
+  is unknown to HTTP and known to this table;
+- **it is this build's plan, not the whole pin table** — `bytes_total` sums what this binary would volunteer, which is
+  the primary artifact on a text-only build (309,855,456 bytes) and both halves on a `vision` build (864,676,512). The
+  disk preflight's number (`np_core::pins::total_size`, always every member) is the second figure; quoting it in a
+  consent sentence would over-promise a transfer this build will never make. The terminal prompt in `np setup` adds up
+  the same plan, so one machine gives one price;
+- **it costs nothing to ask** — no stat, no row, no lock, and it survives even the directory-level failure that leaves
+  `models_dir_error` set with no rows at all. Whether *these* bytes are already on disk is `state`, not this: read both
+  keys rather than making one mean two things. An empty list means your config names no id **this build pins** — a model
+  you installed yourself has no price to name, and borrowing another model's number is the lie the section exists to avoid.
+
 `state` is `present`, or `missing` when the row exists and its file does not — a deleted artifact is reported rather than
 forgotten. `files` names the model's **other** members (a projector, fetched or installed offline) and whether each file is
 there; it appears only when there is one to name, and `--json` carries the same set as `members`

@@ -273,3 +273,37 @@ pub fn pinned_member(id: &str, member: &str) -> Option<&'static PinnedModel> {
 pub fn total_size(id: &str) -> u64 {
     pinned(id).map(|entry| entry.size_bytes).sum()
 }
+
+/// What a fetch of `id` on **this build** would transfer: the members [`members_for_build`] volunteers, in [`PINNED`]
+/// order (**issue #3**).
+///
+/// This is not [`total_size`], and the difference is the whole reason both exist. Rule 6's preflight asks what the disk
+/// has to be able to hold, which is every member the table names for the id; a person deciding whether to say "yes" to
+/// a download asks what *this binary* will ask for — the primary artifact alone on a text-only build, because it has no
+/// code that loads the projector and 554 MB of unused bytes is not a cost worth being asked about. Today the two answers
+/// are 309,855,456 and 864,676,512 for the one id this build pins; quote the wrong one and either the consent prompt
+/// over-promises a transfer that will not happen or the preflight reserves less than the write needs.
+///
+/// An id this build does not pin plans nothing, which is [`pinned`]'s empty answer spelled as an empty plan: a caller
+/// printing a size should not have to handle an `Option` to say "nothing here would be fetched".
+///
+/// The order is the table's, so a client that shows a plan and then watches [`crate::progress`]'s per-member lines sees
+/// the same sequence in both places — which matters because a plan is only useful if it can be recognised later.
+pub fn fetch_plan(id: &str) -> Vec<&'static PinnedModel> {
+    let members = members_for_build();
+    pinned(id)
+        .filter(move |entry| members.contains(&entry.member))
+        .collect()
+}
+
+/// Bytes [`fetch_plan`] adds up — the number to put in front of someone **before** asking to move them.
+///
+/// Pinned bytes, never a transport's `Content-Length` (**§12 rule 12**'s rule, which is why the size on a `fetching`
+/// progress line comes from the same table and why this function can answer at all: an unannounced length is unknown
+/// to a transport and known to the pin).
+pub fn plan_size(id: &str) -> u64 {
+    fetch_plan(id)
+        .iter()
+        .map(|entry| entry.size_bytes)
+        .sum::<u64>()
+}

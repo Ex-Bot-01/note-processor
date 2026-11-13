@@ -604,14 +604,22 @@ fn models_list(params: &Value) -> Result<Value, ServeError> {
     let config = crate::load_config().map_err(refused)?;
     let db = crate::workspace_db(&config, &workspace).map_err(refused)?;
     Ok(match np_core::models::list(&db, &config, &workspace) {
-        Ok(listing) => {
-            crate::listing_json(&listing.models, &listing.fetching, &listing.unclaimed, None)
-        }
+        Ok(listing) => crate::listing_json(
+            &listing.models,
+            &listing.fetching,
+            &listing.unclaimed,
+            &crate::pinned_json(&config),
+            None,
+        ),
         // A directory we cannot read is a state the document already knows how to carry (`models_dir_error`), so it stays a result rather than
         // becoming a fault: `np models list --json` prints the same object and exits non-zero, and exit codes do not exist here.
-        Err(err @ np_core::models::ModelError::ModelsDir { .. }) => {
-            crate::listing_json(&[], &[], &[], Some(&err.to_string()))
-        }
+        Err(err @ np_core::models::ModelError::ModelsDir { .. }) => crate::listing_json(
+            &[],
+            &[],
+            &[],
+            &crate::pinned_json(&config),
+            Some(&err.to_string()),
+        ),
         Err(err) => return Err(refused(err)),
     })
 }

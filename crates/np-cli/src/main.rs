@@ -1031,11 +1031,9 @@ fn consent_to_fetch(
     let Some(id) = pending_pinned_fetch(cfg, workspace)? else {
         return Ok(true);
     };
-    let bytes: u64 = np_core::pins::members_for_build()
-        .iter()
-        .filter_map(|name| np_core::pins::pinned_member(&id, name))
-        .map(|pin| pin.size_bytes)
-        .sum();
+    // The plan's own sum, from the table — the same number `models list --json` publishes under `pinned`, so a terminal
+    // prompt and a GUI on one machine cannot quote two prices for one download (#3).
+    let bytes: u64 = np_core::pins::plan_size(&id);
     emit(&format!(
         "about to fetch {id} ({}) from {}",
         size_human(bytes),
@@ -2507,6 +2505,7 @@ fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
                     &listing.models,
                     &listing.fetching,
                     &listing.unclaimed,
+                    &pinned_json(&config),
                     None,
                 ));
             } else {
@@ -2516,7 +2515,15 @@ fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
         }
         Err(err @ ModelError::ModelsDir { .. }) => {
             if json {
-                emit_json(&listing_json(&[], &[], &[], Some(&err.to_string())));
+                // The plan still goes out beside the failure: it is a fact about this build and this config, and the
+                // person whose artifact directory is unreadable is exactly the one wondering what a re-fetch costs.
+                emit_json(&listing_json(
+                    &[],
+                    &[],
+                    &[],
+                    &pinned_json(&config),
+                    Some(&err.to_string()),
+                ));
             }
             Err(err.into())
         }
@@ -2539,6 +2546,7 @@ fn listing_json(
     models: &[ListedModel],
     fetching: &[FetchEntry],
     unclaimed: &[Unclaimed],
+    pinned: &[Value],
     models_dir_error: Option<&str>,
 ) -> Value {
     json!({
@@ -2550,11 +2558,53 @@ fn listing_json(
             .iter()
             .map(|entry| json!({ "name": entry.name, "kind": unclaimed_kind(entry.kind) }))
             .collect::<Vec<Value>>(),
+        // **What a fetch would cost before it starts** (**#3**), beside the sections that say what is already here.
+        // Empty whenever no pinned id is configured — an absent key would cost every reader a branch, and a `null`
+        // would make "no model named" and "no size known" one answer.
+        "pinned": pinned,
         // Present and null whenever the directory could be listed: suppressing the key on the good path would
         // cost every reader a missing-key branch to answer a question `null` already answers (the precedent is
         // `scan --json`'s `upgrade_orphans`).
         "models_dir_error": models_dir_error,
     })
+}
+
+/// The `pinned` section of the listing document: **what this build would fetch for the workspace's configured model**,
+/// priced from the pin table (**#3**).
+///
+/// Zero or one entry today, because `[embeddings] model` names one id — a list so that a build which pins a second
+/// configurable model publishes it without a schema change.
+///
+/// Three properties the caller depends on, each of which is a choice rather than an accident:
+///
+/// * **Pinned bytes, never a transport's `Content-Length`** — §12 rule 12's rule for progress, extended to the question
+///   asked *before* a transfer. A chunked response announces nothing; this number is in the binary.
+/// * **The build's plan, not the whole table** — [`np_core::pins::plan_size`] sums what this binary volunteers, which is
+///   also what the terminal consent prompt prints, so one machine gives one price. `total_size` (every pinned member,
+///   864,676,512 today) is §12 rule 6's disk preflight and would over-quote a text-only build by 554 MB.
+/// * **Independent of the filesystem** — no stat, no row, no lock: it answers for a workspace with nothing installed,
+///   for one whose artifact directory cannot be listed, and while an embed is running. Whether *these* bytes are
+///   already present is `models[].state`, and a client that wants "download needed?" reads both keys rather than having
+///   this one mean two things.
+fn pinned_json(config: &Config) -> Vec<Value> {
+    let Some(id) = config.embeddings.model.as_deref() else {
+        return Vec::new();
+    };
+    let plan = np_core::pins::fetch_plan(id);
+    if plan.is_empty() {
+        // Configured, but this build pins no member of it: an id from `np models install` has no price to name,
+        // and borrowing another model's number would be the exact lie this section exists to prevent.
+        return Vec::new();
+    }
+    std::iter::once(json!({
+        "id": id,
+        "bytes_total": plan.iter().map(|entry| entry.size_bytes).sum::<u64>(),
+        // The member roles in fetch order, so a client can line this plan up with the per-member `fetching` progress
+        // lines it will see later. File names stay out: they are where an origin lives, and §12 rule 8 keeps that
+        // shape out of reports.
+        "members": plan.iter().map(|entry| entry.member).collect::<Vec<&str>>(),
+    }))
+    .collect()
 }
 
 /// One row under `--json`, with exactly the eight keys §3 pins — and the full digest, which the text column

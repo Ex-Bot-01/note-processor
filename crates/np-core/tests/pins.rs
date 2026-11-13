@@ -370,3 +370,47 @@ fn the_pinned_digest_is_the_real_artifacts_digest_when_the_runner_has_one() {
         .expect("writing to a digest cannot fail");
     assert_eq!(stream.finish_hex(), main.sha256);
 }
+
+/// **What a fetch would cost on *this* build** (issue **#3**).
+///
+/// [`total_size`] answers §12 rule 6's preflight — every member the table holds for an id, because the disk has to be
+/// able to hold whatever *could* be asked for. The number a person needs before agreeing to a download is the other
+/// one: what this binary volunteers, which is [`members_for_build`] — the primary artifact alone on a text-only
+/// build, both halves on a `vision` build, because 554 MB of projector nobody can load is not a cost to ask about.
+///
+/// The two numbers differ by design and both are stated here: today they differ by 554,821,056 bytes on every row in
+/// the table, and a test that pinned only one of them would let the other drift unnoticed.
+#[test]
+fn fetch_plan_is_what_this_build_volunteers_and_sums_to_its_own_number() {
+    let plan = np_core::pins::fetch_plan("embeddinggemma-2");
+    let names: Vec<&str> = plan.iter().map(|entry| entry.member).collect();
+    assert_eq!(
+        names,
+        members_for_build(),
+        "the plan is the build's member set, in table order: {names:?}"
+    );
+
+    let sum: u64 = plan.iter().map(|entry| entry.size_bytes).sum();
+    assert_eq!(
+        np_core::pins::plan_size("embeddinggemma-2"),
+        sum,
+        "the size is the plan's own members summed, never a constant beside them"
+    );
+
+    // The two questions stay two answers. A `vision` build volunteers both halves, so there the plan *is* the whole
+    // table and the sums agree; a text build pays 309,855,456 of the 864,676,512 the preflight reserves.
+    if members_for_build().contains(&np_core::pins::MMPROJ_MEMBER) {
+        assert_eq!(sum, total_size("embeddinggemma-2"), "{names:?}");
+    } else {
+        assert_eq!(
+            (sum, total_size("embeddinggemma-2")),
+            (309_855_456, 864_676_512),
+            "the size a text-only build quotes is its own transfer, not §5's 864.7 MB pair"
+        );
+    }
+
+    // An id this build does not pin plans nothing and costs nothing — the same `None`-shaped answer [`pinned`] gives,
+    // spelled as an empty plan so a caller never has to branch on an option to print a size.
+    assert!(np_core::pins::fetch_plan("some-other-model").is_empty());
+    assert_eq!(np_core::pins::plan_size("some-other-model"), 0);
+}

@@ -249,7 +249,17 @@ fn keys(value: &serde_json::Value) -> Vec<String> {
 /// all four verdicts (a first start has no row at all, and a present row can be re-fetching). Adding the key had to
 /// fail this fence — three cases did, naming the new key on the left of every diff — and updating it here, with the
 /// design section named as the authority, is the whole point of pinning a key set instead of printing one.
-const LIST_KEYS: &[&str] = &["fetching", "models", "models_dir_error", "unclaimed"];
+const LIST_KEYS: &[&str] = &[
+    "fetching",
+    "models",
+    "models_dir_error",
+    "pinned",
+    "unclaimed",
+];
+
+/// The per-entry key set of the **`pinned`** section (**issue #3**): what a fetch of the workspace's configured model
+/// would cost, in bytes this build pinned, named by the members it would write.
+const PINNED_KEYS: &[&str] = &["bytes_total", "id", "members"];
 
 /// The pinned per-row key set of `np models list --json` (§3), sorted for [`keys`].
 const ROW_KEYS: &[&str] = &[
@@ -2252,4 +2262,151 @@ fn an_unpinned_id_is_never_told_it_disagrees_with_a_pin() {
     );
     let doc: serde_json::Value = serde_json::from_str(&installed.stdout()).expect("JSON");
     assert!(doc.get("prefix_drift").is_none(), "{doc}");
+}
+
+/// `[embeddings] model` naming `id`, and nothing else — no provider, no `[models]` key, no fetch of any kind.
+///
+/// The F38 section's own [`embeddings_config`] also sets `provider = "local-model"`, which is what a *fetch* case needs
+/// and what this question does not: **"what would a download cost" is asked before any provider is chosen**, so the
+/// listing has to answer it in a default build with `provider = "none"` too. Keeping the two helpers apart is what keeps
+/// that claim checkable on the rows without the runtime.
+/// Write `[embeddings] model = "<id>"` into this scratch's own config dir, and nothing else — no provider, no
+/// `[models]` key, no fetch of any kind.
+///
+/// Deliberately **not** [`Scratch::write_user_config`], which lives in the `#[cfg(feature = "fetch")]` section with its
+/// callers: **"what would a download cost" is asked before any provider is chosen and before any transport is compiled
+/// in**, so the listing has to answer it on the `--no-default-features` row too. A helper gated like the fetch cases
+/// would have made this key's coverage disappear exactly where the question still has an answer.
+fn name_a_pinned_model(ws: &Scratch, id: &str) {
+    let dir = ws.config_dir().join("note-processor");
+    fs::create_dir_all(&dir).expect("test setup: config package dir");
+    fs::write(
+        dir.join("config.toml"),
+        format!("[embeddings]\nmodel = \"{id}\"\n"),
+    )
+    .expect("test setup: write user config");
+}
+
+/// **How much would this cost, before it costs it?** (issue **#3**)
+///
+/// The app that reported it needs one sentence before the first embed — *"this needs `<id>`, about N MB, into
+/// `<data_dir>`"* — and could name the id and the directory but not N. Every alternative is worse: a number hardcoded
+/// client-side rots the moment the pin moves, and starting the transfer to learn its length is precisely the act that
+/// needs consent first. `np/progress` already carries the pinned size mid-`fetching`; what was missing was asking
+/// **before** anything starts.
+///
+/// The number is the build's own plan (`pins::plan_size`), which is the same sum the terminal consent prompt prints —
+/// so a GUI and an `np setup` on one machine cannot quote two different prices for one download. A text-only build
+/// plans the primary artifact; a `vision` build plans both halves, and this case reads whichever this binary would
+/// actually transfer rather than asserting a constant that would be wrong on the other feature row.
+#[test]
+fn pinned_reports_what_a_fetch_would_cost_before_anything_starts() {
+    let ws = Scratch::new();
+    name_a_pinned_model(&ws, "embeddinggemma-2");
+
+    let listed = run(&mut ws.list(true));
+    listed.assert_success();
+    let report = listed.json();
+
+    let pinned = report["pinned"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("`pinned` is an array on every state: {report}"));
+    assert_eq!(pinned.len(), 1, "one configured id, one plan: {pinned:?}");
+    assert_eq!(keys(&pinned[0]), PINNED_KEYS, "{pinned:?}");
+    assert_eq!(pinned[0]["id"], "embeddinggemma-2", "{pinned:?}");
+
+    let expected = np_core::pins::plan_size("embeddinggemma-2");
+    assert_eq!(
+        pinned[0]["bytes_total"].as_u64(),
+        Some(expected),
+        "the document's number is the pin table's own, not a transport announcement: {pinned:?}"
+    );
+    assert!(expected > 0, "a plan with no bytes is a bug in pins.rs");
+    let members: Vec<&str> = pinned[0]["members"]
+        .as_array()
+        .expect("members is an array")
+        .iter()
+        .map(|name| name.as_str().expect("strings"))
+        .collect();
+    assert_eq!(
+        members,
+        np_core::pins::members_for_build(),
+        "the plan names the files it adds up, in the order a fetch writes them"
+    );
+
+    // **Nothing installed, nothing downloaded.** The whole point is that this answer arrives with no artifact on disk:
+    // `models` stays empty while `pinned` already prices the transfer.
+    assert_eq!(report["models"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        report["fetching"].as_array().map(Vec::len),
+        Some(0),
+        "and no fetch is in flight: {report}"
+    );
+
+    // **A workspace that names no pinned id gets an empty list, not a guess.** Two shapes of that, both from the
+    // reporter's own rule ("empty when the workspace names no pinned id"): no `[embeddings]` section at all, and one
+    // naming an id this build knows nothing about — which must not borrow some other model's number.
+    let unconfigured = Scratch::new();
+    let bare = run(&mut unconfigured.list(true));
+    bare.assert_success();
+    assert_eq!(
+        bare.json()["pinned"],
+        serde_json::Value::Array(Vec::new()),
+        "no configured model is not a free download"
+    );
+
+    let unpinned = Scratch::new();
+    name_a_pinned_model(&unpinned, "some-other-model");
+    let stranger = run(&mut unpinned.list(true));
+    stranger.assert_success();
+    assert_eq!(
+        stranger.json()["pinned"],
+        serde_json::Value::Array(Vec::new()),
+        "an id this build does not pin has no size to report, and inventing one is the lie this key exists to avoid"
+    );
+
+    // Mutation this catches: reporting `total_size` (every pinned member) instead of the build's plan fails the
+    // `bytes_total` assertion on every non-vision row by 554,821,056 bytes; dropping the pin lookup and quoting a
+    // literal fails the unpinned-id case.
+}
+
+/// The size question does not depend on the artifact directory being readable, so the directory-level failure keeps
+/// answering it: `pinned` comes from config and the pin table, and a person whose models directory is unreadable is
+/// exactly the person wondering what a re-fetch would cost.
+#[test]
+fn pinned_survives_the_directory_level_failure() {
+    let ws = Scratch::new();
+    name_a_pinned_model(&ws, "embeddinggemma-2");
+    // The failure §3 knows: the models path exists as a *file*, so listing it is an error and `list` reports
+    // `models_dir_error` with no rows at all.
+    let models = ws.models_dir();
+    // The `workspaces/` parent has to exist for the *path* to accept a file: nothing here has run a command yet, and
+    // `models list` creates directories only when it is allowed to get that far.
+    fs::create_dir_all(
+        models
+            .parent()
+            .expect("test setup: the models dir sits inside `workspaces/`"),
+    )
+    .expect("test setup: create the workspaces dir");
+    fs::write(&models, b"not a directory").expect("test setup: make the models path a file");
+
+    let listed = run(&mut ws.list(true));
+    assert_eq!(
+        listed.code(),
+        1,
+        "the directory failure still refuses: {}",
+        listed.stderr()
+    );
+    let report = listed.json();
+    assert_eq!(keys(&report), LIST_KEYS, "{report}");
+    assert!(
+        !report["models_dir_error"].is_null(),
+        "the failure is reported as it was: {report}"
+    );
+    assert_eq!(
+        report["pinned"][0]["bytes_total"].as_u64(),
+        Some(np_core::pins::plan_size("embeddinggemma-2")),
+        "a question about bytes does not stop being answerable because a directory is broken: {report}"
+    );
 }
