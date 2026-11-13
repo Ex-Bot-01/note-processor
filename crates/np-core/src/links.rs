@@ -554,3 +554,174 @@ fn note_id<'a>(
     ids.insert(path.rel_bytes.as_slice(), id);
     Ok(id)
 }
+
+// ---------------------------------------------------------------------------
+// Reading the graph back
+// ---------------------------------------------------------------------------
+
+/// One stored edge whose target a reader can follow: **both** ends are live notes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkEdge {
+    /// The display path of the note the link is written in.
+    pub src: String,
+    /// The display path of the note on the other end — a path, never a row id, because every question this read answers
+    /// ends with a person opening a file.
+    pub dst: String,
+    /// `links.kind`: `wiki`, `md` or `attachment`.
+    pub kind: String,
+    /// The target exactly as its author wrote it, which is the text a fix replaces.
+    pub target: String,
+    /// 1-based line in [`LinkEdge::src`] — the number an editor jumps to.
+    pub line: i64,
+}
+
+/// One stored edge that no live note answers.
+///
+/// There is deliberately **no `dst` here**: the destination is the thing in question, and naming a stale path beside a
+/// dead target would make it look like somewhere to click. The [`Self::target`] is what a fix edits — which is why this
+/// row carries a line and `ScanReport::unresolved_targets`, which deduplicates names for an author reading a count, does
+/// not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedEdge {
+    /// The display path of the note the link is written in.
+    pub src: String,
+    /// `links.kind`.
+    pub kind: String,
+    /// The target as written.
+    pub target: String,
+    /// 1-based line in [`UnresolvedEdge::src`].
+    pub line: i64,
+}
+
+/// What [`listing`] reads out of the `links` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkListing {
+    /// Edges that land on a live note.
+    pub edges: Vec<LinkEdge>,
+    /// Edges that do not — a target nobody placed, or one whose note has gone stale since.
+    pub unresolved: Vec<UnresolvedEdge>,
+}
+
+/// Which part of the graph one [`listing`] call covers.
+#[derive(Debug, Clone, Copy)]
+pub enum LinkScope<'a> {
+    /// Every edge in the workspace.
+    All,
+    /// Every edge with this note at **either** end.
+    ///
+    /// A subject rather than a direction, because the three features that asked for this read need two different filters
+    /// (a backlinks pane wants the edges *arriving* at a note; fix-at-source wants the dead links *written in* it) and one
+    /// parameter that silently meant "incoming" for one list and "outgoing" for the other is how a GUI ends up listing a
+    /// note as its own backlink. Every entry names both of its ends, so a client says which end it wanted by comparing
+    /// `dst` to the path it asked about — no fourth key has to be invented to express it.
+    ///
+    /// The path is matched on its **byte key**, like every other identity in this database (F13 §4). A caller holding a
+    /// path that came off the disk holds those bytes already; one that typed or received a spelling gets
+    /// [`RelPath::from_display`], which is F13's documented rule for text-only callers and inherits its residual: two live
+    /// rows whose raw names differ where UTF-8 cannot round-trip are addressed by their display spelling, not apart.
+    Note(&'a RelPath),
+}
+
+/// The stored link graph, spelled in display paths (**issue #2**).
+///
+/// `np` computes the whole graph on every scan and had no read for any of it: an application wanting a backlinks pane
+/// could re-parse every note with its own link parser — whose idea of a wikilink drifts from np's in ways no test can
+/// catch — or open `<data_dir>/workspaces/<key>.sqlite` and build a shipping product on an internal schema that
+/// migrations reshape without warning. This is the third option, and the reason the rows carry `(src, line)` rather than
+/// counts: "who links here", "where is this dead target written" and "what must I rewrite when I rename that note" are
+/// three questions about one edge list.
+///
+/// Four rules decide what appears, each of them a reader's question rather than a property of the table:
+///
+/// * **`prose` origins only.** Every other reader of `links` — an image hit's linker set, a scan's unresolved list —
+///   reads prose, because an `approved` edge is a claim a human made about a note that may no longer exist. One rule
+///   everywhere is what lets `np scan --json`'s number and this list be read side by side.
+/// * **Attachments appear in neither list.** A figure's `target` is relative to the linking note's directory and arrives
+///   in TEXT already lossy-decoded (§6), so this table cannot say whether a figure exists, let alone where it moved.
+///   "Which notes embed this figure" is answered by [`crate::search`]'s `linked_notes`, which re-runs the one resolution
+///   rule that can — and a rename tool that needs figure edges must go through that rule rather than guessing here.
+/// * **The source note has to be live.** `files.state = 'stale'` is history np keeps on purpose, and a scan's unresolved
+///   count still counts it; a pane a person clicks must not name a file they cannot open. So this predicate is search's
+///   linker-set one (`state = 'ok'`), not the author-facing count's, and the two numbers may legitimately disagree on a
+///   corpus with churn in it — one counts what was written, this lists what can be opened.
+/// * **A stale destination is unresolved**, by `db::LIVE_EDGE` (private, and the reason it is named in text: one predicate, four readers) — the same predicate behind `ScanReport`'s
+///   `unresolved_links` count, so a count and the list printed under it cannot disagree about which edges are intact.
+///
+/// # Order
+///
+/// Source path in byte order, then line, then insertion: the order a reader would walk a corpus in, pinned because both
+/// channels print this list and a pane that reshuffles between two identical scans is indistinguishable from a bug.
+pub fn listing(db: &Db, scope: LinkScope<'_>) -> Result<LinkListing, DbError> {
+    // One statement for both scopes rather than two texts that can drift: the only difference is the subject predicate,
+    // and a reader comparing the two should see the shared half once. The join is on `rel_bytes` throughout (F13 §3) —
+    // matching or ordering on display text would cross-join a pair of live rows that spell themselves identically.
+    // The scope clause goes **before** the `ORDER BY`, which is why the two halves are named apart rather than one string
+    // with a suffix appended: the first version of this appended `AND …` onto a statement that already ended in
+    // `ORDER BY sn.rel_bytes, l.line, l.rowid`, SQLite read it as an expression to sort by, and the scoped query answered
+    // every edge in the corpus in a different order instead of refusing to answer them at all — silently, and only for
+    // the caller who asked about one note.
+    let sql = match scope {
+        LinkScope::All => format!("{LISTING_WHERE}{LISTING_ORDER}"),
+        LinkScope::Note(_) => {
+            format!("{LISTING_WHERE} AND (sn.rel_bytes = ?2 OR dn.rel_bytes = ?2){LISTING_ORDER}")
+        }
+    };
+    let mut statement = db.0.prepare(&sql)?;
+    let map = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    };
+    // Read out fully before bucketing, so no read statement is open across the loop that consumes it.
+    let mut raw: Vec<(String, Option<String>, i64, String, String, i64)> = match scope {
+        LinkScope::All => statement
+            .query_map(params![db::PROSE_ORIGIN], map)?
+            .collect::<Result<_, _>>()?,
+        LinkScope::Note(path) => statement
+            .query_map(params![db::PROSE_ORIGIN, path.rel_bytes], map)?
+            .collect::<Result<_, _>>()?,
+    };
+
+    let mut listing = LinkListing::default();
+    for (src, dst, live, kind, target, line) in raw.drain(..) {
+        match (live == 1, dst) {
+            (true, Some(dst)) => listing.edges.push(LinkEdge {
+                src,
+                dst,
+                kind,
+                target,
+                line,
+            }),
+            _ => listing.unresolved.push(UnresolvedEdge {
+                src,
+                kind,
+                target,
+                line,
+            }),
+        }
+    }
+    Ok(listing)
+}
+
+/// The shared half of [`listing`]'s statement: the scoped arm appends its `AND …` here and **nothing else may vary**.
+///
+/// `live` is a column rather than a `WHERE` clause because one pass has to fill both buckets: an edge whose destination
+/// row exists but whose file went stale belongs in the unresolved list, and dropping it in SQL would lose the target the
+/// list exists to name.
+const LISTING_WHERE: &str = "SELECT sn.rel, dn.rel,
+           COALESCE(df.state = 'ok', 0),
+           l.kind, l.target, l.line
+      FROM links l
+      JOIN notes sn ON sn.id = l.src_note_id
+      JOIN files sf ON sf.rel_bytes = sn.rel_bytes AND sf.state = 'ok'
+ LEFT JOIN notes dn ON dn.id = l.dst_note_id
+ LEFT JOIN files df ON df.rel_bytes = dn.rel_bytes
+     WHERE l.origin = ?1 AND l.kind != 'attachment'";
+
+/// [`listing`]'s order, in its own constant so both arms of the scope match sort by it and neither can forget to.
+const LISTING_ORDER: &str = " ORDER BY sn.rel_bytes, l.line, l.rowid";

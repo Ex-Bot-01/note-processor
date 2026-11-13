@@ -1995,3 +1995,323 @@ fn an_embed_that_works_narrates_the_chunks_it_encodes() {
         "NOT COVERAGE: chunk narration needs `--features local-model,fetch` and NP_TEST_MODEL_PATH"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `links.list` — the graph behind a backlinks pane (issue #2)
+//
+// The committed corpus is the fixture here, and it is a good one: several notes link `[[start-hier]]`, `start-hier.md`
+// links `[[Gamma]]` which two files claim so nothing resolves, and it embeds `![[scan.png]]`. Those three facts are the
+// three arms of this read — an edge, an unresolved target, and a figure that belongs in neither list — asserted against a
+// real scan rather than against rows planted by hand.
+// ---------------------------------------------------------------------------
+
+/// Every `(src, dst, kind, target, line)` in one response, as a sorted set of tuples.
+fn edges_of(graph: &Value) -> Vec<(String, String, String, String, i64)> {
+    graph["edges"]
+        .as_array()
+        .expect("`edges` is an array on every state")
+        .iter()
+        .map(|edge| {
+            (
+                edge["src"].as_str().expect("a source path").to_string(),
+                edge["dst"]
+                    .as_str()
+                    .expect("a destination path")
+                    .to_string(),
+                edge["kind"].as_str().expect("a kind").to_string(),
+                edge["target"].as_str().expect("a target").to_string(),
+                edge["line"].as_i64().expect("a line"),
+            )
+        })
+        .collect()
+}
+
+/// Every `(src, kind, target, line)` in one response.
+fn unresolved_of(graph: &Value) -> Vec<(String, String, String, i64)> {
+    graph["unresolved"]
+        .as_array()
+        .expect("`unresolved` is an array on every state")
+        .iter()
+        .map(|edge| {
+            (
+                edge["src"].as_str().expect("a source path").to_string(),
+                edge["kind"].as_str().expect("a kind").to_string(),
+                edge["target"].as_str().expect("a target").to_string(),
+                edge["line"].as_i64().expect("a line"),
+            )
+        })
+        .collect()
+}
+
+/// Every key of an object, sorted — the shape check `np --json`'s suites use, kept local to this file's `links.list`
+/// cases because nothing else here pins a whole key set.
+fn key_names(value: &Value) -> Vec<String> {
+    let mut names: Vec<String> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// **"Who links here?" is a question `np` can answer** (issue **#2**).
+///
+/// The gap was not that the information did not exist — every scan writes the whole graph into `links` — but that no
+/// method read it. An application had two bad options: re-parse every note with its own wikilink grammar, or select from
+/// an internal schema that migrations reshape without warning. This case asserts the answer against a real scan of the
+/// committed corpus, including the one edge nobody can resolve and the one figure that must **not** appear.
+#[test]
+fn links_list_names_who_links_here_and_where_the_dead_targets_are() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("scan", json!({"workspace": workspace}));
+
+    let graph = server.result("links.list", json!({"workspace": workspace}));
+    assert_eq!(
+        key_names(&graph),
+        vec!["edges", "indexed", "unresolved"],
+        "one key set for every state: {graph}"
+    );
+    assert_eq!(
+        graph["indexed"], true,
+        "this vault has been scanned: {graph}"
+    );
+
+    let edges = edges_of(&graph);
+    assert!(
+        edges.contains(&(
+            "crlf-note.md".to_string(),
+            "start-hier.md".to_string(),
+            "wiki".to_string(),
+            "start-hier".to_string(),
+            9
+        )),
+        "the corpus's own wikilink, with the line it was written on: {edges:?}"
+    );
+    // **A display path and a line, not a row id.** Every feature that asked for this ends with a person opening a file at
+    // a place, so those are the two things every entry carries — plus the target as written, which is what a fix replaces.
+    for edge in &edges {
+        assert!(
+            !edge.0.starts_with('/') && !edge.1.starts_with('/'),
+            "paths are display paths, never absolute ones (§12 rule 8): {edge:?}"
+        );
+        assert!(
+            edge.4 >= 1,
+            "a line number a editor can jump to is 1-based: {edge:?}"
+        );
+    }
+
+    let unresolved = unresolved_of(&graph);
+    assert!(
+        unresolved.contains(&(
+            "start-hier.md".to_string(),
+            "wiki".to_string(),
+            "Gamma".to_string(),
+            10
+        )),
+        "`[[Gamma]]` is claimed by two notes, so it resolves to nothing and must be named where it is written: {unresolved:?}"
+    );
+    assert!(
+        graph["unresolved"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|row| row.get("dst").is_none()),
+        "an unresolved edge has no destination to name, so it must not carry a key that looks like one: {graph}"
+    );
+
+    // **A figure is in neither list, and that is a gap stated rather than hidden.** `start-hier.md` embeds
+    // `![[scan.png]]`; the row exists, but its `target` is relative to the linking note's directory and arrived in TEXT
+    // already lossy-decoded (§6), so this table cannot say whether that figure exists or where it moved. "Which notes
+    // embed this figure" is answered by a search hit's `linked_notes`, which re-runs the one resolution rule that can —
+    // and a rename tool that needs figure edges has to go through that rule rather than guessing here.
+    assert!(
+        edges.iter().all(|edge| edge.2 != "attachment")
+            && unresolved.iter().all(|edge| edge.1 != "attachment"),
+        "no reader may be handed an attachment edge it cannot verify: {graph}"
+    );
+
+    server.finish();
+}
+
+/// **`rel` names a subject, not a direction** (issue **#2**).
+///
+/// A backlinks pane wants the edges arriving at a note; fix-at-source wants the dead links written in it. One parameter
+/// that meant "incoming" for one list and "outgoing" for the other is how a GUI lists a note as its own backlink, so the
+/// rule is symmetric — every edge with this note at **either** end — and each entry says which end by naming both.
+#[test]
+fn links_list_scopes_to_one_note_at_either_end() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("scan", json!({"workspace": workspace}));
+
+    let whole = server.result("links.list", json!({"workspace": workspace}));
+    let scoped = server.result(
+        "links.list",
+        json!({"workspace": workspace, "rel": "start-hier.md"}),
+    );
+
+    // Both directions are present: three notes link *into* `start-hier.md`, and it links *out* to `projekt-alpha.md`.
+    let edges = edges_of(&scoped);
+    assert!(
+        edges.iter().any(|edge| edge.1 == "start-hier.md"),
+        "the backlinks pane's half is missing: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|edge| edge.0 == "start-hier.md"),
+        "the note's own links are missing, so fix-at-source has nothing to mark: {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .all(|edge| edge.0 == "start-hier.md" || edge.1 == "start-hier.md"),
+        "the scope let an unrelated edge through: {edges:?}"
+    );
+    assert!(
+        scoped["unresolved"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|row| row["src"] == "start-hier.md"),
+        "an unresolved edge belongs to a note only when that note wrote it: {scoped}"
+    );
+    // The scoped answer is a subset of the whole graph, never a different graph.
+    let all = edges_of(&whole);
+    for edge in &edges {
+        assert!(
+            all.contains(edge),
+            "a scoped read invented an edge: {edge:?}"
+        );
+    }
+
+    // **A note this build has never seen scopes to nothing rather than refusing.** The caller asked about a path outside
+    // the corpus, which is a fact about the folder; and `indexed` stays `true`, because that is still a scanned vault —
+    // issue #5's distinction, carried into the method that came after it.
+    let stranger = server.result(
+        "links.list",
+        json!({"workspace": workspace, "rel": "no-such-note.md"}),
+    );
+    assert_eq!(stranger["indexed"], true, "{stranger}");
+    assert_eq!(stranger["edges"].as_array().map(Vec::len), Some(0));
+    assert_eq!(stranger["unresolved"].as_array().map(Vec::len), Some(0));
+
+    server.finish();
+}
+
+/// **A reader in the strong sense** (issue **#2**): no write lock, nothing created, and it says so when there is nothing
+/// to read.
+///
+/// The report asked for this explicitly, and both halves are load-bearing for an app. A GUI asks "who links here" about a
+/// folder it has merely hovered over; if that question minted a workspace database, every vault on the disk would acquire
+/// an index, and an embed in flight would find one more writer than it expected. So this is `status.get`'s rule — test for
+/// the file, then open it — plus the distinction #5 established: **no database is not the same finding as no edges**, and
+/// the document says which one it is answering.
+#[test]
+fn links_list_is_a_reader_that_creates_nothing_and_says_so_when_there_is_nothing_to_read() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    let data_dir = server.data_dir();
+    let before = listing_of(&data_dir);
+
+    let graph = server.result("links.list", json!({"workspace": workspace}));
+    assert_eq!(
+        graph["indexed"], false,
+        "nobody has scanned this folder, and that is not the sentence \"nothing links here\": {graph}"
+    );
+    assert_eq!(graph["edges"].as_array().map(Vec::len), Some(0));
+    assert_eq!(graph["unresolved"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        listing_of(&data_dir),
+        before,
+        "a backlinks question created state in the data dir"
+    );
+    assert!(
+        !listing_of(&data_dir)
+            .iter()
+            .any(|name| name.ends_with(".sqlite")),
+        "a reader created a workspace database: {graph}"
+    );
+
+    // **It answers while a writer holds the workspace** — the guarantee `search` and `models list` give, asked for by name
+    // in the report. A pane that refreshes during an embed must not go blank, and must not be told to retry.
+    server.result("scan", json!({"workspace": workspace}));
+    let config = Config {
+        data_dir: server.data_dir(),
+        ..Config::default()
+    };
+    let db_path = config.workspace_db(&server.root);
+    let held = WorkspaceLock::acquire(
+        db_path
+            .parent()
+            .expect("a workspace database sits in a directory"),
+        db_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("a lockable name"),
+        std::time::Duration::from_millis(200),
+    )
+    .expect("test setup: take the workspace write lock");
+
+    let while_locked = server.result("links.list", json!({"workspace": workspace}));
+    assert_eq!(
+        while_locked["indexed"], true,
+        "the scan is still true with a writer in the room: {while_locked}"
+    );
+    assert!(
+        !edges_of(&while_locked).is_empty(),
+        "a reader was refused while a writer held the workspace: {while_locked}"
+    );
+    assert!(
+        while_locked.get("locked").is_none(),
+        "this method takes no write lock, so it has no contention to report: {while_locked}"
+    );
+    drop(held);
+
+    server.finish();
+}
+
+/// **Parameters that cannot name a thing are faults** (issue **#2**), in the one place this method can tell.
+///
+/// An absent `rel` means "the whole graph" and an unknown `rel` means "a note with no edges"; both are answers. A `rel`
+/// that is empty or not a string is neither: it is a client that meant something and sent the wrong thing, and F35's rule
+/// for configuration values governs protocol parameters for the same reason — a silently-ignored value is how a typo
+/// becomes a pane that shows nothing and reports success.
+#[test]
+fn links_list_refuses_a_rel_that_cannot_name_a_note() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+
+    for (label, params) in [
+        ("no workspace at all", json!({"rel": "start-hier.md"})),
+        ("an empty rel", json!({"workspace": workspace, "rel": ""})),
+        (
+            "a rel that is not a path",
+            json!({"workspace": workspace, "rel": 7}),
+        ),
+    ] {
+        let response = server.request("links.list", params);
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label} must be a fault, not an empty answer: {response}"
+        );
+    }
+
+    // A workspace that is not a directory refuses like every other reader's, before any state is claimed about it.
+    let file = server._tmp.path().join("a-note.md");
+    fs::write(&file, b"# Not a folder\n").expect("test setup: a file where a vault was named");
+    let refused = server.request(
+        "links.list",
+        json!({"workspace": file.display().to_string()}),
+    );
+    assert_eq!(
+        refused["error"]["code"], -32000,
+        "a workspace that is not a directory is a refusal: {refused}"
+    );
+
+    // And the session survives all of it, which is what makes these faults rather than crashes.
+    let graph = server.result("links.list", json!({"workspace": workspace}));
+    assert_eq!(graph["indexed"], false, "{graph}");
+    server.finish();
+}

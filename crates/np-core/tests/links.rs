@@ -681,3 +681,310 @@ fn note_doc_carries_its_links() {
     let release = parse_markdown(&fixture("release-note.md"), "release-note");
     assert_eq!(found(&release.links), [("notes/other.md", LinkKind::Md, 4)]);
 }
+
+// ---------------------------------------------------------------------------
+// Reading the graph back: `links::listing` (issue #2)
+//
+// The table holds every edge `np` computed and no method on it existed, so an application that wanted a backlinks pane
+// had two options: re-parse every note with its own link parser — whose idea of a wikilink drifts from np's in ways no
+// test catches — or read `<data_dir>/workspaces/<key>.sqlite` directly and build a shipping product on an internal
+// schema that migrations reshape without warning. Both are worse than one query here, which is why the row shape below
+// is spelled in display paths and carries the line: it is meant to be the answer a GUI renders, not a dump of `links`.
+// ---------------------------------------------------------------------------
+
+/// The three edges of the fixture corpus this module reads: one resolved, one missing-note, one attachment.
+fn graph_fixture() -> Db {
+    let db = Db::in_memory().expect("in-memory database");
+    add_note(&db, "index.md");
+    add_note(&db, "notes/a.md");
+    add_file(&db, "assets/i.png");
+    store_links(
+        &db,
+        &[
+            ResolvedLink {
+                src: path("index.md"),
+                target: "notes/a.md".to_string(),
+                kind: LinkKind::Md,
+                line: 3,
+                dst: Some(path("notes/a.md")),
+            },
+            ResolvedLink {
+                src: path("index.md"),
+                target: "Missing".to_string(),
+                kind: LinkKind::Wiki,
+                line: 4,
+                dst: None,
+            },
+            ResolvedLink {
+                src: path("index.md"),
+                target: "assets/i.png".to_string(),
+                kind: LinkKind::Attachment,
+                line: 5,
+                dst: Some(path("assets/i.png")),
+            },
+        ],
+        "prose",
+    )
+    .expect("store the graph");
+    db
+}
+
+/// Edges as this module's assertions read them: `(src, dst, kind, target, line)`.
+fn edge_tuples(listing: &np_core::links::LinkListing) -> Vec<(&str, &str, &str, &str, i64)> {
+    listing
+        .edges
+        .iter()
+        .map(|edge| {
+            (
+                edge.src.as_str(),
+                edge.dst.as_str(),
+                edge.kind.as_str(),
+                edge.target.as_str(),
+                edge.line,
+            )
+        })
+        .collect()
+}
+
+/// Unresolved edges as `(src, kind, target, line)`.
+fn unresolved_tuples(listing: &np_core::links::LinkListing) -> Vec<(&str, &str, &str, i64)> {
+    listing
+        .unresolved
+        .iter()
+        .map(|edge| {
+            (
+                edge.src.as_str(),
+                edge.kind.as_str(),
+                edge.target.as_str(),
+                edge.line,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn listing_names_both_ends_and_the_line_each_edge_was_written_on() {
+    let db = graph_fixture();
+    let listing =
+        np_core::links::listing(&db, np_core::links::LinkScope::All).expect("read the graph");
+
+    // **A display path and a line, not a row id.** The three questions this answers — "who links here", "where is this
+    // dead target written", "what must I edit when I rename that note" — are all answered by a place a person can open.
+    assert_eq!(
+        edge_tuples(&listing),
+        vec![("index.md", "notes/a.md", "md", "notes/a.md", 3)]
+    );
+    assert_eq!(
+        unresolved_tuples(&listing),
+        vec![("index.md", "wiki", "Missing", 4)],
+        "the target is spelled as its author wrote it, because that is the text a fix replaces"
+    );
+}
+
+#[test]
+fn listing_leaves_out_attachments_and_edges_no_reader_can_explain() {
+    let db = graph_fixture();
+    // An attachment edge has no note on either end of the question this answers: `links.target` for a figure is relative
+    // to the linking note's directory and cannot survive a trip through TEXT unchanged (§6, and the reason search
+    // re-resolves figure targets itself rather than trusting this column). So it is in neither list — **and that is a
+    // gap, not a cleanup**: "which notes embed this figure" is answered today by `search`'s `linked_notes`, which runs
+    // the one resolution rule that can. A rename tool that needs figure edges must ask there, or this list has to grow a
+    // third bucket built on that rule; what it must not do is guess from `links.target`.
+    let listing =
+        np_core::links::listing(&db, np_core::links::LinkScope::All).expect("read the graph");
+    assert_eq!(listing.edges.len(), 1, "the resolved note edge only");
+    assert_eq!(
+        listing.unresolved.len(),
+        1,
+        "the missing note, not the figure"
+    );
+
+    // An `approved` edge is a claim a human made about a note that may no longer exist, and every other reader of this
+    // table — the linker set behind an image hit, a scan's unresolved list — reads prose only. One rule for all of them
+    // means `np scan --json`'s number and this list can be read side by side.
+    store_links(
+        &db,
+        &[ResolvedLink {
+            src: path("notes/a.md"),
+            target: "index.md".to_string(),
+            kind: LinkKind::Wiki,
+            line: 1,
+            dst: Some(path("index.md")),
+        }],
+        "approved",
+    )
+    .expect("store an approved edge");
+    let listing = np_core::links::listing(&db, np_core::links::LinkScope::All).expect("re-read");
+    assert_eq!(listing.edges.len(), 1, "the approved edge stays out");
+}
+
+#[test]
+fn listing_scopes_to_one_note_at_either_end() {
+    let db = graph_fixture();
+    store_links(
+        &db,
+        &[ResolvedLink {
+            src: path("notes/a.md"),
+            target: "index.md".to_string(),
+            kind: LinkKind::Wiki,
+            line: 7,
+            dst: Some(path("index.md")),
+        }],
+        "prose",
+    )
+    .expect("link back the other way");
+
+    // **`rel` names a subject, not a direction.** The three features that asked for this method need two different
+    // filters — a backlinks pane wants the edges arriving at a note, fix-at-source wants the dead links written in it —
+    // and a parameter that silently meant "incoming" for one list and "outgoing" for the other is how a GUI ends up
+    // showing its own note as its own backlink. So one rule covers both: an edge appears when the named note is **either
+    // end** of it, and every entry says which end by naming both. A client that wants only the incoming ones compares
+    // `dst` to the path it asked about; nothing new has to be invented to say it.
+    let scoped = np_core::links::listing(&db, np_core::links::LinkScope::Note(&path("index.md")))
+        .expect("scope to one note");
+    assert_eq!(
+        edge_tuples(&scoped),
+        vec![
+            ("index.md", "notes/a.md", "md", "notes/a.md", 3),
+            ("notes/a.md", "index.md", "wiki", "index.md", 7),
+        ],
+        "the outgoing edge and the backlink, in reading order"
+    );
+    assert_eq!(
+        unresolved_tuples(&scoped),
+        vec![("index.md", "wiki", "Missing", 4)],
+        "an unresolved edge has no destination, so it can only belong to the note that wrote it"
+    );
+
+    // Scoping to the *other* note answers a different question and must not return the same document: `notes/a.md` holds
+    // no unresolved link of its own. A filter that quietly ignored `rel` would pass an assertion on one of these two.
+    let other = np_core::links::listing(&db, np_core::links::LinkScope::Note(&path("notes/a.md")))
+        .expect("scope to the target");
+    assert_eq!(other.edges.len(), 2, "one edge each way");
+    assert!(
+        other.unresolved.is_empty(),
+        "the scope reached the unresolved list too: {:?}",
+        other.unresolved
+    );
+
+    // A note that is not in the database scopes to nothing rather than failing: the caller asked about a path this build
+    // has never seen, which is a fact about the folder, not a malformed request.
+    let stranger = np_core::links::listing(&db, np_core::links::LinkScope::Note(&path("nope.md")))
+        .expect("scope to an unknown note");
+    assert!(stranger.edges.is_empty() && stranger.unresolved.is_empty());
+}
+
+#[test]
+fn listing_reads_the_graph_a_reader_can_act_on_today() {
+    let db = graph_fixture();
+
+    // **A source whose file is gone contributes nothing.** `files.state = 'stale'` is history np keeps on purpose — the
+    // note may come back, and a scan's unresolved count deliberately still counts those rows — but this list is rendered
+    // into a pane a person clicks. Naming a deleted file as a backlink offers a click on nothing, so the predicate here
+    // is the one search's linker set uses (`state = 'ok'`) rather than the one an author-facing count uses. The two
+    // numbers can therefore disagree when a corpus has churn in it, and that is the correct disagreement: one counts
+    // what was written, this lists what can be opened.
+    np_core::db::mark_stale(&db, b"index.md").expect("age out the source");
+    let listing = np_core::links::listing(&db, np_core::links::LinkScope::All)
+        .expect("read after the delete");
+    assert!(
+        listing.edges.is_empty() && listing.unresolved.is_empty(),
+        "a deleted note's edges are not a reader's to follow: {listing:?}"
+    );
+
+    // **A destination whose file is gone is unresolved, not resolved-onto-nothing.** This is the same `LIVE_EDGE`
+    // predicate a scan counts its unresolved links with, so the count in `np scan --json` and the list here are answers
+    // to one question rather than two.
+    let db = graph_fixture();
+    np_core::db::mark_stale(&db, b"notes/a.md").expect("age out the target");
+    let listing = np_core::links::listing(&db, np_core::links::LinkScope::All)
+        .expect("read after the delete");
+    assert!(
+        listing.edges.is_empty(),
+        "the edge no longer lands anywhere"
+    );
+    assert_eq!(
+        unresolved_tuples(&listing),
+        vec![
+            ("index.md", "md", "notes/a.md", 3),
+            ("index.md", "wiki", "Missing", 4),
+        ],
+        "the edge that lost its destination joins the target that never had one, and both are named by the text a rename has to fix"
+    );
+}
+
+#[test]
+fn listing_orders_by_source_then_line() {
+    let db = Db::in_memory().expect("in-memory database");
+    add_note(&db, "b.md");
+    add_note(&db, "a.md");
+    // Stored in an order no reader would read: `b.md`'s rows first, and within it the later line first.
+    store_links(
+        &db,
+        &[
+            ResolvedLink {
+                src: path("b.md"),
+                target: "a.md".to_string(),
+                kind: LinkKind::Wiki,
+                line: 9,
+                dst: Some(path("a.md")),
+            },
+            ResolvedLink {
+                src: path("b.md"),
+                target: "gone-1".to_string(),
+                kind: LinkKind::Wiki,
+                line: 2,
+                dst: None,
+            },
+            ResolvedLink {
+                src: path("a.md"),
+                target: "b.md".to_string(),
+                kind: LinkKind::Wiki,
+                line: 1,
+                dst: Some(path("b.md")),
+            },
+            ResolvedLink {
+                src: path("b.md"),
+                target: "gone-2".to_string(),
+                kind: LinkKind::Wiki,
+                line: 2,
+                dst: None,
+            },
+        ],
+        "prose",
+    )
+    .expect("store four edges out of order");
+
+    let listing =
+        np_core::links::listing(&db, np_core::links::LinkScope::All).expect("read the graph");
+    assert_eq!(
+        edge_tuples(&listing),
+        vec![
+            ("a.md", "b.md", "wiki", "b.md", 1),
+            ("b.md", "a.md", "wiki", "a.md", 9),
+        ],
+        "source path first, then the line it was written on"
+    );
+    assert_eq!(
+        unresolved_tuples(&listing),
+        vec![
+            ("b.md", "wiki", "gone-1", 2),
+            ("b.md", "wiki", "gone-2", 2),
+        ],
+        "two dead targets on one line keep their written order, so the list does not shuffle between runs"
+    );
+}
+
+#[test]
+fn listing_an_empty_or_absent_graph_is_two_empty_lists() {
+    let db = Db::in_memory().expect("in-memory database");
+    let listing =
+        np_core::links::listing(&db, np_core::links::LinkScope::All).expect("read an empty graph");
+    assert!(listing.edges.is_empty() && listing.unresolved.is_empty());
+
+    // A workspace scanned before links existed, or one whose notes hold none: the same answer, and no error to parse.
+    add_note(&db, "lonely.md");
+    let listing = np_core::links::listing(&db, np_core::links::LinkScope::All)
+        .expect("read a linkless graph");
+    assert!(listing.edges.is_empty() && listing.unresolved.is_empty());
+}

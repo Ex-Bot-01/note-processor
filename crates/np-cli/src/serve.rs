@@ -52,6 +52,10 @@ pub const METHODS: &[&str] = &[
     "scan",
     "embed",
     "models.list",
+    // `links.list` is second-to-last because it is the newest reader and, like `status.get`, answers a question the
+    // terminal does not ask. **Issue #2** added it inside protocol 1: an added method is a compatible change, and a client
+    // that wants to know whether this build has it reads this array — which is the same way `status.get` shipped.
+    "links.list",
     "shutdown",
 ];
 
@@ -328,6 +332,7 @@ fn dispatch(
         "scan" => scan(params, request, ch),
         "embed" => embed(params, request, ch),
         "models.list" => models_list(params),
+        "links.list" => links_list(params),
         "status.get" => status(params, ch),
         // The client asked to be done. Answer first, then stop reading: a response that races the pipe closing is a
         // response nobody received. Closing stdin still works and still exits 0 — this only means `shutdown` alone is
@@ -622,6 +627,68 @@ fn models_list(params: &Value) -> Result<Value, ServeError> {
         ),
         Err(err) => return Err(refused(err)),
     })
+}
+
+/// **Who links here, and where is this dead target written?** (issue **#2**)
+///
+/// `np` computes the whole link graph on every scan and had no read for any of it. The caller that asked for this — a
+/// note editor with a backlinks pane, a fix-at-source marker and a rename-rewriting pass to build — was left choosing
+/// between re-parsing every note with its own wikilink grammar (which drifts from np's in ways no test catches) and
+/// selecting from `links` in `<data_dir>/workspaces/<key>.sqlite`, an internal schema migrations reshape without
+/// warning. This method is the third door, and it is a reader: no write lock, nothing installed, nothing created.
+///
+/// `params.rel` scopes to one note and means **"this note is either end of the edge"**, not "incoming": the three
+/// features that asked for this read need two different filters, and a parameter silently meaning one thing for `edges`
+/// and another for `unresolved` is how a pane lists a note as its own backlink. Every entry names both of its ends, so
+/// the client says which one it wanted by comparing `dst` to the path it asked about. See [`np_core::links::listing`] for
+/// what does and does not appear — prose origins, live sources, no attachments, a stale destination counted as
+/// unresolved.
+fn links_list(params: &Value) -> Result<Value, ServeError> {
+    let workspace = workspace_of(params)?;
+    // **An empty or mistyped `rel` is a fault, not an empty answer.** A GUI that sent `"rel": ""` and got back two empty
+    // lists would conclude the note is unlinked; F35's rule for configuration values applies to protocol parameters for
+    // the same reason — ignoring a value you did not understand is how a typo becomes a silent behaviour change.
+    let rel = match params.get("rel") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if !text.is_empty() => {
+            Some(np_core::path_keys::RelPath::from_display(text))
+        }
+        Some(Value::String(_)) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                "`rel` is empty: name one note the way a report spells it (`welcome.md`), or leave the key out",
+            ))
+        }
+        Some(other) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                format!("`rel` needs a workspace-relative path string, not {other}"),
+            ))
+        }
+    };
+    let config = crate::load_config().map_err(refused)?;
+    // A workspace that is not a directory refuses like every other reader's, before any state is claimed about it.
+    np_core::models::require_workspace_dir(&workspace).map_err(refused)?;
+
+    // **Tested for the file, then opened — in that order** (`status.get`'s rule, and the ask in the report). `Db::open`
+    // mints directories and an empty database, so a backlinks pane that polls would create an index for every folder it
+    // ever hovered over. With no database there is nothing to read and one honest answer to give: two empty lists beside
+    // `indexed: false`, which is issue #5's distinction — "nobody has scanned this" is not the sentence "nothing links
+    // here", and a rename tool that confuses them orphans a note.
+    if !config.workspace_db(&workspace).is_file() {
+        return Ok(crate::links_json(
+            &np_core::links::LinkListing::default(),
+            false,
+        ));
+    }
+    let db = crate::workspace_db(&config, &workspace).map_err(refused)?;
+    let indexed = np_core::scan::indexed(&db).map_err(refused)?;
+    let scope = match &rel {
+        Some(path) => np_core::links::LinkScope::Note(path),
+        None => np_core::links::LinkScope::All,
+    };
+    let listing = np_core::links::listing(&db, scope).map_err(refused)?;
+    Ok(crate::links_json(&listing, indexed))
 }
 
 /// A JSON-RPC error object. Kept in one place so the envelope shape cannot vary by fault kind.

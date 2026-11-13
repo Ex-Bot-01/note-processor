@@ -13,6 +13,7 @@ added inside version 1 because they are opt-in and cannot surprise a client that
 
 - [Framing and lifecycle](#framing-and-lifecycle)
 - [Methods](#methods)
+- [Reading the link graph](#reading-the-link-graph)
 - [States travel as data, not as errors](#states-travel-as-data-not-as-errors)
 - [Fault codes](#fault-codes)
 - [Notifications](#notifications)
@@ -72,6 +73,7 @@ can talk to a server it cannot configure still deserves answers.
 | `scan` | `workspace` | the same report as `np scan --json` | `ScanReport` | `-32602`; `-32000` |
 | `embed` | `workspace` | the same report as `np embed --json` | `embed_report` | `-32602`; `-32000` (including a build without the inference feature) |
 | `models.list` | `workspace` | `{models, fetching, unclaimed, pinned, models_dir_error}` — installed-artifact rows, any fetch in flight, and what a fetch **would** cost before one starts | `listing_json`, the CLI's own builder | `-32602` |
+| [`links.list`](#reading-the-link-graph) | `workspace`, `rel?` | `{indexed, edges, unresolved}` — who links each note, and every dead target with the file and line it was written on | `links_json` | `-32602` on an empty or non-string `rel`; `-32000` when the workspace is not a directory |
 | `status.get` | `workspace` | `{last, fetch_markers, running}` | its own builder | `-32602` |
 | `shutdown` | none | `{protocol}` echoed, then the loop ends | its own builder | — |
 
@@ -86,6 +88,49 @@ Two things are deliberately **not** methods:
 `initialize` also reports `data_dir` — where artifacts and per-workspace databases live — because a client that wants to warn
 "this vault needs 295 MiB" needs to know which disk it means.
 
+## Reading the link graph
+
+`np` computes every wikilink, markdown link and figure embed in a vault on every scan. **`links.list`** is the read of it
+(**issue #2**), and it answers three features of one editor with one document: a backlinks pane, a fix-at-source marker on
+an unresolved `[[target]]`, and the rewrite pass that has to find every link pointing at a note before it is renamed.
+
+```json
+{"id":3,"jsonrpc":"2.0","result":{"edges":[{"dst":"todo.md","kind":"wiki","line":3,"src":"meeting.md","target":"todo.md"},{"dst":"meeting.md","kind":"wiki","line":3,"src":"todo.md","target":"meeting"}],"indexed":true,"unresolved":[{"kind":"wiki","line":5,"src":"meeting.md","target":"someday"}]}}
+```
+
+Captured from a two-note vault — `meeting.md` links `[[todo.md]]` and `[[someday]]`, `todo.md` links back to `[[meeting]]`.
+The second edge is the interesting one: its target is spelled `meeting` and its destination is `meeting.md`, which is
+exactly why this read exists. A client that resolved that itself would be maintaining a second wikilink grammar, and np's
+rule (exact path, then case-folded path, then unique basename, and **nothing** when two notes claim one name) is not a rule
+two implementations agree on by accident.
+
+| Key | Meaning |
+|---|---|
+| `edges` | links that land on a live note: `src`, `dst`, `kind` (`wiki` \| `md`), the `target` as its author wrote it, and the 1-based `line` |
+| `unresolved` | links no live note answers — never placed, ambiguous, or pointing at a note whose file is gone. **No `dst`:** the destination is the thing in question, and a path beside a dead target looks like somewhere to click |
+| `indexed` | whether anybody has ever scanned this folder. Two empty lists on a vault that has never been scanned is not the finding "nothing links here", and a rename pass that reads it as one orphans every note in the vault |
+
+`params.rel` scopes to one note and means **"this note is either end of the edge"** — not "incoming". A backlinks pane and
+a fix-at-source marker need two different filters, and one parameter silently meaning one thing for `edges` and another for
+`unresolved` is how a pane lists a note as its own backlink; every entry names both ends, so the client says which one it
+wanted by comparing `dst` to the path it asked about. An unknown note answers two empty lists (a fact about the folder);
+an empty or non-string `rel` is a `-32602` (a client that meant something and sent the wrong thing).
+
+What is **not** in the document, stated rather than hidden:
+
+- **Figure embeds.** A figure's stored target is relative to the linking note's directory and arrives as text that cannot
+  hold every file name, so this table cannot say whether an image exists or where it moved. "Which notes embed this
+  figure" is answered by a search hit's `linked_notes`, which re-runs the one resolution rule that can.
+- **A source whose file is gone.** Those rows are history the database keeps, and `np scan --json` still counts them in its
+  unresolved number; a pane a person clicks must not name a file they cannot open. The two counts may therefore disagree on
+  a vault with churn in it, which is the correct disagreement — one counts what was written, this lists what can be opened.
+- **`approved` edges**, because every reader of this table reads prose only and nothing writes the other kind yet.
+
+It is a reader in the strong sense: no write lock, and **no database creation** — `status.get`'s rule of testing for the
+file before opening it, so a pane that polls cannot mint an index for every folder it hovers over. It answers while an
+embed holds the workspace. The identity rules a client may rely on, and why each was drawn where it was, are in
+[**F48**](design-f48-links-as-a-query.md).
+
 ## States travel as data, not as errors
 
 This is the rule that makes the interface usable: **a state is not a failure.** Offline is a state. Contention is a state. An
@@ -99,7 +144,7 @@ embed that refused to write because the budget ran out is a state. They arrive i
 | `reason` | a machine token (`provider-disabled`, `local-model-not-built`, `offline`, …) explaining a degraded result. **One token per run**, which is why "not indexed" got its own key below rather than a new token here | `search`, `embed` results |
 | `vectors: false` | this workspace holds no vectors — the truth about the index, and deliberately still `true` on a run that could not use them (**F45**), so it is *not* the answer to "which half ran" | `search` results |
 | `keyword_used`, `semantic_used` | which halves **this answer** was built from. `mode` names what the caller asked for, and hybrid answers from one half whenever the other is missing; these two are what a client shows when it says how a result was found (**#5**) | `search` results |
-| `indexed: false` | nobody has ever scanned this workspace — "this folder is not indexed", which is not the same sentence as "nothing here matches". One `scan` flips it; a search of an unindexed vault does not, because `np_core::scan::indexed` reads the scan stamp and the rows rather than asking whether a file exists | `search` results, and their terminal `np/progress` line |
+| `indexed: false` | nobody has ever scanned this workspace — "this folder is not indexed", which is not the same sentence as "nothing here matches". One `scan` flips it; a search of an unindexed vault does not, because `np_core::scan::indexed` reads the scan stamp and the rows rather than asking whether a file exists | `search` results, their terminal `np/progress` line, and `links.list` (**#5**'s distinction, carried into the method that came after it) |
 | `fetched` | what auto-fetch actually downloaded, or `null` | `search`, `embed` results |
 | `prefix_drift` | the installed artifact's prefix documents differ from the pin's; absent when there is no drift | `embed` results |
 | `outcome` | which arm an embed took (`{offline: …}`, `{local_model_missing: …}`, `over_budget`, …) | `embed` results |
@@ -265,7 +310,9 @@ line appears in the whole session — every line carries an `id`, so a v0.3.0 cl
 
 This block was re-captured on 2026-11-13, one release after the three below it and on a **default-feature** debug build — which is why its
 `features.local_model` reads `false` where B, C and D read `true`. Its third line is also the visible half of **#5**: `indexed`,
-`keyword_used` and `semantic_used` are new keys beside `hits`, and `mode` still means "what was asked for".
+`keyword_used` and `semantic_used` are new keys beside `hits`, and `mode` still means "what was asked for". It predates
+**#2**, so its handshake lists seven methods where this build answers eight; a client feature-detects off that array, which is
+precisely the case the array is there for.
 
 ### A first run with no network
 

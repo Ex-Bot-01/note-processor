@@ -194,7 +194,7 @@ That block is captured stdout, one interrupted download, nothing edited: `lockin
 size, then a refusal carrying the same code as the error object. An embed that gets to run says `embedding` and `writing` where
 this one said `fetching`.
 
-Seven methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `status.get`, `shutdown` — and three rules:
+Eight methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `links.list`, `status.get`, `shutdown` — and three rules:
 
 - **Every `result` is exactly the document `np <verb> --json` prints**, because both channels call one builder; a test compares them
   value for value rather than trusting intent.
@@ -202,6 +202,12 @@ Seven methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `statu
 - **States come back as data, not faults.** `locked`, `offline`, `reason` and `prefix_drift` are keys in the document; a fault means
   the *request* was wrong (`-32700`, `-32601`, `-32602`) or `np` refused before doing work (`-32000`). Progress ends with
   `completed` when the request produced a result — including a degraded one — and `refused` only when it produced an error.
+
+`links.list` is the newest of them, and the first method that answers a question the terminal never asks: **who links this
+note, and where is every dead target written?** One call returns every edge with both ends as display paths and the line it
+was written on, plus the unresolved ones named by the text a fix replaces — so a backlinks pane, an in-editor marker and a
+rename-rewriting pass all read np's own link graph instead of maintaining a second wikilink grammar that agrees with np
+until it does not. `params.rel` scopes it to one note; it is a reader that creates nothing and answers while an embed runs.
 
 Progress is **off unless you ask**, so a client built against v0.3.0 keeps the responses it expects: nothing new arrives unsolicited,
 and every method's result document is byte-for-byte what it was. The one line that did change is `initialize`'s own, which now lists
@@ -289,6 +295,7 @@ The decisions behind those, each with its measurements:
 | [`docs/design-m2-image-embeddings.md`](docs/design-m2-image-embeddings.md) | R7c: media tables, discovery and sniffing, the vision seam, §8's refusal classes, §14's measured numbers |
 | [`docs/design-m2-thread-policy.md`](docs/design-m2-thread-policy.md) | The `"auto"` worker rule and the measurements behind it |
 | [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
+| [`docs/design-f48-links-as-a-query.md`](docs/design-f48-links-as-a-query.md) | What a client may assume about link identity: display paths and lines, what `rel` scopes, and why figures and stale notes are absent from `links.list` |
 | [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
 
 Code comments carry the local reasoning; those files carry the decisions and the measurements.

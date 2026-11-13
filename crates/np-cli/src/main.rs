@@ -2531,6 +2531,56 @@ fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// The document **`links.list`** answers with (**issue #2**): who links here, where the dead targets are written, and
+/// whether anybody has ever scanned this folder.
+///
+/// Three keys on every state, and no more:
+///
+/// * **`edges`** — links that land on a live note, each naming both ends as a display path plus the `kind`, the `target`
+///   as written and the 1-based `line`. A pane filters this by comparing `dst` to the note it is showing.
+/// * **`unresolved`** — links no live note answers, named by their target and where they were written. **No `dst` key**:
+///   the destination is the thing in question, and a path beside a dead target would look like somewhere to click.
+/// * **`indexed`** — issue **#5**'s distinction, carried here because this method walks into the same trap: an empty pair
+///   of lists on a folder nobody scanned is not the finding "nothing links here", and a rename-rewriting tool that reads
+///   it as one silently orphans every note in the vault.
+///
+/// Order is the core's reading order (source path, then line), pinned because this document is rendered into a list a
+/// person reads top-down. `line` is 1-based for the same reason `np scan` names a line: it is the number an editor jumps
+/// to, and the one number an LF and a CRLF copy of the same note agree on.
+///
+/// This is the second method with no terminal twin — like `status.get`, it answers a question a person at a shell does not
+/// ask, so there is no CLI text channel for it and no stdout to keep byte-pinned beside this document.
+pub(crate) fn links_json(listing: &np_core::links::LinkListing, indexed: bool) -> Value {
+    json!({
+        "indexed": indexed,
+        "edges": listing
+            .edges
+            .iter()
+            .map(|edge| {
+                json!({
+                    "src": edge.src,
+                    "dst": edge.dst,
+                    "kind": edge.kind,
+                    "target": edge.target,
+                    "line": edge.line,
+                })
+            })
+            .collect::<Vec<Value>>(),
+        "unresolved": listing
+            .unresolved
+            .iter()
+            .map(|edge| {
+                json!({
+                    "src": edge.src,
+                    "kind": edge.kind,
+                    "target": edge.target,
+                    "line": edge.line,
+                })
+            })
+            .collect::<Vec<Value>>(),
+    })
+}
+
 /// The `--json` body of `np models list`: one object whose key set is identical for every state (§3), built by
 /// this one function so the success path and the directory-level failure cannot grow different keys.
 ///
