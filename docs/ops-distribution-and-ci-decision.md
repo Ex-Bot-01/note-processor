@@ -11,10 +11,21 @@ in October, 2,137 in the first 6.4 days of November). Since then every run on `m
 every job** — including `42394561369` on `2777aeb`. A job that never reaches a step cannot be a code defect; the last tree CI
 actually graded is `5e368ac` (run `42325538290`, four jobs success).
 
-**Distribution.** `.github/workflows/release.yml` builds on `windows-latest`, `ubuntu-latest` and `macos-latest`, so it is metered
-like everything else and cannot run either. The result is the failure mode the repository warns about elsewhere: **the published
-`v0.1.0` assets (2026-10-28) ship a binary with one subcommand** (`scan`) while `main` has `scan`, `embed`, `search` and `models`.
-A user following README's "Pre-built binaries" section today downloads something that cannot search.
+**Distribution, as measured on 2026-11-07.** `.github/workflows/release.yml` built on `windows-latest`, `ubuntu-latest` and
+`macos-latest`, so it was metered like everything else and could not run. The result is the failure mode the repository warns
+about elsewhere: **the published `v0.1.0` assets (2026-10-28) ship a binary with one subcommand** (`scan`) while `main` has
+`scan`, `embed`, `search` and `models`. A user following README's "Pre-built binaries" section today downloads something that
+cannot search.
+
+**Updated 2026-11-13, because the hosted allowance came back and the second problem did not go away.** Minutes are no longer the
+blocker — runs on `main` reach their steps again. What remained was that the release workflow still carried its *own* build recipe
+(`cargo build --release -p np-cli`, default features) while the assets people actually downloaded were built by
+`.github/scripts/package-assets.sh` and `.github/scripts/cross-build-windows.sh`, both of which build `local-model,fetch`. Two
+recipes, one name: any asset CI produced was a binary whose `np embed` answered `runtime not built`, and no gate could see it,
+because the source tree builds either way — F40 was exactly this divergence, reported against a released asset. `.github/workflows/release.yml`
+now runs the two scripts instead of a recipe of its own, on `ubuntu-latest`, which is also the only host that can produce both
+shipped shapes (see `crates/np-core/build.rs`'s refusal for MSVC and macOS). The Windows-MSVC and macOS rows are gone rather than
+relabeled: a runtime-less asset under a name that matches the runtime-bearing ones is how the last trap worked.
 
 ## 2. What was done today, without spending anything
 

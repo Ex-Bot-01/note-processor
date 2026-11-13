@@ -1,8 +1,25 @@
 ---
 name: Release
-# Builds a downloadable `np` for Windows, Linux and macOS and publishes them on a GitHub Release.
-# Tag-triggered so a release is a deliberate act (`git tag v0.1.0 && git push --tags`), and dispatchable
-# without publishing anything so the packaging path can be tested on a branch.
+# Builds the downloadable `np` assets and publishes them on a GitHub Release. Tag-triggered so a release is a
+# deliberate act (`git tag v0.4.0 && git push --tags`), and dispatchable without publishing anything so the
+# packaging path can be rehearsed on a branch before a tag exists.
+#
+# **The two assets this builds, and why there are not three.** Until 2026-11-13 this workflow carried its own build
+# recipe — `cargo build --release -p np-cli` over a Windows-MSVC / Linux / macOS matrix — while the binaries that were
+# actually published came from `.github/scripts/package-assets.sh` and `.github/scripts/cross-build-windows.sh`. The two
+# recipes disagreed about features: the scripts build `local-model,fetch`, the workflow built default features. So every
+# asset CI produced was a binary whose `np embed` said `runtime not built`, which is F40 — a release page that promises
+# embeddings and an artefact that cannot make a vector — and it could only ever have been caught by running the artefact,
+# because every gate passed on all three platforms. The fix is to delete the second recipe: this file now runs the same
+# scripts a human runs, so there is one build definition whose feature list cannot drift from the release's claim.
+#
+# **Why no Windows-MSVC and no macOS asset.** Not a minutes decision — `crates/np-core/build.rs` refuses to compile
+# llama.cpp for any target that is not Linux or `x86_64-pc-windows-gnu` with `NP_LLAMA_CMAKE_TOOLCHAIN` set, and its
+# refusal says why: `§14 keeps its rule: no platform claim without a build measured on it — macOS has no libstdc++ to
+# name and MSVC wants different archive names`. Adding those rows back means porting the C++ link and measuring it, not
+# adding a flag. A runtime-less macOS or MSVC asset would be worse than none: it would arrive under a name that matches
+# the runtime-bearing ones, which is how the last trap worked. `docs/reference-releases.md` carries what each platform
+# gets and how to build it from source instead.
 on:
   push:
     tags: ["v*"]
@@ -16,72 +33,154 @@ on:
 permissions:
   contents: write
 
+# Which features ship is stated once, in the two scripts (`--features local-model,fetch`), and both of them verify the
+# claim against the built bytes rather than trusting a flag list. An `env:` here would be a second place to keep it true,
+# so there is none: read the scripts.
+
 jobs:
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: np.exe
-            archive: zip
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: np
-            archive: tar.gz
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary: np
-            archive: tar.gz
+  # Both asset jobs restore and then run `scripts/vendor-llama-cpp.sh` (the one network step in this repository's build,
+  # keyed on the pin file and the script that unpacks it — the same key `ci.yml`'s feature row uses, so a release reuses
+  # what CI already verified). The script runs after the restore rather than being replaced by it: on a cold cache the
+  # restore yields nothing, and a job whose only source of the pinned tree is a cache that missed fails in `build.rs`
+  # with a message about a script nobody ran. The script is idempotent and verifies content by header digest, so a miss
+  # costs one 38.7 MB download.
+  linux:
+    name: Asset — x86_64-unknown-linux-gnu (with the runtime)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # The runners ship a stable Rust toolchain; nothing is installed so a release cannot silently
-      # start depending on network-installed tooling that CI does not exercise.
-      - name: Build the release binary
-        run: cargo build --release --locked -p np-cli --target ${{ matrix.target }}
-
-      # The archive carries the target in its name, because a Windows user choosing between three
-      # files named `np.zip` is a support ticket waiting to happen.
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Cache the pinned llama.cpp source
+        uses: actions/cache@v4
+        with:
+          path: .vendor
+          key: llama-cpp-${{ hashFiles('third_party/llama-cpp.toml', 'scripts/vendor-llama-cpp.sh') }}
+      - name: Vendor llama.cpp
+        run: ./scripts/vendor-llama-cpp.sh
+      # Not `cargo build` + `tar`: the script is what a human runs, and it carries the checks this workflow cannot
+      # restate — that the binary actually contains llama.cpp's loader symbol (read from the bytes, because `strip`
+      # removes the symbol table), that both licence files land inside the archive, and that the archive is deterministic
+      # enough for a published sha256 to mean anything. cmake is preinstalled on ubuntu-latest; `build.rs` honours a
+      # `CMAKE` override elsewhere and refuses with that name if it finds no binary at all.
+      - name: Build and package
+        run: .github/scripts/package-assets.sh dist
+      # Run what the page will ship. The script proves llama.cpp's loader symbol is in the bytes; this proves the file
+      # starts, prints its version, and answers a JSON-RPC pipe — the three things a release asset can get wrong that no
+      # compile error reports (v0.1.0 shipped a binary with one subcommand, and F40 was an asset whose `np embed` refused).
+      - name: Run the packaged binary
         run: |
-          $version = (Get-Content Cargo.toml | Select-String '^version = "([^"]+)"').Matches[0].Groups[1].Value
-          $name = "np-$version-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path dist | Out-Null
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
-            -DestinationPath "dist/$name.zip"
-          "ASSET=$name.zip" | Tee-Object -FilePath $env:GITHUB_ENV -Append
-
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          name="np-$version-${{ matrix.target }}"
-          mkdir -p dist
-          tar -C "target/${{ matrix.target }}/release" -czf "dist/$name.tar.gz" "${{ matrix.binary }}"
-          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
-
-      # Explicit bash: on a Windows runner the default shell is pwsh, where `test -s` is not a command at all --
-      # the first dispatch got this far, built a real np.exe and then failed on the check meant to catch a bad
-      # archive. Git Bash is present on every runner, so one spelling works for all three platforms.
-      - name: Refuse an empty archive
-        shell: bash
-        run: test -s "dist/$ASSET"
-
+          set -euo pipefail
+          scratch=$(mktemp -d)
+          tar -xzf dist/np-*.tar.gz -C "$scratch"
+          "$scratch/np" --version
+          # HOME and the workspace are inside a scratch directory: this runs the way a person would, with no config on
+          # disk, and must not leave a registry or a database in the runner's home.
+          export HOME="$scratch/home"
+          mkdir -p "$scratch/vault" "$scratch/home"
+          printf '# Index\n\nSee [[Todo]]. And [[no such note]].\n' > "$scratch/vault/index.md"
+          printf -- '- [ ] write the release notes\n' > "$scratch/vault/todo.md"
+          "$scratch/np" scan "$scratch/vault"
+          # `links.list` (issue #2) and `models.list`'s `pinned` (issue #3) are the two reads this release adds. Asking
+          # the packaged binary about them is how "shipped in the source" and "shipped in the asset" stop being different
+          # claims — and both are readers, so this needs no model, no network and no key.
+          printf '%s\n' \
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"links.list\",\"params\":{\"workspace\":\"$scratch/vault\",\"rel\":\"index.md\"}}" \
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"models.list\",\"params\":{\"workspace\":\"$scratch/vault\"}}" \
+            | "$scratch/np" serve > "$scratch/serve.out"
+          cat "$scratch/serve.out"
+          # Read the responses as JSON, not as text: key order is not a promise, and "the dead target landed in
+          # `unresolved`" is a statement about *which array* it sits in — something a substring test cannot make.
+          graph=$(sed -n '1p' "$scratch/serve.out")
+          listing=$(sed -n '2p' "$scratch/serve.out")
+          echo "$graph" | jq -e '.result.indexed == true' >/dev/null || {
+            echo "links.list said this scanned workspace had never been scanned" >&2; exit 1
+          }
+          echo "$graph" | jq -e '.result.edges | any(.src == "index.md" and .dst == "todo.md" and .kind == "wiki")' >/dev/null || {
+            echo "links.list lost the edge index.md -> todo.md: $graph" >&2; exit 1
+          }
+          echo "$graph" | jq -e '.result.unresolved | any(.src == "index.md" and .target == "no such note")' >/dev/null || {
+            echo "links.list lost the dead target written in index.md: $graph" >&2; exit 1
+          }
+          # A dead target with a `dst` key would mean the asset invents a destination for a link that names none.
+          echo "$graph" | jq -e '.result.unresolved | all(has("dst") | not)' >/dev/null || {
+            echo "an unresolved edge carried a dst: $graph" >&2; exit 1
+          }
+          echo "$listing" | jq -e '.result.pinned.bytes_total > 0 and (.result.pinned.members | length > 0)' >/dev/null || {
+            echo "models.list carried no pinned section, so a GUI on this asset cannot price a fetch: $listing" >&2; exit 1
+          }
+          echo "packaged binary answers links.list and prices a fetch"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ASSET }}
-          path: dist/${{ env.ASSET }}
+          name: asset-linux-gnu
+          path: dist/*
+          if-no-files-found: error
+
+  windows-gnu-cross:
+    name: Asset — x86_64-pc-windows-gnu cross (with the runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache the pinned llama.cpp source
+        uses: actions/cache@v4
+        with:
+          path: .vendor
+          key: llama-cpp-${{ hashFiles('third_party/llama-cpp.toml', 'scripts/vendor-llama-cpp.sh') }}
+      - name: Vendor llama.cpp
+        run: ./scripts/vendor-llama-cpp.sh
+      # The win32 threading model is not a preference here: with posix-threaded drivers the exe imports
+      # `libwinpthread-1.dll` and stops being one file, and the script's import-table guard refuses that. Ubuntu splits the
+      # toolchain so the plain name comes from the posix package; `-win32` suffixed drivers come from the win32 ones, and
+      # the script needs both (it finds the directory by the plain `gcc` and then requires the `-win32` pair).
+      - name: Install the mingw-w64 win32 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64-win32 binutils-mingw-w64-x86-64
+          x86_64-w64-mingw32-gcc --version | head -1
+          x86_64-w64-mingw32-g++-win32 --version | head -1
+      # Written here rather than committed: it names this runner's compiler paths, and a file that hardcodes one machine's
+      # scratch directory is the bug the script's own header apologises for. `build.rs` requires the file to exist and the
+      # script requires it to name a win32 driver, so a wrong path fails loudly before anything compiles.
+      - name: Write the cmake toolchain file
+        run: |
+          prefix=$(dirname "$(command -v x86_64-w64-mingw32-gcc")")/x86_64-w64-mingw32-
+          cat > "$RUNNER_TEMP/mingw-win32.cmake" <<EOF
+          set(CMAKE_SYSTEM_NAME Windows)
+          set(CMAKE_SYSTEM_PROCESSOR x86_64)
+          set(TOOL_PREFIX ${prefix})
+          set(CMAKE_C_COMPILER   \${TOOL_PREFIX}gcc-win32)
+          set(CMAKE_CXX_COMPILER \${TOOL_PREFIX}g++-win32)
+          set(CMAKE_AR           \${TOOL_PREFIX}ar)
+          set(CMAKE_RANLIB       \${TOOL_PREFIX}ranlib)
+          set(CMAKE_RC_COMPILER  \${TOOL_PREFIX}windres)
+          EOF
+          cat "$RUNNER_TEMP/mingw-win32.cmake"
+      - name: Build, guard and package
+        env:
+          NP_LLAMA_CMAKE_TOOLCHAIN: ${{ runner.temp }}/mingw-win32.cmake
+        run: .github/scripts/cross-build-windows.sh dist
+      # The script refuses a binary that imports the mingw runtime or carries no llama.cpp; this refuses a release note
+      # that would claim Windows got the same thing as Linux. It does not: it is unsigned, not MSVC, and not
+      # bit-reproducible (`docs/ops-cross-build-windows-gnu.md`), and the notes have to say all three.
+      - name: Say what this asset is and is not
+        run: |
+          {
+            echo "This asset is cross-built with mingw-w64 on Linux: unsigned, **not MSVC**, and not bit-reproducible"
+            echo "(its published sha256 identifies the file you downloaded; rebuilding will not reproduce it byte for byte)."
+            echo "It is built with \`local-model,fetch\`, so it embeds and auto-fetches; the model itself is never in the"
+            echo "asset — 309 MB arrives only when a human runs \`np setup\` or \`np embed\`."
+          } > dist/ABOUT-windows-gnu-cross.md
+          cat dist/ABOUT-windows-gnu-cross.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-windows-gnu-cross
+          path: dist/*
           if-no-files-found: error
 
   release:
     name: Publish the release
-    needs: build
+    # Both assets must exist. A release that ships one of the two is a page whose notes describe a file nobody uploaded,
+    # so `needs` (not `if: always()`) is what decides this.
+    needs: [linux, windows-gnu-cross]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish)
     runs-on: ubuntu-latest
     steps:
@@ -91,6 +190,27 @@ jobs:
         with:
           path: assets
           merge-multiple: true
+
+      # Both scripts write a `SHA256SUMS.txt` into their own output directory, and `merge-multiple` flattens the two
+      # downloads onto one path — so one of them would silently overwrite the other and the release would publish a
+      # checksum file that names only half the assets. Concatenated here, with the archives themselves left alone: a
+      # downloader verifies against one file that lists everything on the page.
+      - name: Combine the checksums
+        run: |
+          find assets -name SHA256SUMS.txt -print0 | xargs -0 cat > assets/SHA256SUMS.txt.combined
+          find assets -name SHA256SUMS.txt -delete
+          mv assets/SHA256SUMS.txt.combined assets/SHA256SUMS.txt
+          sort assets/SHA256SUMS.txt
+          # Every archive on the page must appear in it. A checksum file that names one asset and ships two is a
+          # verification step that fails quietly: nobody notices until someone's digest does not match anything.
+          for archive in assets/*.tar.gz assets/*.zip; do
+            [ -e "$archive" ] || continue
+            name=$(basename "$archive")
+            grep -q "  $name\$" assets/SHA256SUMS.txt || {
+              echo "SHA256SUMS.txt does not cover $name" >&2
+              exit 1
+            }
+          done
 
       # `--generate-notes` rather than a hand-written body: the notes are the commit list, which is
       # the only description this repository keeps up to date.

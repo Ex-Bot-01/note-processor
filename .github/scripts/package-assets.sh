@@ -7,10 +7,16 @@
 # subcommands while shipping a binary with one. A human with a checkout can now produce the same artifact and say honestly
 # where it came from — this script does **not** pretend to be the runner, and neither may the release notes that cite it.
 #
-# One platform per invocation, and only the platform you are standing on: a Windows asset needs the MSVC linker and a macOS
-# asset needs Apple's SDK, so the other two rows of the release matrix stay CI's (or their own machine's) job — for Windows there is
-# also `.github/scripts/cross-build-windows.sh`, which produces the `…-gnu-cross` asset from Linux. That limit is stated in
+# One platform per invocation, and only the platform you are standing on: a macOS asset needs Apple's SDK, which no
+# cross-compiler here has, and `crates/np-core/build.rs` refuses to compile llama.cpp for MSVC rather than meet a linker
+# error. The other shape this repository ships — `x86_64-pc-windows-gnu-cross` — comes from its own file,
+# `.github/scripts/cross-build-windows.sh`, which cross-builds that asset from Linux with mingw-w64. That limit is stated in
 # `docs/ops-distribution-and-ci-decision.md` rather than hidden behind a script that appears to build releases.
+#
+# **Since 2026-11-13 the release workflow runs this file.** It used to carry its own `cargo build` over a Windows/Linux/macOS
+# matrix, and the two recipes disagreed about features: this script built `local-model,fetch`, the workflow built default
+# features. Every asset CI produced was therefore a binary that could not embed while the release page said it could (F40).
+# There is now one build definition, and it is the one in this file and its Windows sibling.
 #
 # **Since 2026-11-08 this builds `local-model,fetch`**, so the asset contains the inference runtime (llama.cpp statically linked) and can
 # embed and auto-fetch. That costs cmake and a C++ compiler at *build* time — not at run time, which is the point: the user's machine needs
