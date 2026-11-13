@@ -111,6 +111,26 @@ if command -v objdump >/dev/null 2>&1 && [ -n "$cache" ]; then
   { find "$(dirname "$cache")" -name '*.o' -print0 2>/dev/null \
       | xargs -0 -r -I{} sh -c 'printf "%s %s\n" "$(objdump -d "{}" 2>/dev/null | grep -cE "%ymm|%zmm")" "{}"' \
       | sort -rn | awk '$1 > 0' | head -10 | sed "s|$(dirname "$cache")/||; s/^/  /"; } || true
+  # **What the compiler assumes when nothing tells it otherwise.** Everything above this line reads OFF and every `-D` is
+  # accounted for, yet these files carry AVX on a runner and none in a local build with the same pin — which leaves the default
+  # target of the compiler itself, set where no build log looks: how `cc` was configured. `-Q --help=target` prints it.
+  { "${CC:-cc}" -Q --help=target 2>/dev/null | grep -E '^\s+-m(arch|tune)=' | sed 's/^/  default /'; } || true
+  # And the flags actually handed to each translation unit, read out of the JSON rather than grepped: cmake writes either
+  # `"command"` or `"arguments"` depending on its own version, and a `grep` that matches neither prints an empty line — which
+  # reads exactly like "no arch flags", as it did here for two rehearsals. A silent probe is worse than no probe.
+  { python3 - "$cc" <<'PYCHK'
+import json, sys, collections
+try:
+    entries = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"  compile_commands.json unreadable: {e}"); raise SystemExit(0)
+flags = collections.Counter()
+for e in entries:
+    cmd = e.get("command") or " ".join(e.get("arguments", []))
+    flags.update(t for t in cmd.split() if t.startswith("-m"))
+print(f"  {len(entries)} translation units; -m flags in use: " + (", ".join(sorted(flags)) or "none"))
+PYCHK
+  } || true
   { echo "compilers   cc=$(command -v "${CC:-cc}") cxx=$(command -v "${CXX:-c++}") cmake=$(command -v "${CMAKE:-cmake}")"; } || true
   { echo "flags       CFLAGS=${CFLAGS-<unset>} CXXFLAGS=${CXXFLAGS-<unset>}" \
              "RUSTFLAGS=${RUSTFLAGS-<unset>} CCACHE=${CCACHE:-<unset>}"; } || true
