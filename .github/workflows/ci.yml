@@ -72,6 +72,12 @@ jobs:
         os: ${{ fromJSON(needs.prepare.outputs.oses) }}
     steps:
       - uses: actions/checkout@v4
+      # A `run:` block with its quotes nested wrong is not a YAML error (the file loads) and not a Rust error (no gate sees it),
+      # and Actions does not parse a step's script until that step starts — which is how one character cost a full Windows
+      # llama.cpp cross-build on `43496323581`. Parsing every block costs milliseconds, so it runs first, before any compile.
+      - name: Workflow shell steps parse
+        if: runner.os == 'Linux'
+        run: .github/scripts/check-workflow-shells.sh
       - name: Toolchain components
         run: rustup component add clippy rustfmt
       - name: Format

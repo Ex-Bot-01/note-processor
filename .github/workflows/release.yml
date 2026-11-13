@@ -72,25 +72,43 @@ jobs:
           scratch=$(mktemp -d)
           tar -xzf dist/np-*.tar.gz -C "$scratch"
           "$scratch/np" --version
-          # HOME and the workspace are inside a scratch directory: this runs the way a person would, with no config on
-          # disk, and must not leave a registry or a database in the runner's home.
+          # HOME, the config and the data dir all live in a scratch directory: this runs the way a person would, and must not
+          # leave a registry or a database in the runner's home.
           export HOME="$scratch/home"
-          mkdir -p "$scratch/vault" "$scratch/home"
-          printf '# Index\n\nSee [[Todo]]. And [[no such note]].\n' > "$scratch/vault/index.md"
+          export XDG_CONFIG_HOME="$scratch/home/cfg" XDG_DATA_HOME="$scratch/home/data"
+          mkdir -p "$XDG_CONFIG_HOME/note-processor" "$XDG_DATA_HOME" "$scratch/vault"
+          # A configured model id is what gives `pinned` something to price. With none, `models.list` answers an empty list —
+          # the honest answer ("nothing here has a price to name yet", issue #3) and not a shape this step could check. The
+          # first dispatch of this step found exactly that: `pinned: []`, because nothing was configured, was read as
+          # "the feature is missing".
+          printf '[embeddings]\nmodel = "embeddinggemma-2"\n' > "$XDG_CONFIG_HOME/note-processor/config.toml"
+          printf '# Index\n\nSee [[todo]]. And [[no such note]].\n' > "$scratch/vault/index.md"
           printf -- '- [ ] write the release notes\n' > "$scratch/vault/todo.md"
           "$scratch/np" scan "$scratch/vault"
-          # `links.list` (issue #2) and `models.list`'s `pinned` (issue #3) are the two reads this release adds. Asking
-          # the packaged binary about them is how "shipped in the source" and "shipped in the asset" stop being different
-          # claims — and both are readers, so this needs no model, no network and no key.
+          # Three reads, none of which needs a model, a network or a key: `initialize` (does this binary claim the runtime?),
+          # `links.list` (issue #2) and `models.list`'s `pinned` (issue #3). Asking the packaged asset is how "shipped in the
+          # source" and "shipped in the asset" stop being different claims.
           printf '%s\n' \
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"links.list\",\"params\":{\"workspace\":\"$scratch/vault\",\"rel\":\"index.md\"}}" \
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"models.list\",\"params\":{\"workspace\":\"$scratch/vault\"}}" \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"links.list\",\"params\":{\"workspace\":\"$scratch/vault\",\"rel\":\"index.md\"}}" \
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"models.list\",\"params\":{\"workspace\":\"$scratch/vault\"}}" \
             | "$scratch/np" serve > "$scratch/serve.out"
           cat "$scratch/serve.out"
           # Read the responses as JSON, not as text: key order is not a promise, and "the dead target landed in
           # `unresolved`" is a statement about *which array* it sits in — something a substring test cannot make.
-          graph=$(sed -n '1p' "$scratch/serve.out")
-          listing=$(sed -n '2p' "$scratch/serve.out")
+          handshake=$(sed -n '1p' "$scratch/serve.out")
+          graph=$(sed -n '2p' "$scratch/serve.out")
+          listing=$(sed -n '3p' "$scratch/serve.out")
+          # **The claim this whole file exists to keep.** `package-assets.sh` proves llama.cpp is in the bytes; this proves the
+          # shipped interface says so too, because F40 was an asset whose every build-time check passed while its `np embed`
+          # answered `runtime not built`. A default-feature asset reports `local_model: false` here — measured on a local debug
+          # build — so this line is the release path noticing a feature list that drifted.
+          echo "$handshake" | jq -e '.result.features.local_model == true and .result.features.fetch == true' >/dev/null || {
+            echo "this asset does not carry the inference runtime: $handshake" >&2; exit 1
+          }
+          echo "$handshake" | jq -e '.result.methods | index("links.list") != null' >/dev/null || {
+            echo "links.list is not in this build's method list: $handshake" >&2; exit 1
+          }
           echo "$graph" | jq -e '.result.indexed == true' >/dev/null || {
             echo "links.list said this scanned workspace had never been scanned" >&2; exit 1
           }
@@ -104,10 +122,18 @@ jobs:
           echo "$graph" | jq -e '.result.unresolved | all(has("dst") | not)' >/dev/null || {
             echo "an unresolved edge carried a dst: $graph" >&2; exit 1
           }
-          echo "$listing" | jq -e '.result.pinned.bytes_total > 0 and (.result.pinned.members | length > 0)' >/dev/null || {
-            echo "models.list carried no pinned section, so a GUI on this asset cannot price a fetch: $listing" >&2; exit 1
+          # `pinned` is a list — one entry for the configured id, empty when nothing is configured — so it is read as a list.
+          echo "$listing" | jq -e '
+              (.result.pinned | length) == 1
+              and .result.pinned[0].id == "embeddinggemma-2"
+              and .result.pinned[0].bytes_total > 0
+              and (.result.pinned[0].members | length > 0)' >/dev/null || {
+            echo "models.list priced no fetch, so a GUI on this asset cannot put a number in front of a consent prompt: $listing" >&2
+            exit 1
           }
-          echo "packaged binary answers links.list and prices a fetch"
+          # The number is the text-only plan (§14's pin table, read by `pins::plan_size`), and quoting it here is how a change
+          # to what a build volunteers shows up as a release failure rather than a surprised user.
+          echo "packaged binary: runtime in, links.list answers, fetch priced at $(echo "$listing" | jq -r '.result.pinned[0].bytes_total') B"
       - uses: actions/upload-artifact@v4
         with:
           name: asset-linux-gnu
@@ -142,7 +168,24 @@ jobs:
       # script requires it to name a win32 driver, so a wrong path fails loudly before anything compiles.
       - name: Write the cmake toolchain file
         run: |
-          prefix=$(dirname "$(command -v x86_64-w64-mingw32-gcc")")/x86_64-w64-mingw32-
+          # Derived from the win32 C++ driver rather than from `dirname` of the plain `gcc`: Ubuntu installs that name as an
+          # `update-alternatives` symlink, so it points wherever the alternatives system happens to have put it, and this file
+          # has to name the drivers the script's own guard will accept. Stripping the driver's own suffix off its own path is
+          # the one spelling that cannot disagree with the binary it came from.
+          cxx=$(command -v x86_64-w64-mingw32-g++-win32)
+          if [ -z "$cxx" ]; then
+            echo "no x86_64-w64-mingw32-g++-win32 on PATH after the install step" >&2
+            exit 1
+          fi
+          prefix="${cxx%g++-win32}"
+          # Checked before anything compiles: cmake would otherwise fail five minutes into a llama.cpp build, on a host that
+          # had the compiler package but not the binutils one.
+          for tool in gcc-win32 g++-win32 ar ranlib windres; do
+            if [ ! -x "$prefix$tool" ]; then
+              echo "the toolchain file would name $prefix$tool, which does not exist" >&2
+              exit 1
+            fi
+          done
           cat > "$RUNNER_TEMP/mingw-win32.cmake" <<EOF
           set(CMAKE_SYSTEM_NAME Windows)
           set(CMAKE_SYSTEM_PROCESSOR x86_64)

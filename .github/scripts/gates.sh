@@ -117,6 +117,11 @@ row catalog-goldens python3 "$S/verify_catalog_goldens.py"
 # this row used `$S` and failed with "can't open file", which is the sound of a gate row skipping itself while still printing
 # a red exit code — better than silently passing, but only just.
 row f31-selftest python3 .github/scripts/f31_eval.py --self-test
+# **A `run:` block that is not a program bash can read.** Actions parses a step's script when the step starts, so on 2026-11-13
+# a mis-nested quote in `release.yml` was discovered by a runner — after it had compiled llama.cpp for Windows. This row costs
+# milliseconds and is the difference between that and a red local run. Not `$S`: it lives beside this script, like the self-test
+# above.
+row workflow-shells .github/scripts/check-workflow-shells.sh
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.
