@@ -228,14 +228,14 @@ for want in ("np.exe", "THIRD_PARTY_NOTICES.md", "LICENSE"):
 PY
 test -s "$archive"
 
-# Both hashes, because the release notes quote both: the zip a downloader verifies, and the exe inside it that a report quotes when it says
-# "the binary I ran had sha256 …".
+# The exe's digest is printed, and the release notes quote it, because a report says "the binary I ran had sha256 …".
 exe_sha=$(sha256sum "$exe" | cut -d' ' -f1)
 archive_sha=$(sha256sum "$archive" | cut -d' ' -f1)
-{
-  printf '%s  np.exe\n' "$exe_sha"
-  printf '%s  %s\n' "$archive_sha" "$(basename "$archive")"
-} > "$out/SHA256SUMS.txt"
+# **Only the archive goes in the checksum file.** `SHA256SUMS.txt` is verified by a person who ran `sha256sum -c` on the files the
+# release page gave them, and `np.exe` is not one of those files — it is inside the zip. Measured on v0.4.0's own page:
+# `np-…tar.gz: OK`, then `np.exe: FAILED open or read`, which reads as a corrupt download and is not one. The exe digest belongs in
+# the notes, where it is quoted as a fact about a build, not in a file whose every line is a command.
+printf '%s  %s\n' "$archive_sha" "$(basename "$archive")" > "$out/SHA256SUMS.txt"
 
 echo "asset    $archive  $(stat -c%s "$archive") B  sha256 $archive_sha"
 echo "inner    np.exe    $(stat -c%s "$exe") B  sha256 $exe_sha"

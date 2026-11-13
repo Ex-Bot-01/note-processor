@@ -266,6 +266,17 @@ jobs:
               exit 1
             }
           done
+          # **The other direction, which is the one that lied.** A checksum file may not name a file the page does not carry:
+          # `sha256sum -c SHA256SUMS.txt` then prints `FAILED open or read` for something nobody could have downloaded wrong, and a
+          # verification step that fails on its own bookkeeping teaches people to ignore it. v0.4.0's first page listed `np.exe`,
+          # which lives inside the zip; this loop is what stops that being a property of pages again.
+          while read -r _ name; do
+            [ -n "$name" ] || continue
+            if [ ! -f "assets/$name" ]; then
+              echo "SHA256SUMS.txt names $name, which is not an asset on this page" >&2
+              exit 1
+            fi
+          done < assets/SHA256SUMS.txt
 
           # The per-asset files did their job — arriving under distinct names so neither overwrote the other, and being joined
           # above. Leaving them on the page too would put three checksum files beside two archives and make a downloader guess
