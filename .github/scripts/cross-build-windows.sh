@@ -116,7 +116,14 @@ echo "codegen  NP_LLAMA_PORTABLE=$NP_LLAMA_PORTABLE (baseline x86-64; checked ag
 # caches, one with nine times the AVX in it. State the floor instead of inheriting the host's.
 if [ "${NP_LLAMA_PORTABLE:-0}" != "0" ]; then
   export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=x86-64"
+  # The C that bypasses cmake too: `libsqlite3-sys` and `ring` build through the `cc` crate, which reads `CFLAGS` from the
+  # environment. A cross build gets its floor for llama.cpp from the toolchain file and nothing at all for those two — and on
+  # 2026-11-13 that is where the last AVX in a "portable" Linux asset was hiding, with `np scan` dying of `SIGILL` on a pre-AVX
+  # host while `np --version`, which never opens a database, ran fine.
+  export CFLAGS="${CFLAGS:+$CFLAGS }-march=x86-64"
+  export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-march=x86-64"
   echo "codegen  RUSTFLAGS=$RUSTFLAGS"
+  echo "codegen  CFLAGS=$CFLAGS"
 fi
 
 echo "build    cargo build --release --locked -p np-cli --features local-model,fetch --target $target"

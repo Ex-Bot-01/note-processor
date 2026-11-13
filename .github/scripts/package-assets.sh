@@ -54,7 +54,17 @@ echo "codegen  NP_LLAMA_PORTABLE=$NP_LLAMA_PORTABLE (1 = baseline x86-64, runs o
 # the floor to both halves: `-C target-cpu=x86-64` here, `GGML_NATIVE=OFF` plus every `GGML_<ISA>` off in `build.rs`.
 if [ "${NP_LLAMA_PORTABLE:-0}" != "0" ]; then
   export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=x86-64"
+  # **…and to the C that never goes through cmake.** `build.rs` pins the floor inside llama.cpp's own configure, but
+  # `libsqlite3-sys` and `ring` compile their C with the `cc` crate, which reads `CFLAGS` from the environment and has never heard of
+  # cmake. That is where the last AVX in a "portable" asset came from on 2026-11-13: llama.cpp's objects were clean at zero wide
+  # instructions, `np --version` ran here at last, and `np scan` — which reaches SQLite immediately and nothing else — still died of
+  # `SIGILL` — measured here: that one file alone carries 3,793 AVX instructions when the compiler defaults above the floor and
+  # zero once `-march=x86-64` is on its command line. Appended last, which withdraws a runner's built-in default and an inherited
+  # `-march=native`; it would not withdraw an explicit `-mavx2`, since gcc treats feature flags as cumulative over an arch.
+  export CFLAGS="${CFLAGS:+$CFLAGS }-march=x86-64"
+  export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-march=x86-64"
   echo "codegen  RUSTFLAGS=$RUSTFLAGS"
+  echo "codegen  CFLAGS=$CFLAGS"
 fi
 
 cargo build --release --locked -p np-cli --features local-model,fetch --target "$target"

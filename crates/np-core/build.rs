@@ -129,8 +129,11 @@ const PORTABLE_ISA_OPTIONS: [&str; 6] = [
 ];
 
 /// The instruction-set floor a portable build compiles to, spelled the way the compiler spells it. Appended **last** to
-/// whatever `CFLAGS`/`CXXFLAGS` already said, because gcc honours the rightmost `-march=`: on the release path this promise
-/// outranks an inherited environment, and [`require_portable_codegen`] says so when it does not hold.
+/// whatever `CFLAGS`/`CXXFLAGS` already said, because gcc honours the rightmost `-march=` — and note the limit of that trick,
+/// measured here: `-mavx2 -march=x86-64` still defines `__AVX2__`, because an explicit feature flag is cumulative over an arch
+/// while a *default* target is not. So this withdraws a runner's built-in default and an inherited `-march=native`, and does
+/// **not** withdraw someone's explicit `-mavx2`. That distinction is exactly why [`require_portable_codegen`] asks the compiler
+/// which macros it predefines instead of trusting that a flag was honoured.
 const PORTABLE_MARCH_FLAG: &str = "-march=x86-64";
 
 /// What a baseline x86-64 compiler must **not** predefine. Read from the compiler rather than from a flag list, because the
@@ -1459,7 +1462,16 @@ fn require_portable_codegen(build_dir: &Path, portable: bool) -> Result<(), Stri
     // start on a pre-AVX machine. Options can withdraw features something asked for; they cannot withdraw the compiler's own
     // default target, which is why `{PORTABLE_MARCH_FLAG}` goes on the command line and why its effect is measured here.
     let mut above = Vec::new();
-    if let Some(compiler) = cache.get("CMAKE_C_COMPILER") {
+    // **Which compiler, from whichever record actually has it.** A native configure files `CMAKE_C_COMPILER:FILEPATH`; a cross
+    // build driven by a toolchain file does not always, and the first run of this check failed the Windows job with "records no
+    // CMAKE_C_COMPILER" while the compiler was sitting in `CMakeFiles/<ver>/CMakeCCompiler.cmake` — the same reason
+    // [`configured_compiler`] already exists for locating the mingw runtime archives. Falling back to it is a fix, not a waiver:
+    // if neither record names a compiler, this function still refuses below.
+    let compiler = cache
+        .get("CMAKE_C_COMPILER")
+        .cloned()
+        .or_else(|| configured_compiler(build_dir));
+    if let Some(compiler) = compiler.as_deref() {
         match predefined_macros(
             compiler,
             cache.get("CMAKE_C_FLAGS").map(String::as_str).unwrap_or(""),
