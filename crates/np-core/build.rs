@@ -107,6 +107,27 @@ const WINDOWS_SYSTEM_LIBS: [&str; 3] = ["m", "ws2_32", "bcrypt"];
 /// C++ tree. Read from a cross recipe (`docs/ops-cross-build-windows-gnu.md`), never guessed at here.
 const TOOLCHAIN_ENV: &str = "NP_LLAMA_CMAKE_TOOLCHAIN";
 
+/// Set this to build llama.cpp for **any** x86-64 machine rather than for the one running cmake. The release
+/// scripts (`.github/scripts/package-assets.sh`, `.github/scripts/cross-build-windows.sh`) set it; a developer
+/// building for their own machine leaves it unset and keeps upstream's `-march=native` fast path. Read once, then
+/// enforced from cmake's cache by [`require_portable_codegen`] — see the measurement at the configure site for why
+/// both halves are needed.
+const PORTABLE_ENV: &str = "NP_LLAMA_PORTABLE";
+
+/// The options that each raise the instruction-set floor of a static build. `GGML_NATIVE` alone is not the floor:
+/// turning it off on a native build switches upstream's `INS_ENB` on, which turns **these** on, and they become
+/// `-msse4.2 … -mavx2` flags on the whole cpu backend (`ggml/src/ggml-cpu/CMakeLists.txt:350-371`). AVX512/VNNI/AMX
+/// default OFF in every mode, so they are not listed; if a future pin turns one on by default, add it here and the
+/// cache check will say so.
+const PORTABLE_ISA_OPTIONS: [&str; 6] = [
+    "GGML_SSE42",
+    "GGML_AVX",
+    "GGML_AVX2",
+    "GGML_FMA",
+    "GGML_F16C",
+    "GGML_BMI2",
+];
+
 /// Where [`stage_prefixed_archives`] puts the archives a cross build links against.
 const LINK_STAGE_DIR: &str = "llama-link-windows-gnu";
 
@@ -224,6 +245,7 @@ fn link_pinned_llama(shape: &Shape) -> Result<(), String> {
     }
 
     println!("cargo::rerun-if-env-changed={TOOLCHAIN_ENV}");
+    println!("cargo::rerun-if-env-changed={PORTABLE_ENV}");
 
     // §14 claimed nothing about Windows or macOS, so this refused every non-Linux target: better a refusal
     // naming the design section than a stranger meeting `-l stdc++` cannot find (macOS) or four wrong archive
@@ -558,6 +580,7 @@ fn configure(
     pin: &Pin,
     cross: Option<&Path>,
 ) -> Result<(), String> {
+    let portable = portable_requested();
     let mut cache = read_cache(&build_dir.join("CMakeCache.txt"));
 
     // **A cmake cache remembers which source tree it was generated from, and refuses another.** Pointed at a
@@ -622,18 +645,23 @@ fn configure(
     // measured 2026-11-08, "already configured for the pin's options; skipping configure" followed by an archive
     // set built with the host compiler and no `lib` prefix. Same reasoning as the CMakeLists digest above: name
     // an input only if something acts on it.
-    let extras = match cross {
+    let mut extras = match cross {
         Some(toolchain) => format!(
-            "toolchain={}\nCMAKE_STATIC_LIBRARY_PREFIX=lib\n",
+            "toolchain={}\nGGML_NATIVE=OFF\nCMAKE_STATIC_LIBRARY_PREFIX=lib\n",
             toolchain.display()
         ),
         None => String::new(),
     };
-    // `GGML_NATIVE=OFF` is stamped for **every** configure, not only a cross one, because it stopped being a
-    // cross-only fact on 2026-11-13 (see the argument below). A host cache configured while it was ON has to be
-    // seen as changed rather than certified fresh — which is what this line does for the machine upgrading.
+    if portable {
+        // Part of the configure's identity: a warm cache configured for this machine must not be certified fresh for
+        // a portable one, or `NP_LLAMA_PORTABLE=1` would print its promise and reuse the AVX-512 archives anyway.
+        extras.push_str("GGML_NATIVE=OFF\n");
+        for option in PORTABLE_ISA_OPTIONS {
+            extras.push_str(&format!("{option}=OFF\n"));
+        }
+    }
     let wanted = format!(
-        "{}{}GGML_NATIVE=OFF\ncmakelists-sha256={}\n",
+        "{}{}cmakelists-sha256={}\n",
         pin.option_stamp(),
         extras,
         sha256_hex(
@@ -731,18 +759,49 @@ fn configure(
         "-B".to_string(),
         build_dir.display().to_string(),
     ];
-    // **The binary you are shipping is not going to run on the machine that built it.** `GGML_NATIVE` defaults to
-    // ON, which means `-march=native` — SIMD choices made by the CPU of whoever ran cmake, applied to every
-    // translation unit rather than only the kernels ggml dispatches at runtime. Measured 2026-11-13 on the first
-    // CI-built Linux asset (`np-0.4.0-x86_64-unknown-linux-gnu.tar.gz`, built on a hosted runner): 14,540 `%zmm`
-    // and 43,295 `%ymm` instructions in `np`, and `np --version` on an x86-64 host whose flags stop at SSE4.2
-    // answers `Illegal instruction (core dumped)` before it prints anything. Off, ggml compiles its per-ISA
-    // objects with their own target flags and picks between them from CPUID at run time, so an AVX-512 machine
-    // still gets the AVX-512 path and a plain x86-64 machine gets a binary that starts. Deliberately outside the
-    // pin's option set: this is a fact about who runs the build, not about the pinned tree.
-    args.push("-DGGML_NATIVE=OFF".to_string());
+    // **A release asset is run by machines that did not build it, and llama.cpp has no static runtime dispatch.**
+    // Both halves matter, and the first draft of this fix got the second one wrong.
+    //
+    // `GGML_NATIVE=ON` (upstream's default for a native build) means `-march=native`: SIMD chosen by the CPU of
+    // whoever ran cmake. Measured 2026-11-13 on the first CI-built Linux asset, built on a hosted runner: 14,540
+    // `%zmm` instructions in `np`, and `np --version` on an x86-64 host whose flags stop at SSE4.2 answered
+    // `Illegal instruction (core dumped)` before printing anything.
+    //
+    // Switching it off does **not** buy runtime dispatch on a static build — that is `GGML_CPU_ALL_VARIANTS`, which
+    // upstream refuses unless `GGML_BACKEND_DL` is on (`ggml/src/CMakeLists.txt:491`), and dynamic backends are a
+    // folder of `.so`s, not the single file this project ships. What `GGML_NATIVE=OFF` actually does on a native
+    // build is flip `INS_ENB` to ON (`ggml/CMakeLists.txt:141`), which turns on `GGML_SSE42`, `GGML_AVX`,
+    // `GGML_AVX2`, `GGML_FMA`, `GGML_F16C` and `GGML_BMI2` — and those become `-msse4.2 … -mavx2` flags on the whole
+    // cpu backend (`ggml/src/ggml-cpu/CMakeLists.txt:350-371`). Measured on the next rehearsal asset: AVX-512 gone,
+    // `%ymm` references **up** from 43,295 to 46,358, and `SIGILL` again at the same instruction (`c5 f9 ef c0`, a
+    // VEX-encoded `paddq`, which needs AVX even in its 128-bit form). That draft made every build require an AVX2
+    // machine, which is a wider floor than the one it replaced.
+    //
+    // So portable means the floor, named: native off **and** each instruction-set option off, which is exactly what
+    // a cross build already gets because `GGML_NATIVE_DEFAULT` is OFF there and `INS_ENB` follows it. The Windows
+    // asset has been baseline x86-64 since v0.2.2; this makes the Linux one say the same thing.
+    //
+    // Deliberately opt-in rather than the default, because the cost lands on whoever builds for their own machine:
+    // `cargo install` with `-march=native` is llama.cpp's fast path and the builder is the user there. The release
+    // scripts set this variable; [`require_portable_codegen`] then proves from cmake's own cache that it took.
+    if portable {
+        args.push("-DGGML_NATIVE=OFF".to_string());
+        for option in PORTABLE_ISA_OPTIONS {
+            args.push(format!("-D{option}=OFF"));
+        }
+    } else if cross.is_none() {
+        // Say the quiet part where a developer will read it: this tree is being compiled for *this* machine.
+        println!(
+            "cargo::warning=np-core: llama.cpp is being built with `-march=native` (GGML_NATIVE defaults to ON). \
+             Fine on this machine; set {PORTABLE_ENV}=1 for anything that will run elsewhere, see `np --version` \
+             refusing to start on a pre-AVX2 host (docs/reference-releases.md)."
+        );
+    }
     if let Some(toolchain) = cross {
         args.push(format!("-DCMAKE_TOOLCHAIN_FILE={}", toolchain.display()));
+        // Cross builds get the portable floor from upstream itself (`INS_ENB` follows `GGML_NATIVE_DEFAULT`, which
+        // is OFF when the target is not the host), so only the native switch has to be made here.
+        args.push("-DGGML_NATIVE=OFF".to_string());
         // mingw gives a static library **no prefix**: the build tree came out as `ggml.a`, `ggml-cpu.a`,
         // `ggml-base.a`, `libllama.a` (measured 2026-11-08), and GNU ld only ever searches `lib<name>.a` for
         // `-l <name>`. Asking cmake for the Unix prefix keeps one archive spelling across both targets, so
@@ -765,7 +824,7 @@ fn configure(
     );
     run(cmake, &args, "configure")?;
     verify_options_understood(build_dir, pin)?;
-    require_portable_codegen(build_dir)?;
+    require_portable_codegen(build_dir, portable)?;
     if cross.is_some() {
         require_win32_threading(build_dir)?;
     }
@@ -1286,31 +1345,68 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// That the configured tree is not tuned to the CPU that configured it.
+/// Whether this invocation asked for a portable tree, and what it says when the answer is neither yes nor no.
 ///
-/// `-DGGML_NATIVE=OFF` above is an argument, and an argument is a claim. The cache is the fact: cmake records what
-/// the tree was configured with, so this reads it back — the same move [`require_win32_threading`] makes about
-/// threading, for the same reason. Without it, a pin edit, a cached configure or a future refactor that drops the
-/// argument produces a binary that works on the builder and dies with `SIGILL` somewhere else, which is a class of
-/// failure no test on the build machine can observe.
-fn require_portable_codegen(build_dir: &Path) -> Result<(), String> {
-    let cache = read_cache(&build_dir.join("CMakeCache.txt"));
-    match cache.get("GGML_NATIVE") {
-        Some(value) if value.eq_ignore_ascii_case("OFF") => Ok(()),
-        Some(value) => Err(format!(
-            "{} records GGML_NATIVE={value}, not OFF.\n  \
-             A tree configured that way is compiled `-march=native` against the CPU running cmake, which \n  \
-             measured 2026-11-13 as a release asset containing 14,540 AVX-512 instructions and refusing to start \n  \
-             on an older x86-64 host. Build the portable tree and let ggml dispatch on CPUID instead.",
-            build_dir.join("CMakeCache.txt").display()
-        )),
-        None => Err(format!(
-            "{} records no GGML_NATIVE, so this script cannot tell whether these archives were \n  \
-             compiled for the building machine's CPU. Upstream renamed or removed the option: check before \n  \
-             shipping an asset that may only run on machines like the runner that made it.",
-            build_dir.join("CMakeCache.txt").display()
-        )),
+/// An unparseable value is reported rather than ignored quietly: `NP_LLAMA_PORTABLE=yes-please` falling back to
+/// "not portable" would ship an asset tuned to the runner, which is the exact failure this variable exists to
+/// prevent — so it prints a warning naming what it saw and what it did.
+fn portable_requested() -> bool {
+    let Some(raw) = env::var_os(PORTABLE_ENV) else {
+        return false;
+    };
+    let text = raw.to_string_lossy().trim().to_ascii_lowercase();
+    match text.as_str() {
+        "" => false,
+        "0" | "off" | "no" | "false" => false,
+        "1" | "on" | "yes" | "true" => true,
+        other => {
+            println!(
+                "cargo::warning={PORTABLE_ENV}={other} is not a yes/no value; building for this machine \
+                 (`-march=native`) rather than portably. Set it to 1 for anything that will run elsewhere."
+            );
+            false
+        }
     }
+}
+
+/// That a build asked to be portable actually configured itself that way.
+///
+/// The `-D` arguments above are claims; cmake's own cache is the record. This is the same move
+/// [`require_win32_threading`] makes about threading, and it exists because the first attempt at this fix passed
+/// `-DGGML_NATIVE=OFF` **and still produced an AVX-requiring binary** — on a native build that flag switches `INS_ENB`
+/// on, which turns the per-ISA options on, which become `-mavx2` on the whole cpu backend. A check that only read
+/// `GGML_NATIVE` back would have called that tree portable. So every option that can raise the floor is read.
+///
+/// Only enforced when `{PORTABLE_ENV}` was requested: a developer's own build is allowed to be tuned to their own
+/// machine, and refusing that here would make the fast path impossible rather than optional.
+fn require_portable_codegen(build_dir: &Path, portable: bool) -> Result<(), String> {
+    if !portable {
+        return Ok(());
+    }
+    let cache_path = build_dir.join("CMakeCache.txt");
+    let cache = read_cache(&cache_path);
+    let mut raised = Vec::new();
+    for option in std::iter::once("GGML_NATIVE").chain(PORTABLE_ISA_OPTIONS) {
+        match cache.get(option) {
+            Some(value) if value.eq_ignore_ascii_case("OFF") => {}
+            // An absent key is not an OFF: it means upstream renamed or dropped the option and this script can no
+            // longer say what the tree was compiled for.
+            Some(value) => raised.push(format!("{option}={value}")),
+            None => raised.push(format!("{option}=absent")),
+        }
+    }
+    if raised.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{PORTABLE_ENV} is set, but {} does not describe a portable tree: {}.\n  \
+         A tree configured this way is compiled for one class of CPU — measured 2026-11-13 as a release asset \n  \
+         full of VEX-encoded instructions that answered `Illegal instruction` on an x86-64 host without AVX. The \n  \
+         portable floor is GGML_NATIVE=OFF **and** every GGML_<ISA> option OFF: llama.cpp's runtime dispatch lives \n  \
+         in dynamic backend variants (`GGML_CPU_ALL_VARIANTS`, which needs `GGML_BACKEND_DL`), not in a static build.",
+        cache_path.display(),
+        raised.join(", ")
+    ))
 }
 
 /// A posix-threaded mingw-w64 produces an exe that imports `libwinpthread-1.dll`, and that DLL is not on a

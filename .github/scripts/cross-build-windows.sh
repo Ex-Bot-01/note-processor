@@ -105,6 +105,12 @@ export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc-win32
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
 rustup target list --installed 2>/dev/null | grep -qx "$target" || rustup target add "$target"
 
+# A cross build already gets the portable floor from upstream (`GGML_NATIVE_DEFAULT` is OFF when the target is not the host), so
+# this mostly documents intent — but setting it also turns on `build.rs`'s cache check, which refuses the build if any option that
+# raises the instruction-set floor came out ON. The exe a Windows user downloads has to run on their CPU, not on Linux's.
+export NP_LLAMA_PORTABLE="${NP_LLAMA_PORTABLE-1}"
+echo "codegen  NP_LLAMA_PORTABLE=$NP_LLAMA_PORTABLE (baseline x86-64; checked against cmake's cache by build.rs)"
+
 echo "build    cargo build --release --locked -p np-cli --features local-model,fetch --target $target"
 cargo build --release --locked -p np-cli --features local-model,fetch --target "$target"
 

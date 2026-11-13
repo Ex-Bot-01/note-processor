@@ -39,6 +39,14 @@ if ! command -v "${CMAKE:-cmake}" >/dev/null 2>&1; then
   exit 1
 fi
 
+# **The asset is run by machines that did not build it.** `NP_LLAMA_PORTABLE=1` makes `build.rs` configure llama.cpp at the
+# baseline x86-64 floor instead of `-march=native`: on 2026-11-13 the first CI-built Linux asset was compiled for its runner's CPU
+# and answered `Illegal instruction` on an older x86-64 host before printing a version number. Override with
+# `NP_LLAMA_PORTABLE=0` only when the machine building this is the machine that will run it — `build.rs` reads the flag back out of
+# cmake's cache and refuses if the tree did not take it, so the promise cannot be decorative.
+export NP_LLAMA_PORTABLE="${NP_LLAMA_PORTABLE-1}"
+echo "codegen  NP_LLAMA_PORTABLE=$NP_LLAMA_PORTABLE (1 = baseline x86-64, runs on machines other than this one)"
+
 cargo build --release --locked -p np-cli --features local-model,fetch --target "$target"
 
 mkdir -p "$out"
