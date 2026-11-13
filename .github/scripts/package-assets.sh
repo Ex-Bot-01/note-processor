@@ -56,18 +56,20 @@ cargo build --release --locked -p np-cli --features local-model,fetch --target "
 # binary: `%zmm` must be zero at the baseline floor, and `%ymm` is reported rather than asserted because Rust crates carry
 # runtime-dispatched AVX2 of their own (a pre-AVX host measured 4,940 of them and runs fine). The instruction counts are the
 # part that caught the real fault: they did not move between two builds whose cmake options differed.
-cache=$(find "target/$target/release/build" -path '*/out/*/CMakeCache.txt' -newer Cargo.toml 2>/dev/null | head -1)
+# Every pipeline here ends in `|| true`: this script runs under `pipefail`, and `find | head` dies of SIGPIPE once `head` has
+# its line — which read as a build failure and stopped the script one line after it printed the thing it exists to print.
+cache=$(find "target/$target/release/build" -path '*/out/*/CMakeCache.txt' 2>/dev/null | head -1 || true)
 if [ -n "$cache" ]; then
   echo "cmake cache used by this link: $cache"
-  grep -E '^(GGML_NATIVE|GGML_SSE42|GGML_AVX|GGML_AVX2|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_OPENMP):' "$cache" | sed 's/^/  /'
+  { grep -E '^(GGML_NATIVE|GGML_SSE42|GGML_AVX|GGML_AVX2|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_OPENMP):' "$cache" | sed 's/^/  /'; } || true
 else
   echo "note: no CMakeCache.txt found under target/$target/release/build — nothing linked llama.cpp?" >&2
 fi
-binary="target/$target/release/np${ext}"
-if command -v objdump >/dev/null 2>&1 && [ -f "$binary" ]; then
-  objdump -d --section=.text "$binary" 2>/dev/null | awk '
+built="target/$target/release/$binary"
+if command -v objdump >/dev/null 2>&1 && [ -f "$built" ]; then
+  { objdump -d --section=.text "$built" 2>/dev/null | awk '
     /%zmm/ { z++ } /%ymm/ { y++ }
-    END { printf "codegen  .text instructions: %%zmm %d (must be 0 at the baseline floor), %%ymm %d\n", z + 0, y + 0 }'
+    END { printf "codegen  .text of $built: %%zmm %d (must be 0 at the baseline floor), %%ymm %d\n", z + 0, y + 0 }'; } || true
 fi
 
 mkdir -p "$out"
