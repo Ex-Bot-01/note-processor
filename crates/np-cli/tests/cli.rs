@@ -2736,13 +2736,36 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
         serde_json::from_str(&ok.stdout()).expect("`--json` prints exactly one JSON object");
     assert_eq!(
         json_keys(&value),
-        vec!["fetched", "hits", "mode", "note", "offline", "reason", "vectors"],
+        vec![
+            "fetched",
+            "hits",
+            "indexed",
+            "keyword_used",
+            "mode",
+            "note",
+            "offline",
+            "reason",
+            "semantic_used",
+            "vectors",
+        ],
         "the hit list plus the keys that say how it was made — **F45** added `reason` (a token beside the prose), `fetched` and
-         `offline` (F38's meanings, so one reader handles embed and search)"
+         `offline` (F38's meanings, so one reader handles embed and search); **#5** added `indexed` (has this workspace ever been
+         scanned) and `keyword_used` / `semantic_used` (which halves this answer was built from)"
     );
     assert_eq!(
         value["mode"], "hybrid",
-        "the default mode reports its own name"
+        "the default mode reports its own name — **what was asked for**, which since #5 is no longer confused with what ran: \
+         `keyword_used`/`semantic_used` below answer that"
+    );
+    assert_eq!(
+        value["keyword_used"], true,
+        "the keyword list ran, and says so even though the mode's name is hybrid"
+    );
+    assert_eq!(
+        value["semantic_used"],
+        false,
+        "no vector list was consulted, so a client must not render this answer as hybrid: {}",
+        ok.stdout()
     );
     assert_eq!(
         value["vectors"], false,
@@ -2800,6 +2823,85 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
         "the keyword half has to show its evidence: {}",
         ok.stdout()
     );
+}
+
+/// **"Your folder is not indexed" is a different answer from "nothing matches"** (issue **#5**).
+///
+/// Reproduced against `np 0.3.1` by the GUI that reported it: on a fresh vault, with no `scan`, `search`
+/// answered `{"hits":[],"mode":"hybrid","vectors":false,"reason":"provider-disabled",…}` and then answered the
+/// same question differently once a scan had run — nothing in the first payload mentioned the missing index,
+/// because every key in it describes the *answer* and none described the *workspace*.
+///
+/// Both channels are asserted, because both were blind: `--json` gains the decidable key, and the text channel
+/// stops telling a person that their words matched nothing when the truth is that nothing was ever read.
+#[test]
+fn searching_a_workspace_that_was_never_scanned_says_it_was_never_scanned() {
+    let ws = workspace();
+    let query = "kumquat";
+
+    // ---- The machine channel, before any scan.
+    let mut before = ws.command_without_operand(&["search"]);
+    before.arg(&ws.root).arg(query).arg("--json");
+    let ok = run(&mut before);
+    assert_eq!(
+        ok.code(),
+        0,
+        "an unindexed vault is still a fact: {}",
+        ok.stderr()
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&ok.stdout()).expect("`--json` prints exactly one JSON object");
+
+    assert!(
+        value["hits"].as_array().is_some_and(|hits| hits.is_empty()),
+        "and no hits, of course: {value}"
+    );
+    assert_eq!(
+        value["indexed"], false,
+        "the one key that tells this world apart from a vault with nothing to find: {value}"
+    );
+    // The other keys keep meaning what they meant: `reason` is about the semantic half, which is a different
+    // fact and true either way — which is exactly why it could not carry this one.
+    assert_eq!(value["reason"], "provider-disabled", "{value}");
+
+    // ---- The human channel, same vault, same question.
+    let mut text = ws.command_without_operand(&["search"]);
+    text.arg(&ws.root).arg(query);
+    let ok = run(&mut text);
+    assert_eq!(ok.code(), 0, "{}", ok.stderr());
+    let line = ok.stdout().trim_end().to_string();
+    assert!(
+        line.contains("never been scanned") && line.contains("np scan"),
+        "the sentence has to name the state and the command that clears it: {line:?}"
+    );
+    assert!(
+        line.contains(&ws.root.display().to_string()),
+        "and the argv it names is for the vault that was asked about: {line:?}"
+    );
+
+    // ---- After one scan, both channels change their story, and only this key changes.
+    run(&mut ws.command(&["scan"])).assert_success();
+    let mut after = ws.command_without_operand(&["search"]);
+    after
+        .arg(&ws.root)
+        .arg("zzz nothing in this vault at all")
+        .arg("--json");
+    let ok = run(&mut after);
+    assert_eq!(ok.code(), 0, "{}", ok.stderr());
+    let value: serde_json::Value = serde_json::from_str(&ok.stdout()).expect("one JSON object");
+
+    assert_eq!(
+        value["indexed"], true,
+        "a committed scan is what flips this, not a hit: {value}"
+    );
+    assert!(
+        value["hits"].as_array().is_some_and(|hits| hits.is_empty()),
+        "and the answer is still empty, which is now unambiguous: {value}"
+    );
+
+    // Mutation this catches: dropping `indexed` from `search_document` fails both JSON assertions; printing the
+    // old three sentences unconditionally fails the text one; computing `indexed` from "does the .sqlite file
+    // exist" fails the FIRST assertion, because searching a vault mints that file.
 }
 
 #[test]

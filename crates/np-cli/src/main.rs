@@ -1110,6 +1110,16 @@ struct SearchRun {
     /// Whether the index holds vectors at all — the truth about the workspace, which **F45** ruled must stay `true` even when this answer could
     /// not use them, because a reader that sees `false` will go and re-fetch a model it does not need.
     present: bool,
+    /// Whether anyone has ever scanned this workspace (**issue #5**). `mode`, `vectors` and `reason` all answer
+    /// questions *about the answer*; this one answers a question about the workspace, and until now an empty list
+    /// from a vault nobody indexed was indistinguishable from an empty list from a vault with nothing to find.
+    indexed: bool,
+    /// Which halves of the mode actually ran (**issue #5**). `mode` is what the caller *asked for* — and since
+    /// **F45** hybrid answers from keywords alone while `vectors` keeps reporting the truth about the workspace,
+    /// so neither of those two says what this answer was built from. A client that shows "hybrid" here is showing
+    /// a word `np` chose for an intent, not a word for a result; these two are the words for the result.
+    keyword_used: bool,
+    semantic_used: bool,
     note: Option<search::RankNote>,
     fetched: Option<Value>,
     offline: bool,
@@ -1131,6 +1141,12 @@ fn search_run(
     // Config first, flag over it: `[search] mode` is the standing choice and `--mode` is the exception to it.
     let mode = mode.unwrap_or(cfg.search.mode);
     let db = workspace_db(&cfg, workspace)?;
+    // **Asked before any work, because it is a fact about the workspace rather than about the answer** (#5).
+    // `workspace_db` above has already opened (and so minted) the database, which is why this reads the scan
+    // stamp and the rows rather than asking whether a file exists: an unindexed vault that somebody *searched*
+    // has a database file on disk, and answering "indexed" about it would repeat the exact confusion the issue
+    // reported, one layer down.
+    let indexed = np_core::scan::indexed(&db)?;
 
     // **Which halves this query can ask about, decided before any model is loaded.** Keyword mode needs no provider at all —
     // that is the property the human asked for when hybrid became the default: search answers on a machine that has never
@@ -1318,11 +1334,18 @@ fn search_run(
     )?;
     let hits = answer.hits;
     let note = note.or(answer.note);
+    // Read off the answer rather than re-derived from `mode` and `vector.is_some()`: `ranked` is the function that
+    // decided which lists it consulted, so a second derivation here is one more place to be wrong — and it already
+    // would be, because a query with no word characters in it runs no keyword list even in keyword mode.
+    let (keyword_used, semantic_used) = (answer.keyword_used, answer.semantic_used);
 
     Ok(SearchRun {
         hits,
         mode,
         present,
+        indexed,
+        keyword_used,
+        semantic_used,
         note,
         fetched,
         offline,
@@ -1345,8 +1368,14 @@ fn search_document(run: &SearchRun) -> Value {
     let objects: Vec<Value> = run.hits.iter().map(hit_json).collect();
     json!({
         "hits": objects,
+        // **What was asked for**, not what ran: `mode` is the caller's request after config, and **F45** made it
+        // possible for hybrid to answer from one half. `keyword_used` / `semantic_used` beside it are what ran.
         "mode": run.mode.label(),
+        "keyword_used": run.keyword_used,
+        "semantic_used": run.semantic_used,
         "vectors": run.present,
+        // The workspace's own state, and the only key that answers "should I offer to index this folder?" (#5).
+        "indexed": run.indexed,
         "note": run.note.as_ref().map(search::RankNote::label),
         "reason": run.note.as_ref().map(search::RankNote::token),
         "fetched": run.fetched.clone(),
@@ -1379,6 +1408,7 @@ fn search_workspace(
         mode,
         note,
         model,
+        indexed,
         ..
     } = run;
     let mut out = io::stdout().lock();
@@ -1396,6 +1426,19 @@ fn search_workspace(
             // `nothing indexed for  by hybrid`: a double space where a model name should be, and a claim about an index that
             // the keyword half had just consulted. When there is no model to name, the sentence names the query and says the
             // vectors are missing instead (found by the first interactive Windows run, 2026-11-07).
+            // **"Never indexed" gets its own sentence** (#5). A person who has just pointed `np` at a folder types
+            // the words they can remember; being told *nothing matched* sends them to their notes, when the action
+            // is one `np scan` away. The other three arms below stay exactly as they were for a workspace that has
+            // been walked, because there the empty list really is an answer about the corpus.
+            if !indexed {
+                let _ = writeln!(
+                    out,
+                    "nothing matched \"{query}\": this workspace has never been scanned — \
+                     run np scan {} to index it",
+                    workspace.display()
+                );
+                return Ok(());
+            }
             let _ = match (mode, model.is_empty()) {
                 (search::SearchMode::Keyword, _) => writeln!(out, "nothing matched \"{query}\""),
                 (_, true) => writeln!(

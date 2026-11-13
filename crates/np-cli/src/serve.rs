@@ -242,7 +242,11 @@ pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>
 /// The state keys a terminal notification copies from its own result (**§2**). Copied, never invented: an absent key on
 /// the response is an absent key on the line, which is how a client can tell "this run was offline" from "this run said
 /// nothing about being offline".
-const TERMINAL_STATE_KEYS: [&str; 5] = ["outcome", "locked", "offline", "reason", "vectors"];
+/// `indexed` joined for **issue #5**: a client that shows "not indexed yet — index it?" while a search is in
+/// flight needs the workspace's state from the line it already reads, not from a second request.
+const TERMINAL_STATE_KEYS: [&str; 6] = [
+    "outcome", "locked", "offline", "reason", "vectors", "indexed",
+];
 
 /// The last `np/progress` line of a request: `completed` when the answer was a result, `refused` when it was an error
 /// object (**spec §2's terminal rule**).

@@ -62,23 +62,29 @@ np search ./notes retro --mode keyword --json
 
 ```json
 {
+  "fetched": null,
   "hits": [
     {
-      "bm25": -1.1139240506329113e-6,
+      "bm25": -1.0620689655172414e-6,
       "cosine": null,
       "keyword_rank": 1,
       "kind": "note",
       "linked_from": 0,
       "linked_notes": [],
       "path": "retro.md",
-      "score": 1.1139240506329113e-6,
+      "score": 1.0620689655172414e-6,
       "semantic_rank": null,
       "snippet": "# Weekly\n\n[Retro]: the demo went well, migration postponed.\n",
       "source_note": null
     }
   ],
+  "indexed": true,
+  "keyword_used": true,
   "mode": "keyword",
   "note": null,
+  "offline": false,
+  "reason": null,
+  "semantic_used": false,
   "vectors": false
 }
 ```
@@ -86,6 +92,17 @@ np search ./notes retro --mode keyword --json
 `bm25` is SQLite's own number, unremapped (better is more negative, so `score` carries its negation to keep "higher first"
 true across modes), and the text channel prints small magnitudes in scientific notation rather than `-0.0000`. With a hybrid
 list whose semantic half could not run, `note` holds the sentence that stderr got and `cosine`/`semantic_rank` hold nulls.
+
+**The keys beside `hits` say three different things, and #5 is why they are three.**
+
+| Key | Question it answers |
+|---|---|
+| `mode` | what the caller **asked for** — the flag, or `[search] mode`. It is not a report of what ran: hybrid answers from keywords alone whenever no vector list exists (**F45**) and still calls itself `hybrid` here |
+| `keyword_used`, `semantic_used` | which halves **actually ran**, so a client that shows "searched by keyword" instead of "hybrid" is showing what `np` did rather than what it was told to do |
+| `vectors` | whether this workspace **holds vectors at all** — deliberately the truth about the index, and still `true` on a run that could not use them (F45's ruling: a reader that sees `false` goes and re-fetches 309 MB it does not need) |
+| `indexed` | whether anyone has ever **scanned** this workspace. `false` with an empty `hits` means "this folder is not indexed", which is a different sentence from "nothing here matches" — and until #5 the two were indistinguishable, because every other key describes the answer rather than the vault |
+| `reason`, `note` | why a half was missing: the token to branch on, and the prose for a human. One token, one fact per run, so it cannot also carry "not indexed" — that is what `indexed` is for |
+| `fetched`, `offline` | what auto-fetch downloaded (**F38**), and whether it was tried and failed |
 
 And with vectors present, `hybrid` fuses both lists. The same two-note vault after `np embed`, queried `"broker lag"` — one
 real run, both channels, on a `--features local-model` build:

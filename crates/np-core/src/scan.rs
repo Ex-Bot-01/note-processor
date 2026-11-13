@@ -2094,6 +2094,40 @@ pub fn last_scan(db: &Db) -> Result<Option<i64>, DbError> {
     Ok(meta_value(db, LAST_SCAN_KEY)?.and_then(|value| value.parse().ok()))
 }
 
+/// Whether this workspace has an index at all — the reading that tells **"nothing here matches"** apart from
+/// **"nobody has ever looked"** (issue **#5**).
+///
+/// Why a reader needs it: `search` answers an empty list in both worlds, and an application holding an empty
+/// list can only say *no results*. A person who just pointed a GUI at a folder they have never indexed reads
+/// that as a broken search; the one-click fix — index it — is invisible. F45 settled the principle for the
+/// neighbouring state (a degraded answer says which half was missing rather than going quiet), and this is
+/// the same fact about a different half: the workspace itself.
+///
+/// Two probes, in this order:
+///
+/// 1. [`LAST_SCAN_KEY`], written inside the scan's own transaction — so a scan that rolled back cannot leave a
+///    stamp claiming it committed, and a scan that found **no notes at all** writes one: an empty vault is
+///    indexed, which is not the same sentence as never scanned, and conflating them would send someone to
+///    `np scan` a folder that has nothing to index.
+/// 2. The [`crate::db`] `files` table, for a database written by an `np` older than the stamp. Those rows are
+///    real and re-scanning them is work, so answering "not indexed" about them would be a lie with a cost.
+///
+/// **Reads only.** No schema write, no directory, no row: like `status.get`'s `last_scan`, this is asked on
+/// paths that must not mint an index for a vault that does not exist (`search` already opens the database by
+/// the time it asks, which is why probe 1 rather than "does the file exist" is the signal — an unscanned
+/// search leaves an empty database behind, and a key that turns on file existence would answer `true` there).
+pub fn indexed(db: &Db) -> Result<bool, DbError> {
+    if last_scan(db)?.is_some() {
+        return Ok(true);
+    }
+    // **Read the projected value, not rusqlite's `exists()`** — the same trap `search::any_vectors_exist`
+    // documents: that helper answers "did the query return rows", and a `SELECT EXISTS(...)` projection always
+    // returns one row, so it would answer `true` for every empty workspace.
+    let mut statement = db.0.prepare_cached("SELECT EXISTS(SELECT 1 FROM files)")?;
+    let rows: i64 = statement.query_row([], |row| row.get(0))?;
+    Ok(rows != 0)
+}
+
 fn set_meta(db: &Db, key: &str, value: &str) -> Result<(), DbError> {
     db.0.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)

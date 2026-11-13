@@ -96,8 +96,10 @@ embed that refused to write because the budget ran out is a state. They arrive i
 |---|---|---|
 | `locked: true`, `waited_ms` | another process holds the workspace write lock; nothing was changed | `scan`, `embed` results |
 | `offline: true`, `reason` | the network was tried and failed, so no artifact could be fetched | `search`, `embed` results |
-| `reason` | a machine token (`provider-disabled`, `local-model-not-built`, `offline`, …) explaining a degraded result | `search`, `embed` results |
-| `vectors: false` | the semantic half did not run, so a hybrid answer is keyword-only | `search` results |
+| `reason` | a machine token (`provider-disabled`, `local-model-not-built`, `offline`, …) explaining a degraded result. **One token per run**, which is why "not indexed" got its own key below rather than a new token here | `search`, `embed` results |
+| `vectors: false` | this workspace holds no vectors — the truth about the index, and deliberately still `true` on a run that could not use them (**F45**), so it is *not* the answer to "which half ran" | `search` results |
+| `keyword_used`, `semantic_used` | which halves **this answer** was built from. `mode` names what the caller asked for, and hybrid answers from one half whenever the other is missing; these two are what a client shows when it says how a result was found (**#5**) | `search` results |
+| `indexed: false` | nobody has ever scanned this workspace — "this folder is not indexed", which is not the same sentence as "nothing here matches". One `scan` flips it; a search of an unindexed vault does not, because `np_core::scan::indexed` reads the scan stamp and the rows rather than asking whether a file exists | `search` results, and their terminal `np/progress` line |
 | `fetched` | what auto-fetch actually downloaded, or `null` | `search`, `embed` results |
 | `prefix_drift` | the installed artifact's prefix documents differ from the pin's; absent when there is no drift | `embed` results |
 | `outcome` | which arm an embed took (`{offline: …}`, `{local_model_missing: …}`, `over_budget`, …) | `embed` results |
@@ -256,10 +258,14 @@ Two notes on disk, a keyword search, and no `notifications` key in the handshake
 line appears in the whole session — every line carries an `id`, so a v0.3.0 client's read loop is untouched.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.rA4ZYv/A/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","protocol":1}}
-{"id":2,"jsonrpc":"2.0","result":{"added":2,"elapsed_ms":160,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
-{"id":3,"jsonrpc":"2.0","result":{"fetched":null,"hits":[{"bm25":-1e-6,"cosine":null,"keyword_rank":1,"kind":"note","linked_from":0,"linked_notes":[],"path":"meeting.md","score":1e-6,"semantic_rank":null,"snippet":"# Meeting notes\n\nThe [rollout] window opens on Tuesday.\n","source_note":null}],"mode":"keyword","note":null,"offline":false,"reason":null,"vectors":false}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap2/A/data","features":{"fetch":true,"local_model":false,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","protocol":1}}
+{"id":2,"jsonrpc":"2.0","result":{"added":2,"elapsed_ms":163,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
+{"id":3,"jsonrpc":"2.0","result":{"fetched":null,"hits":[{"bm25":-9.789227166276348e-7,"cosine":null,"keyword_rank":1,"kind":"note","linked_from":0,"linked_notes":[],"path":"meeting.md","score":9.789227166276348e-7,"semantic_rank":null,"snippet":"# Meeting notes\n\nThe [rollout] window opens on [Tuesday].\n","source_note":null}],"indexed":true,"keyword_used":true,"mode":"keyword","note":null,"offline":false,"reason":null,"semantic_used":false,"vectors":false}}
 ```
+
+This block was re-captured on 2026-11-13, one release after the three below it and on a **default-feature** debug build — which is why its
+`features.local_model` reads `false` where B, C and D read `true`. Its third line is also the visible half of **#5**: `indexed`,
+`keyword_used` and `semantic_used` are new keys beside `hits`, and `mode` still means "what was asked for".
 
 ### A first run with no network
 
@@ -380,8 +386,10 @@ That is the whole contract. `np` remembers nothing about your UI; it hands you e
 
 ## Reproducing the transcripts
 
-The blocks above came from a debug build of this branch (`cargo build -p np-cli --features local-model,fetch`) driven by
-`/home/agent/tmp/cap/capture.sh`, with per-session `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_CONFIG_HOME`, `NP_NO_AUTO_FETCH`
+Sessions B, C and D came from a debug build of that branch (`cargo build -p np-cli --features local-model,fetch`) driven by
+`/home/agent/tmp/cap/capture.sh`. Session A was re-captured on 2026-11-13 by piping three requests to `target/debug/np serve`
+(default features) with the same per-session `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_CONFIG_HOME`, `NP_NO_AUTO_FETCH`
 unset, a two-note vault, and a Python origin that answers the pinned `Content-Length` and then dribbles 4 MiB per 1.2 s before
 hanging up mid-body. Session A opted out of notifications; B pointed `[models] base_url` at a closed port; C and D pointed it at
-the dribbling origin, and D ran its `status.get` from a second process while C's download was in flight.
+the dribbling origin, and D ran its `status.get` from a second process while C's download was in flight. Session A's own shape: two
+notes (`meeting.md`, `todo.md`), `scan`, then `search` for `Tuesday` with `"mode": "keyword"`.

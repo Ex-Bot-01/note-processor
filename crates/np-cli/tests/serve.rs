@@ -341,6 +341,76 @@ fn a_search_response_is_the_same_document_np_search_json_prints() {
     assert_eq!(served, printed, "the two channels answered differently");
 }
 
+/// **"This folder is not indexed" has to be decidable from the answer** (issue **#5**), and `search` is the method a
+/// GUI calls first — before any `scan`, often the only request a curious person makes before deciding whether the
+/// folder is worth indexing at all.
+///
+/// The payload used to be `{hits: [], mode: "hybrid", vectors: false, reason: "provider-disabled"}`, which describes
+/// the answer in four ways and the workspace not at all. `indexed` is the fifth, and it must survive the two things
+/// that make this state easy to get wrong: `search` *opens* (and so creates) the workspace database, so file existence
+/// cannot be the signal; and one search of its own must not flip the answer it is reporting.
+#[test]
+fn a_search_before_any_scan_reports_the_workspace_as_not_indexed() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+
+    let first = server.result(
+        "search",
+        json!({"workspace": workspace, "query": "meeting", "limit": 5}),
+    );
+    assert!(
+        first["hits"].as_array().is_some_and(|hits| hits.is_empty()),
+        "an unindexed vault answers with nothing: {first}"
+    );
+    assert_eq!(
+        first["indexed"], false,
+        "and says it was never indexed, rather than leaving that to be guessed: {first}"
+    );
+    // **Which halves ran**, the issue's second complaint: `mode` is what the caller asked for, and a client that
+    // renders that word tells the user *hybrid* when no vector participated. These two keys are the honest pair.
+    assert_eq!(first["keyword_used"], true, "{first}");
+    assert_eq!(first["semantic_used"], false, "{first}");
+
+    // The terminal notification carries it too: a client drawing "index this folder?" while the request is in
+    // flight reads one line, not a response plus a follow-up question. The id is read before `flush`, which sends a
+    // request of its own and so moves `Server::id` on.
+    let search_id = server.id;
+    server.flush();
+    let lines = server.progress_for(search_id);
+    let last = last_progress(&lines);
+    assert_eq!(
+        last["params"].get("indexed"),
+        Some(&serde_json::Value::Bool(false)),
+        "the state on the line is the state in the result: {last}"
+    );
+
+    // Asking twice does not answer differently: the search that minted the database must not make it look indexed.
+    let second = server.result(
+        "search",
+        json!({"workspace": workspace, "query": "meeting", "limit": 5}),
+    );
+    assert_eq!(
+        second["indexed"], false,
+        "a question is not a scan: {second}"
+    );
+
+    // And one `scan` later the same request answers the other way, with no other key moved but this one.
+    server.result("scan", json!({"workspace": workspace}));
+    let third = server.result(
+        "search",
+        json!({"workspace": workspace, "query": "meeting", "limit": 5}),
+    );
+    assert_eq!(third["indexed"], true, "{third}");
+    assert!(
+        third["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "and the note was there all along: {third}"
+    );
+    server.finish();
+}
+
 /// Same claim as above for `models.list`, whose document is built by a third function (`listing_json`) with a key set that **R7a** pinned precisely
 /// because adding `fetching` had to fail a test. A server that dropped one of those keys would break a support screen that reads it.
 #[test]
@@ -862,7 +932,7 @@ fn a_search_without_vectors_ends_completed_with_its_own_state() {
     let last = last_progress(&server.progress_for(id));
     assert_eq!(last["params"]["phase"], "completed", "{last}");
     assert_eq!(last["params"]["command"], "search", "{last}");
-    for key in ["offline", "vectors", "reason"] {
+    for key in ["offline", "vectors", "reason", "indexed"] {
         if let Some(value) = response["result"].get(key) {
             assert_eq!(
                 last["params"].get(key),

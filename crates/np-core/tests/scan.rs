@@ -6000,3 +6000,95 @@ fn a_migration_keyed_row_with_no_identity_rejoins_its_path_and_leaves_a_stale_ro
     // display key and fails the row-count tuple; letting a stale row be re-used as a live one moves the edited content onto
     // the display key and leaves nothing at the real path.
 }
+
+/// **Has this folder ever been indexed?** (issue **#5**)
+///
+/// `search` answers an empty list for two very different worlds: a vault nobody has ever walked, and a
+/// walked vault where no note holds the words. A client can only say "no results" about both, which is how
+/// a person concludes search is broken when the real answer is "index this folder". The reading that
+/// separates them is `meta('last_scan_unix')`, written inside the scan's own transaction — with a second
+/// probe for databases an older `np` wrote before that stamp existed, because those hold real rows and are
+/// indexed in every sense that matters.
+#[test]
+fn an_index_exists_once_a_scan_has_committed_there() {
+    let ws = scratch(&[("a.md", "# Alpha\n\nkumquat tree\n")], 10);
+
+    // A database opened and never scanned. This is the state a search's `Db::open` leaves behind too, so it
+    // is reachable by asking one question of an unindexed vault — which is exactly what the issue did.
+    let fresh = ws.db();
+    assert!(
+        !scan::indexed(&fresh).expect("the reading never writes"),
+        "an empty database is not an index: {fresh:?}"
+    );
+
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+    assert!(
+        scan::indexed(&ws.db()).expect("read after the scan"),
+        "a committed scan is what makes a workspace indexed"
+    );
+
+    // **An empty vault is indexed.** A folder with nothing in it got a walk, and its answer to every query
+    // is "nothing here matches" rather than "nothing here was ever looked at"; telling the two apart is the
+    // whole point of the reading, so the stamp cannot depend on rows having been written.
+    let empty = scratch(&[], 10);
+    assert!(
+        !scan::indexed(&empty.db()).expect("read the untouched empty vault"),
+        "an empty folder nobody scanned is still not indexed"
+    );
+    scan(&empty.root, &empty.cfg).expect("scan the empty vault");
+    assert!(
+        scan::indexed(&empty.db()).expect("read the scanned empty vault"),
+        "a walk that found nothing still indexed the folder"
+    );
+
+    // The older-database half: rows and no stamp. Deleting the row simulates a workspace written before the
+    // stamp existed, and the answer must stay `true` — otherwise every index built by an earlier release
+    // would tell its owner to re-scan forever.
+    let stamped = ws.db();
+    stamped
+        .0
+        .execute("DELETE FROM meta WHERE key = 'last_scan_unix'", [])
+        .expect("test setup: remove the stamp");
+    assert!(
+        scan::indexed(&stamped).expect("read a stamped-out database"),
+        "rows are evidence of an index even when the stamp is missing"
+    );
+
+    // Which leaves the two probes stated as one rule, and the first assertion of this case is its evidence: a
+    // database with neither stamp nor rows answers `false`. It is asserted *before* anything is written rather than
+    // by deleting rows here, because a scanned workspace's `files` rows are the parents of every derived table —
+    // emptying one by hand would be an FK violation rather than a simulation, and a `PRAGMA foreign_keys=OFF`
+    // added to a test is a database no `np` ever opens.
+}
+
+/// The reading is a **reader**: no schema write, no directory, no row. `status.get` established that a
+/// question must not mint an index, and this one is asked on the search path, where minting would turn every
+/// typo'd vault into a workspace some later tool believes it has seen.
+#[test]
+fn reading_whether_a_workspace_is_indexed_writes_nothing() {
+    let ws = scratch(&[("a.md", "# Alpha\n\nkumquat tree\n")], 10);
+    let db = ws.db();
+    // Whatever opening the database itself filed, captured rather than assumed: the claim is that *asking*
+    // changes nothing, and `Db::open` legitimately writes schema bookkeeping before this case starts.
+    let before = texts(&db, "SELECT key || '=' || value FROM meta ORDER BY key");
+
+    assert!(
+        !scan::indexed(&db).expect("first read"),
+        "the vault is unscanned by construction"
+    );
+    assert!(
+        !scan::indexed(&db).expect("second read"),
+        "reading twice answers the same way"
+    );
+
+    assert_eq!(
+        texts(&db, "SELECT key || '=' || value FROM meta ORDER BY key"),
+        before,
+        "asking whether a workspace is indexed wrote to it"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM files"),
+        0,
+        "and wrote no file row either"
+    );
+}
