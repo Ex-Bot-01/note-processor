@@ -30,6 +30,17 @@ np models install|fetch|hash|list …
   stderr naming the half that was missing, and exits **0**. Nothing dials out to fetch a model because a config key named one —
   the download stays an explicit `np models fetch`. Ask for `--mode semantic` in that same workspace and you get the F32 refusal
   at exit 1 instead, because a request for one list that cannot run is not answerable by the other.
+- **The keyword half is an `AND` of quoted words** (`search::match_expression`). Every word in the query becomes an FTS5 phrase
+  and the phrases are joined with `AND`, so a note appears only when **one** note contains every word — measured on a two-note
+  vault where `retro` is in one file and `kafka` in the other: `"lag broker"` (both words in one note) answers, `"retro kafka"`
+  answers *nothing* at exit **0**. A sentence-shaped query is therefore likely to be void: one word that no note contains — an
+  `are`, a `how` — fails the conjunction on its own, and the answer is indistinguishable from "this vault has nothing of the
+  sort" except by `indexed` (see below) and by trying fewer words. This is deliberate rather than unfinished: treating the query
+  as FTS5 syntax instead would hand the parser every `"`, `*`, `-`, `(` and `:` a person can type, with SQLite's parse errors
+  surfacing out of a library call, and quoting each token is also what keeps an identifier like `GGML_DEFAULT_N_THREADS` from
+  being read as syntax. Two consequences worth knowing: the operators above are **ordinary characters**, not search operators,
+  and a query longer than `MAX_QUERY_TERMS` (32) searches its first 32 words. Softer matching — dropping the rarest term, or
+  falling back to `OR` when `AND` answers nothing — is a decision of its own, not a default to be quietly relaxed.
 - **A schema upgrade's record outlives the run that made it.** The scan whose open cleaned up orphan rows says so on stdout, once — a permanent
   one-line warning would train everyone to ignore it. The record itself lives in the workspace database and reaches every later report as
   `recorded_upgrade_orphans` and `recorded_merged_notes`, so "what did an upgrade delete here last month?" is a question `np scan --json` answers instead of
@@ -39,9 +50,11 @@ np models install|fetch|hash|list …
   JSONL; both are off unless asked, and every report and exit code above is byte-identical with them on or off. The levels, the ten
   targets, the twenty-one rule tokens and both caps are in [`docs/reference-diagnostics.md`](reference-diagnostics.md).
 - **`--json` is the machine interface.** stdout carries exactly one JSON document (`scan`, `embed`, `search`, `models list`).
-  Search's document is `{hits, mode, note, vectors}`: the list, the mode that ran, a sentence about a half that could not run
-  (`null` when nothing was missing), and whether this workspace holds vectors at all — so "no semantic hits" and "no model
-  installed" stay two different reports. Every hit carries the same **eleven** keys whatever the kind and whatever the mode —
+  Search's document is `{hits, mode, keyword_used, semantic_used, vectors, indexed, note, reason, fetched, offline}`: the list,
+  the mode that was **asked for**, which halves actually ran, whether this workspace holds vectors at all, whether anyone has
+  ever scanned it, a sentence and a token about a half that could not run (`null` when nothing was missing), and what auto-fetch
+  did — so "no semantic hits", "no model installed" and "this folder is not indexed" stay three different reports. Each key's
+  question is tabulated under [the search document](#the-search-document-keys-three-kinds-of-no-answer). Every hit carries the same **eleven** keys whatever the kind and whatever the mode —
   `score`, `cosine`, `bm25`, `semantic_rank`, `keyword_rank`, `kind`, `path`, `snippet`, `linked_from`, `source_note`,
   `linked_notes` — because an absent key and a null are two different claims. The five evidence keys are F36's, and they exist so
   a fused score can be argued with: in `keyword` mode `cosine` and `semantic_rank` are `null`, in `semantic` mode the reverse.
@@ -92,8 +105,14 @@ np search ./notes retro --mode keyword --json
 `bm25` is SQLite's own number, unremapped (better is more negative, so `score` carries its negation to keep "higher first"
 true across modes), and the text channel prints small magnitudes in scientific notation rather than `-0.0000`. With a hybrid
 list whose semantic half could not run, `note` holds the sentence that stderr got and `cosine`/`semantic_rank` hold nulls.
+Remember the `AND` rule when a list comes back empty on a vault you know holds the words: they have to be in **one** note.
 
-**The keys beside `hits` say three different things, and #5 is why they are three.**
+### The search document keys three kinds of no answer
+
+An empty `hits` has three causes — nothing matched (the `AND` rule above), a half that could not run, and a folder nobody ever
+indexed — and a client has to be able to tell them apart, because each asks for a different next action. **Issue #5** is why the
+document carries keys for all three rather than one:
+
 
 | Key | Question it answers |
 |---|---|

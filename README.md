@@ -132,8 +132,17 @@ Every command takes `--json` for a machine-readable document, and exit codes mea
 to do" and "nothing indexed"), **1** anything the runtime refused, **2** argv errors. Full field-by-field reference, including why
 every search hit always carries the same eleven keys: [CLI and report reference](docs/reference-cli-and-reports.md).
 
-Two behaviours worth knowing before you script against it:
+Three behaviours worth knowing before you script against it:
 
+- **The keyword half wants *every* word.** A query is a bag of words, not a sentence: each word is quoted and the words are
+  joined with `AND`, so one note has to contain them all for anything to answer. `"lag broker"` finds the note that says both;
+  `"retro kafka"` — one word in each of two notes — answers *nothing*, exit **0**, and a phrase typed out of a sentence
+  (`"how are moved files detected"`) usually does the same, because one stray word no note contains voids the whole
+  conjunction. Ask for fewer words. Once vectors exist, `--mode hybrid` adds a semantic half that ranks by meaning instead of
+  requiring every word — but until a model is installed (`NP_NO_AUTO_FETCH=1`, or a fresh machine), keyword-only *is* the
+  honest answer, so this is where it shows. FTS5's own syntax is not exposed on purpose: `"`, `*`, `-`, `(` and `:` are ordinary
+  characters rather than operators, which is what keeps a note-worthy identifier like `GGML_DEFAULT_N_THREADS` out of a query
+  parser, and a query longer than 32 words searches its first 32.
 - **`np search` answers before any model exists.** A workspace with no artifact and no vectors returns its keyword hits, prints one
   line on stderr naming the half that was missing, and exits **0**. Ask for `--mode semantic` in the same vault and you get a refusal
   at exit 1 instead — a request for one list that cannot run is not answerable by the other.
@@ -230,6 +239,7 @@ text-only on the image side and say so per figure rather than silently skipping.
 | --- | --- |
 | `configuration disabled: embeddings.provider = "none"` from `np embed` | No provider chosen yet — write `[embeddings] provider = "local-model"`, or accept an index-only build |
 | `no vectors in this workspace: ranked by keyword only …` on stderr, exit **0** | Not an error. Keywords answered; the vector list had nothing to rank |
+| `nothing matched "…"` on stdout, exit **0**, in a vault you know holds the words | The keyword half needs **every** word in **one** note (`AND` of quoted phrases), so a sentence-shaped query dies on one stray `how`, and two words that live in different notes never meet. Try fewer words; with vectors installed, `--mode hybrid` adds a semantic half that ranks by meaning. A vault nobody indexed says it out loud instead: `… this workspace has never been scanned` |
 | `np embed` reports `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |
 | `locked: another process is writing this workspace (2000 ms)` | Another `np` holds this vault's write lock. Retry; readers were never blocked, and a killed process cannot leave a lock behind |
 | `offline: could not reach the pinned origin to fetch …` | Auto-fetch tried and nothing answered. `setup` still indexed and exited 0; keyword search works meanwhile; no partial state was written |
