@@ -49,6 +49,27 @@ echo "codegen  NP_LLAMA_PORTABLE=$NP_LLAMA_PORTABLE (1 = baseline x86-64, runs o
 
 cargo build --release --locked -p np-cli --features local-model,fetch --target "$target"
 
+# **Say what the binary was actually compiled for.** `build.rs` refuses a portable build whose cmake cache disagrees, so a
+# successful build already proves the configuration — but a release log that only says "it worked" cannot be read by anyone
+# wondering why an asset will not start on their machine, and 2026-11-13 needed two rehearsals to find out that a flag we set
+# was not the flag that mattered. So print the cache values it checked, and count wide-vector instructions in the linked
+# binary: `%zmm` must be zero at the baseline floor, and `%ymm` is reported rather than asserted because Rust crates carry
+# runtime-dispatched AVX2 of their own (a pre-AVX host measured 4,940 of them and runs fine). The instruction counts are the
+# part that caught the real fault: they did not move between two builds whose cmake options differed.
+cache=$(find "target/$target/release/build" -path '*/out/*/CMakeCache.txt' -newer Cargo.toml 2>/dev/null | head -1)
+if [ -n "$cache" ]; then
+  echo "cmake cache used by this link: $cache"
+  grep -E '^(GGML_NATIVE|GGML_SSE42|GGML_AVX|GGML_AVX2|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_OPENMP):' "$cache" | sed 's/^/  /'
+else
+  echo "note: no CMakeCache.txt found under target/$target/release/build — nothing linked llama.cpp?" >&2
+fi
+binary="target/$target/release/np${ext}"
+if command -v objdump >/dev/null 2>&1 && [ -f "$binary" ]; then
+  objdump -d --section=.text "$binary" 2>/dev/null | awk '
+    /%zmm/ { z++ } /%ymm/ { y++ }
+    END { printf "codegen  .text instructions: %%zmm %d (must be 0 at the baseline floor), %%ymm %d\n", z + 0, y + 0 }'
+fi
+
 mkdir -p "$out"
 name="np-$version-$target"
 archive="$out/$name.tar.gz"
