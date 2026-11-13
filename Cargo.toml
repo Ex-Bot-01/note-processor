@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/np-core", "crates/np-cli"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 # **MIT, ruled by the operator on 2026-12-08** (**F47**), and `LICENSE` at the root is the authority — this field is metadata that must agree
 # with it, which is why it lives in `[workspace.package]` where a member cannot drift from it. The reason MIT specifically: it matches the code

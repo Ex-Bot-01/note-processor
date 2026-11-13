@@ -42,12 +42,12 @@ sha256sum -c SHA256SUMS.txt        # Linux/macOS, run next to the archive
 ```
 
 ```powershell
-(Get-FileHash .\np-0.3.0-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
+(Get-FileHash .\np-0.4.0-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
 ```
 
 | Platform | What you get | Worth knowing |
 | --- | --- | --- |
-| **Linux** `x86_64-unknown-linux-gnu` | one binary, inference runtime **in** it | built by `.github/scripts/package-assets.sh`; byte-reproducible |
+| **Linux** `x86_64-unknown-linux-gnu` | one binary, inference runtime **in** it | built by CI running `.github/scripts/package-assets.sh`; byte-reproducible |
 | **Windows** `x86_64-pc-windows-gnu-cross.zip` | one `np.exe`, runtime **in** it | cross-built here with mingw-w64 — **unsigned, not an MSVC build**; import table checked at packaging so it stays a single file |
 | **macOS** | *no asset exists* | needs an Apple SDK no cross-compiler here has → [build from source](docs/developing.md) |
 
@@ -58,7 +58,7 @@ The model itself is never inside an archive: ~309 MB arrives only when you run `
 Building from source needs nothing but a stable Rust toolchain for the default build — no C++, no cmake:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.3.0 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.4.0 -p np-cli --locked
 ```
 
 Per-version caveats (which old assets are stale, what is compiled out of them): [Release archive caveats](docs/reference-releases.md).
