@@ -109,9 +109,33 @@ impl Workspace {
 
     /// This workspace's database, derived the way the binary derives it from the same absolute root
     /// [`Workspace::command`] passes — the same route [`record_parse_version`] takes.
+    /// The directory np **puts its files in**, given the environment [`Workspace::command`] hands the child.
+    ///
+    /// Not always `data_dir()`: since **F37** Windows nests its data dir under a folder that says whose it is, because
+    /// `%LOCALAPPDATA%` is the directory every application writes into. So on Windows the answer is
+    /// `<XDG_DATA_HOME|LOCALAPPDATA>\note-processor`, and everywhere else it is the variable's own value — which is what
+    /// `np_core::config::data_dir_for` does, restated here from the variables this harness sets rather than from the process
+    /// environment (the child's environment is not this process's environment).
+    ///
+    /// **This was spelled as `data_dir()` until it was measured.** The first nightly whose Windows job got as far as running
+    /// tests failed five cases — an artifact file that "does not exist" after a successful `np models install`, a second writer
+    /// that was never locked out, and a re-parse sentence that never printed — all of them asserting against a directory np
+    /// never wrote to (run 43616394486, 2026-11-14). Nothing in the product was wrong; the harness was reading one floor below
+    /// where np lives. That F37's note also *falls back* to the unnested location when it already holds an index is why most of
+    /// these cases passed anyway: a case that planted rows through `db_path` first created the old directory, and the fallback
+    /// then moved np down to meet it. The five that failed were the ones whose first np run created the tree.
+    fn index_dir(&self) -> PathBuf {
+        let raw = self.data_dir();
+        if cfg!(windows) {
+            raw.join(np_core::config::WINDOWS_DATA_SUBDIR)
+        } else {
+            raw
+        }
+    }
+
     fn db_path(&self) -> PathBuf {
         Config {
-            data_dir: self.data_dir(),
+            data_dir: self.index_dir(),
             ..Config::default()
         }
         .workspace_db(&self.root)
@@ -122,7 +146,7 @@ impl Workspace {
     /// the path `np embed` names mean something.
     fn models_dir(&self) -> PathBuf {
         Config {
-            data_dir: self.data_dir(),
+            data_dir: self.index_dir(),
             ..Config::default()
         }
         .workspace_models_dir(&self.root)

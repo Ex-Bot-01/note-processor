@@ -124,8 +124,22 @@ impl Server {
         }
     }
 
+    /// The raw directory this harness hands the child as `$XDG_DATA_HOME` / `%LOCALAPPDATA%`. **Use [`Server::index_dir`]
+    /// to name a file np wrote**; on Windows those two variables are only the parent of where np lives (**F37** nests its data
+    /// dir under `note-processor`, because `%LOCALAPPDATA%` is the directory every application writes into).
     fn data_dir(&self) -> PathBuf {
         self._tmp.path().join("data")
+    }
+
+    /// Where np puts its files, given that environment. See [`Server::data_dir`] for why the two differ on Windows, and
+    /// `crates/np-cli/tests/cli.rs`'s `Workspace::index_dir` for the nightly run that measured it (43616394486).
+    fn index_dir(&self) -> PathBuf {
+        let raw = self.data_dir();
+        if cfg!(windows) {
+            raw.join(np_core::config::WINDOWS_DATA_SUBDIR)
+        } else {
+            raw
+        }
     }
 
     /// Where this child reads `config.toml` from — the same package directory `np models fetch` tests write into. A case
@@ -810,7 +824,7 @@ fn a_contended_workspace_is_a_result_and_the_server_keeps_answering() {
 
     // Hold this workspace's write lock from the test process, the way a concurrent `np embed` would.
     let config = Config {
-        data_dir: server.data_dir(),
+        data_dir: server.index_dir(),
         ..Config::default()
     };
     // Named exactly the way `np` names it — after this workspace's database file, in the directory that holds it — because a lock the test takes
@@ -871,7 +885,7 @@ fn a_workspace_that_is_not_a_directory_refuses_without_creating_anything() {
         "a refusal names no origin (**F32**): {message}"
     );
     assert!(
-        !server.data_dir().join("workspaces").exists(),
+        !server.index_dir().join("workspaces").exists(),
         "the refusal created a data directory for a vault that does not exist"
     );
 }
@@ -1156,7 +1170,7 @@ fn a_contended_embed_ends_completed_with_locked_true() {
     server.result("scan", json!({"workspace": workspace}));
 
     let config = Config {
-        data_dir: server.data_dir(),
+        data_dir: server.index_dir(),
         ..Config::default()
     };
     let db_path = config.workspace_db(&server.root);
@@ -1354,7 +1368,7 @@ fn status_get_reports_a_marker_another_process_left() {
     let mut server = Server::new();
     let workspace = server.root.display().to_string();
     let config = Config {
-        data_dir: server.data_dir(),
+        data_dir: server.index_dir(),
         ..Config::default()
     };
     let models_dir = config.workspace_models_dir(&server.root);
@@ -1502,7 +1516,7 @@ fn models_list_prices_a_fetch_before_anything_starts() {
     // so the first call in a fresh data dir creates that file (as `np models list` has always done — see issue #3's
     // comment for why the new key itself needs no database at all). What this pins is that the price question is not a
     // second writer: one read, no mutation, and an embed running elsewhere never has to wait for it.
-    let data_dir = server.data_dir();
+    let data_dir = server.index_dir();
     let before = listing_of(&data_dir);
     let again = server.result("models.list", json!({"workspace": workspace}));
     assert_eq!(again["pinned"], listing["pinned"], "stable across asks");
@@ -1556,7 +1570,7 @@ fn a_trailing_separator_is_the_same_workspace_as_the_path_it_ends() {
     // **One database, not two.** The counts could agree by luck (two workspaces of one fresh corpus both
     // report `added: 16`); a second `.sqlite` under `workspaces/` is the durable half of the bug — and it is
     // the half that also mints a second model directory, which is where a client pays 309 MB for a character.
-    let databases = workspace_databases(&server.data_dir().join(WORKSPACES_DIR));
+    let databases = workspace_databases(&server.index_dir().join(WORKSPACES_DIR));
     assert_eq!(
         databases.len(),
         1,
@@ -1591,7 +1605,7 @@ fn workspace_databases(workspaces: &Path) -> Vec<String> {
 #[test]
 fn status_get_never_creates_a_workspace_database() {
     let mut server = Server::new();
-    let data_dir = server.data_dir();
+    let data_dir = server.index_dir();
     // A path that is not a directory and does not exist: the shape a typo or a deleted vault produces.
     let missing = server
         ._tmp
@@ -2104,7 +2118,7 @@ fn an_unreadable_marker_is_reported_and_left_alone() {
     let mut server = Server::new();
     let workspace = server.root.display().to_string();
     let config = Config {
-        data_dir: server.data_dir(),
+        data_dir: server.index_dir(),
         ..Config::default()
     };
     let models_dir = config.workspace_models_dir(&server.root);
@@ -2518,7 +2532,7 @@ fn links_list_scopes_to_one_note_at_either_end() {
 fn links_list_is_a_reader_that_creates_nothing_and_says_so_when_there_is_nothing_to_read() {
     let mut server = Server::new();
     let workspace = server.root.display().to_string();
-    let data_dir = server.data_dir();
+    let data_dir = server.index_dir();
     let before = listing_of(&data_dir);
 
     let graph = server.result("links.list", json!({"workspace": workspace}));
@@ -2544,7 +2558,7 @@ fn links_list_is_a_reader_that_creates_nothing_and_says_so_when_there_is_nothing
     // in the report. A pane that refreshes during an embed must not go blank, and must not be told to retry.
     server.result("scan", json!({"workspace": workspace}));
     let config = Config {
-        data_dir: server.data_dir(),
+        data_dir: server.index_dir(),
         ..Config::default()
     };
     let db_path = config.workspace_db(&server.root);

@@ -1188,7 +1188,7 @@ fn a_locked_workspace_reports_the_rule_and_its_path() {
     fs::remove_file(&log).expect("test setup: start the assertion from an empty log");
 
     let db = Config {
-        data_dir: vault._tmp.path().join("data"),
+        data_dir: np_data_dir(&vault._tmp.path().join("data")),
         ..Config::default()
     }
     .workspace_db(&vault.root);
@@ -2226,4 +2226,15 @@ fn a_bad_log_level_in_the_file_still_serves() {
         err_text.contains("log.level"),
         "the ignored level has to be named on stderr: {err_text:?}"
     );
+}
+
+/// Where np puts its files, given a directory handed to it as `$XDG_DATA_HOME` / `%LOCALAPPDATA%`. **Windows nests** under
+/// `note-processor` (**F37**), so an assertion that spells the raw variable names a directory np never writes there. The
+/// measured version of that sentence is run 43616394486, and the helper beside it in `tests/cli.rs` names the five cases.
+fn np_data_dir(raw: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        raw.join(np_core::config::WINDOWS_DATA_SUBDIR)
+    } else {
+        raw.to_path_buf()
+    }
 }

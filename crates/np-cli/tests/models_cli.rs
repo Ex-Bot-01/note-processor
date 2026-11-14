@@ -120,8 +120,20 @@ impl Scratch {
         self._tmp.path().join("config")
     }
 
+    /// The raw directory handed to the child as `$XDG_DATA_HOME` / `%LOCALAPPDATA%`. To name a file np wrote, use
+    /// [`Fixture::index_dir`]: **Windows nests** its data dir under `note-processor` (F37), so the two differ there.
     fn data_dir(&self) -> PathBuf {
         self._tmp.path().join("data")
+    }
+
+    /// Where np puts its files. See `crates/np-cli/tests/cli.rs`'s `Workspace::index_dir` for the measured failure this avoids.
+    fn index_dir(&self) -> PathBuf {
+        let raw = self.data_dir();
+        if cfg!(windows) {
+            raw.join(np_core::config::WINDOWS_DATA_SUBDIR)
+        } else {
+            raw
+        }
     }
 
     /// This workspace's artifact directory, **derived** the way the binary derives it rather than spelled out.
@@ -130,7 +142,7 @@ impl Scratch {
     /// rule — which is §7's mutation "re-derive the artifact path in np-cli", the P0 arriving by another door.
     fn models_dir(&self) -> PathBuf {
         Config {
-            data_dir: self.data_dir(),
+            data_dir: self.index_dir(),
             ..Config::default()
         }
         .workspace_models_dir(&self.root)
@@ -328,7 +340,7 @@ fn the_artifact_directory_and_the_database_share_one_stem() {
     let digest = source_digest(&source);
     run(&mut ws.install(&source, "384", &digest)).assert_success();
 
-    let mut pairs: Vec<(String, String)> = fs::read_dir(ws.data_dir().join("workspaces"))
+    let mut pairs: Vec<(String, String)> = fs::read_dir(ws.index_dir().join("workspaces"))
         .expect("test: the workspaces directory is readable")
         .map(|entry| entry.expect("test: readable entry").path())
         .filter_map(|path| {
@@ -839,7 +851,7 @@ fn a_workspace_that_is_not_a_directory_is_refused_before_anything_is_written() {
     assert_eq!(listed.stdout(), "");
     // Nothing was minted: not a database, not an artifact directory, not even the `workspaces` folder beside them.
     assert!(
-        !ws.data_dir().join("workspaces").exists(),
+        !ws.index_dir().join("workspaces").exists(),
         "a refused workspace writes no database and no artifact directory"
     );
 }
