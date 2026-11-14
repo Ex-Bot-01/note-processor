@@ -59,15 +59,25 @@ response they are verifying:
 
 ```text
 5c71f53d73e5a08fa5e23f437c1aa09e11dadc1cdfc0d3f81c7a32d8987be3ec  np-0.5.0-x86_64-unknown-linux-gnu.tar.gz
-c2a2da1c28b957c838c8423e289d3ea67f50c526537e06f3a10ed107c35b64b1  np-0.5.0-x86_64-pc-windows-gnu-cross.zip
+4cfb21833582ceed761e501dcf7dec0502f2fe5bf3803aa194e34df16c820db2  np-0.5.0-x86_64-pc-windows-gnu-cross.zip
 ```
 
-Neither is bit-reproducible, so these digests identify *the files on the page*, not a build recipe you can re-run to the same bytes. The
-Windows archive's `np.exe` (16,731,648 bytes) digests to
-`ba310fb99f2ed826843afd7a81332f7bc4446ec776f9b4cb53865c8fc10fbc5c`; it is named here rather than in `SHA256SUMS.txt`, because that file is
-run through `sha256sum -c` against files a person downloaded and must not name a file inside an archive (**v0.4.0's** mistake). The Linux
-binary was executed on a machine whose CPU stops at SSE4.2 before publishing: `np --version`, `np scan`, and a prefix search all ran, and
-its `.text` holds zero `%zmm` and 4,940 `%ymm` references — the same figures `v0.4.0`'s shipped binary carries.
+Both are the digests of **the files on the page**, taken from a fresh download and confirmed by `sha256sum -c SHA256SUMS.txt` — which lists
+exactly these two names and nothing else. The Windows archive's `np.exe` (16,731,648 bytes) digests to
+`cb583af1fefd0a1dbe0c33b8cc8d528c4faa38ba587368d4ff3e8ced4669246f`, and it is named here rather than in `SHA256SUMS.txt`: that file gets run
+through `sha256sum -c` against what a person downloaded, so naming a member of an archive is **v0.4.0's** mistake (`np.exe: FAILED open or read`).
+
+**One half of this release reproduced byte for byte, and one did not — measured rather than asserted.** The rehearsal build
+([run 43642586210](https://github.com/Ex-Bot-01/note-processor/actions/runs/43642586210), `publish=false`) and the tag build
+([run 43643367475](https://github.com/Ex-Bot-01/note-processor/actions/runs/43643367475)) were independent CI runs, and their Linux archives
+digest identically: `5c71f53d…`. The Windows cross-build does not — rehearsal produced `c2a2da1c…`, the page carries `4cfb2183…`, and its
+`np.exe` differs likewise (`ba310fb9…` against `cb583af1…`). So README's table is right in a way it had not been checked to be: Linux is
+byte-reproducible, and the cross-build's `ABOUT-windows-gnu-cross.md` is right that its published sha256 identifies *the file you
+downloaded* rather than a recipe. Anyone comparing a v0.5.0 Windows download should compare against the page, not against a log line from a
+rehearsal run — which is where the numbers in this paragraph's first draft came from, and why they were corrected here instead of left alone.
+
+The Linux binary was executed on a machine whose CPU stops at SSE4.2 before publishing: `np --version`, `np scan`, and a prefix search all
+ran, and its `.text` holds zero `%zmm` and 4,940 `%ymm` references — the same figures `v0.4.0`'s shipped binary carries.
 
 **Since `v0.3.1`, shipped in `v0.4.0`.** `initialize` named **eight** methods there.
 
