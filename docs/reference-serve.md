@@ -74,6 +74,8 @@ can talk to a server it cannot configure still deserves answers.
 | `embed` | `workspace` | the same report as `np embed --json` | `embed_report` | `-32602`; `-32000` (including a build without the inference feature) |
 | `models.list` | `workspace` | `{models, fetching, unclaimed, pinned, models_dir_error}` — installed-artifact rows, any fetch in flight, and what a fetch **would** cost before one starts | `listing_json`, the CLI's own builder | `-32602` |
 | [`links.list`](#reading-the-link-graph) | `workspace`, `rel?` | `{indexed, edges, unresolved}` — who links each note, and every dead target with the file and line it was written on | `links_json` | `-32602` on an empty or non-string `rel`; `-32000` when the workspace is not a directory |
+| [`embeddings.enable`](#turning-embeddings-on-or-off) | `model` | `{changed, provider, model, fetch, persisted_to}` — what the config file now says, and what a first `embed` would cost. **Fetches nothing** | `embeddings_document`, the CLI's own builder | `-32602` on a missing or non-string `model`, or an unknown key; `-32000` for an id this build does not pin, a build with no inference runtime (`local-model-not-built`), or a config that does not load today |
+| [`embeddings.disable`](#turning-embeddings-on-or-off) | none | the same document, with `fetch: null` and `provider: "none"` | `embeddings_document` | `-32000` only when the file cannot be written; `-32602` on any parameter |
 | `status.get` | `workspace` | `{last, fetch_markers, running}` | its own builder | `-32602` |
 | `shutdown` | none | `{protocol}` echoed, then the loop ends | its own builder | — |
 
@@ -83,7 +85,12 @@ Two things are deliberately **not** methods:
 - **Model installation and fetching.** F38's consent step is a human at a terminal reading "this will download 295 MiB". A
   backend that could silently trigger that download would delete the only place that decision lives. Use `np models install`
   or `np models fetch` out of band, or let `embed`/`search` auto-fetch under the usual rules (config `[models] auto_fetch`,
-  `NP_NO_AUTO_FETCH=1`).
+  `NP_NO_AUTO_FETCH=1`). **`embeddings.enable` is the consent answer, not the download**: it writes two config keys and quotes
+  a price (**F50**); the bytes still move at an `embed`.
+
+These two are also the only methods that **refuse an unknown parameter**. A reader sent an extra key asked a question about
+state; a writer whose `"modle"` was ignored consented to nothing while being told it did — which is F35's argument for refusing
+unknown keys in `config.toml`, applied to the method that writes that file.
 
 `initialize` also reports `data_dir` — where artifacts and per-workspace databases live — because a client that wants to warn
 "this vault needs 295 MiB" needs to know which disk it means.
@@ -130,6 +137,44 @@ It is a reader in the strong sense: no write lock, and **no database creation** 
 file before opening it, so a pane that polls cannot mint an index for every folder it hovers over. It answers while an
 embed holds the workspace. The identity rules a client may rely on, and why each was drawn where it was, are in
 [**F48**](design-f48-links-as-a-query.md).
+
+## Turning embeddings on or off
+
+**`embeddings.enable` and `embeddings.disable`** (issue **#7**, [**F50**](design-f50-consent-has-a-door.md)) are the door an
+application needed when a person answered *yes, download the embedding model so search can use meanings*. Before them the only
+way out of np's documented default was for that application to open np's `config.toml` and edit it — re-implementing np's
+validation badly, in a file whose semantics it cannot check, with no record of who set what.
+
+```json
+{"id":7,"jsonrpc":"2.0","method":"embeddings.enable","params":{"model":"embeddinggemma-2"}}
+```
+
+The answer is the same document `np embeddings enable --json` prints:
+
+| Key | Meaning |
+|---|---|
+| `changed` | **the keys np wrote**, in file order — `["embeddings.provider", "embeddings.model"]`, or `["embeddings.model"]` when only the model moved, or `[]` when nothing did. It is not a list of keys involved in the request, and an empty list means no byte was written |
+| `provider`, `model` | what the config file says **after** the call, read back through the loader every run uses — not an echo of what was asked for |
+| `fetch` | `{bytes_total, members}` for a first `embed`: this build's plan from the same pin table as `models.list`'s `pinned` and the terminal prompt, so three surfaces cannot quote two prices for one download. `null` whenever an `embed` would download nothing — a disabled config, or one with no model named. A config that is off but still names a model (which `embeddings.disable` leaves) has no fetch to price, and quoting 309 MB beside `provider: "none"` would be a cost the next run will not incur |
+| `persisted_to` | which file now carries the decision — the same path `initialize`'s neighborhood and About name. `null` only when nothing resolved a config path *and* there was nothing to write |
+
+What it does, and refuses:
+
+- **It writes config and fetches nothing.** The download stays where **F38** put it — at an `embed`, announced with its size and
+  origin, digest-checked. A method that downloaded on the click that only *allowed* a download would be a different product, and
+  #7's first failure row (a successful `embed` that embedded nothing) is avoided by quoting the price here instead.
+- **Idempotent.** Answering *Allow* twice answers `changed: []`, writes no bytes, and still names the file — because "which file
+  carries my decision?" has the same answer before and after a repeat click.
+- **Refuses rather than half-configures**: an id this build does not pin (the refusal lists the ones it does), a build with no
+  inference runtime (`local-model-not-built`, the token `search` already uses), a config file that does not load today (its own
+  error comes back, and np's edit never happens). A refusal leaves the file byte-identical and no temporary file beside it.
+- **Disabling writes one key.** `provider = "none"`, and `embeddings.model` stays where it is: revoking consent to download is not
+  a licence to erase which model was chosen.
+
+There is deliberately **no `workspace` parameter**. The file this writes is global, so passing a workspace would imply a per-vault
+scope np does not have — and #7's own point was that only np can decide which of consent-per-vault, artifacts-per-workspace and
+config-globally a consent answer belongs to. The answer is: the *decision* is global, the *artifacts* are per workspace, so an
+application enables once and then runs `scan`/`embed` per vault, which fetch into that workspace's artifact directory under F38.
 
 ## States travel as data, not as errors
 
@@ -314,8 +359,9 @@ This block was re-captured on 2026-11-14 on a **default-feature** debug build of
 `features.local_model` reads `false` where B, C and D read `true`. Its third line carries the keys the last three issues added:
 `indexed`, `keyword_used` and `semantic_used` from **#5** (which halves this answer was built from, and whether there was
 anything for them to run against), and `prefix_used`, `prefix_terms` and the hit's `matched_exactly` from **#6** — here all
-saying *nothing was widened*, because this query asked for a whole word. Its handshake now lists the same eight methods as this
-build, `links.list` included (**#2**).
+saying *nothing was widened*, because this query asked for a whole word. Its handshake lists eight methods where this build now
+answers ten: `links.list` arrived in **#2** (included here) and `embeddings.enable` / `embeddings.disable` in **#7**, after this
+capture. A client feature-detects off that array, which is exactly the case the array is there for.
 
 ### A first run with no network
 

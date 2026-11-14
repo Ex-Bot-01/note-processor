@@ -341,6 +341,176 @@ fn a_search_response_is_the_same_document_np_search_json_prints() {
     assert_eq!(served, printed, "the two channels answered differently");
 }
 
+/// **#7**: an application that was told *yes, download the embedding model* had nothing to do with the answer except editing
+/// np's TOML. `embeddings.enable` is that action taken by np, answering the same document `np embeddings enable --json` prints
+/// — and quoting the price of a fetch **before** anything is fetched.
+#[cfg(feature = "local-model")]
+#[test]
+fn embeddings_enable_writes_the_config_and_quotes_the_price_before_anything_is_fetched() {
+    let mut server = Server::new();
+    server.result("initialize", json!({"notifications": true}));
+    let id = a_pinned_id();
+
+    let enabled = server.result("embeddings.enable", json!({"model": id}));
+    assert_eq!(
+        key_names(&enabled),
+        vec!["changed", "fetch", "model", "persisted_to", "provider"],
+        "one key set for both doors, and for the CLI's copy of them: {enabled}"
+    );
+    assert_eq!(
+        enabled["changed"].as_array().map(|keys| keys.len()),
+        Some(2),
+        "a config that said nothing about embeddings gains both keys: {enabled}"
+    );
+    assert_eq!(enabled["provider"], "local-model");
+    assert_eq!(enabled["model"], id.as_str());
+    assert_eq!(
+        enabled["fetch"]["bytes_total"].as_u64(),
+        Some(np_core::pins::plan_size(&id)),
+        "the price is the pin table's, so `models.list`'s `pinned`, this answer and the terminal prompt cannot disagree (#3)"
+    );
+
+    let path = std::path::PathBuf::from(enabled["persisted_to"].as_str().expect("a path is named"));
+    let text = std::fs::read_to_string(&path).expect("the file np names exists");
+    assert!(text.contains("provider = \"local-model\""), "{text}");
+    assert!(text.contains(&format!("model = \"{id}\"")), "{text}");
+    assert!(
+        text.contains("np embeddings enable"),
+        "provenance: the file says np wrote it, and with what command:\n{text}"
+    );
+
+    // **Idempotence**, which #7 named first: a GUI that answers *Allow* twice must not append a second `[embeddings]`.
+    let again = server.result("embeddings.enable", json!({"model": id}));
+    assert_eq!(
+        again["changed"].as_array().map(Vec::len),
+        Some(0),
+        "{again}"
+    );
+    assert_eq!(
+        again["persisted_to"], enabled["persisted_to"],
+        "and still names the file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("test step: read it again"),
+        text,
+        "a repeat click writes no bytes"
+    );
+
+    // Turning it back off moves one key and leaves the model alone — consent revoked is not history erased.
+    let off = server.result("embeddings.disable", json!({}));
+    assert_eq!(off["changed"], json!(["embeddings.provider"]), "{off}");
+    assert_eq!(off["provider"], "none");
+    assert_eq!(
+        off["model"],
+        id.as_str(),
+        "the model stays, and the document says so honestly"
+    );
+    assert!(
+        off["fetch"].is_null(),
+        "a disabled config downloads nothing, so it has no price to quote: {off}"
+    );
+    let text = std::fs::read_to_string(&path).expect("test step: read the file again");
+    assert!(text.contains("provider = \"none\""), "{text}");
+    assert!(
+        text.contains(&format!("model = \"{id}\"")),
+        "np left the key it was not asked about:\n{text}"
+    );
+}
+
+/// A build with no inference runtime must not write a provider that cannot embed anything — that is #7's first failure row, a
+/// config that reads as configured and embeds nothing. The refusal is `-32000` carrying the CLI's own sentence, and it writes
+/// nothing at all.
+#[cfg(not(feature = "local-model"))]
+#[test]
+fn embeddings_enable_refuses_on_a_build_with_no_runtime_and_writes_nothing() {
+    let mut server = Server::new();
+    server.result("initialize", json!({"notifications": true}));
+
+    let response = server.request("embeddings.enable", json!({"model": a_pinned_id()}));
+    let fault = &response["error"];
+    assert_eq!(fault["code"], -32000, "{response}");
+    assert!(
+        fault["message"]
+            .to_string()
+            .contains("local-model-not-built"),
+        "one token for one fact, on both doors: {fault}"
+    );
+    assert!(
+        !config_file(&server).exists(),
+        "a refusal does not install a config file"
+    );
+
+    // Disabling needs no runtime — that is the point of an off switch.
+    let off = server.result("embeddings.disable", json!({}));
+    assert_eq!(off["provider"], "none");
+    assert_eq!(
+        off["changed"].as_array().map(Vec::len),
+        Some(0),
+        "nothing was on, so nothing changed: {off}"
+    );
+}
+
+/// These two methods write, so a parameter they cannot use is refused rather than ignored (**F50**, following F35's argument
+/// for `config.toml` itself): a GUI whose `"modle"` was silently dropped would show a person a consent box that configured
+/// nothing, and the answer would look like it had.
+#[test]
+fn embeddings_methods_refuse_a_parameter_they_cannot_use() {
+    let mut server = Server::new();
+    server.result("initialize", json!({"notifications": true}));
+
+    for (method, params, needle) in [
+        ("embeddings.enable", json!({}), "model"),
+        ("embeddings.enable", json!({"model": ""}), "empty"),
+        ("embeddings.enable", json!({"model": 7}), "must be a string"),
+        (
+            "embeddings.enable",
+            json!({"model": a_pinned_id(), "modle": "typo"}),
+            "modle",
+        ),
+        (
+            "embeddings.disable",
+            json!({"workspace": "/tmp"}),
+            "workspace",
+        ),
+    ] {
+        let response = server.request(method, params.clone());
+        let fault = &response["error"];
+        assert_eq!(fault["code"], -32602, "{method} with {params}: {response}");
+        assert!(
+            fault["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(needle),
+            "the refusal should name the caller's own mistake ({needle}): {fault}"
+        );
+    }
+}
+
+/// A model id this build pins, read from the pin table rather than hardcoded.
+fn a_pinned_id() -> String {
+    np_core::pins::PINNED_IDENTITIES
+        .first()
+        .expect("test setup: this build pins at least one model")
+        .id
+        .to_string()
+}
+
+/// The config file the server child reads and writes: `XDG_CONFIG_HOME` / `%APPDATA%` point at `<tmp>/config`, and
+/// `config_file_path` joins `note-processor/config.toml` under it.
+///
+/// Gated with the one case that asks whether a refusal created a file: on a build **with** the runtime, enabling succeeds and
+/// reads the path out of the document instead, so this helper would be dead code — and a dead test helper is a lint failure in
+/// the `local-model` row, which is exactly where it would otherwise sit unnoticed until CI.
+#[cfg(not(feature = "local-model"))]
+fn config_file(server: &Server) -> std::path::PathBuf {
+    server
+        ._tmp
+        .path()
+        .join("config")
+        .join("note-processor")
+        .join("config.toml")
+}
+
 /// **"This folder is not indexed" has to be decidable from the answer** (issue **#5**), and `search` is the method a
 /// GUI calls first — before any `scan`, often the only request a curious person makes before deciding whether the
 /// folder is worth indexing at all.

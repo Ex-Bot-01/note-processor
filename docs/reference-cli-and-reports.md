@@ -11,6 +11,8 @@ np scan <workspace> [--json]              # index + regenerate the catalog
 np embed <workspace> [--json]             # embed what the index says is owed
 np search <workspace> <query> [--limit N] [--mode M] [--json]   # --limit defaults to 10, --mode defaults to config's `hybrid`
 np models install|fetch|hash|list …
+np embeddings enable <id> [--json]        # turn the embedding model on in config.toml; fetches nothing (#7)
+np embeddings disable [--json]            # provider = "none"; the model you chose stays in the file
 ```
 
 - **Order matters: scan, then embed.** Embedding works from the index. `scan` is idempotent and cheap on an unchanged tree.
@@ -259,6 +261,52 @@ What this does **not** do, each for a reason rather than by omission:
   separator it always was.
 - Widening does not make a hit score higher or reorder the list: `bm25()` scores the documents the index matched, and prefix hits
   are ranked by the same number as whole-word ones.
+
+### A consent answer has a door: `np embeddings enable|disable`
+
+An application that asked *"may np download the embedding model?"* and was told yes had nothing to do with the answer except
+editing np's `config.toml` from outside (**issue #7**). These two commands are that action taken by np, so its own validation runs
+on the way in. One real run on a machine with no config file at all:
+
+```console
+$ np embeddings enable embeddinggemma-2
+wrote embeddings.provider, embeddings.model to /tmp/f50cap/cfg/note-processor/config.toml
+embeddings on: provider = "local-model", model = "embeddinggemma-2"
+nothing has been downloaded yet: the first `np embed` fetches 295.5 MB (main) and checks its digest
+```
+
+and the file it created, verbatim — comments, quoting style and unrelated keys elsewhere in a real config survive the same edit:
+
+```toml
+# note-processor set by `np embeddings enable embeddinggemma-2` (np 0.4.0) at 2026-11-14T17:22:41Z
+[embeddings]
+provider = "local-model"
+model = "embeddinggemma-2"
+```
+
+`--json` answers the document serve's `embeddings.enable` answers, so a terminal and a GUI read one shape:
+
+| Key | Meaning |
+|---|---|
+| `changed` | **the keys np wrote**, in file order — `[]` when nothing moved. Not "keys involved in the request": switching one model for another lists only `embeddings.model`, and disabling on an installation that has no config lists nothing and creates no file |
+| `provider`, `model` | what the config says **after** the call, read back through the loader every run uses |
+| `fetch` | `{bytes_total, members}` for a first `embed`, from the same pin table as `models list`'s `pinned` and the terminal consent prompt (**#3**), or `null` when an `embed` would download nothing |
+| `persisted_to` | which file now carries the decision — `null` only when nothing resolved a config path *and* there was nothing to write |
+
+```console
+$ np embeddings disable
+wrote embeddings.provider to /tmp/f50cap/cfg/note-processor/config.toml
+embeddings off: provider = "none"
+model = "embeddinggemma-2" is still in the file; remove that key yourself if you want it gone
+```
+
+Three things to know. **Nothing is fetched by either command** — the bytes move at an `embed`, announced and digest-checked as
+always. **The config file is global while artifacts are per workspace**, so enabling is once-per-machine and each vault gets its
+artifact on its first `np embed`; that is also why neither command takes a workspace operand. And **it refuses rather than
+half-configuring**: an id this build does not pin (the refusal lists the ones it does), a build with no inference runtime
+(`local-model-not-built`), or a config that does not load today (its own error comes back and np's edit never happens) all leave
+the file byte-identical. The reasoning, including how the write is validated by loading it before publishing, is in
+[**F50**](design-f50-consent-has-a-door.md).
 
 - **Exit codes.** `0` success (including "nothing to do" and "nothing indexed"), `1` anything the runtime refused — disabled
   provider, missing artifact, a model mismatch — and `2` for argv errors, which is clap's doing. No command invents a code.

@@ -1,7 +1,9 @@
 # Getting a model onto the machine
 
 Where artifacts live, and the two doors by which bytes get there: `np models fetch` (this build's pinned ids only, digest-verified) and
-    `np models install` (a file you already hold). Read this before editing `embeddings.model` by hand.
+    `np models install` (a file you already hold). A third key turns embeddings on or off without moving any bytes at all —
+    [`np embeddings enable`](#the-third-door-that-moves-no-bytes-turning-embeddings-on) (**#7**) — and it is still worth reading
+    this page before editing `embeddings.model` by hand.
 
 > *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
@@ -30,6 +32,38 @@ files where they are and starts empty under the new key: one `np scan` clears it
 change Windows wrote `workspaces/` and `workspaces.sqlite` straight into `%LOCALAPPDATA%`, which is where every application writes; if
 that is where your index is, this release still reads it there and says so on stderr rather than reporting your notes as new.
 An explicit `data_dir` in the config file is an instruction, not a location the program moved, and is never overridden.
+
+### The third door that moves no bytes: turning embeddings on
+
+An absent `[embeddings]` section is not a broken installation; it is np's documented default (`provider = "none"`), and
+inference does not start merely because a binary was built with the runtime. Until 0.5, the only way to **leave** that state was
+to edit `config.toml`. That left an application with a consent answer in hand and nothing to do with it except write np's own
+file from outside — re-implementing np's validation badly, which is how you get a config that reads as configured and embeds zero
+notes while answering success (**issue #7**, [**F50**](design-f50-consent-has-a-door.md)).
+
+```sh
+np embeddings enable embeddinggemma-2      # writes provider and model; fetches nothing
+np embeddings disable                      # provider = "none"; the model you chose stays in the file
+```
+
+Both commands answer the same document `np serve`'s `embeddings.enable` / `embeddings.disable` answers, so a terminal and a GUI
+see one shape: which keys np wrote (`changed`, empty when nothing moved), what the config says afterwards, what a first `np embed`
+would cost (`fetch.bytes_total`, from the same pin table as `np models list`'s `pinned`), and `persisted_to` — the file that now
+carries the decision.
+
+Four rules worth knowing before you point a button at them:
+
+- **It does not download.** The bytes still move at an `embed`, under F38's announcement and digest rules. This command is the
+  consent *answer*, and it quotes the price instead of paying it.
+- **The config file is global; artifacts are per workspace.** So enabling happens once, and each vault gets its artifact the
+  first time you `np embed` it. That is also why neither command takes a workspace operand: a per-vault consent answer belongs to
+  the application's registry, not to np's file.
+- **It refuses rather than half-configuring**: an id this build does not pin (the refusal lists the ones it does), a build with no
+  inference runtime (`local-model-not-built`), or a config that does not load today (its own error comes back, and np's edit never
+  happens). A refusal leaves the file byte-identical.
+- **The file stays yours.** Comments, blank lines, quoting style and every unrelated key survive; what np touched is marked with a
+  comment naming the command and the instant. There is no TOML re-serialiser in this path on purpose — one would rewrite your file
+  alphabetically and take the comments with it.
 
 ### Option A — fetch it
 

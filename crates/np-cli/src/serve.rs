@@ -56,6 +56,11 @@ pub const METHODS: &[&str] = &[
     // terminal does not ask. **Issue #2** added it inside protocol 1: an added method is a compatible change, and a client
     // that wants to know whether this build has it reads this array — which is the same way `status.get` shipped.
     "links.list",
+    // **F50** (issue **#7**): the door a consent answer needs. Added inside protocol 1 for the same reason `links.list` was —
+    // an added method is a compatible change, and a client that must know whether this build can act on *yes* reads this array
+    // rather than comparing version strings.
+    "embeddings.enable",
+    "embeddings.disable",
     "shutdown",
 ];
 
@@ -333,6 +338,9 @@ fn dispatch(
         "embed" => embed(params, request, ch),
         "models.list" => models_list(params),
         "links.list" => links_list(params),
+        "embeddings.enable" => embeddings_enable(params),
+        "embeddings.disable" => embeddings_disable(params),
+
         "status.get" => status(params, ch),
         // The client asked to be done. Answer first, then stop reading: a response that races the pipe closing is a
         // response nobody received. Closing stdin still works and still exits 0 — this only means `shutdown` alone is
@@ -642,6 +650,86 @@ fn models_list(params: &Value) -> Result<Value, ServeError> {
         ),
         Err(err) => return Err(refused(err)),
     })
+}
+
+/// **"May np download the embedding model?" — someone said yes, so say it to the config file.** (issue **#7**, **F50**)
+///
+/// `embed` answers `embedded: 0` and *success* when `[embeddings]` is absent, which is accurate and unactionable from a
+/// window; until now the only way out was for the application to open np's TOML and edit it — re-implementing np's validation
+/// badly, in a file whose semantics it cannot check. This method is that action taken by the code that owns those rules: it
+/// writes through `np_core::config_write`, which validates its own bytes by loading them, refuses an id this build does not
+/// pin, and refuses a build with no inference runtime rather than writing a provider that cannot embed anything.
+///
+/// **Nothing is fetched here.** The answer quotes the price (`fetch.bytes_total`, from the same pin table as `models.list`'s
+/// `pinned` and the terminal prompt) so consent is informed, and the download stays where F38 put it: at the first `embed`,
+/// announced, digest-checked. A method that downloaded on the click that only *allowed* a download would be a different
+/// product.
+fn embeddings_enable(params: &Value) -> Result<Value, ServeError> {
+    let model = match params.get("model") {
+        None | Some(Value::Null) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                "params need a \"model\" this build pins — `models.list` answers one under `pinned`, with its byte count",
+            ))
+        }
+        Some(Value::String(id)) if id.trim().is_empty() => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                "\"model\" is empty: name the model this answer consents to",
+            ))
+        }
+        Some(Value::String(id)) => id.clone(),
+        Some(other) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                format!("\"model\" must be a string, not {other}"),
+            ))
+        }
+    };
+    refuse_unknown_keys(params, &["model"])?;
+    crate::embeddings_apply(np_core::config_write::EmbeddingsTarget::On { model: &model })
+        .map(|outcome| outcome.document)
+        .map_err(refused)
+}
+
+/// **The other half of consent: revoking it** (**F50**). `provider = "none"`, and `embeddings.model` is left exactly where it
+/// is — withdrawing permission to download is not permission to erase which model was chosen, and the file stays one key away
+/// from being on again.
+///
+/// It needs no runtime, so a build that cannot embed can still turn embeddings off; #7 asked for the enable half first and
+/// could live without this one, which is precisely the kind of thing an application says before it discovers it needs it.
+fn embeddings_disable(params: &Value) -> Result<Value, ServeError> {
+    refuse_unknown_keys(params, &[])?;
+    crate::embeddings_apply(np_core::config_write::EmbeddingsTarget::Off)
+        .map(|outcome| outcome.document)
+        .map_err(refused)
+}
+
+/// Refuse a parameter this method has no use for. **Only these two methods do this**, and only because they write: a typo'd
+/// `"modle"` ignored here would consent to nothing while answering as though it had, which is the same failure F35 refuses in
+/// `config.toml` for the same reason. A reader that sends an extra key is asking a question about state; a writer is changing it.
+fn refuse_unknown_keys(params: &Value, allowed: &[&str]) -> Result<(), ServeError> {
+    let Some(keys) = params.as_object() else {
+        return Ok(());
+    };
+    if let Some(key) = keys.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(ServeError::fault(
+            Fault::INVALID_PARAMS,
+            format!(
+                "unknown parameter \"{key}\" — this method takes {}",
+                if allowed.is_empty() {
+                    "no parameters".to_string()
+                } else {
+                    allowed
+                        .iter()
+                        .map(|key| format!("\"{key}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// **Who links here, and where is this dead target written?** (issue **#2**)

@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod change;
 pub mod chunk;
 pub mod config;
+pub mod config_write;
 pub mod db;
 pub mod diagnostics;
 pub mod embed;

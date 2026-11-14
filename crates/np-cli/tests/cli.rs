@@ -2830,6 +2830,225 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
     );
 }
 
+/// **#7**: an application that was told *yes, download the embedding model* had nothing to do with the answer, so it edited
+/// np's TOML by hand. `np embeddings enable` is that action taken by np — and the terminal says what it wrote, where, and what
+/// the first `embed` will cost, without downloading anything.
+#[cfg(feature = "local-model")]
+#[test]
+fn enabling_embeddings_writes_the_two_keys_quotes_the_price_and_downloads_nothing() {
+    let ws = workspace();
+    let id = a_pinned_id();
+
+    let mut first_cmd = ws.command_without_operand(&["embeddings", "enable", &id]);
+    first_cmd.arg("--json");
+    let first = run(&mut first_cmd);
+    assert_eq!(first.code(), 0, "\n{}", first.stderr());
+    let value: serde_json::Value =
+        serde_json::from_str(&first.stdout()).expect("`--json` prints exactly one JSON object");
+    assert_eq!(
+        json_keys(&value),
+        vec!["changed", "fetch", "model", "persisted_to", "provider"],
+        "one key set for both doors, so a client reads one shape: {value}"
+    );
+    assert_eq!(
+        value["changed"].as_array().map(|keys| keys.len()),
+        Some(2),
+        "a file that said nothing about embeddings gains both keys: {value}"
+    );
+    assert_eq!(value["provider"], "local-model");
+    assert_eq!(value["model"], id.as_str());
+    let expected = np_core::pins::plan_size(&id);
+    assert_eq!(
+        value["fetch"]["bytes_total"].as_u64(),
+        Some(expected),
+        "the same number `models list --json` publishes under `pinned`, so a GUI and a terminal cannot quote two prices (#3)"
+    );
+    assert_eq!(
+        value["fetch"]["members"].as_array().map(Vec::len),
+        Some(np_core::pins::members_for_build().len()),
+        "and it names the members that price covers"
+    );
+
+    let written =
+        std::path::PathBuf::from(value["persisted_to"].as_str().expect("a path is named"));
+    let text = fs::read_to_string(&written).expect("the file np names exists");
+    assert!(text.contains("provider = \"local-model\""), "{text}");
+    assert!(
+        text.contains(&format!("model = \"{id}\"")),
+        "the file says what the document says: {text}"
+    );
+    assert!(
+        text.contains("np embeddings enable"),
+        "and says that np wrote it, with the command to re-run or undo: {text}"
+    );
+
+    // **Nothing was fetched.** The artifact directory this workspace would use does not exist yet.
+    let strays = fs::read_dir(ws.data_dir())
+        .map(|entries| {
+            entries
+                .filter_map(|entry| {
+                    entry
+                        .ok()
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                })
+                .filter(|name| name.contains(".models"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        strays,
+        Vec::<String>::new(),
+        "consent is not a download (**F50**); `embed` is"
+    );
+
+    // …and a second call changes nothing, which is what #7 asked for so an app can answer *Allow* twice.
+    let mut again_cmd = ws.command_without_operand(&["embeddings", "enable", &id]);
+    again_cmd.arg("--json");
+    let again = run(&mut again_cmd);
+    assert_eq!(again.code(), 0, "\n{}", again.stderr());
+    let second: serde_json::Value = serde_json::from_str(&again.stdout()).expect("one document");
+    assert_eq!(
+        second["changed"].as_array().map(Vec::len),
+        Some(0),
+        "answering yes twice appends nothing: {second}"
+    );
+    assert_eq!(
+        second["persisted_to"], value["persisted_to"],
+        "and still names the file that carries the decision"
+    );
+    let after = fs::read_to_string(&written).expect("test step: read the file again");
+    assert_eq!(after, text, "byte for byte: a repeat click writes nothing");
+
+    let mut plain_cmd = ws.command_without_operand(&["embeddings", "enable", &id]);
+    let plain = run(&mut plain_cmd);
+    assert_eq!(plain.code(), 0, "\n{}", plain.stderr());
+    assert!(
+        plain.stdout().contains("already on") && plain.stdout().contains("nothing changed"),
+        "the terminal says the idempotent thing plainly:\n{}",
+        plain.stdout()
+    );
+}
+
+/// **#7**'s off switch. One key moves, and the model that was chosen stays in the file — revoking permission to download is not
+/// a licence to erase which model the person picked.
+#[test]
+fn disabling_embeddings_writes_one_key_and_leaves_the_model_alone() {
+    let ws = workspace();
+    let id = a_pinned_id();
+    ws.write_user_config(&format!(
+        "[embeddings]\nprovider = \"local-model\"\nmodel = \"{id}\"\n"
+    ));
+
+    let mut out_cmd = ws.command_without_operand(&["embeddings", "disable"]);
+    out_cmd.arg("--json");
+    let out = run(&mut out_cmd);
+    assert_eq!(out.code(), 0, "\n{}", out.stderr());
+    let value: serde_json::Value = serde_json::from_str(&out.stdout()).expect("one document");
+    assert_eq!(
+        value["changed"].as_array().map(|keys| keys.len()),
+        Some(1),
+        "one key moved, and the answer does not claim more: {value}"
+    );
+    assert_eq!(value["changed"][0], "embeddings.provider");
+    assert_eq!(value["provider"], "none");
+    assert!(
+        value["fetch"].is_null(),
+        "turning embeddings off costs no bytes: {value}"
+    );
+
+    let text = fs::read_to_string(ws.config_dir().join("note-processor").join("config.toml"))
+        .expect("test step: read the config");
+    assert!(text.contains("provider = \"none\""), "{text}");
+    assert!(
+        text.contains(&format!("model = \"{id}\"")),
+        "np left the model it was not asked about: {text}"
+    );
+
+    // Idempotent on the same terms as enable.
+    let mut again_cmd = ws.command_without_operand(&["embeddings", "disable"]);
+    again_cmd.arg("--json");
+    let again = run(&mut again_cmd);
+    assert_eq!(again.code(), 0, "\n{}", again.stderr());
+    let second: serde_json::Value = serde_json::from_str(&again.stdout()).expect("one document");
+    assert_eq!(second["changed"].as_array().map(Vec::len), Some(0));
+
+    let mut plain_cmd = ws.command_without_operand(&["embeddings", "disable"]);
+    let plain = run(&mut plain_cmd);
+    assert!(
+        plain.stdout().contains("already off"),
+        "the second call is a fact, not an error:\n{}",
+        plain.stdout()
+    );
+}
+
+/// A build with no inference runtime must not write a provider that cannot embed anything — #7's first failure row is a config
+/// that looks configured and does nothing, and this refusal is what keeps np from creating one.
+#[cfg(not(feature = "local-model"))]
+#[test]
+fn a_build_with_no_runtime_refuses_to_enable_embeddings_and_writes_nothing() {
+    let ws = workspace();
+    let id = a_pinned_id();
+
+    let mut out_cmd = ws.command_without_operand(&["embeddings", "enable", &id]);
+    let out = run(&mut out_cmd);
+    assert_eq!(out.code(), 1, "a refusal is a refusal:\n{}", out.stdout());
+    assert!(
+        out.stderr().contains("local-model-not-built"),
+        "the same token `np search` uses, so one fact has one name on both doors:\n{}",
+        out.stderr()
+    );
+    assert!(
+        !ws.config_dir()
+            .join("note-processor")
+            .join("config.toml")
+            .exists(),
+        "a refusal does not install a config file"
+    );
+
+    // And under `--json` it is still a refusal, not an empty document.
+    let mut as_json_cmd = ws.command_without_operand(&["embeddings", "enable", &id]);
+    as_json_cmd.arg("--json");
+    let as_json = run(&mut as_json_cmd);
+    assert_eq!(as_json.code(), 1);
+    assert!(
+        as_json.stdout().trim().is_empty(),
+        "nothing on stdout: {}",
+        as_json.stdout()
+    );
+}
+
+/// The pinned ids are the only ones np can price, digest or fetch, so they are the only ones it will write.
+#[cfg(feature = "local-model")]
+#[test]
+fn an_unpinned_model_id_is_refused_and_names_the_ids_this_build_pins() {
+    let ws = workspace();
+    let mut out_cmd = ws.command_without_operand(&["embeddings", "enable", "not-a-real-model"]);
+    let out = run(&mut out_cmd);
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(
+        out.stderr().contains("not-a-real-model"),
+        "the refusal names what was refused:\n{}",
+        out.stderr()
+    );
+    for pinned in np_core::pins::PINNED_IDENTITIES {
+        assert!(
+            out.stderr().contains(pinned.id),
+            "and lists what this build does pin, the way `models list`'s `pinned` does:\n{}",
+            out.stderr()
+        );
+    }
+}
+
+/// A model id this build pins, read from the pin table rather than hardcoded: a re-pin moves these cases with it instead of
+/// failing on a string nobody changed.
+fn a_pinned_id() -> String {
+    np_core::pins::PINNED_IDENTITIES
+        .first()
+        .expect("test setup: this build pins at least one model")
+        .id
+        .to_string()
+}
+
 /// Issue #6's measurements, made reproducible: a half-typed word, the two doors F49 opens, and an answer that says which
 /// words it widened.
 #[test]

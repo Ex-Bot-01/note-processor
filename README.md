@@ -127,10 +127,11 @@ Two habits that pay off:
 | `np search <workspace> <query> [--limit N] [--mode hybrid\|semantic\|keyword] [--prefix]` | ranks notes and figures; default `hybrid` fuses FTS5 `bm25()` with vectors by reciprocal rank fusion. `--prefix` matches every word at a word beginning (`grand` reaches `grandma`); one marked word, `"grand*"`, does the same for itself | nothing (it opens the database, then only `SELECT`s) |
 | `np setup <workspace> [--yes]` | scan → fetch if missing → embed, one report | index, maybe the artifact, vectors |
 | `np models install \| fetch \| hash \| list …` | puts model bytes in place, per workspace | `<data_dir>/workspaces/<key>.models/` |
+| `np embeddings enable <id> \| disable` | turns the embedding model on or off in np's config file — the door a consent answer needs (**#7**). **Fetches nothing**; quotes what a first `np embed` would cost | `config.toml`, `[embeddings]` |
 
 Every command takes `--json` for a machine-readable document, and exit codes mean what they say: **0** success (including "nothing
 to do" and "nothing indexed"), **1** anything the runtime refused, **2** argv errors. Full field-by-field reference, including why
-every search hit always carries the same eleven keys: [CLI and report reference](docs/reference-cli-and-reports.md).
+every search hit always carries the same twelve keys: [CLI and report reference](docs/reference-cli-and-reports.md).
 
 Three behaviours worth knowing before you script against it:
 
@@ -194,7 +195,8 @@ That block is captured stdout, one interrupted download, nothing edited: `lockin
 size, then a refusal carrying the same code as the error object. An embed that gets to run says `embedding` and `writing` where
 this one said `fetching`.
 
-Eight methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `links.list`, `status.get`, `shutdown` — and three rules:
+Ten methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `links.list`, `embeddings.enable`, `embeddings.disable`,
+`status.get`, `shutdown` — and three rules:
 
 - **Every `result` is exactly the document `np <verb> --json` prints**, because both channels call one builder; a test compares them
   value for value rather than trusting intent.
@@ -299,6 +301,7 @@ The decisions behind those, each with its measurements:
 | [`docs/design-m2-thread-policy.md`](docs/design-m2-thread-policy.md) | The `"auto"` worker rule and the measurements behind it |
 | [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
 | [`docs/design-f48-links-as-a-query.md`](docs/design-f48-links-as-a-query.md) | What a client may assume about link identity: display paths and lines, what `rel` scopes, and why figures and stale notes are absent from `links.list` |
+| [`docs/design-f50-consent-has-a-door.md`](docs/design-f50-consent-has-a-door.md) | Who may write `config.toml`, and how the write is checked: validation by loading, refusal over half-configuration, provenance in the file |
 | [`docs/design-f49-word-beginnings.md`](docs/design-f49-word-beginnings.md) | What a query may ask for besides a whole word: the one character of syntax, why the default did not move, and how an answer admits it widened |
 | [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
 
