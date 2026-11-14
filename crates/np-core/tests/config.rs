@@ -101,6 +101,27 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// previous values go back on drop. Most cases need none of this — each passes an explicit config path or a
 /// `data_dir` inside its own `TempDir` — but every `[models]` case holds one, because those two keys are read out of
 /// the environment by `Config::load` whether or not the fixture asked ([`OVERRIDE_ENV_KEYS`] clears them).
+/// A path as a TOML **basic string** body: every backslash doubled.
+///
+/// Two cases write `data_dir = "<path>"` into a config file, and on a Windows runner that path is
+/// `C:\Users\RUNNER~1\AppData\Local\Temp\.tmpXXXX\chosen` — so the file's own parser reads `\U` as an escape and refuses with
+/// *"too few unicode value digits"* (run 43624800215, `loading_a_windows_upgrade_reaches_the_fallback_and_flags_it`), while the
+/// sibling case got the milder half: `declared_data_dir` answered `None` for a file that named the key plainly. Nothing was
+/// wrong with how np reads a pinned directory; it was how this file wrote one.
+fn toml_escaped(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
+}
+
+/// Whether a stored workspace key ends with `suffix`, read with `/` as the separator.
+///
+/// A drive-less absolute path (`/a/notes`) is absolute on Windows too and resolves against the current drive, so the key comes
+/// back `D:\a\notes` there. The comment beside both of these assertions had said exactly that — and then compared a
+/// `/`-spelled suffix, which smuggles a separator assumption into a path argument: `"D:\a\notes".ends_with("a/notes")` is
+/// false on the platform the comment had just described. Measured on run 43624800215.
+fn key_ends_with(stored: &str, suffix: &str) -> bool {
+    stored.replace('\\', "/").ends_with(suffix)
+}
+
 struct TestEnv {
     /// Held until the values are restored, so no second case installs over ours. A poisoned lock can
     /// only come from a case that already failed, so its contents are taken regardless.
@@ -126,9 +147,15 @@ impl TestEnv {
         // `APPDATA`/`LOCALAPPDATA` for Windows, and `HOME` as the fallback underneath them.
         env::set_var("HOME", tmp.path());
         env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
-        env::set_var("XDG_DATA_HOME", Self::data_dir_of(&tmp));
+        // The **raw** directory, on every platform. `Self::data_dir_of` is the *expectation* (nested on Windows, F37), and
+        // feeding it back in as `%LOCALAPPDATA%` asked np to nest a second time: measured on run 43624800215,
+        // `no_config_file_means_defaults` reported `<tmp>\data\note-processor\note-processor`. No machine holds a
+        // `%LOCALAPPDATA%` that already contains a program folder — the variable is `…\AppData\Local`, and the program's own
+        // name is the part np appends to it.
+        let raw_data = tmp.path().join("data");
+        env::set_var("XDG_DATA_HOME", &raw_data);
         env::set_var("APPDATA", tmp.path().join("config"));
-        env::set_var("LOCALAPPDATA", Self::data_dir_of(&tmp));
+        env::set_var("LOCALAPPDATA", &raw_data);
         // A developer's own mirror or digest override is the same leak as a stray `$HOME`: it would decide what an
         // unrelated case loads, and — since `[models]` refuses bad values — could fail a case for a key it never set.
         for key in OVERRIDE_ENV_KEYS {
@@ -533,7 +560,7 @@ fn registry_records_and_bumps_last_seen() {
     // here. Compare by suffix; the ordering, count and timestamps stay exactly asserted.
     assert_eq!(recent.len(), 2, "re-recording must not add a second row");
     assert!(
-        recent[0].0.ends_with("a/notes"),
+        key_ends_with(&recent[0].0, "a/notes"),
         "most recently seen workspace first, got {:?}",
         recent[0].0
     );
@@ -717,7 +744,7 @@ fn registry_reopens_without_losing_rows() {
     // suffix rather than by the Unix spelling.
     assert_eq!(recent.len(), 1, "the row must survive reopening");
     assert!(
-        recent[0].0.ends_with("a/notes"),
+        key_ends_with(&recent[0].0, "a/notes"),
         "persisted workspace key, got {:?}",
         recent[0].0
     );
@@ -2619,7 +2646,7 @@ fn a_file_that_never_names_data_dir_does_not_get_to_claim_one() {
     let pinned = tmp.path().join("chosen");
     fs::write(
         &file,
-        format!("data_dir = \"{}\"\n", pinned.display()).as_bytes(),
+        format!("data_dir = \"{}\"\n", toml_escaped(&pinned)).as_bytes(),
     )
     .expect("write config");
     assert_eq!(
@@ -2687,7 +2714,7 @@ fn loading_a_windows_upgrade_reaches_the_fallback_and_flags_it() {
     let pinned = cfgdir.path().join("chosen");
     fs::write(
         &file,
-        format!("data_dir = \"{}\"\n", pinned.display()).as_bytes(),
+        format!("data_dir = \"{}\"\n", toml_escaped(&pinned)).as_bytes(),
     )
     .expect("write config");
     let cfg = Config::load_with_platform(Some(&file), DataDirPlatform::Windows).expect("load");
