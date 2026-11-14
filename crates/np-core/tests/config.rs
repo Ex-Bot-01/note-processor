@@ -577,8 +577,11 @@ fn registry_records_and_bumps_last_seen() {
     let first_seen: i64 = conn
         .query_row(
             // Suffix match for the same reason as above: the stored key carries a drive letter
-            // on Windows.
-            "SELECT first_seen FROM workspaces WHERE workspace LIKE '%/a/notes'",
+            // on Windows — and, unlike the two assertions beside it, this one is SQL, so the separator has to be
+            // normalized *inside* the statement. `REPLACE(workspace, '\', '/')` makes the pattern mean one thing on both
+            // platforms; writing `'%/a/notes'` alone was the third copy of the assumption (run 43627654313:
+            // `test: read first_seen: QueryReturnedNoRows`, because no stored key ends in `/a/notes` there).
+            "SELECT first_seen FROM workspaces WHERE REPLACE(workspace, '\\', '/') LIKE '%/a/notes'",
             [],
             |row| row.get(0),
         )
