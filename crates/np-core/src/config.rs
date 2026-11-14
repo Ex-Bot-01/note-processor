@@ -1460,8 +1460,9 @@ fn os_data_dir_on(
 
 /// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows `%LOCALAPPDATA%\note-processor` (**F37**).
 /// `None` when the environment names no data directory at all — what [`Config::load`] refuses rather than deriving paths
-/// relative to the current directory. Note this is the *nested* answer; use [`os_default_data_dir`] for the one an actual run
-/// should use, which may be the pre-F37 location for one release.
+/// relative to the current directory. Note this is the *nested* answer on its own: a run also applies F37's one-release fallback,
+/// so the directory it actually uses may be the pre-F37 location. Pairing those two halves is what the private
+/// `os_default_data_dir` does, so no entry point can apply the nesting and forget the fallback.
 #[cfg(windows)]
 pub fn default_data_dir() -> Option<PathBuf> {
     data_dir_for(DataDirPlatform::Windows, &|key| env_path(key))
