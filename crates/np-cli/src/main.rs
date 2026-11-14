@@ -128,6 +128,12 @@ enum Command {
         /// Maximum number of hits to print, highest score first.
         #[arg(long, default_value_t = DEFAULT_SEARCH_LIMIT)]
         limit: usize,
+        /// Match every word at the **start** of a word instead of as a whole one: `grand` also reaches `grandma` and
+        /// `grandmother`. Off by default — keyword search matches whole tokens, because this vault holds identifiers — and
+        /// one marked word needs no flag here: `"grand*"` asks for word beginnings on its own (**#6**). This widens *every*
+        /// word in the query, which is what a "match word beginnings" toggle in a front end means.
+        #[arg(long)]
+        prefix: bool,
         /// Print the hits as JSON instead of one line each.
         #[arg(long)]
         json: bool,
@@ -333,12 +339,18 @@ fn main() -> ExitCode {
             query,
             limit,
             mode,
+            prefix,
             json,
         } => search_workspace(
             &workspace,
             &query,
             limit,
             mode.map(SearchModeFlag::to_core),
+            if prefix {
+                search::Prefix::EveryTerm
+            } else {
+                search::Prefix::Marked
+            },
             json,
         ),
         Command::Models { command } => match command {
@@ -1118,6 +1130,11 @@ struct SearchRun {
     /// a word `np` chose for an intent, not a word for a result; these two are the words for the result.
     keyword_used: bool,
     semantic_used: bool,
+    /// Whether this answer matched any word at a word beginning, and which words (**#6**). Read off the answer rather than
+    /// off the flag: `--prefix` on a query with no word in it widened nothing, and a key that contradicts `hits: []` is the
+    /// kind of pair a caller has to reconcile.
+    prefix_used: bool,
+    prefix_terms: Vec<String>,
     note: Option<search::RankNote>,
     fetched: Option<Value>,
     offline: bool,
@@ -1132,6 +1149,7 @@ fn search_run(
     query: &str,
     limit: usize,
     mode: Option<search::SearchMode>,
+    prefix: search::Prefix,
     announce: bool,
     progress: &dyn np_core::progress::Progress,
 ) -> Result<SearchRun, Box<dyn Error>> {
@@ -1329,6 +1347,7 @@ fn search_run(
         vector.as_deref(),
         query,
         limit,
+        prefix,
     )?;
     let hits = answer.hits;
     let note = note.or(answer.note);
@@ -1344,6 +1363,8 @@ fn search_run(
         indexed,
         keyword_used,
         semantic_used,
+        prefix_used: answer.prefix_used,
+        prefix_terms: answer.prefix_terms,
         note,
         fetched,
         offline,
@@ -1371,6 +1392,12 @@ fn search_document(run: &SearchRun) -> Value {
         "mode": run.mode.label(),
         "keyword_used": run.keyword_used,
         "semantic_used": run.semantic_used,
+        // **Whether any word here was matched at a word beginning** (#6), and which ones. Beside the two above because
+        // `keyword_used` says the keyword half ran; this says it widened the query, which is the fact a caller needs before
+        // printing `"grand"` as though a note containing only `grandma` said "grand". Per-hit truth travels in each hit's
+        // `matched_exactly`.
+        "prefix_used": run.prefix_used,
+        "prefix_terms": run.prefix_terms,
         "vectors": run.present,
         // The workspace's own state, and the only key that answers "should I offer to index this folder?" (#5).
         "indexed": run.indexed,
@@ -1387,6 +1414,7 @@ fn search_workspace(
     query: &str,
     limit: usize,
     mode: Option<search::SearchMode>,
+    prefix: search::Prefix,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let run = search_run(
@@ -1394,6 +1422,7 @@ fn search_workspace(
         query,
         limit,
         mode,
+        prefix,
         !json,
         np_core::progress::none(),
     )?;
@@ -1407,6 +1436,8 @@ fn search_workspace(
         note,
         model,
         indexed,
+        prefix_used,
+        prefix_terms,
         ..
     } = run;
     let mut out = io::stdout().lock();
@@ -1437,16 +1468,28 @@ fn search_workspace(
                 );
                 return Ok(());
             }
+            // A widened query gets the widening named in the refusal too: `nothing matched "grand"` after `--prefix` would
+            // tell a reader their notes hold no word beginning with `grand`, which is exactly what this run did not check.
+            let widened = if prefix_used {
+                " — not even as the start of a word"
+            } else {
+                ""
+            };
             let _ = match (mode, model.is_empty()) {
-                (search::SearchMode::Keyword, _) => writeln!(out, "nothing matched \"{query}\""),
+                (search::SearchMode::Keyword, _) => writeln!(out, "nothing matched \"{query}\"{widened}"),
                 (_, true) => writeln!(
                     out,
-                    "nothing matched \"{query}\" by {mode}: this workspace holds no vectors"
+                    "nothing matched \"{query}\"{widened} by {mode}: this workspace holds no vectors"
                 ),
                 (_, false) => writeln!(out, "nothing indexed for {model} by {mode}"),
             };
         }
         return Ok(());
+    }
+    if prefix_used {
+        // One line naming the words this run matched as beginnings, above the list it explains. The terms come from the plan
+        // rather than from `query`, so a marked `grand*` prints `grand`: what was searched, not what was typed (#6).
+        let _ = writeln!(out, "word beginnings matched: {}", prefix_terms.join(", "));
     }
     for hit in &hits {
         // Score to four decimals (full precision travels in `--json`), kind padded so the paths start in one column. In
@@ -1544,6 +1587,9 @@ fn hit_json(hit: &Hit) -> Value {
         // A matched phrase from the note body with the hit marked, or `null` on a vector-only hit: keyword evidence is a
         // property of the keyword half, not of a kind of note.
         "snippet": hit.snippet.clone(),
+        // `true` whole words, `false` reached only by a prefix, `null` not from the keyword list at all (#6). `null` is not
+        // `false`: a vector hit did not fail a whole-word test, it was never in one.
+        "matched_exactly": hit.matched_exactly,
         "linked_from": hit.linked_from,
         "source_note": match &hit.source_note {
             Some(note) => json!(note),

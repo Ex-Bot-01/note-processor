@@ -56,9 +56,10 @@ np models install|fetch|hash|list …
   did — so "no semantic hits", "no model installed" and "this folder is not indexed" stay three different reports. Each key's
   question is tabulated under [the search document](#the-search-document-keys-three-kinds-of-no-answer). Every hit carries the same **eleven** keys whatever the kind and whatever the mode —
   `score`, `cosine`, `bm25`, `semantic_rank`, `keyword_rank`, `kind`, `path`, `snippet`, `linked_from`, `source_note`,
-  `linked_notes` — because an absent key and a null are two different claims. The five evidence keys are F36's, and they exist so
+  `linked_notes` and `matched_exactly` — because an absent key and a null are two different claims. The five evidence keys are F36's, and they exist so
   a fused score can be argued with: in `keyword` mode `cosine` and `semantic_rank` are `null`, in `semantic` mode the reverse.
-  The last three are F28's: **every** live note linking a figure, byte-ordered, where the other two were its head and its length.
+  `matched_exactly` is **#6**'s and its third value is load-bearing: `true` whole words, `false` reached only because a widened word
+  *begins* with one of them, `null` not from the keyword list at all. The last three are F28's: **every** live note linking a figure, byte-ordered, where the other two were its head and its length.
   A note hit and an orphaned figure both get `[]`, never `null` — "this hit has no live linker" is one true statement about
   either, and telling them apart is what `kind` is for.
 
@@ -84,6 +85,7 @@ np search ./notes retro --mode keyword --json
       "kind": "note",
       "linked_from": 0,
       "linked_notes": [],
+      "matched_exactly": true,
       "path": "retro.md",
       "score": 1.0620689655172414e-6,
       "semantic_rank": null,
@@ -96,6 +98,8 @@ np search ./notes retro --mode keyword --json
   "mode": "keyword",
   "note": null,
   "offline": false,
+  "prefix_terms": [],
+  "prefix_used": false,
   "reason": null,
   "semantic_used": false,
   "vectors": false
@@ -105,7 +109,8 @@ np search ./notes retro --mode keyword --json
 `bm25` is SQLite's own number, unremapped (better is more negative, so `score` carries its negation to keep "higher first"
 true across modes), and the text channel prints small magnitudes in scientific notation rather than `-0.0000`. With a hybrid
 list whose semantic half could not run, `note` holds the sentence that stderr got and `cosine`/`semantic_rank` hold nulls.
-Remember the `AND` rule when a list comes back empty on a vault you know holds the words: they have to be in **one** note.
+Remember the `AND` rule when a list comes back empty on a vault you know holds the words: they have to be in **one** note, and
+each has to be a **whole** word — which is what [a word can match at its beginning](#a-word-can-match-at-its-beginning) is about.
 
 ### The search document keys three kinds of no answer
 
@@ -159,6 +164,101 @@ A figure linked from two notes, from a `--features local-model,vision` build who
 Before F28 that image line was `(from notes/a.md)` and `notes/b.md` existed only as the number 2 in a JSON key nobody read.
 The note printed is still `source_note`, because it is `linked_notes[0]` — one list, assembled once, and a test that fails
 if head-or-count ever stops matching it.
+
+### A word can match at its beginning, and the answer says when it did
+
+Keyword search matches **whole words**, by design: `runner` does not match `runners`, because a personal vault holds file names,
+commands and identifiers as well as prose (README, "no stemming"). That rule is why `"grand"` used to find nothing in a vault
+holding two `grandma`s — and why the fix was a door rather than a moved wall (**issue #6**).
+
+Two ways to ask, one default that did not change:
+
+- **Mark one word** with a trailing asterisk. `grand*` matches word beginnings for `grand` alone; every other word in the query
+  still has to appear whole. No flag involved, so a person typing into an ordinary search box can use it today.
+- **`--prefix`** widens *every* word: `np search ./notes --prefix grand` reaches `grandma` and `grandmother`. This is the shape of
+  a front end's "match word beginnings" toggle, which is one switch for the whole query.
+
+The document then admits what it did. One real run on a two-note vault — one note holds `grand` as a word, the other only
+`grandma`:
+
+```sh
+np search ./pfx "grand*" --json
+```
+
+```json
+{
+  "fetched": null,
+  "hits": [
+    {
+      "bm25": -1.0538922155688623e-6,
+      "cosine": null,
+      "keyword_rank": 1,
+      "kind": "note",
+      "linked_from": 0,
+      "linked_notes": [],
+      "matched_exactly": true,
+      "path": "size.md",
+      "score": 0.01639344262295082,
+      "semantic_rank": null,
+      "snippet": "# Totals\n\nA [grand] total of nine.\n",
+      "source_note": null
+    },
+    {
+      "bm25": -9.513513513513513e-7,
+      "cosine": null,
+      "keyword_rank": 2,
+      "kind": "note",
+      "linked_from": 0,
+      "linked_notes": [],
+      "matched_exactly": false,
+      "path": "cake.md",
+      "score": 0.016129032258064516,
+      "semantic_rank": null,
+      "snippet": "# Family\n\nMy [grandma] made a cake on Sunday.\n",
+      "source_note": null
+    }
+  ],
+  "indexed": true,
+  "keyword_used": true,
+  "mode": "hybrid",
+  "note": "embeddings are switched off (`embeddings.provider = \"none\"`): ranked by keyword only — set it to `\"local-model\"` with an `embeddings.model` to add the semantic half",
+  "offline": false,
+  "prefix_terms": [
+    "grand"
+  ],
+  "prefix_used": true,
+  "reason": "provider-disabled",
+  "semantic_used": false,
+  "vectors": false
+}
+```
+
+The rules behind this, and the two refusals that shaped the SQL, are in [**F49**](design-f49-word-beginnings.md).
+
+Three things to read off it. **`prefix_used` is the answer's own report**, not an echo of the flag: a query with no word in it
+widens nothing and says so, whatever was asked for. **`prefix_terms` names the words** that were widened, with the asterisk
+removed — what np searched for, which is why the text channel can print it verbatim:
+
+```text
+word beginnings matched: grand
+0.0164 note   size.md  [bm25 -1.05e-6]   … # Totals  A [grand] total of nine. 
+0.0161 note   cake.md  [bm25 -9.51e-7]   … # Family  My [grandma] made a cake on Sunday. 
+```
+
+and **`matched_exactly` is per hit**, computed in the same statement that found the row, so `true` cannot be a claim about a
+version of the vault nobody read. It is what lets an app label a hit *prefix match* instead of leaving a person to conclude that
+a note about their grandmother says *grand*. A hit from the vector list alone carries `null`, which is not `false`: it was never
+in a whole-word test.
+
+What this does **not** do, each for a reason rather than by omission:
+
+- No stemming, no synonyms, no fuzzy matching. `grandm` reaches `grandma`; `grandmas` does not reach `grandma`, and `colour`
+  does not reach `color`. Stemming is the thing #6 declined to become, because it would silently rewrite every identifier query.
+- A trailing asterisk cannot be searched for as text. There is no escape spelling, so a note holding a literal `grand*` is found
+  by searching the words around it — and an asterisk anywhere else in a word (leading, doubled, mid-word) is still just the
+  separator it always was.
+- Widening does not make a hit score higher or reorder the list: `bm25()` scores the documents the index matched, and prefix hits
+  are ranked by the same number as whole-word ones.
 
 - **Exit codes.** `0` success (including "nothing to do" and "nothing indexed"), `1` anything the runtime refused — disabled
   provider, missing artifact, a model mismatch — and `2` for argv errors, which is clap's doing. No command invents a code.

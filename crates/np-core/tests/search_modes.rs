@@ -133,6 +133,7 @@ impl Fixture {
             encoded.as_deref(),
             query_text,
             10,
+            search::Prefix::Marked,
         )
         .expect("the search answers");
         answer
@@ -156,8 +157,8 @@ fn a_keyword_query_finds_an_exact_identifier_with_no_model_installed() {
     );
     fx.note("other.md", "Other", "Nothing about thread counts here.");
 
-    let hits =
-        search::keyword(&fx.db, "GGML_DEFAULT_N_THREADS", 10).expect("keyword search answers");
+    let hits = search::keyword(&fx.db, "GGML_DEFAULT_N_THREADS", 10, search::Prefix::Marked)
+        .expect("keyword search answers");
     assert_eq!(
         hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
         vec!["runners.md"],
@@ -206,7 +207,7 @@ fn diacritics_fold_and_word_endings_do_not() {
     );
 
     assert_eq!(
-        search::keyword(&fx.db, "cafe", 10)
+        search::keyword(&fx.db, "cafe", 10, search::Prefix::Marked)
             .expect("search")
             .iter()
             .map(|hit| hit.path.as_str())
@@ -215,7 +216,7 @@ fn diacritics_fold_and_word_endings_do_not() {
         "`café` and `cafe` are one spelling, not two words"
     );
     assert!(
-        search::keyword(&fx.db, "runner", 10)
+        search::keyword(&fx.db, "runner", 10, search::Prefix::Marked)
             .expect("search")
             .is_empty(),
         "no stemming: a query for `runner` does not silently widen to `runners`"
@@ -235,14 +236,14 @@ fn the_keyword_index_follows_an_edit_and_survives_a_move() {
         "The broker is kafka-3 with one partition.",
     );
     assert_eq!(
-        search::keyword(&fx.db, "partition", 10)
+        search::keyword(&fx.db, "partition", 10, search::Prefix::Marked)
             .expect("search")
             .len(),
         1,
         "a body-only term is indexed"
     );
     assert_eq!(
-        search::keyword(&fx.db, "kafka", 10)
+        search::keyword(&fx.db, "kafka", 10, search::Prefix::Marked)
             .expect("search")
             .len(),
         1,
@@ -257,13 +258,15 @@ fn the_keyword_index_follows_an_edit_and_survives_a_move() {
         )
         .expect("test setup: edit the note");
     assert!(
-        search::keyword(&fx.db, "partition", 10)
+        search::keyword(&fx.db, "partition", 10, search::Prefix::Marked)
             .expect("search")
             .is_empty(),
         "the word is gone from the body, so it must be gone from the index"
     );
     assert_eq!(
-        search::keyword(&fx.db, "redis", 10).expect("search").len(),
+        search::keyword(&fx.db, "redis", 10, search::Prefix::Marked)
+            .expect("search")
+            .len(),
         1,
         "and the new word is findable in the same row"
     );
@@ -288,7 +291,7 @@ fn the_keyword_index_follows_an_edit_and_survives_a_move() {
             [],
         )
         .expect("test setup: refresh the note's display path");
-    let hits = search::keyword(&fx.db, "redis", 10).expect("search");
+    let hits = search::keyword(&fx.db, "redis", 10, search::Prefix::Marked).expect("search");
     assert_eq!(
         hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
         vec!["moved/kafka.md"],
@@ -301,7 +304,7 @@ fn the_keyword_index_follows_an_edit_and_survives_a_move() {
         .execute("DELETE FROM notes WHERE rel = 'moved/kafka.md'", [])
         .expect("test setup: delete the note row");
     assert!(
-        search::keyword(&fx.db, "redis", 10)
+        search::keyword(&fx.db, "redis", 10, search::Prefix::Marked)
             .expect("search")
             .is_empty(),
         "a deleted note answers nothing"
@@ -346,6 +349,7 @@ fn a_hit_found_by_both_lists_outranks_one_found_by_either_alone() {
         Some(&bytes(&[1.0, 0.0])),
         "kafka",
         10,
+        search::Prefix::Marked,
     )
     .expect("hybrid search answers");
     let paths = report.paths();
@@ -386,6 +390,7 @@ fn a_hit_found_by_both_lists_outranks_one_found_by_either_alone() {
         Some(&bytes(&[1.0, 0.0])),
         "kafka",
         10,
+        search::Prefix::Marked,
     )
     .expect("semantic search answers");
     // `words.md` is absent: it holds no vector, so the semantic list cannot see it at all. That absence is the same fact that
@@ -407,8 +412,16 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
     fx.embed("a.md", &[1.0, 0.0]);
     fx.figure(0xaa, "img/fig.png", &[0.0, 1.0]);
 
-    let keyword = search::ranked(&fx.db, SearchMode::Keyword, Some(MODEL), None, "kafka", 10)
-        .expect("keyword answers");
+    let keyword = search::ranked(
+        &fx.db,
+        SearchMode::Keyword,
+        Some(MODEL),
+        None,
+        "kafka",
+        10,
+        search::Prefix::Marked,
+    )
+    .expect("keyword answers");
     assert_eq!(keyword.paths(), ["a.md"]);
     assert!(
         keyword.hits.iter().all(|hit| hit.kind == HitKind::Note),
@@ -422,6 +435,7 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
         Some(&bytes(&[0.0, 1.0])),
         "kafka",
         10,
+        search::Prefix::Marked,
     )
     .expect("hybrid answers");
     // The note is vouched for twice (keyword rank 1, semantic rank 2) and the figure once — at cosine 1.0. Rank fusion ranks
@@ -435,6 +449,7 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
         Some(&bytes(&[0.0, 1.0])),
         "kafka",
         10,
+        search::Prefix::Marked,
     )
     .expect("semantic answers");
     assert_eq!(semantic.paths(), ["img/fig.png", "a.md"]);
@@ -455,6 +470,7 @@ fn no_vectors_is_a_state_and_the_report_says_which_half_answered() {
         Some(&bytes(&[1.0, 0.0])),
         "kafka",
         10,
+        search::Prefix::Marked,
     )
     .expect("hybrid answers with no vectors at all");
     assert_eq!(report.paths(), ["a.md"]);
@@ -473,6 +489,7 @@ fn no_vectors_is_a_state_and_the_report_says_which_half_answered() {
         Some(&bytes(&[1.0, 0.0])),
         "kafka",
         10,
+        search::Prefix::Marked,
     )
     .expect("semantic answers empty");
     assert!(semantic.paths().is_empty());
@@ -525,7 +542,7 @@ fn fts5_operators_are_words_not_grammar() {
 
     // An unbalanced quote is a separator, not a syntax error.
     assert_eq!(
-        search::keyword(&fx.db, "\"kafka", 10)
+        search::keyword(&fx.db, "\"kafka", 10, search::Prefix::Marked)
             .expect("a stray quote must never reach the parser as grammar")
             .iter()
             .map(|hit| hit.path.as_str())
@@ -536,8 +553,13 @@ fn fts5_operators_are_words_not_grammar() {
 
     // Operators read as words, and every word has to be present: `flags.md` holds `-`, `foo`, `OR`, `bar`, `baz` and the
     // rest of that line, so it is the only note a conjunction of them can describe.
-    let hits = search::keyword(&fx.db, "-foo OR (bar): \"baz*\"", 10)
-        .expect("a query of pure operators still has to answer");
+    let hits = search::keyword(
+        &fx.db,
+        "-foo OR (bar): \"baz*\"",
+        10,
+        search::Prefix::Marked,
+    )
+    .expect("a query of pure operators still has to answer");
     assert_eq!(
         hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
         vec!["flags.md"],
@@ -546,7 +568,8 @@ fn fts5_operators_are_words_not_grammar() {
 
     // A query with no word in it has nothing to ask for. Empty and successful — refusing would be a verdict on input that is
     // merely uninformative, and `np search '!!!'` finding nothing is the truth about the vault.
-    let empty = search::keyword(&fx.db, "\":()*-", 10).expect("no tokens is not an error");
+    let empty = search::keyword(&fx.db, "\":()*-", 10, search::Prefix::Marked)
+        .expect("no tokens is not an error");
     assert!(
         empty.is_empty(),
         "a punctuation-only query matches nothing, and got: {empty:?}"
@@ -579,7 +602,8 @@ fn a_query_beyond_the_term_cap_searches_its_first_terms() {
         "test setup: one term past the cap"
     );
 
-    let hits = search::keyword(&fx.db, &long_query, 10).expect("a long query still answers");
+    let hits = search::keyword(&fx.db, &long_query, 10, search::Prefix::Marked)
+        .expect("a long query still answers");
     assert_eq!(
         hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
         vec!["terms.md"],

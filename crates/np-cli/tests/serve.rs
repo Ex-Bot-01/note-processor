@@ -411,6 +411,142 @@ fn a_search_before_any_scan_reports_the_workspace_as_not_indexed() {
     server.finish();
 }
 
+/// **`prefix` is how a front end asks for word beginnings** (issue **#6**), and the answer carries `prefix_used`,
+/// `prefix_terms` and each hit's `matched_exactly` so the app never has to re-derive any of it from the text its user typed.
+///
+/// Three states, and the one that is easy to get wrong is the middle one: `"prefix": false` means *do not widen every word*,
+/// not *treat the query as literal text*. A marked `grand*` still widens with the flag off, on this surface exactly as it does
+/// on the CLI at rest — and a caller that read `false` as a sanitizer would show a user a widened list it believed narrow.
+#[test]
+fn search_prefix_widens_words_when_asked_and_reports_which_ones_it_widened() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    for (name, body) in [
+        ("cake.md", "# Family\n\nMy grandma made a cake on Sunday.\n"),
+        (
+            "visit.md",
+            "# Family\n\nMy grandmother visited on Sunday too.\n",
+        ),
+        ("lake.md", "# Outdoors\n\nThe kestrel flew over the lake.\n"),
+    ] {
+        std::fs::write(server.root.join(name), body).expect("test setup: write a note");
+    }
+    server.result("initialize", json!({"notifications": true}));
+    server.result("scan", json!({"workspace": workspace}));
+
+    // Every request carries the workspace and a generous limit; the caller's object adds the query and, where the case asks
+    // for it, the `prefix` setting — merged because `json!` has no spread.
+    let mut search = |extra: Value| -> Value {
+        let mut params = json!({"workspace": workspace, "limit": 10});
+        for (key, value) in extra
+            .as_object()
+            .expect("test setup: an object of parameters")
+        {
+            params[key] = value.clone();
+        }
+        server.result("search", params)
+    };
+    let paths = |value: &Value| -> Vec<String> {
+        value["hits"]
+            .as_array()
+            .expect("hits is a list")
+            .iter()
+            .map(|hit| {
+                hit["path"]
+                    .as_str()
+                    .expect("every hit has a path")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    // Absent means the rule that was already there: whole words, and no claim about widening.
+    let plain = search(json!({"query": "grandm"}));
+    assert!(
+        plain["hits"].as_array().is_some_and(|h| h.is_empty()),
+        "{plain}"
+    );
+    assert_eq!(plain["prefix_used"], false, "nothing widened: {plain}");
+    assert_eq!(plain["prefix_terms"].as_array().map(Vec::len), Some(0));
+
+    // A marked word needs no parameter, and says which word it widened.
+    let marked = search(json!({"query": "grand*"}));
+    let mut marked_paths = paths(&marked);
+    marked_paths.sort();
+    assert_eq!(marked_paths, vec!["cake.md", "visit.md"], "{marked}");
+    assert_eq!(
+        marked["prefix_used"], true,
+        "a marked term widened: {marked}"
+    );
+    assert_eq!(
+        marked["prefix_terms"][0], "grand",
+        "the word, not the star: {marked}"
+    );
+    for hit in marked["hits"].as_array().expect("hits") {
+        assert_eq!(
+            hit["matched_exactly"], false,
+            "neither note holds `grand` as a whole word, and a hit that was reached through a prefix says so: {hit}"
+        );
+    }
+
+    // `"prefix": true` is the toggle, and it widens words nobody marked.
+    let widened = search(json!({"query": "kestr", "prefix": true}));
+    assert_eq!(paths(&widened), vec!["lake.md"], "{widened}");
+    assert_eq!(widened["prefix_used"], true, "{widened}");
+    assert_eq!(widened["prefix_terms"][0], "kestr", "{widened}");
+
+    // `"prefix": false` declines to widen the unmarked words — it does not disarm a star the caller's user typed.
+    let off = search(json!({"query": "grand*", "prefix": false}));
+    assert_eq!(
+        paths(&off).len(),
+        2,
+        "`false` means do-not-widen-every-word, not the-query-is-literal: {off}"
+    );
+    let narrow = search(json!({"query": "grandm", "prefix": false}));
+    assert!(
+        narrow["hits"].as_array().is_some_and(|h| h.is_empty()),
+        "and an unmarked fragment stays narrow: {narrow}"
+    );
+
+    // **A query with no word in it widens nothing**, under either setting: `prefix_used` describes the answer, not the request.
+    let punctuation = search(json!({"query": "!!!", "prefix": true}));
+    assert_eq!(punctuation["keyword_used"], false, "{punctuation}");
+    assert_eq!(punctuation["prefix_used"], false, "{punctuation}");
+
+    // Mutation this catches: `prefix_used` copied from the request rather than from the plan (the last pair of assertions
+    // fails), and `matched_exactly` hardcoded true (every hit above would claim a whole-word match it did not get).
+}
+
+/// A `prefix` that is neither true nor false is refused where it is written, not mapped onto a default: `"yes"` in a GUI's
+/// request would otherwise become a search the caller never asked for, and the answer would look like np's own idea.
+#[test]
+fn search_refuses_a_prefix_that_is_not_a_boolean() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+
+    for wrong in [
+        json!("yes"),
+        json!(1),
+        json!(["grand"]),
+        json!({"on": true}),
+    ] {
+        let response = server.request(
+            "search",
+            json!({"workspace": workspace, "query": "grandm", "prefix": wrong}),
+        );
+        let fault = &response["error"];
+        assert_eq!(
+            fault["code"], -32602,
+            "{wrong} is not a prefix setting: {fault}"
+        );
+        assert!(
+            fault["message"].to_string().contains("true or false"),
+            "the message names what would have worked: {fault}"
+        );
+    }
+}
+
 /// Same claim as above for `models.list`, whose document is built by a third function (`listing_json`) with a key set that **R7a** pinned precisely
 /// because adding `fetching` had to fail a test. A server that dropped one of those keys would break a support screen that reads it.
 #[test]

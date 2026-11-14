@@ -449,13 +449,28 @@ fn search(
             ))
         }
     };
+    // **`prefix` widens words; it does not sanitise them** (#6). Absent or `false` is `Prefix::Marked` — the same
+    // rule the CLI runs with no flag, where a query word written `grand*` matches word beginnings because its author marked
+    // it. `true` is `Prefix::EveryTerm`: every word in the query reaches what begins with it, which is the shape of
+    // a front end's "match word beginnings" toggle. Saying plainly that `false` does not un-mark a typed `*` matters, because
+    // a caller could otherwise read this key as a way to make query text literal — and it is not.
+    let prefix = match params.get("prefix") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => np_core::search::Prefix::Marked,
+        Some(Value::Bool(true)) => np_core::search::Prefix::EveryTerm,
+        Some(_) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                "\"prefix\" must be true or false",
+            ))
+        }
+    };
     // `announce` false: the facts an announcement would print are in the document (`fetched.origin_kind`, `reason`), and stderr stays quiet for a
     // request that asked for neither prose nor progress.
     // **O2 brought search into scope** because hybrid may dial out: the default mode can trigger the same 309 MB pinned
     // fetch that `np embed` does, and a client watching a search that appears to hang on nothing would otherwise have no
     // way to learn it is downloading a model.
     let progress = crate::serve_channel::ServeProgress::new(ch, request.cloned(), "search");
-    let run = crate::search_run(&workspace, query, limit, mode, false, &progress)?;
+    let run = crate::search_run(&workspace, query, limit, mode, prefix, false, &progress)?;
     Ok(crate::search_document(&run))
 }
 

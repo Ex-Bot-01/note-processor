@@ -124,7 +124,7 @@ Two habits that pay off:
 | --- | --- | --- |
 | `np scan <workspace>` | indexes notes and regenerates the catalog; reports added / modified / moved / removed / unchanged | index, `INDEX.md` (+ shards) |
 | `np embed <workspace>` | encodes what the index says is owed | vectors for the configured model |
-| `np search <workspace> <query> [--limit N] [--mode hybrid\|semantic\|keyword]` | ranks notes and figures; default `hybrid` fuses FTS5 `bm25()` with vectors by reciprocal rank fusion | nothing (it opens the database, then only `SELECT`s) |
+| `np search <workspace> <query> [--limit N] [--mode hybrid\|semantic\|keyword] [--prefix]` | ranks notes and figures; default `hybrid` fuses FTS5 `bm25()` with vectors by reciprocal rank fusion. `--prefix` matches every word at a word beginning (`grand` reaches `grandma`); one marked word, `"grand*"`, does the same for itself | nothing (it opens the database, then only `SELECT`s) |
 | `np setup <workspace> [--yes]` | scan → fetch if missing → embed, one report | index, maybe the artifact, vectors |
 | `np models install \| fetch \| hash \| list …` | puts model bytes in place, per workspace | `<data_dir>/workspaces/<key>.models/` |
 
@@ -264,7 +264,10 @@ upgrade removed something: [Troubleshooting](docs/reference-troubleshooting.md).
 - **No macOS asset**, and feature builds on Windows/macOS get a written refusal from `build.rs`.
 - **Image encoding is off in the release binaries** (`vision` is not a default feature), so every figure lands in
   `vision-unavailable` until you build with it.
-- **No stemming**: `runner` does not match `runners`, because this vault holds identifiers. No OCR, no PDF or audio, no sync, no
+- **No stemming**: `runner` does not match `runners`, because this vault holds identifiers. A word you type has to appear as a
+  whole one — so ask for the shorter form instead: mark it (`"grand*"`) or pass `--prefix`, and the answer reports which words it
+  matched at a word beginning (`prefix_used`, `prefix_terms`) and which hits came only from a prefix (`matched_exactly` per hit).
+  Widening is opt-in because the same rule that protects `runner` protects your file names. No OCR, no PDF or audio, no sync, no
   watch mode, no cloud calls outside `models fetch`.
 - Unmeasured and open: image throughput, resident-set growth with a projector open, cross-worker bit-identity, retrieval quality —
   the list is in [`design-m2-image-embeddings.md` §14](docs/design-m2-image-embeddings.md).
@@ -296,6 +299,7 @@ The decisions behind those, each with its measurements:
 | [`docs/design-m2-thread-policy.md`](docs/design-m2-thread-policy.md) | The `"auto"` worker rule and the measurements behind it |
 | [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
 | [`docs/design-f48-links-as-a-query.md`](docs/design-f48-links-as-a-query.md) | What a client may assume about link identity: display paths and lines, what `rel` scopes, and why figures and stale notes are absent from `links.list` |
+| [`docs/design-f49-word-beginnings.md`](docs/design-f49-word-beginnings.md) | What a query may ask for besides a whole word: the one character of syntax, why the default did not move, and how an answer admits it widened |
 | [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
 
 Code comments carry the local reasoning; those files carry the decisions and the measurements.

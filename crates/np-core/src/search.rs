@@ -105,6 +105,13 @@ pub struct Hit {
     /// A fragment of the note showing what matched, brackets around the hit term. `None` for a hit the keyword list did
     /// not produce — including every image, which has no prose to snippet.
     pub snippet: Option<String>,
+    /// Whether this note contains every query word **whole**: `Some(true)` an exact hit, `Some(false)` one that only began
+    /// with a queried word (**F49**), `None` one the keyword list never held.
+    ///
+    /// `None` is not `false`, and that distinction is the reason this is an `Option` rather than a bit: a vector hit has not
+    /// failed a whole-word test, it was never in one. Under a query that asked for no prefixes every keyword hit is
+    /// `Some(true)`, so this key never quietly changes meaning when a caller stops marking terms.
+    pub matched_exactly: Option<bool>,
 }
 
 impl Hit {
@@ -131,6 +138,7 @@ impl Hit {
             semantic_rank: None,
             keyword_rank: None,
             snippet: None,
+            matched_exactly: None,
         }
     }
 
@@ -149,6 +157,7 @@ impl Hit {
             semantic_rank: None,
             keyword_rank: None,
             snippet: None,
+            matched_exactly: None,
         }
     }
 
@@ -676,6 +685,12 @@ pub struct KeywordHit {
     pub bm25: f64,
     /// A fragment of the body with the matched term in brackets; falls back to the title when the body holds no hit term.
     pub snippet: String,
+    /// Whether this note contains **every** query word whole, rather than satisfying a marked (or `EveryTerm`) prefix.
+    ///
+    /// Computed by a second `MATCH` of [`Plan::exact_expression`] inside the same statement (**F49**), so it describes the
+    /// same row set the hit came from rather than a re-query that could disagree with it. `true` whenever nothing in the
+    /// query asked for word beginnings — the honest reading is "this one needed no prefix", not "this one was checked".
+    pub matched_exactly: bool,
 }
 
 /// Why an answer came back from fewer lists than the mode asked for. Kept as an enum rather than a `String` so the CLI prints
@@ -894,6 +909,14 @@ pub struct Answer {
     /// Whether the keyword list ran (it does not in [`SearchMode::Semantic`], and there is nothing to ask when the query has
     /// no word characters in it).
     pub keyword_used: bool,
+    /// Whether any term was matched at the **start of a word** rather than as a whole word (**F49**): `true` for a marked
+    /// `grand*`, or for any query under [`Prefix::EveryTerm`]. Beside `keyword_used` because "the keyword half ran" and "the
+    /// keyword half widened your words" are two facts, and a client that prints the query as though the notes contained it is
+    /// putting words on screen the bytes did not support.
+    pub prefix_used: bool,
+    /// Which words those were, in query order and deduplicated — the terms to name when labelling a hit, taken from
+    /// [`Plan::prefix_terms`] rather than re-derived from the query text at the print site.
+    pub prefix_terms: Vec<String>,
     /// The one honest sentence about a missing half, if any.
     pub note: Option<RankNote>,
 }
@@ -916,41 +939,170 @@ pub fn vectors_present(conn: &Db) -> Result<bool, SearchError> {
 /// cap exists so a pasted page of text cannot turn one search into a thousand phrase lookups.
 const MAX_QUERY_TERMS: usize = 32;
 
-/// Turn user text into an FTS5 **phrase conjunction**: every word quoted, joined with `AND`.
+/// How much of a query is allowed to match at the start of a word rather than as one whole word (**F49**).
 ///
-/// The query is treated as a bag of words rather than as FTS5 syntax — deliberately, and it is the reason this function
-/// exists. A raw query string would make `"`, `*`, `-`, `(` and `:` a supported input surface whose malformed forms return
-/// SQLite parse errors from inside a library call, and exposing that grammar is a decision of its own (§8 of the design
-/// note). Quoting each token also keeps an identifier like `GGML_DEFAULT_N_THREADS` — the reason hybrid became the default —
-/// out of the parser's way.
-fn match_expression(query: &str) -> Option<String> {
-    let mut parts = Vec::new();
-    for token in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-        if token.is_empty() {
-            continue;
-        }
-        // An FTS5 phrase is `"..."` with any inner quote doubled.
-        parts.push(format!("\"{}\"", token.replace('"', "\"\"")));
-        if parts.len() == MAX_QUERY_TERMS {
-            break;
+/// Keyword search matches whole tokens, and that stance is kept: `runner` does not match `runners`, because a vault holds
+/// identifiers and a search that quietly widened them would report notes the reader never asked about. What this adds is a
+/// way to *ask* — the gap issue #6 named, where `grand` could not reach `grandma` by any route at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Prefix {
+    /// Only a term the caller **marked** is a prefix: a trailing `*`, as in `np search . "grand*"`. The default, because a
+    /// query nobody marked contains no prefix term and keeps matching exactly what it matched before — the README's
+    /// "no stemming" rule still describes every unmarked word.
+    #[default]
+    Marked,
+    /// **Every** term is a prefix, whether marked or not: `grand` matches `grandma`, `grandmother`, `Grand`. This is what
+    /// `np search --prefix` and `search`'s `"prefix": true` ask for — the shape a front end puts behind a visible toggle, so
+    /// a person can see that word beginnings are being matched rather than having it inferred from their typing.
+    EveryTerm,
+}
+
+/// One word of a query, and whether its author asked for word beginnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Term {
+    /// The word itself, with any marking `*` removed.
+    pub text: String,
+    /// Whether a `*` immediately followed it in the query text.
+    pub marked: bool,
+}
+
+/// Split query text into [`Term`]s, which is where F49's one piece of syntax lives.
+///
+/// Word characters are alphanumerics and `_`, exactly as they were; every other character separates. A `*` immediately after
+/// a word marks that term and is **not** a separator, which is what makes `grand*` mean "a word beginning with grand" while
+/// `glob*` in a note about globs still needs the reader to know the trade (F49 §"what `*` costs"). Two consequences worth
+/// stating because they are the whole cost of the feature:
+///
+/// * A trailing asterisk cannot be searched for. There is no escape spelling, and inventing one would put an FTS5 grammar in
+///   the query surface — see [`plan`].
+/// * A `*` anywhere else stays a separator, unchanged from before: `a*b`, `**`, and a leading `*` all split exactly as they
+///   always did. Marking is only ever at the end of a term.
+pub fn terms(query: &str) -> Vec<Term> {
+    let mut out: Vec<Term> = Vec::new();
+    let mut current = String::new();
+    for c in query.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            current.push(c);
+        } else {
+            if !current.is_empty() {
+                out.push(Term {
+                    text: std::mem::take(&mut current),
+                    marked: c == '*',
+                });
+            }
+            // A `*` that follows a separator, or a second one after a mark, is still just a separator: nothing to mark.
         }
     }
-    (!parts.is_empty()).then(|| parts.join(" AND "))
+    if !current.is_empty() {
+        out.push(Term {
+            text: current,
+            marked: false,
+        });
+    }
+    out.truncate(MAX_QUERY_TERMS);
+    out
+}
+
+/// What one query asks the keyword list for: the expression to run, the expression that would have asked for whole words,
+/// and the terms whose match is therefore about word beginnings.
+///
+/// The query stays a bag of words rather than becoming FTS5 syntax — deliberately, and it is why this exists. A raw query
+/// string would make `"`, `-`, `(` and `:` a supported input surface whose malformed forms return SQLite parse errors from
+/// inside a library call, and exposing that grammar is a decision of its own (§8 of the design note). Quoting each token also
+/// keeps an identifier like `GGML_DEFAULT_N_THREADS` — the reason hybrid became the default — out of the parser's way. F49
+/// widens that by exactly one character: a term marked for prefix matching is emitted unquoted with a trailing `*`, which is
+/// safe because a term contains nothing but word characters, so there is no metacharacter left to reach the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The conjunction to run: marked (or, under [`Prefix::EveryTerm`], every) term as `word*`, the rest as `"word"`.
+    pub expression: String,
+    /// The same conjunction with **no** prefix terms — whole words only. Run per row as a second `MATCH`, this is what tells a
+    /// hit that contains the word from one that merely begins with it, in the same statement and therefore the same snapshot.
+    pub exact_expression: String,
+    /// The marked words, in query order, deduplicated: the terms this answer matched at a word beginning. A caller labels
+    /// hits with these rather than printing the raw query as though the note contained it.
+    pub prefix_terms: Vec<String>,
+}
+
+impl Plan {
+    /// Whether anything in this query asked for word beginnings. `false` means [`Plan::expression`] and
+    /// [`Plan::exact_expression`] are the same string, so no hit can be prefix-only.
+    pub fn prefixes(&self) -> bool {
+        !self.prefix_terms.is_empty()
+    }
+}
+
+/// Plan one query under one [`Prefix`] policy, or `None` when it holds no word at all (and so has nothing to ask).
+pub fn plan(query: &str, prefix: Prefix) -> Option<Plan> {
+    let words = terms(query);
+    if words.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut exact_parts = Vec::new();
+    let mut prefix_terms: Vec<String> = Vec::new();
+    for term in &words {
+        // An FTS5 phrase is `"..."` with any inner quote doubled. A prefix term needs no quoting: `terms` keeps word
+        // characters only, so there is nothing in it for the FTS5 parser to read as syntax.
+        let quoted = format!("\"{}\"", term.text.replace('"', "\"\""));
+        let as_prefix = match prefix {
+            Prefix::Marked => term.marked,
+            Prefix::EveryTerm => true,
+        };
+        if as_prefix {
+            parts.push(format!("{}*", term.text));
+            if !prefix_terms.iter().any(|seen| seen == &term.text) {
+                prefix_terms.push(term.text.clone());
+            }
+        } else {
+            parts.push(quoted.clone());
+        }
+        exact_parts.push(quoted);
+    }
+    Some(Plan {
+        expression: parts.join(" AND "),
+        exact_expression: exact_parts.join(" AND "),
+        prefix_terms,
+    })
 }
 
 /// The keyword list: live notes whose title or body contains every word of `query`, ordered by `bm25()` and then by path
 /// **bytes** (F20's rule — the display text is a rendering, so it never decides an order on its own).
-pub fn keyword(conn: &Db, query: &str, limit: usize) -> Result<Vec<KeywordHit>, SearchError> {
-    let Some(expression) = match_expression(query) else {
+///
+/// `prefix` decides how much of the query may match at the start of a word ([`Prefix`], **F49**). Each row also answers the
+/// whole-word question in the same statement (`matched_exactly`), because a hit found by `grand*` and a hit that contains
+/// `grand` are different facts and a client must be able to say which it is showing.
+pub fn keyword(
+    conn: &Db,
+    query: &str,
+    limit: usize,
+    prefix: Prefix,
+) -> Result<Vec<KeywordHit>, SearchError> {
+    let Some(plan) = plan(query, prefix) else {
         return Ok(Vec::new());
     };
+    keyword_planned(conn, &plan, limit)
+}
+
+/// [`keyword`] with the query already planned, so [`ranked`] runs one plan rather than planning twice.
+fn keyword_planned(conn: &Db, plan: &Plan, limit: usize) -> Result<Vec<KeywordHit>, SearchError> {
+    // **The whole-word test is a correlated subquery, not a second query.** SQLite refuses `MATCH` in a select list —
+    // "unable to use function MATCH in the requested context", measured here — so the per-row question is asked where a
+    // `MATCH` is legal: inside its own `SELECT … FROM notes_fts WHERE notes_fts MATCH ?3`, tied to the outer row by rowid.
+    // The alternative was running the exact expression as a second statement and joining paths in Rust, which reads a
+    // database a concurrent `np scan` may have moved between the two statements — and then `matched_exactly` would be a claim
+    // about a row set that produced no hit at all. One statement cannot disagree with itself.
     let mut statement = conn
         .0
         .prepare_cached(
             "SELECT notes.rel,
                     bm25(notes_fts),
                     snippet(notes_fts, 1, '[', ']', ' … ', 12),
-                    snippet(notes_fts, 0, '[', ']', ' … ', 8)
+                    snippet(notes_fts, 0, '[', ']', ' … ', 8),
+                    EXISTS (
+                        SELECT 1 FROM notes_fts
+                         WHERE notes_fts MATCH ?3 AND notes_fts.rowid = notes.id
+                    )
              FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
              JOIN files ON files.rel = notes.rel
@@ -960,17 +1112,23 @@ pub fn keyword(conn: &Db, query: &str, limit: usize) -> Result<Vec<KeywordHit>, 
         )
         .map_err(DbError::from)?;
     let rows = statement
-        .query_map(rusqlite::params![expression, limit as i64], |row| {
-            let rel: String = row.get(0)?;
-            let bm25_score: f64 = row.get(1)?;
-            let body_snippet: String = row.get(2)?;
-            let title_snippet: String = row.get(3)?;
-            Ok((rel, bm25_score, body_snippet, title_snippet))
-        })
+        .query_map(
+            rusqlite::params![plan.expression, limit as i64, plan.exact_expression],
+            |row| {
+                let rel: String = row.get(0)?;
+                let bm25_score: f64 = row.get(1)?;
+                let body_snippet: String = row.get(2)?;
+                let title_snippet: String = row.get(3)?;
+                // SQLite answers a `MATCH` with an integer 0/1, not a boolean.
+                let exact: i64 = row.get(4)?;
+                Ok((rel, bm25_score, body_snippet, title_snippet, exact != 0))
+            },
+        )
         .map_err(DbError::from)?;
     let mut hits = Vec::new();
     for row in rows {
-        let (path, bm25_score, body_snippet, title_snippet) = row.map_err(DbError::from)?;
+        let (path, bm25_score, body_snippet, title_snippet, matched_exactly) =
+            row.map_err(DbError::from)?;
         // A body snippet with no bracket found nothing in the body: the match was in the title, so show the title.
         let snippet = if body_snippet.contains('[') {
             body_snippet
@@ -981,6 +1139,7 @@ pub fn keyword(conn: &Db, query: &str, limit: usize) -> Result<Vec<KeywordHit>, 
             path,
             bm25: bm25_score,
             snippet,
+            matched_exactly,
         });
     }
     Ok(hits)
@@ -1011,6 +1170,7 @@ pub fn ranked(
     query_vector: Option<&[u8]>,
     query_text: &str,
     limit: usize,
+    prefix: Prefix,
 ) -> Result<Answer, SearchError> {
     // The ranking phase (diagnostics design point 7). No workspace field: this function is handed a connection, and the
     // caller that knows the vault — np-cli, or a `np serve` request span — tags everything nested inside it anyway.
@@ -1031,7 +1191,15 @@ pub fn ranked(
         }
     }
 
-    let keyword_used = mode != SearchMode::Semantic && match_expression(query_text).is_some();
+    // Planned once and used twice: for whether the half ran at all, and for the terms it widened. A query with no word in it
+    // has no plan, which is the same `keyword_used == false` as before F49 — prefix mode cannot conjure a keyword half out of
+    // a query that asks for nothing.
+    let plan = if mode == SearchMode::Semantic {
+        None
+    } else {
+        plan(query_text, prefix)
+    };
+    let keyword_used = plan.is_some();
     // **Which halves actually ran**, at the level someone reaches for when nothing failed but the answer is not what they
     // expected. No `rule`: there is no refusal here, and the states that do refuse already report `no-vectors` or
     // `provider-disabled` where they are decided — repeating a token on a routine per-query line would hand a reader two
@@ -1047,10 +1215,9 @@ pub fn ranked(
             (false, false) => "nothing: neither half had anything to rank",
         }
     );
-    let keywords = if keyword_used {
-        keyword(conn, query_text, limit)?
-    } else {
-        Vec::new()
+    let keywords = match &plan {
+        Some(plan) => keyword_planned(conn, plan, limit)?,
+        None => Vec::new(),
     };
 
     // Keyed by (kind, path): a note can sit in both lists, and an image can only ever be in the semantic one.
@@ -1078,6 +1245,9 @@ pub fn ranked(
         entry.keyword_rank = Some(index + 1);
         entry.bm25 = Some(found.bm25);
         entry.snippet = Some(found.snippet);
+        // Only the keyword list can answer this, so a hit it never held keeps `None`: an image found by cosine has no notion
+        // of a whole word, and `false` would claim it failed a test that was never run on it.
+        entry.matched_exactly = Some(found.matched_exactly);
     }
 
     let mut hits: Vec<Hit> = merged.into_values().collect();
@@ -1102,6 +1272,8 @@ pub fn ranked(
         hits,
         semantic_used,
         keyword_used,
+        prefix_used: plan.as_ref().is_some_and(Plan::prefixes),
+        prefix_terms: plan.map(|plan| plan.prefix_terms).unwrap_or_default(),
         note,
     })
 }

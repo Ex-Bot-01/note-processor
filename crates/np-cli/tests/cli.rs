@@ -2744,13 +2744,16 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
             "mode",
             "note",
             "offline",
+            "prefix_terms",
+            "prefix_used",
             "reason",
             "semantic_used",
             "vectors",
         ],
         "the hit list plus the keys that say how it was made — **F45** added `reason` (a token beside the prose), `fetched` and
          `offline` (F38's meanings, so one reader handles embed and search); **#5** added `indexed` (has this workspace ever been
-         scanned) and `keyword_used` / `semantic_used` (which halves this answer was built from)"
+         scanned) and `keyword_used` / `semantic_used` (which halves this answer was built from); **#6** added `prefix_used` /
+         `prefix_terms` (did any word match at the start of a word, and which)"
     );
     assert_eq!(
         value["mode"], "hybrid",
@@ -2805,13 +2808,15 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
             "kind",
             "linked_from",
             "linked_notes",
+            "matched_exactly",
             "path",
             "score",
             "semantic_rank",
             "snippet",
             "source_note",
         ],
-        "every hit carries the same eleven keys, with null where a half did not run"
+        "every hit carries the same twelve keys, with null where a half did not run — `matched_exactly` is **#6**'s: true whole \
+         words, false reached only by a prefix, null not from the keyword list at all"
     );
     assert!(
         hits[0]["cosine"].is_null() && hits[0]["semantic_rank"].is_null(),
@@ -2823,6 +2828,172 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
         "the keyword half has to show its evidence: {}",
         ok.stdout()
     );
+}
+
+/// Issue #6's measurements, made reproducible: a half-typed word, the two doors F49 opens, and an answer that says which
+/// words it widened.
+#[test]
+fn a_query_can_ask_for_word_beginnings_and_the_answer_says_which_words_it_widened() {
+    // The reporter ran the **release binary** against notes holding `grandma`, `grandmother` and `kestrel`: the whole words
+    // hit, every fragment returned nothing, and no flag or parameter could ask otherwise. Same vault, same fragments, both
+    // doors — a word marked `grand*`, and `--prefix` for every word at once.
+    let ws = workspace();
+    for (name, body) in [
+        ("cake.md", "# Family\n\nMy grandma made a cake on Sunday.\n"),
+        (
+            "visit.md",
+            "# Family\n\nMy grandmother visited on Sunday too.\n",
+        ),
+        ("lake.md", "# Outdoors\n\nThe kestrel flew over the lake.\n"),
+        // A note holding `grand` as a whole word, so "exact" and "prefix-only" are two different notes rather than an idea.
+        ("size.md", "# Totals\n\nA grand total of nine.\n"),
+    ] {
+        fs::write(ws.root.join(name), body).expect("test setup: write a note");
+    }
+    run(&mut ws.command(&["scan"])).assert_success();
+
+    let search = |args: &[&str]| -> serde_json::Value {
+        let mut cmd = ws.command_without_operand(&["search"]);
+        cmd.arg(&ws.root);
+        cmd.args(args);
+        cmd.arg("--json");
+        let out = run(&mut cmd);
+        assert_eq!(out.code(), 0, "a search always answers:\n{}", out.stderr());
+        serde_json::from_str(&out.stdout()).expect("`--json` prints exactly one JSON object")
+    };
+    let paths = |value: &serde_json::Value| -> Vec<String> {
+        value["hits"]
+            .as_array()
+            .expect("hits is a list")
+            .iter()
+            .map(|hit| {
+                hit["path"]
+                    .as_str()
+                    .expect("every hit has a path")
+                    .to_string()
+            })
+            .collect()
+    };
+    let exactness = |value: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
+        value["hits"]
+            .as_array()
+            .expect("hits is a list")
+            .iter()
+            .map(|hit| {
+                (
+                    hit["path"].as_str().expect("path").to_string(),
+                    hit["matched_exactly"].clone(),
+                )
+            })
+            .collect()
+    };
+
+    // **The default is unchanged, and that is the first assertion.** Keyword search matches whole tokens — the README's
+    // "no stemming", because this vault holds identifiers — and F49 added a door instead of moving that wall.
+    let whole = search(&["grandm"]);
+    assert_eq!(
+        paths(&whole),
+        Vec::<String>::new(),
+        "an unmarked fragment reaches nothing"
+    );
+    assert_eq!(
+        whole["prefix_used"], false,
+        "nothing was widened, so nothing is claimed"
+    );
+    assert_eq!(whole["prefix_terms"].as_array().map(Vec::len), Some(0));
+    let whole_word = search(&["grand"]);
+    assert_eq!(
+        paths(&whole_word),
+        vec!["size.md"],
+        "the one note holding `grand` as a word, and only it"
+    );
+    assert_eq!(
+        exactness(&whole_word),
+        vec![("size.md".to_string(), serde_json::json!(true))],
+        "an unmarked query's hit matched exactly — the key is never null for a keyword hit, and never true by default"
+    );
+
+    // A word marked with a trailing `*` asks on its own, no flag, and the answer names the word it widened.
+    let marked = search(&["grand*"]);
+    assert_eq!(
+        marked["keyword_used"], true,
+        "the keyword list ran, which is what `keyword_used` has always meant"
+    );
+    assert_eq!(
+        marked["prefix_used"], true,
+        "and it ran widened, which is a separate fact"
+    );
+    assert_eq!(
+        marked["prefix_terms"].as_array().map(Vec::len),
+        Some(1),
+        "the plan reports the word, not the star: {}",
+        marked["prefix_terms"]
+    );
+    assert_eq!(marked["prefix_terms"][0], "grand");
+    let mut marked_paths = paths(&marked);
+    marked_paths.sort();
+    assert_eq!(
+        marked_paths,
+        vec!["cake.md", "size.md", "visit.md"],
+        "`grand*` reaches grandma, grandmother and the whole word alike"
+    );
+    let mut marked_exact = exactness(&marked);
+    marked_exact.sort_by_key(|(path, _)| path.clone());
+    assert_eq!(
+        marked_exact,
+        vec![
+            ("cake.md".to_string(), serde_json::json!(false)),
+            ("size.md".to_string(), serde_json::json!(true)),
+            ("visit.md".to_string(), serde_json::json!(false)),
+        ],
+        "the per-hit truth #6 asked a GUI needs to label a hit: two reached through a prefix, one holding the word"
+    );
+
+    // `--prefix` is the whole-query door a front end's toggle maps onto.
+    let flag = search(&["--prefix", "kestr"]);
+    assert_eq!(
+        paths(&flag),
+        vec!["lake.md"],
+        "the fragment the reporter typed reaches its note at last"
+    );
+    assert_eq!(flag["prefix_used"], true);
+    assert_eq!(flag["prefix_terms"][0], "kestr");
+    assert_eq!(
+        exactness(&flag),
+        vec![("lake.md".to_string(), serde_json::json!(false))],
+        "`kestrel` is not `kestrel`-as-a-whole-word, and the answer does not pretend it is"
+    );
+
+    // **The text channel says it too**, because a person reading a terminal needs the same fact a client reads from JSON:
+    // that what they see was reached from a word beginning.
+    let mut text = ws.command_without_operand(&["search"]);
+    text.arg(&ws.root).arg("--prefix").arg("grand");
+    let said = run(&mut text);
+    assert_eq!(said.code(), 0, "\n{}", said.stderr());
+    assert!(
+        said.stdout().contains("word beginnings matched: grand\n"),
+        "the widened word is named above the list it explains:\n{}",
+        said.stdout()
+    );
+
+    // …and an empty prefix answer cannot read as "no word begins with this": that question was asked, so the sentence says so.
+    let mut none = ws.command_without_operand(&["search"]);
+    none.arg(&ws.root)
+        .arg("--mode")
+        .arg("keyword")
+        .arg("--prefix")
+        .arg("qqzz");
+    let empty = run(&mut none);
+    assert_eq!(empty.code(), 0, "\n{}", empty.stderr());
+    assert_eq!(
+        empty.stdout().trim_end(),
+        r#"nothing matched "qqzz" — not even as the start of a word"#,
+        "the refusal admits the widening it performed"
+    );
+
+    // Mutation this catches: defaulting to `Prefix::EveryTerm` (every assertion above about unmarked queries fails), filling
+    // `matched_exactly` with `true` (the cake/visit pair fails), and printing the header line from `query` rather than the
+    // plan (`grand*` would print `grand*`, telling a reader np searched for a star).
 }
 
 /// **"Your folder is not indexed" is a different answer from "nothing matches"** (issue **#5**).
@@ -3554,13 +3725,14 @@ mod real_model {
                 "kind",
                 "linked_from",
                 "linked_notes",
+                "matched_exactly",
                 "path",
                 "score",
                 "semantic_rank",
                 "snippet",
                 "source_note",
             ],
-            "§12's hit fields, F28's linker list and F36's five evidence keys, no extras"
+            "§12's hit fields, F28's linker list, F36's five evidence keys and #6's `matched_exactly`, no extras"
         );
         // Both halves ran here, so neither number is null — the claim that would be invisible in a default build, where
         // only the keyword side can answer.
