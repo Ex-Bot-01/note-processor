@@ -435,12 +435,11 @@ fn outdated_parse_version() -> u32 {
 /// the binary opens: [`Config::workspace_db`] keys on the absolute root, and [`Workspace::command`] passes
 /// exactly that path.
 fn record_parse_version(ws: &Workspace, version: u32) {
-    let cfg = Config {
-        data_dir: ws.data_dir(),
-        ..Config::default()
-    };
-    let db =
-        Db::open(&cfg.workspace_db(&ws.root)).expect("test setup: open the workspace database");
+    // Derived through `Workspace::db_path`, the same helper the assertions use, rather than a `Config` spelled here:
+    // on Windows the data dir is one floor below `%LOCALAPPDATA%` (**F37**), and this helper writing to the raw variable is
+    // exactly how `a_parse_rule_change_reports_the_re_parse_on_stderr` kept failing after the harness learned to nest —
+    // np re-parsed nothing, because the label row had been planted in a database it never opens.
+    let db = Db::open(&ws.db_path()).expect("test setup: open the workspace database");
     let updated =
         db.0.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -470,12 +469,11 @@ fn skipped(report: &serde_json::Value) -> Vec<String> {
 /// Write the chunker version this workspace recorded, the way an older build would have left it.
 #[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
 fn record_chunk_version(ws: &Workspace, version: i64) {
-    let cfg = Config {
-        data_dir: ws.data_dir(),
-        ..Config::default()
-    };
-    let db =
-        Db::open(&cfg.workspace_db(&ws.root)).expect("test setup: open the workspace database");
+    // Derived through `Workspace::db_path`, the same helper the assertions use, rather than a `Config` spelled here:
+    // on Windows the data dir is one floor below `%LOCALAPPDATA%` (**F37**), and this helper writing to the raw variable is
+    // exactly how `a_parse_rule_change_reports_the_re_parse_on_stderr` kept failing after the harness learned to nest —
+    // np re-parsed nothing, because the label row had been planted in a database it never opens.
+    let db = Db::open(&ws.db_path()).expect("test setup: open the workspace database");
     db.0.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -487,11 +485,7 @@ fn record_chunk_version(ws: &Workspace, version: i64) {
 /// The recorded chunker version, or `None` when the workspace never recorded one.
 #[cfg(unix)] // the only caller is the unix-only gap case; ungated, these are dead code on Windows
 fn recorded_chunk_version(ws: &Workspace) -> Option<i64> {
-    let cfg = Config {
-        data_dir: ws.data_dir(),
-        ..Config::default()
-    };
-    let db = Db::open(&cfg.workspace_db(&ws.root)).expect("test: open the workspace database");
+    let db = Db::open(&ws.db_path()).expect("test: open the workspace database");
     db.0.query_row(
         "SELECT value FROM meta WHERE key = ?1",
         [np_core::scan::EMBED_VERSION_KEY],
