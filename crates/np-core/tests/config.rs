@@ -566,7 +566,7 @@ fn registry_records_and_bumps_last_seen() {
     );
     assert_eq!(recent[0].1, 300, "re-recording must bump last_seen");
     assert!(
-        recent[1].0.ends_with("b/more"),
+        key_ends_with(&recent[1].0, "b/more"),
         "older workspace second, got {:?}",
         recent[1].0
     );
@@ -666,7 +666,7 @@ fn a_registry_write_waits_for_another_connection_instead_of_failing_busy() {
     let recent = registry.recent().expect("recent");
     assert_eq!(recent.len(), 2, "both writes land: {recent:?}");
     assert!(
-        recent[0].0.ends_with("waiting/notes"),
+        key_ends_with(&recent[0].0, "waiting/notes"),
         "the write that waited is the most recent one: {recent:?}"
     );
 }
