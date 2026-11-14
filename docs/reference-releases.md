@@ -54,6 +54,21 @@ A source build is the only shape you can choose features on: `--features local-m
   bytes there rather than U+FFFD, which contradicts what F20's card asserted. **Nightly is red on those two cases**; nothing in the shipped
   binaries depends on them, and they are about how a refusal *report* is spelled.
 
+The two `v0.5.0` archives, as published (2026-11-14), so a reader can check a download against something that is not the same
+response they are verifying:
+
+```text
+5c71f53d73e5a08fa5e23f437c1aa09e11dadc1cdfc0d3f81c7a32d8987be3ec  np-0.5.0-x86_64-unknown-linux-gnu.tar.gz
+c2a2da1c28b957c838c8423e289d3ea67f50c526537e06f3a10ed107c35b64b1  np-0.5.0-x86_64-pc-windows-gnu-cross.zip
+```
+
+Neither is bit-reproducible, so these digests identify *the files on the page*, not a build recipe you can re-run to the same bytes. The
+Windows archive's `np.exe` (16,731,648 bytes) digests to
+`ba310fb99f2ed826843afd7a81332f7bc4446ec776f9b4cb53865c8fc10fbc5c`; it is named here rather than in `SHA256SUMS.txt`, because that file is
+run through `sha256sum -c` against files a person downloaded and must not name a file inside an archive (**v0.4.0's** mistake). The Linux
+binary was executed on a machine whose CPU stops at SSE4.2 before publishing: `np --version`, `np scan`, and a prefix search all ran, and
+its `.text` holds zero `%zmm` and 4,940 `%ymm` references — the same figures `v0.4.0`'s shipped binary carries.
+
 **Since `v0.3.1`, shipped in `v0.4.0`.** `initialize` named **eight** methods there.
 
 - **A diagnostics surface with a reference.** Levels resolve from file, environment and flag; every refusal names its rule on the
