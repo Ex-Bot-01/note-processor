@@ -275,7 +275,9 @@ embeddings on: provider = "local-model", model = "embeddinggemma-2"
 nothing has been downloaded yet: the first `np embed` fetches 295.5 MB (main) and checks its digest
 ```
 
-and the file it created, verbatim — comments, quoting style and unrelated keys elsewhere in a real config survive the same edit:
+and the file it created, verbatim — comments, quoting style and unrelated keys elsewhere in a real config survive the same edit. The
+version inside that comment is the version that *wrote* the line, so a file touched by a later release says `(np 0.5.0)`; it is provenance,
+not a version check, and nothing refuses to load a file an older np wrote:
 
 ```toml
 # note-processor set by `np embeddings enable embeddinggemma-2` (np 0.4.0) at 2026-11-14T17:22:41Z

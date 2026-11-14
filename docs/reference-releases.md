@@ -25,14 +25,36 @@ there at all (`docs/ops-actions-minutes.md`); a locally packaged release carries
 and its notes say so. Source builds need no CI and no minutes:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.4.0 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.5.0 -p np-cli --locked
 ```
 
 A source build is the only shape you can choose features on: `--features local-model` puts the inference runtime in the binary, and adding
 `,vision` adds figure encoding. Neither is needed to index or to search by keyword.
 
-**Current release: `v0.4.0` (2026-11-13).** Everything below is user-visible since `v0.3.1`; the protocol stays **1**, and `initialize`
-now names **eight** methods.
+**Current release: `v0.5.0` (2026-11-14).** The protocol stays **1**; nothing existing changed shape, and `initialize` now answers
+**ten** methods.
+
+- **A word can match at its beginning** (**#6**): `"grand*"` in a query, `--prefix` to widen every word, or `"prefix": true` over the
+  pipe. The answer admits what it did — `prefix_used`, `prefix_terms`, and per-hit `matched_exactly` (`true` whole words only, `false`
+  reached by widening, `null` for a hit that came from vectors and was never in a whole-word test). A query with no `*` still matches
+  whole words exactly as `0.4.0` did: widening is opt-in because a vault holds identifiers.
+- **Consent has a door** (**#7**): `np embeddings enable <id>` / `disable`, and `embeddings.enable` / `embeddings.disable` over the pipe.
+  np writes its own config, names the keys it changed, quotes what a first `np embed` would cost and **moves no bytes**; the prospective
+  file is loaded back through np's own reader before it replaces the old one, so a file that would not load is never published. Comments,
+  unrelated keys and line endings survive; enabling what is already enabled writes nothing; `disable` leaves `embeddings.model` in place,
+  because revoking permission to download is not a licence to erase which model was chosen. These two are the only methods that refuse a
+  parameter they cannot use — a client that sends `"modle"` is told so rather than told `ok`.
+- **A checksum file may only name files the page carries.** `v0.4.0`'s first `SHA256SUMS.txt` listed `np.exe`, which lives *inside* the
+  zip, so the documented `sha256sum -c` reported `FAILED open or read` for a file nobody could download. The published page was corrected
+  by hand and says so; the packaging script is fixed here, and the publish job now checks coverage both ways.
+- **Windows, where five red tests were one bug.** F37 nested np's Windows data dir under `%LOCALAPPDATA%\note-processor`; the test
+  harnesses derived their assertion paths from the raw variable — one floor below where np writes — and six dispatched runs removed that
+  assumption through five call sites. Every other test file then ran on a Windows runner for the first time. One real finding survived:
+  [#9](https://github.com/Ex-Bot-01/note-processor/issues/9), that a name refused for holding an unpaired surrogate carries WTF-8 identity
+  bytes there rather than U+FFFD, which contradicts what F20's card asserted. **Nightly is red on those two cases**; nothing in the shipped
+  binaries depends on them, and they are about how a refusal *report* is spelled.
+
+**Since `v0.3.1`, shipped in `v0.4.0`.** `initialize` named **eight** methods there.
 
 - **A diagnostics surface with a reference.** Levels resolve from file, environment and flag; every refusal names its rule on the
   diagnostic channel; `scan` reports why each note was skipped; records raised inside `np serve` carry the `request` id that caused them
@@ -53,8 +75,8 @@ now names **eight** methods.
 - Keyword search wants **every** word of the query — documented where a reader meets it (**#1**), because AND-of-words is what makes a
   narrow query narrow.
 
-Both assets for `v0.4.0` are built by CI on `ubuntu-latest`, by the two scripts named above, and each carries `np` (or `np.exe`),
-`LICENSE` and `THIRD_PARTY_NOTICES.md`.
+Both assets for `v0.5.0`, like `v0.4.0`'s, are built by CI on `ubuntu-latest`, by the two scripts named above, and each carries `np`
+(or `np.exe`), `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
 **They run on any x86-64 machine, and that costs them speed.** Three things decide the instruction set of a shipped binary, and for
 three rehearsals only the first was being said out loud:

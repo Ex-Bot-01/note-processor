@@ -42,7 +42,7 @@ sha256sum -c SHA256SUMS.txt        # Linux/macOS, run next to the archive
 ```
 
 ```powershell
-(Get-FileHash .\np-0.4.0-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
+(Get-FileHash .\np-0.5.0-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
 ```
 
 | Platform | What you get | Worth knowing |
@@ -58,7 +58,7 @@ The model itself is never inside an archive: ~309 MB arrives only when you run `
 Building from source needs nothing but a stable Rust toolchain for the default build — no C++, no cmake:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.4.0 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.5.0 -p np-cli --locked
 ```
 
 Per-version caveats (which old assets are stale, what is compiled out of them): [Release archive caveats](docs/reference-releases.md).
@@ -105,6 +105,11 @@ np search ~/Notes "how are moved files detected"
 as far as it can on vectors and reports exactly where it stopped. Offline, it exits **0** with `vectors: false` — the vault is
 searchable and nothing needs fixing but the cable. Any other stop on the vector half exits 1.
 
+One stop is a decision rather than a fault: with no `[embeddings] model` configured, np will not start inference just because a
+binary could. `np embeddings enable <id>` is the door that answer goes through — it writes `embeddings.provider` and
+`embeddings.model`, says which keys it changed and what a first `np embed` would cost, and moves no bytes (**#7**). It is also
+`embeddings.enable` over the pipe, so an app that asked its user can record the answer instead of editing TOML by hand.
+
 **The first run may download ~310 MB, and says so before byte one.** `np embed`, `np setup` and a default-mode
 `np search` fetch the pinned artifact when it is missing, announcing id, size and the *kind* of origin, then verifying the digest
 before putting it in place — a partial or wrong file is never used. Three ways to refuse: `--no-auto-fetch` for one run,
@@ -118,7 +123,7 @@ Two habits that pay off:
 - **The report goes to stdout; llama.cpp's log lines go to stderr**, where the default level (`warn`) leaves a few hundred bytes
   instead of the 145,816-byte tensor transcript it used to print ahead of a one-line answer.
 
-## The five commands
+## The six commands
 
 | Command | What it does | What it writes |
 | --- | --- | --- |
@@ -245,7 +250,7 @@ text-only on the image side and say so per figure rather than silently skipping.
 
 | You saw | It means |
 | --- | --- |
-| `configuration disabled: embeddings.provider = "none"` from `np embed` | No provider chosen yet — write `[embeddings] provider = "local-model"`, or accept an index-only build |
+| `configuration disabled: embeddings.provider = "none"` from `np embed` | Nobody has said yes yet. `np embeddings enable <id>` writes both keys and quotes the download without starting it (**#7**); or accept an index-only build, which is a supported shape rather than a failure |
 | `no vectors in this workspace: ranked by keyword only …` on stderr, exit **0** | Not an error. Keywords answered; the vector list had nothing to rank |
 | `nothing matched "…"` on stdout, exit **0**, in a vault you know holds the words | The keyword half needs **every** word in **one** note (`AND` of quoted phrases), so a sentence-shaped query dies on one stray `how`, and two words that live in different notes never meet. Try fewer words; with vectors installed, `--mode hybrid` adds a semantic half that ranks by meaning. A vault nobody indexed says it out loud instead: `… this workspace has never been scanned` |
 | `np embed` reports `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |

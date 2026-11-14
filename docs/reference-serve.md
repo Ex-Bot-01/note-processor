@@ -361,7 +361,9 @@ This block was re-captured on 2026-11-14 on a **default-feature** debug build of
 anything for them to run against), and `prefix_used`, `prefix_terms` and the hit's `matched_exactly` from **#6** — here all
 saying *nothing was widened*, because this query asked for a whole word. Its handshake lists eight methods where this build now
 answers ten: `links.list` arrived in **#2** (included here) and `embeddings.enable` / `embeddings.disable` in **#7**, after this
-capture. A client feature-detects off that array, which is exactly the case the array is there for.
+capture. A client feature-detects off that array, which is exactly the case the array is there for. The `"np"` field is read the same way:
+it is the version of the binary that answered *in this capture*, and a release build reports its own version there (`"0.5.0"` since
+`v0.5.0`) rather than anything a client should compare against a constant.
 
 ### A first run with no network
 
