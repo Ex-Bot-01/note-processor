@@ -16,7 +16,10 @@ Two report-side filters compare **display text** where the rest of the program c
   in both `written.uncovered` and `hidden_by_unknown`, so the refresh-gap line over-counts.
 - `scan::is_unknown_path`'s refused-name arm compares display text for the same reason, with the same twin effect
   (F18 accepted that deliberately *on Windows*, where the key bytes are the lossy ones; on Unix the byte key is
-  exact and the comparison is simply wrong).
+  exact and the comparison is simply wrong). **Stale as of F18 round four (`cfd7e8b`, 2026-11-08):** the Windows key
+  bytes stopped being lossy, so the parenthetical's premise no longer holds — read it as "on the third target, where
+  they still are". The nightly Windows row found the same belief still live in `ScanReport::skipped`'s doc comment and
+  in two assertions of its own (issue #9).
 - `skipped.sort(); skipped.dedup()` publishes **one** line for two byte-distinct refused paths that share a display
   spelling — the report cannot name the file it lost.
 

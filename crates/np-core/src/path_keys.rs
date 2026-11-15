@@ -71,7 +71,12 @@ impl RelPath {
 /// platform, because `rel` is this program's own relative spelling rather than the OS's absolute one. On Unix
 /// the bytes are the raw ones, which is the whole point: `caf\xe9.md` and `caf\xe8.md` key apart while both
 /// decode to `caf\u{FFFD}.md`. Windows has no byte spelling (its paths are UTF-16 and unpaired surrogates are
-/// the lossy case), so it falls back to the lossy text and stays F13's documented residual (F13 §5).
+/// the lossy case — **and that was true of this function until F18 round four.** Windows now encodes through [`wtf8`],
+/// which gives a lone surrogate bytes of its own, so two NTFS names differing only in *which* surrogate key apart here as
+/// well. What survives of F13 §5's residual is the neither-Unix-nor-Windows target, where no
+/// exact spelling exists to take (the third arm of `os_bytes`, which is private, so it is named rather than linked — rustdoc lints a
+/// public page that points at an item with no page). The claim this line replaced stayed stale for six days because only a Windows runner
+/// can exercise it, and none ran until 2026-11-14 (issue #9).
 pub fn rel_bytes<'a>(components: impl IntoIterator<Item = &'a OsStr>) -> Vec<u8> {
     let mut joined: Vec<u8> = Vec::new();
     for component in components {

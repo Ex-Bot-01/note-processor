@@ -676,7 +676,9 @@ test compiles on Windows into a name that cannot be built, and passes by asserti
   extended code rusqlite surfaces for both an `upsert_file` clash and an `apply_move` clash, so the answer is
   evidence in a test file instead of a sentence here. Not load-bearing — `is_identity_conflict`
   (`scan.rs:690-702`) accepts UNIQUE and PRIMARYKEY alike, which is exactly why §1 stopped asserting it.
-- **Windows stance, explicit.** Windows has no byte spelling — Rust hands out UTF-16 code units, and
+- **Windows stance, explicit.** ~~Windows has no byte spelling~~ **— superseded by F18 round four
+  (`cfd7e8b`, 2026-11-08), which gives Windows names exact bytes through `path_keys::wtf8`; see that card. Kept in place of a rewrite because this paragraph is the reason the
+  refusal exists at all.** As written here, Windows has no byte spelling — Rust hands out UTF-16 code units, and
   unpaired surrogates are the only lossy case (`config.rs:214-226` already says so). F13 therefore lands
   Unix fidelity only: `rel_bytes` is filled from `OsStrExt::as_bytes` on Unix and from the current lossy
   text elsewhere, and the Windows gap stays a documented residual.

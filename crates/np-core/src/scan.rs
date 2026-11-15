@@ -169,10 +169,19 @@ pub struct ScanReport {
     /// instead of deleted.
     /// Sorted and deduplicated by the path's **bytes**, printed as display text (F20). Where the keys differ, two
     /// paths print two lines that look alike, because the report can name them no differently — they are not a
-    /// duplicate to clean up later, and collapsing them would hide one lost path. Where the key is itself lossy —
-    /// a Windows refusal, whose identity bytes come from `to_string_lossy` — two names still share a single line,
-    /// which `crates/np-core/tests/walk.rs` pins. So this list is a floor on what the scan lost, never a count of
-    /// it.
+    /// duplicate to clean up later, and collapsing them would hide one lost path.
+    ///
+    /// **The next sentence in this doc comment was false for six days.** It said that where the key is itself lossy —
+    /// "a Windows refusal, whose identity bytes come from `to_string_lossy`" — two names share a single line, and that
+    /// `crates/np-core/tests/walk.rs` pinned it. F18 round four (`cfd7e8b`, 2026-11-08) replaced that byte spelling with
+    /// [`crate::path_keys::wtf8`], so a Windows refusal's identity bytes carry the lone surrogate itself and two such
+    /// names produce **two** lines here; `tests/walk.rs` now pins those six bytes instead, on the Windows row that first
+    /// ran on 2026-11-14 and caught the stale pair of them (issue #9). A key that is genuinely lossy still exists — a row
+    /// whose key migration 4 derived from display text, or an entry that only ever existed as text and reached the report
+    /// through `UnknownPath::from_display` (private, so named rather than linked) — and *those* collapse, which is what the sentence
+    /// should have been about.
+    ///
+    /// So this list is a floor on what the scan lost, never a count of it.
     pub skipped: Vec<String>,
     /// Live note rows — the same number of entries the catalog holds (spec §2).
     pub notes: i64,
@@ -2528,9 +2537,11 @@ fn superseded_names(
 
 /// One generated-looking root entry as the listing saw it: enough to judge it, enough to act on it.
 struct Listed {
-    /// Identity: the file name's OS bytes, which keep two entries sharing a lossy spelling apart. Windows
-    /// has no byte spelling, so its key is the lossy text and twins stay collapsed there — F13 §5's
-    /// residual, not a new one.
+    /// Identity: the file name's OS bytes, which keep two entries sharing a lossy spelling apart. On Windows
+    /// those bytes are exact since F18 round four (`wtf8`, 2026-11-08), so twins stay apart there too; the
+    /// sentence this one replaces claimed the lossy collapse survived on Windows, and was stale from that
+    /// commit until the nightly row read it (issue #9). F13 §5's residual is now only the third target —
+    /// neither Unix nor Windows — where no exact spelling exists to take.
     name_bytes: Vec<u8>,
     /// What gets unlinked, straight from `entry.path()` — the bytes this entry really has on disk.
     path: PathBuf,

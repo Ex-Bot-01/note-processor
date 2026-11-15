@@ -454,17 +454,17 @@ fn nothing_a_normal_tree_can_name_is_refused() {
     );
 }
 
-/// F18's refusal at the level of a real file — **written for a Windows machine to run, not for Linux CI.**
+/// F18's refusal at the level of a real file — **run by `Test (windows-latest)` since 2026-11-14.**
 ///
-/// This cannot execute here: the module is compiled out on Linux, and no Linux syscall can hand `create()` an
-/// unpaired surrogate. So do not count this test as coverage of the rule — `path_keys`' predicate units are
-/// what CI runs and what F18's design doc names as the part that carries the weight. On a Windows box
-/// (`cargo test --test walk`) it is the end-to-end check: two live names differing only in an unpaired
-/// surrogate, which `to_string_lossy` spells identically, must both stay out of the catalog rather than one
-/// overwriting the other's row.
+/// It used to read "written for a Windows machine to run, not for Linux CI", and that was true in the narrow sense
+/// while being false about coverage: no Linux syscall hands `create()` an unpaired surrogate, so nothing between
+/// F18 round four (2026-11-08) and this week exercised the Windows byte rule end-to-end. The nightly Windows row now
+/// does, and it found this file's assertions describing the pre-round-four lossy key — see issue #9. Two live names
+/// differing only in *which* unpaired surrogate they hold must both stay out of the catalog rather than one
+/// overwriting the other's row, and each must be recorded under its own exact bytes.
 ///
-/// If even Windows refuses to *create* such a name, the test says so on stderr and returns without asserting:
-/// a silent pass here would be indistinguishable from the coverage this test cannot provide on Linux.
+/// If a future runner's filesystem refuses to *create* such a name, the test says so on stderr and returns without
+/// asserting: a silent pass here would be indistinguishable from the coverage this test cannot provide on Linux.
 #[cfg(windows)]
 #[test]
 fn an_unpaired_surrogate_name_is_refused() {
@@ -508,17 +508,37 @@ fn an_unpaired_surrogate_name_is_refused() {
         ["\u{10000}.md"],
         "neither twin is indexed; the valid pair is"
     );
-    // One line for two files: the report names display spellings, and both twins share this one.
+    // **Two** entries, spelled alike. This assertion said "one entry" from 2026-10-26 until a Windows runner ran it
+    // on 2026-11-14, and it was stale the moment F18 round four landed (`cfd7e8b`, 2026-11-08): `os_bytes` stopped
+    // spelling a UTF-16 name through `to_string_lossy` and started spelling it through [`np_core::path_keys::wtf8`],
+    // whose whole third arm exists so that a lone surrogate gets bytes of its own. Two names, two byte keys, two
+    // report lines that look identical — which is F20's split arriving on Windows by the route F18 built, not the
+    // Unix route this comment used to claim was the only one.
     //
-    // F20 moves the dedup key to bytes and that changes nothing here, which is worth stating rather than
-    // discovering on a Windows box: `path_keys::os_bytes` has no byte spelling for a UTF-16 name, so these two
-    // paths' *identity* bytes are the lossy text too and they still dedup to one entry. The F20 split — two
-    // entries, two report lines, spelled alike — is the Unix case, where the keys really do differ; on Unix no
-    // name is ever refused, so this list stays empty there.
+    // The bytes are pinned rather than compared to each other, because a decoder written later has to agree with the
+    // encoder that filled a database (the same reason `path_keys` pins `U+D800` → `ED A0 80`): `caf` + U+D800 and
+    // `caf` + U+D801, each followed by `.md`, in ascending byte order because the caller sorts on these bytes.
+    // Nothing on Linux can reach this arm — no syscall here will put an unpaired surrogate in a name — so before this
+    // week the only thing checking those six bytes end-to-end was the pure unit test over `u16`.
+    let refused: &[(&str, &[u8])] = &[
+        (
+            "caf\u{fffd}.md",
+            &[99, 97, 102, 0xED, 0xA0, 0x80, b'.', b'm', b'd'],
+        ),
+        (
+            "caf\u{fffd}.md",
+            &[99, 97, 102, 0xED, 0xA0, 0x81, b'.', b'm', b'd'],
+        ),
+    ];
     assert_eq!(
-        named(&walked.unrepresentable),
-        [("caf\u{fffd}.md", "caf\u{fffd}.md".as_bytes())],
-        "one entry for two names whose bytes are as indistinguishable as their text"
+        named(&walked.unrepresentable).as_slice(),
+        refused,
+        "two refused names, two identity keys, one display spelling each — the report has to say twice"
+    );
+    let spellings = named(&walked.unrepresentable);
+    assert_eq!(
+        spellings[0].0, spellings[1].0,
+        "the display half is lossy by definition, so these two lines are indistinguishable in text: {spellings:?}"
     );
 }
 
@@ -563,10 +583,17 @@ fn an_unpaired_surrogate_directory_is_never_entered() {
     );
     // Recorded once, as the directory's own display spelling, in the list the scan matches by **prefix** — so
     // every row below it stays unknown rather than becoming a `Removed` this scan cannot support.
+    //
+    // Display and bytes are *not* the same text here, which is what this assertion used to claim. The display half is
+    // lossy (`caf\u{fffd}`); the identity half carries the surrogate itself (`ED A0 80`), because F18 round four made
+    // Windows's byte spelling exact so that a refused directory cannot collide with one named with a *different* lone
+    // surrogate, or with one whose name really holds U+FFFD — and this list is matched by prefix against row keys, so a
+    // collision here would hide or stale the wrong subtree.
+    let refused_dir: &[(&str, &[u8])] = &[("caf\u{fffd}", &[99, 97, 102, 0xED, 0xA0, 0x80])];
     assert_eq!(
-        named(&walked.unreadable),
-        [("caf\u{fffd}", "caf\u{fffd}".as_bytes())],
-        "the display spelling is what the report prints; on Windows the bytes are that same text"
+        named(&walked.unreadable).as_slice(),
+        refused_dir,
+        "the report prints the lossy spelling; the key it is matched by is the exact one"
     );
     assert!(
         walked.unrepresentable.is_empty(),
