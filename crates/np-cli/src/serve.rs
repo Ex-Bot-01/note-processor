@@ -687,9 +687,12 @@ fn embeddings_enable(params: &Value) -> Result<Value, ServeError> {
         }
     };
     refuse_unknown_keys(params, &["model"])?;
-    crate::embeddings_apply(np_core::config_write::EmbeddingsTarget::On { model: &model })
-        .map(|outcome| outcome.document)
-        .map_err(refused)
+    crate::embeddings_apply(
+        np_core::config_write::EmbeddingsTarget::On { model: &model },
+        np_core::config_write::WriteSurface::Serve,
+    )
+    .map(|outcome| outcome.document)
+    .map_err(refused)
 }
 
 /// **The other half of consent: revoking it** (**F50**). `provider = "none"`, and `embeddings.model` is left exactly where it
@@ -700,9 +703,12 @@ fn embeddings_enable(params: &Value) -> Result<Value, ServeError> {
 /// could live without this one, which is precisely the kind of thing an application says before it discovers it needs it.
 fn embeddings_disable(params: &Value) -> Result<Value, ServeError> {
     refuse_unknown_keys(params, &[])?;
-    crate::embeddings_apply(np_core::config_write::EmbeddingsTarget::Off)
-        .map(|outcome| outcome.document)
-        .map_err(refused)
+    crate::embeddings_apply(
+        np_core::config_write::EmbeddingsTarget::Off,
+        np_core::config_write::WriteSurface::Serve,
+    )
+    .map(|outcome| outcome.document)
+    .map_err(refused)
 }
 
 /// Refuse a parameter this method has no use for. **Only these two methods do this**, and only because they write: a typo'd

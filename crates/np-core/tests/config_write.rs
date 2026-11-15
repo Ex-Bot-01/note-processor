@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use np_core::config::Config;
-use np_core::config_write::{self, EmbeddingsTarget, Runtime, KEY_MODEL, KEY_PROVIDER};
+use np_core::config_write::{
+    self, EmbeddingsTarget, Runtime, WriteSurface, KEY_MODEL, KEY_PROVIDER,
+};
 use tempfile::TempDir;
 
 /// The environment `Config::load` reads when a file does not name a `data_dir` itself — which is the state of a config written
@@ -135,6 +137,7 @@ fn enabling_writes_the_two_keys_and_leaves_everything_else_exactly_as_it_was() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect("a build with the runtime can enable a pinned model");
     assert_eq!(
@@ -203,6 +206,7 @@ fn enabling_twice_changes_nothing_and_writes_no_bytes() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect("test setup: enable once");
     assert!(!first.changed.is_empty(), "the first call has work to do");
@@ -214,6 +218,7 @@ fn enabling_twice_changes_nothing_and_writes_no_bytes() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect("enabling what is already enabled is not an error");
     assert_eq!(
@@ -250,6 +255,7 @@ fn switching_one_model_for_another_reports_only_the_model() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect("switching models is an enable");
     assert_eq!(
@@ -274,6 +280,7 @@ fn enabling_into_an_installation_with_no_config_file_creates_one() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect("the first `[embeddings]` an installation ever gets is the ordinary case");
     assert_eq!(
@@ -323,8 +330,13 @@ fn disabling_on_an_installation_with_no_config_writes_no_file() {
     let env = TestEnv::install();
     let path = env.config_path();
 
-    let written = config_write::set_embeddings_in(&path, EmbeddingsTarget::Off, &WITHOUT_RUNTIME)
-        .expect("turning nothing on is not an error");
+    let written = config_write::set_embeddings_in(
+        &path,
+        EmbeddingsTarget::Off,
+        &WITHOUT_RUNTIME,
+        WriteSurface::Cli,
+    )
+    .expect("turning nothing on is not an error");
     assert_eq!(
         written.changed,
         Vec::<String>::new(),
@@ -345,8 +357,13 @@ fn disabling_turns_the_provider_off_and_leaves_the_model_where_it_is() {
         a_pinned_id()
     ));
 
-    let written = config_write::set_embeddings_in(&path, EmbeddingsTarget::Off, &WITHOUT_RUNTIME)
-        .expect("turning embeddings off needs no runtime — that is the point of an off switch");
+    let written = config_write::set_embeddings_in(
+        &path,
+        EmbeddingsTarget::Off,
+        &WITHOUT_RUNTIME,
+        WriteSurface::Cli,
+    )
+    .expect("turning embeddings off needs no runtime — that is the point of an off switch");
     assert_eq!(
         written.changed,
         vec![KEY_PROVIDER.to_string()],
@@ -367,8 +384,13 @@ fn disabling_turns_the_provider_off_and_leaves_the_model_where_it_is() {
     );
 
     // And it is idempotent on the same terms as enable.
-    let again = config_write::set_embeddings_in(&path, EmbeddingsTarget::Off, &WITHOUT_RUNTIME)
-        .expect("disabling twice is not an error");
+    let again = config_write::set_embeddings_in(
+        &path,
+        EmbeddingsTarget::Off,
+        &WITHOUT_RUNTIME,
+        WriteSurface::Cli,
+    )
+    .expect("disabling twice is not an error");
     assert_eq!(again.changed, Vec::<String>::new());
 }
 
@@ -384,6 +406,7 @@ fn a_build_with_no_runtime_refuses_and_writes_nothing() {
             model: &a_pinned_id(),
         },
         &WITHOUT_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect_err("a build that cannot embed must not claim it can");
     let message = err.to_string();
@@ -406,6 +429,7 @@ fn a_build_with_no_runtime_refuses_and_writes_nothing() {
             model: &a_pinned_id(),
         },
         &WITHOUT_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect_err("no runtime is still no runtime");
     assert!(err.to_string().contains("local-model-not-built"), "{err}");
@@ -424,6 +448,7 @@ fn an_id_this_build_does_not_pin_refuses_and_names_the_ids_it_does() {
             model: "not-a-real-model",
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect_err("an unpinned id has no size, no digest and no code path");
     let message = err.to_string();
@@ -474,6 +499,7 @@ fn a_file_that_does_not_load_today_is_refused_and_left_untouched() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect_err("F35 refuses unknown keys, so this file does not load");
     assert!(
@@ -506,6 +532,7 @@ fn a_file_whose_provider_this_build_refuses_is_refused_too() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect_err(
         "`openai-compatible` is parseable and refused at load (**F50**'s rule 1 covers it)",
@@ -536,6 +563,7 @@ fn a_publish_that_cannot_happen_leaves_the_file_alone_and_names_the_path() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     );
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
         .expect("test cleanup: unlock the directory");
@@ -572,11 +600,95 @@ fn a_config_that_names_its_data_dir_does_not_need_the_environment() {
             model: &a_pinned_id(),
         },
         &WITH_RUNTIME,
+        WriteSurface::Cli,
     )
     .expect_err("a config whose `[models] base_url` cannot be parsed does not load today");
     assert!(err.to_string().contains("base_url"), "{err}");
     assert!(
         Path::new(&path).exists(),
         "and np was not in there when it failed"
+    );
+}
+
+/// **The provenance line names the door that wrote the file (#10).**
+///
+/// The line exists so someone opening `config.toml` months later can tell what touched their keys — F50's whole argument for np
+/// writing the file instead of an application editing TOML was that np records the truth about the write. Measured on the published
+/// v0.5.0 asset: one `embeddings.enable` request over `np serve`, and the file it created said
+/// ``# note-processor set by `np embeddings enable embeddinggemma-2` …`` — crediting a command nobody ran, which sends whoever is
+/// chasing an app's behaviour looking for a shell history entry that does not exist.
+///
+/// Both doors are exercised here rather than one, because the bug *is* the difference between them: a test that only checked the
+/// terminal would pass on the code that shipped, and a test that only checked the pipe could not say what the line must not claim.
+#[test]
+fn provenance_names_the_door_that_wrote_the_file() {
+    let model = a_pinned_id();
+
+    let cli = TempDir::new().expect("test setup: tempdir");
+    let cli_path = cli.path().join("config.toml");
+    config_write::set_embeddings_in(
+        &cli_path,
+        EmbeddingsTarget::On { model: &model },
+        &WITH_RUNTIME,
+        WriteSurface::Cli,
+    )
+    .expect("test setup: the terminal's door can enable a pinned model");
+
+    let pipe = TempDir::new().expect("test setup: tempdir");
+    let pipe_path = pipe.path().join("config.toml");
+    config_write::set_embeddings_in(
+        &pipe_path,
+        EmbeddingsTarget::On { model: &model },
+        &WITH_RUNTIME,
+        WriteSurface::Serve,
+    )
+    .expect("test setup: the pipe's door can enable a pinned model");
+
+    // The file is what a person opens, so the assertion reads its first line rather than a returned string.
+    let first_line = |path: &Path| -> String {
+        fs::read_to_string(path)
+            .expect("test step: read the file back")
+            .lines()
+            .next()
+            .expect("test step: the writer leaves a provenance line on top")
+            .to_string()
+    };
+
+    let from_cli = first_line(&cli_path);
+    assert!(
+        from_cli.contains(&format!("`np embeddings enable {model}`")),
+        "the terminal's own command is what ran, and the line should say so verbatim: {from_cli}"
+    );
+    assert!(
+        !from_cli.contains("serve"),
+        "a command line wrote this file; nothing about a pipe belongs in its provenance: {from_cli}"
+    );
+
+    let from_pipe = first_line(&pipe_path);
+    assert!(
+        from_pipe.contains("`embeddings.enable`") && from_pipe.contains("`np serve`"),
+        "the method and the surface that answered it are the whole truth of this write: {from_pipe}"
+    );
+    assert!(
+        !from_pipe.contains("np embeddings enable"),
+        "the pipe wrote this file, yet the line credits a command that never ran: {from_pipe}"
+    );
+
+    // The same rule on the way out, which is the half an application's audit trail renders.
+    config_write::set_embeddings_in(
+        &pipe_path,
+        EmbeddingsTarget::Off,
+        &WITH_RUNTIME,
+        WriteSurface::Serve,
+    )
+    .expect("test setup: the pipe's door can turn embeddings off");
+    let from_disable = first_line(&pipe_path);
+    assert!(
+        from_disable.contains("`embeddings.disable`"),
+        "a revocation over the pipe is named by the method that revoked it: {from_disable}"
+    );
+    assert!(
+        !from_disable.contains("np embeddings disable"),
+        "and not by a command line nobody typed: {from_disable}"
     );
 }

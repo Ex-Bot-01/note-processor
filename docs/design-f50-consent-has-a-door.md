@@ -93,10 +93,13 @@ limit rather than a feature to fake with a parameter.
 6. **After the rename, read it back.** `Config::load` on the real path must report the provider and model that were asked
    for; if it does not, the previous bytes are put back by the same temp-and-rename route and the run refuses. This is the
    half that catches a rule nobody thought of — a validation added later that rejects what this writer just wrote.
-7. **Provenance travels as a comment**, in the section np touched: `# np 0.4.0 set embeddings.provider = "local-model" and
-   embeddings.model = "embeddinggemma-2" (np embeddings enable embeddinggemma-2) at 2026-11-14T…Z`. It is a comment because
-   the file must stay valid TOML for a run that knows nothing about this feature, and it names the command because that is
-   the sentence a person can re-run or undo.
+7. **Provenance travels as a comment**, in the section np touched, and it names **the door** that wrote it:
+   ``# note-processor set by `np embeddings enable embeddinggemma-2` (np 0.5.0) at 2026-11-14T…Z`` from a terminal, and
+   ``# note-processor set by the `embeddings.enable` method over `np serve` (np 0.5.0) at …Z`` over the pipe. It is a comment because
+   the file must stay valid TOML for a run that knows nothing about this feature, and it names an actor because that is the sentence a
+   person can re-run, undo, or audit. **The actor half was wrong for the pipe until #10**: both doors spelled the CLI command, so an
+   application's audit trail told its user a command they never typed — in this file's own words, "a record of who set what" that
+   recorded an event which had not happened.
 8. **Disable writes one key**: `provider = "none"`. It leaves `embeddings.model` where it is — revoking consent to download
    is not a licence to erase which model was chosen, and a file that still names the model is one key away from being on
    again, which is what a person who changes their mind wants. `changed` therefore lists only `embeddings.provider`, and

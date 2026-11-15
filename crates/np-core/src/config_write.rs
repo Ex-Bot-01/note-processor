@@ -15,7 +15,7 @@
 //! lines survive verbatim (there is deliberately no TOML re-serialiser in this path — `toml::to_string` would rewrite a whole
 //! file alphabetically and take its comments with it), a file that does not load today is refused rather than half-edited, an
 //! idempotent call writes nothing at all, publishing is a rename inside the directory, and what np touched is recorded as a
-//! comment naming the command that did it.
+//! comment naming **the door that did it** — the terminal's command or the method over the pipe (**#10**).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -96,12 +96,32 @@ impl Runtime {
     }
 }
 
-/// [`set_embeddings_in`] with this build's capabilities — the entry point both surfaces call.
+/// The door a write came through, recorded in the file's provenance line (**#10**).
+///
+/// This is not decoration. F50's argument for np writing `config.toml` instead of letting an application edit TOML was that np can be
+/// trusted to record what happened: validate by loading, refuse rather than half-configure, read the file back after the rename. A line
+/// that credits the write to a surface that did not perform it breaks that promise in the one place the file itself speaks — and it is
+/// the *only* record an application's audit trail has. Measured on the published v0.5.0 asset: one `embeddings.enable` request over the
+/// pipe, and the file said ``# note-processor set by `np embeddings enable embeddinggemma-2` …``, sending whoever audits the app's
+/// behaviour hunting for a shell history entry that does not exist.
+///
+/// The capability question is a parameter for the same reason ([`Runtime`]): what a build *can* do and who just *asked* are both facts
+/// about the caller, and neither belongs baked into a sentence about the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteSurface {
+    /// `np embeddings enable <id>` / `np embeddings disable`, typed at a terminal.
+    Cli,
+    /// `embeddings.enable` / `embeddings.disable`, answered by `np serve`.
+    Serve,
+}
+
+/// [`set_embeddings_in`] with this build's capabilities — the entry point both surfaces call, each naming its own door.
 pub fn set_embeddings(
     path: &Path,
     target: EmbeddingsTarget<'_>,
+    surface: WriteSurface,
 ) -> Result<EmbeddingsWrite, ConfigError> {
-    set_embeddings_in(path, target, &Runtime::of_this_build())
+    set_embeddings_in(path, target, &Runtime::of_this_build(), surface)
 }
 
 /// Write `[embeddings]` so it says [`EmbeddingsTarget`], in the file at `path`.
@@ -121,6 +141,7 @@ pub fn set_embeddings_in(
     path: &Path,
     target: EmbeddingsTarget<'_>,
     runtime: &Runtime,
+    surface: WriteSurface,
 ) -> Result<EmbeddingsWrite, ConfigError> {
     let (wanted_provider, wanted_value, wanted_model, all_keys) = match target {
         EmbeddingsTarget::On { model } => {
@@ -213,7 +234,14 @@ pub fn set_embeddings_in(
     }
 
     let text = existing.clone().unwrap_or_default();
-    let rewritten = rewrite_embeddings(&text, wanted_provider, wanted_model, &changed, target);
+    let rewritten = rewrite_embeddings(
+        &text,
+        wanted_provider,
+        wanted_model,
+        &changed,
+        target,
+        surface,
+    );
 
     // **Rule 4 plus the validation seam:** publish into a sibling temp file and load *it*. A cross-device rename would copy
     // rather than link, so the temp lives in the same directory by construction; and if the bytes are wrong the real file is
@@ -352,6 +380,7 @@ fn rewrite_embeddings(
     model: Option<&str>,
     keys: &[String],
     target: EmbeddingsTarget<'_>,
+    surface: WriteSurface,
 ) -> String {
     let crlf = text.contains("\r\n");
     let ends_newline = text.ends_with('\n');
@@ -365,7 +394,7 @@ fn rewrite_embeddings(
     lines.retain(|line| !line.trim_start().starts_with(PROVENANCE_PREFIX));
 
     let wanted = wanted_keys(provider, model, keys);
-    let note = provenance(target);
+    let note = provenance(target, surface);
 
     match find_section(&lines, "embeddings") {
         Some((header, end)) => {
@@ -429,15 +458,27 @@ fn quote(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
 }
 
-/// The provenance line: what np set, with which command, at which instant, in this build's version. A comment because the
+/// The provenance line: what np set, **through which door**, at which instant, in this build's version. A comment because the
 /// file must stay valid TOML for a run that knows nothing about this feature, and worded as a sentence a person can act on.
-fn provenance(target: EmbeddingsTarget<'_>) -> String {
-    let command = match target {
-        EmbeddingsTarget::On { model } => format!("np embeddings enable {model}"),
-        EmbeddingsTarget::Off => "np embeddings disable".to_string(),
+///
+/// The actor half is spelled per surface rather than derived from `target` alone, which is what made the shipped line false for a pipe
+/// write (**#10**): there is exactly one CLI command per target, so naming it *looked* like naming the action, while in fact asserting
+/// that a terminal was involved. A method over stdin has no command to quote, so its sentence names the method and the program instead.
+fn provenance(target: EmbeddingsTarget<'_>, surface: WriteSurface) -> String {
+    let actor = match (surface, target) {
+        (WriteSurface::Cli, EmbeddingsTarget::On { model }) => {
+            format!("`np embeddings enable {model}`")
+        }
+        (WriteSurface::Cli, EmbeddingsTarget::Off) => "`np embeddings disable`".to_string(),
+        (WriteSurface::Serve, EmbeddingsTarget::On { .. }) => {
+            "the `embeddings.enable` method over `np serve`".to_string()
+        }
+        (WriteSurface::Serve, EmbeddingsTarget::Off) => {
+            "the `embeddings.disable` method over `np serve`".to_string()
+        }
     };
     format!(
-        "{PROVENANCE_PREFIX} by `{command}` (np {}) at {}",
+        "{PROVENANCE_PREFIX} by {actor} (np {}) at {}",
         env!("CARGO_PKG_VERSION"),
         utc_stamp(SystemTime::now())
     )

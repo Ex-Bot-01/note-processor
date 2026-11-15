@@ -277,7 +277,9 @@ nothing has been downloaded yet: the first `np embed` fetches 295.5 MB (main) an
 
 and the file it created, verbatim — comments, quoting style and unrelated keys elsewhere in a real config survive the same edit. The
 version inside that comment is the version that *wrote* the line, so a file touched by a later release says `(np 0.5.0)`; it is provenance,
-not a version check, and nothing refuses to load a file an older np wrote:
+not a version check, and nothing refuses to load a file an older np wrote. The command named there is also only true of **this** door: the same
+decision made over `np serve` writes `the `embeddings.enable` method over `np serve`` instead (**#10**), because a file that credited a shell
+command nobody ran would be a record of an event that did not happen:
 
 ```toml
 # note-processor set by `np embeddings enable embeddinggemma-2` (np 0.4.0) at 2026-11-14T17:22:41Z

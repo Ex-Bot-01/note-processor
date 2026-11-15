@@ -2660,6 +2660,7 @@ pub(crate) struct EmbeddingsOutcome {
 /// refusals, the reload and the document are one code path (**F50**), and neither door can validate less than the other.
 pub(crate) fn embeddings_apply(
     target: np_core::config_write::EmbeddingsTarget<'_>,
+    surface: np_core::config_write::WriteSurface,
 ) -> Result<EmbeddingsOutcome, Box<dyn Error>> {
     let enabling = matches!(target, np_core::config_write::EmbeddingsTarget::On { .. });
     let path = np_core::config::config_file_path().ok_or_else(|| -> Box<dyn Error> {
@@ -2670,7 +2671,7 @@ pub(crate) fn embeddings_apply(
 
     // Every refusal this returns is np's own sentence about its own rules (`local-model-not-built`, an unpinned id, a config
     // that does not load today), and the same sentence reaches `serve` as `-32000`: one fact, one wording, two doors.
-    let write = np_core::config_write::set_embeddings(&path, target)?;
+    let write = np_core::config_write::set_embeddings(&path, target, surface)?;
 
     // What the run will see **now**, through the loader every command uses — not what this call asked for. The writer refuses
     // if the two disagree, so reaching here means they match; reading it anyway is what keeps this honest if that ever stops
@@ -2703,7 +2704,7 @@ fn embeddings_run(
     target: np_core::config_write::EmbeddingsTarget<'_>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let outcome = embeddings_apply(target)?;
+    let outcome = embeddings_apply(target, np_core::config_write::WriteSurface::Cli)?;
     if json {
         emit_json(&outcome.document);
         return Ok(());

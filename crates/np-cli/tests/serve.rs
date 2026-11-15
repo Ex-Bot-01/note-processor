@@ -388,9 +388,17 @@ fn embeddings_enable_writes_the_config_and_quotes_the_price_before_anything_is_f
     let text = std::fs::read_to_string(&path).expect("the file np names exists");
     assert!(text.contains("provider = \"local-model\""), "{text}");
     assert!(text.contains(&format!("model = \"{id}\"")), "{text}");
+    // Provenance, and this is the assertion that **was** the bug (#10): it used to read `text.contains("np embeddings enable")`,
+    // copied from the CLI capture into a test of the pipe. It passed while the file credited a command line nobody typed, which is what
+    // a wrong expectation costs — the check that should have caught the lie was the thing repeating it. What this door writes is the
+    // method and the program, and the terminal's spelling must not appear at all.
     assert!(
-        text.contains("np embeddings enable"),
-        "provenance: the file says np wrote it, and with what command:\n{text}"
+        text.contains("the `embeddings.enable` method over `np serve`"),
+        "provenance: a write over the pipe names the method that wrote it:\n{text}"
+    );
+    assert!(
+        !text.contains("np embeddings enable"),
+        "the file says a command ran that never did — this request arrived over stdin:\n{text}"
     );
 
     // **Idempotence**, which #7 named first: a GUI that answers *Allow* twice must not append a second `[embeddings]`.

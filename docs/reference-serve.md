@@ -170,6 +170,11 @@ What it does, and refuses:
   error comes back, and np's edit never happens). A refusal leaves the file byte-identical and no temporary file beside it.
 - **Disabling writes one key.** `provider = "none"`, and `embeddings.model` stays where it is: revoking consent to download is not
   a licence to erase which model was chosen.
+- **The file records which door wrote it.** The provenance comment over the pipe reads
+  `# note-processor set by the `embeddings.enable` method over `np serve` (np 0.5.0) at 2026-11-14T21:31:58Z`, where the terminal's own
+  command names itself (`set by `np embeddings enable embeddinggemma-2``). Before **#10** both doors wrote the CLI spelling, so an
+  application's audit trail would have shown its user a command they never typed — and the file is the only durable record of who set
+  what, which is F50's whole reason for letting np write it at all.
 
 There is deliberately **no `workspace` parameter**. The file this writes is global, so passing a workspace would imply a per-vault
 scope np does not have — and #7's own point was that only np can decide which of consent-per-vault, artifacts-per-workspace and
