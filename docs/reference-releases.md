@@ -25,14 +25,29 @@ there at all (`docs/ops-actions-minutes.md`); a locally packaged release carries
 and its notes say so. Source builds need no CI and no minutes:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.5.0 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.5.1 -p np-cli --locked
 ```
 
 A source build is the only shape you can choose features on: `--features local-model` puts the inference runtime in the binary, and adding
 `,vision` adds figure encoding. Neither is needed to index or to search by keyword.
 
-**Current release: `v0.5.0` (2026-11-14).** The protocol stays **1**; nothing existing changed shape, and `initialize` now answers
-**ten** methods.
+**Current release: `v0.5.1` (2026-11-15).** A patch, and the kind of patch that is not cosmetic: it fixes two things a client could not work
+around, and adds nothing a parser can see. The protocol stays **1**, no new method and no new key appears, and `np embeddings enable` at a
+terminal writes byte-identical bytes to what 0.5.0 wrote.
+
+- **A write made over `np serve` now records the method that made it** ([#10](https://github.com/Ex-Bot-01/note-processor/issues/10)). On 0.5.0
+  both doors — the terminal and the pipe — wrote ``# note-processor set by `np embeddings enable <id>` …``, so a config file edited over stdin
+  credited a command line nobody had typed. That comment is the only durable record of who set what, and it is what an application's audit trail
+  renders, so the false half was not cosmetic. The pipe now writes ``the `embeddings.enable` method over `np serve` ``. **Breaking for Rust
+  consumers:** `config_write::set_embeddings` / `set_embeddings_in` gained a surface parameter and there is deliberately no default — a default
+  would be "the terminal", which is the bug this removes. Code compiled against 0.5.0 fails at the call site rather than writing a false record.
+- **Windows nightly went from red to green** ([#9](https://github.com/Ex-Bot-01/note-processor/issues/9)). Two `walk.rs` cases asserted that a name
+  refused for holding an unpaired surrogate is recorded with lossy identity bytes; F18 round four had made those bytes exact (WTF-8) on 2026-11-08,
+  and three doc comments had said so too. Nothing could notice, because the assertions were `#[cfg(windows)]` and the prose was not executable. The
+  behaviour is now asserted as it actually is — two refused names produce two keys with one display spelling each — and the refusal itself stays in
+  force for F18's stated reason.
+
+**Since `v0.4.0`, shipped in `v0.5.0`.** `initialize` answers **ten** methods; the protocol stayed **1** and nothing existing changed shape.
 
 - **A word can match at its beginning** (**#6**): `"grand*"` in a query, `--prefix` to widen every word, or `"prefix": true` over the
   pipe. The answer admits what it did — `prefix_used`, `prefix_terms`, and per-hit `matched_exactly` (`true` whole words only, `false`
@@ -55,7 +70,8 @@ A source build is the only shape you can choose features on: `--features local-m
   binaries depends on them, and they are about how a refusal *report* is spelled.
 
 The two `v0.5.0` archives, as published (2026-11-14), so a reader can check a download against something that is not the same
-response they are verifying:
+response they are verifying (`v0.5.1`'s digests are named in its own [release page](https://github.com/Ex-Bot-01/note-processor/releases/tag/v0.5.1)
+and its `SHA256SUMS.txt`, which is the file to check against):
 
 ```text
 5c71f53d73e5a08fa5e23f437c1aa09e11dadc1cdfc0d3f81c7a32d8987be3ec  np-0.5.0-x86_64-unknown-linux-gnu.tar.gz
@@ -100,7 +116,7 @@ ran, and its `.text` holds zero `%zmm` and 4,940 `%ymm` references — the same 
 - Keyword search wants **every** word of the query — documented where a reader meets it (**#1**), because AND-of-words is what makes a
   narrow query narrow.
 
-Both assets for `v0.5.0`, like `v0.4.0`'s, are built by CI on `ubuntu-latest`, by the two scripts named above, and each carries `np`
+Both assets for every release since `v0.4.0` are built by CI on `ubuntu-latest`, by the two scripts named above, and each carries `np`
 (or `np.exe`), `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
 **They run on any x86-64 machine, and that costs them speed.** Three things decide the instruction set of a shipped binary, and for
