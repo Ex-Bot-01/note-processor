@@ -47,6 +47,30 @@ terminal writes byte-identical bytes to what 0.5.0 wrote.
   behaviour is now asserted as it actually is — two refused names produce two keys with one display spelling each — and the refusal itself stays in
   force for F18's stated reason.
 
+The two `v0.5.1` archives, as published (2026-11-15), measured from a fresh download of the page and confirmed by `sha256sum -c SHA256SUMS.txt`
+(which lists exactly these two names):
+
+```text
+9b08f426bc2e679908ad43a8323b0df8e77ea0dd66596cb820cb925d9813a1e6  np-0.5.1-x86_64-unknown-linux-gnu.tar.gz
+c7fa67cd7fc7031eeaa54dd60cc4a4b562e3689d01dc738483ddbfe2d1f92d61  np-0.5.1-x86_64-pc-windows-gnu-cross.zip
+```
+
+Inside the Windows archive, `np.exe` is 16,732,160 bytes and digests to
+`1a2a1111e4425d3dc5eea6131b0a4fbc5fa1c3668732dfc52614fba75880dbc8` — prose, not `SHA256SUMS.txt`, because that file is run through `sha256sum -c`
+against files a person downloaded and must never name a file inside an archive (**v0.4.0's** mistake).
+
+**The Linux reproducibility claim now has three runs behind it, and the Windows non-claim has two.** The rehearsal build of this tag
+([`43737892031`](https://github.com/Ex-Bot-01/note-processor/actions/runs/43737892031), `publish=false`) and the tag build
+([`43738485291`](https://github.com/Ex-Bot-01/note-processor/actions/runs/43738485291)) produced the identical Linux archive — `9b08f426…` both times,
+the digest above — and different Windows archives: the rehearsal's was `47416df0…`, the page carries `c7fa67cd…`. Anyone pinning a Windows digest
+pins one file at one moment; compare against this page, never against a rehearsal log line (which is exactly how `v0.5.0`'s entry below got a wrong
+number into print).
+
+The published Linux binary was run before and after publication on a machine whose CPU stops at SSE4.2: `np --version` → `np 0.5.1`, `np scan`
+indexed a vault, a prefix search widened `grand` → `grandmother`, and one `embeddings.enable` request over stdin wrote
+``# note-processor set by the `embeddings.enable` method over `np serve` (np 0.5.1) at …`` — **#10** verified in the shipped asset rather than in a
+test binary. Its `.text` holds zero `%zmm` and 4,940 `%ymm` references, the same figures `v0.4.0` and `v0.5.0` carry: three releases, one floor.
+
 **Since `v0.4.0`, shipped in `v0.5.0`.** `initialize` answers **ten** methods; the protocol stayed **1** and nothing existing changed shape.
 
 - **A word can match at its beginning** (**#6**): `"grand*"` in a query, `--prefix` to widen every word, or `"prefix": true` over the
