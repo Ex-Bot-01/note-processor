@@ -107,12 +107,18 @@ a stable token under `--json`'s `reason`:
 | artifact missing and policy refused the fetch | `fetch-disabled` | names `NP_NO_AUTO_FETCH` / `[models] auto_fetch`, so nobody debugges a network they switched off |
 | artifact arrived during this search, nothing embedded yet | `artifact-fetched` | run `np embed` — a model in a cache writes no vectors |
 | provider fine, index has no vectors | `no-vectors` | unchanged from F36 |
+| **issue #11**: the same state, asked by `--mode semantic` | `semantic-without-vectors` | the same commands, and one sentence that does not claim a keyword half ran — this mode has none to fall back on |
 
 Two things did **not** change, and both are asserted rather than asserted-about:
 
 * **`--mode semantic` keeps every refusal it had.** Asking for semantics on a machine that cannot do them is a request worth refusing; the
   pinned sentences in `crates/np-cli/tests/cli.rs` still pass word for word. Degrading is what you do when you can still answer, and hybrid
   can. (The same reasoning keeps semantic mode from fetching: spending 309 MB to produce nothing is not a degraded answer, it is a bill.)
+
+**Issue #11 added one token here on 2026-12-18 without touching either ruling.** A `--mode semantic` query that reached the vector list and
+found the workspace holding no vectors at all answered `hits: []` with `reason: null` — which is a true document and a useless one, because "nothing
+matched" and "this folder has never been embedded" print the same empty list. It now answers with `semantic-without-vectors` and its own sentence.
+Refusals stay refusals: this is the state where semantic mode *did* run its only half and that half had nothing to read.
 * **`keyword` mode resolves no provider at all**, so it cannot reach the transport, cannot be declined, and prints no note: an explicitly
   requested half is not a missing one.
 

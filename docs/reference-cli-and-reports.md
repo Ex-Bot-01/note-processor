@@ -118,7 +118,8 @@ each has to be a **whole** word — which is what [a word can match at its begin
 
 An empty `hits` has three causes — nothing matched (the `AND` rule above), a half that could not run, and a folder nobody ever
 indexed — and a client has to be able to tell them apart, because each asks for a different next action. **Issue #5** is why the
-document carries keys for all three rather than one:
+document carries keys for all three rather than one; **issue #11** is why the second of them is now named in every mode that can
+hit it, not only in `hybrid`:
 
 
 | Key | Question it answers |
@@ -127,7 +128,7 @@ document carries keys for all three rather than one:
 | `keyword_used`, `semantic_used` | which halves **actually ran**, so a client that shows "searched by keyword" instead of "hybrid" is showing what `np` did rather than what it was told to do |
 | `vectors` | whether this workspace **holds vectors at all** — deliberately the truth about the index, and still `true` on a run that could not use them (F45's ruling: a reader that sees `false` goes and re-fetches 309 MB it does not need) |
 | `indexed` | whether anyone has ever **scanned** this workspace. `false` with an empty `hits` means "this folder is not indexed", which is a different sentence from "nothing here matches" — and until #5 the two were indistinguishable, because every other key describes the answer rather than the vault |
-| `reason`, `note` | why a half was missing: the token to branch on, and the prose for a human. One token, one fact per run, so it cannot also carry "not indexed" — that is what `indexed` is for |
+| `reason`, `note` | why a half was missing: the token to branch on, and the prose for a human. One token, one fact per run, so it cannot also carry "not indexed" — that is what `indexed` is for. **Issue #11**: `mode:"semantic"` on a workspace with no vectors gets `semantic-without-vectors` rather than `null`, because an empty meanings-only list with no reason attached reads as "nothing matched" to anyone reading it |
 | `fetched`, `offline` | what auto-fetch downloaded (**F38**), and whether it was tried and failed |
 
 And with vectors present, `hybrid` fuses both lists. The same two-note vault after `np embed`, queried `"broker lag"` — one
