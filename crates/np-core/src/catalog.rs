@@ -169,6 +169,67 @@ fn bucket_rank(bucket: char) -> u8 {
     }
 }
 
+/// Whether `ch` is an ASCII control character — the class that cannot appear inside a line of the catalog at all
+/// (**issue #15**), newline included, because "one entry per line" is what makes the file a list.
+fn is_ascii_control(ch: char) -> bool {
+    matches!(ch as u32, 0x00..=0x1f | 0x7f)
+}
+
+/// The label half of an entry line, escaped for markdown (**issue #15**).
+///
+/// Square brackets end a link text where the author meant prose: `[[[bracket](paren) title]]` reads to a renderer as a
+/// wikilink called "bracket" pointing nowhere. So `[`, `]` and the backslash that escapes them get one backslash each.
+/// A control character cannot be escaped that way — `\␊` is a markdown hard break, not a newline — and percent-encoding
+/// would print four characters in the text a person reads, so it becomes U+FFFD: the same posture `np` already takes when
+/// it decodes bytes it cannot (F20 — the bytes are the identity, this is a rendering).
+fn escape_label(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    for ch in title.chars() {
+        match ch {
+            '\\' | '[' | ']' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            ch if is_ascii_control(ch) => out.push('\u{fffd}'),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// The destination half of an entry line, percent-encoded where a label is escaped (**issue #15**).
+///
+/// A destination is resolved rather than read, so what matters is that the bytes still name the same file: `<`, `>`,
+/// brackets, parentheses, `#`, `?`, a backslash and every ASCII control character get their `%XX` spelling. A newline in
+/// a POSIX file name is the case that started this — the destination `new⏎line.md` is not one token, let alone one link —
+/// and `#`/`?` join the set because both mean "somewhere inside the target" to every renderer, so a note named
+/// `roadmap#2.md` would otherwise be linked as `roadmap`.
+///
+/// Two things are deliberately **not** encoded. A space is left exactly as it has always been written here: every
+/// catalog ever published with a spaced path relied on that, and rewriting those bytes for no new truth is a change to
+/// the goldens rather than to the file's usefulness. And `%` itself stays raw, because this program does not percent-
+/// decode link destinations (see [`crate::links`]'s documented limit), so nothing can be double-encoded by an escape
+/// that only exists for readers who do.
+fn escape_destination(rel: &str) -> String {
+    let mut out = String::with_capacity(rel.len());
+    for ch in rel.chars() {
+        match ch {
+            '<' | '>' | '[' | ']' | '(' | ')' | '#' | '?' | '\\' => {
+                push_percent(&mut out, ch as u8)
+            }
+            ch if is_ascii_control(ch) => push_percent(&mut out, ch as u8),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// One byte's percent-escape, uppercase hex — the spelling URLs use and the one `grep` finds.
+fn push_percent(out: &mut String, byte: u8) {
+    out.push('%');
+    out.push_str(&format!("{byte:02X}"));
+}
+
 /// The one-line rendering of an entry, before wrapping.
 fn entry_line(entry: &CatalogEntry) -> String {
     let tags = if entry.tags.is_empty() {
@@ -182,8 +243,12 @@ fn entry_line(entry: &CatalogEntry) -> String {
             .join(" ")
     };
     format!(
-        "- [[{}]]({}) · {} · {tags} · →{} ←{}",
-        entry.title, entry.rel, entry.size_human, entry.out, entry.inc
+        "- [[{}]]({}) \u{b7} {} \u{b7} {tags} \u{b7} \u{2192}{} \u{2190}{}",
+        escape_label(&entry.title),
+        escape_destination(&entry.rel),
+        entry.size_human,
+        entry.out,
+        entry.inc
     )
 }
 
