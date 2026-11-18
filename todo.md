@@ -575,3 +575,55 @@ write-lock exclusion, MSVC parity) and CI minutes.
 
 **Two things a frontend author will otherwise discover the hard way**, both written into tests so they are facts rather than folklore: a search hit has
 **no `title` key** (`path`, `snippet`, ranks, link counts), and `snippet` can contain raw line breaks — which is why the framing test exercises it.
+
+## Measured 2026-12-18 — the reporter's round: issues #11 to #15
+
+Five issues arrived from the same integrator (the Jott front end), each measured against the published `np-0.5.1`
+Linux binary rather than described, and all five reproduced here on that binary. Each got its own commit; the fixes
+are small, the reasoning is in the messages.
+
+* **#11 — a meanings-only search answered an empty list with no words attached.** `hybrid` names the missing half and
+  `keyword` needs no explanation, but `semantic` on a workspace holding no vectors returned `hits: []`, `reason: null`.
+  That is #5's complaint from the other side: "nothing matched" and "this folder has never been embedded" arrive as one
+  document. New note `semantic-without-vectors`, its own sentence, and — because every other note in that enum says
+  **which half answered** and this mode has no fallback to name — its own variant rather than a shared one. The refusals
+  F45 ruled on are untouched: the state where the provider is not `Ready` still faults `-32000` with a quotable sentence,
+  which is what the issue asked for as its second option. **One correction to the report itself:** the `result:null` it
+  measured needs a build whose provider is not `Ready`; on this host that state faults, and the silent empty document
+  reproduces only with the artifact installed and nothing embedded. Both are named in the commit.
+* **#12 — non-markdown files were tracked, unsearchable, and unreported.** The rule is deliberate; the invisibility was
+  not. `ScanReport` gains `attachments` (live tracked files with no note row) and `attachment_examples` (five names,
+  sorted by path bytes, from the same SQL predicate as the count), plus a summary line that prints only when non-zero.
+  The issue's other option — `[index] note_suffixes`, so `.txt` becomes searchable at all — **stays open**: making plain
+  text a note decides where its title comes from, whether markdown syntax inside it is syntax, and what every existing
+  vault's `INDEX.md` does, which is a design card rather than a bug fix.
+* **#13 — an over-long body was written to disk in full before it was refused.** The read loop broke only on EOF. Now it
+  stops one buffer past the pin (`SECURITY.md`'s "unbounded resource use" had a real instance), with its own refusal
+  variant because a stream abandoned at 310 MB cannot be said to have *ended* there: `sent at least N bytes; this build
+  pins M`. Measured against a loopback mirror serving 500,000,000 bytes under the 309,855,456-byte pin: 500 MB written
+  and "ended after 500000000" before; 4,896 bytes past the pin, 1.1 s instead of 1.8 s, and the same clean refusal after.
+* **#14 — an angle-bracket destination resolved to nothing and was reported nowhere; a link inside `` `backticks` `` was
+  extracted as an edge.** `<…>` was never unwrapped, so `extension()` read `md>` and both lookup steps compared a target
+  still wearing its brackets. Code spans are now masked (bytes replaced with spaces, offsets and line numbers intact)
+  because `scan_line` answers bracket questions with whole-line precomputation — a span has to be gone before the pairing,
+  not after it. `[bare](x.md extra)` stays an attachment: cutting at whitespace would break `[t](my photo.png)`, which
+  `strip_title`'s own doc insists must survive.
+* **#15 — `INDEX.md` inserted titles and paths verbatim,** so a file named with a newline took three physical lines and a
+  name with brackets got read as a link ending at the first `]`. Two escape halves, because a label is read by a person
+  and a destination is resolved by a renderer: backslashes (and U+FFFD for control characters) in the label, percent-escapes
+  in the destination. Space stays raw — it always was — and `%` is left alone because nothing here percent-decodes. No
+  golden moved: nothing in `tests/golden` names a file with a bracket or a newline.
+
+**One stale assertion surfaced on the way, and it was already red on `main`.** `real_model::searching_a_real_index_answers_in_both_channels`
+pinned the search document as seven keys while it has printed twelve since #5 and #6. The case is artifact-gated, so in
+every CI run and every hermetic gate row it prints `NOT COVERAGE` and the assertion never executed — green because nothing
+ran, which is the failure mode F33's review named. Confirmed failing at `main` (`v0.5.1+1`) with `NP_TEST_MODEL_PATH` set,
+fixed as a test-only commit, and it now also asserts the two `*_used` keys read `true` on the one row where both halves can answer.
+
+**Gate state for this round** (`.github/scripts/gates.sh`, artifacts supplied, tree `dirty=0`): every row exit 0 —
+including `test-cli-vision` and `test-cli-realmodel`, which is the pair that runs the case above — except three rows that
+fail for a reason outside the tree: `cfg-dead-code`, `attr-displacement` and `catalog-goldens` are python checkers under
+`.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/`, and that directory is empty in this checkout, so all three
+exit 2 with "No such file or directory" on any tree. The goldens themselves are still graded — by
+`golden_render_matches_committed_bytes` in `crates/np-core/tests/catalog.rs`, which passes unmodified. 14 `NOT COVERAGE`
+lines across the logs, all of them artifact- or platform-gated rows this host cannot fill.
