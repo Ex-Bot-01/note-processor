@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use np_core::db::{self, Db};
@@ -31,6 +31,13 @@ enum Serve {
     UnknownLen(Vec<u8>),
     /// Fail to open, with raw client-shaped text that names a host.
     Fail(String),
+    /// Deliver whatever this reader produces, with no announced length (**issue #13**): the shape of a chunked mirror
+    /// that keeps streaming long after the pin was passed. Owned as a `Box` because the case needs a reader with state,
+    /// not a byte string — the whole point is counting how many bytes anyone asked for.
+    Stream {
+        reader: Box<dyn Read + Send>,
+        bytes_total: Option<u64>,
+    },
     /// Serve `bytes`, and on the first read check what the marker says at that moment (§12 rules 3–4 mid-flight).
     Inspect {
         bytes: Vec<u8>,
@@ -116,6 +123,13 @@ impl Transport for Fake {
                     bytes_total: Some(member.size_bytes()),
                 })
             }
+            Some(Serve::Stream {
+                reader,
+                bytes_total,
+            }) => Ok(Body {
+                reader,
+                bytes_total,
+            }),
             // The transport's raw text names the host and URL; only a class may escape (§12 rule 8).
             Some(Serve::Fail(raw)) => Err(FetchError::Transport {
                 id: "test-model".into(),
@@ -1514,4 +1528,129 @@ fn an_empty_directory_this_call_did_not_create_survives_a_failed_fetch() {
         models.is_dir(),
         "the cleanup may remove only what its own call created; this directory was here first"
     );
+}
+
+/// **A mirror that keeps sending stops at the pin instead of filling the disk** (issue #13). The loop that streams a
+/// member into `.part` used to break only on EOF and compare lengths afterwards, so a body longer than the pin was
+/// written in full before it was refused: measured against a loopback mirror streaming 500,000,000 bytes under a
+/// 309,855,456-byte pin, all 500 MB landed on disk first. `SECURITY.md`'s class 3 is "a crash or unbounded resource
+/// use", and while the digest bounded what got *used*, nothing bounded what got *written* — a chunked transfer that
+/// announces no length writes until `ENOSPC`, which on a nearly-full disk fails mid-write with an I/O error instead of
+/// the clean refusal, on the same path that rewrites the marker.
+///
+/// This case pins three things at once, because each alone would let the bug back in:
+///
+/// * the refusal is its own variant, so "the mirror sent more than we asked for" is not reported as "the stream ended
+///   early" — rule 6 keeps its two sentences and gains a third that does not claim to have seen the end;
+/// * the reader stops: bytes pulled from the transport stay within one read buffer of the pin, which is what makes the
+///   free-space preflight's `pinned + margin` reservation adequate again;
+/// * and nothing is left behind, exactly as for every other refusal here.
+#[test]
+fn an_over_long_stream_refuses_at_the_pin_instead_of_filling_the_disk() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    // How much the mirror has to hand out: far more than the pin plus one read buffer, so a loop that drained it is
+    // distinguishable from one that stopped. The 1 MiB is `fetch.rs`'s private `READ_BYTES`, spelled here because a
+    // test that reached for a private const could not fail when somebody changed it.
+    let capacity: u64 = 8 * 1024 * 1024 + 7;
+    const READ_BYTES: u64 = 1024 * 1024;
+
+    struct Endless {
+        left: u64,
+        seen: Arc<AtomicU64>,
+    }
+
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Ok(0);
+            }
+            let want = (buf.len() as u64).min(self.left) as usize;
+            for slot in buf[..want].iter_mut() {
+                *slot = b'x';
+            }
+            self.left -= want as u64;
+            self.seen.fetch_add(want as u64, Ordering::Relaxed);
+            Ok(want)
+        }
+    }
+
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    let table = vec![Spec {
+        member: "main",
+        filename: "test-model.gguf",
+        size_bytes: MAIN.len() as u64,
+        sha256: sha256_bytes(MAIN),
+    }];
+    let seen = Arc::new(AtomicU64::new(0));
+    let fake = Fake::new();
+    // A chunked mirror: no announced length at all, which is the shape that gives a streamer no warning.
+    fake.responses.borrow_mut().insert(
+        "main".to_string(),
+        Serve::Stream {
+            reader: Box::new(Endless {
+                left: capacity,
+                seen: Arc::clone(&seen),
+            }),
+            bytes_total: None,
+        },
+    );
+
+    let err = fetch::fetch_with_table(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        1_730_000_041,
+        &Expectation {
+            table: &table,
+            declaration: &declaration(),
+        },
+    )
+    .expect_err("a body longer than the pin is not the pinned artifact");
+
+    match err {
+        FetchError::Overlong { got, expected, .. } => {
+            assert_eq!(expected, MAIN.len() as u64);
+            assert!(
+                got > expected,
+                "over-long means over-long: {got} for {expected}"
+            );
+        }
+        other => panic!("expected Overlong, got {other:?}"),
+    }
+
+    let pulled = seen.load(Ordering::Relaxed);
+    assert!(
+        pulled <= MAIN.len() as u64 + READ_BYTES,
+        "the loop stopped at the pin: it pulled {pulled} bytes for a {}-byte pin, and one read buffer is the \
+         most it may ever overshoot by",
+        MAIN.len()
+    );
+    assert!(
+        pulled < capacity,
+        "it refused before draining the mirror — {pulled} of {capacity} bytes were ever asked for"
+    );
+
+    let text = err.to_string();
+    // Rule 6's discipline again: name both numbers, and claim nothing beyond what was seen. The stream did not
+    // "end" anywhere, and this build cannot say how long the mirror really was.
+    assert!(text.contains("at least"), "{text}");
+    assert!(text.contains(&expected_of(&err).to_string()), "{text}");
+    assert!(!text.contains("ended after"), "{text}");
+    assert!(!text.contains("corrupt"), "{text}");
+    assert_nothing_left(tmp.path(), &models);
+}
+
+/// The pinned length carried by a refusal, so the message assertion above can ask whether the number is printed
+/// without restating the fixture's arithmetic twice.
+fn expected_of(err: &FetchError) -> u64 {
+    match err {
+        FetchError::Overlong { expected, .. } => *expected,
+        other => panic!("this helper is only for over-long refusals, got {other:?}"),
+    }
 }

@@ -12,6 +12,8 @@ security posture, so it is stated first and precisely — including which parts 
   model download (`np models fetch`, and auto-fetch from `np embed` / `np setup` / first hybrid `np search`).
 - **A download is bounded by a compiled-in list.** Only ids this build *pins* can be fetched, the transfer is verified against a compiled-in SHA-256
   before anything is put in place, and a partial or wrong file is never used. A name that happens to appear in a config file cannot cause a transfer.
+  The length is a bound in both directions: the read loop stops one buffer past the pinned size rather than waiting for EOF, so a mirror that streams
+  on — a chunked `base_url` aimed at something endless — is refused without writing its whole body to disk first (**issue #13**).
   Switch it off with `--no-auto-fetch`, `[models] auto_fetch = false`, or `NP_NO_AUTO_FETCH=1`.
 - **Logs and machine output name an origin's *kind*, never its host.** No URL appears in a report, a log line, or a test fixture's expected output —
   so a support bundle someone pastes into an issue cannot leak an internal mirror address.

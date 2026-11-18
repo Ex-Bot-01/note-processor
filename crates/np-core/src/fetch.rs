@@ -267,6 +267,23 @@ pub enum FetchError {
         /// The pinned length.
         expected: u64,
     },
+    /// **Issue #13.** The body was longer than the pin, so the read loop stopped where the pin said to rather than at
+    /// EOF — and `got` is therefore a lower bound, which is why the sentence says "at least". Distinct from
+    /// [`FetchError::Interrupted`] for the same reason rule 6 keeps short and wrong-digest apart: "it stopped early",
+    /// "it ran on past what we asked for" and "it was different bytes" are three facts with three next commands, and a
+    /// refusal that claims to have seen the end of a stream it abandoned has overstated the evidence.
+    #[error("the transfer for member `{member}` of `{id}` sent at least {got} bytes; this build pins {expected}")]
+    Overlong {
+        /// The id being fetched.
+        id: String,
+        /// Which member sent too much.
+        member: String,
+        /// Bytes read before the refusal — the most this program will ever write for one member (**not** an upper bound
+        /// on what the mirror had to send).
+        got: u64,
+        /// The pinned length.
+        expected: u64,
+    },
     /// Right number of bytes, different digest (rule 6's `FetchDigestMismatch`). The wording is §12's: the published
     /// file **is not the file this build pins** — an upstream re-upload or an alteration in transit are both
     /// consistent with what we know, and "your download is corrupted" blames the human for either.
@@ -894,6 +911,20 @@ fn receive_member(
             })?;
         digest.update(&buffer[..read]);
         count += read as u64;
+        // **Stop at the pin, not at EOF** (**issue #13**). The pin already says how many bytes are wanted, so a body
+        // that passes it cannot become the pinned artifact no matter how much further the mirror goes — and reading on
+        // was what made "unbounded resource use" a real description of this loop: a chunked transfer announces no
+        // length, so a `base_url` aimed at a log tail wrote all 500 MB of it to disk before refusing. One buffer is
+        // now the most a member overshoots by, which is also what makes the preflight's `pinned + margin` reservation
+        // adequate again instead of "by construction less than an oversized body will need".
+        if count > member.size_bytes() {
+            return Err(FetchError::Overlong {
+                id: id.into(),
+                member: member.member().into(),
+                got: count,
+                expected: member.size_bytes(),
+            });
+        }
         if count >= next_marker {
             next_marker = count.saturating_add(MARKER_INTERVAL_BYTES);
             write_marker(
