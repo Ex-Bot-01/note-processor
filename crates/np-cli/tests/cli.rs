@@ -3946,10 +3946,28 @@ mod real_model {
             serde_json::from_str(&json.stdout()).expect("`--json` prints exactly one JSON object");
         assert_eq!(
             json_keys(&value),
-            // **F45** added `reason`; the first-install amendment added `fetched` and `offline`. A healthy semantic run still
-            // says nothing in either: `reason` is null because no half was missing, `fetched` because nothing transferred.
-            vec!["fetched", "hits", "mode", "note", "offline", "reason", "vectors"],
-            "the hit list plus F36's three keys that say how it was made — and nothing else on stdout"
+            // **F45** added `reason`; the first-install amendment added `fetched` and `offline`; **#5** added `indexed`,
+            // `keyword_used` and `semantic_used`; **#6** added `prefix_used` and `prefix_terms`. A healthy semantic run says
+            // nothing in `reason` or `fetched`: no half was missing, and nothing transferred.
+            //
+            // **This list was seven keys for three rounds while the document printed twelve.** The case is artifact-gated,
+            // so on every CI runner and every hermetic gate row it prints its `NOT COVERAGE` stub and this assertion never
+            // ran — which is how a wrong expectation survives three issues that all changed the same document.
+            vec![
+                "fetched",
+                "hits",
+                "indexed",
+                "keyword_used",
+                "mode",
+                "note",
+                "offline",
+                "prefix_terms",
+                "prefix_used",
+                "reason",
+                "semantic_used",
+                "vectors",
+            ],
+            "the hit list beside the keys that say how it was made — and nothing else on stdout"
         );
         // **A healthy run says so by silence.** `note` is null and `vectors` is true exactly when both halves answered, so
         // the caveat key cannot be read as a routine warning; this is the pair to the default-build case
@@ -3969,6 +3987,36 @@ mod real_model {
             "nothing was missing, so nothing is caveated: {}",
             json.stdout()
         );
+        // **Which halves ran**, read off the one row where both can. A default-feature build has no runtime, so its
+        // semantic half is absent by construction and these two keys read `false` there whatever the code does; this is the
+        // only place in the gate list that can say they ever turn on.
+        assert_eq!(
+            value["keyword_used"].as_bool(),
+            Some(true),
+            "the FTS5 half answered: {}",
+            json.stdout()
+        );
+        assert_eq!(
+            value["semantic_used"].as_bool(),
+            Some(true),
+            "and so did the vector half, which is what makes `note` above a claim about silence"
+        );
+        assert_eq!(
+            value["indexed"].as_bool(),
+            Some(true),
+            "the workspace was scanned before it was embedded (**#5**'s key)"
+        );
+        assert_eq!(
+            value["prefix_used"].as_bool(),
+            Some(false),
+            "a query with no `*` in it and no `--prefix` widened nothing (**#6**)"
+        );
+        assert_eq!(
+            value["prefix_terms"].as_array().map(Vec::len),
+            Some(0),
+            "and named no term as widened"
+        );
+
         let hits = value["hits"].as_array().expect("hits is an array");
         assert!(
             !hits.is_empty(),
