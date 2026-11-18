@@ -988,3 +988,92 @@ fn listing_an_empty_or_absent_graph_is_two_empty_lists() {
         .expect("read a linkless graph");
     assert!(listing.edges.is_empty() && listing.unresolved.is_empty());
 }
+
+/// **An angle-bracket destination names the note it wraps** (issue #14). CommonMark allows `[text](<a note.md>)`
+/// precisely so a destination may contain spaces, and this module cut everything else about a destination — title,
+/// fragment, query, `./`, a leading `/` — while never unwrapping that pair. So the brackets travelled into the row:
+/// `extension()` read the last dot of `<a note.md>` as `md>`, the kind became **attachment**, and both lookup steps
+/// that could have found the file missed it because the stored target still wore the wrapping. For a link to a note
+/// that is in the corpus, that is the worst available combination: resolved by nothing, and — attachments not being
+/// counted as unresolved notes — reported nowhere either. The link vanished.
+#[test]
+fn an_angle_bracket_destination_wraps_the_note_it_names() {
+    let links = extract_links(
+        "[angle](<a note.md>) [titled](<a note.md> \"Release\") [plain](a note.md) \
+         [empty](<>) [nested](<a>b.md>) [figure](<my photo.png>)\n",
+    );
+    assert_eq!(
+        found(&links),
+        [
+            ("a note.md", LinkKind::Md, 1),
+            ("a note.md", LinkKind::Md, 1),
+            ("a note.md", LinkKind::Md, 1),
+            // Not a legal angle destination — CommonMark allows spaces inside `<…>` and nothing else — so it keeps
+            // the old behaviour rather than inventing a second unwrapping rule for one bracket pair.
+            ("<a>b.md>", LinkKind::Attachment, 1),
+            ("my photo.png", LinkKind::Attachment, 1),
+        ],
+        "the wrapping is not part of the path: same target and kind as the plain spelling, and an empty `<>` names nothing"
+    );
+
+    // And it resolves, which is the half that was silently missing: a note sitting in the corpus, found.
+    let resolved = resolve(
+        &corpus(&["a note.md", "my photo.png"]),
+        &[(
+            path("t.md"),
+            extract_links("[angle](<a note.md>) ![figure](<my photo.png>)\n"),
+        )],
+    );
+    assert_eq!(
+        placed(&resolved),
+        [
+            ("t.md", "a note.md", "a note.md"),
+            ("t.md", "my photo.png", "my photo.png"),
+        ],
+        "an angle-bracket link to a file in the corpus stops being an unresolved attachment"
+    );
+}
+
+/// **An inline code span holds no links** (issue #14). A fenced block holding no links was already the rule — "a link
+/// written inside a code sample is an example, not a claim about the corpus" — and the same sentence is true of the
+/// backticks someone uses to *show* markdown inside a sentence. Until now only fences were skipped, so
+/// `` `[in-code](zzz-missing.md)` `` contributed a real `md` row, and in the reporter's vault it was the single entry
+/// in `unresolved_targets`: a note that shows a reader a snippet of markdown reported an unresolved link it does not
+/// have, which is exactly the number a script may decide on.
+#[test]
+fn an_inline_code_span_holds_no_links() {
+    let links = extract_links(
+        "# T\n\n`[in-code](zzz-missing.md)` is code, not a link\n\
+         [[Bare]] `[[InSpan]]` and `[two](b.md) with [[also]]` then [[End]]\n",
+    );
+    assert_eq!(
+        found(&links),
+        [("Bare", LinkKind::Wiki, 4), ("End", LinkKind::Wiki, 4),],
+        "the span holds a markdown link and two wikilinks, and none of them is an edge"
+    );
+
+    // An opener that never closes is literal text — CommonMark's rule, and the conservative one here too: everything
+    // after it is still scanned, because guessing that a stray backtick opened a span running to end of line would
+    // drop links from every note whose author typed one.
+    assert_eq!(
+        found(&extract_links("a `[x](y.md) tail\n")),
+        [("y.md", LinkKind::Md, 1)],
+        "an unclosed backtick costs nothing"
+    );
+
+    // Two backticks open and two close, so a span about backticks itself does not mask the sentence around it.
+    assert_eq!(
+        found(&extract_links("use `` `[[NotALink]]` `` for [[Real]]\n")),
+        [("Real", LinkKind::Wiki, 1)],
+        "a doubled delimiter run matches a doubled run, not the single backtick inside it"
+    );
+
+    // And masking is per line: a stray opener cannot reach into the next one, because there is no state carried
+    // between lines here — which is also why the line holding it keeps its own link rather than losing everything after
+    // the backtick to a span nobody closed.
+    assert_eq!(
+        found(&extract_links("`[[Open]]\n[[Next]]\n")),
+        [("Open", LinkKind::Wiki, 1), ("Next", LinkKind::Wiki, 2)],
+        "one unpaired backtick costs nothing on either line"
+    );
+}

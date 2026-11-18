@@ -10,6 +10,11 @@
 //!   headings, tags and words (`crate::parse::prose_lines`), so this module cannot have its own
 //!   opinion about where prose ends. A link written inside a code sample is an example, not a claim
 //!   about the corpus.
+//! - **Neither does an inline code span** (**issue #14**; `mask_code_spans`, private, so named rather than linked). The
+//!   sentence above is the reason this one
+//!   exists: `` `[in-code](zzz-missing.md)` `` shows a reader what a link looks like, and until it was skipped such a
+//!   span contributed a real edge — in the reporting case, the only entry in `unresolved_targets`, an unresolved link the
+//!   note does not have.
 //! - **A target that cannot be placed stays unresolved.** Ambiguity is never resolved by picking,
 //!   because a wrong edge in a note graph is worse than a missing one and is much harder to spot.
 
@@ -79,9 +84,10 @@ pub struct RawLink {
 /// [`LinkKind::Md`], and a wikilink whose target has no attachment extension is
 /// [`LinkKind::Wiki`] — which is why `![[scan.png]]` is an attachment and `[[Note A]]` is a note.
 ///
-/// Four cases produce **no row at all**, each because there is nothing in the corpus to point at:
+/// Five cases produce **no row at all**, each because there is nothing in the corpus to point at:
 ///
 /// - anything inside a ``` fenced region, including the fence lines themselves;
+/// - anything inside an inline code span (**issue #14**);
 /// - a destination with no extension (`[text](relative-path)`), and a target left empty by the
 ///   strips (`[[]]`, `[x](#anchor)`, `[x]()`);
 /// - a destination that leaves the workspace: anything with a scheme before its first `:`
@@ -100,9 +106,73 @@ pub struct RawLink {
 pub fn extract_links(raw: &str) -> Vec<RawLink> {
     let mut found: Vec<RawLink> = Vec::new();
     for (number, text) in prose_lines(raw, 1) {
-        scan_line(text, number, &mut found);
+        // **Code spans are masked, not skipped by a second pass** (**issue #14**): the scanner below answers bracket
+        // questions with whole-line precomputation, so a span has to be removed before that happens or its brackets
+        // still take part in the pairing.
+        scan_line(&mask_code_spans(text), number, &mut found);
     }
     found
+}
+
+/// Blank out every inline code span on one line, delimiters included (**issue #14**).
+///
+/// Spaced rather than sliced because this scanner works in byte offsets into the line it was handed: replacing each
+/// byte of a span with U+0020 keeps every offset, every character boundary and the line number untouched, so the only
+/// thing the scan can lose is syntax that was inside backticks. A backtick string of N opens and the next string of
+/// **exactly** N closes (CommonMark's rule), which is what lets `` `` `x` `` `` talk about backticks without swallowing
+/// its own sentence; an opener with no closer on the line is literal text and masks nothing, because assuming a stray
+/// backtick ran to end of line would drop real links from every note whose author typed one.
+fn mask_code_spans(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('`') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let open = index;
+        let run = backtick_run(bytes, index);
+        match closing_run(bytes, index + run, run) {
+            Some(end) => {
+                masked[open..end].fill(b' ');
+                index = end;
+            }
+            None => index += run,
+        }
+    }
+    // Replacing whole runs between delimiter boundaries cannot split a character: every byte of a multi-byte one is
+    // replaced together with its neighbours, and the delimiters themselves are ASCII.
+    std::borrow::Cow::Owned(
+        String::from_utf8(masked).expect("masking code spans replaces whole characters"),
+    )
+}
+
+/// How many backticks start at `from`. At least one, since only a caller standing on a backtick asks.
+fn backtick_run(bytes: &[u8], from: usize) -> usize {
+    let mut end = from;
+    while bytes.get(end) == Some(&b'`') {
+        end += 1;
+    }
+    end - from
+}
+
+/// The offset just past the next backtick string of exactly `run` backticks, searching from `from`. A run of any other
+/// length is not a closer, and the search continues after it.
+fn closing_run(bytes: &[u8], from: usize, run: usize) -> Option<usize> {
+    let mut search = from;
+    loop {
+        let start = bytes.get(search..)?.iter().position(|byte| *byte == b'`')? + search;
+        let length = backtick_run(bytes, start);
+        let end = start + length;
+        if length == run {
+            return Some(end);
+        }
+        search = end;
+    }
 }
 
 /// The links on one prose line, appended in the order the scan reaches them — see
@@ -256,6 +326,21 @@ fn wikilink(inner: &str) -> Option<(String, LinkKind)> {
 /// The target and kind of a markdown destination, or nothing when it names no file of the corpus.
 fn markdown_target(destination: &str) -> Option<(String, LinkKind)> {
     let written = strip_title(destination.trim());
+    // **An angle-bracketed destination** (**issue #14**): CommonMark wraps a destination in `<…>` precisely so it may
+    // contain spaces, and every other thing this function strips — title, fragment, query, `./`, a leading `/` — was
+    // cut around a wrapping that never got unwrapped. That misclassified the link twice over: `extension()` read the
+    // last dot of `<a note.md>` as `md>`, so an attachment row took the place of a note row, and both lookup steps that
+    // could have found the file compared against a target still wearing its brackets.
+    //
+    // Unwrapped *here*, before the extension test, so the kind and the lookup cannot disagree — which is what the bug
+    // was: they were computed from two different strings. The guard on brackets inside keeps `<a>b.md>` honest about being
+    // one bracket pair rather than a wrapping: inside `<…>` CommonMark allows spaces and nothing else, so inventing a
+    // second rule for a stray bracket would be a rule nobody wrote down.
+    let unwrapped = written
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .filter(|inner| !inner.contains(['<', '>']));
+    let written = unwrapped.unwrap_or(written);
     // An empty destination, an in-page anchor and a protocol-relative URL are not workspace paths,
     // and neither is anything carrying a scheme.
     if written.is_empty()

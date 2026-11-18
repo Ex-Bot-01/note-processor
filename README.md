@@ -23,7 +23,10 @@ this file says so instead of guessing.
   folder is tracked as attachments — hashed, linkable, never searchable — and the report says how many they are (`attachments`,
   `attachment_examples`), so nothing has to guess that a vault full of `.txt` is not empty.
 - **Resolves links.** `[[Note]]`, `[[Note|alias]]` and `[text](relative.md)` are matched case-insensitively against the corpus. An
-  ambiguous or missing target is left unresolved and *named* in the report — never guessed.
+  ambiguous or missing target is left unresolved and *named* in the report — never guessed. A destination may wear angle brackets,
+  so it can hold spaces: `[text](<a note.md>)` finds `a note.md` (**issue #14**). And a link inside code is an example rather than
+  an edge — fenced blocks never yield links, and neither do inline spans (`` `[text](other.md)` ``), so showing a reader a snippet
+  of markdown no longer adds an unresolved link you do not have.
 - **Writes a catalog.** `INDEX.md` at the workspace root, sharded into `INDEX-<a>-<z>.md` once it passes the configured entry budget.
   Generated files carry a fingerprint header, so a scan only ever replaces files it owns.
 - **Searches three ways.** `hybrid` (the default) fuses SQLite's FTS5 `bm25()` over titles and bodies with the vector list by reciprocal
