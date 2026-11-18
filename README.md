@@ -28,7 +28,9 @@ this file says so instead of guessing.
   an edge — fenced blocks never yield links, and neither do inline spans (`` `[text](other.md)` ``), so showing a reader a snippet
   of markdown no longer adds an unresolved link you do not have.
 - **Writes a catalog.** `INDEX.md` at the workspace root, sharded into `INDEX-<a>-<z>.md` once it passes the configured entry budget.
-  Generated files carry a fingerprint header, so a scan only ever replaces files it owns.
+  Generated files carry a fingerprint header, so a scan only ever replaces files it owns. A title or path that would collide with the line's
+  own markdown is escaped on the way out — brackets in the label, percent-escapes in the destination — so a file named with a newline or a
+  `[` still gets exactly one readable entry (**issue #15**).
 - **Searches three ways.** `hybrid` (the default) fuses SQLite's FTS5 `bm25()` over titles and bodies with the vector list by reciprocal
   rank fusion; `keyword` needs no model at all; `semantic` is vectors alone. Hits carry their raw evidence (`cosine`, `bm25`, each
   list's rank), because a fused rank sum is not a similarity and must never be read as one.
