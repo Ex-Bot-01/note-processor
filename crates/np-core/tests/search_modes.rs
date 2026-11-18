@@ -495,6 +495,90 @@ fn no_vectors_is_a_state_and_the_report_says_which_half_answered() {
     assert!(semantic.paths().is_empty());
 }
 
+/// **A meanings-only search says which state left it empty** (issue #11). `hybrid` already named the missing half and
+/// `keyword` needed no explanation, but `semantic` answered an empty list with no words attached — so "nothing matched",
+/// "this folder was never embedded" and "the vectors are not here yet" arrived as one indistinguishable document. That is
+/// the hole #5 closed for the unindexed case, reopened from the other side.
+///
+/// Three things are pinned together here, because any one of them alone would still let a front end lie:
+///
+/// * the answer carries a note whose token is stable and **distinct** from hybrid's — `mode` says what was asked for,
+///   `reason` says why this answer is empty;
+/// * the note does not claim a keyword half ran (`keyword_used` stays `false`: silently falling back to keywords would be
+///   the #5 complaint again, which is why `mode` exists at all);
+/// * and a workspace that **does** hold vectors still gets no note, so "nothing matched" stays a plain empty answer instead
+///   of every miss reading like a missing index.
+#[test]
+fn a_meanings_only_search_names_the_vectors_that_are_missing() {
+    let fx = Fixture::text_only();
+    fx.note("a.md", "Alpha", "kafka runs on port 9092.");
+
+    let semantic = search::ranked(
+        &fx.db,
+        SearchMode::Semantic,
+        Some(MODEL),
+        Some(&bytes(&[1.0, 0.0])),
+        "kafka",
+        10,
+        search::Prefix::Marked,
+    )
+    .expect("semantic answers empty rather than refusing");
+    assert!(semantic.paths().is_empty());
+    assert!(
+        !semantic.semantic_used && !semantic.keyword_used,
+        "neither half ran: a meanings-only answer that fell back to keywords would say so in this key"
+    );
+    let semantic_note = semantic
+        .note
+        .expect("an empty meanings-only answer names its own state instead of saying nothing");
+
+    let hybrid = search::ranked(
+        &fx.db,
+        SearchMode::Hybrid,
+        Some(MODEL),
+        Some(&bytes(&[1.0, 0.0])),
+        "kafka",
+        10,
+        search::Prefix::Marked,
+    )
+    .expect("hybrid answers from keywords");
+    let hybrid_note = hybrid
+        .note
+        .expect("**F45**'s hybrid note is unchanged by this round: one sentence per state, and hybrid's names the half that answered");
+    assert_eq!(hybrid_note, search::RankNote::NoVectors);
+    assert_ne!(
+        semantic_note.token(),
+        hybrid_note.token(),
+        "two states sharing one `reason` token would leave a caller branching on a word that means two things"
+    );
+    assert_ne!(
+        semantic_note.label(),
+        hybrid_note.label(),
+        "the sentence has to be true of the mode that printed it: nothing was ranked by keyword here"
+    );
+
+    // The same query where vectors DO exist, under the id the index is keyed by: an empty list there really is "nothing
+    // matched", and a note about missing vectors would be a second, louder way of being wrong.
+    let fx = Fixture::with_model();
+    fx.note("a.md", "Alpha", "kafka runs on port 9092.");
+    fx.embed("a.md", &[1.0, 0.0]);
+    let ranked = search::ranked(
+        &fx.db,
+        SearchMode::Semantic,
+        Some(MODEL),
+        Some(&bytes(&[0.0, 1.0])),
+        "kafka",
+        10,
+        search::Prefix::Marked,
+    )
+    .expect("semantic answers from the vectors that are there");
+    assert_eq!(
+        ranked.note, None,
+        "vectors exist, so nothing is missing to name"
+    );
+    assert!(ranked.semantic_used);
+}
+
 /// **Mode names are one list, spelled once.** `--mode`, the config value and `--json` all read these strings, and a fourth
 /// spelling appearing in only one of them is how F28's split-refusal lesson repeats: parse it, refuse it by name, and let the
 /// label round-trip.
@@ -633,6 +717,7 @@ fn a_query_beyond_the_term_cap_searches_its_first_terms() {
 fn every_rank_note_says_what_arrived_and_never_names_a_host() {
     let all = [
         search::RankNote::NoVectors,
+        search::RankNote::SemanticWithoutVectors,
         search::RankNote::ProviderDisabled,
         search::RankNote::ModelNotInstalled,
         search::RankNote::ArtifactMissing,

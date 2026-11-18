@@ -700,6 +700,12 @@ pub enum RankNote {
     /// The workspace holds no vectors at all, so hybrid's semantic half had nothing to read. A state, not an error: this is a
     /// machine that has not downloaded an artifact yet. Vectors under some *other* model id stay a refusal — see [`SearchError::NoVectorsForModel`].
     NoVectors,
+    /// **Issue #11 (2026-12-18).** The same workspace state as [`Self::NoVectors`] — no vectors at all — seen by a search that
+    /// asked for meanings only. It gets its own variant rather than sharing hybrid's because the two sentences cannot be one:
+    /// every other note says **which half answered**, and in a `semantic` run neither did, so printing hybrid's "ranked by
+    /// keyword only" there would describe a fallback this mode refuses by design (**F45**'s reason for keeping the refusal).
+    /// The `reason` token is therefore distinct, and `mode` beside it stays the word for what was asked for.
+    SemanticWithoutVectors,
     /// **F45 (A).** Configuration names no provider (`embeddings.provider = "none"`, or no `[embeddings]` section at all), so
     /// there is nothing that could turn the query into a vector. This is an instruction, not a gap: the answer came from FTS5,
     /// and the note says what would add the other half. It used to be a refusal at exit 1 with **zero bytes on stdout**, which
@@ -740,6 +746,20 @@ const NO_VECTORS_SENTENCE: &str = concat!(
 #[cfg(not(feature = "fetch"))]
 const NO_VECTORS_SENTENCE: &str = concat!(
     "no vectors in this workspace: ranked by keyword only \u{2014} ",
+    "`np embed` adds the semantic half once a model is installed"
+);
+
+/// **Issue #11.** The sentence for an empty meanings-only answer. It keeps the rule every other note follows — name the state,
+/// then name the command that changes it, and never a host — with one difference: what it names is that there was **no
+/// fallback**, which is exactly why this mode's emptiness needs words and hybrid's does not.
+#[cfg(feature = "fetch")]
+const SEMANTIC_WITHOUT_VECTORS_SENTENCE: &str = concat!(
+    "no vectors in this workspace: a meanings-only search has nothing to rank and no keyword half to fall back on \u{2014} ",
+    "`np models fetch` or `np embed` adds the semantic half"
+);
+#[cfg(not(feature = "fetch"))]
+const SEMANTIC_WITHOUT_VECTORS_SENTENCE: &str = concat!(
+    "no vectors in this workspace: a meanings-only search has nothing to rank and no keyword half to fall back on \u{2014} ",
     "`np embed` adds the semantic half once a model is installed"
 );
 
@@ -813,6 +833,7 @@ impl RankNote {
     pub fn label(&self) -> &'static str {
         match self {
             Self::NoVectors => NO_VECTORS_SENTENCE,
+            Self::SemanticWithoutVectors => SEMANTIC_WITHOUT_VECTORS_SENTENCE,
             Self::ProviderDisabled => PROVIDER_DISABLED_SENTENCE,
             Self::ModelNotInstalled => MODEL_NOT_INSTALLED_SENTENCE,
             Self::ArtifactMissing => ARTIFACT_MISSING_SENTENCE,
@@ -830,6 +851,9 @@ impl RankNote {
     pub fn token(&self) -> &'static str {
         match self {
             Self::NoVectors => "no-vectors",
+            // Distinct from `no-vectors` rather than shared with it, because `tests/search_modes.rs` pins one token per note:
+            // a caller that branches on `reason` must never have to read a second key to know which state it is in.
+            Self::SemanticWithoutVectors => "semantic-without-vectors",
             Self::ProviderDisabled => "provider-disabled",
             Self::ModelNotInstalled => "model-not-installed",
             Self::ArtifactMissing => "artifact-missing",
@@ -849,7 +873,9 @@ impl RankNote {
     #[must_use]
     pub fn diag_rule(&self) -> &'static str {
         match self {
-            Self::NoVectors => crate::diagnostics::rule::NO_VECTORS,
+            // One rule for both notes: an operator's alert asks "did this workspace have no vectors", and the mode that asked
+            // is on the event's message. Only the **result** token splits, because a front end branches on it per request.
+            Self::NoVectors | Self::SemanticWithoutVectors => crate::diagnostics::rule::NO_VECTORS,
             Self::ProviderDisabled => crate::diagnostics::rule::PROVIDER_DISABLED,
             Self::ModelNotInstalled => crate::diagnostics::rule::MODEL_NOT_INSTALLED,
             Self::ArtifactMissing => crate::diagnostics::rule::ARTIFACT_MISSING,
@@ -1158,7 +1184,8 @@ fn rrf(rank: usize) -> f64 {
 /// `query_vector` is optional because **the caller may have no way to produce one**: a workspace with no vectors, or a
 /// keyword-only mode, should not have to embed anything. Absent vector input simply means no semantic list — hybrid answers
 /// from keywords and sets [`RankNote::NoVectors`] when the workspace holds no vectors at all; [`SearchMode::Semantic`]
-/// answers empty rather than inventing a ranking it cannot compute.
+/// answers empty rather than inventing a ranking it cannot compute, and sets [`RankNote::SemanticWithoutVectors`] so the
+/// emptiness is a stated state rather than silence (**issue #11**).
 ///
 /// Ordering is the existing contract extended, not replaced: fused score descending, then display path ascending, then kind,
 /// then the raw evidence as bit patterns — so an equal-score pair still has exactly one order on every host and after every
@@ -1261,8 +1288,16 @@ pub fn ranked(
     });
     hits.truncate(limit);
 
-    let note = if mode == SearchMode::Hybrid && !semantic_used && !any_vectors_exist(conn)? {
-        Some(RankNote::NoVectors)
+    // **An empty answer says why** (**F45** for hybrid, **issue #11** for semantic). Both notes ask the same question of the
+    // workspace — are there any vectors at all? — and differ only in what their sentence may claim: hybrid's can name the half
+    // that answered, because one did; a meanings-only run has no fallback to describe. Keyword mode gets nothing, because it
+    // never asked ("the semantic half is missing" is not news to a query that refused to look).
+    let note = if !semantic_used && !any_vectors_exist(conn)? {
+        match mode {
+            SearchMode::Hybrid => Some(RankNote::NoVectors),
+            SearchMode::Semantic => Some(RankNote::SemanticWithoutVectors),
+            SearchMode::Keyword => None,
+        }
     } else {
         None
     };
