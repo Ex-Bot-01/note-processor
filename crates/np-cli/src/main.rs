@@ -689,6 +689,31 @@ fn print_summary(report: &ScanReport) {
     for target in &report.unresolved_targets {
         let _ = writeln!(out, "  {target}");
     }
+    // **Tracked but never searchable, named** (issue #12). A vault holding `plain.txt` beside `note.md` answers
+    // `added 5 / notes 1`, and the gap between those two numbers used to be a rule np applied silently: someone else's
+    // product had to guess it and say it in its own words. Printed only when non-zero, because a vault of nothing but
+    // `.md` has no explanation to give — and one label per scan that never needs printing is a line nobody reads.
+    if report.attachments > 0 {
+        let _ = write!(out, "attachments {}", report.attachments);
+        if !report.attachment_examples.is_empty() {
+            // The names come from the same predicate as the count (`db::ATTACHMENT_WHERE`), so this line cannot
+            // describe a file the database has stopped counting. An ellipsis says the cap was reached; the number
+            // above it stayed exact.
+            let more = if i64::try_from(report.attachment_examples.len()).unwrap_or(i64::MAX)
+                < report.attachments
+            {
+                ", \u{2026}"
+            } else {
+                ""
+            };
+            let _ = write!(
+                out,
+                " — tracked, never parsed: {}{more}",
+                report.attachment_examples.join(", ")
+            );
+        }
+        let _ = writeln!(out);
+    }
     let _ = writeln!(out, "skipped    {}", report.skipped.len());
     for path in &report.skipped {
         let _ = writeln!(out, "  {path}");

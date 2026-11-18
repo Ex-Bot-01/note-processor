@@ -19,7 +19,9 @@ this file says so instead of guessing.
 ## What it does
 
 - **Indexes notes.** Discovers files under a workspace root, parses front matter, titles, headings, checklist items and links. A rescan
-  reports added / modified / moved / removed / unchanged and rewrites only what changed.
+  reports added / modified / moved / removed / unchanged and rewrites only what changed. Only `.md` becomes a note: the rest of your
+  folder is tracked as attachments — hashed, linkable, never searchable — and the report says how many they are (`attachments`,
+  `attachment_examples`), so nothing has to guess that a vault full of `.txt` is not empty.
 - **Resolves links.** `[[Note]]`, `[[Note|alias]]` and `[text](relative.md)` are matched case-insensitively against the corpus. An
   ambiguous or missing target is left unresolved and *named* in the report — never guessed.
 - **Writes a catalog.** `INDEX.md` at the workspace root, sharded into `INDEX-<a>-<z>.md` once it passes the configured entry budget.

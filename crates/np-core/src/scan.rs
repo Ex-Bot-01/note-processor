@@ -149,6 +149,12 @@ pub enum ScanError {
     },
 }
 
+/// How many names [`ScanReport::attachment_examples`] may hold (**issue #12**).
+///
+/// Five because it is what a summary line can carry without turning into a file listing, and because the number
+/// beside it answers the question a caller actually asks. The count is never capped with the names.
+pub const ATTACHMENT_EXAMPLE_LIMIT: usize = 5;
+
 /// What one scan did, for the CLI to print and `--json` to serialise.
 #[derive(Debug, Serialize)]
 pub struct ScanReport {
@@ -185,6 +191,22 @@ pub struct ScanReport {
     pub skipped: Vec<String>,
     /// Live note rows — the same number of entries the catalog holds (spec §2).
     pub notes: i64,
+    /// Live tracked files that are **not** notes (**issue #12**): every `.txt`, `.org`, `.png` and `.pdf` the walk
+    /// found, hashed and listed but never parsed, so search cannot reach any of them.
+    ///
+    /// This exists because the distinction was otherwise invisible from outside. A front end that read `added: 5`
+    /// and printed "5 files" was describing a vault whose writing its own product could only ever find in one of
+    /// them, while `unindexable` stayed (correctly) `null` — nothing was lost, these files were simply never notes.
+    /// With this key the sentence is np's to make and the caller's to print.
+    ///
+    /// `notes + attachments` is the count of live `files` rows: the two halves of what a scan tracks, with no third
+    /// bucket. Unlike [`Self::added`] this describes the **workspace**, like [`Self::notes`], not this run's delta.
+    pub attachments: i64,
+    /// Up to [`ATTACHMENT_EXAMPLE_LIMIT`] of [`Self::attachments`], sorted by path bytes and printed as display
+    /// text — names, not a sample chosen for variety (**issue #12**). Capped because the list is "everything else in
+    /// the folder": a vault holding 300 PDFs pays for five strings per scan rather than three hundred, and
+    /// [`Self::attachments`] stays exact whatever the cap prints.
+    pub attachment_examples: Vec<String>,
     /// Link rows with no note on the other end, attachments excluded: the "notes I could not place"
     /// count. [`crate::db::note_counts`]'s figure is the wider database question and does not match
     /// this one.
@@ -607,6 +629,8 @@ fn scan_inner(
     // print the names directly under the number.
     let unresolved = unresolved_links(&db)?;
     let targets = db::unresolved_targets(&db)?;
+    // Read beside `notes`, from the same predicate as its names, so the two counts describe one walk (**issue #12**).
+    let attachments = db::attachments(&db, ATTACHMENT_EXAMPLE_LIMIT)?;
     let previous = index_list(&db)?;
     // Rendering is pure, so the set this scan is about to publish is known here — and `meta` records it
     // inside the transaction rather than after the writes. A list that *leads* reality costs little,
@@ -688,6 +712,8 @@ fn scan_inner(
         // The catalog's own row count is the live-note count: one query answers both questions, so the
         // report and the file it describes cannot drift apart.
         notes: entries.len() as i64,
+        attachments: attachments.count,
+        attachment_examples: attachments.examples,
         unresolved_links: unresolved,
         unresolved_targets: targets,
         index_files: rendered.iter().map(|(name, _)| name.clone()).collect(),

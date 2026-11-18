@@ -27,8 +27,10 @@ use tempfile::TempDir;
 
 /// Markdown notes in the committed corpus (everything but `scan.png`).
 const CORPUS_NOTES: u64 = 16;
+/// Non-markdown files in the corpus: one image, tracked but never parsed (**issue #12** counts these).
+const CORPUS_ATTACHMENTS: u64 = 1;
 /// Tracked files of every kind: the notes plus one image.
-const CORPUS_FILES: u64 = CORPUS_NOTES + 1;
+const CORPUS_FILES: u64 = CORPUS_NOTES + CORPUS_ATTACHMENTS;
 
 /// A workspace copy whose data dir lives in the same tempdir.
 /// Undoing **migration 11** where a fixture rewinds `schema_version` past it, or the next open replays that entry onto a
@@ -274,6 +276,12 @@ fn scan_writes_the_catalog_and_reports_it() {
             "`{expected}` missing from:\n{text}"
         );
     }
+    // **Issue #12:** the gap between `added 17` and `notes 16` is a rule np applies, so the summary states it in
+    // np's own words and names the file behind it — the corpus's one PNG.
+    assert!(
+        text.contains("attachments 1 \u{2014} tracked, never parsed: scan.png",),
+        "the summary has to say what the file that is not a note actually is:\n{text}"
+    );
     // The corpus holds two `gamma.md` files, so at least one link cannot be placed; the summary
     // has to say what to do about it rather than print a bare number.
     assert!(
@@ -331,6 +339,19 @@ fn json_output_matches_the_fixture_corpus() {
         !targets.contains(&"scan.png"),
         "an attachment is not a missing note: {report}"
     );
+    // **Issue #12:** the corpus's one PNG is tracked, unsearchable, and now *counted* — the keys exist so that a
+    // front end can say "1 of 17 files became a note; the other is an attachment" without walking the folder itself.
+    assert_eq!(
+        report["attachments"].as_u64(),
+        Some(CORPUS_ATTACHMENTS),
+        "the report has to name how much of the corpus search will never reach: {report}"
+    );
+    assert_eq!(
+        report["attachment_examples"].as_array().map(Vec::len),
+        Some(1),
+        "and name it, not only count it: {report}"
+    );
+    assert_eq!(report["attachment_examples"][0], "scan.png");
     assert!(ws.index().is_file(), "`--json` still writes the catalog");
 }
 
