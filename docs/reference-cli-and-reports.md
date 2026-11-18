@@ -18,7 +18,10 @@ np embeddings disable [--json]            # provider = "none"; the model you cho
 - **Order matters: scan, then embed.** Embedding works from the index. `scan` is idempotent and cheap on an unchanged tree.
 - **What counts as a note.** Only files ending `.md` (any case) are parsed as notes; other files under the root are still tracked
   for changes, which is why a vault of five files can report `added 5` and `notes 3`. Directories whose name begins with `.` and
-  `processed/` are not walked at all.
+  `processed/` are not walked at all. Since **issue #12** the gap between those two numbers is in the report itself:
+  `attachments` counts the live tracked files that are not notes — hashed, listed, linkable, never searchable — and
+  `attachment_examples` names up to five of them, sorted by path. The count is exact whatever the cap prints, and
+  `notes + attachments` is every live file the scan tracks.
 - **Incremental both ways.** A note whose bytes have not moved keeps its vector; a figure's vectors are keyed to its *content
   hash*, so the same image linked from six notes is encoded once, and deleting the last link to it prunes the row and its
   vectors on the next run.

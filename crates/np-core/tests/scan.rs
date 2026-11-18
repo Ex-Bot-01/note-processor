@@ -6092,3 +6092,90 @@ fn reading_whether_a_workspace_is_indexed_writes_nothing() {
         "and wrote no file row either"
     );
 }
+
+/// **A file that is tracked but not parsed says so in the report** (issue #12). A person's notes folder is
+/// rarely one format, and `scan` answering `added: 5` about a vault where search will only ever reach the one
+/// `.md` invites a front end to say "5 files" out loud. Nothing was *lost* — `unindexable` stays `null`,
+/// correctly — so until now there was no field a caller could quote as the reason, and the sentence had to be
+/// written from the caller's own file walk: np's rule, stated in someone else's product by guesswork.
+///
+/// The count is the workspace's live state beside `notes`, from the same predicate as the names printed under
+/// it, so "1 of 5 files are notes; 4 are attachments" can be said entirely in np's numbers. The examples stop
+/// at a cap on purpose: unlike unresolved link targets, which are a to-do list, this list is "everything else
+/// in your folder", and a vault holding 300 PDFs should not pay for 300 strings on every scan report.
+#[test]
+fn a_tracked_attachment_is_counted_and_named_in_the_report() {
+    let ws = scratch(
+        &[
+            ("note.md", "# Note\n\nplain text.\n"),
+            ("plain.txt", "a plain text note\n"),
+            ("file.org", "* an org headline\n"),
+            ("sub/other.txt", "another plain one\n"),
+            ("scan.png", "\u{89}PNG\u{d}\u{a}\u{1a}\n"),
+        ],
+        100,
+    );
+
+    let report = scan(&ws.root, &ws.cfg).expect("scan answers");
+    assert_eq!(report.notes, 1, "only the markdown file is a note");
+    assert_eq!(
+        report.attachments, 4,
+        "the other four are tracked, hashed and linkable — and never searchable"
+    );
+    assert_eq!(
+        report.attachment_examples,
+        ["file.org", "plain.txt", "scan.png", "sub/other.txt"],
+        "the names beside the count, sorted by path bytes"
+    );
+    assert_eq!(
+        report.notes + report.attachments,
+        scalar(&ws.db(), "SELECT COUNT(*) FROM files WHERE state = 'ok'"),
+        "the two counts are the whole of what a scan tracks: no file is in neither bucket"
+    );
+
+    // A deleted attachment stops being counted: `attachments` answers what the workspace holds now, exactly
+    // as `notes` does, rather than what some earlier scan saw arrive.
+    fs::remove_file(ws.root.join("plain.txt")).expect("test setup: delete an attachment");
+    let after = scan(&ws.root, &ws.cfg).expect("rescan answers");
+    assert_eq!(after.attachments, 3, "the stale row is not counted");
+    assert_eq!(
+        after.attachment_examples,
+        ["file.org", "scan.png", "sub/other.txt"],
+        "and not named"
+    );
+}
+
+/// **The examples are a sample; the count is the answer** (issue #12). Capping the names is only honest if the
+/// number beside them stays exact and the cap is the same list every time, so this pins all three: an exact
+/// count past the cap, exactly `cap` names, and those names the first `cap` by path.
+#[test]
+fn attachment_examples_stop_at_the_cap_and_the_count_stays_exact() {
+    let mut files: Vec<(String, String)> = vec![("note.md".to_string(), "# Note\n".to_string())];
+    for index in 0..8 {
+        files.push((format!("scratch-{index}.txt"), format!("text {index}\n")));
+    }
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(rel, body)| (rel.as_str(), body.as_str()))
+        .collect();
+    let ws = scratch(&borrowed, 100);
+
+    let report = scan(&ws.root, &ws.cfg).expect("scan answers");
+    assert_eq!(
+        report.attachments, 8,
+        "the count is not capped with the names"
+    );
+    assert_eq!(
+        report.attachment_examples.len(),
+        np_core::scan::ATTACHMENT_EXAMPLE_LIMIT,
+        "the examples stop at the documented cap, and no further"
+    );
+    assert_eq!(
+        report
+            .attachment_examples
+            .first()
+            .expect("cap is above zero"),
+        "scratch-0.txt",
+        "and what it does print is the start of the sorted list, not an arbitrary slice"
+    );
+}
