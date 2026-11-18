@@ -133,7 +133,10 @@ knowing, because each is a choice:
 
 - **the bytes are the pin's**, never a transport's `Content-Length` — §12 rule 12 refuses an announced length while a
   download is running for good reason, and a number quoted *before* the download has fewer excuses; an unannounced size
-  is unknown to HTTP and known to this table;
+  is unknown to HTTP and known to this table. Since **issue #13** the pin also bounds the transfer as it runs: a body that
+  passes the pinned length is refused one read buffer past it (`sent at least N bytes; this build pins M`) instead of being
+  written to disk in full and refused at EOF — which is what kept a `base_url` pointing at an endless stream from turning a
+  295 MiB download into however much patience the filesystem had;
 - **it is this build's plan, not the whole pin table** — `bytes_total` sums what this binary would volunteer, which is
   the primary artifact on a text-only build (309,855,456 bytes) and both halves on a `vision` build (864,676,512). The
   disk preflight's number (`np_core::pins::total_size`, always every member) is the second figure; quoting it in a
