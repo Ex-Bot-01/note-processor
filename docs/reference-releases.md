@@ -25,15 +25,42 @@ there at all (`docs/ops-actions-minutes.md`); a locally packaged release carries
 and its notes say so. Source builds need no CI and no minutes:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.5.1 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.6.0 -p np-cli --locked
 ```
 
 A source build is the only shape you can choose features on: `--features local-model` puts the inference runtime in the binary, and adding
 `,vision` adds figure encoding. Neither is needed to index or to search by keyword.
 
-**Current release: `v0.5.1` (2026-11-15).** A patch, and the kind of patch that is not cosmetic: it fixes two things a client could not work
-around, and adds nothing a parser can see. The protocol stays **1**, no new method and no new key appears, and `np embeddings enable` at a
-terminal writes byte-identical bytes to what 0.5.0 wrote.
+**Current release: `v0.6.0` (2026-11-16).** Five findings from one reporter's pass over the shipped binary, each reproduced before it was
+touched. The protocol stays **1** and no method is added — but keys appear, so this is a minor release rather than a patch: a client that
+asserts an exact key list must add two names, and `INDEX.md`'s bytes change for one class of file name.
+
+- **A meanings-only search says which vectors are missing** ([#11](https://github.com/Ex-Bot-01/note-processor/issues/11)). `mode: semantic`
+  with the artifact installed and nothing embedded answered `hits: []`, `note: null`, `reason: null` — indistinguishable from "I searched
+  your notes and found nothing". New token `semantic-without-vectors`, on every door that can produce the state.
+- **A tracked attachment is counted and named** ([#12](https://github.com/Ex-Bot-01/note-processor/issues/12)). `scan` results carry
+  `attachments` (exact) and `attachment_examples` (up to five paths), and the terminal summary gains a line when the count is non-zero. Five
+  files scanned, one searchable note, nothing in the report said so.
+- **An over-long body is refused at the pin** ([#13](https://github.com/Ex-Bot-01/note-processor/issues/13)). A mirror sending 500 MB under a
+  309 MB pin used to write all of it before refusing; one read buffer (1 MiB) is now the most a member can overshoot by, and the refusal says
+  "sent at least N" because a stream abandoned at 310 MB did not *end* there.
+- **Angle-bracket destinations resolve; code spans hold their links** ([#14](https://github.com/Ex-Bot-01/note-processor/issues/14)).
+  `[x](<a note.md>)` was filed as an attachment called `<a note.md>` and reported nowhere — the one silent link failure in the product. Links
+  inside backticks are no longer edges or unresolved targets.
+- **A catalog entry stays on its line** ([#15](https://github.com/Ex-Bot-01/note-processor/issues/15)). A file name containing a newline took
+  three physical lines in `INDEX.md`; brackets and parens in a name or title broke the link around it. Labels escape `[`, `]`, `\` and put
+  U+FFFD where a control character was; destinations are percent-escaped, `#` and `?` included, because both mean "inside the target".
+
+**What a client must do.** Add `attachments` and `attachment_examples` to any exact-key assertion over a `scan` result — absence now means
+"built before 0.6.0", which is not zero. Handle `reason: "semantic-without-vectors"`. And expect `INDEX.md` bytes to change once, on the first
+scan after upgrading, for vaults holding a name with a newline, bracket, paren, `#`, `?` or `<`.
+
+**What is not in it.** The other half of #12 — making `.txt` and friends *searchable* rather than counted — needs a decision about where a
+text file's title comes from, so it stays an open design card. See [`todo.md`](../todo.md).
+
+**`v0.5.1` (2026-11-15).** A patch, and the kind of patch that is not cosmetic: it fixes two things a client could not work around, and adds
+nothing a parser can see. The protocol stayed **1**, no new method and no new key appeared, and `np embeddings enable` at a terminal writes
+byte-identical bytes to what 0.5.0 wrote.
 
 - **A write made over `np serve` now records the method that made it** ([#10](https://github.com/Ex-Bot-01/note-processor/issues/10)). On 0.5.0
   both doors — the terminal and the pipe — wrote ``# note-processor set by `np embeddings enable <id>` …``, so a config file edited over stdin
