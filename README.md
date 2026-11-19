@@ -49,7 +49,7 @@ sha256sum -c SHA256SUMS.txt        # Linux/macOS, run next to the archive
 ```
 
 ```powershell
-(Get-FileHash .\np-0.5.1-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
+(Get-FileHash .\np-0.6.0-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
 ```
 
 | Platform | What you get | Worth knowing |
@@ -65,7 +65,7 @@ The model itself is never inside an archive: ~309 MB arrives only when you run `
 Building from source needs nothing but a stable Rust toolchain for the default build — no C++, no cmake:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.5.1 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.6.0 -p np-cli --locked
 ```
 
 Per-version caveats (which old assets are stale, what is compiled out of them): [Release archive caveats](docs/reference-releases.md).

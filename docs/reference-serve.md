@@ -196,6 +196,7 @@ embed that refused to write because the budget ran out is a state. They arrive i
 |---|---|---|
 | `locked: true`, `waited_ms` | another process holds the workspace write lock; nothing was changed | `scan`, `embed` results |
 | `offline: true`, `reason` | the network was tried and failed, so no artifact could be fetched | `search`, `embed` results |
+| `attachments`, `attachment_examples` | how many tracked files are **not** notes, and up to five of their paths. The count is exact even when five names cover them all; absent from a report captured before **#12** (**v0.6.0**), where absence means "this np did not count them", not zero | `scan` results |
 | `reason` | a machine token (`provider-disabled`, `local-model-not-built`, `offline`, …) explaining a degraded result. **One token per run**, which is why "not indexed" got its own key below rather than a new token here | `search`, `embed` results |
 | `vectors: false` | this workspace holds no vectors — the truth about the index, and deliberately still `true` on a run that could not use them (**F45**), so it is *not* the answer to "which half ran" | `search` results |
 | `keyword_used`, `semantic_used` | which halves **this answer** was built from. `mode` names what the caller asked for, and hybrid answers from one half whenever the other is missing; these two are what a client shows when it says how a result was found (**#5**) | `search` results |
@@ -352,7 +353,12 @@ is not a workspace returns an empty list and leaves no files behind.
 ## Captured transcripts
 
 Every block below is verbatim stdout from one `np serve` session. Nothing was typed by hand, edited, or pretty-printed; paths
-and timestamps are the capture machine's. See [Reproducing the transcripts](#reproducing-the-transcripts).
+and timestamps are the capture machine's. Four of them ran against debug builds of np 0.4.0 (commit `f6b75e9`) — *A client that did not
+opt in* with default features, which is why its `features` object is all `false`, and the other three with `local-model,fetch`.
+*Meanings asked for, vectors not there yet* was captured on 2026-11-16 from a `cargo build --release` of this tag's own tree
+(`v0.6.0`, `local-model,fetch`) — the first of these sessions taken from an optimized build rather than a debug one. What the
+published asset itself was measured doing is recorded in [reference-releases.md](reference-releases.md), next to its digest. See
+[Reproducing the transcripts](#reproducing-the-transcripts).
 
 ### A client that did not opt in
 
@@ -374,6 +380,23 @@ answers ten: `links.list` arrived in **#2** (included here) and `embeddings.enab
 capture. A client feature-detects off that array, which is exactly the case the array is there for. The `"np"` field is read the same way:
 it is the version of the binary that answered *in this capture*, and a release build reports its own version there (`"0.5.0"` since
 `v0.5.0`) rather than anything a client should compare against a constant.
+
+### Meanings asked for, vectors not there yet
+
+Four files, two of them not markdown, on a `local-model,fetch` release build of `np 0.6.0` with the pinned artifact installed by
+`np models install` and **nothing embedded** — so the provider is `Ready`, `vectors` is `false`, and a meanings-only search has
+neither half to answer with. Three requests, one process, in order:
+
+```json
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/tmp/cap060/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","links.list","embeddings.enable","embeddings.disable","shutdown"],"np":"0.6.0","protocol":1}}
+{"id":2,"jsonrpc":"2.0","result":{"added":4,"attachment_examples":["plan.org","scratch.txt"],"attachments":2,"elapsed_ms":11,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
+{"id":3,"jsonrpc":"2.0","result":{"fetched":null,"hits":[],"indexed":true,"keyword_used":false,"mode":"semantic","note":"no vectors in this workspace: a meanings-only search has nothing to rank and no keyword half to fall back on — `np models fetch` or `np embed` adds the semantic half","offline":false,"prefix_terms":[],"prefix_used":false,"reason":"semantic-without-vectors","semantic_used":false,"vectors":false}}
+```
+
+The last two lines together are the whole story of a workspace that is indexed but not embedded: `notes` and `attachments` add up to
+the four files on disk (**#12**), and the empty answer names the half it was missing (**#11**). The handshake above them is what makes
+that safe to act on from a client written against 0.5.1: `"protocol":1`, and the same **ten** methods — this release added keys, not
+doors.
 
 ### A first run with no network
 
@@ -501,3 +524,10 @@ unset, a two-note vault, and a Python origin that answers the pinned `Content-Le
 hanging up mid-body. Session A opted out of notifications; B pointed `[models] base_url` at a closed port; C and D pointed it at
 the dribbling origin, and D ran its `status.get` from a second process while C's download was in flight. Session A's own shape: two
 notes (`meeting.md`, `todo.md`), `scan`, then `search` for `Tuesday` with `"mode": "keyword"`.
+
+*Meanings asked for, vectors not there yet* was captured on 2026-11-16 from a release build of that tag
+(`cargo build --release -p np-cli --features local-model,fetch`) against a four-file vault — `meeting.md`, `todo.md`, `scratch.txt`,
+`plan.org`, the last two holding the same word as the notes — with per-session `XDG_*` directories, `[models] auto_fetch = false`,
+the artifact installed by `np models install <vault> --id embeddinggemma-2 --path … --dim 768 --sha256 …`, and no `embed` run. The
+weights themselves are not part of the recipe: any install that leaves the provider `Ready` with zero embedded notes reproduces it.
+The `data_dir` is that session's scratch directory rather than anything a reader should own.
