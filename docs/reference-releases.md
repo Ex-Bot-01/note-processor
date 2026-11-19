@@ -31,7 +31,7 @@ cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.6.0 -p 
 A source build is the only shape you can choose features on: `--features local-model` puts the inference runtime in the binary, and adding
 `,vision` adds figure encoding. Neither is needed to index or to search by keyword.
 
-**Current release: `v0.6.0` (2026-11-16).** Five findings from one reporter's pass over the shipped binary, each reproduced before it was
+**Current release: `v0.6.0` (2026-11-19).** Five findings from one reporter's pass over the shipped binary, each reproduced before it was
 touched. The protocol stays **1** and no method is added — but keys appear, so this is a minor release rather than a patch: a client that
 asserts an exact key list must add two names, and `INDEX.md`'s bytes change for one class of file name.
 
@@ -50,6 +50,38 @@ asserts an exact key list must add two names, and `INDEX.md`'s bytes change for 
 - **A catalog entry stays on its line** ([#15](https://github.com/Ex-Bot-01/note-processor/issues/15)). A file name containing a newline took
   three physical lines in `INDEX.md`; brackets and parens in a name or title broke the link around it. Labels escape `[`, `]`, `\` and put
   U+FFFD where a control character was; destinations are percent-escaped, `#` and `?` included, because both mean "inside the target".
+
+The two `v0.6.0` archives, as published (2026-11-19), measured from a fresh download of the page and confirmed by `sha256sum -c SHA256SUMS.txt`
+(which lists exactly these two names and nothing inside them):
+
+```text
+7e7b8acf292625ea2274bf6f2dfc43a263fa3b1d6fcba25f791bf2d6fa937e8a  np-0.6.0-x86_64-unknown-linux-gnu.tar.gz
+c776fc8f8f1bb71a0ca07d8c2cb9521fc6d0dc8ac3642f642a288b630b8c9d4b  np-0.6.0-x86_64-pc-windows-gnu-cross.zip
+```
+
+Inside the Windows archive, `np.exe` is 16,740,864 bytes and digests to
+`0408a191ae4f2c4df011adf30a1eb69ca4b7af51ab2e4c9771abb64b43f531ab` — prose, not `SHA256SUMS.txt`, because that file is run through
+`sha256sum -c` against files a person downloaded and must never name a file inside an archive (**v0.4.0's** mistake).
+
+Both archives came from one run of the tag ([`44582261113`](https://github.com/Ex-Bot-01/note-processor/actions/runs/44582261113)), and **no
+rehearsal was dispatched this time**, so this release adds no evidence to the Linux cross-run reproducibility claim or to the Windows
+non-claim: those stand on the three builds measured through `v0.5.1` above, and a digest pinned here is one file at one moment either way.
+The reason not to rehearse is recorded in the tag's chore commit — `release.yml` and both packaging scripts are byte-identical to the pair
+that produced `v0.5.1`'s published assets, and a rehearsal costs the same hosted minutes as the run that publishes.
+
+**Four of the five fixes were then measured in the published Linux asset rather than in a test binary.** Downloaded, `sha256sum -c` clean,
+run against fresh `XDG_*` directories: `np --version` → `np 0.6.0`; an `initialize` handshake answering
+`"features":{"fetch":true,"local_model":true,"vision":false}` — the check **F40** exists to make, that the shipped file really carries the
+runtime its own release page promises; a four-file `scan` reporting `"attachments":2,"attachment_examples":["plan.org","scratch.txt"]`
+(**#12**) in the same session as a `"mode":"semantic"` search answering `"reason":"semantic-without-vectors"` (**#11**); a three-note vault
+whose `INDEX.md` entries came out escaped, one per note (**#15**); and `[angle](<a note.md>)` producing `→1` on the source note and `←1` on
+the file with a space in its name, with `"unresolved_links":0` (**#14**). What was *not* measured: this binary never ran on a machine whose
+CPU stops at SSE4.2, and nothing from the Windows archive executed anywhere — no such host here, so `np.exe` is accounted for as bytes only.
+
+`.text`, counted over both published Linux assets with one command (`objdump -d --section=.text | grep -oE '%(zmm|ymm)[0-9]+'`): **zero
+`%zmm` and 11,154 `%ymm` on `v0.5.1` and on `v0.6.0` alike** — same instruction-set floor, unchanged by this round. That count is not
+comparable with the "4,940 `%ymm`" printed in the `v0.5.1` entry above, whose command was not recorded; what the pair establishes is that one
+command gives one number for both releases.
 
 **What a client must do.** Add `attachments` and `attachment_examples` to any exact-key assertion over a `scan` result — absence now means
 "built before 0.6.0", which is not zero. Handle `reason: "semantic-without-vectors"`. And expect `INDEX.md` bytes to change once, on the first

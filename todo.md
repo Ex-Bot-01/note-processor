@@ -627,3 +627,27 @@ fail for a reason outside the tree: `cfg-dead-code`, `attr-displacement` and `ca
 exit 2 with "No such file or directory" on any tree. The goldens themselves are still graded — by
 `golden_render_matches_committed_bytes` in `crates/np-core/tests/catalog.rs`, which passes unmodified. 14 `NOT COVERAGE`
 lines across the logs, all of them artifact- or platform-gated rows this host cannot fill.
+
+## Shipped: `v0.6.0`, 2026-11-19
+
+The round is on the release page, and the version says **minor** rather than patch for one reason: keys appear. `scan` gained
+`attachments`/`attachment_examples`, `search`'s `reason` gained a value, and `INDEX.md` bytes change once for names holding a newline or a
+bracket. Protocol stays `1`, ten methods unchanged, nothing existing changed shape — but `v0.5.1` could call itself a patch because "nothing a
+parser can see changes", and that sentence is false here.
+
+- **Merged with history**, at `0f8b5b9`, in this repository's shape (`Merge branch 'release/v0.6.0' — …`). The previous round rebased #16 and
+  lost that shape; it is the convention four dozen merges establish, so it is what the release merge does.
+- Tag `v0.6.0` at the chore commit `e87945e`, lightweight, like `v0.5.0`/`v0.5.1`. Assets published by run `44582261113`; digests and the
+  inner `np.exe` digest recorded in [`docs/reference-releases.md`](docs/reference-releases.md).
+- **No rehearsal dispatched**, unlike `v0.5.1`: `release.yml` and both packaging scripts are byte-identical to the pair that published
+  `v0.5.1`, and a rehearsal costs the same hosted minutes as the run that publishes. The cost of that choice is stated where the digests are —
+  this release adds no evidence to the Linux cross-run reproducibility claim or to the Windows non-claim, which still rest on the three builds
+  measured through `v0.5.1`.
+- **Four of the five fixes were measured in the downloaded asset**, not a test binary: features handshake (`local_model: true`, F40's check),
+  `attachments` + `semantic-without-vectors` in one session, escaped `INDEX.md` entries, and `[angle](<a note.md>)` producing real edges. Not
+  measured, because no such host is here: a run on the SSE4.2 CPU floor, and anything executing from the Windows archive.
+- `.text` census over both published Linux assets under one command: zero `%zmm`, 11,154 `%ymm`, identical — one instruction-set floor held
+  across the round. The count is method-dependent, so it is written with its command rather than compared to the older entries' number.
+
+Still open after the release: `note_suffixes` (**#12**'s other offer — making `.txt` searchable rather than counted), which needs a decision
+about where a text file's title comes from before it can be a card, and the `[index]` design note written in the round summary above.

@@ -355,7 +355,7 @@ is not a workspace returns an empty list and leaves no files behind.
 Every block below is verbatim stdout from one `np serve` session. Nothing was typed by hand, edited, or pretty-printed; paths
 and timestamps are the capture machine's. Four of them ran against debug builds of np 0.4.0 (commit `f6b75e9`) — *A client that did not
 opt in* with default features, which is why its `features` object is all `false`, and the other three with `local-model,fetch`.
-*Meanings asked for, vectors not there yet* was captured on 2026-11-16 from a `cargo build --release` of this tag's own tree
+*Meanings asked for, vectors not there yet* was captured on 2026-11-19 from a `cargo build --release` of this tag's own tree
 (`v0.6.0`, `local-model,fetch`) — the first of these sessions taken from an optimized build rather than a debug one. What the
 published asset itself was measured doing is recorded in [reference-releases.md](reference-releases.md), next to its digest. See
 [Reproducing the transcripts](#reproducing-the-transcripts).
@@ -525,7 +525,7 @@ hanging up mid-body. Session A opted out of notifications; B pointed `[models] b
 the dribbling origin, and D ran its `status.get` from a second process while C's download was in flight. Session A's own shape: two
 notes (`meeting.md`, `todo.md`), `scan`, then `search` for `Tuesday` with `"mode": "keyword"`.
 
-*Meanings asked for, vectors not there yet* was captured on 2026-11-16 from a release build of that tag
+*Meanings asked for, vectors not there yet* was captured on 2026-11-19 from a release build of that tag
 (`cargo build --release -p np-cli --features local-model,fetch`) against a four-file vault — `meeting.md`, `todo.md`, `scratch.txt`,
 `plan.org`, the last two holding the same word as the notes — with per-session `XDG_*` directories, `[models] auto_fetch = false`,
 the artifact installed by `np models install <vault> --id embeddinggemma-2 --path … --dim 768 --sha256 …`, and no `embed` run. The
