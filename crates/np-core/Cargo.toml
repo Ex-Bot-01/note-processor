@@ -4,36 +4,27 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# `local-model` is the gate the local inference runtime lives behind
-# (`docs/design-m2-local-embeddings.md` §2, §6, §14). It still declares no dependency crate — §14 chose
-# hand-written FFI over the pinned Rust binding precisely to avoid bindgen and its build-dependencies.
-# What it now gates is real: `build.rs` compiles the pinned llama.cpp (`third_party/llama-cpp.toml`) and
-# `src/llama_ffi.rs` mirrors that revision's C API. So the honest statement of the cost has changed:
-# with the feature off, nothing; with it on, a cmake + C++ toolchain and a source tree that
-# `scripts/vendor-llama-cpp.sh` fetched — neither of which the default build may ever need (§2's promise,
-# proven by the default gate list running with no cmake on PATH).
+# `local-model` gates the local inference runtime: `docs/design-m2-local-embeddings.md`. No dependency crate is
+# declared — the FFI in `src/llama_ffi.rs` is written by hand against the pinned revision (`third_party/llama-cpp.toml`)
+# precisely to keep bindgen and its build-dependencies out. Cost with the feature off: nothing. With it on: a cmake + C++
+# toolchain and a tree fetched by `scripts/vendor-llama-cpp.sh`, which the default build must never need — proven by the
+# default gate list running on a machine with no cmake.
 #
-# The seam itself — `embed::LocalModelProvider` — still compiles in the default build on purpose, so
-# callers and CI exercise the API without paying for inference (§9 item 1).
-#
-# `cargo check --locked -p np-core --features local-model` is the fence that matters now, and it runs on
-# the Linux row only until someone has watched it go green elsewhere (§14's per-OS honesty). Release
-# builds keep the feature off until a Windows build of it is recorded in CI once (§2).
-# `vision` (R7c) sits on top of `local-model` and implies it: `docs/design-m2-image-embeddings.md` §10. What turning it
-# on costs is one cmake option (`LLAMA_BUILD_MTMD=ON`, which the pinned tree defaults to off), one extra cmake target
-# (`mtmd`), **two** extra archives on the link line — `libmtmd.a` needs `hash_sha256_hex`, which lives in
-# `libvendor-hash.a`, so a vision link measures six archives rather than five
-# (`crates/np-core/tests/probes/vision-spike-2026-11-02.md`) — and the 554 MB projector artifact. Default-off like
-# `local-model`, so no shipped shape changes size or dependencies; the package-size re-measurement for this row is
-# R7c Task 7's work, not a number claimed here.
+# `embed::LocalModelProvider` compiles in the default build on purpose, so callers and CI exercise the seam without paying
+# for inference. The fence that matters is `cargo check --locked -p np-core --features local-model`, run on Linux until a
+# green build is recorded on another OS; release builds keep it off until Windows has one.
+# `vision` implies `local-model`: `docs/design-m2-image-embeddings.md`. It costs one cmake option (`LLAMA_BUILD_MTMD=ON`,
+# off in the pinned tree), one extra target, and **two** extra archives — `libmtmd.a` needs `hash_sha256_hex` from
+# `libvendor-hash.a`, so a vision link measures six archives rather than five — plus the 554 MB projector artifact. No
+# default-off feature changes a shipped binary's size or dependencies; no size number is claimed here.
 [features]
-# **`fetch` is default-ON, unlike `local-model`** (`docs/design-m2-local-embeddings.md` §12's premises): a fetch path
-# that release builds compile out would defeat the human's amendment of 2026-10-29, so opting out has to be an explicit
-# `--no-default-features`. The cost is stated where it is paid — an HTTP+TLS client in three release OSes' binaries.
+# **`fetch` is default-ON, unlike `local-model`**: a fetch path that release builds compiled out would defeat the ruling
+# that made downloading part of the product (`docs/adr/0003-local-embeddinggemma-at-768.md`), so opting out is explicit
+# `--no-default-features`. Cost, paid in all three release binaries: an HTTP+TLS client.
 default = ["fetch"]
 local-model = []
-# Image embedding through llama.cpp's `mtmd`. There is no vision code in a build that has no runtime to attach it to,
-# which is what the implication states rather than what it enforces.
+# Image embedding through llama.cpp's `mtmd`. The implication says there is no vision code in a build with no runtime to
+# attach it to; saying so is not enforcing it, and nothing here pretends otherwise.
 vision = ["local-model"]
 fetch = ["dep:ureq"]
 
