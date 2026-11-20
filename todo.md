@@ -4,9 +4,9 @@
 shipped. Do not re-brainstorm approved designs — execute against the roadmap, or write a design and get it
 reviewed before any code for something new.
 
-Repo: `/home/agent/note-processor` · remote `https://github.com/Ex-Bot-01/note-processor` (private; `gh` is
-authenticated as `Ex-Bot-01`, git identity repo-local). Because it is private, release assets 404 for
-anonymous visitors — download while logged in.
+Repo: this working copy, checked out from the remote named in `git remote -v`. The account that hosts it, whether the
+repository is public or private, and who is authenticated to `gh` on a given machine are properties of whoever is working
+here, so they are not written down here — read them from `gh api repos/{owner}/{repo}` when a claim depends on them.
 
 1. **Design (approved):** `docs/superpowers/specs/2026-10-23-note-processor-design.md`
 2. **Roadmap being executed:** `docs/roadmap-2026-10-27.md` (Track A = correctness residue, Track B = product)
@@ -85,13 +85,11 @@ Four questions went up as human decisions; four answers came back, and one of th
   incident is now ~7 hours and spans markdown-only SHAs too. The closure paragraph goes in when a run with steps grades `main`.
 * **Remaining for F28:** nothing implemented; only CI grading of `main`, then the closing paragraph. Then, exposed by step ③ and not caused by it:
   member names in `np models list`, which needs a change to that command's pinned key set.
-* **CI's zero-step failures explained: the account is out of included minutes** (`docs/ops-actions-minutes.md`). Measured from the Actions API — October
-  spent **2,028 billed minutes** and went zero-step on Oct 29; November spent **2,137 in 6.4 days**, crossing the cap at `2026-11-07T01:57:05Z`, seven
-  seconds before the first failure. Windows is 54.6 % of the spend and both feature rows rebuild vendored llama.cpp every run (November costs 25.4 billed
-  minutes per push against October's 10.6). Billing endpoints are unreachable with this token (**403**, billing scope), so the allowance is inferred from
-  where two months stopped rather than read from a meter. **Owed by the human, because it is money and CI shape:** raise the limit (~$80/month at today's
-  pace) or move Windows + both feature rows to `main`/PR only with a vendor cache (≈1,200–1,800/month, inside the allowance). Recommendation in the doc; no
-  workflow file has been touched here. Until then: check `steps=` before believing a red main.
+* **CI's zero-step failures explained: the hosted-minute allowance ran out** (`docs/developing.md`, "Why a red main sometimes has no steps at all"). Two
+  months in a row stopped at the same point, minutes after the last green job, and the billing meter is not readable with this token — so the shape of the
+  matrix was cut to what one month can afford rather than to what would be nice. **Owed by the human, because it is money and CI shape:** raise the limit, or
+  keep Windows and both C++ feature rows off every merge and cache the vendor build. Until that is settled: count the jobs' `steps` before believing a red
+  main.
 * **CI observation (2026-11-06, on `03ef6d8`, a markdown-only commit).** All four jobs failed in ~58 s with **zero steps created**, three attempts
   (`--failed` rerun, full rerun), while the two pushes five minutes earlier (`5374dc1`, `5e368ac`) completed green on the same workflow file. That is
   F34's signature returning — a job that never reaches a step cannot be a code defect, because nothing ran — and it is recorded here rather than
@@ -125,7 +123,7 @@ Four questions went up as human decisions; four answers came back, and one of th
   every scan's JSON, so "what did an upgrade delete here last month?" is answerable without `sqlite3`; the once-per-process announcement is untouched and
   stdout gained nothing — a CLI case asserts both halves on one workspace. Three np-core cases (durable merge receipt, zero receipts proving the checks ran,
   a hand-poked `NULL` reading as no record instead of failing every later scan) and one mutant killed at two levels after I noticed my first durability case
-  only asserted a field the same open also wrote. Closure withheld on F28's ground: CI cannot grade it (`docs/ops-actions-minutes.md`).
+  only asserted a field the same open also wrote. Closure withheld on F28's ground: CI cannot grade it (`docs/developing.md`).
 * **F29 closed (2026-11-07, docs-only):** README's "Images in the index" now states the limit — `.svg`/`.drawio`/`.excalidraw`/`.pdf` out by decision, with
   the rasteriser's real cost named (external references and DTDs, a dependency, an attack surface, a per-encode measurement §8 demands) — answers "what will
   `np` encode" as PNG and JPEG by extension *and* signature, points the `unsupported-format` row at that paragraph, and says what a refused figure does not

@@ -189,15 +189,18 @@ are listed with defaults and refusal behaviour in [Configuration reference](docs
 same work as the commands, on a channel that does not fork. Ask for `notifications` in the handshake and it also narrates the slow
 parts, which is what a GUI needs while a 295 MiB model downloads:
 
+(Temp paths in the transcript below are elided to `$TMPDIR`; the rest is captured output — provenance in
+[the serve reference](docs/reference-serve.md).
+
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/run.IaDK9X/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":61}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1494}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4036}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6589}}
-{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.IaDK9X/C/data/workspaces/39e6b8caca57d6ee.models/.part.embeddinggemma-2.1323809-1794227836518406938-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
+{"error":{"code":-32000,"message":"cannot write $TMPDIR/cap/run.IaDK9X/C/data/workspaces/39e6b8caca57d6ee.models/.part.embeddinggemma-2.1323809-1794227836518406938-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
 {"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7704}}
 {"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7704,"phase":"refused","request":2},"running":null}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":0}}

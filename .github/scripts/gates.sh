@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The gate list, as one command, on any machine. CI grades `main` when it has minutes; this script is what "graded" means
-# when it does not (`docs/ops-actions-minutes.md`), and it is the same list CI runs — so a green local log and a green run
+# when it does not (`docs/developing.md`), and it is the same list CI runs — so a green local log and a green run
 # say the same thing about the same tree.
 #
 # Usage:
@@ -146,7 +146,7 @@ row_or_skip test-core-realvision "$artifacts" env CARGO_BUILD_JOBS=2 cargo test 
 
 # **`--exclude=driver.log`, and the reason it is a guard rather than a fix.** On a fresh log directory this cannot matter: the count
 # runs *before* the summary line is echoed, so the phrase is not in that file yet — measured on 2026-11-09, where the tally over
-# `/home/agent/tmp/gates-progress2` was 14 with and without the exclusion. It matters when a run reuses a directory holding an older
+# `$TMPDIR/gates-progress2` was 14 with and without the exclusion. It matters when a run reuses a directory holding an older
 # log, because the previous verdict sentence does contain the phrase; that is exactly how the v0.3.0 release notes came to publish
 # "zero" beside a tally of 1. Excluding it makes the count independent of what happened to be in the directory before.
 vacuous=$(grep -rho --exclude=driver.log 'NOT COVERAGE' "$logs" 2>/dev/null | wc -l | tr -d ' ')

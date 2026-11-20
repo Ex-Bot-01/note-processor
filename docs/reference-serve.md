@@ -366,7 +366,7 @@ Two notes on disk, a keyword search, and no `notifications` key in the handshake
 line appears in the whole session — every line carries an `id`, so a v0.3.0 client's read loop is untouched.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap3/A/data","features":{"fetch":true,"local_model":false,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","links.list","shutdown"],"np":"0.4.0","protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap3/A/data","features":{"fetch":true,"local_model":false,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","links.list","shutdown"],"np":"0.4.0","protocol":1}}
 {"id":2,"jsonrpc":"2.0","result":{"added":2,"elapsed_ms":162,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
 {"id":3,"jsonrpc":"2.0","result":{"fetched":null,"hits":[{"bm25":-1.03862660944206e-6,"cosine":null,"keyword_rank":1,"kind":"note","linked_from":0,"linked_notes":[],"matched_exactly":true,"path":"meeting.md","score":1.03862660944206e-6,"semantic_rank":null,"snippet":"# Meeting notes\n\nThe rollout window opens on [Tuesday].\n","source_note":null}],"indexed":true,"keyword_used":true,"mode":"keyword","note":null,"offline":false,"prefix_terms":[],"prefix_used":false,"reason":null,"semantic_used":false,"vectors":false}}
 ```
@@ -404,7 +404,7 @@ Opted in, `[embeddings] provider = "local-model"`, origin unreachable. `locking`
 then the answer says **offline**, and so does the terminal line — as a state, `completed`, not `refused`.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.rA4ZYv/B/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/run.rA4ZYv/B/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"id":2,"jsonrpc":"2.0","result":{"artifact_check":null,"busy_gap":0,"chunks_seen":0,"current":0,"embedded":0,"errors":0,"fetched":null,"image_refusals":[],"images_embedded":0,"images_pruned":0,"images_refused":0,"images_seen":0,"images_sweep_ran":false,"images_unchecked":0,"model":"embeddinggemma-2","offline":true,"outcome":{"offline":{"id":"embeddinggemma-2"}},"refused_budget":0,"verification":"self-consistent, not verified","workers":null}}
@@ -420,14 +420,14 @@ Same session shape, origin reachable but the connection closes mid-body after 12
 object — because an interrupted transfer really did fail, where the session above really did not.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.rA4ZYv/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/run.rA4ZYv/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":60}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1493}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4039}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6483}}
-{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.rA4ZYv/C/data/workspaces/32ed8d1669063346.models/.part.embeddinggemma-2.1530703-179424188689490595-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
+{"error":{"code":-32000,"message":"cannot write $TMPDIR/cap/run.rA4ZYv/C/data/workspaces/32ed8d1669063346.models/.part.embeddinggemma-2.1530703-179424188689490595-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
 {"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7537}}
 {"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7537,"phase":"refused","request":2},"last_scan":null,"running":null}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":1}}
@@ -443,7 +443,7 @@ One `np serve` is mid-download; a **second** process answers `status.get` immedi
 the writer. This is the case `running: null` cannot cover, and it is why the marker list exists.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/marker.678uo7/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/marker.678uo7/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","protocol":1}}
 {"id":2,"jsonrpc":"2.0","result":{"command":"scan","locked":true,"waited_ms":2000}}
 {"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[{"bytes_done":8388608,"bytes_total":309855456,"id":"embeddinggemma-2","started_at":1794241904,"state":"running"}],"last":{"command":"scan","elapsed_ms":2006,"phase":"completed","request":2},"last_scan":null,"running":null}}
 ```
@@ -517,8 +517,9 @@ That is the whole contract. `np` remembers nothing about your UI; it hands you e
 
 ## Reproducing the transcripts
 
-Sessions B, C and D came from a debug build of that branch (`cargo build -p np-cli --features local-model,fetch`) driven by
-`/home/agent/tmp/cap/capture.sh`. Session A was re-captured on 2026-11-14 by piping three requests to `target/debug/np serve`
+Host temp paths inside the transcripts are written `$TMPDIR/…`; nothing else in them was edited — they are the byte output of
+real sessions. Sessions B, C and D came from a debug build of that branch (`cargo build -p np-cli --features local-model,fetch`)
+driven by a capture script kept outside the repository. Session A was re-captured on 2026-11-14 by piping three requests to `target/debug/np serve`
 (default features) with the same per-session `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_CONFIG_HOME`, `NP_NO_AUTO_FETCH`
 unset, a two-note vault, and a Python origin that answers the pinned `Content-Length` and then dribbles 4 MiB per 1.2 s before
 hanging up mid-body. Session A opted out of notifications; B pointed `[models] base_url` at a closed port; C and D pointed it at

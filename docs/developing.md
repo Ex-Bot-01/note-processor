@@ -117,21 +117,21 @@ every `--features local-model,vision` row ever run was graded on `-p np-core`, s
 with image support. It could not (**F28**), and no failure any of the other jobs produce would have said so. Its first grading is the run that adds it,
 which is worth stating rather than backdating: this sentence was written before that job had ever gone green.
 
-**Why the zero-step windows happen, now measured (`docs/ops-actions-minutes.md`).** This repository is private, so its hosted minutes are metered against
-the account's monthly allowance — and both unexplained gaps in CI line up with that allowance running out. October spent **2,028 billed minutes** and went
-zero-step on 2026-10-29T14:39; November had no C++ cache and spent **2,137 in six days**, crossing the cap at `2026-11-07T01:57:05Z`, seven seconds before
-the first zero-step failure. A Windows job is 54.6 % of that spend, and both feature rows rebuild the vendored llama.cpp from scratch every run. So a red
-main gets one check before anything else: do the jobs have **steps**? `steps=0` on all four means the account is out, not the tree — re-triggering until it
-goes green would only teach everyone to ignore CI.
+**Why a red main sometimes has no steps at all.** A hosted job that fails within a second or two with **zero steps created** was never provisioned: the
+account's included hosted minutes ran out. That is not the tree failing, and re-running it until it goes green only teaches everyone to ignore CI — so the
+first check on a red main is whether the jobs have **steps** (`gh api` the run's `/jobs` and count `steps`). Two facts about hosted runners shape the matrix
+because they decide how fast those minutes go: a Windows runner bills at a multiple of a Linux one, and both C++ feature rows rebuild the vendored llama.cpp
+from scratch unless something caches it. The account's plan, its monthly allowance and this repository's visibility belong to whoever hosts it and change
+without warning, so they are not recorded here — query them when a claim depends on them rather than trusting a figure copied out of a document.
 
-**What CI grades, as of 2026-11-07 (`ci.yml` reshaped for the allowance).** A **push to `main`** runs `Test (ubuntu-latest)` — fmt, clippy, rustdoc with
-`--deny warnings`, and the whole workspace test suite including the release-only cases — and nothing else: about 4.6 billed minutes, landing within minutes of
-the merge. The **Windows row and both C++ feature rows** now run on a **nightly schedule (03:17 UTC), on any pull request, and on a manual dispatch**, which is
-where platform and feature-gated evidence comes from: `gh workflow run ci.yml --ref <sha>` buys the full matrix for one specific tree (~25.4 billed minutes) when
-a claim needs it before anyone writes it down. **Pushes to other branches run no CI at all.** That is a trade, not a saving: between a merge and the next nightly,
-`main` is graded on Linux only, so a Windows-only lint or a feature-gated compile break can sit there for up to a day. The 17-row local gate list — which includes
-the `local-model` and `local-model,vision` clippy, rustdoc and test rows — is what stands in during that window, and it is what ran before every merge this week.
+**What CI grades.** A **push to `main`** runs `Test (ubuntu-latest)` — fmt, clippy, rustdoc with `--deny warnings`, and the whole workspace test suite
+including the release-only cases — and nothing else, landing within minutes of the merge. The **Windows row and both C++ feature rows** run on a **nightly
+schedule (03:17 UTC), on any pull request, and on a manual dispatch**, which is where platform and feature-gated evidence comes from: `gh workflow run ci.yml
+--ref <sha>` buys the full matrix for one specific tree when a claim needs it before anyone writes it down. **Pushes to other branches run no CI at all.** That
+is a trade, not a saving: between a merge and the next nightly, `main` is graded on Linux only, so a Windows-only lint or a feature-gated compile break can sit
+there for up to a day. The local gate list — which includes the `local-model` and `local-model,vision` clippy, rustdoc and test rows — is what stands in during
+that window.
 
-The arithmetic is in `docs/ops-actions-minutes.md`, including the correction it forced: at November's measured cadence (15 runs a day, 6.25 of them onto `main`)
-the earlier recommendation to keep Windows and the feature rows on every merge would still have cost ~5,900 billed minutes a month against an allowance inferred at
-~2,000. The shape above projects ~1,620.
+The cut exists because hosted minutes are metered and the full matrix on every merge costs several times what a Linux-only run does — enough that this
+repository's cadence could not afford it, which is the correction **F39** forced: the earlier recommendation to keep Windows and both feature rows on every
+merge was written without measuring what a merge actually cost. Current figures are measured when needed, from the API, because they move with the account plan.

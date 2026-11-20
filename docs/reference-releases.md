@@ -21,7 +21,7 @@ is. Since `v0.4.0` `.github/workflows/release.yml` builds both shipped assets by
 one build definition and CI grades it. Before that the workflow carried its own `cargo build` over a Windows/Linux/macOS matrix while
 the published files came from those scripts, and the two disagreed about features: an asset CI produced could not embed although the
 page said it could (**F40**). Hosted runners are also metered, so when an account is out of included minutes no release can be built
-there at all (`docs/ops-actions-minutes.md`); a locally packaged release carries **the one platform the packager was standing on**,
+there at all (`docs/developing.md`); a locally packaged release carries **the one platform the packager was standing on**,
 and its notes say so. Source builds need no CI and no minutes:
 
 ```sh

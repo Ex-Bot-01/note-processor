@@ -2,7 +2,7 @@
 # Build and package a release asset for this machine's target triple, in the shape `.github/workflows/release.yml`
 # expects — same archive name, same "the binary is the only member" rule, same refusal of an empty archive.
 #
-# Why this file exists: the published assets were built by CI, and CI is metered (`docs/ops-actions-minutes.md`). When the
+# Why this file exists: the published assets were built by CI, and CI is metered (`docs/developing.md`). When the
 # allowance ran out on 2026-11-07 the release path stopped producing anything, which is how `v0.1.0` came to advertise four
 # subcommands while shipping a binary with one. A human with a checkout can now produce the same artifact and say honestly
 # where it came from — this script does **not** pretend to be the runner, and neither may the release notes that cite it.

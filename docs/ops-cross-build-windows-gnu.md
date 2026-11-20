@@ -33,7 +33,7 @@ thing here to a determinism claim: same toolchain, same tree, same bytes. The re
 archives, and `dpkg-deb -x` unpacks them anywhere.
 
 ```bash
-mkdir -p /home/agent/tmp/mingwdebs && cd /home/agent/tmp/mingwdebs
+mkdir -p $TMPDIR/mingwdebs && cd $TMPDIR/mingwdebs
 apt-get install --print-uris -y gcc-mingw-w64-x86-64 | grep "^'" | sed "s/'\([^']*\)'.*/\1/" > uris.txt   # 10 URIs
 cat uris.txt | xargs -n1 -P4 curl -sS -O
 mkdir -p ../mingw && for d in *.deb; do dpkg-deb -x "$d" ../mingw; done
@@ -45,8 +45,8 @@ cd ../mingw/usr/bin && ln -sf x86_64-w64-mingw32-gcc-13-posix x86_64-w64-mingw32
 `ar`, `as`, `nm`, `ranlib`, `strip`, `windres`, `dlltool` already exist under their plain names; only `gcc` needed the symlink. Then:
 
 ```bash
-cd /home/agent/note-processor
-export PATH="/home/agent/tmp/mingw/usr/bin:$HOME/.cargo/bin:$PATH" TMPDIR=/home/agent/tmp
+cd "$HOME/note-processor"   # your checkout
+export PATH="$TMPDIR/mingw/usr/bin:$HOME/.cargo/bin:$PATH" TMPDIR=$TMPDIR
 export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc
 export AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc

@@ -1,22 +1,10 @@
 name: CI
 
-# **Reshaped 2026-11-07 for the account's Actions allowance** — measured arithmetic in
-# `docs/ops-actions-minutes.md`, including why the earlier "option E" recommendation was wrong. The shape now is:
-#
-# * **a push to `main`** → `Test (ubuntu-latest)` and nothing else (~4.6 billed minutes). This is the row a closure
-#   paragraph has always been able to cite for fmt/clippy/rustdoc/tests, and it lands within minutes of the merge.
-# * **nightly schedule, a manual dispatch, or any pull request** → the full matrix: Windows plus both C++ feature rows
-#   (~25.4 billed minutes). This is where platform and feature-gated evidence comes from now; `gh workflow run ci.yml
-#   --ref <sha>` buys it for one specific tree before a card closes on it.
-# * **a push to any other branch** → nothing. Branch pushes were never the graded artifact here: local gates (17 rows,
-#   including the `local-model` and `vision` clippy/test rows) are the branch evidence, and they already ran before every
-#   merge this week.
-#
-# What that trades, said plainly: between a merge and the next nightly, `main` is graded on Linux only. A Windows-only
-# lint or platform answer, or a feature-gated compile break, can therefore sit on `main` for up to a day — which is what
-# the local gate rows are for in the meantime, and what a manual dispatch before a closure paragraph is for. The
-# allowance (inferred at ~2,000 billed minutes/month from two months stopping just past it) does not support anything
-# richer at this repository's November cadence: 91 runs in 6.4 days, 38 of them on `main`.
+# The matrix policy, in one sentence: a push to `main` grades Linux; Windows and both C++ feature rows run on the
+# nightly schedule, on any pull request, and on `workflow_dispatch`, where `gh workflow run ci.yml --ref <sha>` buys the
+# full matrix for one tree. Why it is cut there, and what stands in between a merge and the next nightly, is in
+# `docs/developing.md`.
+
 on:
   push:
     branches: [main]

@@ -217,7 +217,7 @@ No change to the unix arithmetic. No new dependency, no new exit code, no change
 
 ## 10. Rollout
 
-1. **Probe, measured 2026-11-05** (`/home/agent/tmp/winprobe`, throwaway): exactly this `#[link(name = "kernel32")] extern "system"`
+1. **Probe, measured 2026-11-05** (`$TMPDIR/winprobe`, throwaway): exactly this `#[link(name = "kernel32")] extern "system"`
    block, the `encode_wide` conversion and the climb loop. `cargo check --target x86_64-pc-windows-msvc --all-targets` → **exit 0** at
    the workspace's own edition (2021), where a plain `extern "system"` is legal. The same file compiled for the host → **fails**, as
    it must, since the code lives under `#[cfg(windows)]`. A whole-crate cross-check is impossible on this host: bundled SQLite needs
