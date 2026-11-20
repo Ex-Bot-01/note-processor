@@ -1622,7 +1622,7 @@ fn index_file(
 /// live note, against "tracked but never catalogued", so the row goes with what hangs off it.
 ///
 /// Only this note's `origin = 'prose'` edges go too: an approved edge is an input and not derived output
- Edges pointing *in* lose their destination rather than being deleted, because they are
+/// Edges pointing *in* lose their destination rather than being deleted, because they are
 /// another note's prose and stay countable as unresolved.
 ///
 /// Migration 3 gave every one of these five statements a twin in the schema — each child table cascades
