@@ -125,6 +125,11 @@ row f31-selftest python3 .github/scripts/f31_eval.py --self-test
 # a mis-nested quote in `release.yml` was discovered by a runner — after it had compiled llama.cpp for Windows. This row costs
 # milliseconds and is the difference between that and a red local run.
 row workflow-shells .github/scripts/check-workflow-shells.sh
+# **A date in the future, which is how a month gets written wrong.** A stretch of this project's prose was dated one
+# month ahead of the work it described — "while cutting v0.3.0" beside a tag dated 2026-11-09, a spec first committed
+# 2026-11-09 whose file name claimed another month — and a wrong month reads exactly like a right one, so nothing caught
+# it. This row costs milliseconds: any calendar date in a tracked file later than HEAD's own commit date is reported.
+row dates-ahead python3 .github/scripts/check-dates-ahead.py
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.
