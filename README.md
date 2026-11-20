@@ -318,7 +318,7 @@ The decisions behind those, each with its measurements:
 | [`docs/design-f48-links-as-a-query.md`](docs/design-f48-links-as-a-query.md) | What a client may assume about link identity: display paths and lines, what `rel` scopes, and why figures and stale notes are absent from `links.list` |
 | [`docs/design-f50-consent-has-a-door.md`](docs/design-f50-consent-has-a-door.md) | Who may write `config.toml`, and how the write is checked: validation by loading, refusal over half-configuration, provenance in the file |
 | [`docs/design-f49-word-beginnings.md`](docs/design-f49-word-beginnings.md) | What a query may ask for besides a whole word: the one character of syntax, why the default did not move, and how an answer admits it widened |
-| [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
+| [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/archive/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
 
 Code comments carry the local reasoning; those files carry the decisions and the measurements.
 

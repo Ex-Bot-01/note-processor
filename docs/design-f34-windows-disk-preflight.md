@@ -186,11 +186,11 @@ records it as a prediction); concurrency slack in the relational test; or anythi
 What it *does* say about macOS is a build fact only: the target compiles the unix `statvfs` arm (`Cargo.toml:57-58`,
 `release.yml:35-36`), and its number has never been read here.
 
-`docs/plan-2026-10-28-state-and-roadmap.md:62` says "CI green Linux + Windows" for the shipped milestones. **That was true** — those
+`docs/archive/plan-2026-10-28-state-and-roadmap.md:62` says "CI green Linux + Windows" for the shipped milestones. **That was true** — those
 milestones' Windows jobs ran, 10 steps each, through 2026-10-29 (§1). An earlier draft of this round rewrote it to "nothing in this
 subgraph was ever executed on Windows", which the job-by-job scan falsifies; the wording now restored adds only what is measured:
 the block window, the resumption, and that `main` has been red on Windows since `a816b17`. The same scan retires the "CI cannot start
-jobs on this account" sentences in `README.md`, `docs/plan-…:161`, `docs/roadmap-2026-10-27.md` and `.github/workflows/ci.yml`.
+jobs on this account" sentences in `README.md`, `docs/plan-…:161`, `docs/archive/roadmap-2026-10-27.md` and `.github/workflows/ci.yml`.
 
 ## 8. Non-goals
 

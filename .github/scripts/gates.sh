@@ -117,7 +117,7 @@ row catalog-goldens python3 "$G/verify_catalog_goldens.py"
 # The fences that check the fences. Each python fence carries `--self-test`: a tree of planted violations it must name,
 # one per rule it claims to enforce. A rule nobody has ever seen fail is indistinguishable from a rule someone deleted,
 # which is how three of these rows sat red for weeks with nothing but an exit code to say so.
-for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead; do
+for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links; do
   row "selftest-${fence}" python3 "$G/${fence}.py" --self-test
 done
 
@@ -135,6 +135,12 @@ row workflow-shells "$G/check-workflow-shells.sh"
 # 2026-11-09 whose file name claimed another month — and a wrong month reads exactly like a right one, so nothing caught
 # it. This row costs milliseconds: any calendar date in a tracked file later than HEAD's own commit date is reported.
 row dates-ahead python3 "$G/check-dates-ahead.py"
+
+# **A link is a promise.** Both spellings are checked — `[text](target)` and a backticked path — because documents move
+# directories and the paths inside them do not move with them. The exclusions (sample data, archived plans, syntax written
+# inside backticks) are listed in the script and pinned by its `--self-test` row below, so they cannot quietly widen into a
+# checker that passes everything.
+row links python3 "$G/check-links.py"
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.

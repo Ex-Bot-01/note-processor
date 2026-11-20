@@ -1,7 +1,7 @@
 # `np serve` — a stdio JSON-RPC surface for a frontend
 
 **Status:** design, 2026-11-08. Approach chosen by the operator (option C of three) when asked what a frontend should talk to.
-**Companion:** `docs/roadmap-2026-10-27.md` puts the daemon, loopback HTTP API, watcher and autostart in **M4**; this document is deliberately
+**Companion:** `docs/archive/roadmap-2026-10-27.md` puts the daemon, loopback HTTP API, watcher and autostart in **M4**; this document is deliberately
 smaller than M4 and does not pre-implement it.
 
 ## Intent and the why

@@ -3,7 +3,7 @@
 //! **Why this exists and what it is not.** A frontend needs three things argv does not give it cheaply: no process start per question, no model
 //! reload per question (a fresh `np` re-reads a 309 MB artifact before its first search), and one place to hold a workspace open. This module is
 //! the smallest surface that provides them: **one long-lived process, newline-delimited JSON in and out, no port, no auth, no daemon**. The
-//! loopback HTTP API, watcher and autostart are M4 in `docs/roadmap-2026-10-27.md` and have their own design ahead of them; nothing here
+//! loopback HTTP API, watcher and autostart are M4 in `docs/archive/roadmap-2026-10-27.md` and have their own design ahead of them; nothing here
 //! pre-implements them, and the dispatcher is a plain function so that an HTTP adapter can call it later without re-deciding what a request means.
 //! Design: `docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md`.
 //!

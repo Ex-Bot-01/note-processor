@@ -1,7 +1,7 @@
 # M2a — chunk and vector storage, with the model choice still open
 
 Date: 2026-10-28. Branch: `m12/embeddings`. Spec: `docs/superpowers/specs/2026-10-23-note-processor-design.md`
-§"Embeddings", §13 step 2. Roadmap: `docs/roadmap-2026-10-27.md` Track B M2. Backlog note that made the ordering
+§"Embeddings", §13 step 2. Roadmap: `docs/archive/roadmap-2026-10-27.md` Track B M2. Backlog note that made the ordering
 argument: `docs/backlog-m2-followups.md:189` — derived-data storage is "cheaper to build once now than to retrofit
 after clustering stores derived data too."
 
@@ -42,7 +42,7 @@ M2a therefore builds **the seam and the measurement**, not the model:
   contacts nothing, and renders the identical catalog. This is not a stub to be filled in later: it is the shipping
   behaviour for anyone who has not chosen, and it is why M2a can merge before §2's question is answered.
 - The benchmark (§6) runs on this host against whichever candidates I can build here, with its limits stated. Its
-  numbers go into `docs/design-m2-model-choice.md`, which is where the model gets picked — with you in the loop, since
+  numbers go into `docs/design-m2-local-embeddings.md`, which is where the model got picked — with you in the loop, since
   it is your CPU and your bandwidth.
 
 ## 3. Schema: migration 7
