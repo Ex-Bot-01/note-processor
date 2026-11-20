@@ -603,12 +603,13 @@ fn scan_inner(
         },
     )?;
     // Decided here, before anything else writes, from what the write pass actually delivered. One coverage
-    // answer serves both versions, because §5 reuses `refresh_covered`'s two sources **unchanged**: a note
+    // answer serves both versions, because the chunk rule reuses `refresh_covered`'s two sources **unchanged**:
+// a note
     // that escaped this scan escaped chunking too, and inventing a second coverage rule for chunks would be
     // a second thing to keep honest for no extra fact.
     let covered = refresh_covered(&written, hidden);
     let record_version = refresh && covered;
-    // **Provider availability is not version debt** (design-m2-embeddings §5's P0). Nothing above or below
+    // **Provider availability is not version debt.** Nothing above or below
     // this line asks whether an embedder exists, and that is the whole decision: if recording waited for a
     // provider, then with `embeddings.provider = "none"` — the default, what every install runs until
     // a human picks a model — the key would never be recorded, the coverage record would read as a gap
@@ -642,7 +643,7 @@ fn scan_inner(
     // it describes became durable.
     set_meta(&db, LAST_SCAN_KEY, &unix_now().to_string())?;
     // Read here, inside the transaction and after every write of this scan, so the duplicate count answers
-    // what this scan leaves behind rather than what it found (F23's duplicate is *created* by a write pass).
+    // what this scan leaves behind rather than what it found: a duplicate pair is *created* by a write pass.
     let duplicates = duplicated_rels(&db)?;
     if record_version {
         // Recorded in the same transaction as the rows it describes: a scan that dies halfway has to
@@ -668,16 +669,16 @@ fn scan_inner(
     if chunk_refresh && !record_chunk_version {
         // The same silence is worse here than it is for parse rules. `report_refresh` above prints nothing when
         // this scan re-parsed nothing, which is exactly the shape of a chunker-only bump: the version is withheld
-        // by an F18 refused name or an unmerged duplicate pair, and no line is written about it on any scan, so a
-        // coverage gap nobody is told about is indistinguishable from a corpus that was never cut. §5's case for
-        // recording anyway rests on that gap being bad; this line is what makes it visible.
+        // by a name this build refuses or an unmerged duplicate pair, and no line is written about it on any
+        // scan, so a coverage gap nobody is told about is indistinguishable from a corpus that was never cut.
+        // The case for recording anyway rests on that gap being bad; this line is what makes it visible.
         report_chunk_gap(&mut io::stderr(), written.uncovered + hidden);
     }
 
-    // The durable record of what this scan could not index, written **after** the commit it describes — the
-    // position F21's receipt echo established, and for the same reason: a scan that rolled itself back has
-    // nothing to announce. Written on every scan, including one that lost nothing, because the record is
-    // current state and an old value left standing is a false accusation (F22 §2).
+    // The durable record of what this scan could not index, written **after** the commit it describes for the
+    // same reason the report lines above wait for it: a scan that rolled itself back has nothing to announce.
+    // Written on every scan, including one that lost nothing, because the record is current state and an old
+    // value left standing is a false accusation.
     let losses = unindexable_record(
         &walked.unreadable,
         &walked.unrepresentable,
@@ -802,7 +803,7 @@ fn read_found(files: &[DiscoveredFile], skipped: &mut Vec<UnknownPath>) -> Vec<F
             .filter(|found| is_unknown(found))
             // Both spellings of the path, from the walk's own component walk: this file was listed, so its
             // bytes are as exact as a refused directory's, and deduping on them keeps two unreadable twins
-            // from publishing one line (F20 §1).
+            // from publishing one line.
             .map(|found| UnknownPath {
                 display: found.snapshot.rel.clone(),
                 bytes: found.snapshot.rel_bytes.clone(),
@@ -816,7 +817,7 @@ fn read_found(files: &[DiscoveredFile], skipped: &mut Vec<UnknownPath>) -> Vec<F
 ///
 /// Keying on bytes is what stops two refused (or unreadable, or unread-and-vanished) paths that share one lossy
 /// display spelling from collapsing into a single line — the scan saw two paths and has to say so twice, however
-/// alike the two lines look (F20 §1). Sorting by the same key makes the order total where display text ties.
+/// alike the two lines look. Sorting by the same key makes the order total where display text ties.
 /// A name that only ever existed as text arrives through [`UnknownPath::from_display`], whose bytes *are* that
 /// text's UTF-8 bytes, so such entries dedup and order exactly as the strings used to.
 fn skipped_lines(mut paths: Vec<UnknownPath>) -> Vec<String> {
@@ -891,12 +892,13 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// The registry rows `classify` compares against: live rows, minus anything whose path this scan could not
 /// look at — a subtree under an unreadable directory, or one refused name. The filter is
 /// [`is_unknown_path`], and it judges a row by its `rel_bytes`: a row whose *display* text happens to match an
-/// unknown path while its bytes do not belongs to a subtree this scan did read, and hiding it is F20. The one
-/// exception is a row whose stored key was itself derived from display text ([`key_is_display_derived`]): such a
-/// row has no byte spelling left to be judged by, so it is compared text against text (F20 §4.2, "unknown is not
-/// absent") — but since F23 that comparison **marks** the row instead of deleting it. An ambiguous row stays in
-/// `known` when a listed readable path spells it exactly and matches its stored hash ([`admits`], §2's scoping),
-/// and whether it resolves is decided afterwards from what `classify` did, not here.
+/// unknown path while its bytes do not belongs to a subtree this scan did read, and hiding such a row is the
+/// mistake this filter exists not to make. The one exception is a row whose stored key was itself derived from
+/// display text ([`key_is_display_derived`]): such a row has no byte spelling left to be judged by, so it is
+/// compared text against text — unknown is not absent — and that comparison **marks** the row rather than
+/// deleting it. An ambiguous row stays in `known` when a listed readable path spells it exactly and matches its
+/// stored hash, which is what [`admits`] decides; whether it resolves is settled afterwards from what
+/// `classify` did, not here.
 ///
 /// Stale rows stay out because their absence was already reported; leaving them in would count one
 /// deleted file as `removed` on every later scan. Dropping them is also what lets such a file come back
@@ -904,38 +906,38 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 /// [`crate::db`] keeps ids stable for exactly that.
 ///
 /// The unreadable directories are the other half of the same caution: files below one were never seen,
-/// so their rows must reach neither a `Removed` nor a move (Task 4 handoff), and leaving them in would
+/// so their rows must reach neither a `Removed` nor a move, and leaving them in would
 /// stale a whole subtree over one transient permission error. A refused name is the third piece of the same
-/// rule ([`is_unknown_path`], F18): the file is there, but its identity could not be spelled, so its row
+/// rule ([`is_unknown_path`]): the file is there, but its identity could not be spelled, so its row
 /// keeps what it has instead of being marked stale for want of a key. A refused **directory** needs no fourth
 /// rule: [`crate::walk`] records it in `unreadable`, because an unspellable name makes every path below it
 /// unkeyable too — the same hole an unreadable one cuts, by the same prefix.
 ///
 /// The note test correlates on `rel_bytes`: with twins a note belonging to either file would otherwise
 /// answer for both, and that boolean feeds the refresh-coverage decision, which decides whether
-/// [`PARSE_VERSION_KEY`] gets recorded (F13 §3).
+/// [`PARSE_VERSION_KEY`] gets recorded.
 ///
 /// The count alongside the rows is how many live **note** rows that byte-keyed filter dropped — nothing else
 /// reports them, since they appear nowhere in `found` — which is how [`scan_with_inject`] knows a
 /// parse-rule refresh never reached part of the corpus. Any row with no note behind it is excluded by the
 /// `EXISTS` — attachments and never-yet-parsed paths alike: no parse rule can stale rows that do not exist,
-/// so counting one would pin the version forever over work that is not owed. F23's marked rows charge
-/// **separately** ([`unresolved_ambiguity`], §3's source 2), and a row never charges both ([`known_rows`]'s
+/// so counting one would pin the version forever over work that is not owed. Marked rows charge
+/// **separately** ([`unresolved_ambiguity`]), and a row never charges both ([`known_rows`]'s
 /// precedence: the byte arm answers first and marks nothing).
 struct KnownRows {
     /// The rows `classify` may judge.
     rows: Vec<Snapshot>,
-    /// Source 1: live note rows the **byte-keyed** arm hid, unchanged by F23.
+    /// Live note rows the **byte-keyed** arm hid.
     hidden: usize,
     /// Every ambiguous row this pass marked, admitted or refused, in byte-key ascending order — the
-    /// population [`unresolved_ambiguity`] reads and §6's record field renders.
+    /// population [`unresolved_ambiguity`] reads and the unindexable record renders.
     marked: Vec<Marked>,
     /// The one identity tally computed from these rows and the listed paths, shared with
-    /// [`crate::change::classify_with_identities`] so admission and pairing cannot disagree (design-a4 §3).
+    /// [`crate::change::classify_with_identities`] so admission and pairing cannot disagree.
     identity: FileIdentities,
 }
 
-/// One row F23 **marked**: its key is display text ([`key_is_display_derived`]) and an unreadable path spells
+/// One row `known_rows` **marked**: its key is display text ([`key_is_display_derived`]) and an unreadable path spells
 /// that text, so `known_rows` cannot tell whether the file it describes is the readable look-alike or a file
 /// behind the obstruction. It may never be removed, and it may be claimed — by content or by its own listed
 /// path.
@@ -943,7 +945,7 @@ struct Marked {
     /// The row's stored key: what a claim names (`Change::Moved { from }`) and what [`strip_marked_removals`]
     /// matches a `Removed` against.
     key: Vec<u8>,
-    /// Display spelling, for the capped name list in F22's record.
+    /// Display spelling, for the capped name list in the unindexable record.
     rel: String,
     /// Whether [`admits`] let it reach `known`. A refused row is pre-dropped — today's behaviour — and so
     /// resolves nothing this pass.
@@ -960,8 +962,8 @@ fn known_rows(
     listed: &[Snapshot],
 ) -> Result<KnownRows, DbError> {
     // Both key columns come back, because this is the database side of a byte-keyed comparison: hand out
-    // display text here and every non-UTF-8 row reads as removed-and-re-added on every scan forever, which is
-    // §1's never-converges symptom manufactured by the fix (F13 §4.1).
+    // display text here and every non-UTF-8 row reads as removed-and-re-added on every scan forever — the
+    // never-converges symptom manufactured by the fix.
     let mut statement = db.0.prepare(
         "SELECT f.rel_bytes, f.case_bytes, f.rel, f.case_key, f.hash, f.size, f.mtime,
                 EXISTS (SELECT 1 FROM notes n WHERE n.rel_bytes = f.rel_bytes),
@@ -979,7 +981,7 @@ fn known_rows(
                 size: row.get::<_, i64>(5)?.max(0) as u64,
                 mtime: row.get(6)?,
                 // Nullable by design: a row written before migration 6, or any row on a platform that reports
-                // nothing, reads as unknown. The routes that use it treat unknown as no opinion (design-a4 §3).
+                // nothing, reads as unknown. The routes that use it treat unknown as no opinion.
                 file_id: row.get(8)?,
             },
             row.get::<_, bool>(7)?,
@@ -997,25 +999,25 @@ fn known_rows(
     // fact about the whole population — "exactly one row and exactly one listed path carry this id" cannot be
     // answered row by row — so it is computed once from everything loaded, then consulted by admission here and
     // by pairing in `classify`. One tally, two readers, which is what keeps them from disagreeing about who is
-    // eligible (design-a4 §3): a row admitted without a partner would have its `Removed` stripped and gain no
+    // eligible: a row admitted without a partner would have its `Removed` stripped and gain no
     // `Moved`, the permanent-duplicate stuck state this function's own comment warns about.
     let mut loaded: Vec<Snapshot> = Vec::new();
     // `(index, is_note)` for each marked row, in the query's byte-key order — which is the order `marked` must
-    // come out in, because §5.7's determinism rule reads that vector when it renders the record.
+    // come out in, because the determinism rule reads that vector when it renders the record.
     let mut candidates: Vec<(usize, bool)> = Vec::new();
     let mut is_marked: Vec<bool> = Vec::new();
     for row in rows {
         let (snapshot, is_note) = row?;
         // Bytes first: that is the identity, and for any row the walk keyed it this is the whole answer. First
-        // for a second reason too — §3's **precedence**. The permanent class satisfies both arms at once (a row
+        // for a second reason too — **precedence**. The permanent class satisfies both arms at once (a row
         // whose key equals its OS bytes, sitting under a genuinely unreadable prefix), so marking before hiding
-        // would charge it in source 1 *and* source 2; on Windows, where refusal bytes are already lossy, that
+        // would charge it in the hidden count *and* the ambiguity tally; on Windows, where refusal bytes are lossy, that
         // double charge would be universal. Today's single `||` could not double count, and neither may this.
         if is_unknown_path(&snapshot.rel_bytes, unreadable, unrepresentable) {
             if is_note {
                 // The row is live and hidden, not deleted — the distinction a reader of a short `INDEX.md` is trying
-                // to make. The directory is reported as `unreadable`; this names the note it swallowed (§12: the stored
-                // path, never the note's text).
+                // to make. The directory is reported as `unreadable`; this names the note it swallowed — the stored
+                // path, never the note's text.
                 tracing::debug!(
                     target: crate::diagnostics::target::SCAN,
                     rule = crate::diagnostics::rule::HIDDEN_BEHIND_UNREADABLE,
@@ -1036,8 +1038,8 @@ fn known_rows(
     }
 
     // The scope lives here, at the one call site, rather than as a wider public API: every marked row is
-    // display-derived by construction, so this is exactly F23's population and an ordinary rename's stored row is
-    // never offered to identity pairing at all (design-a4 §3).
+    // display-derived by construction, so this is exactly the ambiguous population and an ordinary rename's
+    // stored row is never offered to identity pairing at all.
     let identity = FileIdentities::build(&loaded, listed, |row| {
         key_is_display_derived(&row.rel, &row.rel_bytes)
     });
@@ -1048,7 +1050,7 @@ fn known_rows(
     let mut marked = Vec::with_capacity(candidates.len());
     for &(index, is_note) in &candidates {
         let snapshot = &loaded[index];
-        // Content first, identity second, and the order is F23 §3's precedence carried forward rather than
+        // Content first, identity second, and the order is a precedence rule rather than
         // taste: the byte arm of `key_is_display_derived` already decides what a row is, and a route that could
         // disagree with it would make which fact wins depend on which question got asked first.
         let admitted = admits(db, snapshot, listed)?
@@ -1099,8 +1101,8 @@ fn known_rows(
     })
 }
 
-/// Whether an ambiguous row is **admitted** to `known` — §2's scoping clause, and the one assertion standing
-/// between F23 and a note re-homed onto a stranger's file.
+/// Whether an ambiguous row is **admitted** to `known` — the scoping rule that stands between marking such a
+/// row and re-homing its note onto a stranger's file.
 ///
 /// `classify` matches a claim on **hash alone** (`claimants.get(added.hash)` over every unmatched known row),
 /// and its `present_hashes` guard cannot help here: that set is seeded from known rows whose *key* matches an
@@ -1110,7 +1112,7 @@ fn known_rows(
 /// path must spell the row exactly (same display text), carry its stored hash, and be readable (an empty hash is
 /// [`crate::change`]'s unknown marker).
 ///
-/// The third test is §4's stale-row rule: a claim onto a key another row already holds hits the `UNIQUE` in
+/// The third test is the stale-row rule: a claim onto a key another row already holds hits the `UNIQUE` in
 /// [`crate::db::apply_move`], comes back `Indexed::Taken`, returns early, and leaves the path in `skipped` while
 /// `owes_a_reparse` charges `written.uncovered` on every refresh — a stuck state nothing clears. Rows of **any**
 /// state count, because [`crate::db::upsert_file`] resolves by `rel_bytes` with no state filter and that is how a
@@ -1119,7 +1121,7 @@ fn known_rows(
 /// Testing "some candidate" rather than "the one `classify` will pick" is sound: a claim needs exactly one added
 /// path carrying the hash (`added_count == Some(&1)`), so wherever two twins both qualify there is no claim to
 /// refuse. With display scoping plus `files.rel_bytes UNIQUE` there is at most **one claimant per listed path**,
-/// which is why no multiplicity rule, tally or tie-break exists to write (§2's corollary).
+/// which is why no multiplicity rule, tally or tie-break exists to write.
 fn admits(db: &Db, row: &Snapshot, listed: &[Snapshot]) -> Result<bool, DbError> {
     for path in listed {
         if path.rel != row.rel || path.hash.is_empty() || path.hash != row.hash {
@@ -1143,7 +1145,7 @@ fn key_taken(db: &Db, key: &[u8], except: &[u8]) -> Result<bool, DbError> {
     Ok(taken)
 }
 
-/// §4's post-strip: drop every `Removed` naming an admitted marked key, after classification and before
+/// Post-strip: drop every `Removed` naming an admitted marked key, after classification and before
 /// anything consumes the list — `changes` has exactly one consumer ([`apply_changes`]), read twice inside it.
 ///
 /// **`Change::Removed` only.** The identity-matched route legitimately emits `Modified` keyed on the listed
@@ -1167,11 +1169,12 @@ fn strip_marked_removals(
         .collect()
 }
 
-/// §3's source 2: the marked rows this pass **did not resolve**, as their display spellings in byte-key order.
+/// The ambiguity half of the coverage charge: the marked rows this pass **did not resolve**, as their display
+/// spellings in byte-key order.
 ///
-/// Resolution is §2's two routes, read from what classification actually delivered rather than tallied in a
-/// pre-pass — which is what lets healed N′ stop paying once it has healed (a charge that never clears is F19's
-/// bug wearing this milestone's clothes):
+/// Resolution is the two routes below, read from what classification actually delivered rather than tallied in
+/// a pre-pass — which is what lets a healed row stop paying once it has healed, because a charge that never
+/// clears is the bug this mechanism exists not to reintroduce:
 ///
 /// - **claimed** — it produced `Moved { from } = its own key`, so [`crate::db::apply_move`] re-keys `rel_bytes`
 ///   from real bytes; or
@@ -1180,10 +1183,10 @@ fn strip_marked_removals(
 ///   are still unpaired. Without this route the permanent class — a name genuinely holding `U+FFFD`, and every
 ///   lossy Windows name — would charge every scan forever.
 ///
-/// Then §3's exclusion: a marked row whose own key was listed **unreadable** is charged by `written.uncovered`
+/// Then the exclusion: a marked row whose own key was listed **unreadable** is charged by `written.uncovered`
 /// instead, which resolves by byte key. Deriving the count from "did we strip a `Removed`" instead would charge
 /// zero times for a marked row `classify` filtered out before emitting anything — an uncharged stale row is
-/// exactly the F15 class this project keeps paying to avoid.
+/// exactly the silent-gap class this project keeps paying to avoid.
 fn unresolved_ambiguity(
     marked: &[Marked],
     changes: &[(RelPath, Change)],
@@ -1219,11 +1222,11 @@ fn unresolved_ambiguity(
 
 /// Whether `rel_bytes` sits inside a directory whose contents this walk never saw, which makes its absence from
 /// the found list meaningless — either the walk could not enter it, or the directory's own name was refused
-/// below ([`crate::walk::Walked::unreadable`] carries both shapes, F18). `"."` is how [`crate::walk`] spells the
+/// below ([`crate::walk::Walked::unreadable`] carries both shapes). `"."` is how [`crate::walk`] spells the
 /// workspace root itself, and that leaves nothing knowable at all.
 ///
 /// Both sides of the comparison are **bytes**, and an entry only matches at a `/` boundary: `caf\xE9` hides
-/// `caf\xE9/a.md` and nothing else — not its twin `caf\xE8/a.md`, whose display spelling is identical (F20 §1),
+/// `caf\xE9/a.md` and nothing else — not its twin `caf\xE8/a.md`, whose display spelling is identical,
 /// and not `caf\xE9x/a.md`, which is a different subtree.
 ///
 /// An entry holding **no** bytes matches nothing. The walk spells the root `"."` for exactly that reason (see
@@ -1242,7 +1245,7 @@ fn under_unreadable(rel_bytes: &[u8], unreadable: &[UnknownPath]) -> bool {
 ///
 /// They describe different shapes of "unknown" and so match differently: an unreadable **directory** hides a
 /// whole subtree, hence [`under_unreadable`]'s prefix rule, while a refused name
-/// ([`crate::walk::Walked::unrepresentable`], F18) is one file rather than a region, hence exact equality.
+/// ([`crate::walk::Walked::unrepresentable`]) is one file rather than a region, hence exact equality.
 /// A refused **directory** belongs to the first list rather than the second
 /// ([`crate::walk::Walked::unreadable`]), and that is not a convenience: its name is the first component of
 /// every path below it, so none of those can be keyed either and the whole subtree needs the prefix rule.
@@ -1271,10 +1274,10 @@ fn is_unknown_path(
 /// Whether a row's stored key is the bytes of its own **display text** instead of the bytes of the path on
 /// disk — the shape [`crate::db::copy_files_rows`] leaves behind, since migration 4 keyed every row through
 /// [`crate::path_keys::rel_bytes_of_display`]. A note really named `caf\xE9/note.md` therefore sits under
-/// `63 61 66 EF BF BD 2F 6E 6F 74 65 2E 6D 64`: the `U+FFFD` spelling of a name whose bytes no `String` holds
-/// (`docs/design-f13-byte-paths.md` §4.2, and `crates/np-core/tests/db.rs` proves such rows ship).
+/// `63 61 66 EF BF BD 2F 6E 6F 74 65 2E 6D 64`: the `U+FFFD` spelling of a name whose bytes no `String` holds;
+/// `crates/np-core/tests/db.rs` proves such rows ship.
 ///
-/// Both halves of the test keep this to rows whose key **is** their own display text, which is what F20's byte
+/// Both halves of the test keep this to rows whose key **is** their own display text, which is what byte
 /// matching cannot judge: a key differing from its row's display bytes came off the disk, and a `rel` with no
 /// `U+FFFD` in it has one spelling — either way [`is_unknown_path`] already decided the row exactly as it did
 /// before this fallback existed.
@@ -1285,11 +1288,11 @@ fn is_unknown_path(
 /// byte spelling for a UTF-16 name. In those cases the text arm is just the byte arm again — same bytes, same
 /// answer — which is why widening here costs nothing they were not already paying.
 ///
-/// A migrated row leaves the class when a scan sees its path **and** pairs with it — by identity, or since F23 by
+/// A migrated row leaves the class when a scan sees its path **and** pairs with it — by identity, or by
 /// content through [`known_rows`]' scoping, which routes the pair through [`crate::db::apply_move`] so `rel_bytes`
-/// becomes the walk's bytes (F13 §4.2's one-time churn). Nothing else does: an unchanged row is refreshed in place and
+/// becomes the walk's bytes, a churn paid once per row. Nothing else does: an unchanged row is refreshed in place and
 /// keeps the key it has, so this fallback is not transitional for the cases above — say "until someone renames it", not
-/// "until the next scan". What F23 changed is not membership but consequence: a row still in the class is now marked
+/// "until the next scan". What changed is not membership but consequence: a row still in the class is now marked
 /// rather than deleted, which is what lets content settle identity at all.
 ///
 /// The refused-name arm gets no text side, deliberately: a refusal entry's own bytes are lossy wherever refusals
@@ -1307,22 +1310,22 @@ fn key_is_display_derived(rel: &str, rel_bytes: &[u8]) -> bool {
 /// Matching these against such a row's `rel` is deliberately **wider** than the byte comparison, and only for
 /// those rows: one `caf\u{FFFD}` entry then hides it whichever twin its bytes came from. The asymmetry is the whole
 /// argument — a false `Removed` stales a live note, drops it from the catalog, under-charges the refresh gap so
-/// [`PARSE_VERSION_KEY`] is recorded over rows nobody re-parsed, and (F13 §4.2) brings the note back as a **second
+/// [`PARSE_VERSION_KEY`] is recorded over rows nobody re-parsed, and brings the note back as a **second
 /// `notes.id`** when the directory opens again.
 ///
 /// **Do not call that over-hiding harmless.** When the row's own path is readable while an unreadable twin shares its
 /// display spelling, hiding the row left the listed path with no row to pair with, so it indexed as a spurious `Added`:
-/// two live `files` and `notes` rows for one file, with the version withheld forever. **F23 closed that half here** —
+/// two live `files` and `notes` rows for one file, with the version withheld forever. **That half is closed here** —
 /// not by narrowing this predicate, which cannot tell the cases apart, but by marking the row instead of deleting it so
-/// [`crate::change::classify`] can pair them on content: see `docs/design-f23-ambiguous-rows.md` §2 and
-/// `a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version`.
+/// [`crate::change::classify`] can pair them on content; that is what
+/// `a_healed_display_keyed_pair_leaves_one_live_row_and_records_the_version` asserts.
 ///
 /// What still stands, and is why the width stays: no predicate computable at this point separates the two cases, because
 /// a display spelling has many byte twins and a lossy key records none of them. A row whose **content changed** while it
 /// was unindexable has nothing to pair on, so its duplicate pair returns; and the case this fallback exists for — the
 /// row's own file inside the obstruction, a different file readable outside it — must keep hiding, which is what
-/// `a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin` fences. Backlog **F23** remains open
-/// for the residue and names durable file identity as the way through it.
+/// `a_display_keyed_row_inside_an_unreadable_directory_survives_its_readable_twin` fences. The residue stays an
+/// open backlog item, where durable file identity is named as the way through it.
 fn display_spelled(paths: &[UnknownPath]) -> Vec<UnknownPath> {
     paths
         .iter()
@@ -1335,14 +1338,14 @@ fn display_spelled(paths: &[UnknownPath]) -> Vec<UnknownPath> {
 ///
 /// Every readable file is upserted and not only the changed ones, because `classify` emits nothing for a
 /// matched pair whose hash agrees — and without the refresh such a file would carry an old `mtime` in the
-/// database and be re-hashed by every later scan forever (Task 4 handoff).
+/// database and be re-hashed by every later scan forever.
 ///
 /// A path whose identity is already held by another row — two files named `a.md` and `A.md` on a
 /// case-sensitive filesystem, where `files.case_bytes` stays unique and nothing picks a winner — is
-/// reported under `skipped` and left out of the counts instead of aborting the scan (ruling P3). So is a path
+/// reported under `skipped` and left out of the counts instead of aborting the scan. So is a path
 /// holding more than one note row ([`NoteRow::Duplicate`]), which no constraint can see.
 ///
-/// The pending map is keyed on bytes, like every other identity in the pass (F13 §4.1): keyed on display
+/// The pending map is keyed on bytes, like every other identity in the pass: keyed on display
 /// `rel`, two twins read back **the same change** from one slot whatever the columns are called.
 ///
 /// `chunks` accumulates what the chunk pass did ([`ChunkTally`]). It is a parameter rather than a field of
@@ -1371,7 +1374,7 @@ fn apply_changes(
         if is_unknown(readable) {
             // The file was listed and then could not be read (or changed under the read). This is the state whose
             // absence from a report once read as "the note is gone": its rows are kept precisely because the next scan
-            // may read it fine, and the diagnostic says which of the two happened to this path (§12: a path, no body).
+            // may read it fine, and the diagnostic says which of the two happened to this path — a path, no body.
             tracing::debug!(
                 target: crate::diagnostics::target::SCAN,
                 rule = crate::diagnostics::rule::UNREADABLE,
@@ -1425,8 +1428,8 @@ fn apply_changes(
                     written.uncovered += 1;
                 }
             }
-            // More than one note row sits on this path, so no note was re-parsed or rewritten (F13 §7; the
-            // registry row may already have moved — see [`Indexed::Duplicate`]). Its rows exist and stay
+            // More than one note row sits on this path, so no note was re-parsed or rewritten (the registry
+            // row may already have moved — see [`Indexed::Duplicate`]). Its rows exist and stay
             // whatever rules wrote them, which is exactly what a refresh has to remember.
             Indexed::Duplicate => {
                 // Neither of these two rules has a case asserting on the event, and the reason is named rather than
@@ -1496,8 +1499,8 @@ enum Indexed {
     Done(Option<Parsed>),
     /// Another path holds this identity, so nothing about this row was touched.
     Taken,
-    /// More than one note row sits on this path's key — a legacy duplicate `notes.rel` never forbade
-    /// (F13 §7). Picking one would rewrite that note's title, tags, items and links with the other's
+    /// More than one note row sits on this path's key — a legacy duplicate `notes.rel` never forbade.
+    /// Picking one would rewrite that note's title, tags, items and links with the other's
     /// contents, so no note is re-parsed or rewritten and the file is named in `skipped`.
     ///
     /// What *is* already written by the time this is decided, and what a reader must not be promised away:
@@ -1518,8 +1521,8 @@ enum Indexed {
 /// Bring one found file's row up to date and re-index its contents when they changed, or when `refresh`
 /// says the rules that wrote its derived rows are no longer this build's.
 ///
-/// A note's chunks are refreshed on the same pass and inside the same transaction (§5: cheap, and atomic
-/// with the note rows) — see [`refresh_chunks`] for the order that work is decided in.
+/// A note's chunks are refreshed on the same pass and inside the same transaction — cheap, and atomic with
+/// the note rows — see [`refresh_chunks`] for the order that work is decided in.
 fn index_file(
     db: &Db,
     readable: &Found,
@@ -1546,7 +1549,7 @@ fn index_file(
                 // Identity first: on a case-insensitive filesystem the row may sit under another
                 // spelling of the same name — a case-only rename emits no change at all — and upserting
                 // over it would trip `files.case_bytes UNIQUE` instead of renaming the note that is still
-                // the same note (Task 4 handoff).
+                // the same note.
                 if let Some(old) = folded_row(db, &snapshot.case_bytes, &snapshot.rel_bytes)? {
                     if let Err(err) = db::apply_move(db, &old, &path, now) {
                         return conflict_or_err(err, Indexed::Taken);
@@ -1557,7 +1560,7 @@ fn index_file(
     }
 
     // Whether this write replaced a different digest. `index_file` needs it below: a change kind cannot express
-    // "same file, new path, new bytes", and that is exactly the case identity resolves (design-a4 §4a).
+    // "same file, new path, new bytes", and that is exactly the case identity resolves.
     let hash_changed = match db::upsert_file(db, snapshot, &readable.abs, now) {
         Ok(changed) => changed,
         Err(err) => return conflict_or_err(err, Indexed::Taken),
@@ -1567,7 +1570,7 @@ fn index_file(
     // path. Missing rows are rebuilt whatever `classify` said: a file that changed extension into `.md`
     // while keeping its bytes is a `Moved`, and would otherwise stay unparsed forever.
     if let Some(text) = &readable.text {
-        // `refresh` rewrites a note whose bytes did not change: the whole point of F15 is that its
+        // `refresh` rewrites a note whose bytes did not change: the whole point is that its
         // derived rows were written by rules this build no longer has.
         // `hash_changed` is the content-based half of this test, and it is load-bearing rather than tidier.
         // A `Moved` was never in the list above because every move today implies equal bytes by construction —
@@ -1576,14 +1579,15 @@ fn index_file(
         // from the ambiguity charge, and let `PARSE_VERSION` be recorded as though it had been read; the next
         // scan short-circuits on size and mtime before comparing hashes, so nothing would ever notice. Keyed on
         // content rather than on a variant on purpose: any future route that pairs differing bytes lands in the
-        // same hole (design-a4 §4a).
+        // same hole.
         let rewritten =
             refresh || hash_changed || matches!(change, Some(Change::Added | Change::Modified));
         // One id lookup per note, resolved here — after any move above has been applied, which is
         // what lets [`db::apply_move`] have rewritten `notes.rel` onto the new path (migration 4 removed the
         // foreign key that used to do it). The same answer
         // decides whether a note without a row is rebuilt (`is_none()` below) and whether
-        // [`store_note`] updates or inserts; looking it up again inside `store_note` was F10.
+        // [`store_note`] updates or inserts; a second lookup inside `store_note` is the duplicated read
+        // this rule exists to stop.
         let existing = match note_row(db, &path)? {
             NoteRow::Missing => None,
             NoteRow::One(id) => Some(id),
@@ -1639,7 +1643,7 @@ fn index_file(
 ///   its destination — which is precisely what `dst_note_id`'s foreign key now rules out.
 ///
 /// Returns `false` when the path carries **more than one** note row and nothing was deleted: choosing which
-/// of two notes to destroy is the same guess F13 §7 refuses, so the caller reports the file instead.
+/// of two notes to destroy is a guess this pass never makes, so the caller reports the file instead.
 /// `true` means the path is now free of note rows — whether or not one was there, since "already none" is
 /// the state this call wanted.
 fn delete_note_row(db: &Db, path: &RelPath) -> Result<bool, DbError> {
@@ -1699,7 +1703,7 @@ fn is_identity_conflict(err: &DbError) -> bool {
 
 /// The `rel` of a live row holding `case_key` under a different spelling of the same path.
 /// The row holding `case_bytes` under a different byte key — the one a rename has to follow. Matched on the
-/// ASCII byte fold and returning both spellings of the row it finds (F13 §3): once this matched the Unicode
+/// ASCII byte fold and returning both spellings of the row it finds: once this matched the Unicode
 /// display fold it handed back a *twin* as "another spelling of the same name", and [`index_file`] then moved
 /// a row between two files that both exist. The accepted price is in [`crate::path_keys::case_fold`]'s doc:
 /// a rename that changes only a non-ASCII letter's case stops being followed here.
@@ -1725,12 +1729,12 @@ fn folded_row(db: &Db, case_bytes: &[u8], rel_bytes: &[u8]) -> Result<Option<Rel
 /// headings, tags and items hang off it and M3's item identity has to survive a rescan. The child rows are
 /// then replaced rather than appended — [`crate::links::store_links`] writes nothing on its own, so a scan
 /// that appended would duplicate every row on every rescan and break byte-identical regeneration. Only
-/// this note's `origin = 'prose'` links go; an approved edge is an input and not derived output (spec
-/// §10), so a rescan must never undo one.
+/// this note's `origin = 'prose'` links go; an approved edge is an input and not derived output, so a
+/// rescan must never undo one.
 ///
 /// `existing` is the note row behind `rel` as [`index_file`] resolved it — `None` when there is none
 /// yet. The id is passed in rather than looked up here because [`index_file`] needs the same answer
-/// to decide whether to re-parse at all, and before F10 the duplicate existed on exactly one branch:
+/// to decide whether to re-parse at all, and the duplicate used to exist on exactly one branch:
 /// its `rewritten || note_id(db, rel)?.is_none()` short-circuits on `Added | Modified`, so a changed
 /// note did its only lookup inside this function — only a row-less note, where `rewritten` is false
 /// and `is_none()` alone decides, was asked the question twice.
@@ -1741,7 +1745,7 @@ fn folded_row(db: &Db, case_bytes: &[u8], rel_bytes: &[u8]) -> Result<Option<Rel
 /// and that call is where the note's byte key is written, not here (see its doc for why the insert lives in
 /// `db`).
 /// Returns the `notes.id` the row was written under — the id a re-parse keeps — because the chunk pass that
-/// follows hangs its rows off it and must not look it up a second time (F10's rule about a duplicated read).
+/// follows hangs its rows off it and must not look it up a second time.
 fn store_note(
     db: &Db,
     path: &RelPath,
@@ -1826,17 +1830,18 @@ fn store_note(
 
 /// Cut one note into chunks when its stored rows no longer describe its bytes.
 ///
-/// **The order is the whole point** (design-m2-embeddings §5): [`db::chunk_digest`] is consulted **first**, and
+/// **The order is the whole point**: [`db::chunk_digest`] is consulted **first**, and
 /// only a note whose rows carry no single digest — none at all, a digest other than `note_digest`, or a row
 /// behind [`CHUNKER_VERSION`] — goes on to be cut. The stamp read deliberately excludes `chunks.text`: reading
 /// the texts here would make a warm scan pull roughly the whole corpus out of SQLite and discard it, which is
-/// not §5's "one indexed lookup" and is invisible to a fixture whose notes are one chunk each.
+/// not the one indexed lookup a warm pass should cost, and invisible to a fixture whose notes are one chunk
+/// each.
 ///
 /// Nothing is re-read either: `text` is the string [`read_one`]
 /// decoded once for the parser (leading BOM stripped, bytes UTF-8 cannot hold replaced), which is exactly the
-/// domain §4 defines the offsets over. Cutting first and asking afterwards would slice every unchanged note in
-/// the vault on every warm scan to arrive at rows that are already there — the failure mode §5 exists to
-/// prevent — which is why [`ChunkTally::cut`] is asserted rather than timed.
+/// domain the chunk offsets are defined over. Cutting first and asking afterwards would slice every unchanged
+/// note in the vault on every warm scan to arrive at rows that are already there — the failure mode this order
+/// exists to prevent — which is why [`ChunkTally::cut`] is asserted rather than timed.
 ///
 /// `note_digest` is `files.hash`: the digest of the bytes on disk, BOM included ([`read_one`]). The offsets
 /// stay over the decoded text, and that is not a contradiction: decoding is a pure function of those
@@ -1844,7 +1849,7 @@ fn store_note(
 /// only digest this call can compare without opening the file again.
 ///
 /// **A note with nothing to cut has no rows to stamp**, so [`db::chunk_digest`] answers `None` for it forever
-/// and it pays one indexed lookup plus an empty cut on every scan. §5's warm-pass property is about the notes
+/// and it pays one indexed lookup plus an empty cut on every scan. The warm-pass property is about the notes
 /// that have rows; a blank note cuts nothing, writes nothing, and stays cheap in the way that matters.
 fn refresh_chunks(
     db: &Db,
@@ -1864,7 +1869,7 @@ fn refresh_chunks(
     chunks.cut += 1;
     let cut = chunk(text);
     // No transaction of its own: `db::write_chunks_for_note` writes through the caller's handle, which here
-    // is the scan's single write transaction — §5 requires chunk rows to be atomic with the note rows.
+    // is the scan's single write transaction, and chunk rows have to be atomic with the note rows.
     db::write_chunks_for_note(db, note_id, &cut, note_digest)?;
     Ok(())
 }
@@ -1878,13 +1883,13 @@ enum NoteRow {
     One(i64),
     /// More than one row on the key. Legal at version 3 (`notes.rel` was never `UNIQUE`) and copied onto one
     /// `rel_bytes` by migration 4, so this is a population the reader has to name rather than pretend not to
-    /// have (F13 §7).
+    /// have.
     Duplicate,
 }
 
 /// How many note rows sit behind one path's byte key, and which one if there is a single answer.
 ///
-/// **No `LIMIT 1`** (F13 §3): the old single-row read is what made a legacy duplicate silently *wrong* rather
+/// **No `LIMIT 1`**: the old single-row read is what made a legacy duplicate silently *wrong* rather
 /// than loud — it handed one file's title, tags, items and links to the other file's note. Refusing with an
 /// error was the other wrong answer: it would make a workspace holding one old duplicate impossible to scan
 /// ever again. So the count travels back to the caller, which reports the file under `skipped`, rewrites no
@@ -1912,10 +1917,10 @@ fn store_note_links(db: &Db, parsed: &[Parsed]) -> Result<(), DbError> {
 /// `case_key` → every live row carrying that fold: the corpus [`crate::links::resolve`] places targets in.
 ///
 /// Each entry is a [`RelPath`], so a placed target names the row it landed on rather than a spelling two
-/// rows may share; matching still happens entirely on display text, which is the author's question (F13 §4.1).
+/// rows may share; matching still happens entirely on display text, which is the author's question.
 ///
 /// A `Vec` rather than the one `rel` an earlier build kept, because `files.case_key` stopped being unique
-/// with migration 4 (F13 §3): `Ämli.md` beside `ämli.md` is two files whose display fold is one string, so
+/// with migration 4: `Ämli.md` beside `ämli.md` is two files whose display fold is one string, so
 /// `insert` would have handed the fold to whichever row was read last and a link naming that fold would land
 /// on it by iteration order. Listing both is what lets resolution see the ambiguity and decline, exactly as
 /// [`crate::links`] already models an ambiguous basename. A fold with one owner still resolves.
@@ -1943,7 +1948,7 @@ fn live_corpus(db: &Db) -> Result<BTreeMap<String, Vec<RelPath>>, DbError> {
 /// Live rows only, joined through `files`, so a stale note leaves the catalog while its rows stay in the
 /// database. Tags come back in insertion order, which is the note's own order, because the
 /// renderer prints them as written.
-/// The join and the order are both on `rel_bytes` (F13 §3). On display `rel` two rows on each side of one
+/// The join and the order are both on `rel_bytes`. On display `rel` two rows on each side of one
 /// spelling is a cross product, so the catalog gained duplicate entries carrying wrong link counts; and for
 /// twins that spelling is *identical*, so a display `ORDER BY` orders nothing and the rendered bytes fell to
 /// whichever row SQLite happened to read.
