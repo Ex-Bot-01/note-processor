@@ -47,7 +47,16 @@ in which round and on which machine, lives in `git log`.
 
 ## Where decisions live
 
-`todo.md` is the handoff: open questions, deferred work, owed measurements, and the changes of plan that are not
-closed yet. A decision that has been closed stops being argued in `todo.md` and moves to `docs/adr/`. That
-directory does not exist yet — the task which moves `todo.md`'s "Locked decisions" section creates it — so until
-that happens the locked list stays where it is.
+`todo.md` is the handoff and it is deliberately short: what is true now, what a human owes, the next three actions.
+A decision that has been closed stops being argued there and gets a file in `docs/adr/`, indexed in
+`docs/adr/README.md`. Work that shipped goes to `release-notes/`; deferred engineering cards go to
+`docs/backlog-m2-followups.md`. If you find yourself adding a fourth section to `todo.md`, it belongs in one of
+those instead.
+
+## The machine you are working on
+
+- Rust is in `~/.cargo/bin`; put it on `PATH` before any cargo command. Node and npm exist for the front end (M5).
+- Never put a GitHub token on a command line or in a file. `$GH_TOKEN` is already wired for `gh`, and `gh` is
+  authenticated — use it rather than re-discovering credentials.
+- A subagent endpoint tends to die around thirty minutes in. Keep rounds bounded, have the implementer commit `wip:` as
+  soon as it compiles, and resume a stalled round rather than restarting it.
