@@ -1,0 +1,59 @@
+# `cargo deny` configuration — advisories, licenses, and duplicate versions.
+#
+# **What this file is for, and what it is not.** The hosted checks (`cargo deny`, `cargo audit`) are the only ones that can
+# see a *published* advisory: they need network access to the RustSec database, which a build on a machine without one does
+# not have. So they run in CI, where it does, and this repository also runs `.github/scripts/check-deps.py` locally — licenses
+# and duplicate majors, offline, from `Cargo.lock`. The two agree on those two rules on purpose; the advisory half is the part
+# only CI can do, which is why it is here rather than in a script nobody's machine can run.
+
+[advisories]
+# Yanked/unpublished-but-locked crates are worth hearing about even before an advisory exists.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+  # An entry here needs three things written down: the RUSTSEC id, the crate, and *why* waiting is acceptable —
+  # plus what would remove it. Empty today, and that is the state to keep.
+]
+
+[licenses]
+# `np` is MIT and ships statically linked binaries, so the test is "can we distribute this object file", not
+# "is this license famous". The allowlist mirrors PERMISSIVE in `.github/scripts/check-deps.py`; if they ever disagree,
+# the local fence fails first and says which crate moved.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "ISC",
+  "Zlib",
+  "Unlicense",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CDLA-Permissive-2.0",
+  "CC0-1.0",
+  "MulanPSL-2.0",
+]
+# An `OR` that includes a copyleft option (r-efi offers LGPL as one alternative) is a choice, not an obligation: the
+# distributor takes MIT. Denied outright, this would push toward removing crates that are fine rather than recording the
+# choice — which is what docs/dependency-licenses.md does instead.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "deny"
+highlight = "all-dependencies"
+skip = [
+  # Each entry states who pulls both majors and what would collapse them. This mirrors DUPLICATE_EXCEPTIONS in the local
+  # fence; a duplicate that appears without an entry here fails CI *and* locally, which is the point.
+  { name = "getrandom", version = "0.2.17" },
+  { name = "hashbrown", version = "0.16.1" },
+  { name = "webpki-roots", version = "0.26.11" },
+  { name = "windows-sys", version = "0.52.0" },
+  { name = "winnow", version = "0.7.15" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

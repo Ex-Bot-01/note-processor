@@ -1,0 +1,46 @@
+name: Supply chain
+
+# **Advisories need a database nobody offline can read.** `cargo deny` and `cargo audit` ask RustSec which published versions
+# have known problems; that answer changes the day an advisory is filed, not the day this tree changes, so it is graded on a
+# schedule as well as per pull request. Licenses and duplicate majors are checked twice on purpose: here (through `deny.toml`)
+# and by `.github/scripts/check-deps.py`, which runs offline from `Cargo.lock` and therefore still works on a machine with no
+# network — the half of the promise CI cannot make for you.
+#
+# **Verified where?** The two actions below need network access and are not runnable on the machine this round was developed
+# on, so they are unverified here in the sense F18's rule cares about: written to run, never seen to run. `check-deps.py` has
+# a `--self-test` row in `.github/scripts/gates.sh` and its rules are graded locally; treat these two as the advisory half only.
+
+on:
+  pull_request:
+  schedule:
+    # 03:41 UTC, after CI's own nightly at 03:17 so a dependency that broke the build is already visible in the other log.
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+# Nothing here writes back to the repository, and neither action needs more than a read token.
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo deny (advisories, licenses, duplicates, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `deny.toml` is the configuration of record. An ignored advisory must carry its RUSTSEC id, the crate, and a reason —
+      # the file says so where the list lives, because an ignore without a reason is how a known problem becomes permanent.
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  audit:
+    name: cargo audit (RustSec advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -56,12 +56,25 @@ reader to assume linkage where there is none. If a future build links `common/` 
 
 ## Rust crates
 
-`np` is a Rust workspace and its binary also contains code from crates.io. The authoritative list of those names and licenses is derived, not
-hand-written: `cargo tree -p np-cli -e features` and, for a release, a generated report (`cargo about`, which is not yet wired into the packaging
-scripts). Hand-maintaining ~200 entries that change with every dependency bump would be a list that is wrong more often than it is right, so the
-open item is to generate the report in CI or in the packaging step and attach it beside this file. Recorded as such rather than quietly omitted:
-for now, MIT/Apache-2.0 dual-licensed crates are satisfied by `LICENSE-APACHE`/`LICENSE-MIT` files upstream and by this disclosure of their
-presence, and any crate under a *copyleft* license would need stronger treatment — hence the check belongs in tooling rather than in prose.
+`np` is a Rust workspace and its binary also contains code from crates.io. The list of those names and licenses is derived,
+not hand-written, and it is now generated rather than promised: [`docs/dependency-licenses.md`](docs/dependency-licenses.md)
+is written by `.github/scripts/check-deps.py --write-report`, and the same script fails the build when that file no longer
+matches what it would write. A dependency bump that changes a license therefore shows up as a diff in a tracked file instead
+of as a rumour in a binary nobody inspected.
+
+What the fence enforces, and what it leaves to CI:
+
+* **Every dependency must offer a permissive option** (`MIT`, `Apache-2.0`, `ISC`, `BSD-2/3`, `Zlib`, `Unlicense`,
+  `Unicode-3.0`, `CDLA-Permissive-2.0`, `CC0-1.0`, `MulanPSL-2.0`, and `WITH` variants of those). A crate whose only option is
+  copyleft is a distribution decision for a human, not something a build script may quietly accept — which is what the earlier
+  version of this page asked tooling to catch. One crate today offers a choice that includes a copyleft alternative
+  (`r-efi`: `MIT OR Apache-2.0 OR LGPL-2.1-or-later`); the report names it and the option taken, because "the distributor
+  picks MIT" is a decision worth recording rather than one to bury.
+* **One major version per crate**, unless `check-deps.py` records who pulls both and what would collapse them. Five coexist
+  today, each with a reason written down; an unlisted duplicate fails locally and in CI.
+* **Advisories are graded where the database is reachable** — `.github/workflows/supply-chain.yml` runs `cargo deny` and
+  `cargo audit` on every pull request and nightly. Offline, neither can answer anything, so no claim about "no known
+  advisories" is made in this file or anywhere else in the tree.
 
 ## Model weights are not distributed here
 
