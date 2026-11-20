@@ -57,7 +57,12 @@ unresolved.
 
 ## Owed measurements — nothing may be claimed until one is run
 
-* The **"chunks owed but unembedded" count** in the scan report, and backlog **D1–D10** from the M2a whole-branch review.
+* The **"chunks owed but unembedded" count** in the scan report — `ScanReport` carries no chunk counters at all today
+  (`scan.rs:162-193`), so this starts with a short design, not a field.
+* Backlog **D1–D10**, triaged against the tree on 2026-11-20 (`docs/backlog-m2-followups.md`): one closed (D9), seven open
+  with a next action each, and two whose next move is a ruling rather than an hour of code — **D2** (is frontmatter part of the
+  embedded text?) and **D5** (does the embed round delete stale vectors or compare them?). **D10** was restated: it names the
+  wrong protection, and may be an orphaning write rather than a latent one. No test covers duplicate-healing next to chunks.
 * **A4's A/B/A benchmark** and its whole-branch review, both skipped on instruction at merge time.
 * **F18 residue:** Windows file identity (`VolumeSerialNumber` + `FileId`) needs real Windows hardware and a recorded run;
   CI proves only that the path is inert. No behaviour claim about a platform until it was run there.
@@ -66,7 +71,7 @@ unresolved.
 
 1. Rule on the two documents named above — they gate code, and one of them decides whether this project has a second job.
 2. Pay the chunks-owed count in the scan report: it is the one number in `np embed`'s story that a person cannot ask for
-   today, and its design already exists in the M2a review's backlog.
+   today. The definition is in the M2a backlog; the field, and what "owed" means once a chunker bump retires vectors, are not.
 3. Settle F25 one way or the other, since both fixes touch goldens and neither should be chosen by whoever happens to be
    editing the renderer.
 
