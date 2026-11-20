@@ -160,16 +160,16 @@ pub struct ScanReport {
     pub modified: usize,
     /// Paths whose contents travelled from another path in the same workspace.
     pub moved: usize,
-    /// Paths that are gone; their rows are marked stale, never deleted (spec §2).
+    /// Paths that are gone; their rows are marked stale, never deleted.
     pub removed: usize,
     /// Paths the registry already had exactly as they are.
     pub unchanged: usize,
     /// Paths this scan could not index and left untouched: directories it could not read, files that
     /// vanished or changed between walk and read, paths whose identity is already taken, a name the byte
-    /// spelling cannot hold (F18), a catalog temporary it could not remove (see `clear_temp_corpses`), and a root
+    /// spelling cannot hold, a catalog temporary it could not remove (see `clear_temp_corpses`), and a root
     /// entry wearing a generated catalog name that this program did not publish — left on disk and named here
     /// instead of deleted.
-    /// Sorted and deduplicated by the path's **bytes**, printed as display text (F20). Where the keys differ, two
+    /// Sorted and deduplicated by the path's **bytes**, printed as display text. Where the keys differ, two
     /// paths print two lines that look alike, because the report can name them no differently — they are not a
     /// duplicate to clean up later, and collapsing them would hide one lost path.
     ///
@@ -178,14 +178,14 @@ pub struct ScanReport {
     /// `crates/np-core/tests/walk.rs` pinned it. F18 round four (`cfd7e8b`, 2026-11-08) replaced that byte spelling with
     /// [`crate::path_keys::wtf8`], so a Windows refusal's identity bytes carry the lone surrogate itself and two such
     /// names produce **two** lines here; `tests/walk.rs` now pins those six bytes instead, on the Windows row that first
-    /// ran on 2026-11-14 and caught the stale pair of them (issue #9). A key that is genuinely lossy still exists — a row
+    /// ran and caught the stale pair of them (issue #9). A key that is genuinely lossy still exists — a row
     /// whose key migration 4 derived from display text, or an entry that only ever existed as text and reached the report
     /// through `UnknownPath::from_display` (private, so named rather than linked) — and *those* collapse, which is what the sentence
     /// should have been about.
     ///
     /// So this list is a floor on what the scan lost, never a count of it.
     pub skipped: Vec<String>,
-    /// Live note rows — the same number of entries the catalog holds (spec §2).
+    /// Live note rows — the same number of entries the catalog holds.
     pub notes: i64,
     /// Live tracked files that are **not** notes (**issue #12**): every `.txt`, `.org`, `.png` and `.pdf` the walk
     /// found, hashed and listed but never parsed, so search cannot reach any of them.
@@ -281,7 +281,7 @@ pub struct ScanReport {
     /// degrades the diagnosis and never changes what is indexed.
     pub unindexable: Option<Unindexable>,
     /// Wall-clock milliseconds for the whole scan. Informational only — never in a generated file,
-    /// where it would make every regeneration differ (spec §10).
+    /// where it would make every regeneration differ.
     pub elapsed_ms: u128,
 }
 
@@ -301,7 +301,7 @@ pub struct Unindexable {
     /// Directories whose contents this walk did not read: permission denied, or a directory that vanished
     /// mid-walk. Somebody's `chmod`, not anybody's filename.
     pub unreadable: usize,
-    /// Names the byte spelling cannot hold (F18) — the count [`Self::unreadable`] refuses to be confused
+    /// Names the byte spelling cannot hold — the count [`Self::unreadable`] refuses to be confused
     /// with, because this one is fixed by renaming a file. Windows-only in practice: `os_bytes` is exact on
     /// Unix, so no scan run there ever raises this above zero (see [`crate::walk::Walked::unrepresentable`]).
     pub unkeyable: usize,
@@ -316,7 +316,7 @@ pub struct Unindexable {
     /// cause, so this count stays what it is — a pointer at paths — and the reader who wants the reason reads the
     /// other field.
     pub duplicates: usize,
-    /// Notes whose registry row is **keyed from display text** and could not be settled this scan (F23): the walk
+    /// Notes whose registry row is **keyed from display text** and could not be settled this scan: the walk
     /// could not read their own path, and no listed readable path both spells them exactly and matches their stored
     /// hash, so nothing could say which byte spelling the row belongs to.
     ///
@@ -401,7 +401,7 @@ fn unindexable_record(
 ///
 /// The pipeline is walk → read and hash → classify → parse → store → resolve links → items → render →
 /// write index files, then [`WorkspaceRegistry::record`]; the database comes from
-/// [`Config::workspace_db`] (spec §11). See the module docs for the rules that hold it together, and
+/// [`Config::workspace_db`]. See the module docs for the rules that hold it together, and
 /// [`scan_with_inject`] for the seam its race test drives.
 ///
 /// A scan does not fail because of one bad file: an unreadable directory, a note with latin-1 bytes, a
@@ -494,7 +494,7 @@ fn scan_inner(
         return Err(ConfigError::MissingField("data_dir").into());
     }
     // One absolute spelling for the walk, the database key, the stored `abs` and the registry row, so
-    // one folder is one workspace however it was typed (spec §11).
+    // one folder is one workspace however it was typed.
     let root = abs_path(root);
     // **The phase reports itself** (diagnostics design point 7): one span for the whole pass, so every event inside it
     // inherits the workspace and its close says what the scan cost. The name is `scan` because that is the word the CLI,
@@ -510,7 +510,7 @@ fn scan_inner(
     // attachment (see [`clear_temp_corpses`]). One that will not be removed is reported and retried by
     // the next scan; it does not end this one.
     // Carried as [`UnknownPath`] pairs to the end of the scan, where they are deduped and ordered by bytes and
-    // only then printed: a name that came off the disk keeps its real bytes all the way to the report (F20).
+    // only then printed: a name that came off the disk keeps its real bytes all the way to the report.
     let mut skipped: Vec<UnknownPath> = clear_temp_corpses(&root)?
         .into_iter()
         .map(UnknownPath::from_display)
@@ -519,7 +519,7 @@ fn scan_inner(
     after_walk(&root);
 
     // A directory whose contents the walk did not read holds files that are unknown rather than absent — it
-    // could not be entered, or its **own name** was refused (F18), which hides the same subtree. Their known
+    // could not be entered, or its **own name** was refused, which hides the same subtree. Their known
     // rows stay out of the comparison (see [`known_rows`]) and the directory itself is what the report names.
     // A refused *file* name is the same rule about one path instead of a region: it is not indexed this scan,
     // its row keeps what it holds, and the path is named here too.
@@ -565,7 +565,7 @@ fn scan_inner(
     // Which rules wrote the rows on disk. Read before anything is written, so this one scan both does the
     // re-parse and records what it re-parsed with: `classify` compares bytes and knows nothing about the
     // rules that turn those bytes into headings, tags, items and links, so without this a note nobody has
-    // edited since an older build ran would keep its old derived rows forever (F15).
+    // edited since an older build ran would keep its old derived rows forever.
     let stored = parse_version(&db)?;
     let refresh = refresh_needed(stored);
     // The same question one definition over: are this workspace's `chunks` rows labelled with the chunker
@@ -610,7 +610,7 @@ fn scan_inner(
     let record_version = refresh && covered;
     // **Provider availability is not version debt** (design-m2-embeddings §5's P0). Nothing above or below
     // this line asks whether an embedder exists, and that is the whole decision: if recording waited for a
-    // provider, then with `embeddings.provider = "none"` — the default (§2), what every install runs until
+    // provider, then with `embeddings.provider = "none"` — the default, what every install runs until
     // a human picks a model — the key would never be recorded, the coverage record would read as a gap
     // nobody can clear, and any later reader that treats a missing key as "the corpus was never cut" would
     // re-cut ~18k notes on every scan forever. Re-chunking fails for no external reason, so it is coverage
@@ -758,7 +758,7 @@ struct Found {
     /// The real OS path, byte-exact even when `rel` had to be decoded lossily.
     abs: PathBuf,
     /// Decoded note text; `None` for a file that could not be read or is not markdown, since an
-    /// attachment is hashed, tracked and linkable but never parsed (spec §10).
+    /// attachment is hashed, tracked and linkable but never parsed.
     text: Option<String>,
     /// Whether the walk called this a note at all. [`apply_changes`] needs it to charge a missed path
     /// only when a parse was actually owed — see [`refresh_covered`].
@@ -787,7 +787,7 @@ fn owes_a_reparse(db: &Db, path: &RelPath, is_markdown: bool) -> Result<bool, Db
 
 /// Read every discovered file, re-stating each one first, and name the unreadable ones in `skipped`.
 ///
-/// The restatement is what closes the walk-to-read window (Review Focus 5): a file that has gone, or
+/// The restatement is what closes the walk-to-read window: a file that has gone, or
 /// whose size or modification second moved since the walk, is *unknown* to this scan. It is reported,
 /// indexed as nothing, and keeps the row it has.
 ///
@@ -833,7 +833,7 @@ fn skipped_lines(mut paths: Vec<UnknownPath>) -> Vec<String> {
 /// A markdown file is read once and digested from memory, because its bytes are held for parsing anyway;
 /// anything else is digested in chunks by [`sha256_file`], so one large attachment never decides how much
 /// memory a scan needs. Both spellings digest the raw bytes on disk — BOM included — because the digest
-/// is the file's identity and not the text's (Review Focus 1b).
+/// is the file's identity and not the text's.
 fn read_one(file: &DiscoveredFile) -> Found {
     let unknown = || Found {
         snapshot: Snapshot::new(file, String::new()),
@@ -889,7 +889,7 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 }
 
 /// The registry rows `classify` compares against: live rows, minus anything whose path this scan could not
-/// look at — a subtree under an unreadable directory, or one refused name (F18). The filter is
+/// look at — a subtree under an unreadable directory, or one refused name. The filter is
 /// [`is_unknown_path`], and it judges a row by its `rel_bytes`: a row whose *display* text happens to match an
 /// unknown path while its bytes do not belongs to a subtree this scan did read, and hiding it is F20. The one
 /// exception is a row whose stored key was itself derived from display text ([`key_is_display_derived`]): such a
@@ -925,7 +925,7 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 struct KnownRows {
     /// The rows `classify` may judge.
     rows: Vec<Snapshot>,
-    /// Source 1 (§3): live note rows the **byte-keyed** arm hid, unchanged by F23.
+    /// Source 1: live note rows the **byte-keyed** arm hid, unchanged by F23.
     hidden: usize,
     /// Every ambiguous row this pass marked, admitted or refused, in byte-key ascending order — the
     /// population [`unresolved_ambiguity`] reads and §6's record field renders.
@@ -938,12 +938,12 @@ struct KnownRows {
 /// One row F23 **marked**: its key is display text ([`key_is_display_derived`]) and an unreadable path spells
 /// that text, so `known_rows` cannot tell whether the file it describes is the readable look-alike or a file
 /// behind the obstruction. It may never be removed, and it may be claimed — by content or by its own listed
-/// path (§2).
+/// path.
 struct Marked {
     /// The row's stored key: what a claim names (`Change::Moved { from }`) and what [`strip_marked_removals`]
     /// matches a `Removed` against.
     key: Vec<u8>,
-    /// Display spelling, for the capped name list in F22's record (§6).
+    /// Display spelling, for the capped name list in F22's record.
     rel: String,
     /// Whether [`admits`] let it reach `known`. A refused row is pre-dropped — today's behaviour — and so
     /// resolves nothing this pass.
@@ -1042,7 +1042,7 @@ fn known_rows(
         key_is_display_derived(&row.rel, &row.rel_bytes)
     });
 
-    // Admission is decided before anything is dropped (§4): what no route can account for never enters `known`
+    // Admission is decided before anything is dropped: what no route can account for never enters `known`
     // — today's behaviour for the refused set, unchanged — and charges source 2.
     let mut admitted_row = vec![false; loaded.len()];
     let mut marked = Vec::with_capacity(candidates.len());
@@ -1249,13 +1249,13 @@ fn under_unreadable(rel_bytes: &[u8], unreadable: &[UnknownPath]) -> bool {
 /// Every arm here suppresses `Removed` for the same reason — the scan did not see that path, which is not
 /// evidence it stopped existing.
 ///
-/// Both arms compare **bytes** (F20), which is the whole point of [`UnknownPath`]. Matching display text instead
+/// Both arms compare **bytes**, which is the whole point of [`UnknownPath`]. Matching display text instead
 /// let one unreadable or refused directory hide its readable twin: `caf\xE9/` and `caf\xE8/` spell one
 /// `caf\u{FFFD}/`, so rows belonging to a subtree this scan had read in full dropped out of `known` — a real
 /// deletion inside the readable twin went unreported, a rename there produced a second live row instead of a
 /// move, and one note could be charged in both `written.uncovered` and `hidden_by_unknown`.
 ///
-/// Windows loses nothing by the switch and gains nothing from it: its key bytes *are* the lossy text (F18), so
+/// Windows loses nothing by the switch and gains nothing from it: its key bytes *are* the lossy text, so
 /// byte equality there decides exactly what text equality decided. On Unix no *refused* name can reach either
 /// list at all (`path_keys::name_is_lossless` is `true` for every byte a filename holds), while the prefix arm
 /// still fires on any genuinely unreadable directory — and that is where the twin case above is reachable today.
@@ -1465,7 +1465,7 @@ fn apply_changes(
                     Some(Change::Added) => written.added += 1,
                     Some(Change::Modified) => written.modified += 1,
                     Some(Change::Moved { .. }) => written.moved += 1,
-                    // The warm-pass answer for most of a vault, so it is the one scan rule at `trace` (§4): turning it
+                    // The warm-pass answer for most of a vault, so it is the one scan rule at `trace`: turning it
                     // on is how someone finds out that the file they edited is *not* in this set.
                     None | Some(Change::Removed) => {
                         tracing::trace!(
@@ -1619,10 +1619,10 @@ fn index_file(
 /// A byte-identical rename that drops the extension (`note.md` → `note.txt`) is a `Moved`, and
 /// [`db::apply_move`] rewrites `notes.rel` onto the new path — but an attachment is never parsed, so
 /// nothing overwrote that row. Left in place it renders as `- [[Title]](note.txt)` and is counted as a
-/// live note, against "tracked but never catalogued" (spec §10), so the row goes with what hangs off it.
+/// live note, against "tracked but never catalogued", so the row goes with what hangs off it.
 ///
 /// Only this note's `origin = 'prose'` edges go too: an approved edge is an input and not derived output
-/// (spec §10). Edges pointing *in* lose their destination rather than being deleted, because they are
+ Edges pointing *in* lose their destination rather than being deleted, because they are
 /// another note's prose and stay countable as unresolved.
 ///
 /// Migration 3 gave every one of these five statements a twin in the schema — each child table cascades
@@ -1839,7 +1839,7 @@ fn store_note(
 /// prevent — which is why [`ChunkTally::cut`] is asserted rather than timed.
 ///
 /// `note_digest` is `files.hash`: the digest of the bytes on disk, BOM included ([`read_one`]). The offsets
-/// stay over the decoded text (§4), and that is not a contradiction: decoding is a pure function of those
+/// stay over the decoded text, and that is not a contradiction: decoding is a pure function of those
 /// bytes, so one file digest still states exactly which decoded text these rows were cut from — and it is the
 /// only digest this call can compare without opening the file again.
 ///
@@ -1941,7 +1941,7 @@ fn live_corpus(db: &Db) -> Result<BTreeMap<String, Vec<RelPath>>, DbError> {
 /// The catalog's rows: one per live note, with the link counts and tags it renders.
 ///
 /// Live rows only, joined through `files`, so a stale note leaves the catalog while its rows stay in the
-/// database (spec §2). Tags come back in insertion order, which is the note's own order, because the
+/// database. Tags come back in insertion order, which is the note's own order, because the
 /// renderer prints them as written.
 /// The join and the order are both on `rel_bytes` (F13 §3). On display `rel` two rows on each side of one
 /// spelling is a cross product, so the catalog gained duplicate entries carrying wrong link counts; and for
@@ -2267,7 +2267,7 @@ fn chunker_refresh_needed(stored: Option<i64>) -> bool {
 ///
 /// Two ways to miss one, neither visible in [`ScanReport`]: a file that changed or became unreadable
 /// between the walk and the read (`uncovered`, since the write pass skips its marker), and a live row this
-/// scan could not look at — under a directory it could not enter, or carrying a name it refused (F18) —
+/// scan could not look at — under a directory it could not enter, or carrying a name it refused —
 /// which [`known_rows`] drops so it cannot be mistaken for deleted (`hidden_by_unknown`). Recording the
 /// version over either would label rows as current that an older build wrote, permanently — the exact
 /// failure F15 exists to prevent, reintroduced by the fix.
@@ -2449,7 +2449,7 @@ fn write_index_files(
 /// carries display text only — it was never a path the walk keyed — so the bytes [`ScanReport::skipped`] dedups
 /// by are that text's own UTF-8 bytes, and two byte-distinct foreign twins still publish a single line. Read
 /// that count as "names needing attention", never as "files on disk"; the paths the *walk* named do get one
-/// line each (F20).
+/// line each.
 ///
 /// `meta` alone is not enough. It is committed inside the scan's transaction (see [`set_index_list`]), so
 /// a kill between that commit and the writes in [`write_index_files`] leaves it naming only the
@@ -2462,7 +2462,7 @@ fn write_index_files(
 /// when it is a regular file opening with [`catalog::HEADER`] byte for byte, in either its LF or its CRLF
 /// spelling (see [`np_published`]). A name that merely looks generated belongs to somebody else — a
 /// hand-written `INDEX-old.md` in the root is never indexed, because [`walk`] excludes these names, so
-/// deleting it would destroy a note no scan ever wrote (spec §7). Such a candidate, and a directory
+/// deleting it would destroy a note no scan ever wrote. Such a candidate, and a directory
 /// wearing the name, are returned for the report instead: the user learns about the collision, and a
 /// `remove_file` that could only answer `IsADirectory` never breaks every later scan of the workspace.
 ///
@@ -2925,7 +2925,7 @@ mod tests {
     /// Deliberately not named like `walk::tests::unknown_from_text_bytes`, which takes a path's `str::as_bytes`
     /// with no key rule between. The two return the same bytes for every input today — `rel_bytes_of_display` *is*
     /// `as_bytes` — and promise different things: this one tracks the stored-key rule, that one tracks the platform
-    /// whose refusal entries are already lossy text (F18). Two names keep that difference visible at the call site.
+    /// whose refusal entries are already lossy text. Two names keep that difference visible at the call site.
     fn display_keyed_unknown(display: &str) -> UnknownPath {
         UnknownPath {
             display: display.to_string(),
@@ -2951,7 +2951,7 @@ mod tests {
     }
 
     /// The charge behind the suppression: a hidden note is one the refresh never re-parsed, so recording the
-    /// new rules over it would label rows an older build wrote as current (F15). `known_rows` keeps the row out
+    /// new rules over it would label rows an older build wrote as current. `known_rows` keeps the row out
     /// of `classify`'s reach **and** counts it here — one comparison, both halves of the promise.
     ///
     /// F23 §5.2 named this case as one whose contract was being replaced, on the reading that its rows are
@@ -3219,7 +3219,7 @@ mod tests {
         );
 
         // The exact arm: one refused file, its byte-twin, and three neighbours that share something with it.
-        // Exact equality is what keeps all four of these visible (F18), and bytes are what makes the first of
+        // Exact equality is what keeps all four of these visible, and bytes are what makes the first of
         // them the *right* one to suppress when two refused names spell alike.
         let files = [raw(b"caf\xE9.md")];
         assert!(
