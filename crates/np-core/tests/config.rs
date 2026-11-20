@@ -2797,7 +2797,7 @@ fn an_operator_chosen_directory_wins_even_when_the_legacy_index_is_sitting_there
 }
 
 // ---------------------------------------------------------------------------------------------
-// `[log] level` / `NP_LOG` / `--log-spec`: the diagnostic level vocabulary (docs/superpowers/specs/2026-12-10-np-diagnostics-design.md).
+// `[log] level` / `NP_LOG` / `--log-spec`: the diagnostic level vocabulary (docs/superpowers/specs/2026-11-09-np-diagnostics-design.md).
 //
 // These cases are about *resolution*, not sinks: nothing here opens a file or writes a line. What they pin is the two things an
 // integrator can otherwise only guess at — which words mean which depth, and which source won when three of them disagreed.

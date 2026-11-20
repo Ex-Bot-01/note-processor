@@ -232,8 +232,8 @@ the files it can read.
 
 The whole interface — every method, every phase, four captured transcripts and a Python walkthrough including what to show after a
 page reload — is in [`docs/reference-serve.md`](docs/reference-serve.md); the reasoning is in
-[`np serve` over stdio](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) and its
-[progress design](docs/superpowers/specs/2026-12-09-np-serve-progress-design.md).
+[`np serve` over stdio](docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md) and its
+[progress design](docs/superpowers/specs/2026-11-09-np-serve-progress-design.md).
 
 Diagnostics stay off the protocol: `-v`, `NP_LOG` or `[log] level` puts human text on stderr, `[log] file` writes JSONL, and every
 record raised inside a request carries that request's id. You are not obliged to read stderr — np drops diagnostics rather than
@@ -311,7 +311,7 @@ The decisions behind those, each with its measurements:
 | [`docs/design-m2-models-install.md`](docs/design-m2-models-install.md) | What "installed" means: rows, digests, per-workspace artifacts |
 | [`docs/design-m2-image-embeddings.md`](docs/design-m2-image-embeddings.md) | R7c: media tables, discovery and sniffing, the vision seam, §8's refusal classes, §14's measured numbers |
 | [`docs/design-m2-thread-policy.md`](docs/design-m2-thread-policy.md) | The `"auto"` worker rule and the measurements behind it |
-| [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
+| [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
 | [`docs/design-f48-links-as-a-query.md`](docs/design-f48-links-as-a-query.md) | What a client may assume about link identity: display paths and lines, what `rel` scopes, and why figures and stale notes are absent from `links.list` |
 | [`docs/design-f50-consent-has-a-door.md`](docs/design-f50-consent-has-a-door.md) | Who may write `config.toml`, and how the write is checked: validation by loading, refusal over half-configuration, provenance in the file |
 | [`docs/design-f49-word-beginnings.md`](docs/design-f49-word-beginnings.md) | What a query may ask for besides a whole word: the one character of syntax, why the default did not move, and how an answer admits it widened |
@@ -324,7 +324,7 @@ Repository layout: `crates/np-core` (discovery, parsing, links, catalog, databas
 
 ## License
 
-MIT — [`LICENSE`](LICENSE), adopted 2026-12-08. Both release archives carry it beside the binary, and
+MIT — [`LICENSE`](LICENSE), adopted 2026-11-08. Both release archives carry it beside the binary, and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) carries the verbatim MIT text for the llama.cpp / ggml code statically linked in,
 plus exactly which archives are linked — because that obligation attaches to the artefact you download, not to the repository it came
 from. Model weights are a separate matter and are not redistributed: `embeddinggemma-2` is fetched on your explicit action,

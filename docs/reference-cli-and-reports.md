@@ -2,7 +2,7 @@
 
 What each command writes, which keys `--json` carries and why they are always present, what every line of the `np embed` report means, and what the exit codes promise. Quoted output is output a real run printed, not an illustration.
 
-> *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
+> *Moved out of `README.md` on 2026-11-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
 ```sh
 # Global flags come before the subcommand: -v | -vv | -vvv, --log-spec SPEC, --log-file PATH

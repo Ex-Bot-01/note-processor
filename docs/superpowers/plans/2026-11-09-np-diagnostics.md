@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021 workspace (`np-core`, `np-cli`), `tracing`, `tracing-subscriber` (EnvFilter), `serde_json` for the file records, existing gate script `.github/scripts/gates.sh`.
 
-**Spec:** `docs/superpowers/specs/2026-12-10-np-diagnostics-design.md` — including the *Decisions settled at approval* section, which supersedes earlier text.
+**Spec:** `docs/superpowers/specs/2026-11-09-np-diagnostics-design.md` — including the *Decisions settled at approval* section, which supersedes earlier text.
 
 ## Global Constraints
 

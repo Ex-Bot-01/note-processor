@@ -700,7 +700,7 @@ pub enum RankNote {
     /// The workspace holds no vectors at all, so hybrid's semantic half had nothing to read. A state, not an error: this is a
     /// machine that has not downloaded an artifact yet. Vectors under some *other* model id stay a refusal — see [`SearchError::NoVectorsForModel`].
     NoVectors,
-    /// **Issue #11 (2026-12-18).** The same workspace state as [`Self::NoVectors`] — no vectors at all — seen by a search that
+    /// **Issue #11 (fixed 2026-11-19, opened 2026-11-15).** The same workspace state as [`Self::NoVectors`] — no vectors at all — seen by a search that
     /// asked for meanings only. It gets its own variant rather than sharing hybrid's because the two sentences cannot be one:
     /// every other note says **which half answered**, and in a `semantic` run neither did, so printing hybrid's "ranked by
     /// keyword only" there would describe a fallback this mode refuses by design (**F45**'s reason for keeping the refusal).

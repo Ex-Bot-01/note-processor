@@ -2,7 +2,7 @@
 
 Every key, its default, and what it refuses. The file is optional and read once per command; a partial file is fine.
 
-> *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
+> *Moved out of `README.md` on 2026-11-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
 
 Optional, and read once per command from:
@@ -15,11 +15,11 @@ $XDG_CONFIG_HOME/note-processor/config.toml     else ~/.config/note-processor/co
 A partial file is fine — every key has a default. Two environment variables exist, and they **fill keys the file leaves out**;
 a value in the file always wins, and an empty environment value counts as unset rather than as a choice.
 
-The table below was checked against the structs on 2026-12-09 rather than copied from the README: every container carries
+The table below was checked against the structs on 2026-11-09 rather than copied from the README: every container carries
 `deny_unknown_fields` (**F35**), so `Config`, `CatalogConfig`, `MarkerConfig`, `EmbeddingsConfig`, `ModelsConfig`, `SearchConfig` and `LogConfig` in
 `crates/np-core/src/config.rs` *are* the key list — a key not in them cannot be written at all. That audit added two rows this table had
 lost: top-level `data_dir`, and `models.auto_fetch`, which is one of the three kill switches the README names while omitting the key that
-holds it. Three more arrived on 2026-12-10 with `[log]`, the diagnostics section. There are **18** keys.
+holds it. Three more arrived on 2026-11-09 with `[log]`, the diagnostics section. There are **18** keys.
 
 | Key | Default | What it does |
 | --- | --- | --- |

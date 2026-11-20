@@ -557,7 +557,7 @@ what fails is not a check, because removal makes tests pass.
 * **CI**: GitHub refuses to start jobs — no Actions budget. Until that changes, every gate below runs locally and its
   exit codes are the evidence; nothing here is claimed on CI's behalf.
 
-## Ruled 2026-12-09 — the backend surface is `np serve`, and a license exists
+## Ruled 2026-11-09 — the backend surface is `np serve`, and a license exists
 
 **A frontend can start today.** The question put to the human was what "finish the base of the backend" means, with three options; **C was chosen**:
 `np serve` — JSON-RPC 2.0 over stdin/stdout inside the existing binary. One process, no port, no token, no daemon, no watcher (those stay M4 in
@@ -565,7 +565,7 @@ what fails is not a check, because removal makes tests pass.
 and every `result` is the document `np <verb> --json` prints, because both channels call one builder. States stay states across the pipe: `locked`
 (**F44**), `offline`, `reason` (**F45**) and `prefix_drift` (**F42**) are keys in a successful result; JSON-RPC `error` is reserved for a bad request
 (`-32700/-32601/-32602`) or a refusal before any work (`-32000`, carrying the CLI's own sentence). README's "Driving `np` from a program" is the
-contract; `docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md` is the reasoning, including what was *not* reviewed independently and why that
+contract; `docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md` is the reasoning, including what was *not* reviewed independently and why that
 matters.
 
 **Licensing closed: MIT** (`LICENSE` at root, `license.workspace = true` on both crates), chosen because it is what we statically link and so adds no
@@ -576,7 +576,7 @@ write-lock exclusion, MSVC parity) and CI minutes.
 **Two things a frontend author will otherwise discover the hard way**, both written into tests so they are facts rather than folklore: a search hit has
 **no `title` key** (`path`, `snippet`, ranks, link counts), and `snippet` can contain raw line breaks — which is why the framing test exercises it.
 
-## Measured 2026-12-18 — the reporter's round: issues #11 to #15
+## Measured 2026-11-19 — the reporter's round: issues #11 to #15
 
 Five issues arrived from the same integrator (the Jott front end), each measured against the published `np-0.5.1`
 Linux binary rather than described, and all five reproduced here on that binary. Each got its own commit; the fixes

@@ -5,7 +5,7 @@
 //! the smallest surface that provides them: **one long-lived process, newline-delimited JSON in and out, no port, no auth, no daemon**. The
 //! loopback HTTP API, watcher and autostart are M4 in `docs/roadmap-2026-10-27.md` and have their own design ahead of them; nothing here
 //! pre-implements them, and the dispatcher is a plain function so that an HTTP adapter can call it later without re-deciding what a request means.
-//! Design: `docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md`.
+//! Design: `docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md`.
 //!
 //! # The one rule everything else follows from
 //!

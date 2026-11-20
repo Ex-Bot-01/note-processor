@@ -5,7 +5,7 @@
 appears on stderr unless you ask for it. Every transcript below was copied from the shipped binary — the method is at the
 end.
 
-Design: [`docs/superpowers/specs/2026-12-10-np-diagnostics-design.md`](superpowers/specs/2026-12-10-np-diagnostics-design.md).
+Design: [`docs/superpowers/specs/2026-11-09-np-diagnostics-design.md`](superpowers/specs/2026-11-09-np-diagnostics-design.md).
 Cost of having the machinery at all: [`docs/measurement-np-diagnostics-cost.md`](measurement-np-diagnostics-cost.md).
 
 ## Turning it on

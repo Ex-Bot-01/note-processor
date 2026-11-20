@@ -2016,10 +2016,10 @@ sentence §12 leans on when arguing that a default-on fetch is safe.
 **Done when:** a ruling is recorded and either the warning, the command, or the documentation carries a dated test; and `models list`'s empty
 prefixes under a pinned id are no longer a state a careful user can enter without a word of warning.
 
-**Ruled 2026-12-08: option A**, on the implementer's recommendation, and implemented in the same change. **A correction first, because this
+**Ruled 2026-11-08: option A**, on the implementer's recommendation, and implemented in the same change. **A correction first, because this
 card's premise was wrong.** It says the drift is "empty prefixes … where the pin declares `represent this sentence for retrieval:` /
 `query for note search:`". `pins::PINNED_IDENTITIES` has declared **empty** prefixes since it was introduced (`864ef95`, and at `v0.2.3` —
-checked with `git show v0.2.3:crates/np-core/src/pins.rs` on 2026-12-08), deliberately: no instruction convention has been measured in this
+checked with `git show v0.2.3:crates/np-core/src/pins.rs` on 2026-11-08), deliberately: no instruction convention has been measured in this
 repository, and prefixes are part of an id's identity, so a measured convention must arrive as a new `@n` id rather than an edit. So the
 round-four row (`prefix_doc "" prefix_query ""`) **agreed** with the pin, and the two cosines on this card compared a pin-conformant install
 against one carrying prefixes the pin does *not* declare. Different vector bytes, yes — which was the point — but the card described the
@@ -2042,7 +2042,7 @@ different from a fetched model's, and no command rewrites them (`np models list`
 nothing at all.
 
 Tests: `installing_a_pinned_model_with_an_undeclared_prefix_says_so`, `installing_a_pinned_model_without_prefixes_stays_silent`, and
-`an_unpinned_id_is_never_told_it_disagrees_with_a_pin` (np-cli `models_cli`, 2026-12-08) plus
+`an_unpinned_id_is_never_told_it_disagrees_with_a_pin` (np-cli `models_cli`, 2026-11-08) plus
 `embedding_a_pinned_model_with_undeclared_prefixes_notes_the_drift_and_still_reports_its_own_outcome` (np-cli `cli`). Two mutants, one per
 failure mode a warning can have: making `prefix_drift` always return `None` kills the install and embed cases; making it always claim a
 document drift kills the silent case. Neither mutant survives, which is the whole reason the silent case has its own test — a warning that
@@ -2211,7 +2211,7 @@ Three things worth naming before anyone fixes it:
 release binary has no runtime, so `embed` refuses before touching the database. Reproduce with: two concurrent `np scan <vault>` in a loop,
 capturing exit codes and stdout byte counts separately.
 
-**Ruled 2026-12-08: the coarse advisory lock, default on, no flag** (the implementer's recommendation, adopted). Implemented the same day.
+**Ruled 2026-11-08: the coarse advisory lock, default on, no flag** (the implementer's recommendation, adopted). Implemented the same day.
 
 **What shipped.** `np_core::lock::WorkspaceLock` ([`crates/np-core/src/lock.rs`](../crates/np-core/src/lock.rs)) is a `BEGIN IMMEDIATE`
 transaction on `<data-dir>/<workspace-key>.lock.db`, opened and left uncommitted for the life of the command, released by `Drop`. Five commands
@@ -2251,7 +2251,7 @@ would not contend and a test written that way would pass whether or not exclusio
 2 000-note vault for the same reason and prints an un-contended scan's duration beside the counts, because "nobody was refused" means something
 different on a box where a scan takes 200 ms than on one where it takes 2 s.
 
-**Tests** (`crates/np-cli/tests/cli.rs`, 2026-12-08): `a_second_writer_refuses_as_a_state_and_still_prints_one_document` (all five mutating
+**Tests** (`crates/np-cli/tests/cli.rs`, 2026-11-08): `a_second_writer_refuses_as_a_state_and_still_prints_one_document` (all five mutating
 commands, plus text mode printing nothing on stdout), `readers_answer_while_a_writer_holds_the_workspace`,
 `one_workspace_being_written_does_not_stop_another_being_written` (second vault *inside the same data directory*, so it proves scoping rather than
 unrelated paths), `concurrent_writers_never_emit_the_raw_sqlite_error`; and in np-core, `acquiring_and_dropping_leaves_the_workspace_lockable_again`
@@ -2305,7 +2305,7 @@ the machine-readable channel carries no explanation either (same failure shape a
 
 ## F47 — a runtime-bearing release ships MIT code and the project has no license of its own
 
-Filed 2026-12-08 while writing `THIRD_PARTY_NOTICES.md`, prompted by §14's decision to own the llama.cpp build. Two separate obligations, one
+Filed 2026-11-08 while writing `THIRD_PARTY_NOTICES.md`, prompted by §14's decision to own the llama.cpp build. Two separate obligations, one
 card because they land in the same change:
 
 **The third-party half is done.** Since `v0.3.0` every published asset statically links `libllama.a`, `libggml.a`, `libggml-cpu.a` and
@@ -2334,7 +2334,7 @@ card is the reason printed in the release notes rather than a footnote here.
 be a list that is wrong more often than right, so the item is tooling — and the reason it is written down rather than dropped is that a copyleft
 crate in the tree would need stronger treatment than disclosure, which is exactly what a generated report catches and prose does not.
 
-**Closed 2026-12-08: the operator chose MIT**, on the question of what to put in the copyright line giving no name, I wrote
+**Closed 2026-11-08: the operator chose MIT**, on the question of what to put in the copyright line giving no name, I wrote
 `Copyright (c) 2026 The note-processor authors` and said so out loud rather than inventing a person — it is theirs to replace, and README's
 licensing section says exactly that, so nobody has to guess whether the grant is provisional. It is not.
 
@@ -2365,7 +2365,7 @@ distinguish real installs from stubs by looking inside — which is exactly the 
 says. B: keep creating it and document that emptiness is normal, then fix consumers (my script now counts `.models` directories *containing
 files* and prints both numbers). A is the smaller lie; B is the smaller change. **Owed:** ruling plus, either way, a test that `scan` on a fresh workspace never makes one.
 
-**Ruled 2026-12-08: option A**, on the implementer's recommendation ("directory existence should mean a model is there"), and implemented the same
+**Ruled 2026-11-08: option A**, on the implementer's recommendation ("directory existence should mean a model is there"), and implemented the same
 day. One correction to the premise first, because it changed where the fix went.
 
 **What actually reproduces, and what does not.** The card says the stub appeared "during a plain `np scan`", attributed to
@@ -2384,7 +2384,7 @@ fails on a non-empty path: a fetch interrupted mid-transfer leaves its `.fetchin
 removed, and §12 rule 4's marker survives untouched. Cleanup errors are dropped deliberately — a stub we could not delete is untidiness next to
 the refusal the caller is about to print.
 
-**Tests** (`crates/np-core/tests/fetch.rs`, 2026-12-08): `a_transport_that_never_opens_leaves_no_directory_at_all`,
+**Tests** (`crates/np-core/tests/fetch.rs`, 2026-11-08): `a_transport_that_never_opens_leaves_no_directory_at_all`,
 `a_truncated_transfer_also_leaves_no_directory_behind`, `a_directory_this_call_did_not_create_is_never_removed`, and
 `an_empty_directory_this_call_did_not_create_survives_a_failed_fetch`. All four were written red first — the two "leaves no directory" cases failed
 against the old code, which is the point of filing the card.
@@ -2453,7 +2453,7 @@ its line changes to the degraded wording on the next Windows run, which is the d
 
 **Still owed:** CI grading (local rows: default 42 np-cli cases, `local-model,fetch` 56 with real artifacts), and the operator's Windows run to
 confirm the first-install fetch behaves the same on a machine whose network stack they actually have.
-## F18 — round four (2026-12-08): Windows identity now has exact bytes, and the refusal stays for a different reason
+## F18 — round four (2026-11-08): Windows identity now has exact bytes, and the refusal stays for a different reason
 
 Prompted by the operator's instruction to finish what of this card is reachable from Linux. Two things changed; one thing did not, and the reason it
 did not is the useful part.

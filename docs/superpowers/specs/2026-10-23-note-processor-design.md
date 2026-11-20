@@ -335,7 +335,7 @@ tests; one opt-in integration test against the real endpoint, skipped by default
 - "Stale since edit" definition: days since last edit with no state event, threshold configurable.
 - `INDEX.md` line format: `- [[Title]](path) · size · tags · →2 ←1 · cluster · status`. `→n` and `←n`
   count edges that land on a **live** note, not stored rows: an edge into a stale or deleted destination
-  is not advertised as intact and surfaces in the unresolved figure instead. Since **issue #15** (2026-12-18)
+  is not advertised as intact and surfaces in the unresolved figure instead. Since **issue #15** (fixed 2026-11-19)
   the two inserted halves are escaped on the way out — the label with backslashes, the destination with
   percent-escapes — because a POSIX file name may legally hold a newline or a bracket, and "one entry per
   note" is only true if the line survives what the note is called.

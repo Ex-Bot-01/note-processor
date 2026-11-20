@@ -16,7 +16,7 @@
 //! * **A diagnostic is never the reason a command fails.** An unopenable log path warns once and carries on; a full budget
 //!   stops writing and says so in one final record; a deleted file costs records, not the run.
 //!
-//! Design: `docs/superpowers/specs/2026-12-10-np-diagnostics-design.md`.
+//! Design: `docs/superpowers/specs/2026-11-09-np-diagnostics-design.md`.
 //!
 //! # Two phases, because configuration is itself a thing that can fail
 //!

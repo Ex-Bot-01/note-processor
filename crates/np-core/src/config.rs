@@ -1478,7 +1478,7 @@ pub fn default_data_dir() -> Option<PathBuf> {
 // ---------------------------------------------------------------------------------------------
 // The diagnostic level vocabulary: what a level is spelled, how a spec of them is written, and which
 // source won when file, environment and flag disagreed
-// (`docs/superpowers/specs/2026-12-10-np-diagnostics-design.md`).
+// (`docs/superpowers/specs/2026-11-09-np-diagnostics-design.md`).
 //
 // This section decides; it never writes. The sinks that consume a resolved [`DiagSpec`] live in np-cli, which owns the process
 // and its stderr — np-core's half is the vocabulary, so that `np`, a test harness, and a library caller embedding this crate

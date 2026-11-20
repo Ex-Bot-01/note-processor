@@ -94,7 +94,7 @@ row test-workspace cargo test --workspace -- --nocapture
 row test-cli-nodefaults cargo test -p np-cli --no-default-features -- --nocapture
 row_or_skip test-cli-vision "$cmake_missing" cargo test -p np-cli --features local-model,vision -- --nocapture
 row_or_skip test-core-vision "$cmake_missing" cargo test -p np-core --features local-model,vision -- --nocapture
-# **The row that was missing until 2026-12-09.** `crates/np-cli/tests/serve.rs` gates its fetch and chunk-narration cases on
+# **The row that was missing until 2026-11-09.** `crates/np-cli/tests/serve.rs` gates its fetch and chunk-narration cases on
 # `all(feature = "local-model", feature = "fetch")`, because a default build has no transport to narrate and no runtime to embed
 # with. No other row compiles that pair for np-cli — `test-cli-vision` uses `vision`, `test-cli-realmodel` uses `local-model`
 # alone — so every one of those cases ran as its "NOT COVERAGE" stub in every graded log, and the wire-level claims about byte
@@ -125,6 +125,11 @@ row f31-selftest python3 .github/scripts/f31_eval.py --self-test
 # a mis-nested quote in `release.yml` was discovered by a runner — after it had compiled llama.cpp for Windows. This row costs
 # milliseconds and is the difference between that and a red local run.
 row workflow-shells .github/scripts/check-workflow-shells.sh
+# **A date in the future, which is how a month gets written wrong.** A stretch of this project's prose was dated one
+# month ahead of the work it described — "while cutting v0.3.0" beside a tag dated 2026-11-09, a spec first committed
+# 2026-11-09 whose file name claimed another month — and a wrong month reads exactly like a right one, so nothing caught
+# it. This row costs milliseconds: any calendar date in a tracked file later than HEAD's own commit date is reported.
+row dates-ahead python3 .github/scripts/check-dates-ahead.py
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.
@@ -135,7 +140,7 @@ row_or_skip test-cli-realmodel "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p
 row_or_skip test-core-realvision "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-core --features local-model,vision -- --nocapture
 
 # **`--exclude=driver.log`, and the reason it is a guard rather than a fix.** On a fresh log directory this cannot matter: the count
-# runs *before* the summary line is echoed, so the phrase is not in that file yet — measured on 2026-12-09, where the tally over
+# runs *before* the summary line is echoed, so the phrase is not in that file yet — measured on 2026-11-09, where the tally over
 # `/home/agent/tmp/gates-progress2` was 14 with and without the exclusion. It matters when a run reuses a directory holding an older
 # log, because the previous verdict sentence does contain the phrase; that is exactly how the v0.3.0 release notes came to publish
 # "zero" beside a tally of 1. Excluding it makes the count independent of what happened to be in the directory before.

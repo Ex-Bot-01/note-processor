@@ -48,7 +48,7 @@ pub mod vision;
 pub mod pins;
 // What a long-running command is doing right now, as data rather than prose. No JSON and no clock here on purpose:
 // np-core has no serde_json dependency, and the throttle that keeps a status stream from becoming the traffic is a
-// property of the channel printing it (`docs/superpowers/specs/2026-12-09-np-serve-progress-design.md` §4).
+// property of the channel printing it (`docs/superpowers/specs/2026-11-09-np-serve-progress-design.md` §4).
 pub mod progress;
 // The read side of the index: one cosine pass over both vector kinds, with no write anywhere in its path
 // (`docs/design-m2-image-embeddings.md` §12). No feature gate — it reads bytes the schema already holds, so a text-only

@@ -2,7 +2,7 @@
 
 Which figures `np` will encode, which it refuses by decision, and what each refusal class tells you to do.
 
-> *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
+> *Moved out of `README.md` on 2026-11-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
 A note links a figure with ordinary markdown image syntax — `![alt](diagram.png)` — and the path resolves exactly like a note
 link: relative to the linking file, case-insensitively, inside the workspace only. Accepted extensions are `.png`, `.jpg` and

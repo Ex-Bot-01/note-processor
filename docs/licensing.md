@@ -2,9 +2,9 @@
 
 The README's version is two lines: MIT, notices shipped inside every archive. This is the long form — why the copyright line reads the way it does, what the obligation attaches to, and what is deliberately not covered.
 
-> *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
+> *Moved out of `README.md` on 2026-11-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
-**`np` is MIT**, in [`LICENSE`](../LICENSE) — ruled on 2026-12-08, which closed **F47**. The copyright line reads
+**`np` is MIT**, in [`LICENSE`](../LICENSE) — ruled on 2026-11-08, which closed **F47**. The copyright line reads
 `Copyright (c) 2026 The note-processor authors` because no personal or organisational name was given to put there; it is a placeholder in the
 sense that it is yours to replace with whatever you want credited, not in the sense that the grant is provisional. MIT was chosen to match what
 this binary already statically links (llama.cpp and ggml are MIT), so nothing we ask of a downstream user is stricter than an obligation we are

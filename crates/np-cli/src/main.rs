@@ -143,7 +143,7 @@ enum Command {
     /// One process, no port, no daemon: stdout carries exactly one JSON object per line and nothing else, every human sentence goes to stderr, and
     /// each method's `result` is the same document `np <verb> --json` prints. A workspace is named per request rather than remembered, so one
     /// server can serve several vaults and a stale session cannot answer for a directory you moved. Design:
-    /// `docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md`.
+    /// `docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md`.
     Serve,
     /// Index a workspace, fetch its pinned model if this build can, embed it — one command that ends with vectors or says
     /// exactly where it stopped (**F38**).
