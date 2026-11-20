@@ -16,8 +16,8 @@
 //!
 //! # Results are the CLI's documents, not a second vocabulary
 //!
-//! Each method returns *the same object* `np <verb> --json` prints — built by the same function on both channels ([`crate::search_document`],
-//! [`crate::embed_report`] plus [`crate::insert_drift`], [`crate::listing_json`]). Two implementations of one state is how a screen starts
+//! Each method returns *the same object* `np <verb> --json` prints — built by the same function on both channels ([`crate::commands::search::search_document`],
+//! [`crate::commands::embed::embed_report`] plus [`crate::commands::embed::insert_drift`], [`crate::commands::models::listing_json`]). Two implementations of one state is how a screen starts
 //! disagreeing with a terminal about what `vectors: false` meant, which is the failure this whole repository has been carding against since F32.
 //! A test asserts the equality directly rather than trusting the intent.
 //!
@@ -394,7 +394,7 @@ fn initialize(
         "methods": METHODS,
         // Where the index and model caches live. A path rather than a host: §12 rule 8 forbids naming an *origin*, and this is the line a support
         // screenshot needs when someone asks "why does this vault have no vectors".
-        "data_dir": crate::Config::default().data_dir.display().to_string(),
+        "data_dir": np_core::config::Config::default().data_dir.display().to_string(),
     });
     // Support is advertised by the key's presence, so a client that asks an older server gets nothing and can fall back
     // to polling without a version check. `protocol` stays 1 either way: an optional parameter and added methods are
@@ -478,8 +478,10 @@ fn search(
     // fetch that `np embed` does, and a client watching a search that appears to hang on nothing would otherwise have no
     // way to learn it is downloading a model.
     let progress = crate::serve_channel::ServeProgress::new(ch, request.cloned(), "search");
-    let run = crate::search_run(&workspace, query, limit, mode, prefix, false, &progress)?;
-    Ok(crate::search_document(&run))
+    let run = crate::commands::search::search_run(
+        &workspace, query, limit, mode, prefix, false, &progress,
+    )?;
+    Ok(crate::commands::search::search_document(&run))
 }
 
 fn scan(
@@ -488,7 +490,7 @@ fn scan(
     ch: &mut crate::serve_channel::Channel<'_>,
 ) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
-    let cfg = crate::load_config().map_err(refused)?;
+    let cfg = crate::commands::common::load_config().map_err(refused)?;
     // **`locking` before the attempt, not after the grant** (spec §2): a client watching a first run needs to see that
     // np is waiting on another writer, because from outside a blocked write and a slow scan look identical. The walk
     // itself stays unreported until Task 8 gives scan a seam; this line is the part that needs none.
@@ -496,16 +498,16 @@ fn scan(
     crate::serve_channel::report(&progress, Phase::Locking, ProgressEvent::default());
     // The lock is taken and released inside this one request. A held-across-requests design would have the server refuse *itself* after 2 s,
     // which is F44 doing its job against the wrong caller.
-    let _writer = match crate::server_writer_lock(&cfg, &workspace, "scan")? {
-        crate::LockGrant::Contended(document) => return Ok(document),
-        crate::LockGrant::Held(guard) => guard,
+    let _writer = match crate::commands::common::server_writer_lock(&cfg, &workspace, "scan")? {
+        crate::commands::common::LockGrant::Contended(document) => return Ok(document),
+        crate::commands::common::LockGrant::Held(guard) => guard,
     };
     // **Bookended, not live** (spec §9): one line when the walk starts, one when it ends with its counts. A solo scan of
     // 4 000 notes measured 2.6 s, so per-file callbacks would mean threading a reporter through the hottest loop in
     // np-core to narrate two seconds — and `files_seen` / `notes_seen` already exist in the report the walk produces.
     // The opening bookend: no counts yet, because none have been counted.
     crate::serve_channel::report(&progress, Phase::Indexing, ProgressEvent::default());
-    let report = crate::scan(&workspace, &cfg).map_err(refused)?;
+    let report = np_core::scan(&workspace, &cfg).map_err(refused)?;
     let mut params = crate::serve_channel::progress_params(
         request,
         "scan",
@@ -533,28 +535,36 @@ fn embed(
     ch: &mut crate::serve_channel::Channel<'_>,
 ) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
-    let cfg = crate::load_config().map_err(refused)?;
+    let cfg = crate::commands::common::load_config().map_err(refused)?;
     // Reported before the lock is attempted, for the same reason `scan` says it: waiting is the state a GUI has to draw.
     let progress = crate::serve_channel::ServeProgress::new(ch, request.cloned(), "embed");
     crate::serve_channel::report(&progress, Phase::Locking, ProgressEvent::default());
-    let _writer = match crate::server_writer_lock(&cfg, &workspace, "embed")? {
-        crate::LockGrant::Contended(document) => return Ok(document),
-        crate::LockGrant::Held(guard) => guard,
+    let _writer = match crate::commands::common::server_writer_lock(&cfg, &workspace, "embed")? {
+        crate::commands::common::LockGrant::Contended(document) => return Ok(document),
+        crate::commands::common::LockGrant::Held(guard) => guard,
     };
     // (The reporter was built above, before the lock: `Channel::notify` is what knows whether this connection opted in,
     // so a handler that decided for itself would be a second place where "did they ask?" can be answered wrongly.)
     // The same function `np embed` runs — arm order, fetch trigger and all — with the human channel off. F42's drift notice still prints, on
     // stderr, because it is prose about a state the document also reports in `prefix_drift`.
-    let report = crate::embed_report(&workspace, crate::AutoFetch::Deferred, false, &progress)
-        .map_err(refused)?;
+    let report = crate::commands::embed::embed_report(
+        &workspace,
+        crate::commands::embed::AutoFetch::Deferred,
+        false,
+        &progress,
+    )
+    .map_err(refused)?;
     let drift = match report.model.as_deref() {
-        Some(id) => {
-            crate::prefix_drift_notice(&crate::load_config().map_err(refused)?, &workspace, id)
-                .map_err(refused)?
-        }
+        Some(id) => crate::commands::embed::prefix_drift_notice(
+            &crate::commands::common::load_config().map_err(refused)?,
+            &workspace,
+            id,
+        )
+        .map_err(refused)?,
         None => None,
     };
-    crate::insert_drift(serde_json::to_value(&report).map_err(refused)?, drift).map_err(refused)
+    crate::commands::embed::insert_drift(serde_json::to_value(&report).map_err(refused)?, drift)
+        .map_err(refused)
 }
 
 /// What this connection knows, and what the disk says is being downloaded.
@@ -580,7 +590,7 @@ fn embed(
 /// someone's config read as an indexed workspace to the next tool that looks.
 fn status(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
-    let config = crate::load_config().map_err(refused)?;
+    let config = crate::commands::common::load_config().map_err(refused)?;
     let models_dir = config.workspace_models_dir(&workspace);
     let markers: Vec<Value> = np_core::models::list_fetch_markers(&models_dir)
         .into_iter()
@@ -617,7 +627,7 @@ fn status(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Valu
         // Tested for the file, then opened — in that order. `Db::open` creates directories and an empty database, so a
         // check afterwards could not un-mint the thing this function promises not to make.
         "last_scan": if config.workspace_db(&workspace).is_file() {
-            let db = crate::workspace_db(&config, &workspace).map_err(refused)?;
+            let db = crate::commands::common::workspace_db(&config, &workspace).map_err(refused)?;
             np_core::scan::last_scan(&db)
                 .map(|stamp| stamp.map_or(Value::Null, |secs| json!(secs)))
                 .map_err(refused)?
@@ -629,25 +639,27 @@ fn status(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Valu
 
 fn models_list(params: &Value) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
-    let config = crate::load_config().map_err(refused)?;
-    let db = crate::workspace_db(&config, &workspace).map_err(refused)?;
+    let config = crate::commands::common::load_config().map_err(refused)?;
+    let db = crate::commands::common::workspace_db(&config, &workspace).map_err(refused)?;
     Ok(match np_core::models::list(&db, &config, &workspace) {
-        Ok(listing) => crate::listing_json(
+        Ok(listing) => crate::commands::models::listing_json(
             &listing.models,
             &listing.fetching,
             &listing.unclaimed,
-            &crate::pinned_json(&config),
+            &crate::commands::models::pinned_json(&config),
             None,
         ),
         // A directory we cannot read is a state the document already knows how to carry (`models_dir_error`), so it stays a result rather than
         // becoming a fault: `np models list --json` prints the same object and exits non-zero, and exit codes do not exist here.
-        Err(err @ np_core::models::ModelError::ModelsDir { .. }) => crate::listing_json(
-            &[],
-            &[],
-            &[],
-            &crate::pinned_json(&config),
-            Some(&err.to_string()),
-        ),
+        Err(err @ np_core::models::ModelError::ModelsDir { .. }) => {
+            crate::commands::models::listing_json(
+                &[],
+                &[],
+                &[],
+                &crate::commands::models::pinned_json(&config),
+                Some(&err.to_string()),
+            )
+        }
         Err(err) => return Err(refused(err)),
     })
 }
@@ -687,7 +699,7 @@ fn embeddings_enable(params: &Value) -> Result<Value, ServeError> {
         }
     };
     refuse_unknown_keys(params, &["model"])?;
-    crate::embeddings_apply(
+    crate::commands::embeddings::embeddings_apply(
         np_core::config_write::EmbeddingsTarget::On { model: &model },
         np_core::config_write::WriteSurface::Serve,
     )
@@ -703,7 +715,7 @@ fn embeddings_enable(params: &Value) -> Result<Value, ServeError> {
 /// could live without this one, which is precisely the kind of thing an application says before it discovers it needs it.
 fn embeddings_disable(params: &Value) -> Result<Value, ServeError> {
     refuse_unknown_keys(params, &[])?;
-    crate::embeddings_apply(
+    crate::commands::embeddings::embeddings_apply(
         np_core::config_write::EmbeddingsTarget::Off,
         np_core::config_write::WriteSurface::Serve,
     )
@@ -775,7 +787,7 @@ fn links_list(params: &Value) -> Result<Value, ServeError> {
             ))
         }
     };
-    let config = crate::load_config().map_err(refused)?;
+    let config = crate::commands::common::load_config().map_err(refused)?;
     // A workspace that is not a directory refuses like every other reader's, before any state is claimed about it.
     np_core::models::require_workspace_dir(&workspace).map_err(refused)?;
 
@@ -785,19 +797,19 @@ fn links_list(params: &Value) -> Result<Value, ServeError> {
     // `indexed: false`, which is issue #5's distinction — "nobody has scanned this" is not the sentence "nothing links
     // here", and a rename tool that confuses them orphans a note.
     if !config.workspace_db(&workspace).is_file() {
-        return Ok(crate::links_json(
+        return Ok(crate::commands::models::links_json(
             &np_core::links::LinkListing::default(),
             false,
         ));
     }
-    let db = crate::workspace_db(&config, &workspace).map_err(refused)?;
+    let db = crate::commands::common::workspace_db(&config, &workspace).map_err(refused)?;
     let indexed = np_core::scan::indexed(&db).map_err(refused)?;
     let scope = match &rel {
         Some(path) => np_core::links::LinkScope::Note(path),
         None => np_core::links::LinkScope::All,
     };
     let listing = np_core::links::listing(&db, scope).map_err(refused)?;
-    Ok(crate::links_json(&listing, indexed))
+    Ok(crate::commands::models::links_json(&listing, indexed))
 }
 
 /// A JSON-RPC error object. Kept in one place so the envelope shape cannot vary by fault kind.
