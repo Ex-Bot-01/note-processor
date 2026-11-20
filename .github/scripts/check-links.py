@@ -24,9 +24,13 @@ spellings — and then declines to check the shapes that were never promises.
   * **anything under `docs/archive/`.** An archived plan quotes the paths it was written against — including generated ones
     like `tests/fixtures/corpus/INDEX.md` that existed only while somebody was following it. Rewriting a step to keep a
     checker quiet would falsify the record, so archive is quoted, not linked; see `docs/archive/README.md`.
-  * a path whose first component is not tracked here (`notes/x.md`, `daily/2026-01-01.md`, `src/llama-context.cpp:1631`,
-    `caf\xe9.md`) describes somebody's vault, llama.cpp's source, or a byte-level case. The tree does not contain them and
-    was never meant to;
+  * a **backticked** path whose first component is not tracked here (`notes/x.md`, `daily/2026-01-01.md`,
+    `src/llama-context.cpp:1631`, `caf\xe9.md`) describes somebody's vault, llama.cpp's source, or a byte-level case; the tree
+    does not contain them and was never meant to. The exemption stops at backticks, and the reason is worth keeping in writing:
+    `[the design](superpowers/specs/2026-10-23-note-processor-design.md)` in `docs/README.md` is a relative link whose first
+    component is not a top-level directory either, so when the rule covered markdown links it skipped 22 of them — 21 of which
+    resolved fine, the whole document index among them — while printing "0 broken". A link written in link syntax is checked;
+    a path mentioned in prose gets the benefit of the doubt;
   * files under `tests/fixtures/`: a note in a fixture that links to `notes/other.md` is testing what `np` does with a
     dangling link.
 
@@ -91,7 +95,7 @@ def candidates(raw, heads):
             if "/" not in body:
                 if kind == "backtick":
                     continue  # `scan.rs` is a name, not a path
-            elif body.split("/", 1)[0] not in heads:
+            elif kind == "backtick" and body.split("/", 1)[0] not in heads:
                 continue  # somebody's vault, or llama.cpp's source tree
             yield kind, t, body
 
@@ -188,6 +192,24 @@ def self_test():
             failures.append(f"a tree whose links all resolve reported: {found}")
         else:
             cases.append("a resolving tree passes, and every exclusion stays green")
+
+        # A relative markdown link out of a subdirectory is still a link. Exempting it because its first component is not a
+        # top-level directory is how the document index ended up unchecked while the row printed "0 broken".
+        write("README.md", "# Top\n\n[real](docs/exists.md)\n")
+        write("docs/index-like.md", "see [a real file](../README.md)\nand [a dead one](../no-such-dir/thing.rs)\n")
+        subprocess.run(["git", "-C", tmp, "add", "-A"], check=True, capture_output=True)
+        problems = run()
+        if len([x for x in problems if "no-such-dir/thing.rs" in x]) == 1 and not [x for x in problems if "../README.md" in x]:
+            cases.append("a relative markdown link is checked; its resolving sibling stays green")
+        else:
+            failures.append(f"relative markdown links mishandled: {problems}")
+
+        write("docs/index-like.md", "lives in `notes/some-note.md` and `src/llama-context.cpp:1631`\n")
+        subprocess.run(["git", "-C", tmp, "add", "-A"], check=True, capture_output=True)
+        if not run():
+            cases.append("a backticked path outside this tree keeps the exemption")
+        else:
+            failures.append(f"foreign backtick paths flagged: {run()}")
 
         planted = [
             ("markdown link", "# I\n\n[Nowhere](docs/gone.md).\n", "docs/gone.md"),
