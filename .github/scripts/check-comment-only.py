@@ -6,7 +6,8 @@ by eye asks a human to confirm a negative across every file, which is exactly th
 computed instead: strip the comments out of every file the range touched, and compare what is left. If two token streams
 differ, a code token changed and the range was not a comment-only change.
 
-    check-comment-only.py BASE [HEAD]        # default HEAD = working tree's commit
+    check-comment-only.py BASE [HEAD]        # no HEAD: the base is compared against the working tree, so it can be run
+                                             # before committing — which is when a stray token is cheapest to notice
 
 The stripper is deliberately boring: `//` runs to end of line in Rust, `#` does in TOML/shell/Python/YAML, and neither counts
 inside a string literal. It does not try to be a parser — it only has to be *conservative*, because the failure mode that
@@ -97,14 +98,21 @@ def _looks_like_char_literal(line, i):
 
 
 def changed_files(base, head, root="."):
-    out = subprocess.run(["git", "-C", root, "diff", "--name-only", f"{base}..{head}"], capture_output=True, text=True,
-                         check=True)
+    spec = f"{base}..{head}" if head else base          # no head: compare the base against the working tree
+    out = subprocess.run(["git", "-C", root, "diff", "--name-only", spec], capture_output=True, text=True, check=True)
     return [f for f in out.stdout.split("\n") if f.strip()]
 
 
 def blob(rev, path, root="."):
+    if rev == "":                                        # the working tree, for a range with no explicit head
+        full = os.path.join(root, path)
+        try:
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return None                                  # deleted in the tree: a comment-only change deletes nothing
     r = subprocess.run(["git", "-C", root, "show", f"{rev}:{path}"], capture_output=True, text=True)
-    return r.stdout if r.returncode == 0 else None      # absent at that revision: added or deleted file
+    return r.stdout if r.returncode == 0 else None       # absent at that revision: added or deleted file
 
 
 def check(base, head="", root="."):
@@ -115,7 +123,7 @@ def check(base, head="", root="."):
         if ext not in RUST and ext not in HASH:
             continue                                    # lockfiles, goldens, data: this fence is about source prose
         before = blob(base, path, root)
-        after = blob(head or "HEAD", path, root)
+        after = blob(head, path, root) if head != "" else blob("", path, root)
         if before is None or after is None:
             problems.append(f"{path}: added or deleted in this range — a comment-only change neither adds nor removes files")
             continue
@@ -203,6 +211,21 @@ def self_test():
         cases.append("a file added in the range is named rather than silently skipped")
     else:
         failures.append(f"an added file slipped through: {problems}")
+
+    with open(os.path.join(tmp, "src/a.rs"), "a", encoding="utf-8") as fh:
+        fh.write("// a note added but not committed\n")
+    _, problems = check(head_of(0), "", tmp)
+    if not problems:
+        cases.append("an uncommitted comment-only edit compares against the working tree, not against HEAD")
+    else:
+        failures.append(f"an uncommitted prose edit was flagged: {problems}")
+    with open(os.path.join(tmp, "src/a.rs"), "a", encoding="utf-8") as fh:
+        fh.write("static LEAK: i32 = 1;\n")
+    _, problems = check(head_of(0), "", tmp)
+    if any("src/a.rs" in x for x in problems):
+        cases.append("an uncommitted code line is caught before it is committed")
+    else:
+        failures.append("an uncommitted static slipped through")
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("comment-only self-test")
