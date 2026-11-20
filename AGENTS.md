@@ -38,8 +38,8 @@ in which round and on which machine, lives in `git log`.
 - An absolute path into a home directory or a working tree. Write the repo-relative path, or name the environment
   variable that holds the real one at runtime.
 - An account name or owner handle — anything that only makes sense to whoever owns the hosted repository.
-- Actions-minute or storage arithmetic. Quota numbers move with the billing period, so they are kept and
-  re-measured in `docs/ops-actions-minutes.md` rather than repeated where they go stale.
+- Actions-minute or storage arithmetic. Quota numbers move with the billing period and with whether the
+  repository is public, so a figure copied into a tracked file is stale before its first reader sees it.
 - A CI run number. It cannot be opened by anyone without access to that host, and it stops resolving whenever the
   runs age out.
 - "Measured on <date>" narration. The measurement belongs in the file; the day it happened belongs in the commit
