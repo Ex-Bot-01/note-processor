@@ -604,7 +604,7 @@ fn scan_inner(
     )?;
     // Decided here, before anything else writes, from what the write pass actually delivered. One coverage
     // answer serves both versions, because the chunk rule reuses `refresh_covered`'s two sources **unchanged**:
-// a note
+    // a note
     // that escaped this scan escaped chunking too, and inventing a second coverage rule for chunks would be
     // a second thing to keep honest for no extra fact.
     let covered = refresh_covered(&written, hidden);
@@ -927,7 +927,7 @@ fn decode(bytes: &[u8]) -> (String, bool) {
 struct KnownRows {
     /// The rows `classify` may judge.
     rows: Vec<Snapshot>,
-    /// Live note rows the **byte-keyed** arm hid.
+    /// Source 1 of the refresh's coverage charge: live note rows the **byte-keyed** arm hid.
     hidden: usize,
     /// Every ambiguous row this pass marked, admitted or refused, in byte-key ascending order — the
     /// population [`unresolved_ambiguity`] reads and the unindexable record renders.
@@ -1169,8 +1169,8 @@ fn strip_marked_removals(
         .collect()
 }
 
-/// The ambiguity half of the coverage charge: the marked rows this pass **did not resolve**, as their display
-/// spellings in byte-key order.
+/// Source 2 of the refresh's coverage charge: the marked rows this pass **did not resolve**, as their display
+/// spellings in byte-key order. Source 1 is `KnownRows::hidden`; a row is charged by one of the two, never both.
 ///
 /// Resolution is the two routes below, read from what classification actually delivered rather than tallied in
 /// a pre-pass — which is what lets a healed row stop paying once it has healed, because a charge that never
@@ -2131,12 +2131,12 @@ pub fn last_scan(db: &Db) -> Result<Option<i64>, DbError> {
 }
 
 /// Whether this workspace has an index at all — the reading that tells **"nothing here matches"** apart from
-/// **"nobody has ever looked"** (issue **#5**).
+/// **"nobody has ever looked"**.
 ///
 /// Why a reader needs it: `search` answers an empty list in both worlds, and an application holding an empty
 /// list can only say *no results*. A person who just pointed a GUI at a folder they have never indexed reads
-/// that as a broken search; the one-click fix — index it — is invisible. F45 settled the principle for the
-/// neighbouring state (a degraded answer says which half was missing rather than going quiet), and this is
+/// that as a broken search; the one-click fix — index it — is invisible. The principle is settled for the
+/// neighbouring state already: a degraded answer says which half was missing rather than going quiet. This is
 /// the same fact about a different half: the workspace itself.
 ///
 /// Two probes, in this order:
@@ -2173,14 +2173,14 @@ fn set_meta(db: &Db, key: &str, value: &str) -> Result<(), DbError> {
     Ok(())
 }
 
-/// The display paths the registry holds **more than one live row** for — counted, never explained (F22 §4.5).
+/// The display paths the registry holds **more than one live row** for — counted, never explained.
 ///
 /// Grouped by `rel`, the display text, because that is what a person notices: two byte-distinct paths sharing one
 /// lossy spelling produce two alike-looking lines in `INDEX.md`. **That is also why the count cannot name a cause.**
 /// Two different files whose names collide under lossy decoding are legitimate, correctly indexed, and
-/// indistinguishable here from F23's duplicated note — and an attachment sharing a display spelling with a note
+/// indistinguishable here from a duplicated note — and an attachment sharing a display spelling with a note
 /// counts too, though it has no catalog entry at all. Narrowing this with `key_is_display_derived` would not help:
-/// it flags both of F23's configurations identically (nothing separates them) while staying silent on Windows,
+/// it flags both ambiguous configurations identically (nothing separates them) while staying silent on Windows,
 /// where every lossy key qualifies.
 ///
 /// `state = 'ok'` keeps stale rows out; a note whose file went away is not a path that appears twice. Sorted by the
@@ -2198,7 +2198,7 @@ fn duplicated_rels(db: &Db) -> Result<Vec<String>, DbError> {
     Ok(rels)
 }
 
-/// Record what this scan lost, **after the transaction commit and best-effort** (F22 §3).
+/// Record what this scan lost, **after the transaction commit and best-effort**.
 ///
 /// "After the commit" is not "after the scan finished": publishing the index files and recording the workspace
 /// row come later and can still fail the run. The record is therefore accurate about the *committed rows* it
@@ -2208,9 +2208,9 @@ fn duplicated_rels(db: &Db) -> Result<Vec<String>, DbError> {
 /// The result is dropped for the reason [`crate::db::report_orphans`] gives for its own writes: by the time
 /// this runs the scan's rows and catalog are committed, so a `meta` write that refuses — a full disk, a lock another
 /// process holds past the timeout, a trigger — costs this workspace its record and nothing else. Returning
-/// `Err` would report a failed scan whose rows and catalog are already durable, and `.expect` would do worse
-/// (F21 §2: that panic is exactly what F21 removed). The loss still reaches this run's report field and its
-/// stdout line; only its afterlife is degraded.
+/// `Err` would report a failed scan whose rows and catalog are already durable, and `.expect` would do worse:
+/// a panic here throws away a committed scan, which is the failure this call exists not to add. The loss
+/// still reaches this run's report field and its stdout line; only its afterlife is degraded.
 fn record_unindexable(db: &Db, value: &str) {
     let _ = set_meta(db, UNINDEXABLE_KEY, value);
 }
@@ -2275,7 +2275,7 @@ fn chunker_refresh_needed(stored: Option<i64>) -> bool {
 /// scan could not look at — under a directory it could not enter, or carrying a name it refused —
 /// which [`known_rows`] drops so it cannot be mistaken for deleted (`hidden_by_unknown`). Recording the
 /// version over either would label rows as current that an older build wrote, permanently — the exact
-/// failure F15 exists to prevent, reintroduced by the fix.
+/// failure this rule exists to prevent, reintroduced by the fix.
 /// Retrying is the cheaper fault: one subtree stays stale until it becomes readable again, and the scan
 /// after that records the version once the corpus is covered.
 ///
@@ -2287,7 +2287,7 @@ fn chunker_refresh_needed(stored: Option<i64>) -> bool {
 ///
 /// What *can* still hold the version back indefinitely is stale data that exists and cannot be rewritten: a
 /// note whose rows are there but unreadable (a mode-000 `.md`, or one inside a directory nobody can enter), a
-/// live row hidden behind such a directory, **a name this build refuses for good** (F18: while that spelling
+/// live row hidden behind such a directory, **a name this build refuses for good** (while that spelling
 /// stays unrepresentable no scan can index it — a refused *file* leaves its own rows owing, a refused
 /// *directory* leaves everything below it owing — so they keep whatever an older build wrote and only renaming
 /// the path clears the debt), a move refused by an identity conflict — judged by the path it came from, since
@@ -2296,7 +2296,7 @@ fn chunker_refresh_needed(stored: Option<i64>) -> bool {
 ///
 /// Of those, a refused name is the one that never clears on its own: no code renames a file, so such a
 /// workspace re-parses its whole corpus on every scan and prints the gap line each time. That is chosen over
-/// recording the version beside a note that was not re-parsed, which is F15's bug wearing a clean hat; the cost
+/// recording the version beside a note that was not re-parsed, which is that bug wearing a clean hat; the cost
 /// is named here rather than discovered.
 ///
 /// A duplicate pair no longer belongs to that class in a database this program wrote: **the next open heals
@@ -2310,11 +2310,12 @@ fn chunker_refresh_needed(stored: Option<i64>) -> bool {
 /// and the notice below names the count so this is never silent.
 ///
 /// Read that healing narrowly, because it is the scope boundary of this paragraph: it covers
-/// [`Indexed::Duplicate`] — **two note rows on one byte key** — and no other duplicate. F23's duplicate is another shape,
-/// two live `files` **and** `notes` rows for one file behind a lossy display spelling, and F23 healed only the half where
-/// content still agrees: a row whose **content changed while its path was unindexable** has nothing to pair on, so the
-/// pair returns and this function keeps withholding the version — permanently for a migration-keyed row, whose stored key
-/// matches no listing (`docs/design-f23-ambiguous-rows.md` §6 names durable file identity as the way through). "Duplicate
+/// [`Indexed::Duplicate`] — **two note rows on one byte key** — and no other duplicate. The ambiguous
+/// duplicate is another shape: two live `files` **and** `notes` rows for one file behind a lossy display
+/// spelling, and only the half where content still agrees is healed — a row whose **content changed while its
+/// path was unindexable** has nothing to pair on, so the pair returns and this function keeps withholding the
+/// version — permanently for a migration-keyed row, whose stored key
+/// matches no listing; durable file identity is the named way through. "Duplicate
 /// rows are healed" is therefore not a sentence to carry past here; "the ones this program can prove are one file are
 /// healed" is.
 fn refresh_covered(written: &Written, hidden_by_unknown: usize) -> bool {
@@ -2396,7 +2397,7 @@ fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
 /// The order is the whole contract, because one set of files cannot be published atomically:
 ///
 /// 1. Every shard, each written to a temporary name and moved in with one `rename`, so a reader never
-///    sees a half-written file (spec §7's whole-file regenerate).
+///    sees a half-written file: the regenerate is whole-file, never in place.
 /// 2. `INDEX.md` last. Until it moves, the old catalog still names only files that exist; from then on
 ///    the new one does too. Renaming it first is what let an entry point advertise shards that were
 ///    never written while superseded shards of another generation survived beside them.
@@ -2407,8 +2408,8 @@ fn report_refresh_gap(out: &mut dyn io::Write, missed: usize) {
 /// makes [`set_index_list`] safe to commit ahead of these writes.
 ///
 /// Returns the root entries that wear a generated name without carrying this program's fingerprint: they
-/// are left exactly as they are and reach [`ScanReport::skipped`], because spec §7 grants regeneration of
-/// what np published and not removal of whatever is named like it.
+/// are left exactly as they are and reach [`ScanReport::skipped`], because this publishes what np wrote and
+/// does not remove whatever is merely named like it.
 fn write_index_files(
     root: &Path,
     rendered: &[(String, String)],
@@ -2446,9 +2447,9 @@ fn write_index_files(
 /// entries whose names UTF-8 cannot hold — `INDEX-\xff.md` beside `INDEX-\xef\xbf\xbd.md` — lose to the same
 /// `U+FFFD` spelling, and a verdict taken on that spelling answers for whichever one readdir happened to
 /// reach first: it can unlink a header-less foreign file at its twin's bytes, or leave our own shard alive
-/// in silence. That is F13 §1 on the one code path here that deletes files (see
-/// `docs/design-f13-byte-paths.md`), so identity is compared as bytes end to end and the lossy text is kept
-/// only for what is genuinely a display question — [`index_names::is_generated_index`] and the report line.
+/// in silence. That is the display-text trap on the one code path here that deletes files, so identity is
+/// compared as bytes end to end and the lossy text is kept only for what is genuinely a display question —
+/// [`index_names::is_generated_index`] and the report line.
 ///
 /// Which leaves one asymmetry to know about: **verdicts are per entry, report lines are not.** `foreign`
 /// carries display text only — it was never a path the walk keyed — so the bytes [`ScanReport::skipped`] dedups
@@ -2551,7 +2552,7 @@ fn superseded_names(
             // Ours, unlinked at the path this entry actually has.
             Some(listed) if listed.ours => superseded.delete.push(listed.path.clone()),
             // On disk, but not ours: a foreign note or a directory wearing one of our names. Reported as
-            // display text because a report line is a display question (F13 §3).
+            // display text because a report line is a display question.
             Some(listed) => superseded.foreign.push(listed.display.clone()),
             // Named by `meta` and already gone — the state this call wanted, which is how the delete loop
             // in [`write_index_files`] reads an [`io::ErrorKind::NotFound`]. Reporting it would name a
@@ -2565,9 +2566,7 @@ fn superseded_names(
 /// One generated-looking root entry as the listing saw it: enough to judge it, enough to act on it.
 struct Listed {
     /// Identity: the file name's OS bytes, which keep two entries sharing a lossy spelling apart. On Windows
-    /// those bytes are exact since F18 round four (`wtf8`, 2026-11-08), so twins stay apart there too; the
-    /// sentence this one replaces claimed the lossy collapse survived on Windows, and was stale from that
-    /// commit until the nightly row read it (issue #9). F13 §5's residual is now only the third target —
+    /// those bytes are exact (`wtf8`), so twins stay apart there too. The residual is only the third target —
     /// neither Unix nor Windows — where no exact spelling exists to take.
     name_bytes: Vec<u8>,
     /// What gets unlinked, straight from `entry.path()` — the bytes this entry really has on disk.
@@ -2787,15 +2786,15 @@ mod tests {
         }
     }
 
-    /// §3's accepted regression, as evidence rather than a paragraph: the ASCII byte fold cannot bridge a
+    /// The accepted regression, as evidence rather than a paragraph: the ASCII byte fold cannot bridge a
     /// Unicode-only case pair, so [`folded_row`] misses a rename that changes only a non-ASCII letter's case.
     ///
-    /// Before round 2 this lookup ran on the Unicode display `case_key`, where `Ämli.md` and `ämli.md` are one
+    /// This lookup used to run on the Unicode display `case_key`, where `Ämli.md` and `ämli.md` are one
     /// fold and the rename was followed onto the existing row. Matched on `case_bytes` it finds nothing, so the
     /// caller upserts a second row — and [`crate::change::key_of`] is `case_bytes` under `case_sensitive =
-    /// false`, which means **on Windows this pair is the entire rename-following story**, not one corner of it
-    /// (`docs/backlog-m2-followups.md` F18). Two seams keep this out of the integration tests: `folded_row` is
-    /// private, and `scan::run` hardcodes case sensitivity as `!cfg!(windows)`; the classify half of the same
+    /// false`, which means **on Windows this pair is the entire rename-following story**, not one corner of it.
+    /// Two seams keep this out of the integration tests: `folded_row` is private, and `scan::run` hardcodes
+    /// case sensitivity as `!cfg!(windows)`; the classify half of the same
     /// pair — the note detaching into `Added` + `Removed` — is pinned in `crates/np-core/tests/change.rs`.
     #[test]
     fn the_ascii_fold_cannot_follow_a_unicode_only_case_rename() {
@@ -2830,15 +2829,14 @@ mod tests {
         );
     }
 
-    // F18's protective half, on the platform that cannot refuse a real name: the two lists `crate::walk`
+    // The protective half, on the platform that cannot refuse a real name: the two lists `crate::walk`
     // reports are built by hand here, exactly as that walk builds them, because no Linux filesystem can put
     // an unpaired surrogate in a file name. What they must never do is over-reach — every one of these tests
     // names the paths that stay visible alongside the refused one.
     //
     // The refusal has two arms and they are not interchangeable: a refused **file** suppresses its own `rel`
-    // alone, and a refused **directory** suppresses its whole subtree by prefix. Getting either wrong is the
-    // silent overwrite F18 exists to stop (too narrow) or a catalog that stops noticing real deletions
-    // (too wide).
+    // alone, and a refused **directory** suppresses its whole subtree by prefix. Getting either wrong costs
+    // a silent overwrite (too narrow) or a catalog that stops noticing real deletions (too wide).
 
     /// The exact arm: one refused file, and four neighbours that must keep being judged.
     #[test]
@@ -2901,8 +2899,8 @@ mod tests {
 
     /// An unknown path from its **raw identity bytes**, with the display text a lossy decode of those same
     /// bytes produces. Unlike [`display_keyed_unknown`], whose bytes are derived from its text, this one can hold
-    /// bytes no `String` can — which is the whole subject of F20: `raw(b"caf\xE9")` and `raw(b"caf\xE8")` are two paths
-    /// whose `display` fields are one string.
+    /// bytes no `String` can — which is the whole point of the twin cases: `raw(b"caf\xE9")` and
+    /// `raw(b"caf\xE8")` are two paths whose `display` fields are one string.
     fn raw(bytes: &[u8]) -> UnknownPath {
         UnknownPath {
             display: String::from_utf8_lossy(bytes).into_owned(),
@@ -2910,7 +2908,7 @@ mod tests {
         }
     }
 
-    /// The premise every F20 case below rests on, asserted instead of assumed: `left` and `right` are distinct
+    /// The premise every twin case below rests on, asserted instead of assumed: `left` and `right` are distinct
     /// as identity and identical as display text. Put it in a helper because a fixture that quietly stopped
     /// producing one shared spelling would keep passing while proving nothing.
     fn assert_twin_bytes(left: &[u8], right: &[u8]) {
@@ -2959,11 +2957,12 @@ mod tests {
     /// new rules over it would label rows an older build wrote as current. `known_rows` keeps the row out
     /// of `classify`'s reach **and** counts it here — one comparison, both halves of the promise.
     ///
-    /// F23 §5.2 named this case as one whose contract was being replaced, on the reading that its rows are
-    /// ambiguous (`snap` keys from display text, so they are). Running it showed the other half of §3: the entry
-    /// [`crate::walk`] would record for this refusal is built by [`display_keyed_unknown`], whose **bytes** equal
-    /// those rows' keys, so the byte-keyed arm answers first and precedence keeps them charged in source 1 and
-    /// unmarked. That is pinned below rather than assumed: listing their own paths readable does not move them.
+    /// This case is worth pinning because the reading of it was argued rather than obvious: on paper its rows
+    /// are ambiguous (`snap` keys from display text, so they are). Running it showed the other half of the
+    /// precedence rule: the entry [`crate::walk`] would record for this refusal is built by
+    /// [`display_keyed_unknown`], whose **bytes** equal those rows' keys, so the byte-keyed arm answers first
+    /// and precedence keeps them charged in the hidden count and unmarked. That is pinned below rather than
+    /// assumed: listing their own paths readable does not move them.
     #[test]
     fn a_note_behind_a_refused_path_is_charged_to_the_refresh_that_missed_it() {
         let db = Db::in_memory().expect("in-memory database");
@@ -2999,7 +2998,7 @@ mod tests {
             "one charge per hidden note — the attachment behind the same refusal owes nothing"
         );
 
-        // §3's precedence, on the arm pair that overlaps for the permanent class. These rows are ambiguous by
+        // Precedence, on the arm pair that overlaps for the permanent class. These rows are ambiguous by
         // predicate, and their own paths can be listed readable with a matching hash, yet the byte-keyed arm has
         // already answered: they stay charged **once**, in source 1, and are never marked. Mark-first would charge
         // each of them twice — universally on Windows, where refusal bytes are already lossy.
@@ -3068,15 +3067,15 @@ mod tests {
 
     /// The one exception to byte matching, and its bound, in one comparison. A row whose key migration 4 derived
     /// from display text ([`key_is_display_derived`]) has no byte spelling to be judged by, so an unreadable
-    /// directory whose bytes it cannot tell apart is **marked** — since F23 that is what the fallback does with
-    /// it, instead of deleting it from the scan's view. With nothing listed the mark refuses admission (today's
+    /// directory whose bytes it cannot tell apart is **marked** — that is what the fallback now does with it,
+    /// instead of deleting it from the scan's view. With nothing listed the mark refuses admission (today's
     /// pre-drop) and charges source 2; with a listed readable path spelling the row exactly and carrying its
     /// stored hash the row is **in `known`, marked, and unremovable** — `classify` still calls it `Removed`, and
     /// [`strip_marked_removals`] is what stops that stale-ing a live note.
     ///
     /// The same display spelling keyed from **real** bytes is a row the walk re-keyed, and stays in `known` on
-    /// its bytes: that is F20's twin fix surviving the fallback, asserted rather than promised. F23 §5.2 names
-    /// this case as a contract update rather than a fence, and it is one: the assertions below used to read
+    /// its bytes: that is the twin fix surviving the fallback, asserted rather than promised. This case is a
+    /// contract update rather than a fence, and it is one: the assertions below used to read
     /// `hidden == 1`, which was the deletion being counted.
     #[test]
     fn a_display_keyed_row_falls_back_to_text_and_a_byte_keyed_row_does_not() {
@@ -3151,7 +3150,7 @@ mod tests {
             "the legacy note is still charged to a refresh that could not reach it — as source 2 now"
         );
 
-        // The contract F23 replaces: a listed readable path that spells the row exactly **and** carries its
+        // What marking buys: a listed readable path that spells the row exactly **and** carries its
         // stored hash admits it. It pairs with nothing by identity — its key is display text, the listing's are
         // the walk's bytes — so `classify` still reaches for a `Removed`, and being marked is what makes that
         // change unremovable.
@@ -3199,13 +3198,13 @@ mod tests {
         );
     }
 
-    // F20 §5: the two matchers over hand-built `UnknownPath`s whose **bytes** differ while their display text
-    // does not. A Linux filesystem refuses no name, so the refused arm is hand-built here exactly as F18's tests
-    // above build it — and the unreadable arm is hand-built for a reason F18 did not need: on Unix the twin pair
-    // `caf\xE9` / `caf\xE8` is reachable today, and only raw bytes can spell it.
+    // The two matchers over hand-built `UnknownPath`s whose **bytes** differ while their display text does
+    // not. A Linux filesystem refuses no name, so the refused arm is hand-built here exactly as the refusal
+    // tests above build it — and the unreadable arm is hand-built for a reason those did not need: on Unix
+    // the twin pair `caf\xE9` / `caf\xE8` is reachable today, and only raw bytes can spell it.
 
     /// Byte near-twins are different paths. Neither matcher may let `caf\xE9` cover `caf\xE8`, whose display
-    /// spelling is identical — that single collapse is F20 §1: a readable subtree dropped out of `known`, so a
+    /// spelling is identical — and that single collapse is what hid a readable subtree from `known`, so a
     /// deletion in it went unreported and a rename there produced a second live row instead of a move.
     #[test]
     fn a_byte_near_twin_is_not_the_unknown_path() {
@@ -3334,7 +3333,7 @@ mod tests {
 
     /// [`ScanReport::skipped`] is sorted and deduplicated by **bytes**: two refused (or unreadable, or
     /// unread-and-vanished) paths sharing one lossy spelling publish two lines that look alike, because the
-    /// scan saw two paths and can only name them alike (F20 §1, §3). One path reaching the report twice is
+    /// scan saw two paths and can only name them alike. One path reaching the report twice is
     /// still one line — the dedup survives the key change, it just stops being able to merge two paths.
     #[test]
     fn skipped_lines_dedups_by_bytes_and_not_by_display() {
@@ -3358,17 +3357,17 @@ mod tests {
         );
     }
 
-    /// F22 §3's arithmetic, over **hand-built** walk lists.
+    /// The loss record's arithmetic, over **hand-built** walk lists.
     ///
     /// A Linux filesystem refuses no name — `os_bytes` is exact — so the refusal arm has no end-to-end
     /// fixture and is counted here instead, exactly as the matcher cases above and in `walk::tests` build
     /// their refused entries. What this does **not** claim is that any real scan produces a non-zero
-    /// `unkeyable`: only Windows refuses a name, and that arm stays unexecuted (F18's honest terms). The last
+    /// `unkeyable`: only Windows refuses a name, and that arm stays unexecuted here. The last
     /// block pins the consequence for every run on this platform: `unkeyable` is zero, always.
     #[test]
     fn the_record_counts_each_loss_by_kind_and_caps_its_names() {
         // Two refused names and one unreadable directory, all with distinct display text. The counts have to
-        // stay apart, because "3 paths skipped" — the sentence `skipped` prints — is precisely what F22
+        // stay apart, because "3 paths skipped" — the sentence `skipped` prints — is precisely what the record
         // exists to replace with a diagnosis.
         let refused = [
             display_keyed_unknown("caf\u{fffd}.md"),
@@ -3413,7 +3412,7 @@ mod tests {
 
         // The cap: five refused, four unreadable, three duplicated is twelve losses and eight names. What falls
         // off is the directories: a refused name and a duplicated path reach the person only through this list,
-        // while an unreadable directory is named in `ScanReport::skipped` as well (F22 §3).
+        // while an unreadable directory is named in `ScanReport::skipped` as well.
         let spelled = |prefix: &str, count: usize| -> Vec<UnknownPath> {
             (0..count)
                 .map(|index| display_keyed_unknown(&format!("{prefix}{index}.md")))
@@ -3456,7 +3455,7 @@ mod tests {
 
         // Nothing lost: `is_empty` is what makes the report field `None`, while the value is still the full
         // all-zero spelling — a fixed workspace has to overwrite an older complaint rather than leave it
-        // standing there accusing somebody (F22 §2).
+        // standing there accusing somebody.
         let clean = unindexable_record(&[], &[], &[], &[]);
         assert!(clean.is_empty(), "nothing lost is nothing reported");
         assert_eq!(
@@ -3482,10 +3481,10 @@ mod tests {
         assert!(!unix.is_empty(), "one unreadable directory is still a loss");
     }
 
-    /// §3's exclusion, pinned on the class it exists for. A row whose key already equals its OS bytes — a name
+    /// The exclusion, pinned on the class it exists for. A row whose key already equals its OS bytes — a name
     /// genuinely holding `U+FFFD`, which is every lossy name on Windows — can be marked *and* listed unread: the walk
     /// saw the path, the read failed, and `written.uncovered` charges that. Source 2 must stand down for it, or one note
-    /// pays twice and the gap line over-counts the way F20 §1 says it used to.
+    /// pays twice and the gap line over-counts, which is what this exclusion exists to stop.
     #[test]
     fn a_marked_row_listed_but_unread_charges_exactly_one_counter() {
         assert_twin_bytes(b"caf\xE9/note.md", b"caf\xE8/note.md");
@@ -3525,7 +3524,7 @@ mod tests {
         );
     }
 
-    /// §4.4's answer, **counted** rather than assumed: one note behind one unknown path is charged in exactly
+    /// The answer, **counted** rather than assumed: one note behind one unknown path is charged in exactly
     /// one of the two counters the gap line adds together.
     ///
     /// They are disjoint for the rows both sides judge **by bytes**, which is what this test builds.
@@ -3537,15 +3536,15 @@ mod tests {
     ///
     /// The [`key_is_display_derived`] fallback used to sit outside that construction: it hid a row on **display** text,
     /// so a row it dropped could also be one whose own path was listed and could not be read — `written.uncovered`'s
-    /// shape as well. F23 settled that in two places rather than leaving it to luck: `known_rows` asks the byte arm
-    /// **first** and marks nothing it already hid (§3's precedence, which on Windows is the difference between one charge
+    /// shape as well. That was settled in two places rather than left to luck: `known_rows` asks the byte arm
+    /// **first** and marks nothing it already hid (precedence, which on Windows is the difference between one charge
     /// and a universal double charge), and [`unresolved_ambiguity`] skips any marked row whose key appears in the
     /// found-side unreadable set. [`a_marked_row_listed_but_unread_charges_exactly_one_counter`] pins that exclusion on
-    /// the class it exists for; what remains here is the byte-keyed disjointness F20 established.
+    /// the class it exists for; what remains here is the byte-keyed disjointness.
     ///
-    /// Before F20 the two sets overlapped for byte-keyed rows too: a note in the readable twin was hidden by its
+    /// The two sets used to overlap for byte-keyed rows too: a note in the readable twin was hidden by its
     /// unreadable twin's display spelling **and** charged as an unread write, so one note cost two charges and the
-    /// refresh-gap line over-counted (F20 §1). `ScanReport` carries no gap count, which is why this arithmetic lives
+    /// refresh-gap line over-counted. `ScanReport` carries no gap count, which is why this arithmetic lives
     /// here rather than in `tests/scan.rs`.
     #[test]
     fn one_note_behind_an_unknown_path_is_charged_in_exactly_one_counter() {
@@ -3596,8 +3595,9 @@ mod tests {
             "one note the refresh missed, one charge on the gap line"
         );
 
-        // Case 2 — the overlap F20 closed. The readable twin's note cannot be read this scan either (gone, or
-        // changed, between walk and read), so it reaches `found` as an unknown marker while its unreadable twin
+        // Case 2 — the overlap that byte matching closed. The readable twin's note cannot be read this scan
+        // either (gone, or changed, between walk and read), so it reaches `found` as an unknown marker while
+        // its unreadable twin
         // sits in the list. Matched on display text it would be charged **twice**: hidden by a refusal this
         // scan never made, and missed by the write pass.
         let second = known_rows(&db, &dirs, &[], &[]).expect("the rows read back again");
