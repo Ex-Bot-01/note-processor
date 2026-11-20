@@ -107,6 +107,10 @@ RUSTDOCFLAGS="--deny warnings" row rustdoc-deny-default cargo doc --workspace --
 row_or_skip rustdoc-deny-localmodel "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model --no-deps
 row_or_skip rustdoc-deny-lm-vision "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model,vision --no-deps
 
+# Path to the fence scripts, defined before the first row that needs one: `set -u` makes a use-before-definition
+# an immediate abort rather than a row that quietly exits 127 further down the log.
+G=.github/scripts
+
 # **The hand-written FFI against the header it mirrors.** `crates/np-core/src/llama_ffi.rs` declares llama.cpp's C API by
 # hand (§14 says why), so a re-pin that changes a signature produces no compile error — only behaviour nothing predicts. This
 # compares name, arity and parameter/return shape against the pinned tree's own headers, admits what it cannot compare
@@ -120,7 +124,6 @@ row_or_skip llama-decls "$decl_missing" env NP_LLAMA_CPP_SRC="$llama_src" python
 # The three static fences. They live beside this script because a gate that is not in the repository is a gate that
 # quietly stops running: these three lived in a git-ignored scratch directory, and every row here kept exiting 2 with
 # "can't open file" until somebody noticed.
-G=.github/scripts
 row cfg-dead-code python3 "$G/check_cfg_dead_code.py"
 row attr-displacement python3 "$G/check_attr_displacement.py"
 row catalog-goldens python3 "$G/verify_catalog_goldens.py"
