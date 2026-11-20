@@ -1146,8 +1146,13 @@ mod tests {
         assert!(flags >= 0, "test setup: F_GETFL");
         // SAFETY: the same live descriptor, and the value written is the flags just read with one bit added; no other
         // process holds a claim on this pipe's write end.
-        let set_nonblocking =
-            unsafe { libc::fcntl(write_half.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        let set_nonblocking = unsafe {
+            libc::fcntl(
+                write_half.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        };
         assert!(set_nonblocking >= 0, "test setup: O_NONBLOCK");
         (read_half, write_half)
     }
