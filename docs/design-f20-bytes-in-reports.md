@@ -112,6 +112,6 @@ pub struct UnknownPath {
 The standing list, no subsetting: `cargo fmt --check`; `cargo clippy --all-targets -- -D warnings`;
 `cargo test --workspace`; `env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config`;
 `RUSTDOCFLAGS="--deny warnings" cargo doc --locked --workspace --no-deps`;
-`python3 .superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/check_cfg_dead_code.py`;
-`python3 .superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/verify_catalog_goldens.py` → `GOLDEN CHECK: pass`.
+`python3 .github/scripts/check_cfg_dead_code.py`;
+`python3 .github/scripts/verify_catalog_goldens.py` → `GOLDEN CHECK: pass`.
 CI green on Linux **and** Windows is part of "green", and nothing under `tests/golden/` is ever regenerated.

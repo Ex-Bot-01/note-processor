@@ -114,22 +114,27 @@ G=.github/scripts
 row cfg-dead-code python3 "$G/check_cfg_dead_code.py"
 row attr-displacement python3 "$G/check_attr_displacement.py"
 row catalog-goldens python3 "$G/verify_catalog_goldens.py"
+# The fences that check the fences. Each python fence carries `--self-test`: a tree of planted violations it must name,
+# one per rule it claims to enforce. A rule nobody has ever seen fail is indistinguishable from a rule someone deleted,
+# which is how three of these rows sat red for weeks with nothing but an exit code to say so.
+for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead; do
+  row "selftest-${fence}" python3 "$G/${fence}.py" --self-test
+done
+
 # **F31's harness arithmetic, with no binary and no model.** The metric functions are self-tested against hand-computed numbers, so
 # this row costs milliseconds and catches the one failure mode that would matter: a scoring function that quietly flatters itself (an
 # MRR computed over only the answered queries rises when recall falls). The harness's *usefulness* still needs labelled queries — see
 # `docs/design-f31-quality-harness.md`, which is written to keep that distinction visible.
-# Not `$G`: this one is `.github/scripts/f31_eval.py`, run by path rather than by variable so that a wrong directory shows
-# up as "can't open file" on the row that got it wrong instead of on all four python rows at once.
-row f31-selftest python3 .github/scripts/f31_eval.py --self-test
+row f31-selftest python3 "$G/f31_eval.py" --self-test
 # **A `run:` block that is not a program bash can read.** Actions parses a step's script when the step starts, so on 2026-11-13
 # a mis-nested quote in `release.yml` was discovered by a runner — after it had compiled llama.cpp for Windows. This row costs
 # milliseconds and is the difference between that and a red local run.
-row workflow-shells .github/scripts/check-workflow-shells.sh
+row workflow-shells "$G/check-workflow-shells.sh"
 # **A date in the future, which is how a month gets written wrong.** A stretch of this project's prose was dated one
 # month ahead of the work it described — "while cutting v0.3.0" beside a tag dated 2026-11-09, a spec first committed
 # 2026-11-09 whose file name claimed another month — and a wrong month reads exactly like a right one, so nothing caught
 # it. This row costs milliseconds: any calendar date in a tracked file later than HEAD's own commit date is reported.
-row dates-ahead python3 .github/scripts/check-dates-ahead.py
+row dates-ahead python3 "$G/check-dates-ahead.py"
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.
