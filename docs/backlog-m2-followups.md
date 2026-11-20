@@ -28,7 +28,7 @@ one stale registry row rather than a lost note, and the human accepted option A 
 and closed below. Audited the same day: **F30 closed** — both halves of the storage measurement are in (`docs/measurement-f30-vector-surface.md`) and the human ruled
 to **keep 768**, with the numbers that decided it written into the card; **F31 stays open and blocked**, needing about twenty labelled queries from a real vault or a
 recorded decline, and it is also what keeps F30's ranking question unanswerable. Still open: **F18** (needs real Windows hardware), **F21** and **F28** (both
-implemented; their closure paragraphs wait on a graded tree — see `docs/ops-actions-minutes.md` for what CI grades now and how to buy a full grade for one SHA).
+implemented; their closure paragraphs wait on a graded tree — see `docs/developing.md` for what CI grades now and how to buy a full grade for one SHA).
 
 
 These are not new features. They are the items the Milestone 1 reviews judged *correct enough to ship* but
@@ -593,7 +593,7 @@ instead of `meta` fails the CLI case immediately and, once the np-core case gain
 because that assertion was missing at first, and a durability test that only checks the field this open also wrote proves nothing.
 
 **Still not closed, on the same ground as F28: CI cannot grade it.** Actions has been out of included minutes since `2026-11-07T01:57Z`
-(`docs/ops-actions-minutes.md`). What is graded locally: 17 gate rows exit 0, workspace tests green, `GOLDEN CHECK: pass`, plus the CLI case through argv.
+(`docs/developing.md`). What is graded locally: 17 gate rows exit 0, workspace tests green, `GOLDEN CHECK: pass`, plus the CLI case through argv.
 The closure paragraph goes in when a run that has steps grades `main`. **No new exit code and no second echo**, as this card's own "Do when" required.
 
 ## F22 — a refusal exists only as one report line, with no reason attached
@@ -745,7 +745,7 @@ which is why nothing here waits on a capability.
 **How this was verified, and why that is not a CI claim.** `cargo test -p np-core --test scan` → **78 passed / 0 failed**, with **zero `NOT COVERAGE` lines**, on host
 `pi`, euid 1000 — the runner condition this card's own caveat demands be named, because these fixtures build their obstruction with `chmod 000` and latin-1 directory
 names and print `NOT COVERAGE` instead of passing quietly where the filesystem or a privileged account declines. Full local gates: 17 rows exit 0, workspace **693
-passed / 0 failed**, `GOLDEN CHECK: pass`. Actions minutes are exhausted (`docs/ops-actions-minutes.md`), so no run graded this tree and the last CI-graded tree stays
+passed / 0 failed**, `GOLDEN CHECK: pass`. Actions minutes are exhausted (`docs/developing.md`), so no run graded this tree and the last CI-graded tree stays
 `5e368ac`. That is disclosed rather than papered over, and it is also the weaker argument here than it usually is: by this card's own caveat a green CI run is *not*
 proof these cases executed, so naming the host and the euid carries more than a job that might have skipped them. The closure rests on measurement plus text, as F29's
 did, and says so in the same breath.
@@ -1185,7 +1185,7 @@ the link is recorded in `links` like any other attachment — which is the card'
 `links.kind = 'attachment'`") turned into something a reader can rely on rather than a surprise count.
 
 **Closed without CI grading, deliberately, and that choice is stated rather than skipped past.** CI has been out of included minutes since
-`2026-11-07T01:57Z` (`docs/ops-actions-minutes.md`), and this card's "done when" is satisfied by text a reader can open — no code path changed, so there is
+`2026-11-07T01:57Z` (`docs/developing.md`), and this card's "done when" is satisfied by text a reader can open — no code path changed, so there is
 no behaviour for a runner to grade. What was run on the tree: 17 local gate rows exit 0 and `GOLDEN CHECK: pass`. The one *factual* claim added here that a
 test could hold — that an unsupported attachment link still lands in `links` as an `attachment` row — is already pinned elsewhere (F26's content gate cases
 in `crates/np-core/tests/embed_media.rs`, and the resolver cases in `tests/media.rs`), so no new assertion was invented to make a docs commit look like work.
@@ -1271,7 +1271,7 @@ one thing still untested: that slack stays put when the payload shrinks — noth
 
 Verified as measurement, not as CI grading: 17 local gate rows exit 0, workspace **693 passed / 0 failed**, `GOLDEN CHECK: pass`, and the figure half was produced by
 the real release+`vision` binary against both artifacts installed through `np models install [--member mmproj]`. Actions minutes are exhausted
-(`docs/ops-actions-minutes.md`), so nothing about this tree was graded remotely; the last CI-graded tree remains `5e368ac`. No code changed — this card's remaining
+(`docs/developing.md`), so nothing about this tree was graded remotely; the last CI-graded tree remains `5e368ac`. No code changed — this card's remaining
 deliverable was a decision, and the card says so rather than inventing work.
 
 ## F31 — nothing can be said about whether search finds the right diagram, because there is no labelled set
@@ -1407,7 +1407,7 @@ production arm, the climb out of an absent directory, and the NUL refusal. macOS
 API: this private repository spent **2,028 billed minutes in October** (stopping at the moment CI went zero-step) and **2,137 in the first 6.4 days of
 November**, crossing the allowance at `2026-11-07T01:57:05Z` — seven seconds before the first zero-step failure. The account ran out of included minutes;
 nothing about the tree was involved, and a zero-step job spends nothing. Numbers, method and the options for spending less are in
-`docs/ops-actions-minutes.md`. **This does not reopen F34**, which was closed on its own evidence (the Windows preflight answering through
+`docs/developing.md`. **This does not reopen F34**, which was closed on its own evidence (the Windows preflight answering through
 `GetDiskFreeSpaceExW`, green on the runner at `b2840f9`). What it changes is what "CI is red" means operationally: the first question is whether the jobs
 have steps, and this card exists because four days of *executed-but-red* Windows runs were read as absent — a mistake in the opposite direction from
 treating an unprovisioned runner as a defect.
@@ -1495,7 +1495,7 @@ three rows fail for a reason that reads like a code defect.
 **Implemented on 2026-11-08; closure withheld.** Merged into `main` at `0fa2f0b` (branch `f36/hybrid-search`: `e872c66` the change,
 `7ce7335` the rulings and measurements). CI still cannot grade anything: run `42394486534` on the merged tree completed as a failure with
 **zero steps on every job** — `Decide the matrix` failed before step one and the other three reported `skipped`, which is the account-out-of-
-included-minutes signature recorded in `docs/ops-actions-minutes.md`, not a code defect (count `[.steps[]?] | length` before believing red).
+included-minutes signature recorded in `docs/developing.md`, not a code defect (count `[.steps[]?] | length` before believing red).
 So this card carries local gate evidence and no graded run, and says so. Design and rulings: `docs/design-m3-hybrid-search.md`.
 
 ### What was asked, by whom
@@ -1778,7 +1778,7 @@ silenced without editing anything), and every transfer announces id, members, by
 
 ### Evidence
 
-+ **Gates: 19 rows, all exit 0, `NOT COVERAGE` 0**, with both real artifacts exported — `/home/agent/tmp/gates-f38t6b`, tree
++ **Gates: 19 rows, all exit 0, `NOT COVERAGE` 0**, with both real artifacts exported — `$TMPDIR/gates-f38t6b`, tree
   `2c56b9a` whose only difference from the committed tree here is documentation and CI environment. No row was skipped.
 + Tests that carry the claims: `embed_fetches_a_missing_pinned_model_and_refuses_honestly_when_there_is_no_connection`,
   `the_kill_switch_leaves_the_old_refusal_word_for_word`, `an_unpinned_id_is_refused_before_any_transport_is_chosen`,
@@ -1816,7 +1816,7 @@ silenced without editing anything), and every transfer announces id, members, by
   not exist. The Windows script's Stage 8 was rewritten against this table the same day.
 
 + **CI grading.** No workflow run has had steps since the included minutes ran out at `2026-11-07T01:57:05Z`; the last CI-graded tree is
-  still `5e368ac`. Local gates are not closure (`docs/ops-actions-minutes.md`), so **this card stays open** and F36/F40's closures stay
+  still `5e368ac`. Local gates are not closure (`docs/developing.md`), so **this card stays open** and F36/F40's closures stay
   withheld for the same reason.
 + **Windows, in the field.** Stage 8 of the operator script (sha256 `feadc2c7…508a7c`, uploaded on v0.2.1) asks the four questions this
   card can only ask on Linux — including that a release asset must *not* speak of fetching at all. Written here, never executed by
@@ -1967,7 +1967,7 @@ its assertion with `cfg!`.
 Evidence, all re-run rather than inherited: np-core `--test embed_run` **26 / 0**; np-cli default **37 / 0** including the new
 `embed_without_a_runtime_refuses_before_reading_a_note`; np-cli with `local-model` **42 / 0**; and with the real 310 MB artifact exported,
 the same suite **42 / 0** plus **39 / 0** in `models_cli`, no `NOT COVERAGE` line anywhere. Full local gate list at `e361e03`, `dirty=0`:
-**17 rows exit 0**, two artifact rows SKIPPED by unset env, `NOT COVERAGE` count **0** (`/home/agent/tmp/gates-f40`). Mutation — mapping
+**17 rows exit 0**, two artifact rows SKIPPED by unset env, `NOT COVERAGE` count **0** (`$TMPDIR/gates-f40`). Mutation — mapping
 `ProviderState::Ready` back to `Resolution::Provider` in a default build — FAILS the new test and passes again after revert; the core arm (v)
 test asserts the label *before* the counts, because deleting the early return leaves every count at zero and would otherwise pass on numbers.
 

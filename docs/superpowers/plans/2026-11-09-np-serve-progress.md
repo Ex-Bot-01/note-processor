@@ -20,7 +20,7 @@
 - **§12 rule 8:** no host and no URL in any message, log or test output — assert `!text.contains("http")` on every notification the tests capture.
 - **§12 rule 4:** a fetch marker is reported, never deleted, never expired.
 - **Never regenerate catalog goldens.** Any diff under `tests/golden*` is a stop-and-report.
-- **Gate by exit code:** `.github/scripts/gates.sh <log-dir>` (20 rows) must be run at the end with `CMAKE=/home/agent/tools/cmake/bin/cmake`, `CARGO_BUILD_JOBS=4`, `NP_NO_AUTO_FETCH=1` unset for artifact rows; `NOT COVERAGE` lines are counted, not ignored.
+- **Gate by exit code:** `.github/scripts/gates.sh <log-dir>` (20 rows) must be run at the end with `CMAKE=$HOME/tools/cmake/bin/cmake`, `CARGO_BUILD_JOBS=4`, `NP_NO_AUTO_FETCH=1` unset for artifact rows; `NOT COVERAGE` lines are counted, not ignored.
 - **Terminal vocabulary:** `completed` when a response *result* was produced (whatever it says), `refused` when an error object was produced. No `ready`/`stopped`.
 
 ## Review Focus
@@ -227,8 +227,8 @@ The spec's tests cover the happy protocol; these five inputs are where a client 
 
 ### Task 10: Full gates, then push
 
-- [ ] **Step 1:** `PATH="$HOME/.cargo/bin:$PATH" TMPDIR=/home/agent/tmp CARGO_BUILD_JOBS=4 CMAKE=/home/agent/tools/cmake/bin/cmake NP_LLAMA_CPP_SRC=/home/agent/note-processor/.vendor/llama.cpp-v0.8.0 .github/scripts/gates.sh /home/agent/tmp/gates-progress` → expect `fail=0`, 20 rows, and read the `NOT COVERAGE` count: it must not rise versus `gates-v030` except for rows that legitimately cannot run without weights.
-- [ ] **Step 2:** Artifact-backed rows with weights: `NP_TEST_MODEL_PATH=/home/agent/models/embeddinggemma-2-Q8_0.gguf NP_TEST_MMPROJ_PATH=/home/agent/models/mmproj-embeddinggemma-2-Q8_0.gguf` for `test-core-vision` / `test-cli-realmodel`, unsetting `NP_NO_AUTO_FETCH`.
+- [ ] **Step 1:** `PATH="$HOME/.cargo/bin:$PATH" TMPDIR=$TMPDIR CARGO_BUILD_JOBS=4 CMAKE=$HOME/tools/cmake/bin/cmake NP_LLAMA_CPP_SRC=this repository/.vendor/llama.cpp-v0.8.0 .github/scripts/gates.sh $TMPDIR/gates-progress` → expect `fail=0`, 20 rows, and read the `NOT COVERAGE` count: it must not rise versus `gates-v030` except for rows that legitimately cannot run without weights.
+- [ ] **Step 2:** Artifact-backed rows with weights: `NP_TEST_MODEL_PATH=$HOME/models/embeddinggemma-2-Q8_0.gguf NP_TEST_MMPROJ_PATH=$HOME/models/mmproj-embeddinggemma-2-Q8_0.gguf` for `test-core-vision` / `test-cli-realmodel`, unsetting `NP_NO_AUTO_FETCH`.
 - [ ] **Step 3:** Re-run the three rustdoc rows with their exact invocations (`RUSTDOCFLAGS="--deny warnings" cargo doc --workspace --no-deps` per feature row) — a green from a command I invented is not evidence.
 - [ ] **Step 4:** Push `main`; append an as-built section to the spec recording anything the implementation contradicted, including whether `chunks_total` shipped and why.
 

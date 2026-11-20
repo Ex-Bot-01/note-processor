@@ -8,14 +8,14 @@ R8 (`docs/design-m2-thread-policy.md`) changed the default from llama.cpp's comp
 Commands (one process per configuration, `--test-threads=1`; the two configurations are separate invocations so neither
 one's page cache or CPU state contaminates the other):
 
-    NP_TEST_MODEL_PATH=/home/agent/models/embeddinggemma-2-Q8_0.gguf \
+    NP_TEST_MODEL_PATH=$HOME/models/embeddinggemma-2-Q8_0.gguf \
       cargo test --locked -p np-core --features local-model --test local_corpus \
         the_corpus_pass_under_the_auto_worker_count -- --nocapture --test-threads=1      # run twice
 
     … --test local_corpus a_first_pass_over_a_corpus_is_measured_and_projected …          # four-worker control, same day
 
 Host: 16-core x86_64 Linux, CPU-only, `MemTotal: 7597988 kB`. Artifact:
-`/home/agent/models/embeddinggemma-2-Q8_0.gguf`, 309,855,456 B, sha256
+`$HOME/models/embeddinggemma-2-Q8_0.gguf`, 309,855,456 B, sha256
 `2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135`. llama.cpp pinned tag v0.8.0, `GGML_OPENMP=OFF`.
 Worker counts below are printed by the harness (`workers=` on every row), not asserted from the config file.
 

@@ -90,7 +90,7 @@ const MAIN: PinnedModel = PinnedModel {
     // Both numbers come from `docs/design-m2-local-embeddings.md` §3 ("The artifact's own header, measured",
     // R6b1, 2026-10-30): the size is the file's length on disk and the digest is sha256 over every one of those
     // bytes, read from the artifact itself rather than from a model card. Re-measured on this host on 2026-11-01
-    // with `np models hash /home/agent/models/embeddinggemma-2-Q8_0.gguf`, which printed
+    // with `np models hash $HOME/models/embeddinggemma-2-Q8_0.gguf`, which printed
     // `2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135` — the value below, and 64 characters.
     size_bytes: 309_855_456,
     sha256: "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135",
