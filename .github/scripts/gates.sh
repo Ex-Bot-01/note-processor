@@ -87,7 +87,9 @@ cmake_missing=""
 row_or_skip clippy-localmodel "$cmake_missing" cargo clippy -p np-core -p np-cli --features local-model --all-targets -- -D warnings
 row_or_skip clippy-lm-vision "$cmake_missing" cargo clippy -p np-core -p np-cli --features local-model,vision --all-targets -- -D warnings
 row clippy-nodefaults cargo clippy -p np-core -p np-cli --no-default-features --all-targets -- -D warnings
-row check-cli-vision cargo check -p np-cli --features local-model,vision
+# Needs the same cmake as the two clippy rows above: `build.rs` refuses to guess where cmake lives, so without it this
+# row panics in the build script and prints a red that reads exactly like a compile break.
+row_or_skip check-cli-vision "$cmake_missing" cargo check -p np-cli --features local-model,vision
 row test-workspace cargo test --workspace -- --nocapture
 row test-cli-nodefaults cargo test -p np-cli --no-default-features -- --nocapture
 row_or_skip test-cli-vision "$cmake_missing" cargo test -p np-cli --features local-model,vision -- --nocapture
@@ -105,22 +107,23 @@ RUSTDOCFLAGS="--deny warnings" row rustdoc-deny-default cargo doc --workspace --
 row_or_skip rustdoc-deny-localmodel "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model --no-deps
 row_or_skip rustdoc-deny-lm-vision "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model,vision --no-deps
 
-S=.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog
-row cfg-dead-code python3 "$S/check_cfg_dead_code.py"
-row attr-displacement python3 "$S/check_attr_displacement.py"
-row catalog-goldens python3 "$S/verify_catalog_goldens.py"
+# The three static fences. They live beside this script because a gate that is not in the repository is a gate that
+# quietly stops running: these three lived in a git-ignored scratch directory, and every row here kept exiting 2 with
+# "can't open file" until somebody noticed.
+G=.github/scripts
+row cfg-dead-code python3 "$G/check_cfg_dead_code.py"
+row attr-displacement python3 "$G/check_attr_displacement.py"
+row catalog-goldens python3 "$G/verify_catalog_goldens.py"
 # **F31's harness arithmetic, with no binary and no model.** The metric functions are self-tested against hand-computed numbers, so
 # this row costs milliseconds and catches the one failure mode that would matter: a scoring function that quietly flatters itself (an
 # MRR computed over only the answered queries rises when recall falls). The harness's *usefulness* still needs labelled queries — see
 # `docs/design-f31-quality-harness.md`, which is written to keep that distinction visible.
-# Not `$S`: the three checkers above live under `.superpowers/sdd/…`, this one lives beside this script. The first version of
-# this row used `$S` and failed with "can't open file", which is the sound of a gate row skipping itself while still printing
-# a red exit code — better than silently passing, but only just.
+# Not `$G`: this one is `.github/scripts/f31_eval.py`, run by path rather than by variable so that a wrong directory shows
+# up as "can't open file" on the row that got it wrong instead of on all four python rows at once.
 row f31-selftest python3 .github/scripts/f31_eval.py --self-test
 # **A `run:` block that is not a program bash can read.** Actions parses a step's script when the step starts, so on 2026-11-13
 # a mis-nested quote in `release.yml` was discovered by a runner — after it had compiled llama.cpp for Windows. This row costs
-# milliseconds and is the difference between that and a red local run. Not `$S`: it lives beside this script, like the self-test
-# above.
+# milliseconds and is the difference between that and a red local run.
 row workflow-shells .github/scripts/check-workflow-shells.sh
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
