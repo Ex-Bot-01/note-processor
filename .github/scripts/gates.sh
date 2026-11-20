@@ -117,7 +117,7 @@ row catalog-goldens python3 "$G/verify_catalog_goldens.py"
 # The fences that check the fences. Each python fence carries `--self-test`: a tree of planted violations it must name,
 # one per rule it claims to enforce. A rule nobody has ever seen fail is indistinguishable from a rule someone deleted,
 # which is how three of these rows sat red for weeks with nothing but an exit code to say so.
-for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links; do
+for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links check-deps; do
   row "selftest-${fence}" python3 "$G/${fence}.py" --self-test
 done
 
@@ -141,6 +141,12 @@ row dates-ahead python3 "$G/check-dates-ahead.py"
 # inside backticks) are listed in the script and pinned by its `--self-test` row below, so they cannot quietly widen into a
 # checker that passes everything.
 row links python3 "$G/check-links.py"
+
+# **What this tree links, checked offline.** Licenses (every dependency must offer a permissive option) and one major version
+# per crate unless an exception is recorded with a reason — plus a staleness check on `docs/dependency-licenses.md`, so the
+# notices file's claim that the list is "derived, not hand-written" cannot mean "nobody regenerated it". The advisory half
+# lives in CI (`supply-chain.yml`), because RustSec's database is not readable from a machine without network.
+row deps python3 "$G/check-deps.py"
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.
