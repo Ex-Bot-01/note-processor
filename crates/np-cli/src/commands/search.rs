@@ -42,7 +42,7 @@ impl SearchModeFlag {
 /// Rank `query` against `workspace`'s index and print the hits.
 ///
 /// The provider is built exactly as `np embed` builds it, because the query must be embedded by the **same** model whose
-/// rows are being read — and under its `prefix_query` spelling, not the document one ([`Embedder::embed_query`]). That is also
+/// rows are being read — and under its `prefix_query` spelling, not the document one ([`np_core::embed::Embedder::embed_query`]). That is also
 /// where a run that cannot embed refuses at exit 1, with the sentence for its own [`ProviderState`]: an absent artifact, an
 /// unbuilt runtime, a missing row, a switched-off provider. A query nobody can embed has no ranking to print —
 /// and until recently four of those five shared one sentence about `provider = "none"`.

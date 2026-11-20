@@ -97,7 +97,7 @@ enum Command {
     /// Rank the indexed notes and images against a text query.
     ///
     /// `<workspace>` is an operand for the same reason `scan` and `embed` take it: the index lives under this
-    /// workspace's key ([`Config::workspace_db`]), so a command without one could not find a database to read.
+    /// workspace's key ([`np_core::config::Config::workspace_db`]), so a command without one could not find a database to read.
     ///
     /// The command writes **no vector, no stamp and no note row** ([`np_core::search`] prepares nothing but `SELECT`s).
     /// Opening the workspace database is not covered by that promise: like every other command, `workspace_db` creates the

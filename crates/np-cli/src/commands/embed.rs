@@ -2,11 +2,23 @@ use crate::commands::common::emit_json;
 use crate::commands::common::load_config;
 use crate::commands::common::workspace_db;
 use crate::commands::common::writer_lock;
+// The fetch trigger below lives here because `embed_provider` is its only caller: `np setup` reaches it
+// through `embed_workspace`, not directly.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+use crate::commands::common::emit;
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+use crate::commands::common::now_secs;
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+use crate::commands::setup::origin_kind_line;
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+use crate::commands::setup::origin_kind_token;
 #[cfg(feature = "fetch")]
 use np_core::catalog::size_human;
 use np_core::config::Config;
 use np_core::config::EmbeddingProvider;
 use np_core::db::model_row;
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+use np_core::db::Db;
 use np_core::embed::ArtifactCheck;
 use np_core::embed::Embedder;
 use np_core::embed::NoEmbeddingProvider;
@@ -15,6 +27,8 @@ use np_core::embed_run::EmbedOutcome;
 use np_core::embed_run::EmbedReport;
 use np_core::embed_run::NoProvider;
 use np_core::embed_run::Resolution;
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+use np_core::fetch;
 use std::error::Error;
 use std::io;
 use std::io::Write;
@@ -641,7 +655,7 @@ pub(crate) fn embed_provider(
 
 /// The human-readable form of an embed report: the arm first, then the six counts, then the verification caveat.
 ///
-/// Same aligned-label shape as [`print_summary`], and every line written to one locked stdout handle with its
+/// Same aligned-label shape as [`crate::commands::scan::print_summary`], and every line written to one locked stdout handle with its
 /// result dropped for the same reason: a descriptor that refuses writes must not turn a finished run into a
 /// panic. The verification line is printed even when nothing was embedded, because the whole point is that the
 /// caveat is read at 2 a.m. rather than filed.
@@ -750,6 +764,103 @@ pub(crate) fn free_space_line(free: Option<u64>) -> String {
     match free {
         Some(free) => format!("{FREE_SPACE_KEY}{} before the fetch", size_human(free)),
         None => format!("{FREE_SPACE_KEY}not checked on this platform"),
+    }
+}
+/// What one auto-fetch attempt produced.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+pub(crate) enum FetchStep {
+    /// Bytes arrived and were published by digest. Carries the record `--json` will print.
+    Fetched(np_core::embed_run::FetchedRecord),
+    /// Nothing was reached. Not an error: a state, with its own report arm downstream.
+    Offline,
+}
+
+/// Fetch the pinned id's members that **this build can use**, because this workspace is missing them.
+///
+/// Called only from the trigger in [`crate::commands::embed::embed_provider`], which has already decided a fetch is permitted; this function's own
+/// job is to be honest about the transfer and to classify its failure rather than flatten it.
+///
+/// * **Before byte one**, in text mode, it says what is about to happen: id, the members this build would load, their
+///   combined size, and the origin's *kind*. `np models fetch` prints the same pair of lines for the same reason — a
+///   silent 310 MB transfer is not a side effect anyone should discover afterwards.
+/// * **Offline is its own answer** (`FetchError::is_offline`): no probe was run, and none will be — this call *is*
+///   the probe, made only where the artifact was already missing, so a machine that holds its model pays nothing. The
+///   sentence says what could not be reached, that nothing was embedded, and what to re-run; it does not dress a missing
+///   network up as a broken vault, which is the same lesson applied one arm over.
+/// * **Anything the origin actually answered** — 404, 403, a redirect, wrong bytes — propagates as `fetch`'s own refusal,
+///   unchanged. Those are not outages and must never be skipped past: an unreachable mirror behind "offline" is how a
+///   broken install becomes permanent.
+#[cfg(all(feature = "local-model", feature = "fetch"))]
+pub(crate) fn fetch_pinned_missing(
+    cfg: &Config,
+    db: &Db,
+    models_dir: &Path,
+    id: &str,
+    announce: bool,
+    progress: &dyn np_core::progress::Progress,
+) -> Result<FetchStep, Box<dyn Error>> {
+    let members = np_core::pins::members_for_build();
+    let bytes: u64 = members
+        .iter()
+        .filter_map(|name| np_core::pins::pinned_member(id, name))
+        .map(|pin| pin.size_bytes)
+        .sum();
+
+    if announce {
+        emit(&format!(
+            "fetching     {id} ({}, {}) — this workspace has no artifact to embed with",
+            members.join(", "),
+            size_human(bytes),
+        ));
+        emit(origin_kind_line(cfg));
+    }
+
+    let origin = fetch::resolve_origin(cfg.models.base_url.as_deref());
+    let transport = fetch::HttpTransport::new(origin);
+    let requested: Vec<&str> = members.to_vec();
+    match fetch::fetch_reporting(
+        db,
+        models_dir,
+        id,
+        &requested,
+        &transport,
+        now_secs(),
+        progress,
+    ) {
+        Ok(report) => {
+            if announce {
+                for member in &report.members {
+                    emit(&format!(
+                        "{FETCHED_KEY}{} ({}, sha256 {})",
+                        member.member,
+                        size_human(member.bytes),
+                        member.sha256
+                    ));
+                }
+                emit(&free_space_line(report.free_bytes));
+            }
+            Ok(FetchStep::Fetched(np_core::embed_run::FetchedRecord {
+                id: report.id.clone(),
+                // `fetch` publishes a member only after its digest matches the pin, so every member that
+                // arrives here is verified — the flag is a promise the reader can check against the type's doc, not a
+                // claim this call site makes up.
+                members: report
+                    .members
+                    .iter()
+                    .map(|member| np_core::embed_run::FetchedMember {
+                        name: member.member.clone(),
+                        bytes: member.bytes,
+                        digest_verified: true,
+                    })
+                    .collect(),
+                // A *kind*, never a host: the same distinction `origin_kind_line` prints for humans.
+                origin: origin_kind_token(cfg),
+            }))
+        }
+        // **Offline is a state, so it returns one.** It used to come back as an error string from here, which meant `--json`
+        // had no document to carry the fact and a caller had to read prose to learn that nothing was downloaded.
+        Err(err) if err.is_offline() => Ok(FetchStep::Offline),
+        Err(err) => Err(err.into()),
     }
 }
 #[cfg(all(test, feature = "fetch"))]
