@@ -370,8 +370,8 @@ coverage only** (provider availability is a reported count, never version debt �
 ## Method (unchanged, and it is what keeps the defect count honest)
 
 `superpowers:subagent-driven-development`: fresh implementer per bounded round, fresh scoped reviewer after each,
-fix loop for Critical/Important, broad whole-branch review at the end, merge only on the human's word. **Design
-review before any code.** Two writers never share a worktree. Reviewers have no shell — they must say "static
+fix loop for Critical/Important, broad whole-branch review at the end, merge only on the human's word. The conventions an agent follows opening this tree cold — including design review
+before any code — are in `AGENTS.md`, not here. Two writers never share a worktree. Reviewers have no shell — they must say "static
 read" and list commands; the controller runs load-bearing claims himself. A subordinate's evidence outranks a
 controller instruction: refuse and explain rather than fake coverage. No behaviour claim about a platform until
 it was run there (F18's rule). Mutation testing means **production** mutations — deleting an assertion to see
