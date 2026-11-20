@@ -213,14 +213,17 @@ def self_test():
     return 1 if failures else 0
 
 
-def main(argv, root="."):
+def main(argv, root=None):
+    if root is None:
+        top = subprocess.run(["git", "rev-parse", "show-toplevel"], capture_output=True, text=True)
+        root = top.stdout.strip() or "."
     if "--self-test" in argv:
         return self_test()
-    if len(argv) < 2:
+    if not argv:
         print("usage: check-comment-only.py BASE [HEAD]   (or --self-test)")
         return 2
-    base = argv[1]
-    head = argv[2] if len(argv) > 2 else ""
+    base = argv[0]
+    head = argv[1] if len(argv) > 1 else ""
     for rev in [base] + ([head] if head else []):
         probe = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", f"{rev}^{{commit}}"], capture_output=True)
         if probe.returncode:
