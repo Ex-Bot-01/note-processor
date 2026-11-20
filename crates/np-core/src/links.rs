@@ -419,7 +419,7 @@ fn extension(target: &str) -> Option<&str> {
 
 /// The last `/`-separated component of a target or rel. A target with no slash is its own file
 /// name, which is why this cannot fail.
-fn file_name(target: &str) -> &str {
+pub(crate) fn file_name(target: &str) -> &str {
     match target.rfind('/') {
         Some(slash) => &target[slash + 1..],
         None => target,
