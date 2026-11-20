@@ -12,7 +12,7 @@ use crate::db::migrations::first_violation;
 /// Echo the stored orphan receipt to `out` — [`std::io::stderr`] in production — unless there is
 /// nothing to say.
 ///
-/// `receipt` is the [`FK_ORPHANS_KEY`] value exactly as the migration wrote it, so this line, the scan
+/// `receipt` is the [`crate::db::FK_ORPHANS_KEY`] value exactly as the migration wrote it, so this line, the scan
 /// report's field and `np scan`'s summary line render **one** string rather than recomputing the news
 /// three ways; the total beside it comes from [`orphan_total`], the same reader the summary uses.
 ///
@@ -27,7 +27,7 @@ use crate::db::migrations::first_violation;
 /// A failed write is dropped rather than raised. It used to `.expect`, from inside the
 /// migration's own transaction, so a workspace opened with descriptor 2 refusing writes had its whole
 /// upgrade rolled back — every time, forever, over one line nobody could read. That panic never
-/// protected the signal: the same counts are written into `meta` under [`FK_ORPHANS_KEY`] in that same
+/// protected the signal: the same counts are written into `meta` under [`crate::db::FK_ORPHANS_KEY`] in that same
 /// transaction, and the scan whose own open did the deleting echoes them
 /// ([`crate::ScanReport::upgrade_orphans`]). An unprinted line is a lost courtesy; a refused upgrade is
 /// the worse silence, because it hides the deletions *and* leaves the file unupgraded.
@@ -55,14 +55,14 @@ pub(crate) fn report_orphans(out: &mut dyn io::Write, receipt: &str) {
     );
 }
 
-/// How many rows a stored [`FK_ORPHANS_KEY`] receipt announces: the sum of its labelled counts.
+/// How many rows a stored [`crate::db::FK_ORPHANS_KEY`] receipt announces: the sum of its labelled counts.
 ///
 /// The reader that pairs with `OrphanCleanup::value` (a code span, not a link: that type is private and
 /// rustdoc warns when public docs link to it), for every caller left holding only the stored
 /// string — the scan report, `np scan`'s summary line, and the stderr echo in `report_orphans` (a code
 /// span, not a link: that function is private), each of which names the total beside the counts.
 /// Every number in the value is summed whatever its label: the spelling is this module's own
-/// and its labels are pinned by the tests around [`FK_ORPHANS_KEY`], so there is nothing here to
+/// and its labels are pinned by the tests around [`crate::db::FK_ORPHANS_KEY`], so there is nothing here to
 /// validate — a fragment that will not parse as a count adds nothing rather than failing a report.
 pub fn orphan_total(value: &str) -> usize {
     value
@@ -87,7 +87,7 @@ pub(crate) struct OrphanCleanup {
 }
 
 impl OrphanCleanup {
-    /// The stored spelling — the labels of [`FK_ORPHANS_KEY`], in the order the tables are rebuilt.
+    /// The stored spelling — the labels of [`crate::db::FK_ORPHANS_KEY`], in the order the tables are rebuilt.
     pub(crate) fn value(&self) -> String {
         format!(
             "headings={},tags={},items={},links_src={},links_dst_null={}",
@@ -235,7 +235,7 @@ pub(crate) fn byte_path_keys(conn: &Connection) -> Result<(), DbError> {
     if let Some((table, rowid, parent)) = first_violation(conn)? {
         // Nothing above is committed: the caller's transaction rolls back with this error, so the file keeps
         // its version-3 schema and its data. An orphan note is the case this catches — it was writable with
-        // enforcement off, which is how orphans got in at all (see [`FK_ORPHANS_KEY`]) — and this step can
+        // enforcement off, which is how orphans got in at all (see [`crate::db::FK_ORPHANS_KEY`]) — and this step can
         // neither delete it (its file may come back; that is what `state = 'stale'` is for) nor invent a
         // parent for it.
         let count: i64 = conn.query_row(

@@ -26,7 +26,7 @@ use crate::scan::ScanError;
 
 /// What one scan's chunk pass did, counted per live note.
 ///
-/// It reaches no report and no serialised output: [`ScanReport`] stays the classification truth (and its
+/// It reaches no report and no serialised output: [`crate::scan::ScanReport`] stays the classification truth (and its
 /// JSON shape is pinned by the CLI tests). The tally exists so `tests/scan.rs` can assert the warm-pass
 /// property — a note whose rows already carry its digest costs **one indexed lookup and no cutting** — as
 /// counted work rather than as a duration, which is the only honest way to state it on a shared machine.

@@ -319,7 +319,7 @@ pub fn chunk_digest(db: &Db, note_id: i64) -> Result<Option<String>, DbError> {
 /// One chunk the catalog can still show a reader: its id and its stored text.
 ///
 /// The `files.state = 'ok'` join is the liveness fence that keeps a stale note out. A note whose file is gone keeps its row
-/// with `state = 'stale'` and every child row intact — [`mark_stale`] says so in its own words — so an
+/// with `state = 'stale'` and every child row intact — [`crate::db::notes::mark_stale`] says so in its own words — so an
 /// un-fenced read over `chunks` is the first production reader that computes vectors for a deleted file's text
 /// and reports them current. Joining through `notes.rel_bytes = files.rel_bytes` rather than `rel` because the
 /// byte key is the identity: an ASCII-lossy display spelling could fold two paths into

@@ -42,7 +42,7 @@ pub const EMBED_VERSION_KEY: &str = "embed_version";
 /// The value is `unreadable=N;unkeyable=N;duplicates=N;names=a,b`, written **even when every count is
 /// zero**: this record describes the *last scan* rather than the history of the file, so a fixed workspace
 /// has to overwrite an old complaint instead of leaving it standing there forever. `names` holds
-/// up to eight display spellings joined by `,` — see [`Unindexable::names`] for their order — and a path
+/// up to eight display spellings joined by `,` — see [`crate::scan::Unindexable::names`] for their order — and a path
 /// holding a comma reads as two entries, because this is a diagnosis for a human at an `sqlite3` prompt and
 /// not a format to parse. Nothing decides anything with it: no deletion rule reads this key.
 pub const UNINDEXABLE_KEY: &str = "unindexable";

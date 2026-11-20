@@ -29,7 +29,7 @@
 //!   on the naming rule alone, because that spelling is one nothing else produces and a half-written temporary
 //!   has no complete header to fingerprint — a naming-trust decision, stated so the rule above can be read
 //!   literally. The
-//!   names themselves come from [`index_names`], which owns their spelling; what this module owns is the
+//!   names themselves come from [`crate::index_names`], which owns their spelling; what this module owns is the
 //!   fingerprint deciding which of them are ours to replace. Every write goes through a temporary file
 //!   plus `rename`, and no note body is ever opened for writing.
 

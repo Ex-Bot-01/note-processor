@@ -56,11 +56,11 @@ pub fn upsert_vector(
 /// Drop every vector stored for one chunk, under every model, leaving the chunk row itself alone.
 ///
 /// The cascade already covers the case where the **chunk** goes away. This is the other case: the chunk row
-/// stays — keeping its ordinal and its `chunks.id`, which is what [`write_chunks_for_note`] exists to
+/// stays — keeping its ordinal and its `chunks.id`, which is what [`crate::db::write_chunks_for_note`] exists to
 /// preserve — while its vectors do not. Deleting nothing is not an error: a chunk that was never embedded
 /// has no rows, and "no vectors behind it" is a fact rather than a missing thing.
 ///
-/// Separate from [`write_chunks_for_note`] on purpose, because the two tables are written in different
+/// Separate from [`crate::db::write_chunks_for_note`] on purpose, because the two tables are written in different
 /// transactions: chunk writes ride the scan's transaction, while a vector batch commits outside it.
 pub fn delete_vectors_for_chunk(db: &Db, chunk_id: i64) -> Result<(), DbError> {
     db.0.prepare_cached("DELETE FROM embeddings WHERE chunk_id = ?1")?

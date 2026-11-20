@@ -229,7 +229,7 @@ pub fn record_media_embedding(
 
 /// Every media vector stored under one model id, ascending by media id.
 ///
-/// [`vectors_for`]'s sibling, and the same rule applies: the `model` filter is not optional, because
+/// [`crate::db::vectors_for`]'s sibling, and the same rule applies: the `model` filter is not optional, because
 /// `PRIMARY KEY (media_id, model)` lets two models answer for one figure and mixing them is how one model's query
 /// ranks another's answer. Ordered by media id so a resumed run produces the same ranking as an uninterrupted one.
 pub fn media_embeddings(db: &Db, model: &str) -> Result<Vec<(i64, Vec<u8>)>, DbError> {
@@ -312,7 +312,7 @@ pub fn media_path_check(db: &Db, rel: &[u8]) -> Result<Option<PathCheck>, DbErro
 /// Record the check that justifies reading no bytes at this path on the next run.
 ///
 /// Written only **after** the bytes were digested and the path row was pointed at them, exactly like
-/// [`record_artifact_stamp`], and a no-op for a path that is gone: a figure unlinked between hashing and this write is a
+/// [`crate::db::record_artifact_stamp`], and a no-op for a path that is gone: a figure unlinked between hashing and this write is a
 /// fact about the world, not a corrupt database. The caller reads `size` from the same `stat` it read `mtime` from, and
 /// `mtime` from [`crate::walk`]`'s` D12 clock — one reading of the clock for both columns.
 pub fn set_media_path_check(db: &Db, rel: &[u8], size: i64, mtime: i64) -> Result<(), DbError> {
