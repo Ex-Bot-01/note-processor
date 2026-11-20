@@ -107,6 +107,16 @@ RUSTDOCFLAGS="--deny warnings" row rustdoc-deny-default cargo doc --workspace --
 row_or_skip rustdoc-deny-localmodel "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model --no-deps
 row_or_skip rustdoc-deny-lm-vision "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model,vision --no-deps
 
+# **The hand-written FFI against the header it mirrors.** `crates/np-core/src/llama_ffi.rs` declares llama.cpp's C API by
+# hand (§14 says why), so a re-pin that changes a signature produces no compile error — only behaviour nothing predicts. This
+# compares name, arity and parameter/return shape against the pinned tree's own headers, admits what it cannot compare
+# (callbacks, opaque handles) instead of passing it silently, and fails on anything else. Skips when the pinned source is not
+# on disk: `./scripts/vendor-llama-cpp.sh` once, or `NP_LLAMA_CPP_SRC`.
+llama_src="${NP_LLAMA_CPP_SRC:-$PWD/.vendor/llama.cpp-v$(sed -n 's/^tag *= *"v\{0,1\}\([^"]*\)".*/\1/p' third_party/llama-cpp.toml | head -1)}"
+decl_missing=""
+[ -d "$llama_src" ] || decl_missing="no pinned llama.cpp source at $llama_src (run ./scripts/vendor-llama-cpp.sh or set NP_LLAMA_CPP_SRC)"
+row_or_skip llama-decls "$decl_missing" env NP_LLAMA_CPP_SRC="$llama_src" python3 "$G/check-llama-decls.py"
+
 # The three static fences. They live beside this script because a gate that is not in the repository is a gate that
 # quietly stops running: these three lived in a git-ignored scratch directory, and every row here kept exiting 2 with
 # "can't open file" until somebody noticed.
@@ -117,7 +127,7 @@ row catalog-goldens python3 "$G/verify_catalog_goldens.py"
 # The fences that check the fences. Each python fence carries `--self-test`: a tree of planted violations it must name,
 # one per rule it claims to enforce. A rule nobody has ever seen fail is indistinguishable from a rule someone deleted,
 # which is how three of these rows sat red for weeks with nothing but an exit code to say so.
-for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links check-deps; do
+for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links check-deps check-llama-decls; do
   row "selftest-${fence}" python3 "$G/${fence}.py" --self-test
 done
 
