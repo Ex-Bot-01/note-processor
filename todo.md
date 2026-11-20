@@ -51,7 +51,16 @@ unresolved.
 4. **CI's shape is money, so it stays a human decision.** Either raise the hosted-minute limit, or keep Windows and both
    C++ feature rows off every merge and cache the vendor build. Until then: count a job's `steps` before believing a red
    main (`docs/developing.md`).
-5. **F31 still owes ~20 labelled retrieval queries** from the real vault (`query<TAB>path` per line), or a recorded
+5. **Is the comment-ratio target (0.35) still the goal?** Measured 2026-11-20 across `crates/*/src`: 13,396 comment lines to
+   18,651 code lines (**0.72**), and hitting 0.35 means shedding **6,869 comment lines**. Narration is not where they are:
+   whole-line history that can be deleted safely totals **two lines**, and the 1,327 lines carrying a ticket or `§` reference
+   hold it *mid-sentence*, so removing the marker rewrites the sentence rather than shortening the file. The arithmetic lands on
+   compressing genuine explanation — `db.rs` by 57%, `config.rs` by 62%, and `llama_ffi.rs` by **78%**, the file whose comments
+   are where the pinned header's promises are written down (the reason `.github/scripts/check-llama-decls.py` can compare shapes
+   but not intent). Either keep the ratio and accept that trade, or set the target to what narration plus real duplication can
+   reach. Tranche 1 of the diet is merged (`Cargo.toml`, `ci.yml`) with a fence that proves prose-only diffs:
+   `.github/scripts/check-comment-only.py`.
+6. **F31 still owes ~20 labelled retrieval queries** from the real vault (`query<TAB>path` per line), or a recorded
    decline with the reason. Without them, recall can be measured and precision cannot — which is also the blocker on any
    chat-panel claim.
 
