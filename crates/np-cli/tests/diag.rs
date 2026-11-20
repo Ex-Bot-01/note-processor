@@ -3,7 +3,7 @@
 //! **Why every case here spawns the binary.** np-cli is a binary crate with no library target, so nothing in this file *can*
 //! call `diag::install`. That limitation is the point rather than an obstacle: the claims under test are about descriptor 2 of a
 //! process somebody else started, and a seam-level test that called into the sink layer would prove the layer works while leaving
-//! open the question anyone actually asks — whether `np` ever hands it anything. The 2026-12-09 round learned that the hard way
+//! open the question anyone actually asks — whether `np` ever hands it anything. The 2026-11-09 round learned that the hard way
 //! when twenty-eight green rows coexisted with a feature unreachable from `np serve`. So: `-v` is typed, stderr is read from a
 //! file, and the JSONL log is opened with `serde_json` rather than eyeballed.
 //!
@@ -27,7 +27,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 /// The keys a JSONL record may carry — the frozen set from
-/// `docs/superpowers/specs/2026-12-10-np-diagnostics-design.md` point 7 plus the three the same spec mandates: `elapsed_ms`
+/// `docs/superpowers/specs/2026-11-09-np-diagnostics-design.md` point 7 plus the three the same spec mandates: `elapsed_ms`
 /// (point "Serve"/timing), and `bytes`/`action` inside the final `log full` record (point 8).
 const RECORD_KEYS: [&str; 13] = [
     "ts",

@@ -1,7 +1,7 @@
 # Third-party code in `np`
 
 **What this file covers.** The licenses of code that is *compiled into a binary you download or build*. `np`'s own terms are MIT and live in
-[`LICENSE`](LICENSE); this file is about everybody else's code inside the artefact. (Until 2026-12-08 there was no `LICENSE` at the root at all,
+[`LICENSE`](LICENSE); this file is about everybody else's code inside the artefact. (Until 2026-11-08 there was no `LICENSE` at the root at all,
 which is **F47** — three releases went out under no stated terms before anyone noticed while writing this page.)
 
 Why this file exists now and not earlier: through `v0.2.3`, published binaries contained no C/C++ at all — `build.rs` refused every non-Linux

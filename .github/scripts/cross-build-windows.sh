@@ -163,7 +163,7 @@ echo "runtime  llama.cpp present ($runtime_hits copies of the loader symbol name
 # Strip for the asset. §14's ≤ 40 MB ceiling has been quoted against **stripped** sizes since it was written, while every asset so far
 # shipped unstripped — measured 2026-11-08: this build 23,297,605 B becomes 16,253,440 B; the runtime-less v0.2.3 asset was 14,073,097 B
 # where a stripped one is 9,952,768 B. Both numbers are printed below because the release notes quote the archive and a report quotes the exe.
-# **Strip a copy, never the build artefact.** Measured on 2026-12-09 while cutting v0.3.0: five consecutive runs of this script produced five different
+# **Strip a copy, never the build artefact.** Measured on 2026-11-09 while cutting v0.3.0: five consecutive runs of this script produced five different
 # `np.exe` hashes from a build cargo reported unchanged ("Finished in 0.04s"), and the reason turned out to be two separate things — worth separating,
 # because only one of them is ours to fix:
 #

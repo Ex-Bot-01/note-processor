@@ -1,6 +1,6 @@
 //! The published diagnostics vocabulary: the targets an event can name and the rule tokens it can report.
 //!
-//! Design: `docs/superpowers/specs/2026-12-10-np-diagnostics-design.md` §1 (contract), §4 (levels), §12 (privacy).
+//! Design: `docs/superpowers/specs/2026-11-09-np-diagnostics-design.md` §1 (contract), §4 (levels), §12 (privacy).
 //! This module holds **names only** — no formatting, no sink, no subscriber. Choosing a subscriber and writing to
 //! stderr or a file is np-cli's job ([`np_cli::diag`](../../np_cli/diag/index.html)); np-core emits events against the
 //! names here and nothing else, which is what lets a library embed in a process that has its own logging.

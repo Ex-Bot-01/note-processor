@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, `serde_json` (np-cli only), `rustls`/HTTP transport behind feature `fetch`, existing test harnesses (`crates/np-cli/tests/serve.rs` child-pipe tests, `crates/np-core/tests/fetch.rs` fake transports).
 
-**Spec:** `docs/superpowers/specs/2026-12-09-np-serve-progress-design.md` — read it with this plan; every value below comes from it.
+**Spec:** `docs/superpowers/specs/2026-11-09-np-serve-progress-design.md` — read it with this plan; every value below comes from it.
 
 ## Global Constraints
 

@@ -159,7 +159,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "--deny warnings"
         run: cargo doc --locked -p np-core --features local-model --no-deps
-      # **The pair `np serve`'s wire tests are gated on (added 2026-12-09 after a review found it missing).**
+      # **The pair `np serve`'s wire tests are gated on (added 2026-11-09 after a review found it missing).**
       # `crates/np-cli/tests/serve.rs` gates its fetch- and chunk-narration cases on `all(feature = "local-model",
       # feature = "fetch")`, because a default build has no transport to narrate and no runtime to embed with — and no
       # other job built that pair for np-cli: the vision job uses `vision`, and the default job's features exclude
