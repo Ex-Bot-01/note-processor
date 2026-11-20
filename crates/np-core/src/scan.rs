@@ -5,16 +5,15 @@
 //!
 //! - **One transaction for the database, files written after it commits.** The workspace row, the note
 //!   row and everything derived from its text either all move to this scan's state or none of them do.
-//!   (The registry line in `config.rs`'s database sits outside that set on purpose: it is written on a second
-//!   connection after [`crate::db`] commits, so a registry failure exits 1 over work that is already durable,
-//!   and the next scan reconciles it — the alternative was one transaction across two databases.)
-//!   `INDEX.md` cannot join a SQLite transaction, so the catalog is rendered inside that transaction,
+//!   The registry line in `config.rs`'s database sits outside that set on purpose: written on a second connection
+//!   after [`crate::db`] commits, so a registry failure exits 1 over work that is already durable and the next scan
+//!   reconciles it. `INDEX.md` cannot join a SQLite transaction, so the catalog is rendered inside that transaction,
 //!   its name list is committed with it, and only then does the filesystem work start. A scan that dies
 //!   halfway leaves the previous catalog readable instead of half-rewritten, and never leaves a delete
 //!   list that lags the files on disk (see `set_index_list` and `write_index_files` for the order).
 //! - **Unknown is not absent.** A directory the walk could not enter, a file that vanished or was
-//!   rewritten between the walk and the read, and a name whose byte spelling cannot be held (F18) are named
-//!   in [`ScanReport::skipped`] and keep the row they already have (Review Focus 5). Reporting any of them
+//!   rewritten between the walk and the read, and a name whose byte spelling cannot be held, are named in
+//!   [`ScanReport::skipped`] and keep the row they already have. Reporting any of them
 //!   as `Removed` would stale live notes because of a permission error, a race, or a name this program
 //!   refuses to guess at.
 //! - **Parse rules reach notes that did not change.** Byte comparison cannot see a rule change, so
@@ -23,14 +22,13 @@
 //!   truth about the *files*: such a scan still reports its notes as unchanged.
 //! - **The catalog reads live rows only.** Entries and [`ScanReport::notes`] come from
 //!   `files.state = 'ok'`; [`crate::db::note_counts`] stays the unfiltered database truth, because a
-//!   stale note is hidden from the catalog, not forgotten (spec §2).
+//!   stale note is hidden from the catalog, not forgotten.
 //! - **`INDEX.md` and its shards are the only names this module creates, and it deletes only the ones
-//!   that open with its own generated header** (spec §7): a name alone never licenses a removal — with
-//!   **one exception, our own temporaries**. A leftover `<generated>.tmp` from a killed write is cleared by
-//!   `clear_temp_corpses` on the naming rule alone: that spelling is one nothing else produces, and a
-//!   half-written temporary has no complete header to fingerprint. The F13 §1 review flagged the apparent
-//!   contradiction; it is a naming-trust decision rather than an oversight, stated here so the rule above can
-//!   be read literally. The
+//!   that open with its own generated header**: a name alone never licenses a removal — with **one exception,
+//!   our own temporaries**. A leftover `<generated>.tmp` from a killed write is cleared by `clear_temp_corpses`
+//!   on the naming rule alone, because that spelling is one nothing else produces and a half-written temporary
+//!   has no complete header to fingerprint — a naming-trust decision, stated so the rule above can be read
+//!   literally. The
 //!   names themselves come from [`index_names`], which owns their spelling; what this module owns is the
 //!   fingerprint deciding which of them are ours to replace. Every write goes through a temporary file
 //!   plus `rename`, and no note body is ever opened for writing.
@@ -64,7 +62,7 @@ const BOM: &[u8] = &[0xef, 0xbb, 0xbf];
 /// `notes.encoding` for text that decoded without a single replacement character.
 const ENCODING_UTF8: &str = "utf-8";
 /// `notes.encoding` for bytes UTF-8 cannot hold, decoded with replacements instead of failing the scan
-/// (Review Focus 1b).
+/// so that one undecodable byte does not fail the whole scan.
 const ENCODING_LOSSY: &str = "lossy";
 /// `meta` key holding the index files this program has published, newline-separated. The previous list
 /// is what lets a rescan delete the shards it no longer produces.
@@ -76,31 +74,29 @@ pub const LAST_SCAN_KEY: &str = "last_scan_unix";
 /// were written with. Absent means "written before this mechanism existed", which is not a version to
 /// compare against and therefore refreshes; see the comparison in `refresh_needed`.
 pub const PARSE_VERSION_KEY: &str = "parse_version";
-/// `meta` key holding [`crate::chunk::CHUNKER_VERSION`] for the workspace's `chunks` rows — the value
-/// design-m2-embeddings §5 calls `EMBED_VERSION`, spelled by its role rather than by a second number,
-/// because the only definition it can describe is the chunker that cut those rows. Recording a second
-/// constant beside `CHUNKER_VERSION` would let the two disagree in the file while claiming one fact.
+/// `meta` key holding [`crate::chunk::CHUNKER_VERSION`] for the workspace's `chunks` rows — what other documents
+/// call `EMBED_VERSION`. There is deliberately no second constant beside `CHUNKER_VERSION`: the only definition this
+/// key could describe is the chunker that cut those rows, and two names for one fact eventually disagree in the file.
 ///
-/// **Chunker coverage only.** The record answers "did this build's chunking reach every note it owed", and
-/// nothing else. Provider availability is not version debt (§5's P0, and the decision comment sits on
-/// `record_chunk_version` where it is taken): with the default `embeddings.provider = "none"` the key is
+/// **Chunker coverage only.** The record answers "did this build's chunking reach every note it owed", and nothing
+/// else. Provider availability is not version debt — the reasoning sits on `record_chunk_version`, where it is taken:
+/// with the default `embeddings.provider = "none"` the key is
 /// recorded anyway, because a withheld key would be a coverage gap no user can clear.
 pub const EMBED_VERSION_KEY: &str = "embed_version";
 /// `meta` key holding what the **last scan** of this workspace could not index, beside what its registry
 /// currently duplicates.
 ///
-/// Beside [`crate::db::FK_ORPHANS_KEY`] and [`crate::db::PATHS_LOSSY_KEY`] for the same reason (F22 §1): a
-/// refusal is a fact with no afterlife otherwise — one line on stdout or stderr at the moment it happened,
-/// gone as soon as the terminal closes, while the note stays missing from the catalog until somebody
-/// renames the file. There is no logger to write to and the catalog's bytes may not move, so `meta` is where
-/// a person reading the workspace later has to be able to ask what was lost.
+/// Beside [`crate::db::FK_ORPHANS_KEY`] and [`crate::db::PATHS_LOSSY_KEY`] for the same reason: a refusal is a fact
+/// with no afterlife otherwise — one line on stderr at the moment it happened, gone when the terminal closes, while
+/// the note stays missing from the catalog until somebody renames the file. There is no logger to write to and the
+/// catalog's bytes may not move, so `meta` is where a person reading the workspace later can ask what was lost.
 ///
 /// The value is `unreadable=N;unkeyable=N;duplicates=N;names=a,b`, written **even when every count is
 /// zero**: this record describes the *last scan* rather than the history of the file, so a fixed workspace
-/// has to overwrite an old complaint instead of leaving it standing there forever (F22 §2). `names` holds
+/// has to overwrite an old complaint instead of leaving it standing there forever. `names` holds
 /// up to eight display spellings joined by `,` — see [`Unindexable::names`] for their order — and a path
 /// holding a comma reads as two entries, because this is a diagnosis for a human at an `sqlite3` prompt and
-/// not a format to parse. Nothing decides anything with it: no deletion rule reads this key (F22 §4.2).
+/// not a format to parse. Nothing decides anything with it: no deletion rule reads this key.
 pub const UNINDEXABLE_KEY: &str = "unindexable";
 /// Suffix of the temporary file every catalog write goes through before its `rename`.
 const TEMP_SUFFIX: &str = ".tmp";
@@ -112,8 +108,8 @@ const TEMP_SUFFIX: &str = ".tmp";
 const NAME_CAP: usize = 8;
 
 /// A note re-parsed by one scan: its path and the links its text holds, which is everything
-/// [`store_note_links`] needs once the whole corpus is up to date. The path travels in both spellings so the
-/// id lookup that follows can go by bytes (F13 §4.1).
+/// [`store_note_links`] needs once the whole corpus is up to date. The path travels in both spellings so the id
+/// lookup that follows can go by bytes.
 type Parsed = (RelPath, Vec<RawLink>);
 
 /// The two spellings of one found file, as the write pass and the link pass both need them.
