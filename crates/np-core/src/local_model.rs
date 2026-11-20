@@ -1691,9 +1691,14 @@ fn open_context(
     // (`src/llama-context.cpp:342`, `:344`, `GGML_PAD` at `:387`) into a checked fact — A1 review P1-1, which is worth
     // landing here rather than in R6c because R6c makes the budget config-derived and this is the bound it leans on.
     //
-    // SAFETY: `ctx` is non-null (checked above) and these read its own parameters.
-    let built_ctx = unsafe { llama_ffi::llama_n_ctx(ctx.as_ptr()) } as usize;
-    let built_ubatch = unsafe { llama_ffi::llama_n_ubatch(ctx.as_ptr()) } as usize;
+    // SAFETY: `ctx` is non-null (checked above), and both calls read that context's own parameters without mutating it or
+    // taking ownership of anything.
+    let (built_ctx, built_ubatch) = unsafe {
+        (
+            llama_ffi::llama_n_ctx(ctx.as_ptr()) as usize,
+            llama_ffi::llama_n_ubatch(ctx.as_ptr()) as usize,
+        )
+    };
     if built_ubatch < requested {
         // A context that cannot hold a batch as wide as its own window would turn every long note into an assert. The
         // mismatch is the runtime's answer, not the caller's fault, so this refuses rather than quietly embedding a

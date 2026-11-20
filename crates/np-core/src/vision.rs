@@ -294,6 +294,8 @@ impl Projector {
     ) -> Result<ImageEmbedding, EmbedError> {
         let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
 
+        // SAFETY: no arguments, and the return is either null or a fresh `mtmd_input_chunks` that this call owns. Ownership
+        // passes to the cleanup below exactly once, on every path out of this function.
         let chunks = unsafe { mtmd::mtmd_input_chunks_init() };
         if chunks.is_null() {
             // Not expected, and honest about why we cannot promise what happens instead: C does `new mtmd_input_chunks`
@@ -518,9 +520,11 @@ impl Projector {
             return Err(unavailable());
         }
         // SAFETY: the context promises `n_embd_out` floats for sequence 0 when pooling is on (the artifact answers
-        // MEAN, which §1.2's recipe expects).
+        // MEAN, which §1.2's recipe expects), and `pooled` was just checked non-null. The row is copied here, before any
+        // further decode, because the next decode is what would rewrite that buffer.
+        let pooled_row = unsafe { std::slice::from_raw_parts(pooled, self.n_out) };
         let mut vector = Vec::with_capacity(self.n_out);
-        vector.extend_from_slice(unsafe { std::slice::from_raw_parts(pooled, self.n_out) });
+        vector.extend_from_slice(pooled_row);
 
         let norm: f64 = vector
             .iter()
