@@ -15,3 +15,4 @@ treat what follows as settled unless a human reopens it.
 | [0007](0007-derived-data-with-no-importance-filter.md) | Derived data lives in the database and `INDEX.md`, with no importance filter | — |
 | [0008](0008-frontend-stack.md) | The front end is React + Vite + TypeScript with CodeMirror 6 | — |
 | [0009](0009-how-work-is-done.md) | Fresh implementer, fresh reviewer, merge only on the human's word | — |
+| [0010](0010-the-crate-is-mit.md) | The crate is MIT, and not dual-licensed | — |

@@ -130,7 +130,7 @@ row catalog-goldens python3 "$G/verify_catalog_goldens.py"
 # The fences that check the fences. Each python fence carries `--self-test`: a tree of planted violations it must name,
 # one per rule it claims to enforce. A rule nobody has ever seen fail is indistinguishable from a rule someone deleted,
 # which is how three of these rows sat red for weeks with nothing but an exit code to say so.
-for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links check-deps check-llama-decls check-unsafe-lints; do
+for fence in check-comment-only check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links check-deps check-llama-decls check-unsafe-lints; do
   row "selftest-${fence}" python3 "$G/${fence}.py" --self-test
 done
 
@@ -164,6 +164,14 @@ row deps python3 "$G/check-deps.py"
 # stops denying either one, or if any file under `crates/` — tests included — allows one. A denial with a silent exception is
 # a denial of everything except the block that needed it.
 row unsafe-lints python3 "$G/check-unsafe-lints.py"
+
+# **A comment diet may not move a token.** Given `NP_COMMENT_BASE`, this strips the comments out of every source file the range
+# touched and compares what is left, so "only prose changed" is computed rather than asserted. Without a base it skips by name:
+# a row that quietly passes because there was nothing to compare against is the failure mode this repository keeps meeting.
+comment_base="${NP_COMMENT_BASE:-}"
+comment_missing=""
+[ -n "$comment_base" ] || comment_missing="no NP_COMMENT_BASE — set it to the revision the range starts at"
+row_or_skip comment-only "$comment_missing" python3 "$G/check-comment-only.py" "$comment_base"
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.
