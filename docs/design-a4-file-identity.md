@@ -1,6 +1,6 @@
 # A4 — durable file identity: a third matching route that may only ever *add* a match
 
-Design note, 2026-10-28. Roadmap: Track A item **A4** (`docs/roadmap-2026-10-27.md`). Branch: `m10/file-identity`.
+Design note, 2026-10-28. Roadmap: Track A item **A4** (`docs/archive/roadmap-2026-10-27.md`). Branch: `m10/file-identity`.
 Root cause shared by `docs/design-f23-ambiguous-rows.md` §6 and `docs/design-f20-bytes-in-reports.md`: a registry key derived
 from display text cannot say which physical file it belongs to.
 

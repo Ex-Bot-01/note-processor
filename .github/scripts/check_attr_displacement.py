@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Attribute-displacement fence: a `#[cfg]` that ended up on the wrong item.
 
-Why this exists: `docs/roadmap-2026-10-27.md` records this class making Windows CI red twice, both times after every
+Why this exists: `docs/archive/roadmap-2026-10-27.md` records this class making Windows CI red twice, both times after every
 local gate was green. The shape each time was an insertion made at "the nearest `#[` before this function", which turned
 out to be an attribute belonging to the *neighbour*: the new item inherited a gate it never asked for, the old item lost
 the gate it depended on, and Linux — where every gated helper exists anyway — compiled happily.

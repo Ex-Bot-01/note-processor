@@ -14,6 +14,7 @@ Everything that was here and is not one of those has a home now, and no fact was
 | `docs/backlog-m2-followups.md` | Deferred engineering cards and their closure conditions |
 | `docs/design-*.md`, `docs/measurement-*.md` | Designs as they were argued, measurements as they were taken |
 | `AGENTS.md` | The conventions an agent follows opening this tree cold |
+| `docs/README.md` | Every document, sorted into reference, designs and decisions, and history |
 
 ## What this product is (one paragraph)
 

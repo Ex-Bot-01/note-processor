@@ -43,7 +43,7 @@ AutoFetch::Deferred.allowed(&cfg)`), so the first call a GUI makes can be the 31
 
 - **No cancellation.** A `cancel` method (a GUI "stop" button) is its own design: aborting mid-write must decide what a half-written batch means.
 - **No per-file granularity** for scan, and no per-image granularity for media: phases and throttled counters (§3), not thousands of lines.
-- **No HTTP/SSE/WebSocket transport.** M4 (`docs/roadmap-2026-10-27.md`), its own design; nothing here pre-implements it.
+- **No HTTP/SSE/WebSocket transport.** M4 (`docs/archive/roadmap-2026-10-27.md`), its own design; nothing here pre-implements it.
 - **No telemetry.** np stays silent unless a human or the connected client asks.
 
 ## Anti-goals

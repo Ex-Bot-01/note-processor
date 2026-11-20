@@ -1188,7 +1188,7 @@ the link is recorded in `links` like any other attachment — which is the card'
 `2026-11-07T01:57Z` (`docs/developing.md`), and this card's "done when" is satisfied by text a reader can open — no code path changed, so there is
 no behaviour for a runner to grade. What was run on the tree: 17 local gate rows exit 0 and `GOLDEN CHECK: pass`. The one *factual* claim added here that a
 test could hold — that an unsupported attachment link still lands in `links` as an `attachment` row — is already pinned elsewhere (F26's content gate cases
-in `crates/np-core/tests/embed_media.rs`, and the resolver cases in `tests/media.rs`), so no new assertion was invented to make a docs commit look like work.
+in `crates/np-core/tests/embed_media.rs`, and the resolver cases in `tests/media_resolve.rs`), so no new assertion was invented to make a docs commit look like work.
 
 **A stale sentence this closure retired on the way.** README's "Does not" row still claimed "no image encoding in a shipped binary yet (F28)" — untrue since
 step ② merged at `736a66d`. It now says image encoding needs a `--features local-model,vision` build plus an installed projector, that release binaries are
@@ -1755,7 +1755,7 @@ nested-first without anyone hand-writing it — and Stage 9b's refusal to move l
 **Opened 2026-11-07 as a question, ruled 2026-11-08 by the human partner: default ON.** The reason is in the ruling's own words — the
 consumer of this program is increasingly another program, and what it wants is *for vectors to simply exist*, not a sequence of three
 commands whose exit codes it has to interpret. Design `docs/design-f38-auto-fetch.md`, plan
-`docs/superpowers/plans/2026-11-08-auto-fetch-and-setup.md`; this card is the record of what shipped and what it still owes.
+`docs/archive/plans/2026-11-08-auto-fetch-and-setup.md`; this card is the record of what shipped and what it still owes.
 
 **Default-on is defensible only because of what can be fetched, not because of who asked.** One id (`embeddinggemma-2`), from one
 origin that is compiled in unless `[models] base_url` replaces it, verified against the pinned digest before a single byte is put in

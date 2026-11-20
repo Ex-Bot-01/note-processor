@@ -133,7 +133,7 @@ size before every line.
 ## What may be in a diagnostic
 
 Paths, ids, rule tokens, counts and timings. **Never a note's body, never an origin host or URL** — the rule
-`docs/design-m2-model-registry.md` §12 already holds the transport to, extended to every event. Note *paths* are allowed
+`docs/design-m2-local-embeddings.md` §12 already holds the transport to, extended to every event. Note *paths* are allowed
 and useful (a skip event names the file it skipped); note *content* is not. `a_diagnostic_never_carries_note_text_or_an_origin`
 in `crates/np-cli/tests/diag.rs` runs scan, embed, search and models at `trace` and asserts both halves on the file
 channel; `no_diagnostic_carries_a_note_body` does the same in-process for np-core.
