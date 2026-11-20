@@ -2425,7 +2425,7 @@ pub fn upsert_vector(
 /// has no rows, and "no vectors behind it" is a fact rather than a missing thing.
 ///
 /// Separate from [`write_chunks_for_note`] on purpose, because the two tables are written in different
-/// transactions.
+/// transactions: chunk writes ride the scan's transaction, while a vector batch commits outside it.
 pub fn delete_vectors_for_chunk(db: &Db, chunk_id: i64) -> Result<(), DbError> {
     db.0.prepare_cached("DELETE FROM embeddings WHERE chunk_id = ?1")?
         .execute(params![chunk_id])?;
