@@ -1132,11 +1132,8 @@ mod tests {
     fn pipe() -> (std::fs::File, std::fs::File) {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: two ints that `pipe2` fills; close-on-exec keeps them out of any child this process spawns.
-        assert_eq!(
-            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
-            0,
-            "test setup: pipe2"
-        );
+        let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(created, 0, "test setup: pipe2");
         // SAFETY: both numbers are descriptors the call above just created, each adopted by exactly one owner here.
         let (read_half, write_half) = unsafe {
             (
@@ -1147,16 +1144,16 @@ mod tests {
         // SAFETY: `write_half` is live; reading its flags to add one bit changes nothing else about it.
         let flags = unsafe { libc::fcntl(write_half.as_raw_fd(), libc::F_GETFL) };
         assert!(flags >= 0, "test setup: F_GETFL");
-        assert!(
-            unsafe {
-                libc::fcntl(
-                    write_half.as_raw_fd(),
-                    libc::F_SETFL,
-                    flags | libc::O_NONBLOCK,
-                )
-            } >= 0,
-            "test setup: O_NONBLOCK"
-        );
+        // SAFETY: the same live descriptor, and the value written is the flags just read with one bit added; no other
+        // process holds a claim on this pipe's write end.
+        let set_nonblocking = unsafe {
+            libc::fcntl(
+                write_half.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        };
+        assert!(set_nonblocking >= 0, "test setup: O_NONBLOCK");
         (read_half, write_half)
     }
 

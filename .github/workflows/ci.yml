@@ -327,3 +327,30 @@ jobs:
       # "compiled" and "ran" that F18's rule exists to keep loud.
       - name: Test (pair on, artifacts absent ⇒ printed NOT COVERAGE)
         run: cargo test --locked -p np-core --features local-model,vision --test local_vision -- --nocapture
+
+  # **AddressSanitizer over the FFI boundary, nightly and on demand.** Not per pull request: it rebuilds std and the pinned
+  # C++ with sanitizer flags, which is minutes a merge should not wait on. It exists because nearly every `unsafe` site in
+  # this tree calls into llama.cpp — the lints (`#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]` in both
+  # crates) keep each block argued in writing; only a sanitizer can catch the class of mistake where the argument was wrong.
+  # The script is the gate: it builds a private copy of the pinned source so cmake cannot hand back an unsanitized cache, and
+  # prints `NOT COVERAGE` rather than a pass if the archives carry no ASan symbols. Findings get filed as cards, not silenced.
+  asan-local-model-vision:
+    name: AddressSanitizer local-model,vision (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain, rust-src, and cmake
+        run: |
+          rustup toolchain install nightly --component rust-src
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      - name: Cache the pinned llama.cpp source
+        uses: actions/cache@v4
+        with:
+          path: .vendor
+          key: llama-cpp-${{ hashFiles('third_party/llama-cpp.toml', 'scripts/vendor-llama-cpp.sh') }}
+      - name: Vendor llama.cpp
+        run: ./scripts/vendor-llama-cpp.sh
+      - name: Build with ASan, prove the archives are instrumented, run the loader and decoder tests
+        run: ./.github/scripts/asan-localmodel.sh

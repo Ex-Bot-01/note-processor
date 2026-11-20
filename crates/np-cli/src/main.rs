@@ -5,6 +5,11 @@
 //! is in lives in [`np_core::models`], so this file holds no SQL and defines no second SHA-256
 //! ([`np_core::hash::sha256_file`] is the one digest in the program, and `np models hash` calls it).
 
+// **Same rule as `np-core`: unsafe is documented or it does not compile.** The blocks here are all libc calls behind the
+// diagnostics pipe (`diag.rs`) — small, but they are the reason a log line cannot make `np` hang, and "small" is not a
+// safety argument. Denied at crate level for every feature combination, with no `allow` in the tree.
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
+
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
 use std::num::NonZeroU16;

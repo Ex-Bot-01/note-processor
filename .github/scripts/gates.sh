@@ -107,6 +107,10 @@ RUSTDOCFLAGS="--deny warnings" row rustdoc-deny-default cargo doc --workspace --
 row_or_skip rustdoc-deny-localmodel "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model --no-deps
 row_or_skip rustdoc-deny-lm-vision "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model,vision --no-deps
 
+# Path to the fence scripts, defined before the first row that needs one: `set -u` makes a use-before-definition
+# an immediate abort rather than a row that quietly exits 127 further down the log.
+G=.github/scripts
+
 # **The hand-written FFI against the header it mirrors.** `crates/np-core/src/llama_ffi.rs` declares llama.cpp's C API by
 # hand (§14 says why), so a re-pin that changes a signature produces no compile error — only behaviour nothing predicts. This
 # compares name, arity and parameter/return shape against the pinned tree's own headers, admits what it cannot compare
@@ -120,14 +124,13 @@ row_or_skip llama-decls "$decl_missing" env NP_LLAMA_CPP_SRC="$llama_src" python
 # The three static fences. They live beside this script because a gate that is not in the repository is a gate that
 # quietly stops running: these three lived in a git-ignored scratch directory, and every row here kept exiting 2 with
 # "can't open file" until somebody noticed.
-G=.github/scripts
 row cfg-dead-code python3 "$G/check_cfg_dead_code.py"
 row attr-displacement python3 "$G/check_attr_displacement.py"
 row catalog-goldens python3 "$G/verify_catalog_goldens.py"
 # The fences that check the fences. Each python fence carries `--self-test`: a tree of planted violations it must name,
 # one per rule it claims to enforce. A rule nobody has ever seen fail is indistinguishable from a rule someone deleted,
 # which is how three of these rows sat red for weeks with nothing but an exit code to say so.
-for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links check-deps check-llama-decls; do
+for fence in check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links check-deps check-llama-decls check-unsafe-lints; do
   row "selftest-${fence}" python3 "$G/${fence}.py" --self-test
 done
 
@@ -157,6 +160,10 @@ row links python3 "$G/check-links.py"
 # notices file's claim that the list is "derived, not hand-written" cannot mean "nobody regenerated it". The advisory half
 # lives in CI (`supply-chain.yml`), because RustSec's database is not readable from a machine without network.
 row deps python3 "$G/check-deps.py"
+# **Nobody may mute the unsafe lints from inside a module.** Both crates deny them at the top; this fence fails if a crate
+# stops denying either one, or if any file under `crates/` — tests included — allows one. A denial with a silent exception is
+# a denial of everything except the block that needed it.
+row unsafe-lints python3 "$G/check-unsafe-lints.py"
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.
@@ -165,6 +172,19 @@ artifacts=""
 row_or_skip test-cli-realmodel "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-cli --features local-model -- --nocapture
 [ -n "${NP_TEST_MMPROJ_PATH:-}" ] || artifacts="NP_TEST_MODEL_PATH or NP_TEST_MMPROJ_PATH unset"
 row_or_skip test-core-realvision "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-core --features local-model,vision -- --nocapture
+
+# **AddressSanitizer over the FFI boundary.** Nearly every `unsafe` site in this tree calls into llama.cpp, so the sanitizer
+# has to be under the Rust as well as around it — which is why the row is a script that refuses to trust a cmake cache
+# (`asan-localmodel.sh`: it builds a private copy of the pinned source with sanitizer flags and checks the archives for ASan
+# symbols before running a single test). Skips, each naming what to install or export: no nightly toolchain, no `rust-src`,
+# no cmake, or no pinned llama.cpp tree.
+llama_src="${NP_LLAMA_CPP_SRC:-$PWD/.vendor/llama.cpp-v$(sed -n 's/^tag *= *"v\{0,1\}\([^"]*\)".*/\1/p' third_party/llama-cpp.toml | head -1)}"
+asan_missing=""
+[ "$have_cmake" = 1 ] || asan_missing="no cmake on PATH; set CMAKE"
+rustup toolchain list 2>/dev/null | grep -q '^nightly' || asan_missing="$asan_missing; no nightly toolchain (rustup toolchain install nightly)"
+rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src.*installed' || asan_missing="$asan_missing; no rust-src for nightly"
+[ -d "$llama_src" ] || asan_missing="$asan_missing; no pinned llama.cpp source at $llama_src (run ./scripts/vendor-llama-cpp.sh or set NP_LLAMA_CPP_SRC)"
+row_or_skip asan-localmodel-vision "$asan_missing" env NP_LLAMA_CPP_SRC="$llama_src" .github/scripts/asan-localmodel.sh
 
 # **`--exclude=driver.log`, and the reason it is a guard rather than a fix.** On a fresh log directory this cannot matter: the count
 # runs *before* the summary line is echoed, so the phrase is not in that file yet — measured on 2026-11-09, where the tally over

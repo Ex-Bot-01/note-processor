@@ -6,6 +6,14 @@
 //! mutable; an out-of-tree caller holding a shared `&dyn Embedder`, or reusing one provider across two runs through a
 //! shared reference, needs the same change. There is no CHANGELOG in this tree, so this is where the note lives.
 
+// **The unsafe rules are lints, not a convention.** This crate holds every `unsafe` site in the program: hand-written
+// llama.cpp declarations (`llama_ffi`), the loader and decoder (`local_model`, `vision`). Two properties have to hold at
+// each one — that an `unsafe fn`'s body is still checked rather than implicitly trusted, and that a human wrote down why
+// the preconditions hold — and neither survives contact with a large FFI surface as a code-review custom. So both are
+// denied at crate level, for every feature combination, with no `allow` anywhere in the tree: a gate that only bites when
+// `local-model` is configured is a gate that stays green while the code that can corrupt memory changes.
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
+
 pub mod catalog;
 pub mod change;
 pub mod chunk;
