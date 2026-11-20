@@ -215,8 +215,10 @@ def self_test():
 
 def main(argv, root=None):
     if root is None:
-        top = subprocess.run(["git", "rev-parse", "show-toplevel"], capture_output=True, text=True)
-        root = top.stdout.strip() or "."
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        # An empty answer means "not a repository", and running on with a bogus root would report every revision as missing —
+        # the same shape as a green row built on nothing.
+        root = top.stdout.strip() if top.returncode == 0 else "."
     if "--self-test" in argv:
         return self_test()
     if not argv:
