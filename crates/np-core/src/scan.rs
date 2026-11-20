@@ -175,7 +175,7 @@ pub struct ScanReport {
     ///
     /// **The next sentence in this doc comment was false for six days.** It said that where the key is itself lossy —
     /// "a Windows refusal, whose identity bytes come from `to_string_lossy`" — two names share a single line, and that
-    /// `crates/np-core/tests/walk.rs` pinned it. F18 round four (`cfd7e8b`, 2026-11-08) replaced that byte spelling with
+    /// `crates/np-core/tests/walk.rs` pins the behaviour. A later change replaced that byte spelling with
     /// [`crate::path_keys::wtf8`], so a Windows refusal's identity bytes carry the lone surrogate itself and two such
     /// names produce **two** lines here; `tests/walk.rs` now pins those six bytes instead, on the Windows row that first
     /// ran and caught the stale pair of them (issue #9). A key that is genuinely lossy still exists — a row
@@ -250,11 +250,11 @@ pub struct ScanReport {
     /// What this **file records** under [`crate::db::FK_ORPHANS_KEY`], written by this open or by any earlier one —
     /// `None` only when no such record exists.
     ///
-    /// **The other half of F21, and the question it existed for.** [`Self::upgrade_orphans`] answers "what did this run
+    /// **The question this field exists to answer.** [`Self::upgrade_orphans`] answers "what did this run
     /// delete" and is quiet from then on; someone asking a month later had to open `sqlite3`. This field is that record
     /// read back through `np scan`, so the durable receipt stops being readable only by whoever brings a database shell.
     /// It changes no announcement, clears nothing, and prints nothing new on stdout: an old fact stays available without
-    /// any run becoming louder for it, which is the balance F21 §3 struck and this field keeps.
+    /// any run becoming louder for it, which is the balance this field keeps.
     ///
     /// **Null means no record, not a zero receipt.** A file created at the current schema carries
     /// `headings=0,tags=0,…` — proof the sweep ran — and that string reaches here verbatim; only a workspace whose file
@@ -268,7 +268,7 @@ pub struct ScanReport {
     pub recorded_merged_notes: Option<String>,
     /// What this scan could not index, and what the registry duplicates — counted by kind, which is the
     /// diagnosis [`ScanReport::skipped`] cannot give because it merges every cause into one list of paths
-    /// (F22 §1). `None` when every count is zero, so a workspace that lost nothing keeps a clean report.
+    /// `None` when every count is zero, so a workspace that lost nothing keeps a clean report.
     ///
     /// **Null, not absent**, exactly like [`Self::upgrade_orphans`]: the JSON key is there on every scan
     /// whatever the outcome, because a reader must be able to tell "nothing was lost" apart from "this build
@@ -277,7 +277,7 @@ pub struct ScanReport {
     ///
     /// The durable copy is `meta`'s [`UNINDEXABLE_KEY`] value, written after this scan's commit and overwritten
     /// by the next one. This field is not read back from it, and nothing that *decides* anything reads either:
-    /// unknown-is-not-absent stays settled by the walk's own lists (F22 §4.2), so a refused record write
+    /// unknown-is-not-absent stays settled by the walk's own lists, so a refused record write
     /// degrades the diagnosis and never changes what is indexed.
     pub unindexable: Option<Unindexable>,
     /// Wall-clock milliseconds for the whole scan. Informational only — never in a generated file,
@@ -285,11 +285,11 @@ pub struct ScanReport {
     pub elapsed_ms: u128,
 }
 
-/// What one scan could not index, and what its registry duplicates — F22's diagnosis, counted by kind.
+/// What one scan could not index, and what its registry duplicates, counted by kind.
 ///
 /// This exists because [`ScanReport::skipped`] cannot carry it: one merged list names an unreadable
 /// directory and a name the byte spelling refuses identically, so even the live line cannot tell a
-/// permission problem from an unkeyable name (F22 §1). The list itself keeps its entries **verbatim** —
+/// permission problem from an unkeyable name. The list itself keeps its entries **verbatim** —
 /// causes arrive here, as separate counts, rather than by rewording strings a person's `grep` already
 /// depends on.
 ///
@@ -309,8 +309,8 @@ pub struct Unindexable {
     ///
     /// **This is a question, not an accusation.** Two genuinely different files can share a display spelling —
     /// latin-1 `caf\xE9/note.md` beside `caf\xE8/note.md`, both readable, both correctly indexed — and they land
-    /// here exactly as F23's one-file-two-rows does. It also counts attachments, which have no catalog entry at
-    /// all. So read it as "look at these paths" and confirm with `sqlite3` before deleting anything (F22 §4.5).
+    /// here exactly as the one-file-two-rows case does. It also counts attachments, which have no catalog entry at
+    /// all. So read it as "look at these paths" and confirm with `sqlite3` before deleting anything.
     ///
     /// It used to promise to be "deliberately unexplained"; [`Self::ambiguous`] beside it now names one possible
     /// cause, so this count stays what it is — a pointer at paths — and the reader who wants the reason reads the
@@ -321,7 +321,7 @@ pub struct Unindexable {
     /// hash, so nothing could say which byte spelling the row belongs to.
     ///
     /// `N` is exactly the population that holds [`PARSE_VERSION_KEY`] back — this field is rendered *from* that
-    /// count and never read back into a deletion or version decision, the same rule F21 argues for: ask a day later
+    /// count and never read back into a deletion or version decision, the same rule this report follows elsewhere: ask a day later
     /// and the record has to say what the withheld version meant.
     pub ambiguous: usize,
     /// Up to eight display spellings, most actionable first: [`Self::unkeyable`] paths, then
@@ -332,7 +332,7 @@ pub struct Unindexable {
     /// an unbounded value.
     ///
     /// Names are display text, so **a name here identifies no path**: two byte-distinct paths can share one
-    /// lossy spelling (F20 §1) and then two entries look alike, exactly as two `skipped` lines do. It says
+    /// lossy spelling and then two entries look alike, exactly as two `skipped` lines do. It says
     /// where to look, not which twin.
     pub names: Vec<String>,
 }
@@ -355,7 +355,7 @@ impl Unindexable {
 
     /// Whether this scan lost nothing at all, which is the case [`ScanReport::unindexable`] reports as
     /// `None` while `meta` still records it as zeros — "looked and found none" staying distinguishable from
-    /// "this workspace was never scanned by a build that looks" (F22 §2).
+    /// "this workspace was never scanned by a build that looks."
     ///
     /// [`Self::ambiguous`] is deliberately absent. Marking a row needs an unreadable look-alike prefix
     /// (`under_unreadable` reads only that list), so `ambiguous > 0` implies `unreadable >= 1`, which already makes
@@ -369,7 +369,7 @@ impl Unindexable {
 /// display paths.
 ///
 /// Takes the pieces rather than the database or the walk because all three are already in hand once the
-/// write pass ends (F22 §3), and because a hand-built list is the only way to exercise the refusal arm on a
+/// write pass ends, and because a hand-built list is the only way to exercise the refusal arm on a
 /// platform that refuses no name — see `scan::tests` for the case that does.
 fn unindexable_record(
     unreadable: &[UnknownPath],
@@ -405,7 +405,7 @@ fn unindexable_record(
 /// [`scan_with_inject`] for the seam its race test drives.
 ///
 /// A scan does not fail because of one bad file: an unreadable directory, a note with latin-1 bytes, a
-/// zero-byte file and a frontmatter-only note all index, and all get a catalog entry (Review Focus 1b,
+/// zero-byte file and a frontmatter-only note all index, and all get a catalog entry (
 /// 4). What does fail is a workspace that cannot be opened at all, an unusable `data_dir`, and a catalog
 /// file that cannot be written.
 pub fn scan(root: &Path, cfg: &Config) -> Result<ScanReport, ScanError> {
@@ -416,14 +416,14 @@ pub fn scan(root: &Path, cfg: &Config) -> Result<ScanReport, ScanError> {
 /// What one scan's chunk pass did, counted per live note.
 ///
 /// It reaches no report and no serialised output: [`ScanReport`] stays the classification truth (and its
-/// JSON shape is pinned by the CLI tests). The tally exists so `tests/scan.rs` can assert §5's warm-pass
+/// JSON shape is pinned by the CLI tests). The tally exists so `tests/scan.rs` can assert the warm-pass
 /// property — a note whose rows already carry its digest costs **one indexed lookup and no cutting** — as
 /// counted work rather than as a duration, which is the only honest way to state it on a shared machine.
 /// A test that cannot see the work can only measure it, and a measurement of 2,000 small notes proves
 /// nothing about 18k ones.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkTally {
-    /// Live notes whose stored chunk rows were consulted — §5's one indexed lookup each. A warm scan
+    /// Live notes whose stored chunk rows were consulted — one indexed lookup each. A warm scan
     /// raises this and nothing else.
     pub consulted: usize,
     /// Notes actually handed to [`crate::chunk::chunk`], because no stored row carried their current
@@ -446,7 +446,7 @@ pub struct ChunkTally {
 struct WritePass<'a> {
     markers: &'a MarkerConfig,
     /// Accumulated through the write pass so [`scan_counting_chunks`] can hand it to a test; the tally is not a
-    /// field of [`Written`] because `Written` describes rows, and this counts work (§5's warm-pass property).
+    /// field of [`Written`] because `Written` describes rows, and this counts work — the warm-pass property `tests/scan.rs` asserts.
     chunks: &'a mut ChunkTally,
 }
 
@@ -525,7 +525,7 @@ fn scan_inner(
     // its row keeps what it holds, and the path is named here too.
     skipped.extend(walked.unreadable.iter().cloned());
     skipped.extend(walked.unrepresentable.iter().cloned());
-    // **One event per hidden subtree** (diagnostics design §1 point 4). The report merges both lists into one `skipped`
+    // **One event per hidden subtree**. The report merges both lists into one `skipped`
     // array, which is the right shape for a summary line and the wrong one for a diagnosis: "could not enter" and
     // "cannot spell the name" have different remedies — one is a mount or a chmod, the other is a filename this build
     // will refuse forever. `what` is the display spelling, because these paths are exactly what the report prints.
@@ -577,11 +577,11 @@ fn scan_inner(
     let known = known_rows(&db, &walked.unreadable, &walked.unrepresentable, &snapshots)?;
     let changes =
         classify_with_identities(&known.rows, &snapshots, !cfg!(windows), &known.identity);
-    // An ambiguous row is marked rather than deleted (F23 §2), which puts two decisions between
-    // classification and the write pass: a `Removed` naming an admitted marked key is dropped (§4 — this is
-    // the arm that used to live inside `known_rows` as a deletion, and F20's safety property says it must
+    // An ambiguous row is marked rather than deleted, which puts two decisions between
+    // classification and the write pass: a `Removed` naming an admitted marked key is dropped (this is
+    // the arm that used to live inside `known_rows` as a deletion, and the safety property says it must
     // never stale a note nobody re-read), and what is left unresolved becomes the second source of the
-    // charge §3 sums.
+    // charge the counters above.
     let changes = strip_marked_removals(changes, &known.marked);
     let ambiguous = unresolved_ambiguity(&known.marked, &changes, &snapshots);
     // The two sources are **added**, never one replacing the other: rows hidden by the byte-keyed arm
