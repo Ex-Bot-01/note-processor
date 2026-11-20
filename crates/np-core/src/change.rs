@@ -231,7 +231,7 @@ fn key_of(snapshot: &Snapshot, case_sensitive: bool) -> &[u8] {
 }
 
 /// The two spellings of one snapshot, as the write pass needs them.
-fn path_of(snapshot: &Snapshot) -> RelPath {
+pub(crate) fn path_of(snapshot: &Snapshot) -> RelPath {
     RelPath::new(snapshot.rel_bytes.clone(), snapshot.rel.clone())
 }
 
