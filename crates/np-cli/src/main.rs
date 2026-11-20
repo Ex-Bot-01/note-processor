@@ -38,7 +38,7 @@ use np_core::scan::{scan, ScanReport};
 use np_core::search::{self, Hit};
 use serde_json::{json, Value};
 
-/// §12's default top-k for `np search --limit`.
+/// The default top-k for `np search --limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 
 #[derive(Parser)]
@@ -64,7 +64,7 @@ struct Cli {
     /// Also write every captured record to this file as JSONL, one object per line.
     ///
     /// The flag rather than only `[log] file`, because the config file is the thing most likely to be broken in the run you are
-    /// debugging (**F35**) — and a file that cannot load cannot configure its own sink. Human text stays on stderr; JSON goes
+    /// debugging — and a file that cannot load cannot configure its own sink. Human text stays on stderr; JSON goes
     /// here and nowhere else.
     #[arg(long = "log-file", value_name = "PATH", global = true)]
     log_file: Option<PathBuf>,
@@ -85,7 +85,7 @@ enum Command {
     },
     /// Embed the notes a workspace owes, for the configured model.
     ///
-    /// **This command may fetch** (**F38**). When `[embeddings] model` names an id this build pins and the artifact is
+    /// **This command may fetch**. When `[embeddings] model` names an id this build pins and the artifact is
     /// missing, `embed` transfers it before embedding — because the consumer of this program is increasingly another
     /// program that wants vectors to exist rather than a person willing to sequence three commands. It is **on by
     /// default** (the human's ruling, 2026-11-08) and switched off three ways: `--no-auto-fetch` for one run,
@@ -151,11 +151,11 @@ enum Command {
     /// `docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md`.
     Serve,
     /// Index a workspace, fetch its pinned model if this build can, embed it — one command that ends with vectors or says
-    /// exactly where it stopped (**F38**).
+    /// exactly where it stopped.
     ///
     /// Built for an application that wants vectors to exist and does not want to sequence three commands and interpret
     /// three exit codes. The order is deliberate: **scan first**, because keyword search works the moment indexing
-    /// finishes (F36) and a download must not stand between a person and their first results; fetch and embed second.
+    /// finishes and a download must not stand between a person and their first results; fetch and embed second.
     ///
     /// Exit codes are split by *kind* of stopping place, which is the one judgement in this command worth reading twice:
     /// offline exits **0** with `vectors: false, offline: true` — the vault is indexed, search answers, and the missing
@@ -194,12 +194,12 @@ enum Command {
     },
 }
 
-/// `np embeddings …`, the mirror of serve's `embeddings.enable` / `embeddings.disable` (**F50**). Both doors answer one
+/// `np embeddings …`, the mirror of serve's `embeddings.enable` / `embeddings.disable`. Both doors answer one
 /// document, because a GUI and a terminal asking the same question must be able to read the same answer.
 #[derive(Debug, Subcommand)]
 enum EmbeddingsCommand {
     /// Say yes: write `[embeddings] provider = "local-model"` and `model = <id>`. **Fetches nothing** — the download happens
-    /// on the first `np embed` (or `np serve`'s `embed`), under F38's announcement and digest rules.
+    /// on the first `np embed` (or `np serve`'s `embed`), under the fetch command's announcement and digest
     Enable {
         /// The model to use, which must be one this build pins. `np models list --json` prints them under `pinned`, with the
         /// byte count each one costs.
@@ -219,7 +219,7 @@ enum EmbeddingsCommand {
 
 /// `--mode` as clap sees it. A separate `clap` enum because the value parser and the help list have to come from the same
 /// place as the names; [`SearchModeFlag::to_core`] is the only bridge, so a fourth spelling cannot appear in one door and not
-/// the other (F28's lesson about two lists of the same names).
+/// the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum SearchModeFlag {
     /// Both lists, fused by rank. The default.
@@ -240,7 +240,7 @@ impl SearchModeFlag {
     }
 }
 
-/// The three model commands of `docs/design-m2-models-install.md` §2.
+/// The model commands, and which of them touch this workspace's database.
 ///
 /// `<workspace>` is an operand of `install` and `list` rather than an option because both the `models` row
 /// and the artifact live under one workspace's key ([`Config::workspace_db`], [`Config::workspace_models_dir`])
@@ -266,7 +266,7 @@ enum ModelsCommand {
         ///
         /// A member install writes no width and no prefixes — those describe the text encoder — and it requires the model
         /// to be installed already. It exists because a machine that cannot reach Hugging Face still has to be able to
-        /// place the 554 MB projector that `np embed` then tells it it is missing (F28).
+        /// place the 554 MB projector that `np embed` then tells it it is missing.
         #[arg(long)]
         member: Option<String>,
         /// The digest this artifact must hash to: 64 hex characters, from `np models hash <file>`.
@@ -284,14 +284,14 @@ enum ModelsCommand {
     },
     /// Fetch a pinned model's artifacts and record them in this workspace.
     ///
-    /// The **explicit** dial-out (§12 rule 1): it dials where `[models] base_url` says, or `NP_MODELS_BASE_URL` when the
+    /// The **explicit** dial-out: it dials where `[models] base_url` says, or `NP_MODELS_BASE_URL` when the
     /// file leaves that key out, or the one origin baked into the pin table when neither speaks. You ran it, so it runs.
     ///
-    /// It is no longer the *only* command that transfers bytes, and this paragraph used to claim it was. **F38** (shipped
-    /// 2026-11-09) gave `np embed` and `np setup` an automatic trigger for a missing **pinned** artifact, on by default;
-    /// that trigger reuses this command's origin rules, pin, marker and digest verification rather than inventing a second
+    /// It is no longer the *only* command that transfers bytes: `np embed` and `np setup` carry an automatic
+    /// trigger for a missing **pinned** artifact, on by default. That trigger reuses this command's origin rules,
+    /// pin, marker and digest verification rather than inventing a second
     /// transport, which is why the surface stayed one door wide at the wire level even though a second command may now
-    /// knock. What still never fetches: `np scan`, `np search` (**F38** §5 spells that out) and any id this build does not
+    /// knock. What still never fetches: `np scan`, `np search` and any id this build does not
     /// pin — an unpinned id is refused before a socket opens.
     #[cfg(feature = "fetch")]
     Fetch {
@@ -306,7 +306,8 @@ enum ModelsCommand {
         members: Vec<String>,
         /// Discard this id's fetch marker (and the partial download it names) and then fetch.
         ///
-        /// §12 rule 4's explicit door: a marker means some process claimed this download, and liveness is consent, so
+        /// The explicit door for a claim that will not expire itself: a marker means some process claimed this
+        /// download, and liveness is consent, so
         /// no clock may expire it. If you know no fetch is running, this is how you say so.
         #[arg(long)]
         discard_marker: bool,
@@ -479,7 +480,7 @@ fn main() -> ExitCode {
 /// descriptor that refuses writes must not cost the caller the exit code (see the call site in `main`). A
 /// configuration that names no data dir is reported as the missing value it is by [`load_config`], because
 /// [`Config::load`] refuses rather than deriving `workspaces/<hash>.sqlite` next to the current directory.
-/// Take this workspace's write lock (**F44**), or report that somebody else holds it and stop.
+/// Take this workspace's write lock, or report that somebody else holds it and stop.
 ///
 /// Every command that changes state calls this before it touches anything, because the defect it closes is not two writers arguing inside
 /// SQLite — that argument ends in `database is locked` in 5 ms, which is ugly but survivable. It is that `scan` renders `INDEX.md` *inside*
@@ -496,10 +497,12 @@ fn writer_lock(
     workspace: &Path,
     command: &str,
 ) -> Result<np_core::lock::WorkspaceLock, LockFailure> {
-    // **§3 step 0 comes first, and it belongs here rather than in each caller**: taking the lock creates a file, and a typo'd workspace path
+    // **The workspace-directory check comes first, and it belongs here rather than in each caller**: taking the
+    // lock creates a file, and a typo'd workspace path
     // must not leave one behind. `Config::workspace_db` happily derives a name for a directory that does not exist, so a lock taken before
-    // this check would create a data directory and a `<hash>.lock.db` for a vault nobody has — the exact failure §3 step 0 exists to prevent,
-    // re-opened through a new door. Every mutating command requires an existing workspace directory anyway, so nothing loses coverage.
+    // this check would create a data directory and a `<hash>.lock.db` for a vault nobody has — the exact failure
+    // that check exists to prevent, re-opened through a new door. Every mutating command requires an existing
+    // workspace directory anyway, so nothing loses coverage.
     models::require_workspace_dir(workspace).map_err(|source| LockFailure::Other(source.into()))?;
     let db_path = cfg.workspace_db(workspace);
     // The lock is named after the workspace database rather than recomputing an id, so there is no second derivation to drift from the first:
@@ -523,10 +526,11 @@ fn writer_lock(
     ) {
         Ok(held) => Ok(held),
         Err(np_core::lock::LockError::Held { waited }) => {
-            // Contention as a diagnostic (diagnostics design §1 point 4). `what` is the **workspace**, not the lock file:
+            // Contention as a diagnostic. `what` is the **workspace**, not the lock file:
             // `<hash>.lock.db` names a workspace to nobody reading a log, and the path is the identity every other
-            // np diagnostic uses (§12 allows paths; this one is the user's own). The two numbers say how long this
-            // process waited and how long it was willing to — the difference between a busy vault and a broken one.
+            // np diagnostic uses — a workspace path may be named where an origin's URL may not. The two numbers say
+            // how long this process waited and how long it was willing to — the difference between a busy vault and
+            // a broken one.
             let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
             tracing::warn!(
                 target: np_core::diagnostics::target::LOCK,
@@ -546,7 +550,7 @@ fn writer_lock(
 }
 
 impl LockFailure {
-    /// The machine-readable form of a refusal, built once for every channel (**F44**).
+    /// The machine-readable form of a refusal, built once for every channel.
     ///
     /// `locked` sits beside `offline` and `fetched` as the third thing that can stop a mutating command without being anybody's bug. It is a
     /// function rather than a literal at a print site because `np serve` has to put *this same object* in a JSON-RPC result: two places building
@@ -566,8 +570,8 @@ impl LockFailure {
     /// exit code — two channels, one fact. Other channels render [`Self::document`] their own way, which is why this takes the channel as an
     /// argument instead of the lock helper taking a boolean.
     fn report_cli(self, json: bool) -> Box<dyn Error> {
-        // Printed before `self` is consumed below: a JSON caller that gets only a sentence on stderr is the exact F44 defect this type exists to
-        // prevent (before it, a losing `np scan --json` printed nothing at all).
+        // Printed before `self` is consumed below: a JSON caller that gets only a sentence on stderr is exactly
+        // the defect this type exists to prevent (before it, a losing `np scan --json` printed nothing at all).
         if json {
             if let Some(doc) = self.document() {
                 emit_json(&doc);
@@ -586,7 +590,7 @@ impl LockFailure {
 
 /// Whether the server may work, as three outcomes rather than two.
 ///
-/// **F44 says contention is a state, and a state must survive every channel.** A JSON-RPC *fault* would fire an app's generic "the backend refused"
+/// **Contention is a state, and a state must survive every channel.** A JSON-RPC *fault* would fire an app's generic "the backend refused"
 /// handler on something it is meant to retry, so `np serve` turns contention back into the very document `np scan --json` prints under contention
 /// ([`LockFailure::document`]) and lets the caller branch on `locked`.
 enum LockGrant {
@@ -669,7 +673,7 @@ fn print_summary(report: &ScanReport) {
             receipt
         );
     }
-    // What this run's own `Db::open` merged — F19's duplicate-note repair. One value, printed verbatim as
+    // What this run's own `Db::open` merged — the duplicate-note repair. One value, printed verbatim as
     // `meta` holds it under `np_core::db::NOTE_MERGE_KEY`, so this line and the durable record cannot drift
     // and no second count is computed here.
     //
@@ -694,7 +698,7 @@ fn print_summary(report: &ScanReport) {
     for target in &report.unresolved_targets {
         let _ = writeln!(out, "  {target}");
     }
-    // **Tracked but never searchable, named** (issue #12). A vault holding `plain.txt` beside `note.md` answers
+    // **Tracked but never searchable, named**. A vault holding `plain.txt` beside `note.md` answers
     // `added 5 / notes 1`, and the gap between those two numbers used to be a rule np applied silently: someone else's
     // product had to guess it and say it in its own words. Printed only when non-zero, because a vault of nothing but
     // `.md` has no explanation to give — and one label per scan that never needs printing is a line nobody reads.
@@ -723,7 +727,7 @@ fn print_summary(report: &ScanReport) {
     for path in &report.skipped {
         let _ = writeln!(out, "  {path}");
     }
-    // What that list actually **was**, counted by kind instead of merged (F22 §3): `skipped 2` hides that one
+    // What that list actually **was**, counted by kind instead of merged: `skipped 2` hides that one
     // path is a permission problem nobody fixes by renaming and the other a name this build can never key.
     // Printed only when something was lost, and printed as the same string `meta` records under
     // `np_core::scan::UNINDEXABLE_KEY` — one value, two channels, so the line a person read yesterday can be
@@ -741,7 +745,7 @@ fn print_summary(report: &ScanReport) {
 }
 
 // ---------------------------------------------------------------------------
-// `np embed` — design-m2-local-embeddings.md §6.
+// `np embed` — resolve a provider, embed what moved, report what happened.
 //
 // The command resolves *which* provider the configuration names and prints what came back; every decision
 // about currency, batching, exit arms and the stamp rule lives in [`np_core::embed_run`]. That split is why
@@ -752,8 +756,8 @@ fn print_summary(report: &ScanReport) {
 ///
 /// Three of the four arms leave as exit 1 with the arm's sentence on stderr *and* in the printed report: two
 /// channels for one fact, the posture `np models list` already takes for a directory-level failure. No new exit
-/// code is introduced — §6 says so, and clap keeps argv failures at 2.
-/// Whether this run may fetch a pinned artifact it is missing (**F38**), resolved from argv before anything else.
+/// code is introduced for it, and clap keeps argv failures at 2.
+/// Whether this run may fetch a pinned artifact it is missing, resolved from argv before anything else.
 ///
 /// Three values rather than a `bool` because "the operator said yes" and "nobody said anything" must not collapse: the
 /// first ignores the config file, the second defers to it. Resolution order is **argv → environment+file** — argv last
@@ -815,7 +819,7 @@ fn embed_report(
         workers,
         fetched,
         // Not read here: `np embed` refuses when it cannot embed, so "a fetch was declined" adds nothing to a refusal that already
-        // names the command. `np search --json` is the caller that needs the distinction (**F45**), and it reads the field directly.
+        // names the command. `np search --json` is the caller that needs the distinction, and it reads the field directly.
         fetch_declined: _,
     } = embed_provider(
         &cfg,
@@ -830,15 +834,16 @@ fn embed_report(
     // widths when the truth was a missing file (see [`Resolution`]).
     //
     // Both live providers and placeholders map to `Resolution::Provider`, which is exactly what this call site produced
-    // before F32 — the two arms embed can see are unchanged by construction, and that is the reason `ProviderState` was
-    // allowed to exist at all (F32 §5).
+    // before the states were split — the two arms embed can see are unchanged by construction, and that is the
+    // reason `ProviderState` was
+    // allowed to exist at all.
     //
     // `as_mut`, not `as_ref`: a provider is the thing that can open a projector, so the run holds it mutably for as long
     // as the resolution lives (`Resolution::Provider`'s note says why).
-    // **F40 splits this mapping by build shape.** In a binary that links no runtime, `ProviderState::Ready` holds the
+    // **This mapping splits by build shape.** In a binary that links no runtime, `ProviderState::Ready` holds the
     // seam's placeholder — a provider whose every batch answers `RuntimeNotBuilt`. Handing it to the run is how an
     // operator who installed a model correctly (digest verified, 295.5 MB) got `outcome owed and not produced` with
-    // `errors 1`: §6's report-integrity arm, quoting a per-batch error, after the corpus had been read. This build now
+    // `errors 1` — the report-integrity arm, quoting a per-batch error, after the corpus had been read. This build now
     // refuses before any of that, naming the feature and the two ways forward. A `local-model` build keeps the original
     // mapping untouched — there, "the bytes would not load" genuinely *is* arm (iv), and its own test says so.
     #[cfg(not(feature = "local-model"))]
@@ -848,7 +853,8 @@ fn embed_report(
         },
         ProviderState::Placeholder { embedder, .. } => Resolution::Provider(embedder.as_mut()),
         ProviderState::ArtifactAbsent => Resolution::ArtifactAbsent,
-        // **F38 arm (vi).** The fetch was allowed, attempted, and nothing answered; the run says so before reading a chunk.
+        // The offline arm: the fetch was allowed, attempted, and nothing answered; the run says so before it reads
+        // a chunk.
         ProviderState::FetchSkippedOffline { id } => Resolution::FetchSkippedOffline {
             // Cloned because this match borrows `state` mutably for the provider arm; the offline arm needs a value that
             // outlives the borrow.
@@ -874,14 +880,15 @@ fn embed_report(
     // np-core's own seam tests call `embed_with_inject` directly and never come through here.
     let mut report = embed_run::embed_with_resolution(workspace, &cfg, resolution, progress)?;
     // What was concluded about the model's bytes travels on the report rather than being printed here, so `--json`
-    // and the text summary cannot disagree about whether this run verified anything (the same reason §7's caveat is a
+    // and the text summary cannot disagree about whether this run verified anything (the same reason the verification
+    // caveat is a
     // field). `None` says no local artifact was involved — a `provider = "none"` run has nothing to claim.
     report.artifact_check = artifact_check;
     // Likewise the worker count: decided where the provider was built, printed here. `None` means **no local-model
     // provider was constructed** — which is not the same sentence as "nothing was embedded": a `local-model` run whose
     // notes were all current still built a provider, and its report states the count it would have used.
     report.workers = workers;
-    // **F38's machine-readable answer to "did this invocation download a model?"** — set here rather than inside the run
+    // **The machine-readable answer to "did this invocation download a model?"** — set here rather than inside the run
     // because the transfer happened upstream, in provider resolution, and the document that must not contradict the text
     // summary is this one object.
     report.fetched = fetched;
@@ -910,7 +917,7 @@ fn embed_refusal(report: &EmbedReport) -> String {
     format!("{label}: {detail}")
 }
 
-/// **F42 option A: say it out loud and keep going.** One stderr line when the model row on file declares instruction prefixes this build's
+/// **Say it out loud and keep going.** One stderr line when the model row on file declares instruction prefixes this build's
 /// pin does not, plus the value `--json` carries under `prefix_drift` (absent when there is no drift, so every existing document shape is
 /// untouched).
 ///
@@ -923,7 +930,7 @@ fn embed_refusal(report: &EmbedReport) -> String {
 /// Which halves differ is reported separately, because they are not symmetric: the document prefix is what every stored vector was computed
 /// under, while the query prefix affects only future queries. And the case that is *not* warned about matters as much — this build's pin
 /// declares empty prefixes (`pins::PINNED_IDENTITIES`), so an install that omits both flags agrees with it and stays silent. The operator's
-/// round-four row was that case; **F42**'s card said otherwise and has been corrected.
+/// review row was that case, and the card that claimed otherwise has been corrected.
 fn prefix_drift_notice(
     cfg: &Config,
     workspace: &Path,
@@ -948,10 +955,10 @@ fn prefix_drift_notice(
          something different from a fetched model's, and no command rewrites them (`np models list` shows the \
          declaration on file)"
     );
-    // …and the same fact as a diagnostic (diagnostics design §1 point 4), with the id as `what`. The stderr sentence
+    // …and the same fact as a diagnostic, with the id as `what`. The stderr sentence
     // above is pinned output and stays byte-for-byte; this reaches only whoever asked for diagnostics, which is why both
     // can exist without a doubled line. Which halves drifted travels in the message rather than in `expected`/`actual`,
-    // because those keys are for numbers (§1) and "the document prefix" is not one.
+    // because those keys are for numbers and "the document prefix" is not one.
     tracing::warn!(
         target: np_core::diagnostics::target::EMBED,
         rule = np_core::diagnostics::rule::PREFIX_DRIFT,
@@ -979,7 +986,8 @@ fn embed_workspace(
     json: bool,
     auto_fetch: AutoFetch,
 ) -> Result<(), Box<dyn Error>> {
-    // The lock spans the run: an `embed` writes vectors and re-renders `INDEX.md`, and a second writer in the same vault is what F44 measured.
+    // The lock spans the run: an `embed` writes vectors and re-renders `INDEX.md`, and a second writer in the same
+    // vault is what this lock exists to stop.
     let cfg_for_lock = load_config()?;
     let _writer = writer_lock(&cfg_for_lock, workspace, "embed")
         .map_err(|failure| failure.report_cli(json))?;
@@ -1005,7 +1013,7 @@ fn embed_workspace(
 
 /// `np setup`: index first, then embed (which may fetch), then say in one place how far this got.
 ///
-/// Scan runs **before** anything network-facing on purpose: keyword search works the moment indexing finishes (F36), so a
+/// Scan runs **before** anything network-facing on purpose: keyword search works the moment indexing finishes, so a
 /// 310 MB transfer — or the four seconds spent discovering there is no network — must not stand between a person and their
 /// first results. The embed half is [`embed_report`] unchanged, which means its arm order, its fetch trigger, and its
 /// report fields are the same code `np embed` runs; setup adds an ordering and a verdict, not a second implementation.
@@ -1083,7 +1091,7 @@ fn setup_workspace(
 
     if embedded.offline {
         // Indexed and searchable is a result, not a failure: exiting 1 here would tell an app to retry forever over a
-        // condition that needs no code change, and F36 already answers queries meanwhile.
+        // condition that needs no code change, and the keyword index answers queries meanwhile.
         return Ok(());
     }
     if embedded.succeeded() {
@@ -1092,7 +1100,7 @@ fn setup_workspace(
     Err(embed_refusal(&embedded).into())
 }
 
-/// Ask before transferring, when a person could answer — and never ask when one cannot (**F38**).
+/// Ask before transferring, when a person could answer — and never ask when one cannot.
 ///
 /// Returns `true` when the fetch may proceed. It can only ever **veto**: if this predicate and the trigger in
 /// [`embed_provider`] ever disagree, the worst outcome is a question that did not need asking, or no question before a
@@ -1177,26 +1185,28 @@ fn origin_kind_token(cfg: &Config) -> &'static str {
 /// The provider is built exactly as `np embed` builds it, because the query must be embedded by the **same** model whose
 /// rows are being read — and under its `prefix_query` spelling, not the document one ([`Embedder::embed_query`]). That is also
 /// where a run that cannot embed refuses at exit 1, with the sentence for its own [`ProviderState`]: an absent artifact, an
-/// unbuilt runtime, a missing row, a switched-off provider. A query nobody can embed has no ranking to print (F32: until this
-/// round four of those five shared one sentence about `provider = "none"`).
+/// unbuilt runtime, a missing row, a switched-off provider. A query nobody can embed has no ranking to print —
+/// and until recently four of those five shared one sentence about `provider = "none"`.
 /// What one search produced, before anybody printed it.
 ///
 /// **Why this type exists.** `np search` used to interleave "work out the answer" with "write bytes to stdout", which meant the only way to get a
 /// search document was to print one. `np serve` needs the same object on a different channel, and the alternative to this struct was a second
 /// implementation of provider resolution, fetch policy and note selection — two vocabularies for one state, which is the failure every card from
-/// F32 onward has been about. The CLI prints this; the server serialises it; neither can drift, because there is one of each function.
+/// these states have been about. The CLI prints this; the server serialises it; neither can drift, because there is
+/// one of each function.
 struct SearchRun {
     hits: Vec<search::Hit>,
     mode: search::SearchMode,
-    /// Whether the index holds vectors at all — the truth about the workspace, which **F45** ruled must stay `true` even when this answer could
+    /// Whether the index holds vectors at all — the truth about the workspace, which must stay `true` even when this
+    /// answer could
     /// not use them, because a reader that sees `false` will go and re-fetch a model it does not need.
     present: bool,
-    /// Whether anyone has ever scanned this workspace (**issue #5**). `mode`, `vectors` and `reason` all answer
+    /// Whether anyone has ever scanned this workspace. `mode`, `vectors` and `reason` all answer
     /// questions *about the answer*; this one answers a question about the workspace, and until now an empty list
     /// from a vault nobody indexed was indistinguishable from an empty list from a vault with nothing to find.
     indexed: bool,
-    /// Which halves of the mode actually ran (**issue #5**). `mode` is what the caller *asked for* — and since
-    /// **F45** hybrid answers from keywords alone while `vectors` keeps reporting the truth about the workspace,
+    /// Which halves of the mode actually ran. `mode` is what the caller *asked for* — and since hybrid answers from
+    /// keywords alone while `vectors` keeps reporting the truth about the workspace,
     /// so neither of those two says what this answer was built from. A client that shows "hybrid" here is showing
     /// a word `np` chose for an intent, not a word for a result; these two are the words for the result.
     keyword_used: bool,
@@ -1239,20 +1249,20 @@ fn search_run(
     // that is the property the human asked for when hybrid became the default: search answers on a machine that has never
     // downloaded 310 MB.
     //
-    // **Two rulings rewrote this block on 2026-11-09, which is why the comments are long.**
+    // **Two decisions shape this block, which is why the comments are long.**
     //
-    // *F45 (option A).* Hybrid is the mode that always answers. Until now it degraded to keyword only when the index held no
+    // *Hybrid is the mode that always answers.* It used to degrade to keyword only when the index held no
     // vectors; with vectors in it and the semantic half unbuildable — `embeddings.provider = "none"`, a model that was never
     // installed here, bytes deleted after an earlier embed — it exited 1 having written **zero bytes to stdout**, while
     // `--mode keyword` answered the same query happily. An application calling the default mode could not tell "no results" from
     // "search is broken", and the operator's own harness produced that state on every run. So hybrid no longer refuses for a
     // missing semantic half: it answers from FTS5 and says which half was absent, in prose on stderr and in a stable token under
     // `reason`. `--mode semantic` keeps every refusal it had — asking for semantics and silently receiving keyword results is the
-    // exact failure F32 and F36 were built to prevent.
+    // exact failure these refusals exist to prevent.
     //
-    // *First install (the operator's amendment to F38 §5).* "When the program has it first install on a machine it tries to
+    // *First install.* "When the program has it first install on a machine it tries to
     // install the model; if it has no internet connection then it falls back." Hybrid may therefore trigger the pinned fetch, and
-    // offline is a state it reports rather than a failure it throws. The metered-laptop objection F38 §5 recorded is answered by
+    // offline is a state it reports rather than a failure it throws. The metered-laptop objection to that is answered by
     // the conditions rather than by a new flag: configuration must name a `local-model` provider and an id **this build pins**,
     // the runtime and the HTTP client must be compiled in, `[models] auto_fetch = false` / `NP_NO_AUTO_FETCH=1` still veto,
     // `--mode keyword` never dials out, and neither does `--mode semantic` — refusing *is* that mode's answer, so a download
@@ -1275,7 +1285,8 @@ fn search_run(
     let mut note: Option<search::RankNote> = None;
     let mut vector: Option<Vec<u8>> = None;
     let mut model = String::new();
-    // `fetched` and `offline` carry F38's meanings into search's document so one caller vocabulary covers both commands: "what
+    // `fetched` and `offline` carry the meanings embed's document already uses, so one caller vocabulary covers both
+    // commands: "what
     // arrived from an origin", and "the pinned origin could not be reached". `reason` (below) says which half is missing.
     let mut fetched: Option<Value> = None;
     let mut offline = false;
@@ -1315,7 +1326,7 @@ fn search_run(
                 // `[embeddings] model` that disagrees with the installed row would otherwise search one model and report another.
                 model = provider.model_id().to_string();
                 // **Semantic always embeds the query; hybrid only when there is something to compare it with.** That asymmetry is
-                // not a micro-optimisation: embedding the query is what surfaces provider-level refusals, and one of them is F40's
+                // not a micro-optimisation: embedding the query is what surfaces provider-level refusals, and one of them is the
                 // `runtime is not built` — a build that links no inference has to say so to the mode that asked for semantics and got
                 // nothing, naming the id that stayed owed. An earlier draft skipped the call whenever the index held no vectors and
                 // turned that refusal into a silent empty answer; `searching_without_the_runtime_names_the_model_that_stayed_owed`
@@ -1334,7 +1345,7 @@ fn search_run(
                     });
                 }
             }
-            // ---- `--mode semantic`: every refusal below is unchanged from F32/F38, wording included. Asked for semantics, cannot
+            // ---- `--mode semantic`: every refusal below keeps its existing wording. Asked for semantics, cannot
             // do semantics: exit 1, not a keyword list with an apology attached.
             (search::SearchMode::Semantic, ProviderState::Placeholder { reason, .. }) => {
                 return Err(reason.sentence(workspace).into())
@@ -1355,7 +1366,7 @@ fn search_run(
                      connect and try again, or search by keyword (`np search --mode keyword`)")
                     .into())
             }
-            // ---- Hybrid (**F45**): a half is missing and the answer is not withheld. These are separate arms rather than one `_`
+            // ---- Hybrid: a half is missing and the answer is not withheld. These are separate arms rather than one `_`
             // mapping everything to "no vectors" because each is a different reader's mistake with a different next command.
             (_, ProviderState::FetchSkippedOffline { .. }) => {
                 offline = true;
@@ -1380,7 +1391,7 @@ fn search_run(
                 note = Some(search::RankNote::ArtifactMissing)
             }
             // ---- Unreachable by construction: `resolve` is false when the mode is keyword, so no provider state can arrive here.
-            // Spelled as refusals rather than `unreachable!()` or a `_` arm for two reasons. The F32 rule at this call site is
+            // Spelled as refusals rather than `unreachable!()` or a `_` arm for two reasons. The rule at this call site is
             // "every `ProviderState` has an arm", which a wildcard would silently end; and if a future change does resolve a
             // provider for keyword mode, a visible wrong sentence is better to debug than a panic in someone's app.
             (_, ProviderState::Placeholder { reason, .. }) => {
@@ -1398,7 +1409,7 @@ fn search_run(
         note = Some(search::RankNote::NoVectors);
     }
 
-    // **The note is reported where it becomes final** (diagnostics design §1 point 4): every state decided above goes out
+    // **The note is reported where it becomes final**: every state decided above goes out
     // once, with the model id this run resolved. A note that `ranked` adds instead — a hybrid search whose index holds no
     // vectors at all — is reported by [`search`] itself, which is where that fact is decided; the two paths cannot both
     // fire for one run, because reaching `search` needs a query vector and `ranked`'s note needs the absence of one.
@@ -1445,12 +1456,12 @@ fn search_run(
 
 /// The document `np search --json` prints, in one function so no second channel can invent its own keys.
 ///
-/// One object per hit under `hits`, beside the two keys that say how the list was made (§12). The empty case is an empty array — a machine reader
+/// One object per hit under `hits`, beside the two keys that say how the list was made. The empty case is an empty array — a machine reader
 /// does not need a sentence, and a second key per hit would be a schema change in disguise; `mode` and `vectors` describe the *list*, so they sit
 /// beside it.
 ///
-/// **F45/F38 keys, and why `reason` is not the same thing as `note`.** `note` is prose for a human and may be reworded; `reason` is the token a
-/// caller branches on when it wants to know which half answered. `fetched` and `offline` mean exactly what they mean in `np embed --json` (F38),
+/// **Why `reason` is not the same thing as `note`.** `note` is prose for a human and may be reworded; `reason` is the token a
+/// caller branches on when it wants to know which half answered. `fetched` and `offline` mean exactly what they mean in `np embed --json`,
 /// so one reader handles both commands: an application that called `np search` first on a fresh machine can now see `fetched` arrive,
 /// `vectors:false`, and `reason:"artifact-fetched"` telling it the next call is `np embed`. Nothing here changes when the semantic half worked:
 /// `reason` is null and `note` stays null, exactly as before.
@@ -1458,8 +1469,8 @@ fn search_document(run: &SearchRun) -> Value {
     let objects: Vec<Value> = run.hits.iter().map(hit_json).collect();
     json!({
         "hits": objects,
-        // **What was asked for**, not what ran: `mode` is the caller's request after config, and **F45** made it
-        // possible for hybrid to answer from one half. `keyword_used` / `semantic_used` beside it are what ran.
+        // **What was asked for**, not what ran: `mode` is the caller's request after config, and hybrid may have
+        // answered from one half. `keyword_used` / `semantic_used` beside it are what ran.
         "mode": run.mode.label(),
         "keyword_used": run.keyword_used,
         "semantic_used": run.semantic_used,
@@ -1518,7 +1529,7 @@ fn search_workspace(
         let _ = writeln!(io::stderr(), "{reason}");
     }
     if hits.is_empty() {
-        // §12: an empty index is a fact. Written to stdout, exit 0 — the caller has nothing to fix.
+        // An empty index is a fact. Written to stdout, exit 0 — the caller has nothing to fix.
         // `--limit 0` asks for no hits and gets no lines, which is not the same sentence, so it is not printed.
         if limit > 0 {
             // Three sentences, because the old two printed a lie on Windows' most likely first run. With no `[embeddings]`
@@ -1580,7 +1591,7 @@ fn search_workspace(
         match &hit.source_note {
             Some(note) => {
                 // One linker gets named; more than one says so, because the count used to be invisible here and a figure
-                // belonging to four notes should not read as though it belongs to the one printed (F28). The note that is
+                // belonging to four notes should not read as though it belongs to the one printed. The note that is
                 // printed is `source_note` — the head of the same list `--json` carries in full.
                 let extra = match hit.linked_notes.len() {
                     0 | 1 => String::new(),
@@ -1627,7 +1638,7 @@ fn number(value: f64) -> String {
 /// One hit as JSON: **the same eleven keys whatever the kind and whatever the mode** —
 /// `{score, cosine, bm25, semantic_rank, keyword_rank, kind, path, snippet, linked_from, source_note, linked_notes}`.
 ///
-/// F36 added the five evidence keys to this list rather than printing them only in the modes that produce them, for the
+/// The five evidence keys are in this list rather than printed only in the modes that produce them, for the
 /// reason below: a schema whose keys depend on a value inside the object makes every reader branch before it reads.
 ///
 /// The first version added `linked_from` and `source_note` only for image hits, which made the schema depend on a value
@@ -1636,7 +1647,7 @@ fn number(value: f64) -> String {
 /// emits both keys always: `source_note: null` and `linked_from: 0` for a hit that has no linking note (every note hit, and
 /// an orphaned figure). Same rule `EmbedReport::artifact_check` already follows — present and null, not missing.
 ///
-/// `linked_notes` follows the same rule in list form: **an empty array, never `null`** (F28). It is the whole relation — every
+/// `linked_notes` follows the same rule in list form: **an empty array, never `null`**. It is the whole relation — every
 /// live note linking a figure, byte-ordered — where `source_note` was its head and `linked_from` its length, so the three
 /// cannot tell different stories about one hit. An empty array means "this hit has no live linker", which is true of both a
 /// note hit and an orphaned figure; distinguishing those two is what `kind` is for, and giving the list a null on one kind
@@ -1644,8 +1655,8 @@ fn number(value: f64) -> String {
 fn hit_json(hit: &Hit) -> Value {
     json!({
         "score": hit.score,
-        // The two raw numbers beside the fused score. In `hybrid` a reader cannot recover them from `score`, and F31 will
-        // need both columns to judge ranking at all; in a single-list mode one of them is `null`, which is the same
+        // The two raw numbers beside the fused score. In `hybrid` a reader cannot recover them from `score`, and
+        // judging ranking needs both columns; in a single-list mode one of them is `null`, which is the same
         // present-and-null statement `source_note` already makes rather than a key that appears only in some modes.
         "cosine": hit.cosine,
         "bm25": hit.bm25,
@@ -1677,22 +1688,22 @@ fn hit_json(hit: &Hit) -> Value {
 /// without an out-parameter, and keeps the alternative — verifying inside `embed_run`, which is handed a provider and
 /// cannot know how its bytes were produced — off the table.
 struct Resolved {
-    /// What `[embeddings]` resolved to, including the states where nothing can embed. F32 replaced the
+    /// What `[embeddings]` resolved to, including the states where nothing can embed. This field replaced the
     /// `Option<Box<dyn Embedder>>` this field used to be: an `Option` could say "no provider" without saying which of five
     /// reasons, and only one of those reasons was ever explained.
     state: ProviderState,
-    /// D12's verify-on-change result, or `None` when no local artifact was read at all.
+    /// The verify-on-change result, or `None` when no local artifact was read at all.
     artifact_check: Option<ArtifactCheck>,
-    /// The worker-thread plan for this run, or `None` when no local-model provider was built (§6's arms and
+    /// The worker-thread plan for this run, or `None` when no local-model provider was built (the arms that
     /// `provider = "none"` have no worker count to report).
     workers: Option<np_core::embed_run::WorkerPlan>,
-    /// What this run **transferred from an origin** before it could embed (**F38**), or `None` when nothing arrived.
+    /// What this run **transferred from an origin** before it could embed, or `None` when nothing arrived.
     ///
     /// Produced where the fetch happens — provider resolution — and copied onto the report by [`embed_workspace`] for the
     /// same reason `artifact_check` and `workers` are: the fact is decided next to the config and the filesystem, while the
     /// document that must not contradict itself is written downstream.
     fetched: Option<np_core::embed_run::FetchedRecord>,
-    /// **F45:** the artifact is missing, this build *could* have fetched it (pinned id, `local-model` and `fetch` compiled in),
+    /// The artifact is missing, this build *could* have fetched it (pinned id, `local-model` and `fetch` compiled in),
     /// and policy said no — `[models] auto_fetch = false` or `NP_NO_AUTO_FETCH=1`.
     ///
     /// Carried as a fact rather than re-derived by each caller because "could this build have downloaded it" is one rule with two
@@ -1706,7 +1717,7 @@ struct Resolved {
 ///
 /// Four states, which is how many answers exist: a provider this run can embed with, a provider-shaped placeholder for a
 /// state that refuses before a vector is asked for, a filesystem fact no downstream code can re-derive, and — since
-/// **F38** — a fetch that was permitted, attempted, and met no connection. The last two look alike from the filesystem
+/// a fetch that was permitted, attempted, and met no connection. The last two look alike from the filesystem
 /// (no artifact on disk) and must not share a sentence: one names a file to install, the other names a cable to plug in.
 enum ProviderState {
     /// A local provider built from the installed row. Nothing here claims its bytes verified anything — that is
@@ -1722,7 +1733,7 @@ enum ProviderState {
     /// The row says installed and the file is not there. Not a configuration state, and not recoverable downstream: only
     /// this function holds the row and the path at the same time (R6c1 D-2).
     ArtifactAbsent,
-    /// A fetch was permitted, attempted, and **nothing answered** (**F38**). Not a filesystem fact and not a
+    /// A fetch was permitted, attempted, and **nothing answered**. Not a filesystem fact and not a
     /// configuration state: the artifact is absent *and* unreachable, which is its own answer with its own remedy
     /// (connect, re-run) and must not be dressed as either neighbour.
     ///
@@ -1750,7 +1761,7 @@ fn placeholder(reason: NoProvider) -> Resolved {
     }
 }
 
-/// Attach the **F45** "a fetch was possible and policy refused it" fact to a resolution that did not produce a provider.
+/// Attach "a fetch was possible and policy refused it" to a resolution that did not produce a provider.
 ///
 /// Gated on the state on purpose: with a provider in hand nothing was declined, and letting a caller stamp `true` beside a
 /// `Ready` would be a document contradicting itself. Applied at each non-`Ready` return inside the local-model branch, which is
@@ -1771,7 +1782,7 @@ fn artifact_absent() -> Resolved {
     }
 }
 
-/// The **F38** resolution for "we asked and nothing answered": no provider, and the offline arm as the answer.
+/// The resolution for "we asked and nothing answered": no provider, and the offline arm as the answer.
 #[cfg(all(feature = "local-model", feature = "fetch"))]
 fn fetch_offline(id: &str) -> Resolved {
     Resolved {
@@ -1781,7 +1792,7 @@ fn fetch_offline(id: &str) -> Resolved {
         // Nothing arrived, so nothing is claimed. `EmbedReport::offline` is set downstream from the arm itself, which is
         // why this field stays `None` rather than carrying a half-populated record.
         fetched: None,
-        // Not declined: it was *attempted*. The distinction is F45's whole point — "we asked and nothing answered" and
+        // Not declined: it was *attempted*. The distinction is the whole point — "we asked and nothing answered" and
         // "we were not allowed to ask" are different notes with different next commands.
         fetch_declined: false,
     }
@@ -1790,28 +1801,28 @@ fn fetch_offline(id: &str) -> Resolved {
 /// What `[embeddings]` names, as one of three [`ProviderState`]s.
 ///
 /// [`ProviderState::ArtifactAbsent`] means **exactly that one thing** — the row says installed, the file is not there — and
-/// `np embed` turns it into [`Resolution::ArtifactAbsent`] so §6's arm (iii) can say so. The four states that are *not* about
+/// `np embed` turns it into [`Resolution::ArtifactAbsent`] so the artifact-absent arm can say so. The four states that are *not* about
 /// bytes (`provider = "none"`, a missing [`np_core::config::EmbeddingsConfig::model`], an id naming no installed row, a row whose
 /// declared width cannot be stored) hand over [`NoEmbeddingProvider`] as a **placeholder** — what [`np_core::embed_run`] wants,
 /// since it derives those arms from configuration and the `models` table, the sources that hold the fact — **and** a
-/// [`NoProvider`] reason, which is what `np search` prints instead of the placeholder's generic refusal (F32).
+/// [`NoProvider`] reason, which is what `np search` prints instead of the placeholder's generic refusal.
 ///
 /// Two of those four reasons are unreachable from argv: `Config::load` refuses `local-model` with no `model`, and
 /// `np models install --dim` validates 1..=65535 at the command line. They stay because a `Config` can be built in memory, and
-/// because the alternative is a state with no sentence — F32 §1 records both measurements.
+/// because the alternative is a state with no sentence — and both paths were measured, not guessed.
 ///
 /// The row is read through a connection that closes when this function returns, before `embed_run` opens its
 /// own: np-cli holds no SQL of its own, and one workspace's [`np_core::db::ModelRow`] is where a local provider's
-/// identity comes from (§3).
+/// identity comes from.
 /// Resolve `[embeddings]` into something that can embed — or into the one refusal that explains why nothing can.
 ///
-/// `auto_fetch` is **F38's trigger**, and it is a parameter rather than a global so that each call site states its
+/// `auto_fetch` is the fetch trigger, and it is a parameter rather than a global so that each call site states its
 /// permission: `np embed` passes the operator's decision, `np search` passes `false` unconditionally. Even when true, a
 /// fetch needs three more things — an id this build **pins**, a build that can run inference, and the compile-time
 /// `fetch` feature — so no configuration value alone can make a binary dial out.
 /// `announce` is text mode only: `false` under `--json`, where stdout holds exactly one document and a progress line
-/// would corrupt it. **F38**'s notice is therefore suppressed rather than smuggled onto stderr, keeping that promise the
-/// simple thing it is — Task 4 replaces the line with a `fetched` key, which is what a program should read anyway.
+/// would corrupt it. The fetch notice is therefore suppressed rather than smuggled onto stderr, keeping that promise
+/// the simple thing it is: a program reads the `fetched` key instead.
 fn embed_provider(
     cfg: &Config,
     workspace: &Path,
@@ -1824,7 +1835,7 @@ fn embed_provider(
     let _ = &progress;
     match cfg.embeddings.provider {
         // The default. Nothing is built, nothing is contacted, and the report says *configuration disabled*
-        // rather than a fault (§2, §6).
+        // rather than a fault.
         EmbeddingProvider::None => Ok(placeholder(NoProvider::ConfigDisabled)),
         EmbeddingProvider::OpenAiCompatible => {
             // Unreachable through `Config::load`, which refuses this variant by name; kept as a refusal rather
@@ -1847,7 +1858,7 @@ fn embed_provider(
             )]
             let mut row = model_row(&db, id)?;
 
-            // ---- **F38's trigger: fetch the pinned artifact this workspace is missing.** One place, before any provider
+            // ---- The fetch trigger: fetch the pinned artifact this workspace is missing. One place, before any provider
             // is constructed and long before any transaction opens — a download that starts mid-embed would hold a write
             // lock through someone else's egress.
             //
@@ -1858,10 +1869,10 @@ fn embed_provider(
             //                              defensible: the target is one known artifact from one origin verified by
             //                              digest, never "whatever config named";
             //   * `feature = "local-model"`— a binary that links no inference runtime must not spend 310 MB it can never
-            //                              read. F40 gave this state a name; here it is a compile-time gate;
+            //                              read; here it is a compile-time gate, not a runtime guess;
             //   * `feature = "fetch"`      — a build that compiled the HTTP client out cannot advertise a dial-out.
             //
-            // Nothing here prints in `--json` mode (`announce`), and nothing here ever names a host (§12 rule 8): the only
+            // Nothing here prints in `--json` mode (`announce`), and nothing here ever names a host: the only
             // origin fact allowed out is *which kind* of origin was resolved.
             #[cfg(all(feature = "local-model", feature = "fetch"))]
             let mut fetched_this_run: Option<np_core::embed_run::FetchedRecord> = None;
@@ -1876,7 +1887,8 @@ fn embed_provider(
                     FetchStep::Fetched(record) => {
                         fetched_this_run = Some(record);
                         // The fetch records the `models` row itself, so a workspace that had neither row nor file is now a
-                        // workspace with both — re-read rather than assume, and let F32's arm still answer if it somehow
+                        // workspace with both — re-read rather than assume, and let the missing-row arm still answer
+                        // if it somehow
                         // did not.
                         row = model_row(&db, id)?;
                     }
@@ -1887,7 +1899,7 @@ fn embed_provider(
             #[cfg(not(all(feature = "local-model", feature = "fetch")))]
             let _ = (announce, &models_dir, &artifact);
 
-            // **F45:** the same facts the trigger above tests, with the operator's veto flipped — read BEFORE any fetch could have
+            // The same facts the trigger above tests, with the operator's veto flipped — read BEFORE any fetch could have
             // run, so it describes the state the caller walked into rather than the state a fetch left behind. This is the only
             // place "could this build have downloaded it?" is asked: `np search` reads the answer off [`Resolved::fetch_declined`]
             // instead of restating the predicate and drifting from it.
@@ -1901,7 +1913,7 @@ fn embed_provider(
             let _ = auto_fetch;
 
             let Some(row) = row else {
-                // F32's arm: this is the state that used to print a sentence about `provider = "none"`.
+                // The missing-row arm: this is the state that used to print a sentence about `provider = "none"`.
                 return Ok(declined(
                     placeholder(NoProvider::RowMissing { id: id.to_string() }),
                     fetch_declined,
@@ -1916,8 +1928,9 @@ fn embed_provider(
                 .map(usize::from)
                 .or_else(|| usize::try_from(row.dim).ok())
             else {
-                // Also defensive: `--dim` bounds what can be installed (F32 §1). Never a declined fetch — the row is here and its
-                // bytes are not in question, so stamping that fact would attach F45's note to the wrong state.
+                // Also defensive: `--dim` bounds what can be installed. Never a declined fetch — the row is here and its
+                // bytes are not in question, so stamping that fact would attach the declined-fetch note to the wrong
+                // state.
                 return Ok(declined(
                     placeholder(NoProvider::RowDimUnusable {
                         id: id.to_string(),
@@ -1928,14 +1941,15 @@ fn embed_provider(
             };
 
             // With the runtime compiled in, the provider is the one that loads llama.cpp **on first use**
-            // (`local_model::LazyLocalEmbedder`, §14): resolving a provider happens before anyone knows whether
+            // (`local_model::LazyLocalEmbedder`): resolving a provider happens before anyone knows whether
             // the workspace owes a chunk, and an eager load would spend ~420 MiB of resident weights plus load time
             // on a run whose answer is "nothing changed". The two refusals that need no model — a row width that
-            // is not this run's, and an artifact that is not a file — are still taken here, so §6's *artifact
+            // is not this run's, and an artifact that is not a file — are still taken here, so the *artifact
             // absent* arm stays arm (iii) instead of arriving late as a failure.
             #[cfg(feature = "local-model")]
             {
-                // F33: decide how loud llama.cpp may be on this run's stderr, once, before anything can load. The rules — the five names,
+                // Decide how loud llama.cpp may be on this run's stderr, once, before anything can load. The rules —
+                // the five names,
                 // which source wins, what an empty value means — live in `np_core::loglevel` beside the vocabulary; this call is only the
                 // decision to opt in, because *this* process owns its stderr and a library quietly installing a global sink would not.
                 // `Config::load` already refused a value that cannot be honoured, so the error arm is unreachable from argv; propagating
@@ -1954,7 +1968,7 @@ fn embed_provider(
                     // pays nothing. When it does hash (the first run under this build, or bytes that moved) it refuses
                     // **before** `embed_run` reads a note, so a swapped artifact never earns a stamped vector.
                     Ok(embedder) => {
-                        // **F28: a build with the image code asks this workspace for a projector.** Which bytes qualify is
+                        // **A build with the image code asks this workspace for a projector.** Which bytes qualify is
                         // np-core's rule, not this file's (`local_model::projector_artifact`: recorded by *this* database,
                         // present on disk, and either stamped or digest-matching), because two copies of that rule could
                         // disagree in exactly one direction — the CLI accepting a file the pin table would refuse.
@@ -2005,7 +2019,7 @@ fn embed_provider(
             #[cfg(not(feature = "local-model"))]
             match np_core::embed::LocalModelProvider::new(&row, &artifact, configured) {
                 // No digest check on this half: without the runtime nothing reads the artifact, so there is no claim
-                // about its bytes to make — and printing one would be the false report §7 refuses.
+                // about its bytes to make — and printing one would be a false report.
                 Ok(provider) => Ok(Resolved {
                     state: ProviderState::Ready(Box::new(provider)),
                     artifact_check: None,
@@ -2028,11 +2042,11 @@ fn embed_provider(
     }
 }
 
-/// The human-readable form of an embed report: the arm first, then §6's six counts, then §7's caveat.
+/// The human-readable form of an embed report: the arm first, then the six counts, then the verification caveat.
 ///
 /// Same aligned-label shape as [`print_summary`], and every line written to one locked stdout handle with its
 /// result dropped for the same reason: a descriptor that refuses writes must not turn a finished run into a
-/// panic. The verification line is printed even when nothing was embedded, because §7's whole point is that the
+/// panic. The verification line is printed even when nothing was embedded, because the whole point is that the
 /// caveat is read at 2 a.m. rather than filed.
 fn print_embed_summary(report: &EmbedReport) {
     let mut out = io::stdout().lock();
@@ -2042,7 +2056,7 @@ fn print_embed_summary(report: &EmbedReport) {
         let _ = writeln!(out, "detail     {detail}");
     }
     // The path arm (iii) looked at, printed apart from the hint so a reader can `ls` it. It is a data-dir file
-    // this program wrote, which is why naming it is safe (§3's payload rule).
+    // this program wrote, which is why naming it is safe.
     if let EmbedOutcome::ArtifactAbsent { artifact, .. } = &report.outcome {
         let _ = writeln!(out, "artifact   {}", artifact.display());
     }
@@ -2053,11 +2067,11 @@ fn print_embed_summary(report: &EmbedReport) {
     let _ = writeln!(out, "busy-gap   {}", report.busy_gap);
     let _ = writeln!(out, "errors     {}", report.errors);
     // Images get their own line and no place in any other count: a corpus with no figures prints nothing here, so the
-    // text-only report keeps the shape it had before images existed (§6's order puts this after the chunk counts).
+    // text-only report keeps the shape it had before images existed.
     if report.images_seen > 0 {
-        // §6's line, with the classes spelled out: a count of three refusals tells a reader nothing about whether their
+        // The image line, with the classes spelled out: a count of three refusals tells a reader nothing about whether their
         // vault is full of `.svg` (a format decision) or missing files (their own edit), and those two answers lead to
-        // different commands. Classes come from `image_refusal_classes`, in §8's order, so this line and `--json` cannot
+        // different commands. Classes come from `image_refusal_classes`, in one fixed order, so this line and `--json` cannot
         // drift apart.
         let classes = report
             .image_refusal_classes()
@@ -2097,7 +2111,7 @@ fn print_embed_summary(report: &EmbedReport) {
         );
     }
     let _ = writeln!(out, "verify     {}", report.verification);
-    // Printed after §7's standing caveat because the two answer different questions: that one asks whether these
+    // Printed after the standing verification caveat because the two answer different questions: that one asks whether these
     // *vectors* were checked against a reference implementation, this one asks whether the model's *bytes* were.
     // Omitted entirely when no local artifact was involved — silence is the truthful report there, not "verified".
     if let Some(check) = &report.artifact_check {
@@ -2112,24 +2126,24 @@ fn print_embed_summary(report: &EmbedReport) {
 }
 
 // ---------------------------------------------------------------------------
-// `np models` — M2a round 4a (`docs/design-m2-models-install.md` §2, §3).
+// `np models` — install, fetch, hash and list.
 //
 // Three commands, and the whole of their intelligence is in `np_core::models`: these functions turn argv
 // into an `Install`, open one workspace's database, call the library, and print what came back. That split is
-// why there is no SQL here (round 4a §6 names every read and write in `db.rs` instead) and no `sha2`
-// dependency (`hash` calls `np_core::hash::sha256_file`, which §7's test 9 exists to keep the only one).
+// why there is no SQL here (every read and write lives in `db.rs` instead) and no `sha2`
+// dependency (`hash` calls `np_core::hash::sha256_file`, and a test exists to keep that the only digest reader).
 // ---------------------------------------------------------------------------
 
-/// Hex characters shown in the human-readable digest column (§3: "12 hex, full value under `--json`").
+/// Hex characters shown in the human-readable digest column: 12, with the full value under `--json`.
 const DIGEST_TEXT_CHARS: usize = 12;
 
-/// Parse `--dim` as §2 states it: a width from 1 to `u16::MAX`, refused while parsing rather than at the write.
+/// Parse `--dim`: a width from 1 to `u16::MAX`, refused while parsing rather than at the write.
 ///
 /// `u16` because [`np_core::config::EmbeddingsConfig::dim`] already measures that quantity in `u16`; non-zero
 /// because migration 7's `CHECK (length(vector) = 4 * dim)` admits a zero-byte vector when `dim` is 0, so a
 /// dim-0 row would accept an embedding of nothing for every chunk. Both messages name the ceiling, which is
 /// what a human who typed `153600` needs to read — and refusing here rather than in the schema is what keeps
-/// §6's "no new migration" true.
+/// the "no new migration" promise true.
 fn parse_dim(raw: &str) -> Result<NonZeroU16, String> {
     let ceiling = u16::MAX;
     let value: u32 = raw
@@ -2151,10 +2165,10 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
     let cfg = match Config::load(None) {
         Ok(cfg) => cfg,
         Err(err) => {
-            // **The refusal is itself a diagnostic** (spec point 3): a broken config must not be the one failure that reports
+            // **The refusal is itself a diagnostic**: a broken config must not be the one failure that reports
             // nothing, and this is the most common one. `error` level, on the config target, with the rule as a field rather
             // than as prose — which is what lets a frontend log *why* without matching a sentence. It reaches stderr only if
-            // someone asked for diagnostics (spec point 1), so the pinned single-line refusal below is still exactly one line.
+            // someone asked for diagnostics, so the pinned single-line refusal below is still exactly one line.
             tracing::error!(
                 target: np_core::diagnostics::target::CONFIG,
                 rule = np_core::diagnostics::rule::CONFIG_REFUSED,
@@ -2166,7 +2180,7 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
     // **Phase two**: `[log] level` and `[log] file` now that there is a file to read them from. Idempotent, because several
     // commands load configuration more than once per run.
     diag::apply_config(&cfg);
-    // **F37's one-release note, on stderr.** Stdout stays exactly one document when `--json` is asked for — the fact this
+    // **The one-release fallback note, on stderr.** Stdout stays exactly one document when `--json` is asked for — the fact this
     // line carries is about *where* the run is reading from, not about the run's result, and a reader who needs it is a
     // human standing at the machine. Nothing here is actionable: that is the point of the fallback, and saying "moved"
     // would imply a move happened, which this release deliberately does not do.
@@ -2176,7 +2190,7 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
     Ok(cfg)
 }
 
-/// The sentence [`load_config`] prints when **F37**'s fallback found an index at the pre-nesting Windows location.
+/// The sentence [`load_config`] prints when its fallback found an index at the pre-nesting Windows location.
 ///
 /// A function rather than an inline literal for one reason: the fallback itself cannot happen on this platform or on CI
 /// (Unix has no pre-nesting shape to fall back from), so the *words* are the only part of this path that Linux can check at
@@ -2191,7 +2205,7 @@ fn legacy_data_dir_note(legacy: &Path) -> String {
     )
 }
 
-/// This workspace's database, opened in the order §3 step 0 requires.
+/// This workspace's database, opened in the order that stops a bad path from creating one.
 ///
 /// [`models::require_workspace_dir`] comes **first** because `Config::workspace_db` is infallible by contract
 /// and `Db::open` creates directories: check after opening would have already minted an empty database for a
@@ -2203,9 +2217,9 @@ fn workspace_db(config: &Config, workspace: &Path) -> Result<Db, Box<dyn Error>>
 
 /// `np models install` — verify the human's file against their declaration, then record it.
 ///
-/// The one sentence that says **which kind** of origin this run would dial (**F38**, §12 rule 8).
+/// The one sentence that says **which kind** of origin this run would dial.
 ///
-/// Gated on `fetch` because both doors that print it — `np models fetch` and F38's trigger — are gated on the same feature: a build with
+/// Gated on `fetch` because both doors that print it — `np models fetch` and the auto-fetch trigger — are gated on the same feature: a build with
 /// no HTTP client has no origin to describe, and an ungated helper there is a dead-function warning in the default CI row for
 /// `--no-default-features`.
 ///
@@ -2223,16 +2237,16 @@ fn origin_kind_line(cfg: &Config) -> &'static str {
     }
 }
 
-/// What one auto-fetch attempt produced (**F38**).
+/// What one auto-fetch attempt produced.
 #[cfg(all(feature = "local-model", feature = "fetch"))]
 enum FetchStep {
     /// Bytes arrived and were published by digest. Carries the record `--json` will print.
     Fetched(np_core::embed_run::FetchedRecord),
-    /// Nothing was reached. Not an error: a state, with its own report arm downstream (**F40's** lesson, one arm over).
+    /// Nothing was reached. Not an error: a state, with its own report arm downstream.
     Offline,
 }
 
-/// Fetch the pinned id's members that **this build can use**, because this workspace is missing them (**F38**).
+/// Fetch the pinned id's members that **this build can use**, because this workspace is missing them.
 ///
 /// Called only from the trigger in [`embed_provider`], which has already decided a fetch is permitted; this function's own
 /// job is to be honest about the transfer and to classify its failure rather than flatten it.
@@ -2240,10 +2254,10 @@ enum FetchStep {
 /// * **Before byte one**, in text mode, it says what is about to happen: id, the members this build would load, their
 ///   combined size, and the origin's *kind*. `np models fetch` prints the same pair of lines for the same reason — a
 ///   silent 310 MB transfer is not a side effect anyone should discover afterwards.
-/// * **Offline is its own answer** (`FetchError::is_offline`, F38 §5): no probe was run, and none will be — this call *is*
+/// * **Offline is its own answer** (`FetchError::is_offline`): no probe was run, and none will be — this call *is*
 ///   the probe, made only where the artifact was already missing, so a machine that holds its model pays nothing. The
 ///   sentence says what could not be reached, that nothing was embedded, and what to re-run; it does not dress a missing
-///   network up as a broken vault, which is F40's lesson applied one arm over.
+///   network up as a broken vault, which is the same lesson applied one arm over.
 /// * **Anything the origin actually answered** — 404, 403, a redirect, wrong bytes — propagates as `fetch`'s own refusal,
 ///   unchanged. Those are not outages and must never be skipped past: an unreachable mirror behind "offline" is how a
 ///   broken install becomes permanent.
@@ -2298,7 +2312,7 @@ fn fetch_pinned_missing(
             }
             Ok(FetchStep::Fetched(np_core::embed_run::FetchedRecord {
                 id: report.id.clone(),
-                // `fetch` publishes a member only after its digest matches the pin (§12 rule 6), so every member that
+                // `fetch` publishes a member only after its digest matches the pin, so every member that
                 // arrives here is verified — the flag is a promise the reader can check against the type's doc, not a
                 // claim this call site makes up.
                 members: report
@@ -2310,7 +2324,7 @@ fn fetch_pinned_missing(
                         digest_verified: true,
                     })
                     .collect(),
-                // A *kind*, never a host (§12 rule 8): the same distinction `origin_kind_line` prints for humans.
+                // A *kind*, never a host: the same distinction `origin_kind_line` prints for humans.
                 origin: origin_kind_token(cfg),
             }))
         }
@@ -2321,11 +2335,11 @@ fn fetch_pinned_missing(
     }
 }
 
-/// Nothing is printed before [`models::install`] returns: §3 step 7 and F21 both say the durable record comes
+/// Nothing is printed before [`models::install`] returns: the durable record comes
 /// first and the echo second, so a refusal cannot leave a success line behind on stdout.
 /// Fetch `id`'s pinned members into `workspace` and record the model.
 ///
-/// **The origin is read, never printed.** §12 rule 8 bounds what a report may say about where bytes came from, and a
+/// **The origin is read, never printed.** What a report may say about where bytes came from is bounded on purpose, and a
 /// success line lands in CI logs as readily as a refusal does — so the report says an origin was configured and names
 /// the members, sizes and digests, which is everything a person can act on. The one thing that must not appear is the
 /// URL, because a mirror's hostname is someone's infrastructure detail and this program has no business publishing it
@@ -2340,9 +2354,9 @@ fn models_fetch(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let config = load_config()?;
-    // **F44**, and it comes before the discard below rather than after it. `--discard-marker` is documented as an action that does not depend on
+    // The lock, and it comes before the discard below rather than after it. `--discard-marker` is documented as an action that does not depend on
     // the rest of the run, and that stays true of its *failures*; what it must not do is delete a marker while another process is mid-fetch in
-    // this same workspace — which is exactly the situation the lock detects, and exactly what §12 rule 4's marker exists to make visible. A
+    // this same workspace — which is exactly the situation the lock detects, and exactly what the marker exists to make visible. A
     // refusal here therefore leaves the marker where it is, for the other run to finish with.
     let _writer = writer_lock(&config, workspace, "models fetch")
         .map_err(|failure| failure.report_cli(json))?;
@@ -2350,7 +2364,7 @@ fn models_fetch(
     let models_dir = config.workspace_models_dir(workspace);
 
     // **The discard happens first.** `--discard-marker` is a filesystem action a human takes because they know no fetch
-    // is running (§12 rule 4's only door), so it may not depend on anything the rest of the run needs — not which
+    // is running, so it may not depend on anything the rest of the run needs — not which
     // origin resolves, not whether this build can use the members it would plan. Dialing out is the part that can fail
     // for reasons outside the workspace, and a case where it does (`crates/np-cli/tests/models_cli.rs`) still expects
     // the discard to have happened.
@@ -2368,24 +2382,24 @@ fn models_fetch(
         }
     }
 
-    // The origin, in the one order §12 rule 7 sets out as amended on 2026-11-04: `[models] base_url` as config left it
+    // The origin, in the one order this crate settles on: `[models] base_url` as config left it
     // (`NP_MODELS_BASE_URL` fills that key only when the file leaves it unset — `np_core::config`'s rule for every key
     // in that section), then the origin baked into the pin table. A machine with no configuration therefore makes one
     // outbound request during installation instead of being refused; a mirror is still one config line away, and this
-    // line stays true of every run: the resolved origin is read here and printed nowhere (§12 rule 8).
+    // line stays true of every run: the resolved origin is read here and printed nowhere.
     let origin = fetch::resolve_origin(config.models.base_url.as_deref());
 
     // **Say which origin this run is about to dial, in class terms, before any byte moves.** Rule 8 still forbids the host, so
     // the line names where the answer came from rather than what it is. It exists because `NP_MODELS_BASE_URL=` (set, empty)
-    // counts as unset — a rule `tests/config.rs` pins on purpose, mirroring how an empty `$XDG_*` is treated — and since §12
-    // rule 7's 2026-11-04 amendment, "unset" no longer means "refuse": it means the compiled-in origin. A mirror whose value
+    // counts as unset — a rule `tests/config.rs` pins on purpose, mirroring how an empty `$XDG_*` is treated — and
+    // "unset" no longer means "refuse": it means the compiled-in origin. A mirror whose value
     // was lost to a shell (`NP_MODELS_BASE_URL=$MIRROR` with `MIRROR` unset) would otherwise spend the operator's egress
     // budget in silence.
     if !json {
         emit(origin_kind_line(&config));
     }
 
-    // **Fetch what this binary can use** (`docs/design-m2-image-embeddings.md` §13): with no `--member`, the plan is
+    // **Fetch what this binary can use**: with no `--member`, the plan is
     // the members this build could load, so a text-only install never transfers 554 MB of projector it has no code for.
     let requested_owned: Vec<String> = if members.is_empty() {
         np_core::pins::members_for_build()
@@ -2479,16 +2493,16 @@ fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(),
     let config = load_config()?;
     // An install writes a row and copies an artifact into the per-workspace model directory. Neither is in the transaction that `scan` would
     // open, so a concurrent index can observe a half-installed model — which is why this command is inside the same lock as everything else
-    // that changes state (**F44**), not merely next to it.
+    // that changes state, not merely next to it.
     let _writer = writer_lock(&config, workspace, "models install")
         .map_err(|failure| failure.report_cli(json))?;
     let db = workspace_db(&config, workspace)?;
     let outcome = models::install(&db, &config, workspace, request, now_secs())?;
     if json {
-        // `state` is the key §3 pins and its three strings come from
+        // `state` is a pinned key and its three strings come from
         // [`np_core::models::InstallOutcome::state_label`], not from a format string here. `id` rides along
         // because a JSON reader of a redirected run has no argv to look at, and the same two keys are present
-        // for all three outcomes — one shape per command, as §3 requires.
+        // for all three outcomes — one shape per command, as the document contract requires.
         let drift = prefix_drift_notice(&config, workspace, &request.id)?;
         let doc = insert_drift(
             json!({ "id": request.id, "state": outcome.state_label() }),
@@ -2594,7 +2608,7 @@ fn models_install_member(args: &InstallArgs, member: &str) -> Result<(), Box<dyn
 /// pastes straight into `install --sha256`.
 ///
 /// No database and no digest of its own: [`sha256_file`] streams the file and returns lowercase hex, which is
-/// what makes §7's test 9 (this command's output equals that function's, same bytes) a tautology rather than a
+/// what makes the test that compares this command's output with that function's, byte for byte, a tautology rather than a
 /// coincidence.
 fn models_hash(file: &Path) -> Result<(), Box<dyn Error>> {
     // `models::access` is the spelling the OS wants (absolute, no symlink resolution); on Windows a long relative
@@ -2606,7 +2620,7 @@ fn models_hash(file: &Path) -> Result<(), Box<dyn Error>> {
 
 /// `np models list <workspace>` — every row and what its artifact looks like on disk.
 ///
-/// The directory-level failure is handled apart from the rest because §3 refuses to let it become a per-row
+/// The directory-level failure is handled apart from the rest because this command refuses to let it become a per-row
 /// verdict: [`models::list`] answers it with no [`Listing`] at all, so there are no rows to print and no
 /// `missing` to claim against any of them. In text mode stdout stays empty; under `--json` the pinned key set
 /// still goes out with `"models_dir_error"` holding the message, since that key exists precisely to be the
@@ -2648,7 +2662,7 @@ fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// The document **`links.list`** answers with (**issue #2**): who links here, where the dead targets are written, and
+/// The document **`links.list`** answers with: who links here, where the dead targets are written, and
 /// whether anybody has ever scanned this folder.
 ///
 /// Three keys on every state, and no more:
@@ -2670,7 +2684,7 @@ fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
 /// Run `np embeddings enable|disable`, and answer with [`embeddings_document`] on both channels.
 ///
 /// The config file is the one every run reads — there is no per-workspace config to write, which is why neither door takes a
-/// workspace operand (**F50**: "only np can decide which of those a consent answer belongs to", and the answer is *this* one).
+/// workspace operand: only np can decide which of those a consent answer belongs to, and its answer is *this* one.
 /// What one `embeddings.enable` / `embeddings.disable` call did, in the shape both doors need: the shared document for a
 /// machine, and the four facts the terminal sentence is assembled from.
 pub(crate) struct EmbeddingsOutcome {
@@ -2682,12 +2696,12 @@ pub(crate) struct EmbeddingsOutcome {
     pub enabling: bool,
     /// What the config says afterwards, as its own words rather than as an enum a caller would have to know.
     pub provider: String,
-    /// The model the config names afterwards — `Some` after a disable too, because np leaves that key alone (**F50**).
+    /// The model the config names afterwards — `Some` after a disable too, because np leaves that key alone.
     pub model: Option<String>,
 }
 
 /// Apply one embeddings target to np's config file and report it. Shared by `np embeddings …` and serve's two methods so the
-/// refusals, the reload and the document are one code path (**F50**), and neither door can validate less than the other.
+/// refusals, the reload and the document are one code path, and neither door can validate less than the other.
 pub(crate) fn embeddings_apply(
     target: np_core::config_write::EmbeddingsTarget<'_>,
     surface: np_core::config_write::WriteSurface,
@@ -2796,7 +2810,7 @@ fn embeddings_run(
 /// The document both doors answer, built once so `np embeddings enable --json` and serve's `embeddings.enable` cannot drift.
 ///
 /// `provider` and `model` are what the file says **after** the call rather than what was asked for — the caller's question is
-/// "what is my setup now?", and a reload that disagreed would have refused before this was built (**F50**'s read-back rule).
+/// "what is my setup now?", and a reload that disagreed would have refused before this was built.
 pub(crate) fn embeddings_document(
     changed: &[String],
     provider: &str,
@@ -2862,14 +2876,14 @@ pub(crate) fn links_json(listing: &np_core::links::LinkListing, indexed: bool) -
     })
 }
 
-/// The `--json` body of `np models list`: one object whose key set is identical for every state (§3), built by
+/// The `--json` body of `np models list`: one object whose key set is identical for every state, built by
 /// this one function so the success path and the directory-level failure cannot grow different keys.
 ///
-/// The three top-level names and the seven per-row names are §3's, pinned by a test that compares the whole
+/// The three top-level names and the seven per-row names are pinned by a test that compares the whole
 /// set rather than looking one key up — `state` or `unclaimed` renamed must fail here, not in a reader written
 /// against the old spelling.
 ///
-/// **`fetching` is a deliberate protocol change**, added by R7a under `design-m2-local-embeddings.md` §12 rule 3:
+/// **`fetching` is a deliberate protocol change**:
 /// a fetch is orthogonal to the four `ArtifactState` verdicts (first start has no row at all, and a present row
 /// can be re-fetching), so it gets a listing-level section beside `unclaimed` rather than a fifth arm. The key
 /// set is pinned precisely so that adding it had to fail a test — and did.
@@ -2908,11 +2922,11 @@ fn listing_json(
 ///
 /// Three properties the caller depends on, each of which is a choice rather than an accident:
 ///
-/// * **Pinned bytes, never a transport's `Content-Length`** — §12 rule 12's rule for progress, extended to the question
+/// * **Pinned bytes, never a transport's `Content-Length`** — the rule for progress, extended to the question
 ///   asked *before* a transfer. A chunked response announces nothing; this number is in the binary.
 /// * **The build's plan, not the whole table** — [`np_core::pins::plan_size`] sums what this binary volunteers, which is
 ///   also what the terminal consent prompt prints, so one machine gives one price. `total_size` (every pinned member,
-///   864,676,512 today) is §12 rule 6's disk preflight and would over-quote a text-only build by 554 MB.
+///   864,676,512 today) is the number the disk preflight uses, and it would over-quote a text-only build by 554 MB.
 /// * **Independent of the filesystem** — no stat, no row, no lock: it answers for a workspace with nothing installed,
 ///   for one whose artifact directory cannot be listed, and while an embed is running. Whether *these* bytes are
 ///   already present is `models[].state`, and a client that wants "download needed?" reads both keys rather than having
@@ -2931,14 +2945,14 @@ fn pinned_json(config: &Config) -> Vec<Value> {
         "id": id,
         "bytes_total": plan.iter().map(|entry| entry.size_bytes).sum::<u64>(),
         // The member roles in fetch order, so a client can line this plan up with the per-member `fetching` progress
-        // lines it will see later. File names stay out: they are where an origin lives, and §12 rule 8 keeps that
+        // lines it will see later. File names stay out: they are where an origin lives, and the report rules keep that
         // shape out of reports.
         "members": plan.iter().map(|entry| entry.member).collect::<Vec<&str>>(),
     }))
     .collect()
 }
 
-/// One row under `--json`, with exactly the eight keys §3 pins — and the full digest, which the text column
+/// One row under `--json`, with exactly the eight pinned keys — and the full digest, which the text column
 /// shortens.
 fn model_json(model: &ListedModel) -> Value {
     json!({
@@ -2950,7 +2964,7 @@ fn model_json(model: &ListedModel) -> Value {
         "installed_at": model.row.installed_at,
         "state": model.state.state_label(),
         // Every file this identity has besides its main artifact — present/absent by stat, never hashed here. A model
-        // with only its main artifact answers `[]`, which is a fact and not an omission (**F28** exposed the gap:
+        // with only its main artifact answers `[]`, which is a fact and not an omission (the gap this field closed:
         // confirming an offline projector install used to mean watching `np embed` stop reporting `projector-absent`).
         "members": model
             .members
@@ -2973,7 +2987,8 @@ fn model_json(model: &ListedModel) -> Value {
 /// Suppressing the field keys on that arm would cost every reader a missing-key branch to answer a question null
 /// already answers, and a reader branching on "is `nonce` there?" is a reader that guesses at why it is not.
 ///
-/// `path` is here because §12 rule 4's advice — "if no fetch is running, delete this file and re-run" — cannot be
+/// `path` is here because the advice that goes with a stale marker — "if no fetch is running, delete this file and
+/// re-run" — cannot be
 /// followed from an id alone: the artifact directory's own name is a hash of the workspace path.
 fn fetch_json(entry: &FetchEntry) -> Value {
     let (fields, marker_error) = match &entry.state {
@@ -2989,14 +3004,14 @@ fn fetch_json(entry: &FetchEntry) -> Value {
         "nonce": fields.map(|fields| fields.nonce.as_str()),
         "started_at": fields.map(|fields| fields.started_at),
         "bytes_done": fields.map(|fields| fields.bytes_done),
-        // Null means "this fetch never announced a size" (§12 rule 12) — never zero, which would be a
+        // Null means "this fetch never announced a size" — never zero, which would be a
         // denominator this program invented.
         "bytes_total": fields.map(|fields| fields.bytes_total),
         "marker_error": marker_error,
     })
 }
 
-/// The two words §3 needs from an unclaimed entry: a subdirectory has to be **reported as one**, which is why
+/// The two words the listing needs from an unclaimed entry: a subdirectory has to be **reported as one**, which is why
 /// an entry is an object rather than a bare name in JSON and carries the word in text.
 fn unclaimed_kind(kind: UnclaimedKind) -> &'static str {
     match kind {
@@ -3016,7 +3031,7 @@ fn unclaimed_kind(kind: UnclaimedKind) -> &'static str {
 fn print_listing(listing: &Listing) {
     let mut out = io::stdout().lock();
     // Ids vary in length, so the column is as wide as the widest one rather than a constant that would break on
-    // a 64-character id (§2 allows one).
+    // a 64-character id.
     let width = listing
         .models
         .iter()
@@ -3060,7 +3075,7 @@ fn print_listing(listing: &Listing) {
     }
     // One line per fetch in progress, and **no section header**: `models` and `unclaimed` print their counts even
     // when empty because "looked and found none" must not read as "printed nothing", while a fetch line is an
-    // event — R7a's brief asks for nothing extra when nothing is fetching, so an idle workspace prints exactly
+    // event — the pinned shape asks for nothing extra when nothing is fetching, so an idle workspace prints exactly
     // what it printed before this section existed.
     let count = listing.fetching.len();
     for entry in &listing.fetching {
@@ -3074,7 +3089,7 @@ fn print_listing(listing: &Listing) {
 
 /// One fetch's line: `{n} fetch in progress · {id} ({what the marker says})`.
 ///
-/// The count rides on every line rather than heading a block because that is the shape R7a pins — one line per
+/// The count rides on every line rather than heading a block because that is the pinned shape — one line per
 /// fetch, readable on its own when someone greps stdout for `fetch`. With two fetches running the number repeats
 /// and stays true; `tests/models_cli.rs` pins both the singular and the plural so this is a decision on the
 /// record rather than an accident of the one case that was written down.
@@ -3086,14 +3101,14 @@ fn print_listing(listing: &Listing) {
 /// **Fields are printed exactly as the marker wrote them, even when they contradict each other.** A marker saying
 /// `bytes_done = 1.4 GB, bytes_total = 100 MB` prints both, because "report what you found" is the whole duty here:
 /// clamping would hide a file this program cannot explain, and refusing it as unreadable would be this build
-/// deciding that §12 rule 6's pair is impossible when only R7b can say whether it happens.
+/// deciding that the size pair is impossible when only the marker's writer can say whether it happens.
 fn fetch_line(count: usize, entry: &FetchEntry) -> String {
     let plural = if count == 1 { "fetch" } else { "fetches" };
     let head = format!("{count} {plural} in progress · ");
     match &entry.state {
         FetchState::Present(fields) => {
             let done = size_human(fields.bytes_done);
-            // No denominator invented: an unknown total says so in words, which is §12 rule 12's whole point — a
+            // No denominator invented: an unknown total says so in words, which is the whole point — a
             // reader who sees `41.9 MB / 0.0 MB` would divide by it.
             let progress = match fields.bytes_total {
                 Some(total) => format!("{done} / {}", size_human(total)),
@@ -3118,7 +3133,7 @@ fn fetch_line(count: usize, entry: &FetchEntry) -> String {
 }
 
 /// The digest column: twelve hex characters, or `NULL` spelled as the schema spells it. An empty value would
-/// read as a truncated digest; `NULL` is the row's own statement that no artifact is expected (§3).
+/// read as a truncated digest; `NULL` is the row's own statement that no artifact is expected.
 fn text_digest(sha256: &Option<String>) -> String {
     match sha256 {
         None => "NULL".to_string(),
@@ -3155,7 +3170,7 @@ fn now_secs() -> i64 {
 #[cfg(all(test, feature = "fetch"))]
 mod tests {
 
-    /// **F37**: the fallback note is the only part of that path a Linux machine can execute, so it is tested here — while the
+    /// The fallback note is the only part of that path a Linux machine can execute, so it is tested here — while the
     /// decision to print it is tested in np-core, where both platform shapes resolve. Together they cover the sentence and
     /// the condition; neither alone would be evidence about the other.
     #[test]

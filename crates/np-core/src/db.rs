@@ -1,7 +1,7 @@
 //! One SQLite file per workspace: the registry of paths, plus the rows derived from them.
 //!
 //! Two rules decide the shape of everything here. A file that is gone is **marked stale and
-//! never destroyed** (spec §2): its row keeps `state = 'stale'` with every child row intact,
+//! never destroyed**: its row keeps `state = 'stale'` with every child row intact,
 //! so the note can come back later and rejoin the live set as the same note. And a move
 //! changes a path, not a note — [`apply_move`] writes one row of `files`, rewrites that note's display
 //! `rel` beside it, and lets `notes.rel_bytes` ride its own cascade (migration 4 removed `notes.rel`'s foreign
@@ -14,7 +14,7 @@
 //! column a foreign key on `notes(id)`, so a row no note owns cannot be written at all. Each entry of
 //! [`MIGRATIONS`] says what a deleted note does to the rows around it.
 //!
-//! There is no transaction helper on purpose: Task 10 wraps a whole scan in one
+//! There is no transaction helper on purpose: the scan wraps itself in one
 //! [`rusqlite::Connection::unchecked_transaction`], which needs the public connection.
 
 use std::fs;
@@ -152,14 +152,14 @@ pub const MIGRATIONS: &[Migration] = &[
     // ADD CONSTRAINT`, so each table is rebuilt, and the orphans an older build left behind have to be
     // counted and reported on the way through.
     Migration::Code(add_note_foreign_keys),
-    // `files` and `notes` gain byte keys (F13). Also not a script, for the same reason plus one more: the
+    // `files` and `notes` gain byte keys. Also not a script, for the same reason plus one more: the
     // ASCII-case fold of a byte key is Rust's, and SQL has no equivalent that a copy could call.
     Migration::Code(byte_path_keys),
-    // The duplicate note rows version 3 allowed (F19). Not a script either: the survivor is chosen per key
+    // The duplicate note rows version 3 allowed. Not a script either: the survivor is chosen per key
     // and its incoming edges are re-pointed rather than dropped, which is a loop with a receipt, not a
     // statement.
     Migration::Code(merge_duplicate_notes),
-    // Durable file identity (design-a4 §3): the OS's own answer to "is this the same file", so a note whose
+    // Durable file identity: the OS's own answer to "is this the same file", so a note whose
     // bytes changed while its path was unreadable can still be rejoined to its row. Nullable and **not
     // backfilled**: identity is only readable by walking, so a row carries NULL until its path is next seen,
     // and every reader must treat that as unknown rather than as a mismatch. No CHECK (the bytes are opaque and
@@ -169,9 +169,9 @@ pub const MIGRATIONS: &[Migration] = &[
     ALTER TABLE files ADD COLUMN file_id BLOB;
     "#,
     ),
-    // Chunk and vector storage (design-m2-embeddings §3): the first derived data that hangs off a note *id* rather
-    // than a path, which is the F13 lesson applied forward — a chunk storing `rel_bytes` would inherit every
-    // lossy-name, rename and merge defect six milestones spent removing.
+    // Chunk and vector storage: the first derived data that hangs off a note *id* rather than a path, which is
+    // the byte-key lesson applied forward — a chunk storing `rel_bytes` would inherit every lossy-name, rename
+    // and merge defect the earlier migrations spent removing.
     //
     // Four things about this shape are decisions rather than accidents:
     //
@@ -181,12 +181,12 @@ pub const MIGRATIONS: &[Migration] = &[
     //   `CHECK (typeof(sha256) = 'text')`: that CHECK would refuse the shipping configuration.
     // - **`embeddings.model` is a real foreign key**, and `models` is declared before its child so the key reads in
     //   file order. Without the reference an embedding row could name a model that was never installed, or one
-    //   removed and reinstalled under the same id — exactly the orphan class migration 3 exists to end ("Migration 3
-    //   gave every one of these five statements a twin in the schema", `scan.rs:1338-1340`) — and
+    //   removed and reinstalled under the same id — exactly the orphan class migration 3 exists to end, the one
+    //   that gave every child statement a twin in the schema — and
     //   `PRAGMA foreign_key_check` reads *declared* constraints and ignores the pragma, which is what
     //   `first_violation`'s own comment says; a key that was never declared is a key that check can never see.
     //   Declaring it here costs nothing at write time and buys the one audit that reaches every row.
-    // - **`vector` carries a length CHECK.** Little-endian f32 instead of the spec's q8 (`spec:85`) is a deliberate
+    // - **`vector` carries a length CHECK.** Little-endian f32 rather than quantised bytes is a deliberate
     //   deviation — quantisation is a quality decision that belongs with the model benchmark, not smuggled in as
     //   storage trivia — and the CHECK keeps that deviation machine-enforced *now*, while the table is empty, so a
     //   later switch to q8 fails at write instead of becoming subtly wrong cosines no test would notice. `dim` is
@@ -236,10 +236,10 @@ pub const MIGRATIONS: &[Migration] = &[
     );
     "#,
     ),
-    // **Verify-on-change (D12, closed 2026-10-31).** Two nullable columns remembering which artifact bytes this row's
+    // **Verify-on-change.** Two nullable columns remembering which artifact bytes this row's
     // `sha256` was last checked against: the size and whole-second mtime of the file at that moment. Their only job is
-    // to make re-verification cheap — R6d measured a full pass over the pinned artifact at **11.32 s** (26 MiB/s, our
-    // own `hash::sha256_file`) against **~0.09 s** for llama.cpp's first read of every byte (§14), so hashing before
+    // to make re-verification cheap — a full pass over the pinned artifact costs **11.32 s** (26 MiB/s, our own
+    // `hash::sha256_file`) against **~0.09 s** for llama.cpp's first read of every byte — so hashing before
     // every embed would cost more than embedding a small workspace. A matching stat therefore skips the hash; a
     // different one, or no stamp at all, re-hashes and refuses on mismatch.
     //
@@ -255,14 +255,14 @@ pub const MIGRATIONS: &[Migration] = &[
     ALTER TABLE models ADD COLUMN verified_mtime INTEGER;
     "#,
     ),
-    // **A model can be more than one file (R7b, `docs/design-m2-local-embeddings.md` §12 rule 10).** The
+    // **A model can be more than one file.** The
     // `embeddinggemma-2` pair is a text encoder plus an `mmproj` vision/audio projector, and `models.sha256` holds
     // exactly one digest — the **primary** artifact's, which is what every existing reader (`verify_artifact`,
     // `install`'s comparison, `local_model`'s identity check) has always meant by it. Keeping that column meaning
     // *main* is the deliberate half of this migration: the alternative, re-pointing it at a pair, would silently
     // change what "the digest matches" asserts in code that cannot express "which file".
     //
-    // §12 rule 10's asymmetry is why this is a child table and not more columns on `models`: **digests are cheap to
+    // The asymmetry is why this is a child table and not more columns on `models`: **digests are cheap to
     // retrofit, names are not** — bytes already on disk live under `<models_dir>/<id>` with no room for a second
     // name. So the pair gets names here (`name = 'main'` is the primary, matching the artifact path) and any later
     // member arrives as a row rather than as a schema change.
@@ -275,7 +275,7 @@ pub const MIGRATIONS: &[Migration] = &[
     // Not backfilled, like migration 6's `file_id` and migration 8's stamp: a model installed by an older build has
     // no recorded members until it is installed or fetched again, and readers treat "no rows" as *unknown*, never as
     // "this model has no files". No foreign key either — `models` has no delete path today, and adding an FK whose
-    // cascade this migration cannot test on three OSes would be a claim, not a constraint (F18).
+    // cascade this migration cannot test on three OSes would be a claim, not a constraint.
     Migration::Sql(
         r#"
     CREATE TABLE model_files (
@@ -287,7 +287,7 @@ pub const MIGRATIONS: &[Migration] = &[
     );
     "#,
     ),
-    // 10. Media as a vector source of its own (`docs/design-m2-image-embeddings.md` §6): an image linked from a note
+    // 10. Media as a vector source of its own: an image linked from a note
     // is not a chunk of prose, so it gets tables that can state what it actually is instead of a `chunks` row whose
     // `ordinal`, byte offsets and `source_hash` would have to lie about bytes no chunker ever read.
     //
@@ -298,18 +298,18 @@ pub const MIGRATIONS: &[Migration] = &[
     //
     // The CHECK families are borrowed, not invented: `length(hash) = 64` is migration 9's rule for `model_files.sha256`
     // (a truncated paste must not become content identity and then refuse the real file forever), `typeof(rel_bytes) =
-    // 'blob'` beside declared affinity is migration 4's F13 lesson (affinity alone accepts a TEXT bind, and `length()`
+    // 'blob'` beside declared affinity is migration 4's lesson about affinity (alone it accepts a TEXT bind, and `length()`
     // would then count characters), and `typeof(vector) = 'blob' AND length(vector) = 4 * dim` is migration 7's fence on
     // `embeddings` — eight characters satisfy `length(vector) = 8` at dim 2 and reach a cosine as garbage.
     //
-    // **The stamp columns are D12 carried to two more places.** `media_path.verified_size` / `verified_mtime` decide
+    // **Verify-on-change, carried to two more places.** `media_path.verified_size` / `verified_mtime` decide
     // whether the next run re-hashes an image or trusts one `stat`; adding them to `model_files` is what stops every
-    // image pass from hashing all 554,821,056 projector bytes (§6's third change, ~21 s at D12's measured rate). Both
+    // image pass from hashing all 554,821,056 projector bytes (~21 s at the measured rate above). Both
     // pairs are nullable and **not backfilled**: an older row reads as "never checked", which is the honest cost of
     // upgrading into a check, and a half pair reads as no pair at all (`media_path_check`, `member_stamp`) for the
     // migration-8 reason.
     //
-    // **The image pair sits on `media_path`, not on `media`, and that placement is the whole point.** D12's rule is "one
+    // **The image pair sits on `media_path`, not on `media`, and that placement is the whole point.** The rule is "one
     // `stat` when the bytes have not moved since the last check, a full hash when they have" — a statement about a
     // *file*, while `media` is keyed by content hash. A stamp on `media` could only be read after the hash was known,
     // which means after reading the file: the work the stamp exists to skip. So the pair travels with the path it
@@ -317,12 +317,12 @@ pub const MIGRATIONS: &[Migration] = &[
     //
     // Migration 10 is unreleased on this branch, so the DDL is edited in place rather than given a second entry — the same
     // call as dropping `media_path.case_key`, and every rewind fixture already drops these tables. (Migration 11 exists now:
-    // F36's keyword index. It is a separate entry because it changes nothing here, and the reasoning above was about not
+    // The keyword index is a separate entry because it changes nothing here, and the reasoning above was about not
     // splitting one media shape across two versions, not about keeping the list at ten.)
     //
     // Same coupling as migration 9 warned about, now pointing forward: the eight rewind fixtures
     // (`tests/db.rs`, `tests/scan.rs`, `np-cli/tests/cli.rs`) delete version numbers and must undo what later entries
-    // created, so each one drops these three tables — child first — beside `model_files`. F36 extended that duty to its own
+    // created, so each one drops these three tables — child first — beside `model_files`. The keyword index added its own
     // entry: the same fixtures also drop `notes_fts` and its three triggers, or re-running migration 11 fails on
     // `table notes_fts already exists`.
     Migration::Sql(
@@ -485,8 +485,8 @@ pub enum DbError {
         value: i64,
     },
     /// A rebuild's replacement table does not hold as many rows as the table it is about to replace, so the
-    /// step refuses the `DROP`. A count cannot prove the *right* rows survived — that is what F13 §5's
-    /// per-row key comparison is for — but it is the only assertion that can see a lost **attachment**: a
+    /// step refuses the `DROP`. A count cannot prove the *right* rows survived — that is what the per-row key
+    /// comparison in this migration is for — but it is the only assertion that can see a lost **attachment**: a
     /// `files` row with no note row has no child at all, so nothing cascades, `PRAGMA foreign_key_check`
     /// stays clean, and the drop would destroy the row with no error and no report line.
     #[error("refusing to drop {table}: it holds {old} row(s) but its replacement holds {staged}, so the copy lost a row")]
@@ -606,7 +606,7 @@ impl Db {
     ///
     /// Carried on the handle rather than read from `meta` by whoever feels like saying it: the stored
     /// receipt is never cleared, so "the upgrade removed N rows" stays true for the life of the file, and
-    /// a scan that echoed it from then on would be a permanent one-line warning (F21 §3). Whether the
+    /// a scan that echoed it from then on would be a permanent one-line warning. Whether the
     /// value is worth printing is the reader's question — [`crate::ScanReport::upgrade_orphans`] answers
     /// it, and drops the all-zero case that proves only that the check ran.
     pub fn upgrade_orphans(&self) -> Option<&str> {
@@ -631,7 +631,7 @@ impl Db {
     ///
     /// **Why this exists when [`Db::upgrade_orphans`] does.** The carried value answers "what did *this* process
     /// delete", and it is deliberately `None` forever after, because a permanent one-line warning trains a reader to
-    /// ignore it (F21 §3). That left the other question — what did an upgrade delete here, months ago, which is the
+    /// ignore it. That left the other question — what did an upgrade delete here, months ago, which is the
     /// question someone asks when notes look shorter than they remember — answerable only with `sqlite3`. Reading
     /// `meta` is the same record through a different door: nothing echoes, nothing clears, and no run becomes louder
     /// for a fact it did not produce.
@@ -765,13 +765,13 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<Carried, DbError> {
         // The echo waits for the commit. A COMMIT can fail by itself — `SQLITE_FULL`, a WAL that
         // cannot be resumed — and take the deletes with it, so announcing from
         // [`add_note_foreign_keys`] used to say "removed N orphan row(s)" about rows that were still
-        // there, and say it again on every retry: the false announcement F21 §3.1 refuses. Nothing is
-        // printed anywhere before this line, so a step that rolled itself back — at any statement,
+        // there, and say it again on every retry: the false announcement this position exists to refuse.
+        // Nothing is printed anywhere before this line, so a step that rolled itself back — at any statement,
         // including this commit — is silent. That silence rests on call-site position rather than on
-        // a test: no portable way to fail a COMMIT here is known (F21 §2 says so plainly), and the
+        // a test: no portable way to fail a COMMIT here is known, and the
         // durable receipt in `meta` is what the promise actually rests on. Both receipts are scoped to one
-        // iteration, so no later step can re-echo an earlier one — and F19's merge follows the same rule for
-        // the same reason: a merge announced before its commit is a merge that may not have happened.
+        // iteration, so no later step can re-echo an earlier one — and the duplicate merge follows the same
+        // rule for the same reason: a merge announced before its commit is a merge that may not have happened.
         if let Some(value) = &orphan_receipt {
             report_orphans(&mut io::stderr(), value);
         }
@@ -828,7 +828,7 @@ pub const FK_ORPHANS_KEY: &str = "fk_orphans";
 ///   `delete_note_row` does by hand and what keeps the edge inside `unresolved_links`.
 ///
 /// The one place the schema is stricter than the hand-written cleanup is approved edges. That function
-/// drops only this note's `origin = 'prose'` rows and keeps an approved one (spec §10), but a foreign
+/// drops only this note's `origin = 'prose'` rows and keeps an approved one, but a foreign
 /// key cannot be conditional: either an approved edge goes with its source or the source row cannot be
 /// deleted at all. It goes. M1 writes no approved edges — nothing calls `store_links` with that origin
 /// outside tests — so nothing observable changes today, and `delete_note_row` says so where a reader
@@ -878,7 +878,7 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
         });
     }
 
-    // This `?` is the invariant rather than error handling for its own sake (F21 §2): the write shares
+    // This `?` is the invariant rather than error handling for its own sake: the write shares
     // the transaction with the deletes above, so a receipt that cannot be written rolls the cleanup back
     // and **nothing is ever deleted unannounced**. `a_receipt_that_cannot_be_written_rolls_the_cleanup_back`
     // in `crates/np-core/tests/db.rs` refuses this one statement with a trigger and asserts the orphan rows
@@ -909,7 +909,7 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
 /// fails a test instead of going unnoticed; what they cannot pin is that the production call site
 /// names stderr, nor that it runs after the commit (see [`apply_migrations`]).
 ///
-/// A failed write is dropped rather than raised (F21 §2). It used to `.expect`, from inside the
+/// A failed write is dropped rather than raised. It used to `.expect`, from inside the
 /// migration's own transaction, so a workspace opened with descriptor 2 refusing writes had its whole
 /// upgrade rolled back — every time, forever, over one line nobody could read. That panic never
 /// protected the signal: the same counts are written into `meta` under [`FK_ORPHANS_KEY`] in that same
@@ -925,7 +925,8 @@ fn add_note_foreign_keys(conn: &Connection) -> Result<(), DbError> {
 fn report_orphans(out: &mut dyn io::Write, receipt: &str) {
     // The total is read out of the stored receipt rather than carried alongside it, so the stderr copy
     // cannot disagree with the two stdout renderings of the same value. All zeros stays silent: every
-    // pre-F5 workspace passes through here, and "found nothing" on an ordinary upgrade is not news.
+    // workspace that predates this cleanup passes through here, and "found nothing" on an ordinary upgrade
+    // is not news.
     let total = orphan_total(receipt);
     if total == 0 {
         return;
@@ -944,8 +945,8 @@ fn report_orphans(out: &mut dyn io::Write, receipt: &str) {
 /// The reader that pairs with `OrphanCleanup::value` (a code span, not a link: that type is private and
 /// rustdoc warns when public docs link to it), for every caller left holding only the stored
 /// string — the scan report, `np scan`'s summary line, and the stderr echo in `report_orphans` (a code
-/// span, not a link: that function is private), each of which names the total beside the counts
-/// (F21 §3). Every number in the value is summed whatever its label: the spelling is this module's own
+/// span, not a link: that function is private), each of which names the total beside the counts.
+/// Every number in the value is summed whatever its label: the spelling is this module's own
 /// and its labels are pinned by the tests around [`FK_ORPHANS_KEY`], so there is nothing here to
 /// validate — a fragment that will not parse as a count adds nothing rather than failing a report.
 pub fn orphan_total(value: &str) -> usize {
@@ -1121,19 +1122,19 @@ fn first_violation(conn: &Connection) -> Result<Option<(String, i64, String)>, D
 
 /// `meta` key recording how many migrated rows carry a lossy display spelling.
 ///
-/// Beside [`FK_ORPHANS_KEY`] for the same reason (F13 §4): a person reading a scan report afterwards has to
+/// Beside [`FK_ORPHANS_KEY`] for the same reason: a person reading a scan report afterwards has to
 /// be able to tell "this file was upgraded and held two such paths" apart from "this file was never
 /// upgraded", and there is no logger to write to. The value is `files=N,notes=M`, written **even when both
 /// are zero** — the count's whole use is that it distinguishes looked-and-found-none from never-looked, and
 /// the first byte-keyed scan's expected churn can only be read against it.
 pub const PATHS_LOSSY_KEY: &str = "paths_lossy";
 
-/// Migration 4 — `files` and `notes` are rebuilt so their identity lives in bytes (F13 §4).
+/// Migration 4 — `files` and `notes` are rebuilt so their identity lives in bytes.
 ///
 /// Why bytes: a path is an OS byte string, `rel` was stored as TEXT, and SQLite stores anything that is not
 /// valid UTF-8 as the replacement character. Two files named `caf\xE9.md` and `caf\xE8.md` therefore became
 /// one row whose `rel` matched no file on disk — and because `abs` was a *derived* column, the real path was
-/// not recoverable from the row either (F13 §1). The new `rel_bytes` / `case_bytes` pair is the identity;
+/// not recoverable from the row either. The new `rel_bytes` / `case_bytes` pair is the identity;
 /// `rel`, `case_key` and `abs` stay, become display text, and keep being written exactly as before, so every
 /// reader that still matches on them keeps working until the round that moves them.
 ///
@@ -1193,8 +1194,8 @@ fn byte_path_keys(conn: &Connection) -> Result<(), DbError> {
 
     // The one copy that can stay a statement: its key comes from the row's own `rel`, so `CAST` is a per-row
     // value rather than one bind shared by every row — and casting to BLOB yields `typeof(...) = 'blob'`,
-    // which the CHECK demands. Binding the same text as a Rust `&str` would not (F13 §4: a TEXT key and its
-    // BLOB twin never compare equal, so one accidental string bind reopens F13 silently).
+    // which the CHECK demands. Binding the same text as a Rust `&str` would not: a TEXT key and its BLOB
+    // twin never compare equal, so one accidental string bind quietly reopens the byte-key bug.
     //
     // `rel` stops being a foreign key. Two live notes may spell themselves identically once the lossy
     // spelling is admitted, and a key that two rows share cannot be a key; `notes.rel`'s `ON UPDATE CASCADE`
@@ -1287,7 +1288,7 @@ struct FileRow {
 /// Copy version-3 `files` into `files_new`, one row at a time, deriving both byte keys in Rust.
 ///
 /// Ordered by `rowid` so the new `id`s are handed out in the same sequence the old rows held them — the
-/// stability ruling F5's copy already follows (see [`rebuild_with_keys`] for why the order is load-bearing
+/// stability ruling the version-3 copy already follows (see [`rebuild_with_keys`] for why the order is
 /// rather than stylistic). `case_key` is copied, never recomputed: SQLite's `LOWER()` folds ASCII only, so
 /// deriving it in SQL would rewrite every non-ASCII name's fold and break the link resolution that reads it.
 fn copy_files_rows(conn: &Connection) -> Result<(), DbError> {
@@ -1319,8 +1320,8 @@ fn copy_files_rows(conn: &Connection) -> Result<(), DbError> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for row in rows {
-        // Both keys come from this row's own `rel`, through the one module that owns them (F13 §4: no
-        // statement derives a key by hand). Round 1's keys are the bytes of the stored display spelling,
+        // Both keys come from this row's own `rel`, through the one module that owns them — no statement
+        // derives a key by hand. The migrated keys are the bytes of the stored display spelling,
         // U+FFFD included — see [`crate::path_keys`].
         let rel_bytes = path_keys::rel_bytes_of_display(&row.rel);
         let case_bytes = path_keys::case_fold(&rel_bytes);
@@ -1372,7 +1373,7 @@ fn count_rows(conn: &Connection, table: &str) -> Result<i64, DbError> {
 ///
 /// The test is U+FFFD in the display column, which is what a lossy read leaves behind. It counts rows whose
 /// *display* carries the marker rather than rows whose key differs from something: after this migration the
-/// two are the same fact, and the count is what makes the first byte-keyed scan's churn readable (F13 §4.2).
+/// two are the same fact, and the count is what makes the first byte-keyed scan's churn readable.
 fn lossy_rows(conn: &Connection, table: &str) -> Result<i64, DbError> {
     Ok(conn.query_row(
         &format!("SELECT COUNT(*) FROM {table} WHERE INSTR(rel, ?1) > 0"),
@@ -1387,25 +1388,25 @@ fn lossy_rows(conn: &Connection, table: &str) -> Result<i64, DbError> {
 /// Beside [`FK_ORPHANS_KEY`] and [`PATHS_LOSSY_KEY`] for the same reason: no logger exists, and a person
 /// reading a scan report weeks later has to be able to tell "this file held a duplicate pair and it was
 /// folded away" apart from "this file never had one". The value is `merged=N;paths=a.md,b.md`, written
-/// **even when nothing was merged** — `merged=0` is the record that the check ran (F21 §2's lesson), and N
+/// **even when nothing was merged** — `merged=0` is the record that the check ran, and N
 /// counts the note rows folded into a survivor rather than the number of paths, because a path holding three
 /// rows lost two of them.
 pub const NOTE_MERGE_KEY: &str = "note_merges";
 
-/// How many display spellings one [`NOTE_MERGE_KEY`] receipt names — the same eight F22 caps its loss record
+/// How many display spellings one [`NOTE_MERGE_KEY`] receipt names — the same eight the loss record caps
 /// at, for the same reason: the count is the fact and the names are only where to look.
 const MERGE_NAME_CAP: usize = 8;
 
-/// Migration 5 — the duplicate note rows version 3 left behind are merged into one row each (F19).
+/// Migration 5 — the duplicate note rows version 3 left behind are merged into one row each.
 ///
 /// Why a merge and not a permanent charge: `notes.rel` carried no `UNIQUE`, so one path could hold two note
 /// rows, migration 4 copied both onto one `rel_bytes`, and every scan since has answered that key with
 /// the scan's reader (`crate::scan::Indexed::Duplicate`, a code span: that enum is private) — charging
 /// `uncovered` forever, withholding the parse version forever,
-/// re-parsing the whole corpus on every run and printing a refresh gap nobody can act on (F19 §1). The charge
+/// re-parsing the whole corpus on every run and printing a refresh gap nobody can act on. The charge
 /// was right while there was no exit; this is the exit.
 ///
-/// The rule, stated rather than left to chance (F19 §2):
+/// The rule, stated rather than left to chance:
 ///
 /// - **Winner = `MIN(id)`.** The oldest row is the one derived rows already hang off, so keeping it keeps the
 ///   corpus attached. Content loses, and that is survivable *because* the version was already withheld: the
@@ -1419,7 +1420,7 @@ const MERGE_NAME_CAP: usize = 8;
 ///   onto the winner cannot collide with anything, and two edges that now look alike are two mentions of one
 ///   note, which is what the writer would have stored anyway. A defensive dedup here can never fire.
 ///
-/// **The deletes are by hand, not by cascade.** F19 §2 expected the loser's derived rows to go with its row,
+/// **The deletes are by hand, not by cascade.** The expectation was that the loser's derived rows go with its row,
 /// and that is the outcome; the mechanism cannot be the schema's, because [`migrate`] runs every step with
 /// `PRAGMA foreign_keys = OFF` — a pragma that cannot be changed inside a transaction — and SQLite performs
 /// no `ON DELETE CASCADE` while it is off (verified: deleting a parent with the pragma off leaves its
@@ -1433,7 +1434,7 @@ const MERGE_NAME_CAP: usize = 8;
 /// `PRAGMA foreign_key_check` like migrations 3 and 4 — see the check's own comment for why it matters more here
 /// than it does anywhere else in this file.
 ///
-/// The receipt goes into `meta` **inside this transaction** (F19 §4.1): a merge that cannot announce itself
+/// The receipt goes into `meta` **inside this transaction**: a merge that cannot announce itself
 /// does not happen. [`apply_migrations`] echoes it after the commit, never from here.
 fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
     // Every read happens before the first write, and each query is fully collected rather than iterated:
@@ -1472,8 +1473,8 @@ fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
         // pinned by `the_merge_gate_refuses_damage_that_no_merge_could_have_caused` (a file with **no pair**, so
         // narrowing this check to `merged > 0` fails there) and by
         // `the_merge_gate_refuses_a_child_row_whose_note_is_gone` (the same damage beside a pair). Its only exit
-        // is the message itself (table, rowid, parent) because §7 of `docs/design-f19-note-merge.md` rules out a
-        // repair command. The check is not scoped to rows this merge touched.
+        // is the message itself (table, rowid, parent), because nothing downstream can repair one: there is
+        // no repair command for this damage. The check is not scoped to rows this merge touched.
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_foreign_key_check()",
             [],
@@ -1499,10 +1500,10 @@ fn merge_duplicate_notes(conn: &Connection) -> Result<(), DbError> {
 /// One byte key that holds more than one note row: the survivor, the rows folded into it, and the name the
 /// receipt gives them.
 struct DuplicateNotes {
-    /// The surviving row's display `rel`. Names in the receipt are display text and identify no path (F20 §1)
+    /// The surviving row's display `rel`. Names in the receipt are display text and identify no path
     /// — they say where to look.
     display: String,
-    /// `MIN(id)`: the oldest row, which keeps its id and therefore its derived rows (F19 §2).
+    /// `MIN(id)`: the oldest row, which keeps its id and therefore its derived rows.
     winner: i64,
     /// Every other id on the key, ascending.
     losers: Vec<i64>,
@@ -1511,15 +1512,14 @@ struct DuplicateNotes {
 /// Every `rel_bytes` holding more than one note row, with its winner and losers.
 ///
 /// Ordered by the **byte key**, which is what makes one database produce one receipt; display spellings can
-/// tie where bytes do not (F20 §1), the key cannot.
+/// tie where bytes do not, the key cannot.
 ///
 /// Rows whose key is NULL are left alone — and today none can exist. `notes.rel_bytes` carries
 /// `CHECK (typeof(rel_bytes) = 'blob')` from migration 4 onward and `typeof(NULL)` is `'null'`, so a keyless row
 /// is unwritable by this program or by anything speaking plain SQL to the file; **that constraint, not this
 /// clause, is what protects those rows, which is why no test pins the clause and none can be written.** It stays
 /// as defence in depth for whoever changes that: `GROUP BY` gathers **every** NULL into one group, two keyless
-/// notes are two unrelated files, and folding them deletes one of their note rows outright. The same reasoning
-/// is in `docs/design-f19-note-merge.md` §3 step 1.
+/// notes are two unrelated files, and folding them deletes one of their note rows outright.
 fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateNotes>, DbError> {
     let keys: Vec<Vec<u8>> = {
         let mut statement = conn.prepare(
@@ -1558,7 +1558,7 @@ fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateNotes>, DbError> {
 
 /// The spelling one merged path is named by in the receipt.
 ///
-/// `notes.rel` is a display column and nullable (F13 §4), so a hand-made row can lack it; the byte key's own
+/// `notes.rel` is a display column and nullable, so a hand-made row can lack it; the byte key's own
 /// lossy spelling is the fallback, because the receipt points at a path rather than identifying one. Without it
 /// such a merge would record `merged=1;paths=` — a fold whose path cannot be named. Pinned by
 /// `a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key` in `crates/np-core/tests/db.rs`.
@@ -1609,7 +1609,7 @@ pub fn merge_total(value: &str) -> usize {
 /// receipt) and `a_merge_that_folded_nothing_writes_no_line` (silence at zero, which is what keeps every
 /// ordinary command quiet while `merged=0` still lands in `meta` as proof the check ran). What they cannot pin
 /// is that the production call site names stderr, nor that it runs after the commit — see [`apply_migrations`],
-/// where the same no-portable-COMMIT-failure argument as F21 §2 applies. And a failed write must not roll back
+/// where the same no-portable-COMMIT-failure argument applies. And a failed write must not roll back
 /// (or abort) an upgrade whose deletions are durable in `meta` under [`NOTE_MERGE_KEY`].
 fn report_merges(out: &mut dyn io::Write, receipt: &str) {
     let merged = merge_total(receipt);
@@ -1634,7 +1634,7 @@ fn report_merges(out: &mut dyn io::Write, receipt: &str) {
 /// own. Migration 4 made `rel_bytes` / `case_bytes` `NOT NULL UNIQUE` and dropped `case_key UNIQUE`, so a write
 /// that supplied no key would fail with `SQLITE_CONSTRAINT_NOTNULL` on the first file of every scan, and the
 /// constraint that used to report P3's case pair would be gone. Deriving them from the *display* text instead
-/// is the bug F13 exists to end: twins spell themselves identically, so the second one would resolve onto its
+/// is exactly the bug the byte key exists to prevent: twins spell themselves identically, so the second one would resolve onto its
 /// twin's row and overwrite it with no constraint firing at all.
 ///
 /// The row is resolved by `id`, in two statements, where this function used to carry one
@@ -1642,13 +1642,13 @@ fn report_merges(out: &mut dyn io::Write, receipt: &str) {
 /// only reason `ON CONFLICT (rel)` matched anything, migration 4 gives `rel` no unique constraint at all, and
 /// SQLite answers a non-matching conflict target at *prepare* time — so an arm kept out of habit does not fail
 /// on a lossy name, it fails on the first ordinary ASCII file and takes every scan down with it. The lookup
-/// that replaced it asks about `rel_bytes`, which is F13 §3's "the conflict target moves to `rel_bytes`" in
-/// the shape this function can prepare: two twins now resolve to two different rows.
+/// that replaced it asks about `rel_bytes` — the conflict target moved to the byte key — in the shape this
+/// function can prepare: two twins now resolve to two different rows.
 ///
 /// A `case_bytes` collision — two paths differing only in ASCII case on a case-sensitive filesystem —
 /// surfaces as the constraint violation it is, exactly as `case_key UNIQUE` used to. Nothing picks a winner:
-/// Task 10 reports such a path under `skipped` and keeps scanning. Names differing only in a *non-ASCII*
-/// letter now get two rows, which is the behaviour change F13 §3 accepts out loud.
+/// the scan reports such a path under `skipped` and keeps scanning. Names differing only in a *non-ASCII*
+/// letter now get two rows, which is the behaviour change the byte-key migration accepted out loud.
 ///
 /// This and [`apply_move`] / [`mark_stale`] prepare through [`Connection::prepare_cached`], like the
 /// scan path already does, because each runs once per *path* inside a scan's write loop rather than
@@ -1660,7 +1660,7 @@ fn report_merges(out: &mut dyn io::Write, receipt: &str) {
 /// file. Caching changes how a statement is obtained, not what it does: every error — the
 /// identity collisions below included — reaches the caller exactly as it did before.
 pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<bool, DbError> {
-    // The row's **previous digest travels out of this function** (design-a4 §3 and §4a). The caller decides
+    // The row's **previous digest travels out of this function**. The caller decides
     // whether a note has to be re-parsed, and an identity-resolved move — same file, new key, different bytes —
     // is a case no `Change` variant names. Reading it here costs nothing, because this statement already runs
     // once per file, and the compare sits in the same transaction as the write, so no other writer can slip a
@@ -1731,10 +1731,11 @@ pub fn upsert_file(db: &Db, s: &Snapshot, abs: &Path, now: i64) -> Result<bool, 
 ///
 /// This is the program's **only writer of `notes.rel_bytes`**, and it lives here rather than beside the rest
 /// of `scan::store_note` so that "bind this note key as TEXT" is not a call any scan-side site can
-/// write (F13 §4). That matters more here than anywhere else in the schema: `notes.rel` is plain TEXT and stays
+/// write. That matters more here than anywhere else in the schema: `notes.rel` is plain TEXT and stays
 /// nullable, so an insert that named only the display column would succeed — leaving a note whose byte key is
 /// NULL, which matches nothing the re-keyed join, cascade and lookup compare on bytes. A note row silently
-/// detached from its file is F13 reproduced by the fix, starting with the first new note.
+/// detached from its file is the bug this migration exists to end, reproduced by the fix, starting with the
+/// first new note.
 ///
 /// The id is minted here and returned because every derived row hangs off it; the update arm of `store_note`
 /// stays in `scan.rs` because it writes no key at all.
@@ -1767,14 +1768,14 @@ pub fn insert_note(
 ///
 /// **This reads every row on purpose; there is no `LIMIT 1`.** `notes.rel_bytes` carries no `UNIQUE`: a
 /// version-3 database could hold two note rows for one path (`notes.rel` was never unique) and migration 4
-/// copies both onto one key (F13 §7). Handing back one answer from that population is either a silent pick,
+/// copies both onto one key. Handing back one answer from that population is either a silent pick,
 /// which rewrites a note's whole derived set with another note's, or an `ExecuteMultipleValues` error, which
 /// makes a legacy workspace impossible to scan forever. Both are refused by returning the count for the caller
 /// to act on: one id is the normal path, none means "no row yet", and more than one is an identity conflict
 /// the scan reports and leaves alone.
 ///
 /// The key arrives as bytes because that is the only spelling with one answer per file; matching on display
-/// text would let a twin's note answer for it (F13 §3).
+/// text would let a twin's note answer for it.
 pub fn note_ids(db: &Db, rel_bytes: &[u8]) -> Result<Vec<i64>, DbError> {
     let mut statement =
         db.0.prepare_cached("SELECT id FROM notes WHERE rel_bytes = ?1 ORDER BY id")?;
@@ -1838,7 +1839,7 @@ pub fn apply_move(db: &Db, from: &RelPath, to: &RelPath, now: i64) -> Result<(),
                 },
                 other => DbError::Sqlite(other),
             })?;
-    // `rebase_abs` is display work — its output is the display `abs` column (F13 §3) — so it reads the two
+    // `rebase_abs` is display work — its output is the display `abs` column — so it reads the two
     // display spellings, not the bytes.
     let new_abs = rebase_abs(&abs, &from.rel, &to.rel).ok_or_else(|| DbError::BadAbs {
         rel: from.rel.clone(),
@@ -1874,10 +1875,10 @@ pub fn apply_move(db: &Db, from: &RelPath, to: &RelPath, now: i64) -> Result<(),
 ///
 /// The row and every child of it stay: the note keeps its headings, tags, links and items so
 /// it can rejoin with its identity if the file comes back, and so the catalog can say "stale"
-/// instead of forgetting it ever existed (spec §2). A path that is not in the registry changes
+/// instead of forgetting it ever existed. A path that is not in the registry changes
 /// nothing, which is correct — there is no row to mark.
 ///
-/// Matched on `rel_bytes`, and taking bytes from the caller is what makes that possible (F13 §3): keyed on
+/// Matched on `rel_bytes`, and taking bytes from the caller is what makes that possible: keyed on
 /// display text, deleting one twin marked **both** stale, so the catalog lost a note that was sitting there
 /// readable and nothing reported it.
 pub fn mark_stale(db: &Db, rel_bytes: &[u8]) -> Result<(), DbError> {
@@ -1967,7 +1968,7 @@ pub(crate) const PROSE_ORIGIN: &str = "prose";
 /// healthy link. Migration 3 removed the other case this predicate used to catch — an edge pointing at a
 /// note row that had been deleted, now impossible because `dst_note_id` is a foreign key that NULLs
 /// itself — so the join stays for the stale case and the query is unchanged.
-/// The join is on `rel_bytes`, not the display `rel` (F13 §3): once two live rows may spell themselves
+/// The join is on `rel_bytes`, not the display `rel`: once two live rows may spell themselves
 /// identically, joining on that text is a cross product — one edge counted twice, and a stale twin able to
 /// answer for a live one, so the count and the list printed under it could disagree.
 pub(crate) const LIVE_EDGE: &str =
@@ -2004,7 +2005,7 @@ pub fn unresolved_targets(db: &Db) -> Result<Vec<String>, DbError> {
     Ok(targets)
 }
 
-/// A live tracked file with no note row behind it: an **attachment** (**issue #12**).
+/// A live tracked file with no note row behind it: an **attachment**.
 ///
 /// One const rather than two queries, for the reason [`LIVE_EDGE`] exists: [`attachments`] reads it twice, and a
 /// count that disagrees with the names printed beside it sends the reader looking for a file the list cannot show.
@@ -2016,13 +2017,13 @@ const ATTACHMENT_WHERE: &str =
 pub struct Attachments {
     /// Every live tracked file that is not a note. Exact, and never capped.
     pub count: i64,
-    /// Up to the caller's limit of them, ordered by path **bytes** and printed as display text (F20) — so two
+    /// Up to the caller's limit of them, ordered by path **bytes** and printed as display text — so two
     /// byte-distinct twins can arrive as two lines that read alike, exactly as in
     /// [`crate::ScanReport::skipped`].
     pub examples: Vec<String>,
 }
 
-/// The files this workspace tracks that search will never reach (**issue #12**): hashed, listed and linkable,
+/// The files this workspace tracks that search will never reach: hashed, listed and linkable,
 /// but parsed only when they are markdown.
 ///
 /// This is the number a front end needs to say what happened in np's own words — "1 of 5 files became notes; 4
@@ -2055,9 +2056,9 @@ pub fn attachments(db: &Db, example_limit: usize) -> Result<Attachments, DbError
 /// What one call to [`write_chunks_for_note`] touched, as counts of **rows touched**.
 ///
 /// Each field counts rows whose stored content changed, not chunks that were looked at: a chunk already on
-/// file exactly as this build would write it appears in none of the three numbers. That is the shape §5's
-/// warm pass is about — an unchanged note answers [`ChunkWrite::default()`] — and a report claiming work it
-/// did not do is the lie F21 §3 refuses.
+/// file exactly as this build would write it appears in none of the three numbers. That is the shape the warm
+/// pass is about — an unchanged note answers [`ChunkWrite::default()`] — and a report claiming work it did not
+/// do is the lie this module's own doc refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChunkWrite {
     /// Ordinals the note had no row for, so a fresh `chunks.id` was minted.
@@ -2074,7 +2075,7 @@ pub struct ChunkWrite {
 /// Replace one note's chunk rows with `chunks`, by **per-ordinal diff**.
 ///
 /// This is the program's only writer of `chunks`, and it diffs instead of delete-and-reinserting for one
-/// reason (design-m2-embeddings §5's third bullet): `embeddings.chunk_id` cascades off `chunks.id`, so the
+/// reason: `embeddings.chunk_id` cascades off `chunks.id`, so the
 /// derived-row pattern used elsewhere (`crate::scan`'s delete-then-insert for headings, tags, items and
 /// links) would cascade away every vector of an edited note. "Re-embed only what moved" therefore depends
 /// on row *identity* surviving an edit, not merely on the final rows being right. Hence:
@@ -2086,17 +2087,17 @@ pub struct ChunkWrite {
 /// - ordinals the note no longer has (`ordinal >= chunks.len()`) are deleted, and only those.
 ///
 /// Two facts go on every row this function writes: `chunker = CHUNKER_VERSION`, so a bump makes old rows
-/// *identifiable* rather than presumed stale (§4), and `source_hash = note_digest` — the digest of the
-/// **note** bytes the chunks were cut from. That is one level coarser than `embeddings.source_hash` (§3's
-/// two levels: a heading edit in paragraph 9 leaves chunk 2's own text alone, and that fact belongs to the
-/// vector row, never here). Stamping the digest onto rows whose text did not move is deliberate rather
-/// than sloppiness: it is what makes the cheap path below reachable on the *next* scan, which is §5's "an
-/// unchanged note costs one indexed lookup per scan". Its cost is one `UPDATE` per unchanged row on the
+/// *identifiable* rather than presumed stale, and `source_hash = note_digest` — the digest of the
+/// **note** bytes the chunks were cut from. That is one level coarser than `embeddings.source_hash`, and the
+/// two levels are by design: a heading edit in paragraph 9 leaves chunk 2's own text alone, and that fact
+/// belongs to the vector row, never here. Stamping the digest onto rows whose text did not move is deliberate
+/// rather than sloppiness: it is what makes the cheap path below reachable on the *next* scan, which is the
+/// rule that an unchanged note costs one indexed lookup per scan. Its cost is one `UPDATE` per unchanged row on the
 /// one scan that notices an edit, and it touches no vector — this function never writes `embeddings`.
 ///
 /// `Chunk::text` travels as bytes (`&[u8]`), never as `String` or `&str`: a text bind arrives at SQLite as
 /// TEXT, migration 7's `CHECK (typeof(text) = 'blob')` refuses it, and BLOB is an affinity rather than a
-/// constraint — F13 §4's split-type bug, kept armed by `a_string_bind_is_refused_from_chunks_text`.
+/// constraint — the split-type bug, kept armed by `a_string_bind_is_refused_from_chunks_text`.
 ///
 /// ## The cheap path
 ///
@@ -2109,13 +2110,13 @@ pub struct ChunkWrite {
 /// returns no chunks for — wants zero rows and can hold three stamped with an older digest; against the stamp
 /// alone both sides read `0 == 0`, so a single-count predicate returns early and leaves those rows **and their
 /// vectors** on the table permanently, every later scan re-deriving the same empty list and taking the same arm.
-/// That is a report claiming work it did not do, which is the F21 §3 lie this module's own doc refuses.
+/// That is a report claiming work it did not do, which is the lie this module's own doc refuses.
 ///
 /// ## Transaction
 ///
 /// None of its own: chunk writes belong to whichever transaction the caller is in, which for the scan is
-/// its single write transaction — §5: "Chunk writes stay in the transaction — they are cheap and must be
-/// atomic with the note rows". A failure mid-diff therefore rolls back alongside the note rows it
+/// its single write transaction, on the rule that chunk writes stay in the transaction — they are cheap and
+/// must be atomic with the note rows. A failure mid-diff therefore rolls back alongside the note rows it
 /// accompanied instead of leaving a note half-rechunked.
 pub fn write_chunks_for_note(
     db: &Db,
@@ -2230,7 +2231,7 @@ struct StoredChunk {
     chunker: i64,
     byte_start: i64,
     byte_end: i64,
-    /// Read back as bytes because the column is a BLOB holding note bytes (F13 §4): reading it into a
+    /// Read back as bytes because the column is a BLOB holding note bytes: reading it into a
     /// `String` would fail on exactly the lossy notes the column exists to hold.
     text: Vec<u8>,
     source_hash: String,
@@ -2268,7 +2269,7 @@ fn stored_chunks(db: &Db, note_id: i64) -> Result<Vec<StoredChunk>, DbError> {
 /// What one note's stored chunks say about themselves: the note digest they were cut from, and their text
 /// by ordinal.
 ///
-/// The reader §5's staleness rule needs. A caller compares a fresh note digest against the first element to
+/// The reader the staleness rule needs. A caller compares a fresh note digest against the first element to
 /// decide whether this note needs any chunk work at all, and compares each stored text against the chunk it
 /// just cut to decide which ordinals moved; both answers come from one indexed pass over one note's rows.
 ///
@@ -2278,8 +2279,8 @@ fn stored_chunks(db: &Db, note_id: i64) -> Result<Vec<StoredChunk>, DbError> {
 /// - **The digest arm is `Some` only when there is one answer.** Every row must carry the same
 ///   `source_hash`, and every row must carry the current [`CHUNKER_VERSION`]; otherwise these rows support
 ///   no single statement and the caller has to re-chunk. Folding the chunker in follows from this signature
-///   having no third slot — and rows cut by an older chunker must never read as current, since §4 stamps
-///   per row precisely so a bump invalidates them. A note with no rows has no digest either: nothing has
+///   having no third slot — and rows cut by an older chunker must never read as current, since the version
+///   stamp lives per row precisely so a bump invalidates them. A note with no rows has no digest either: nothing has
 ///   been cut from it yet, which is the same answer as "stale" and costs the caller one
 ///   [`write_chunks_for_note`] call.
 /// - **A row this program cannot have written.** `chunks.ordinal` is a SQLite INTEGER, so a hand-edited file
@@ -2287,7 +2288,7 @@ fn stored_chunks(db: &Db, note_id: i64) -> Result<Vec<StoredChunk>, DbError> {
 ///   is "not ours, not current": the digest arm comes back `None` and that row is reported at `u32::MAX`,
 ///   which keeps it visible instead of silently dropping a row from the list.
 ///
-/// Texts are `Vec<u8>` because the column holds note bytes, not a promise about UTF-8 (§3).
+/// Texts are `Vec<u8>` because the column holds note bytes, not a promise about UTF-8.
 // The tuple stays spelled out: the caller destructures `(digest, texts)`, and a public alias for
 // `Vec<(u32, Vec<u8>)>` would name one fact twice without saying anything the signature does not already.
 // clippy's heuristic counts nesting rather than meaning.
@@ -2330,7 +2331,7 @@ pub fn chunk_state(
 
 /// The note digest one note's chunk rows agree on, **without reading their text**.
 ///
-/// This is the scan's per-note decision (design §5: "an unchanged note costs one indexed lookup per scan"), and
+/// This is the scan's per-note decision, and
 /// the stamps are all that decision uses. [`chunk_state`] answers the same question while materialising a `Vec<u8>`
 /// per chunk — on a warm scan over a real vault that is roughly the whole corpus read out of SQLite and thrown
 /// away, which is a different cost class from an index probe and one the suite cannot see, because the perf fixture's
@@ -2373,16 +2374,16 @@ pub fn chunk_digest(db: &Db, note_id: i64) -> Result<Option<String>, DbError> {
 /// have been re-cut — and a vector stamped with the note digest would then claim currency for bytes nobody has
 /// embedded since. Pinned by `a_vector_stamped_with_the_note_digest_is_not_found_by_a_chunk_text_question`.
 ///
-/// `INSERT … ON CONFLICT (chunk_id, model) DO UPDATE` rather than a plain `INSERT`, and §5's third bullet is
-/// the reason: F15 *expects* its retry, so "this write already happened" is an ordinary event rather than a
+/// `INSERT … ON CONFLICT (chunk_id, model) DO UPDATE` rather than a plain `INSERT`, and the retry rule is the
+/// reason: an embed pass *expects* its retry, so "this write already happened" is an ordinary event rather than a
 /// bug. A plain insert into `PRIMARY KEY (chunk_id, model)` answers that retry with
 /// `SQLITE_CONSTRAINT_PRIMARYKEY`, and because one `?` propagates out of the scan's write pass, the whole
 /// scan's indexing work would roll back over one repeated vector — a provider problem turned into data
-/// loss, which §5 forbids twice over ("Provider failure must not be data loss; neither may our own conflict
-/// handling be").
+/// loss, which the rule forbids twice over: provider failure must not be data loss, and neither may our own
+/// conflict handling be.
 ///
 /// The conflict target is the **pair**, so re-embedding under a second model cannot disturb the first row —
-/// §3's "switching providers then costs a re-embed and nothing else", pinned at the schema by
+/// Switching providers then costs a re-embed and nothing else — pinned at the schema by
 /// `two_models_hold_vectors_for_one_chunk` and at the writer by `upsert_vector_keeps_both_models_rows`. `dim`, `source_hash` and `embedded_at` travel in the
 /// update arm as well: a retry computed from chunk text that has since moved, or under a model whose answer
 /// changed, must leave the row stating what it now holds rather than keeping the older facts beside a new
@@ -2391,8 +2392,8 @@ pub fn chunk_digest(db: &Db, note_id: i64) -> Result<Option<String>, DbError> {
 /// `bytes` is the little-endian f32 payload — [`crate::embed::Vector::to_bytes`] writes it — bound as bytes,
 /// which is the only spelling migration 7's `CHECK (typeof(vector) = 'blob' …)` accepts. Nothing here
 /// re-checks `bytes.len() == 4 * dim`: the `CHECK` does it at the write, and `Vector::from_bytes` is its
-/// twin on the read side (§3). An unknown `model` is refused by the foreign key rather than looked up here,
-/// which is why `models` must be written before any vector naming it (§3).
+/// twin on the read side. An unknown `model` is refused by the foreign key rather than looked up here,
+/// which is why `models` must be written before any vector naming it.
 pub fn upsert_vector(
     db: &Db,
     chunk_id: i64,
@@ -2424,7 +2425,7 @@ pub fn upsert_vector(
 /// has no rows, and "no vectors behind it" is a fact rather than a missing thing.
 ///
 /// Separate from [`write_chunks_for_note`] on purpose, because the two tables are written in different
-/// transactions (§5: chunk writes ride the scan's transaction, vector batches commit per batch outside it).
+/// transactions: chunk writes ride the scan's transaction, while a vector batch commits outside it.
 pub fn delete_vectors_for_chunk(db: &Db, chunk_id: i64) -> Result<(), DbError> {
     db.0.prepare_cached("DELETE FROM embeddings WHERE chunk_id = ?1")?
         .execute(params![chunk_id])?;
@@ -2434,8 +2435,8 @@ pub fn delete_vectors_for_chunk(db: &Db, chunk_id: i64) -> Result<(), DbError> {
 /// One stored vector's currency stamp under one model: the chunk it belongs to, and the digest of the bytes
 /// that were handed to the model to make it.
 ///
-/// Only those two fields, because they are the whole answer to "is this vector still current": §6's rule is
-/// that `embeddings.source_hash` holds the digest of **the bytes the model read** (backlog D4), so currency is
+/// Only those two fields, because they are the whole answer to "is this vector still current": the rule is
+/// that `embeddings.source_hash` holds the digest of **the bytes the model read**, so currency is
 /// one string comparison and needs neither the vector nor the timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorStamp {
@@ -2449,8 +2450,8 @@ pub struct VectorStamp {
 /// Every vector stored under one model id, ascending by chunk.
 ///
 /// The `model` filter is not optional and that is the whole reason this reader exists
-/// (`docs/design-m2-local-embeddings.md` §6: "every read filters on an explicit model id … no such reader
-/// exists yet"): `PRIMARY KEY (chunk_id, model)` lets two models hold a vector for one chunk, and comparing
+/// — every read filters on an explicit model id, and for a long time no such reader existed:
+/// `PRIMARY KEY (chunk_id, model)` lets two models hold a vector for one chunk, and comparing
 /// one model's stamps against another's vectors would call a stale row current — or the other way round,
 /// re-embedding forever. A caller that wants "all vectors" can ask twice with two ids; there is no query here
 /// that mixes them.
@@ -2476,11 +2477,11 @@ pub fn vectors_for(db: &Db, model: &str) -> Result<Vec<VectorStamp>, DbError> {
 
 /// One chunk the catalog can still show a reader: its id and its stored text.
 ///
-/// The `files.state = 'ok'` join is §6's liveness fence (backlog D3). A note whose file is gone keeps its row
+/// The `files.state = 'ok'` join is the liveness fence that keeps a stale note out. A note whose file is gone keeps its row
 /// with `state = 'stale'` and every child row intact — [`mark_stale`] says so in its own words — so an
 /// un-fenced read over `chunks` is the first production reader that computes vectors for a deleted file's text
 /// and reports them current. Joining through `notes.rel_bytes = files.rel_bytes` rather than `rel` because the
-/// byte key is the identity (F13 §4, migration 4): an ASCII-lossy display spelling could fold two paths into
+/// byte key is the identity: an ASCII-lossy display spelling could fold two paths into
 /// one.
 ///
 /// Ordered by `chunks.id`, which is the order [`crate::embed_run`] batches in — deterministic batching is what
@@ -2516,7 +2517,7 @@ pub fn live_chunks(db: &Db) -> Result<Vec<LiveChunk>, DbError> {
 /// here and stale there would embed images for a deleted file.
 ///
 /// Ordered by `rel_bytes` so one run walks notes in the same order on every host and a report's refusal list is
-/// reproducible. Bytes rather than strings because a non-UTF-8 note name is a live note (F13).
+/// reproducible. Bytes rather than strings because a non-UTF-8 note name is a live note.
 pub fn live_note_paths(db: &Db) -> Result<Vec<Vec<u8>>, DbError> {
     let mut statement = db.0.prepare_cached(
         "SELECT n.rel_bytes
@@ -2586,7 +2587,7 @@ const MODEL_COLUMNS: &str =
 /// Read the one row naming `id`, or `None` when no model of that identity has been installed.
 ///
 /// The reads live here rather than in the command because np-cli has no `rusqlite` dependency and must not
-/// grow one to answer a question about its own table (`docs/design-m2-models-install.md` §6), and because
+/// grow one to answer a question about its own table, and because
 /// `install`'s idempotence test is *this* row read against the *declared* tuple — a comparison no caller may
 /// skip or partially perform.
 pub fn model_row(db: &Db, id: &str) -> Result<Option<ModelRow>, DbError> {
@@ -2648,7 +2649,7 @@ pub fn record_artifact_stamp(db: &Db, id: &str, size: i64, mtime: i64) -> Result
 /// Insert an installed model, reporting whether this call was the one that wrote it.
 ///
 /// `ON CONFLICT (id) DO NOTHING` rather than a plain `INSERT`, and the reason is concurrent installs of one
-/// id (§6): two processes can both pass [`crate::models`]'s "is there already a row?" step, and if the loser
+/// id: two processes can both pass [`crate::models`]'s "is there already a row?" step, and if the loser
 /// raised `SQLITE_CONSTRAINT_PRIMARYKEY` the human would read a bare constraint violation about a table they
 /// have never opened. Returning `false` says what actually happened — somebody else installed this identity,
 /// and [`crate::models::install`] turns that into the same full-tuple comparison it applies to its own
@@ -2656,7 +2657,7 @@ pub fn record_artifact_stamp(db: &Db, id: &str, size: i64, mtime: i64) -> Result
 ///
 /// `dim` and `now` arrive as `i64` because those are SQLite's `INTEGER` columns; the range rules on a
 /// declared dim (`u16`, never zero) belong to the caller that parses human input, not to the writer
-/// (`docs/design-m2-models-install.md` §2). `sha256` is `None` for a provider with no local weights —
+/// itself. `sha256` is `None` for a provider with no local weights —
 /// migration 7's nullable arm.
 pub fn insert_model(
     db: &Db,
@@ -2677,7 +2678,7 @@ pub fn insert_model(
     Ok(written == 1)
 }
 
-/// One recorded member of a model's set of files (migration 9, §12 rule 10).
+/// One recorded member of a model's set of files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelFile {
     /// Which file of the id this is: `main` is the primary artifact whose digest also stands in `models.sha256`.
@@ -2826,7 +2827,7 @@ mod tests {
 
     #[test]
     fn a_sink_that_refuses_writes_does_not_abort_the_upgrade() {
-        // F21 §1, at the unit level. This echo used to sit inside the migration's transaction, so a
+        // The upgrade-abort bug, at the unit level. This echo used to sit inside the migration's transaction, so a
         // panic here rolled the whole upgrade back — the file refused to open, every time, forever.
         // It now runs after the commit (see `apply_migrations`), where a panic would still abort a run
         // whose deletions are already durable. Either way the write is best effort, because its signal
@@ -2869,7 +2870,7 @@ mod tests {
 
     #[test]
     fn an_upgrade_with_nothing_removed_writes_no_receipt() {
-        // The other half of the promise: every pre-F5 workspace passes through the migration, and
+        // The other half of the promise: every workspace older than this migration passes through it, and
         // "found nothing" on an ordinary upgrade is not news. If this ever prints, every upgrade
         // shouts and the receipt stops meaning anything.
         let mut out = Vec::new();
@@ -2885,7 +2886,7 @@ mod tests {
         // The merge half of the stderr visibility path, pinned through the sink for the same reason
         // `report_orphans` is: this runs inside [`Db::open`], before any test could redirect descriptor 2. The
         // input is the stored spelling because that string is what [`apply_migrations`] holds after the commit,
-        // and the count printed beside it is read back out of it — one value, three readers (F21 §3's rule).
+        // and the count printed beside it is read back out of it — one value, three readers.
         let mut out = Vec::new();
         report_merges(&mut out, "merged=2;paths=a.md,b.md");
         assert_eq!(
@@ -2903,7 +2904,7 @@ mod tests {
         // `the_upgrading_scan_prints_the_merged_pair_on_stdout` asserts that an upgrade with nothing to fold says
         // nothing on stderr. The old claim here was "no integration test can see descriptor 2", which this repo
         // contradicts in three places — the child's stderr is read throughout `crates/np-cli/tests/cli.rs`, and
-        // F21 grew precisely this assertion for the orphan echo — so what is true is narrower: no CLI case
+        // the orphan echo grew precisely this assertion — so what is true is narrower: no CLI case
         // asserted it **until now**.
         let mut out = Vec::new();
         report_merges(&mut out, "merged=0;paths=");
@@ -2942,7 +2943,7 @@ pub struct MediaRow {
     /// filename — a file whose name lies is stored as what it is, because we measured the bytes to get here anyway.
     ///
     /// **Nothing reads this column yet.** The embed report counts figures and never names their format, so `mime` (like
-    /// `size`) is recorded for whoever queries the database directly and for §12's unbuilt `np search`, where a hit will
+    /// `size`) is recorded for whoever queries the database directly and for the unbuilt `np search` output, where a hit will
     /// name what it found. Claiming it feeds the report line would be a promise no code keeps.
     pub mime: String,
 }
@@ -2980,7 +2981,7 @@ pub fn media_by_hash(db: &Db, hash: &str) -> Result<Option<MediaRow>, DbError> {
 
 /// Every path a media row is recorded at, in path order.
 ///
-/// The lifecycle sweep's read (§7 rule 4): the embed pass knows which paths the live notes referenced and needs the ones
+/// The lifecycle sweep's read: the embed pass knows which paths the live notes referenced and needs the ones
 /// it did not. Ordered by `rel_bytes` so the sweep deletes in the same order on every host.
 pub fn media_paths(db: &Db) -> Result<Vec<Vec<u8>>, DbError> {
     let mut statement =
@@ -3012,9 +3013,9 @@ fn read_media_by_hash(db: &Db, hash: &str) -> Result<MediaRow, DbError> {
 /// An upsert because a diagram replaced in place, or moved and re-added under the same name, is the normal case; a
 /// `SQLITE_CONSTRAINT_PRIMARYKEY` out of the write pass would roll the whole embed pass back over one re-pointed row.
 /// `rel_bytes` is bound as bytes and never decoded — the column's `typeof` CHECK is what keeps a lossy spelling from
-/// becoming the stored path (F13), which is why this takes `&[u8]` where a `&str` would have compiled. `abs` is the
-/// opposite case and is deliberately lossy: it is the display spelling a report prints (F20's rule that reports show
-/// bytes as text), while `rel_bytes` stays the identity.
+/// becoming the stored path, which is why this takes `&[u8]` where a `&str` would have compiled. `abs` is the
+/// opposite case and is deliberately lossy: it is the display spelling a report prints, because a report shows
+/// bytes as text, while `rel_bytes` stays the identity.
 pub fn link_media_path(db: &Db, rel: &[u8], abs: &Path, media_id: i64) -> Result<(), DbError> {
     // What this path pointed at before the upsert, if anything. A figure replaced in place is the ordinary case, and
     // once its last path re-points elsewhere nothing references it — the same stranded-row shape as an unlink, so the
@@ -3037,7 +3038,7 @@ pub fn link_media_path(db: &Db, rel: &[u8], abs: &Path, media_id: i64) -> Result
     // against the old content, and if the new file happens to share a size and a whole-second mtime — a rewritten
     // screenshot, an editor's atomic save, a copy that preserved length — the next pass reads no bytes at all and answers
     // search with a vector of the figure that used to live here. Same content re-linked (the ordinary second run) keeps its
-    // pair, so §7 rule 2 still costs one `stat`.
+    // pair, so the re-hash rule still costs exactly one `stat`.
     db.0.prepare_cached(
         "INSERT INTO media_path (rel_bytes, abs, media_id) VALUES (?1, ?2, ?3)
          ON CONFLICT (rel_bytes) DO UPDATE
@@ -3066,7 +3067,7 @@ pub fn link_media_path(db: &Db, rel: &[u8], abs: &Path, media_id: i64) -> Result
 
 /// Remove one path, reporting how many media rows went with it.
 ///
-/// The count is the lifecycle rule made observable (§6): a media row lives while at least one path holds those bytes,
+/// The count is the lifecycle rule made observable: a media row lives while at least one path holds those bytes,
 /// so the last unlink deletes the media row and `ON DELETE CASCADE` takes its vectors. Returning the number rather than
 /// a bool lets the embed report say "1 figure removed" without a second query, and says `0` for both "one of two paths
 /// went" and "this path was never linked" — a deleted file is a fact about the world, not a corrupt database.
@@ -3104,8 +3105,8 @@ pub fn unlink_media_path(db: &Db, rel: &[u8]) -> Result<usize, DbError> {
 ///
 /// [`unlink_media_path`] cannot be the whole lifecycle rule on its own: it works from a path, so a media row that never
 /// gained one — bytes recorded and then refused by the encoder, or an embed interrupted between the two writes by a
-/// provider that would not load — is invisible to it forever. §6's rule is "a media row lives while at least one live
-/// path exists", and this is the accessor that makes that statement true rather than aspirational. `ON DELETE CASCADE`
+/// provider that would not load — is invisible to it forever. The rule is "a media row lives while at least one
+/// live path exists", and this is the accessor that makes that statement true rather than aspirational. `ON DELETE CASCADE`
 /// takes the vectors, so a swept figure cannot answer `np search`.
 ///
 /// Idempotent by construction: the second call finds nothing, which is what lets an embed pass run it unconditionally at
@@ -3163,7 +3164,7 @@ pub fn media_embeddings(db: &Db, model: &str) -> Result<Vec<(i64, Vec<u8>)>, DbE
     Ok(out)
 }
 
-/// What the vector one model made for one figure was built from — §7's *embedding currency*.
+/// What the vector one model made for one figure was built from — its *embedding currency*.
 ///
 /// **The stamp is `media_embeddings.source_hash` itself; there is deliberately no second column and no setter.** "The
 /// bytes this vector was made from" is one fact, and a second spelling of it (a `media_stamps` table, say) is a second
@@ -3244,7 +3245,7 @@ pub fn set_media_path_check(db: &Db, rel: &[u8], size: i64, mtime: i64) -> Resul
 
 /// Record the stamp that justified skipping a re-hash of one recorded model file.
 ///
-/// The projector's half of §6's third change: without it, verifying the 554,821,056-byte `mmproj` costs a full read on
+/// The projector's half of verify-on-change: without it, verifying the 554,821,056-byte `mmproj` costs a full read on
 /// every image run. No-op for an unrecorded member, like [`record_artifact_stamp`] is for a missing model.
 pub fn record_member_stamp(
     db: &Db,
