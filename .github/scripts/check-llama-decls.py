@@ -188,7 +188,8 @@ def rust_struct_fields(rust_text, name):
     is indented), and it silently swallows the structs that follow — which reads as "17 fields declared" for one that has 15.
     Fields are counted at depth 1 only, so a `Option<extern "C" fn(…)>` spanning several lines is one field, not four.
     """
-    m = re.search(r"#\[repr\(C\)\]\s*pub struct\s+" + re.escape(name) + r"\s*\{", rust_text)
+    # Anchored on `pub struct`, not on the attribute pair: an interposed `#[derive(...)]` must not move a struct out of reach.
+    m = re.search(r"^\s*pub struct\s+" + re.escape(name) + r"\s*\{", rust_text, re.M)
     if not m:
         return None
     i, depth, body = m.end(), 1, []
@@ -209,6 +210,24 @@ def rust_struct_fields(rust_text, name):
             count += 1
         depth += line.count("{") - line.count("}")
     return count
+
+
+STRUCT_ANY_RUST = re.compile(r"^\s*pub struct (\w+)\s*\{", re.M)
+
+
+def mirrored_structs(rust_text):
+    """Every `pub struct` in the file, with whether a `#[repr(C)]` sits above it.
+
+    Matching `#[repr(C)] pub struct` as one pattern is what let `llama_batch` escape this check for as long as it existed:
+    the real file puts `#[derive(Debug, Copy, Clone)]` between the two, and a fence that silently compares seven of eight
+    structs is worse than one that says which eight it looked at. So the struct list comes from `pub struct`, and a missing
+    `#[repr(C)]` becomes a finding rather than an omission.
+    """
+    out = []
+    for m in STRUCT_ANY_RUST.finditer(rust_text):
+        head = rust_text[:m.start()].split("\n")[-9:]
+        out.append((m.group(1), any("#[repr(C)]" in line for line in head)))
+    return out
 
 
 def extern_block(rust_text):
@@ -245,7 +264,8 @@ def compare(ffi_text, header_text):
                for x, sh in zip(params, probed)):
             # A callback parameter (`Option<unsafe extern "C" fn(…)>`) cannot be split on commas without a real parser, and a
             # half-parsed signature is worse than an admitted gap: name and arity are still checked above.
-            skipped.append(f"`{name}`: takes a callback — name and arity compared, parameter types not")
+            skipped.append(f"`{name}`: takes a callback — name compared, and arity from the declaration's top-level "
+                           f"commas; the callback's own signature is not compared")
             continue
         if False:
             problems.append(f"llama_ffi declares `{name}`, which the pinned header does not declare")
@@ -273,7 +293,10 @@ def compare(ffi_text, header_text):
                 return b
             # An int-represented enum (`enum llama_pooling_type`) is declared as `i32` in Rust: compared by the fact that
             # both sides are a 4-byte integer, which is the only property a caller can rely on.
-            same_kind = kind(hb) == kind(rb) or (hb.startswith("name:") and rb in {"i32", "u32"})
+            # A C `enum` is int-represented, so declaring it as `i32` mirrors it; `u32` does not — signedness is part of the
+            # shape, and a negative enumerator would arrive reinterpreted. Tight on purpose: this is the one place the fence
+            # could otherwise wave through a real difference.
+            same_kind = kind(hb) == kind(rb) or (hb.startswith("name:") and rb == "i32")
             # Declaring `*const` where C takes a non-const pointer is stricter, not looser: safe for the read-only queries
             # here, and named as a note so a future pin that turns one into a writer shows up as a line in the log.
             return same_kind and (hc == rc or (rc and not hc))
@@ -303,18 +326,27 @@ def compare(ffi_text, header_text):
                             + (f"; return header {got[0]}, Rust {want_ret}" if ret_bad else "")
                             + (f"; {detail}" if detail else ""))
 
-    for name in [m.group(1) for m in STRUCT_IN_RUST.finditer(ffi_text)]:
+    structs_compared = structs_opaque = 0
+    for name, is_repr_c in mirrored_structs(ffi_text):
+        if not is_repr_c:
+            problems.append(f"struct {name}: mirrored without `#[repr(C)]` — field order is the compiler's guess, not the C layout")
+            continue
         n_rust = rust_struct_fields(ffi_text, name) or 0
         fields = c_struct_fields(header_text, name)
         if fields is None:
             skipped.append(f"struct {name}: opaque in the header (held by pointer only) — layout not compared")
+            structs_opaque += 1
             continue
         n_c = len(fields)
         if n_c != n_rust:
             problems.append(f"struct {name}: {n_rust} field(s) declared, header has {n_c}")
         else:
             compared += 1
-    return problems, compared, skipped, notes
+            structs_compared += 1
+    return problems, compared, skipped, notes + [
+        f"struct coverage: {len(mirrored_structs(ffi_text))} mirrored, {structs_compared} field-compared, "
+        f"{structs_opaque} opaque-by-handle"
+    ]
 
 
 def pinned_headers(root):
@@ -453,6 +485,20 @@ extern "C" {
             cases.append(f"planted {label} is named")
         else:
             failures.append(f"planted {label} not caught: {problems}")
+
+    derived = ffi.replace("#[repr(C)]\npub struct llama_batch {", "#[repr(C)]\n#[derive(Debug, Copy, Clone)]\npub struct llama_batch {")
+    problems, _, _, notes = compare(derived.replace("    pub logits: *mut i8,\n}", "}"), header)
+    if any("field(s) declared" in pr for pr in problems):
+        cases.append("a struct with a derive between `#[repr(C)]` and `pub struct` is still compared")
+    else:
+        failures.append(f"a derived struct escaped the field check: {problems}")
+
+    noattr = ffi.replace("#[repr(C)]\npub struct llama_batch {", "pub struct llama_batch {")
+    problems, _, _, _ = compare(noattr, header)
+    if any("without `#[repr(C)]`" in pr for pr in problems):
+        cases.append("a mirrored struct missing `#[repr(C)]` is named")
+    else:
+        failures.append(f"a struct without repr(C) passed silently: {problems}")
 
     # An opaque struct must be reported as not compared, never counted as a pass.
     _, _, skipped, _ = compare(ffi + '\n#[repr(C)]\npub struct llama_model {\n    pub phantom: u8,\n}\n', header)
