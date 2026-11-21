@@ -10,7 +10,7 @@
 //!   headings, tags and words (`crate::parse::prose_lines`), so this module cannot have its own
 //!   opinion about where prose ends. A link written inside a code sample is an example, not a claim
 //!   about the corpus.
-//! - **Neither does an inline code span** (**issue #14**; `mask_code_spans`, private, so named rather than linked). The
+//! - **Neither does an inline code span** (`mask_code_spans`, private, so named rather than linked). The
 //!   sentence above is the reason this one
 //!   exists: `` `[in-code](zzz-missing.md)` `` shows a reader what a link looks like, and until it was skipped such a
 //!   span contributed a real edge — in the reporting case, the only entry in `unresolved_targets`, an unresolved link the
@@ -87,7 +87,7 @@ pub struct RawLink {
 /// Five cases produce **no row at all**, each because there is nothing in the corpus to point at:
 ///
 /// - anything inside a ``` fenced region, including the fence lines themselves;
-/// - anything inside an inline code span (**issue #14**);
+/// - anything inside an inline code span;
 /// - a destination with no extension (`[text](relative-path)`), and a target left empty by the
 ///   strips (`[[]]`, `[x](#anchor)`, `[x]()`);
 /// - a destination that leaves the workspace: anything with a scheme before its first `:`
@@ -106,7 +106,7 @@ pub struct RawLink {
 pub fn extract_links(raw: &str) -> Vec<RawLink> {
     let mut found: Vec<RawLink> = Vec::new();
     for (number, text) in prose_lines(raw, 1) {
-        // **Code spans are masked, not skipped by a second pass** (**issue #14**): the scanner below answers bracket
+        // **Code spans are masked, not skipped by a second pass**: the scanner below answers bracket
         // questions with whole-line precomputation, so a span has to be removed before that happens or its brackets
         // still take part in the pairing.
         scan_line(&mask_code_spans(text), number, &mut found);
@@ -114,7 +114,7 @@ pub fn extract_links(raw: &str) -> Vec<RawLink> {
     found
 }
 
-/// Blank out every inline code span on one line, delimiters included (**issue #14**).
+/// Blank out every inline code span on one line, delimiters included.
 ///
 /// Spaced rather than sliced because this scanner works in byte offsets into the line it was handed: replacing each
 /// byte of a span with U+0020 keeps every offset, every character boundary and the line number untouched, so the only
@@ -326,7 +326,7 @@ fn wikilink(inner: &str) -> Option<(String, LinkKind)> {
 /// The target and kind of a markdown destination, or nothing when it names no file of the corpus.
 fn markdown_target(destination: &str) -> Option<(String, LinkKind)> {
     let written = strip_title(destination.trim());
-    // **An angle-bracketed destination** (**issue #14**): CommonMark wraps a destination in `<…>` precisely so it may
+    // **An angle-bracketed destination**: CommonMark wraps a destination in `<…>` precisely so it may
     // contain spaces, and every other thing this function strips — title, fragment, query, `./`, a leading `/` — was
     // cut around a wrapping that never got unwrapped. That misclassified the link twice over: `extension()` read the
     // last dot of `<a note.md>` as `md>`, so an attachment row took the place of a note row, and both lookup steps that
@@ -439,7 +439,7 @@ fn is_attachment(extension: &str) -> bool {
 /// Source and destination are [`RelPath`]s, not display strings. Placement still works on text (see
 /// [`resolve`]'s order), but the answer has to name **which row** it landed on: two live rows can spell one
 /// display path identically, and a link written against that text would otherwise be stored against whichever
-/// note the id lookup happened to reach (F13 §3).
+/// note the id lookup happened to reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLink {
     /// The note the link was written in.
@@ -457,7 +457,7 @@ pub struct ResolvedLink {
 ///
 /// `corpus` is the map a scan builds — `case_key` → every live path carrying that fold — and `links`
 /// one `(src, links)` entry per note, so a resolved list needs no second pass to know who wrote
-/// each link. **The matching stays display text end to end** (F13 §4.1: an author names a title, not a byte
+/// each link. **The matching stays display text end to end**: an author names a title, not a byte
 /// sequence); what the byte key in each [`RelPath`] decides is only which row a placed target writes.
 /// Each target is placed in exactly this order:
 ///
@@ -476,7 +476,7 @@ pub struct ResolvedLink {
 /// `[[notes/a.md]]` or `[text](notes/a.md)` is exact and wins over the ambiguity — which is what a
 /// later report should suggest next to an unresolved target. The exception is a pair differing only in case:
 /// every spelling of `Ämli.md` folds the same as every spelling of `ämli.md`, so no amount of qualifying places
-/// either, and those targets stay unresolved by design (§3 accepts this rather than picking). An unknown target is unresolved the same
+/// either, and those targets stay unresolved by design: ambiguity is accepted rather than picked through. An unknown target is unresolved the same
 /// way, and an empty corpus resolves nothing without failing.
 pub fn resolve(
     corpus: &BTreeMap<String, Vec<RelPath>>,
@@ -506,7 +506,7 @@ fn resolve_target(
 ) -> Option<RelPath> {
     // One `case_key` lookup answers both of the first two steps: what is found here is either spelled
     // exactly as the target (step 1) or its only case variant (step 2) — but only when one path owns
-    // that fold. `files.case_key UNIQUE` is gone (F13 §3), so `Ämli.md` and `ämli.md` can both be live
+    // that fold. `files.case_key UNIQUE` is gone, so `Ämli.md` and `ämli.md` can both be live
     // rows under the same fold, and then the fold names no file: falling through to step 3 hands the
     // pair to its "held by several paths" decline instead of resolving onto whichever row the corpus
     // map happened to keep.
@@ -519,7 +519,7 @@ fn resolve_target(
     }
     // Step 3. A file name held by several paths is not resolvable by anybody's rule — and two byte-distinct
     // twins carry the *same* display name, so they are two entries here even though a reader cannot tell them
-    // apart (F13 §3: that is why the corpus lists rows rather than deduplicating on text).
+    // apart — that is why the corpus lists rows rather than deduplicating on text.
     basenames
         .get(&file_name(target).to_lowercase())
         .filter(|candidates| candidates.len() == 1)
@@ -530,7 +530,7 @@ fn resolve_target(
 /// both `beta.md` and `beta`. A `Vec` longer than one entry is what makes a target ambiguous, and
 /// a file whose name has no extension contributes one key rather than two — inserting the same
 /// path twice under one key would make it ambiguous against itself. **Do not "fix" that with a dedup on
-/// display text.** Two live rows can carry byte-identical display text (F13 §1's twins), so a dedup there
+/// display text.** Two live rows can carry byte-identical display text, so a dedup there
 /// would collapse them into one candidate and silently reopen the guess this function exists to refuse;
 /// each row is pushed as its own entry whatever its spelling.
 fn basename_index(corpus: &BTreeMap<String, Vec<RelPath>>) -> HashMap<String, Vec<RelPath>> {
@@ -564,7 +564,7 @@ const INSERT_LINK: &str = "INSERT INTO links (src_note_id, dst_note_id, kind, ta
 ///
 /// Source and destination become note ids through `notes.rel_bytes`, because a move rewrites a path and
 /// not a note — the id is what keeps a link attached across a rename ([`crate::db`]) — and because display
-/// text is no longer a spelling that names one row (F13 §3). Two kinds of
+/// text is no longer a spelling that names one row. Two kinds of
 /// destination cannot be written as an id:
 ///
 /// - a target the corpus could not place keeps `dst_note_id NULL` plus the raw [`ResolvedLink::target`],
@@ -619,7 +619,7 @@ pub fn store_links(db: &Db, links: &[ResolvedLink], origin: &str) -> Result<(), 
 ///
 /// Keyed on bytes, and read through [`db::note_ids`], which returns **every** row behind the key. Two rows on
 /// one key answer `None` here rather than a pick: this function has no report to name a duplicate in, and the
-/// write pass that owns the file has already put it in `skipped` (F13 §7). Storing an edge onto whichever row
+/// write pass that owns the file has already put it in `skipped`. Storing an edge onto whichever row
 /// a query reached first is the silent guess the same rule refuses in [`crate::scan`].
 fn note_id<'a>(
     db: &Db,
@@ -700,14 +700,14 @@ pub enum LinkScope<'a> {
     /// note as its own backlink. Every entry names both of its ends, so a client says which end it wanted by comparing
     /// `dst` to the path it asked about — no fourth key has to be invented to express it.
     ///
-    /// The path is matched on its **byte key**, like every other identity in this database (F13 §4). A caller holding a
+    /// The path is matched on its **byte key**, like every other identity in this database. A caller holding a
     /// path that came off the disk holds those bytes already; one that typed or received a spelling gets
-    /// [`RelPath::from_display`], which is F13's documented rule for text-only callers and inherits its residual: two live
+    /// [`RelPath::from_display`], the documented route for text-only callers, and it inherits that route's residual: two live
     /// rows whose raw names differ where UTF-8 cannot round-trip are addressed by their display spelling, not apart.
     Note(&'a RelPath),
 }
 
-/// The stored link graph, spelled in display paths (**issue #2**).
+/// The stored link graph, spelled in display paths.
 ///
 /// `np` computes the whole graph on every scan and had no read for any of it: an application wanting a backlinks pane
 /// could re-parse every note with its own link parser — whose idea of a wikilink drifts from np's in ways no test can
@@ -738,7 +738,7 @@ pub enum LinkScope<'a> {
 /// channels print this list and a pane that reshuffles between two identical scans is indistinguishable from a bug.
 pub fn listing(db: &Db, scope: LinkScope<'_>) -> Result<LinkListing, DbError> {
     // One statement for both scopes rather than two texts that can drift: the only difference is the subject predicate,
-    // and a reader comparing the two should see the shared half once. The join is on `rel_bytes` throughout (F13 §3) —
+    // and a reader comparing the two should see the shared half once. The join is on `rel_bytes` throughout —
     // matching or ordering on display text would cross-join a pair of live rows that spell themselves identically.
     // The scope clause goes **before** the `ORDER BY`, which is why the two halves are named apart rather than one string
     // with a suffix appended: the first version of this appended `AND …` onto a statement that already ended in
