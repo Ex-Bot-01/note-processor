@@ -2,7 +2,7 @@
 
 Command (one process, `--test-threads=1`, ~9.4 min for all three cases each time):
 
-    NP_TEST_MODEL_PATH=/home/agent/models/embeddinggemma-2-Q8_0.gguf \
+    NP_TEST_MODEL_PATH=$HOME/models/embeddinggemma-2-Q8_0.gguf \
       cargo test -p np-core --features local-model --test local_corpus -- --nocapture --test-threads=1
 
 Host: 16-core x86_64 Linux, CPU-only. `MemTotal: 7597988 kB`, `MemAvailable: ~5,750,000 kB` at run time (printed by the

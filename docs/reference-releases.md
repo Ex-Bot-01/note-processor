@@ -3,7 +3,7 @@
 Which assets exist, what is compiled into each one, and which claims about them have never been measured. Written because a downloaded binary
     cannot tell you its own build flags, and because "it is the same version" is not the same as "it can do the same things".
 
-> *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
+> *Moved out of `README.md` on 2026-11-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
 ### Pre-built binaries
 
@@ -21,19 +21,78 @@ is. Since `v0.4.0` `.github/workflows/release.yml` builds both shipped assets by
 one build definition and CI grades it. Before that the workflow carried its own `cargo build` over a Windows/Linux/macOS matrix while
 the published files came from those scripts, and the two disagreed about features: an asset CI produced could not embed although the
 page said it could (**F40**). Hosted runners are also metered, so when an account is out of included minutes no release can be built
-there at all (`docs/ops-actions-minutes.md`); a locally packaged release carries **the one platform the packager was standing on**,
+there at all (`docs/developing.md`); a locally packaged release carries **the one platform the packager was standing on**,
 and its notes say so. Source builds need no CI and no minutes:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.5.1 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.6.0 -p np-cli --locked
 ```
 
 A source build is the only shape you can choose features on: `--features local-model` puts the inference runtime in the binary, and adding
 `,vision` adds figure encoding. Neither is needed to index or to search by keyword.
 
-**Current release: `v0.5.1` (2026-11-15).** A patch, and the kind of patch that is not cosmetic: it fixes two things a client could not work
-around, and adds nothing a parser can see. The protocol stays **1**, no new method and no new key appears, and `np embeddings enable` at a
-terminal writes byte-identical bytes to what 0.5.0 wrote.
+**Current release: `v0.6.0` (2026-11-19).** Five findings from one reporter's pass over the shipped binary, each reproduced before it was
+touched. The protocol stays **1** and no method is added — but keys appear, so this is a minor release rather than a patch: a client that
+asserts an exact key list must add two names, and `INDEX.md`'s bytes change for one class of file name.
+
+- **A meanings-only search says which vectors are missing** ([#11](https://github.com/Ex-Bot-01/note-processor/issues/11)). `mode: semantic`
+  with the artifact installed and nothing embedded answered `hits: []`, `note: null`, `reason: null` — indistinguishable from "I searched
+  your notes and found nothing". New token `semantic-without-vectors`, on every door that can produce the state.
+- **A tracked attachment is counted and named** ([#12](https://github.com/Ex-Bot-01/note-processor/issues/12)). `scan` results carry
+  `attachments` (exact) and `attachment_examples` (up to five paths), and the terminal summary gains a line when the count is non-zero. Five
+  files scanned, one searchable note, nothing in the report said so.
+- **An over-long body is refused at the pin** ([#13](https://github.com/Ex-Bot-01/note-processor/issues/13)). A mirror sending 500 MB under a
+  309 MB pin used to write all of it before refusing; one read buffer (1 MiB) is now the most a member can overshoot by, and the refusal says
+  "sent at least N" because a stream abandoned at 310 MB did not *end* there.
+- **Angle-bracket destinations resolve; code spans hold their links** ([#14](https://github.com/Ex-Bot-01/note-processor/issues/14)).
+  `[x](<a note.md>)` was filed as an attachment called `<a note.md>` and reported nowhere — the one silent link failure in the product. Links
+  inside backticks are no longer edges or unresolved targets.
+- **A catalog entry stays on its line** ([#15](https://github.com/Ex-Bot-01/note-processor/issues/15)). A file name containing a newline took
+  three physical lines in `INDEX.md`; brackets and parens in a name or title broke the link around it. Labels escape `[`, `]`, `\` and put
+  U+FFFD where a control character was; destinations are percent-escaped, `#` and `?` included, because both mean "inside the target".
+
+The two `v0.6.0` archives, as published (2026-11-19), measured from a fresh download of the page and confirmed by `sha256sum -c SHA256SUMS.txt`
+(which lists exactly these two names and nothing inside them):
+
+```text
+7e7b8acf292625ea2274bf6f2dfc43a263fa3b1d6fcba25f791bf2d6fa937e8a  np-0.6.0-x86_64-unknown-linux-gnu.tar.gz
+c776fc8f8f1bb71a0ca07d8c2cb9521fc6d0dc8ac3642f642a288b630b8c9d4b  np-0.6.0-x86_64-pc-windows-gnu-cross.zip
+```
+
+Inside the Windows archive, `np.exe` is 16,740,864 bytes and digests to
+`0408a191ae4f2c4df011adf30a1eb69ca4b7af51ab2e4c9771abb64b43f531ab` — prose, not `SHA256SUMS.txt`, because that file is run through
+`sha256sum -c` against files a person downloaded and must never name a file inside an archive (**v0.4.0's** mistake).
+
+Both archives came from one run of the tag ([`44582261113`](https://github.com/Ex-Bot-01/note-processor/actions/runs/44582261113)), and **no
+rehearsal was dispatched this time**, so this release adds no evidence to the Linux cross-run reproducibility claim or to the Windows
+non-claim: those stand on the three builds measured through `v0.5.1` above, and a digest pinned here is one file at one moment either way.
+The reason not to rehearse is recorded in the tag's chore commit — `release.yml` and both packaging scripts are byte-identical to the pair
+that produced `v0.5.1`'s published assets, and a rehearsal costs the same hosted minutes as the run that publishes.
+
+**Four of the five fixes were then measured in the published Linux asset rather than in a test binary.** Downloaded, `sha256sum -c` clean,
+run against fresh `XDG_*` directories: `np --version` → `np 0.6.0`; an `initialize` handshake answering
+`"features":{"fetch":true,"local_model":true,"vision":false}` — the check **F40** exists to make, that the shipped file really carries the
+runtime its own release page promises; a four-file `scan` reporting `"attachments":2,"attachment_examples":["plan.org","scratch.txt"]`
+(**#12**) in the same session as a `"mode":"semantic"` search answering `"reason":"semantic-without-vectors"` (**#11**); a three-note vault
+whose `INDEX.md` entries came out escaped, one per note (**#15**); and `[angle](<a note.md>)` producing `→1` on the source note and `←1` on
+the file with a space in its name, with `"unresolved_links":0` (**#14**). What was *not* measured: this binary never ran on a machine whose
+CPU stops at SSE4.2, and nothing from the Windows archive executed anywhere — no such host here, so `np.exe` is accounted for as bytes only.
+
+`.text`, counted over both published Linux assets with one command (`objdump -d --section=.text | grep -oE '%(zmm|ymm)[0-9]+'`): **zero
+`%zmm` and 11,154 `%ymm` on `v0.5.1` and on `v0.6.0` alike** — same instruction-set floor, unchanged by this round. That count is not
+comparable with the "4,940 `%ymm`" printed in the `v0.5.1` entry above, whose command was not recorded; what the pair establishes is that one
+command gives one number for both releases.
+
+**What a client must do.** Add `attachments` and `attachment_examples` to any exact-key assertion over a `scan` result — absence now means
+"built before 0.6.0", which is not zero. Handle `reason: "semantic-without-vectors"`. And expect `INDEX.md` bytes to change once, on the first
+scan after upgrading, for vaults holding a name with a newline, bracket, paren, `#`, `?` or `<`.
+
+**What is not in it.** The other half of #12 — making `.txt` and friends *searchable* rather than counted — needs a decision about where a
+text file's title comes from, so it stays an open design card. See [`todo.md`](../todo.md).
+
+**`v0.5.1` (2026-11-15).** A patch, and the kind of patch that is not cosmetic: it fixes two things a client could not work around, and adds
+nothing a parser can see. The protocol stayed **1**, no new method and no new key appeared, and `np embeddings enable` at a terminal writes
+byte-identical bytes to what 0.5.0 wrote.
 
 - **A write made over `np serve` now records the method that made it** ([#10](https://github.com/Ex-Bot-01/note-processor/issues/10)). On 0.5.0
   both doors — the terminal and the pipe — wrote ``# note-processor set by `np embeddings enable <id>` …``, so a config file edited over stdin

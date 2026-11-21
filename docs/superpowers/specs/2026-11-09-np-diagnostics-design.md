@@ -1,6 +1,6 @@
 # Diagnostics: a debug window into `np` for people building on it
 
-**Status: approved 2026-12-10** (operator; the settled points are recorded at the end and supersede anything above that conflicts). Purpose decided by the operator: *debugging while implementing the frontend* —
+**Status: approved 2026-11-09** (operator; the settled points are recorded at the end and supersede anything above that conflicts). Purpose decided by the operator: *debugging while implementing the frontend* —
 "when something fails and what fails." Everything below serves that; fleet observability is explicitly out.
 
 ## Why
@@ -114,7 +114,7 @@ bytes (they are pinned by tests) and are emitted through the new path at `info`.
 - Whether `np/diagnostic` ships in the first cut; it is separable and may be deferred without weakening anything above.
 - File rotation: none initially; document that the file grows and deleting it is safe.
 
-## Decisions settled at approval (2026-12-10)
+## Decisions settled at approval (2026-11-09)
 
 A builder check surfaced eight under-specified points. Six were settled here as the author's calls; two went to the operator and are
 recorded with their answers. Where this section conflicts with the text above, **this section wins**.

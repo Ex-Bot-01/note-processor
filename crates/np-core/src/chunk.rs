@@ -1,7 +1,7 @@
 //! Chunking: cutting one note's text into the pieces a model is asked to embed.
 //!
 //! Text in, [`Chunk`] list out — no files, no database, no clock, no tokenizer, no network. This is
-//! the function design-m2-embeddings §4 describes, and its contract is asserted here before any
+//! the function this module exists to implement, and its contract is asserted here before any
 //! provider exists:
 //!
 //! - **Total and deterministic.** Every input yields a result, and the same input yields byte-identical
@@ -9,7 +9,7 @@
 //!   Unicode property lookup either (`char::is_whitespace` and friends). A blank line is four ASCII
 //!   bytes and nothing else, because a Unicode revision that reclassified one character would otherwise
 //!   move chunk boundaries without anyone changing a rule — the same reason the workspace pins
-//!   `unicode-width` exactly (F12) — and because the seam rules below stay readable from the bytes alone.
+//!   `unicode-width` exactly — and because the seam rules below stay readable from the bytes alone.
 //! - **Slice identity.** For every chunk, `&text[byte_start..byte_end] == chunk.text`, with both offsets
 //!   on char boundaries. Enforced by the [`debug_assert!`]s in [`chunk`] and pinned by `tests/chunk.rs`:
 //!   an off-by-one here silently misaligns every citation M2b writes, and a boundary through a multi-byte
@@ -20,13 +20,13 @@
 //!   non-blank lines) while it fits the bound; only a block larger than the bound is cut, and then at a
 //!   whitespace seam near the limit rather than at the limit itself.
 //! - **Disjoint, and seam-blind to fences.** Chunks never overlap one another: v1 cuts at blank lines
-//!   only, so the spec's "~350 tokens ±overlap" is not implemented here, and a fenced code block that
-//!   contains a blank line can still be split in half — §4 wants fenced regions kept whole, which needs
+//!   only, so the "~350 tokens ±overlap" sketch is not implemented here, and a fenced code block that
+//!   contains a blank line can still be split in half. Fenced regions are meant to stay whole, which needs
 //!   [`crate::parse`]'s notion of a block rather than this module's. Both belong with the tokenizer-aware
 //!   cut that bumps [`CHUNKER_VERSION`], where they change every row and so announce themselves.
 //! - **Stable under local edits.** A same-length edit changes the text of the chunks covering it and
 //!   leaves every other chunk's offsets and bytes alone (`tests/chunk.rs` asserts both halves), which is
-//!   what lets §5 re-embed only what moved.
+//!   what lets a re-run embed only what moved.
 //!
 //! ## Why the domain is the decoded text, not the file
 //!
@@ -36,7 +36,7 @@
 //! `frontmatter_is_part_of_the_text_being_cut`, and backlog D2 for the decision that has to happen before anything
 //! embeds. File offsets are the tempting
 //! choice and they are a trap: `crate::hash` digests the **raw bytes on disk**, BOM included, so the two
-//! spellings differ for exactly the corpus F13/F18/F20/F23 refuse to key by — every BOM'd Windows export
+//! spellings differ for exactly the corpus that byte keys, lossless names and byte identity exist for — every BOM'd Windows export
 //! and every non-UTF-8 note. Offsets into the file would therefore mean one thing for ordinary notes and
 //! another for the lossy ones, in a table with no column to say which is which. Offsets into the decoded
 //! text mean the same thing everywhere, because they index the bytes that were actually embedded. The
@@ -48,25 +48,25 @@
 //!
 //! Chunk text comes from stored note bytes, so a CRLF↔LF rewrite by an editor or a sync client moves
 //! every offset in the file and re-embeds the whole note — worst case all ~18k chunks of one language,
-//! against spec §"Linux **and** Windows: … line endings … differ". Normalising line endings before
+//! platforms disagree about line endings, and this program is expected to run on both. Normalising line endings before
 //! chunking is the obvious fix and it is refused: `byte_start`/`byte_end` would then index a string
 //! nobody has, which breaks the slice identity above, and a citation resolved through them would point at
 //! text the file does not contain. The bytes that get embedded have to be the bytes a reader can go and
 //! look at, so the churn is paid instead of laundered — written here so a Windows user's second scan is
-//! not filed as a bug (design-m2-embeddings §4).
+//! not filed as a bug.
 
-/// Which chunking code produced a row, stored in `chunks.chunker` (design-m2-embeddings §3).
+/// Which chunking code produced a row, stored in `chunks.chunker`.
 ///
 /// Stamped per row rather than assumed globally, so a bump makes old rows *identifiable* instead of
 /// merely presumed stale: staleness stays `chunker = CHUNKER_VERSION AND source_hash matches`, and the
-/// tokenizer-aware cut §4 promises can land as version 2 without invalidating what version 1 wrote.
+/// tokenizer-aware cut can land as version 2 without invalidating what version 1 wrote.
 /// `i64` because that is what an SQLite `INTEGER` column binds and reads back.
 pub const CHUNKER_VERSION: i64 = 1;
 
 /// The hard byte bound every chunk obeys, and the number [`chunk`] measures its tolerance against.
 ///
 /// **Why 1800.** The spec (`spec:223`) puts the target at "~350 tokens ±overlap", and tokens need a tokenizer
-/// this milestone does not have (§4), so the bound is stated in bytes and picked to put the corpus's
+/// this milestone does not have, so the bound is stated in bytes and picked to put the corpus's
 /// common case near that target: prose here is mostly German and English running ~4 ASCII bytes per
 /// subword token, which places 350 tokens at ~1400 bytes, and 1800 is the next round step up. The
 /// headroom over 1400 is not slack about the target, it is seam quality — a bound sitting just below a
@@ -74,7 +74,7 @@ pub const CHUNKER_VERSION: i64 = 1;
 /// worse than one ending short. Two consequences belong to the number rather than to the implementation:
 /// - chunks near the bound sit roughly **25-30% above** the token target — deliberate seam headroom, and the reason
 ///   this constant will be replaced by a tokenizer rather than tuned toward correctness. The "~4 ASCII bytes per
-///   subword token" figure above is an **unmeasured estimate**, pending §6's real corpus; treat 1400 as arithmetic
+///   subword token" figure above is an **unmeasured estimate**, awaiting a real corpus measurement; treat 1400 as arithmetic
 ///   on that estimate, not as a measurement of this vault; and
 /// - a CJK- or emoji-dense note (3 bytes per character, ~1 token per character) can reach well past 350 tokens,
 ///   because **a byte bound cannot be a token bound** — which is exactly why this constant gets replaced by the
@@ -90,7 +90,7 @@ const _: () = assert!(
     "one window has to hold the longest UTF-8 sequence"
 );
 
-/// One embeddable piece of one note, in the shape `chunks` rows store (§3).
+/// One embeddable piece of one note, in the shape `chunks` rows store.
 ///
 /// `text` is the slice, not a re-spelling of it — see the module doc's slice identity. `ordinal` is
 /// `u32` because it counts positions within one note, and 4 billion chunks of one note would be ~7 TB of

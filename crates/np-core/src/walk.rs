@@ -17,11 +17,11 @@ use crate::index_names;
 use crate::path_keys;
 
 /// Paths of this many characters or more need the Windows extended-length prefix
-/// (spec §11: `\\?\` above 260 chars).
+/// (Windows needs the `\\?\` prefix once a path reaches this length).
 const LONG_PATH_CHARS: usize = 260;
 /// Windows extended-length path prefix.
 const WINDOWS_PREFIX: &str = r"\\?\";
-/// Regenerated compressed copies live here; derived output, never an input (spec §7).
+/// Regenerated compressed copies live here; derived output, never an input.
 const PROCESSED_DIR: &str = "processed";
 /// Markdown extension, matched against the already-lowercased `rel`. Whether a name is one of the catalog
 /// files this program writes is a different question, and [`crate::index_names`] answers it.
@@ -47,17 +47,17 @@ pub enum WalkError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredFile {
     /// The identity of this path: the OS bytes of the `/`-separated relative path, no leading
-    /// `./`. Every later stage keys on these bytes (F13 §4.1), so a name holding a byte UTF-8 cannot
+    /// `./`. Every later stage keys on these bytes, so a name holding a byte UTF-8 cannot
     /// represent stays two distinct files instead of collapsing into one lossy string.
     pub rel_bytes: Vec<u8>,
     /// [`path_keys::case_fold`] of `rel_bytes`: the ASCII-case identity guard that still reports
     /// `a.md` beside `A.md` as one file on a case-sensitive filesystem.
     pub case_bytes: Vec<u8>,
     /// Display spelling of the relative path: `rel_bytes` decoded with replacements. Reports and the
-    /// catalog render this; nothing uses it to decide which file a row is (F13 §3).
+    /// catalog render this; nothing uses it to decide which file a row is.
     pub rel: String,
-    /// `rel` lowercased — the Unicode display fold link resolution matches an author's target against
-    /// (spec §11). Not an identity: two live rows may share it.
+    /// `rel` lowercased — the Unicode display fold that link resolution matches an author's target
+    /// against. Not an identity: two live rows may share it.
     pub case_key: String,
     /// The real OS path, byte-exact even when `rel` had to be decoded lossily.
     /// This is what [`to_open_path`] turns into an argument for `open()`.
@@ -70,7 +70,7 @@ pub struct DiscoveredFile {
     /// The OS's durable identity for this file — device and inode on Unix, `None` everywhere else — read from
     /// the same metadata call that produced [`DiscoveredFile::size`] and [`DiscoveredFile::mtime`], so capturing
     /// it costs no extra stat. Opaque bytes, never interpreted, never rendered; `None` means unknown rather
-    /// than different (`docs/design-a4-file-identity.md` §2).
+    /// than different.
     pub file_id: Option<Vec<u8>>,
     /// Whether the name ends in `.md`, matched case-insensitively. Non-markdown
     /// files are still tracked: they get a registry row and can be link targets.
@@ -81,7 +81,7 @@ pub struct DiscoveredFile {
 #[derive(Debug, Clone, Default)]
 pub struct WalkOptions {
     /// Extra names to leave out at every depth. Matched case-insensitively, because
-    /// these come from user config and Windows path comparison folds case (spec §11);
+    /// these come from user config and Windows path comparison folds case;
     /// the built-in exclusions stay exact-case, since this program writes those names.
     pub extra_excludes: Vec<String>,
 }
@@ -91,7 +91,7 @@ pub struct WalkOptions {
 ///
 /// The entries [`crate::walk`] builds take both spellings from **one** component walk
 /// ([`crate::path_keys::rel_bytes` through [`normalize_rel`]), so a path cannot be matched by one spelling and
-/// named by another (F13 §4.1). Keeping them apart is what F20 is about: two directories whose names differ only
+/// named by another. Keeping them apart is the point of the byte key: two directories whose names differ only
 /// in bytes UTF-8 cannot hold — `caf\xE9/` beside `caf\xE8/` — share one display spelling, so a filter that
 /// matched on `display` would let the unreadable twin hide the readable one. `UnknownPath::from_display` is the
 /// one constructor with no component walk to borrow, and it says what its fields hold instead.
@@ -107,7 +107,7 @@ pub struct UnknownPath {
     /// display text (`U+FFFD` included) and can say nothing about which twin a row is.
     ///
     /// That asymmetry is why the report's merged [`crate::ScanReport::skipped`] list must never be handed to a
-    /// matcher: it mixes both kinds, and matching a text-only entry against a byte-keyed row is F20 §1 all over
+    /// matcher: it mixes both kinds, and matching a text-only entry against a byte-keyed row is the old collapse all over
     /// again — one `U+FFFD` spelling hiding the path whose bytes differ. Only [`Walked::unreadable`] and
     /// [`Walked::unrepresentable`] are spellings of paths this walk saw.
     pub bytes: Vec<u8>,
@@ -140,10 +140,10 @@ pub struct Walked {
     /// than naming each file inside it. A reason is deliberately not part of this type: the report names the
     /// path either way, and what a caller must do is identical. Matching is by [`UnknownPath::bytes`] and
     /// printing by [`UnknownPath::display`], because two byte-distinct directories can share one display
-    /// spelling (F20).
+    /// spelling.
     pub unreadable: Vec<UnknownPath>,
     /// Paths of **files whose own name** the byte key cannot hold — on Windows, a name carrying an unpaired
-    /// surrogate, which `path_keys::name_is_lossless` refuses (F18). They are left out of [`Walked::files`]
+    /// surrogate, which `path_keys::name_is_lossless` refuses. They are left out of [`Walked::files`]
     /// rather than indexed under a key two different names may share.
     ///
     /// The two lists answer the same question and differ only in what they name and how wide a hole they cut:
@@ -154,7 +154,7 @@ pub struct Walked {
     /// [`mod@crate::scan`] names every entry in [`crate::ScanReport::skipped`] and keeps the row each path
     /// already has. Empty on Unix, where `os_bytes` is exact and no name can fail the test. Matched by
     /// [`UnknownPath::bytes`], printed by [`UnknownPath::display`] — which is why two refused twins publish
-    /// two report lines rather than one (F20).
+    /// two report lines rather than one.
     pub unrepresentable: Vec<UnknownPath>,
 }
 
@@ -165,7 +165,7 @@ pub struct Walked {
 /// recorded, so a link back to a parent directory cannot loop and a link to a file is
 /// never counted as a second copy of its target. `INDEX.md`, `INDEX-<range>.md`,
 /// `processed/`, dot-files and dot-directories stay out; the catalog names only at the
-/// root, which is where they are written (spec §7).
+/// root, which is where they are written.
 ///
 /// `root` must be a readable directory: missing, unreadable and non-directory roots
 /// all fail as [`WalkError::Root`], because returning an empty list for them would
@@ -175,7 +175,7 @@ pub struct Walked {
 /// vanishes mid-walk (deleted, permission revoked) is skipped so one bad file cannot
 /// lose the walk.
 ///
-/// A path whose **own name** cannot survive the byte spelling ([`crate::path_keys`] refuses it, F18) is not
+/// A path whose **own name** cannot survive the byte spelling ([`crate::path_keys`] refuses it) is not
 /// indexed: it is left out of [`Walked::files`], because indexing it would mean keying it by a lossy spelling
 /// another live name may already hold. A refused **file** is named in [`Walked::unrepresentable`]; a refused
 /// **directory** is never entered at all — its name is the first component of every path below it, so nothing
@@ -274,7 +274,7 @@ fn walk_with_predicate(
     //
     // Both rules read [`UnknownPath::bytes`], never `display`: byte order is the deterministic one, and two
     // byte-distinct paths that share a display spelling are **two** entries — deduping them by text would put
-    // the report back in the position of naming one path where the disk holds two (F20 §1).
+    // the report back in the position of naming one path where the disk holds two.
     unreadable.extend(refused_dirs);
     let mut unrepresentable = refused_files;
     for list in [&mut unreadable, &mut unrepresentable] {
@@ -288,7 +288,7 @@ fn walk_with_predicate(
     })
 }
 
-/// Which half of F18's refusal an entry falls under, if any.
+/// Which half of the lossless-name refusal an entry falls under, if any.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     /// A **file** whose own name cannot be spelled. One path, so the report names exactly that path and the
@@ -303,7 +303,7 @@ enum Refusal {
 
 /// The walk's per-entry refusal decision, taken before anything is keyed.
 ///
-/// F18's rule: a name the byte spelling cannot hold would take its key from U+FFFD, and the row lookup would
+/// The rule this enforces: a name the byte spelling cannot hold would take its key from U+FFFD, and the row lookup would
 /// then rewrite whichever twin already owns that key. Never index it — name it, and let the scan keep the row
 /// it has. Always `None` on Unix, where the OS bytes are the key (`crate::path_keys::name_is_lossless`).
 fn refusal(entry: &DirEntry, lossless: fn(&OsStr) -> bool) -> Option<Refusal> {
@@ -337,7 +337,7 @@ fn unreadable_path(dir: &Path, root: &Path) -> UnknownPath {
 }
 
 /// [`UnknownPath`] for one path relative to the workspace root, both spellings from a single [`normalize_rel`]
-/// call (F13 §4.1).
+/// call, so one walk produces both.
 ///
 /// A path that normalises to empty — the root itself, or anything whose components are all `CurDir` — spells
 /// `"."` in **both** fields rather than empty ones. That is a constraint, not a cosmetic choice: both report-side
@@ -359,8 +359,8 @@ fn unknown_path(os: &Path) -> UnknownPath {
 ///
 /// `CurDir` components are dropped, so the workspace root itself normalises to empty in every column;
 /// input is expected to be relative to that root. The byte key and the display text come out of **one**
-/// component walk (F13 §4.1 takes `to_string_lossy` out of the middle of it rather than adding a second
-/// pass), so a path cannot be keyed by one spelling and reported by another.
+/// component walk (`to_string_lossy` is kept out of the middle of it rather than run as a second pass),
+/// so a path cannot be keyed by one spelling and reported by another.
 pub fn normalize_rel(os: &Path) -> (Vec<u8>, String, String) {
     let mut names: Vec<&OsStr> = Vec::new();
     for component in os.components() {
@@ -379,7 +379,7 @@ pub fn normalize_rel(os: &Path) -> (Vec<u8>, String, String) {
 
 /// Path spelling to hand to `open()` and friends. Identity everywhere except
 /// Windows, where a long path gets the extended-length prefix so `MAX_PATH` cannot
-/// truncate it (spec §11). Every file open in this crate goes through here.
+/// truncate it. Every file open in this crate goes through here.
 #[cfg(not(windows))]
 pub fn to_open_path(abs: &Path) -> PathBuf {
     abs.to_path_buf()
@@ -387,7 +387,7 @@ pub fn to_open_path(abs: &Path) -> PathBuf {
 
 /// Path spelling to hand to `open()` and friends. Identity everywhere except
 /// Windows, where a long path gets the extended-length prefix so `MAX_PATH` cannot
-/// truncate it (spec §11). Every file open in this crate goes through here.
+/// truncate it. Every file open in this crate goes through here.
 #[cfg(windows)]
 pub fn to_open_path(abs: &Path) -> PathBuf {
     PathBuf::from(long_prefix(&abs.to_string_lossy(), true))
@@ -438,7 +438,7 @@ fn record(entry: &DirEntry, root: &Path) -> Option<DiscoveredFile> {
     let meta = entry.metadata().ok()?;
     let abs = entry.path().to_path_buf();
     let (rel_bytes, rel, _display) = normalize_rel(abs.strip_prefix(root).unwrap_or(&abs));
-    // Both folds through `path_keys` rather than locally (F13 §4): `case_bytes` is the ASCII byte fold
+    // Both folds come from `path_keys` rather than a local one: `case_bytes` is the ASCII byte fold
     // that guards identity and `case_key` the Unicode display fold link resolution reads, and this walk
     // is the one place either is derived — neither is ever written without the other.
     let case_bytes = path_keys::case_fold(&rel_bytes);
@@ -462,7 +462,7 @@ fn record(entry: &DirEntry, root: &Path) -> Option<DiscoveredFile> {
 ///
 /// The byte key is what makes this total on its own. Comparing display `rel` needed an `abs` tie-break,
 /// because two different raw names decode to one lossy `rel` and their order then fell to whichever path
-/// was read last (F13 §1). Byte keys cannot tie, so the absolute path is no longer part of the answer.
+/// was read last. Byte keys cannot tie, so the absolute path is no longer part of the answer.
 fn sort_found(found: &mut [DiscoveredFile]) {
     found.sort_by(|a, b| {
         a.case_key
@@ -496,7 +496,7 @@ fn file_identity(meta: &fs::Metadata) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Windows and every other platform report **unknown**, deliberately and for now (design-a4 §2). NTFS has the
+/// Windows and every other platform report **unknown**, deliberately and for now. NTFS has the
 /// equivalent in `VolumeSerialNumber` + `FileId`, but reaching it needs a syscall crate and — the part that
 /// actually decides — a fixture run on a Windows host with its evidence recorded, because a feature that reads
 /// `None` there passes every test either way. Green Windows CI is proof of *inert*, not of support.
@@ -535,7 +535,7 @@ mod tests {
     ];
 
     /// The name prefix [`refuse_that_name`] refuses — a stand-in for the unpaired surrogate that only Windows
-    /// can put into a directory entry (F18). Two words are refused so one tree can hold both shapes: the
+    /// can put into a directory entry. Two words are refused so one tree can hold both shapes: the
     /// directory `refused-dir` and the file `refused-file.md`.
     const REFUSED: &str = "refused";
 
@@ -555,7 +555,7 @@ mod tests {
     /// The bytes here are the text's own `str::as_bytes`, with no key rule between — deliberately not named like
     /// `scan::tests::display_keyed_unknown`, which routes the same text through
     /// [`crate::path_keys::rel_bytes_of_display`] to stand for a **stored row key**. Equal results, different
-    /// provenance: this is what [`crate::walk`] records on the platform that refuses names (F18), where an entry's
+    /// provenance: this is what [`crate::walk`] records on the platform that refuses names, where an entry's
     /// bytes already are its lossy text.
     fn unknown_from_text_bytes(display: &str) -> UnknownPath {
         UnknownPath {
@@ -577,7 +577,7 @@ mod tests {
         tmp
     }
 
-    /// The refused-directory half of F18's refusal, which no filesystem here can express as a name.
+    /// The refused-directory half of the lossless-name refusal, which no filesystem here can express as a name.
     ///
     /// A directory named with an unpaired surrogate used to be descended: its children keyed as
     /// `dir\u{fffd}/n.md`, so two such directories — or one beside a directory literally named U+FFFD — shared
@@ -623,7 +623,7 @@ mod tests {
     /// A refusal is recorded by **path**, not by file name. Every other refusal fixture puts the refused
     /// directory at depth 1, where the two spellings coincide — so a `rel` built from `file_name()` instead of
     /// `strip_prefix(root)` would pass them all and then hide the wrong subtree the moment a real workspace
-    /// nested one (F18 review).
+    /// nested one.
     #[test]
     fn a_refused_directory_is_recorded_by_its_path_not_its_file_name() {
         let tmp = tree(&["deep/refused-dir/x.md", "refused-dir/y.md", "kept.md"]);
@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn sort_is_total_when_lossy_names_collide() {
-        // F13 §1's collision, built so the collision is *inside* the fixture: 0xFF and the UTF-8 encoding
+        // The lossy-decode collision, built so the collision is *inside* the fixture: 0xFF and the UTF-8 encoding
         // of a literal replacement character both spell `we\u{fffd}.md`, so their display `rel` and their
         // `case_key` are the same string and `case_key` cannot decide this order. Every other field is
         // deliberately identical too — same `abs`, same size, same mtime — which leaves `rel_bytes` as the

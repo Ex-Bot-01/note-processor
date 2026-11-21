@@ -1,6 +1,6 @@
 //! The published diagnostics vocabulary: the targets an event can name and the rule tokens it can report.
 //!
-//! Design: `docs/superpowers/specs/2026-12-10-np-diagnostics-design.md` §1 (contract), §4 (levels), §12 (privacy).
+//! Three things bind this vocabulary: it is a contract, its levels are bounded, and it never names an origin.
 //! This module holds **names only** — no formatting, no sink, no subscriber. Choosing a subscriber and writing to
 //! stderr or a file is np-cli's job ([`np_cli::diag`](../../np_cli/diag/index.html)); np-core emits events against the
 //! names here and nothing else, which is what lets a library embed in a process that has its own logging.
@@ -9,7 +9,7 @@
 //!
 //! A rule token is an interface: an integrator's alerting rule matches on it. Interfaces rot when their list lives in a
 //! document nobody edits, so `RULE_TOKENS` and `TARGETS` are what the documentation test compares the manual against
-//! (`crates/np-cli/tests/diag.rs`, plan Task 6 Step 2) and what every emitted token is checked to belong to here. Adding
+//! (`crates/np-cli/tests/diag.rs`) and what every emitted token is checked to belong to here. Adding
 //! an event without adding its token therefore fails a test, in this crate or the one that documents it.
 //!
 //! # What a rule token is *not*
@@ -23,7 +23,7 @@
 /// The ten targets, in the order the design lists them: one per module whose failures a reader needs to tell apart.
 ///
 /// A target is set with `tracing`'s `target:` field at the emission site. Filtering by target is how an operator says
-/// "only the fetcher" (`NP_LOG=fetch=debug`, plan Task 5), so the ten names are stable strings, not a module path
+/// "only the fetcher" (`NP_LOG=fetch=debug`), so the ten names are stable strings, not a module path
 /// derived from `module_path!()`: renaming a module must not silently rename a published filter.
 pub const TARGETS: [&str; 10] = [
     target::CONFIG,
@@ -67,7 +67,7 @@ pub mod target {
 /// Sites reference these constants rather than repeating literals, so a token cannot be emitted by one call site and
 /// documented under another spelling.
 pub mod rule {
-    /// A `config.toml` was refused; the command may still serve from defaults (**F35**).
+    /// A `config.toml` was refused; the command may still serve from defaults.
     pub const CONFIG_REFUSED: &str = "config-refused";
     /// Embeddings are switched off — `embeddings.provider = "none"`, or a key that names no provider.
     pub const PROVIDER_DISABLED: &str = "provider-disabled";
@@ -75,7 +75,7 @@ pub mod rule {
     pub const LOCAL_MODEL_NOT_BUILT: &str = "local-model-not-built";
     /// A row names an artifact the disk does not have.
     pub const ARTIFACT_MISSING: &str = "artifact-missing";
-    /// A transfer was allowed and attempted, and the transport said no connection (**F38**).
+    /// A transfer was allowed and attempted, and the transport said no connection.
     pub const OFFLINE: &str = "offline";
     /// Work was asked for and a run finished without producing it — arm (iv), the failure half of `np embed`.
     pub const NOT_PRODUCED: &str = "not-produced";
@@ -83,7 +83,7 @@ pub mod rule {
     pub const TOKEN_BUDGET: &str = "token-budget";
     /// An installed row's prefix no longer matches the pinned prefix, so its vectors are stale by construction.
     pub const PREFIX_DRIFT: &str = "prefix-drift";
-    /// Another writer holds this workspace and the wait expired (F44).
+    /// Another writer holds this workspace and the wait expired.
     pub const LOCKED: &str = "locked";
     /// No vectors are stored under the configured model, so the semantic half has nothing to rank.
     pub const NO_VECTORS: &str = "no-vectors";
@@ -96,7 +96,7 @@ pub mod rule {
     /// a reader that sees vectors where it saw none last run needs to know which run made them.
     pub const ARTIFACT_FETCHED: &str = "artifact-fetched";
 
-    // ---- scan: one token per reason a file on disk was not indexed (**design §1 point 4**, plan Task 4).
+    // ---- scan: one token per reason a file on disk was not indexed.
     //
     // `ScanReport::skipped` merges several of these into one list of paths, and two of them (`not-markdown`,
     // `unchanged-content`) were never in it at all: they are not failures, so prose had no reason to name them. The
@@ -108,7 +108,7 @@ pub mod rule {
     /// This scan could not read the file (permission denied, or it changed between the listing and the read). The rows
     /// it already had are kept, because unknown is not absent.
     pub const UNREADABLE: &str = "unreadable";
-    /// A name this build's byte key cannot hold — on Windows, a name carrying an unpaired surrogate (F18). Refused for
+    /// A name this build's byte key cannot hold — on Windows, a name carrying an unpaired surrogate. Refused for
     /// good, so re-running changes nothing; the fix is the filename.
     pub const UNREPRESENTABLE_PATH: &str = "unrepresentable-path";
     /// The bytes matched the stored digest, so nothing was re-parsed or rewritten. Reported at `trace`: on a warm vault
@@ -117,13 +117,13 @@ pub mod rule {
     /// A live note row sits under a directory this scan could not read, so it is hidden from the catalog rather than
     /// deleted. The directory is `unreadable`; this names the note it swallowed.
     pub const HIDDEN_BEHIND_UNREADABLE: &str = "hidden-behind-unreadable";
-    /// A stored row whose path only has a lossy spelling (F23) and which no route could account for this scan, so it
+    /// A stored row whose path only has a lossy spelling and which no route could account for this scan, so it
     /// stayed out of the catalog. The remedy is on disk: make the file listable with a lossless name.
     pub const UNRESOLVED_AMBIGUITY: &str = "unresolved-ambiguity";
     /// Another path already holds this note identity (case-folded collision), so this file kept no new rows and its
     /// existing note was left exactly as it was.
     pub const IDENTITY_TAKEN: &str = "identity-taken";
-    /// More than one note row sits on this path's key — the legacy duplicate F13 §7 refuses to guess about — so no note
+    /// More than one note row sits on this path's key — a legacy duplicate this program refuses to guess about — so no note
     /// was re-parsed and nothing about its contents was rewritten.
     pub const DUPLICATE_ROWS: &str = "duplicate-rows";
 }

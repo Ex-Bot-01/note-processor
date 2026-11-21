@@ -6,10 +6,10 @@ token (§3).
 
 ## 1. The two blockers, stated as facts
 
-**Graded CI.** Included Actions minutes ran out at `2026-11-07T01:57:05Z` (`docs/ops-actions-minutes.md`: 2,028 billed minutes
-in October, 2,137 in the first 6.4 days of November). Since then every run on `main` completes as a failure with **zero steps on
-every job** — including `42394561369` on `2777aeb`. A job that never reaches a step cannot be a code defect; the last tree CI
-actually graded is `5e368ac` (run `42325538290`, four jobs success).
+**Graded CI.** The hosted-minute allowance ran out, and every run on `main` since completes as a failure with **zero steps on
+every job**. A job that never reaches a step cannot be a code defect: nothing ran. What is graded now, and how to buy a full
+grade for one SHA, is in `docs/developing.md`; the account's plan and allowance are not recorded here because they are not this
+repository's facts to keep.
 
 **Distribution, as measured on 2026-11-07.** `.github/workflows/release.yml` built on `windows-latest`, `ubuntu-latest` and
 `macos-latest`, so it was metered like everything else and could not run. The result is the failure mode the repository warns
@@ -90,13 +90,13 @@ So both remaining fixes need either the web UI or a token with **Administration:
 
 | Route | Cost | Time to first green run | What it cannot do | Who can do it |
 | --- | --- | --- | --- | --- |
-| **A. Make the repo public** | $0 — public repos get free GitHub-hosted minutes (2,000 Linux concurrent-minutes/month on the free plan) and this repository's reshaped matrix spends ~1,800 at the current cadence (`docs/ops-actions-minutes.md` §option E arithmetic) | immediately: the next push gets steps | nothing about Windows quality is proven by a hosted runner either way (F18 stays open until someone runs it interactively) | web UI: Settings → General → Danger Zone → Change visibility. Needs Administration scope for an API call |
+| **A. Make the repo public** | $0 — public repos get free GitHub-hosted minutes (2,000 Linux concurrent-minutes/month on the free plan) and this repository's reshaped matrix spends ~1,800 at the current cadence (`docs/developing.md` §option E arithmetic) | immediately: the next push gets steps | nothing about Windows quality is proven by a hosted runner either way (F18 stays open until someone runs it interactively) | web UI: Settings → General → Danger Zone → Change visibility. Needs Administration scope for an API call |
 | **B. Self-hosted runner on this Linux box** | $0 — self-hosted runners are not metered | after registration + one push | Linux only: no Windows or macOS grading, and no hosted release matrix. **Security caveat that matters**: `pull_request` runs would execute contributor code on this machine with this machine's credentials, so keep the runner for `push`/`schedule` on `main` (or gate PRs with the "required reviewers" setting) | needs `POST …/runners/registration-token`, i.e. Actions: write |
 | **C. Buy minutes** (raise the spending limit, or GitHub Pro at $4/user/month giving 3,000 included private minutes) | ~$80/month at November's measured pace on the current matrix; ~$4/month plus scoping if Windows and both feature rows stay off `main` pushes | immediately | money is the thing being decided, so this is the human's call, not mine | billing UI |
 | **D. Wait for the monthly reset** | $0 | unknown: the reset date is unreadable at this scope; the allowance crossed on 2026-11-07, so plan on the start of the next cycle | nothing gets graded in the meantime, including release builds | nobody has to do anything |
 
 **Recommendation.** A if the vault-indexing code and its history are fit to be public — checked today: `git log -p --all` finds
-no token, key or credential pattern, and the only host-specific strings are a `/home/agent/models/…gguf` path in a comment
+no token, key or credential pattern, and the only host-specific strings are a `$HOME/models/…gguf` path in a comment
 (`crates/np-core/src/pins.rs:93`) and probe logs under `crates/np-core/tests/probes/`. If the repository must stay private, B is
 the cheapest way to get real grading on Linux, with C as the only route that restores the Windows row.
 

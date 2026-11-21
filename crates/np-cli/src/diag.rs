@@ -16,12 +16,10 @@
 //! * **A diagnostic is never the reason a command fails.** An unopenable log path warns once and carries on; a full budget
 //!   stops writing and says so in one final record; a deleted file costs records, not the run.
 //!
-//! Design: `docs/superpowers/specs/2026-12-10-np-diagnostics-design.md`.
-//!
 //! # Two phases, because configuration is itself a thing that can fail
 //!
 //! [`bootstrap`] runs before any config file is read, so the most common integrator failure — a `config.toml` with one section
-//! name one letter off (**F35**) — already has somewhere to be reported. [`apply_config`] upgrades it once the file has loaded:
+//! name one letter off — already has somewhere to be reported. [`apply_config`] upgrades it once the file has loaded:
 //! the level may change, and `[log] file` opens then. Both mutate the *same* sink through an `Arc`, because tracing's global
 //! default can be set only once; a level chosen at start-up is therefore still replaceable mid-run without a reload handle or a
 //! second subscriber.
@@ -648,7 +646,7 @@ pub(crate) fn apply_config(cfg: &Config) {
         source,
     );
     // The announce line belongs *after* configuration when the file is what chose the level: that is the first moment the answer
-    // is final. One ordering caveat is accepted rather than worked around — on Windows, **F37**'s legacy-data-dir note prints
+    // is final. One ordering caveat is accepted rather than worked around — on Windows, the legacy-data-dir note prints
     // inside `load_config`, so it can precede this line. It is a one-release notice, and both lines are stderr anyway.
 }
 
@@ -722,7 +720,7 @@ pub(crate) fn bootstrap(
     // Phase two must resolve with this string or the flag is inert (see [`Sink::flag`]).
     sink().remember_flag(flag.as_deref());
     // The `[log]` table is **peeked** here — read leniently, ignoring a file that refuses for any other reason — because the
-    // level announced on stderr has to be the answer that is *final*, and the file outranks the environment (§12 rule 7).
+    // level announced on stderr has to be the answer that is *final*, and the file outranks the environment.
     // Without the peek, `NP_LOG=trace` next to `[log] level = "info"` would announce `trace from NP_LOG` and then quietly run
     // at info: precisely the invisibility the announce line exists to remove. The second benefit is the one spec point 3 asks
     // for — a config that refuses for an unrelated reason still says where its diagnostics go.
@@ -908,7 +906,7 @@ impl Visit for Record {
     }
 }
 
-/// What a span hands to every record opened inside it (spec §"Serve": *each request span carries the JSON-RPC `id` (or
+/// What a span hands to every record opened inside it: *each request span carries the JSON-RPC `id` (or
 /// none) and the workspace path*).
 ///
 /// Only two keys are inherited — `request` and `workspace` — because those are the two a reader cannot recover from the
@@ -1099,7 +1097,7 @@ where
         let meta = event.metadata();
         let mut record = Record::default();
         event.record(&mut record);
-        // **Correlation before formatting** (spec §"Serve"): whatever the enclosing spans declared rides on this
+        // **Correlation before formatting**: whatever the enclosing spans declared rides on this
         // record, innermost first, and a field the event set itself is never overwritten — an emitter that named its own
         // workspace knows better than the span wrapped around it.
         if let Some(current) = ctx.event_span(event) {
@@ -1132,11 +1130,8 @@ mod tests {
     fn pipe() -> (std::fs::File, std::fs::File) {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: two ints that `pipe2` fills; close-on-exec keeps them out of any child this process spawns.
-        assert_eq!(
-            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
-            0,
-            "test setup: pipe2"
-        );
+        let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(created, 0, "test setup: pipe2");
         // SAFETY: both numbers are descriptors the call above just created, each adopted by exactly one owner here.
         let (read_half, write_half) = unsafe {
             (
@@ -1147,16 +1142,16 @@ mod tests {
         // SAFETY: `write_half` is live; reading its flags to add one bit changes nothing else about it.
         let flags = unsafe { libc::fcntl(write_half.as_raw_fd(), libc::F_GETFL) };
         assert!(flags >= 0, "test setup: F_GETFL");
-        assert!(
-            unsafe {
-                libc::fcntl(
-                    write_half.as_raw_fd(),
-                    libc::F_SETFL,
-                    flags | libc::O_NONBLOCK,
-                )
-            } >= 0,
-            "test setup: O_NONBLOCK"
-        );
+        // SAFETY: the same live descriptor, and the value written is the flags just read with one bit added; no other
+        // process holds a claim on this pipe's write end.
+        let set_nonblocking = unsafe {
+            libc::fcntl(
+                write_half.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        };
+        assert!(set_nonblocking >= 0, "test setup: O_NONBLOCK");
         (read_half, write_half)
     }
 

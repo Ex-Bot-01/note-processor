@@ -6,7 +6,7 @@
 > string is a contract, which is why one of the two cost a test.
 
 Status: **shipped 2026-11-09** (`aa204e0` → `3986738`, released in v0.2.2), with closure withheld because no CI run has graded it — included
-Actions minutes ran out on 2026-11-07 and the last CI-graded tree is still `5e368ac`; local grading is `/home/agent/tmp/gates-f38t6b` and later
+Actions minutes ran out on 2026-11-07 and the last CI-graded tree is still `5e368ac`; local grading is `$TMPDIR/gates-f38t6b` and later
 runs. Ruled by the human on 2026-11-08: *"I mean your app calling `np` and wanting vectors to
 simply exist."* That sentence is the requirement this document is written against — the consumer is a program, not a person at a
 terminal, so every promise below is a machine-readable one.

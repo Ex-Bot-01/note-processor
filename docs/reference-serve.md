@@ -196,6 +196,7 @@ embed that refused to write because the budget ran out is a state. They arrive i
 |---|---|---|
 | `locked: true`, `waited_ms` | another process holds the workspace write lock; nothing was changed | `scan`, `embed` results |
 | `offline: true`, `reason` | the network was tried and failed, so no artifact could be fetched | `search`, `embed` results |
+| `attachments`, `attachment_examples` | how many tracked files are **not** notes, and up to five of their paths. The count is exact even when five names cover them all; absent from a report captured before **#12** (**v0.6.0**), where absence means "this np did not count them", not zero | `scan` results |
 | `reason` | a machine token (`provider-disabled`, `local-model-not-built`, `offline`, …) explaining a degraded result. **One token per run**, which is why "not indexed" got its own key below rather than a new token here | `search`, `embed` results |
 | `vectors: false` | this workspace holds no vectors — the truth about the index, and deliberately still `true` on a run that could not use them (**F45**), so it is *not* the answer to "which half ran" | `search` results |
 | `keyword_used`, `semantic_used` | which halves **this answer** was built from. `mode` names what the caller asked for, and hybrid answers from one half whenever the other is missing; these two are what a client shows when it says how a result was found (**#5**) | `search` results |
@@ -352,7 +353,12 @@ is not a workspace returns an empty list and leaves no files behind.
 ## Captured transcripts
 
 Every block below is verbatim stdout from one `np serve` session. Nothing was typed by hand, edited, or pretty-printed; paths
-and timestamps are the capture machine's. See [Reproducing the transcripts](#reproducing-the-transcripts).
+and timestamps are the capture machine's. Four of them ran against debug builds of np 0.4.0 (commit `f6b75e9`) — *A client that did not
+opt in* with default features, which is why its `features` object is all `false`, and the other three with `local-model,fetch`.
+*Meanings asked for, vectors not there yet* was captured on 2026-11-19 from a `cargo build --release` of this tag's own tree
+(`v0.6.0`, `local-model,fetch`) — the first of these sessions taken from an optimized build rather than a debug one. What the
+published asset itself was measured doing is recorded in [reference-releases.md](reference-releases.md), next to its digest. See
+[Reproducing the transcripts](#reproducing-the-transcripts).
 
 ### A client that did not opt in
 
@@ -360,7 +366,7 @@ Two notes on disk, a keyword search, and no `notifications` key in the handshake
 line appears in the whole session — every line carries an `id`, so a v0.3.0 client's read loop is untouched.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap3/A/data","features":{"fetch":true,"local_model":false,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","links.list","shutdown"],"np":"0.4.0","protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap3/A/data","features":{"fetch":true,"local_model":false,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","links.list","shutdown"],"np":"0.4.0","protocol":1}}
 {"id":2,"jsonrpc":"2.0","result":{"added":2,"elapsed_ms":162,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
 {"id":3,"jsonrpc":"2.0","result":{"fetched":null,"hits":[{"bm25":-1.03862660944206e-6,"cosine":null,"keyword_rank":1,"kind":"note","linked_from":0,"linked_notes":[],"matched_exactly":true,"path":"meeting.md","score":1.03862660944206e-6,"semantic_rank":null,"snippet":"# Meeting notes\n\nThe rollout window opens on [Tuesday].\n","source_note":null}],"indexed":true,"keyword_used":true,"mode":"keyword","note":null,"offline":false,"prefix_terms":[],"prefix_used":false,"reason":null,"semantic_used":false,"vectors":false}}
 ```
@@ -375,13 +381,30 @@ capture. A client feature-detects off that array, which is exactly the case the 
 it is the version of the binary that answered *in this capture*, and a release build reports its own version there (`"0.5.0"` since
 `v0.5.0`) rather than anything a client should compare against a constant.
 
+### Meanings asked for, vectors not there yet
+
+Four files, two of them not markdown, on a `local-model,fetch` release build of `np 0.6.0` with the pinned artifact installed by
+`np models install` and **nothing embedded** — so the provider is `Ready`, `vectors` is `false`, and a meanings-only search has
+neither half to answer with. Three requests, one process, in order:
+
+```json
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/tmp/cap060/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","links.list","embeddings.enable","embeddings.disable","shutdown"],"np":"0.6.0","protocol":1}}
+{"id":2,"jsonrpc":"2.0","result":{"added":4,"attachment_examples":["plan.org","scratch.txt"],"attachments":2,"elapsed_ms":11,"index_files":["INDEX.md"],"merged_notes":null,"modified":0,"moved":0,"notes":2,"recorded_merged_notes":"merged=0;paths=","recorded_upgrade_orphans":"headings=0,tags=0,items=0,links_src=0,links_dst_null=0","removed":0,"skipped":[],"unchanged":0,"unindexable":null,"unresolved_links":0,"unresolved_targets":[],"upgrade_orphans":null}}
+{"id":3,"jsonrpc":"2.0","result":{"fetched":null,"hits":[],"indexed":true,"keyword_used":false,"mode":"semantic","note":"no vectors in this workspace: a meanings-only search has nothing to rank and no keyword half to fall back on — `np models fetch` or `np embed` adds the semantic half","offline":false,"prefix_terms":[],"prefix_used":false,"reason":"semantic-without-vectors","semantic_used":false,"vectors":false}}
+```
+
+The last two lines together are the whole story of a workspace that is indexed but not embedded: `notes` and `attachments` add up to
+the four files on disk (**#12**), and the empty answer names the half it was missing (**#11**). The handshake above them is what makes
+that safe to act on from a client written against 0.5.1: `"protocol":1`, and the same **ten** methods — this release added keys, not
+doors.
+
 ### A first run with no network
 
 Opted in, `[embeddings] provider = "local-model"`, origin unreachable. `locking` appears before the write lock is attempted;
 then the answer says **offline**, and so does the terminal line — as a state, `completed`, not `refused`.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.rA4ZYv/B/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/run.rA4ZYv/B/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"id":2,"jsonrpc":"2.0","result":{"artifact_check":null,"busy_gap":0,"chunks_seen":0,"current":0,"embedded":0,"errors":0,"fetched":null,"image_refusals":[],"images_embedded":0,"images_pruned":0,"images_refused":0,"images_seen":0,"images_sweep_ran":false,"images_unchecked":0,"model":"embeddinggemma-2","offline":true,"outcome":{"offline":{"id":"embeddinggemma-2"}},"refused_budget":0,"verification":"self-consistent, not verified","workers":null}}
@@ -397,14 +420,14 @@ Same session shape, origin reachable but the connection closes mid-body after 12
 object — because an interrupted transfer really did fail, where the session above really did not.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.rA4ZYv/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/run.rA4ZYv/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":60}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1493}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4039}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6483}}
-{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.rA4ZYv/C/data/workspaces/32ed8d1669063346.models/.part.embeddinggemma-2.1530703-179424188689490595-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
+{"error":{"code":-32000,"message":"cannot write $TMPDIR/cap/run.rA4ZYv/C/data/workspaces/32ed8d1669063346.models/.part.embeddinggemma-2.1530703-179424188689490595-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
 {"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7537}}
 {"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7537,"phase":"refused","request":2},"last_scan":null,"running":null}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":1}}
@@ -420,7 +443,7 @@ One `np serve` is mid-download; a **second** process answers `status.get` immedi
 the writer. This is the case `running: null` cannot cover, and it is why the marker list exists.
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/marker.678uo7/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/marker.678uo7/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.1","protocol":1}}
 {"id":2,"jsonrpc":"2.0","result":{"command":"scan","locked":true,"waited_ms":2000}}
 {"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[{"bytes_done":8388608,"bytes_total":309855456,"id":"embeddinggemma-2","started_at":1794241904,"state":"running"}],"last":{"command":"scan","elapsed_ms":2006,"phase":"completed","request":2},"last_scan":null,"running":null}}
 ```
@@ -494,10 +517,18 @@ That is the whole contract. `np` remembers nothing about your UI; it hands you e
 
 ## Reproducing the transcripts
 
-Sessions B, C and D came from a debug build of that branch (`cargo build -p np-cli --features local-model,fetch`) driven by
-`/home/agent/tmp/cap/capture.sh`. Session A was re-captured on 2026-11-14 by piping three requests to `target/debug/np serve`
+Host temp paths inside the transcripts are written `$TMPDIR/…`; nothing else in them was edited — they are the byte output of
+real sessions. Sessions B, C and D came from a debug build of that branch (`cargo build -p np-cli --features local-model,fetch`)
+driven by a capture script kept outside the repository. Session A was re-captured on 2026-11-14 by piping three requests to `target/debug/np serve`
 (default features) with the same per-session `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_CONFIG_HOME`, `NP_NO_AUTO_FETCH`
 unset, a two-note vault, and a Python origin that answers the pinned `Content-Length` and then dribbles 4 MiB per 1.2 s before
 hanging up mid-body. Session A opted out of notifications; B pointed `[models] base_url` at a closed port; C and D pointed it at
 the dribbling origin, and D ran its `status.get` from a second process while C's download was in flight. Session A's own shape: two
 notes (`meeting.md`, `todo.md`), `scan`, then `search` for `Tuesday` with `"mode": "keyword"`.
+
+*Meanings asked for, vectors not there yet* was captured on 2026-11-19 from a release build of that tag
+(`cargo build --release -p np-cli --features local-model,fetch`) against a four-file vault — `meeting.md`, `todo.md`, `scratch.txt`,
+`plan.org`, the last two holding the same word as the notes — with per-session `XDG_*` directories, `[models] auto_fetch = false`,
+the artifact installed by `np models install <vault> --id embeddinggemma-2 --path … --dim 768 --sha256 …`, and no `embed` run. The
+weights themselves are not part of the recipe: any install that leaves the provider `Ready` with zero embedded notes reproduces it.
+The `data_dir` is that session's scratch directory rather than anything a reader should own.

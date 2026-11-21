@@ -1,8 +1,8 @@
 # Design: progress reporting from `np serve` (`np/progress`, `status.get`)
 
-Date 2026-12-09 · Status: both product decisions resolved by the operator (O1 push-only, O2 search included); this document now awaits approval as written
+Date 2026-11-09 · Status: both product decisions resolved by the operator (O1 push-only, O2 search included); this document now awaits approval as written
 Owner: controller session
-Builds on: `docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md` (the F-series rules it inherits are under Constraints)
+Builds on: `docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md` (the F-series rules it inherits are under Constraints)
 
 ## Intent, and why
 
@@ -16,7 +16,7 @@ The ask, in the operator's words: *"send status reports to the frontend what the
 What that buys is not a progress bar for its own sake: it is the difference between a screen that lies (spinner, then either a result or nothing) and
 one that can say *what it is waiting on* — including after the user reloads, and after np dies halfway through a transfer.
 
-## Decisions the operator made (2026-12-09)
+## Decisions the operator made (2026-11-09)
 
 **O1 — push-only; no reader thread.** A GUI learns what is happening from `np/progress` notifications, and `status.get` reports what finished plus what
 is recorded on disk. The consequence, stated where a client author will read it: while a request runs, np is not reading stdin (one line in, run to
@@ -43,7 +43,7 @@ AutoFetch::Deferred.allowed(&cfg)`), so the first call a GUI makes can be the 31
 
 - **No cancellation.** A `cancel` method (a GUI "stop" button) is its own design: aborting mid-write must decide what a half-written batch means.
 - **No per-file granularity** for scan, and no per-image granularity for media: phases and throttled counters (§3), not thousands of lines.
-- **No HTTP/SSE/WebSocket transport.** M4 (`docs/roadmap-2026-10-27.md`), its own design; nothing here pre-implements it.
+- **No HTTP/SSE/WebSocket transport.** M4 (`docs/archive/roadmap-2026-10-27.md`), its own design; nothing here pre-implements it.
 - **No telemetry.** np stays silent unless a human or the connected client asks.
 
 ## Anti-goals
@@ -275,7 +275,7 @@ stall: the auto-fetch that fires inside provider resolution when hybrid mode fin
 
 ## Builder check record
 
-A fresh reviewer read this document before the operator saw it (`delegate`, 2026-12-09; artifact
+A fresh reviewer read this document before the operator saw it (`delegate`, 2026-11-09; artifact
 `c81713ad-6849-44c7-89c5-3b0c9495e9e7_delegate_0_output.md`) and raised ten questions. Where each landed:
 
 | # | Question | Where it went |
@@ -296,12 +296,12 @@ A fresh reviewer read this document before the operator saw it (`delegate`, 2026
 **Status: shipped on `main`.** It rides the next release as a feature addition — protocol stays `1`, so it is a `0.3.x` bump unless something
 else in flight forces otherwise. Nothing here changes CLI behaviour, exit codes, `--json` documents, or on-disk format; a client that ignores
 notifications sees the v0.3.0 server as documented, which is asserted by a test rather than promised here (the 47 pre-existing `tests/cli.rs`
-cases pass untouched, in both feature configurations). See [As built](#as-built-2026-12-09) for the twelve places the implementation landed
+cases pass untouched, in both feature configurations). See [As built](#as-built-2026-11-09) for the twelve places the implementation landed
 differently from this design.
 
 ---
 
-## As built (2026-12-09)
+## As built (2026-11-09)
 
 The implementation is shipped; this section records where it landed differently from the design, and why. Each entry names the
 commit or test that pins it, so a future reader can re-check the claim instead of trusting this prose.
@@ -341,7 +341,7 @@ per-member byte counters with a pinned denominator, terminal line mirroring the 
 9. **`chunks_total` did not ship — and the reason given for not shipping it was wrong.** This section claimed np-core's chunk pass
    discovers work lazily, so any total at phase start would be a guess. It does not: `embed_run::run` materialises its owed list into
    a `Vec` before the writer loop, which is why the run can batch over it — so the total was always free, and every GUI that wanted a
-   percentage was being handed an indeterminate bar on a false premise. Fixed 2026-12-09: the opening line and every batch line carry
+   percentage was being handed an indeterminate bar on a false premise. Fixed 2026-11-09: the opening line and every batch line carry
    `chunks_total`, fixed for the whole request (a denominator recomputed from what remains would let a bar reach 100 % with work
    queued, and a run that stops early ends below its total — both asserted by name in `crates/np-core/tests/progress.rs`). The lesson
    is narrower than "double-check assumptions": this claim was written because it *sounded* like the shape of an embed loop, and no
@@ -391,7 +391,7 @@ test red. Two of those four were not: the chunk-reporter mutant was the shipped 
 ignored hung the suite instead of failing it until the case learned to poll with a deadline — both are recorded here because a list
 of kills reads like a method unless the misses are in it too.
 
-**Evidence.** `.superpowers/sdd/2026-12-09-np-serve-progress/progress.md` carries per-task commits, the rulings above at the
+**Evidence.** `.superpowers/sdd/2026-11-09-np-serve-progress/progress.md` carries per-task commits, the rulings above at the
 moment they were made, and the gate log paths; `docs/reference-serve.md` is the interface reference with four captured
 transcripts, one of which shows a *second* process reporting an in-flight download that the first process could not have
 described about itself.

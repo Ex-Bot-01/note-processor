@@ -18,7 +18,7 @@
 - Offline means *skip and say so*: `embed` exits **1**, `setup` exits **0** with `vectors:false`. TLS failures are **not** offline. Digest mismatch is never offline.
 - Exit codes unchanged: 0 success, 1 runtime refusal, 2 argv. Exactly one JSON document on stdout; progress and notices go to stderr.
 - Config stays strict (`deny_unknown_fields`, F35): a misspelled `auto_fetch` refuses naming file, line and key.
-- Never touch anything under `tests/golden*`. `CMAKE=/home/agent/tools/cmake/bin/cmake` for every `local-model` row.
+- Never touch anything under `tests/golden*`. `CMAKE=$HOME/tools/cmake/bin/cmake` for every `local-model` row.
 - Commit after each task with the task number in the subject.
 
 ## Review Focus
@@ -88,7 +88,7 @@ Five things a reviewer must check that no single task's tests fully cover: (1) h
 - [x] README: first-run paragraph states plainly that `np embed` may transfer ~310 MB from the pinned origin on a machine that has nothing installed, and gives both kill switches; the "only command that dials out" sentence is amended rather than deleted.
 - [x] `docs/design-m3-hybrid-search.md` §7: record the amendment — search still never fetches; embed and setup may.
 - [x] Backlog: F38 card with the ruling dated 2026-11-08 (default true, offline skips), and a line in F34's card that auto-fetch inherits the Windows preflight answer rather than bypassing it.
-- [x] Full gates `.github/scripts/gates.sh /home/agent/tmp/gates-f38` — every row 0, `NOT COVERAGE` counted; then merge with `--no-ff` and push.
+- [x] Full gates `.github/scripts/gates.sh $TMPDIR/gates-f38` — every row 0, `NOT COVERAGE` counted; then merge with `--no-ff` and push.
 
 ---
 
@@ -104,5 +104,5 @@ record. Three deviations from the plan, each recorded where the ruling lives rat
 + Task 5 found **F41** — a fresh workspace with fetching switched off is told `configuration disabled` with no remedy line. Filed, not
   fixed: the wording is pinned in fourteen assertions and F32 chose it deliberately.
 
-Full gates (19 rows, exit 0, `NOT COVERAGE` 0, both real artifacts) at `/home/agent/tmp/gates-f38t6b`. Closure still withheld: CI has
+Full gates (19 rows, exit 0, `NOT COVERAGE` 0, both real artifacts) at `$TMPDIR/gates-f38t6b`. Closure still withheld: CI has
 had no steps since the minutes ran out, so this is "graded locally", not "closed" — see the F38 card's last section.

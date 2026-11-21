@@ -1,5 +1,5 @@
 //! Progress reporting through the seams that a GUI would watch (**F48** design:
-//! `docs/superpowers/specs/2026-12-09-np-serve-progress-design.md`).
+//! `docs/superpowers/specs/2026-11-09-np-serve-progress-design.md`).
 //!
 //! The fetch cases here reuse [`np_core::fetch`]’s test seam rather than inventing one, for the reason
 //! `tests/fetch.rs` gives: production pins a 309 MB artifact, and a progress case that downloaded it would be slow

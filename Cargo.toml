@@ -3,13 +3,10 @@ resolver = "2"
 members = ["crates/np-core", "crates/np-cli"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
-# **MIT, ruled by the operator on 2026-12-08** (**F47**), and `LICENSE` at the root is the authority — this field is metadata that must agree
-# with it, which is why it lives in `[workspace.package]` where a member cannot drift from it. The reason MIT specifically: it matches the code
-# we statically link (llama.cpp/ggml, MIT), so no obligation here is stricter than one already being satisfied, and it keeps a downstream user's
-# obligations to "keep the notices attached". `license = "MIT"` alone (no `OR Apache-2.0`) is deliberate: nothing in this workspace is dual-licensed
-# by its authors, and an option nobody granted is worse than no option.
+# **MIT** — `docs/adr/0010-the-crate-is-mit.md` records who ruled it and why; `LICENSE` at the root is the authority. It sits
+# in `[workspace.package]` so a member crate cannot drift from it while still publishing metadata.
 license = "MIT"
 
 # Every dependency is declared once here; member crates opt in with
@@ -25,23 +22,21 @@ sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
 toml = "0.9"
-# The diagnostic channel's vocabulary and macros (docs/superpowers/specs/2026-12-10-np-diagnostics-design.md). np-core carries
-# `tracing` **without a subscriber**: an instrumented library that installs nothing costs a compare-and-return per event, which is
-# the "free when off" half of that design, and it means a caller embedding np-core keeps its own subscriber. The heavyweight half
-# (`tracing-subscriber`) belongs to np-cli alone — the global sink is the process's, and only `np` owns a process.
-# `std` only: these crates use the `event!`/`span!` macros and the `Subscriber`/`Layer` traits, never `#[instrument]`, so the
-# default `attributes` feature would add a procedural macro and a second copy of `syn` to every build for a thing nothing calls.
+# The diagnostic channel's vocabulary (`docs/reference-diagnostics.md`). np-core carries `tracing` **without a subscriber**:
+# an instrumented library that installs nothing costs a compare-and-return per event — the "free when off" half — and a
+# caller embedding np-core keeps its own subscriber. `tracing-subscriber` belongs to np-cli alone, because the global sink is
+# the process's and only `np` owns a process. `std` only, and no `attributes` feature: these crates use `event!`/`span!` and
+# the `Subscriber`/`Layer` traits, never `#[instrument]`, so that feature would add a proc macro and a second copy of `syn`
+# to every build for something nothing calls.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-# The subscriber np-cli owns. `default-features = false` keeps the pieces this program does not use out of the binary: no
-# `fmt` layer (the human format here is six lines of `format!`, and pinning bytes on stderr predates tracing), no `env-filter`
-# (`NP_LOG` follows §12 rule 7's precedence, which is the *inverse* of the ecosystem's env-beats-file habit — see
-# `np_core::config::DIAG_ENV_VAR`), no ansi. `registry` is the one part that matters: it gives spans somewhere to live, which is
-# what request correlation and span durations read from in Task 5.
+# The subscriber np-cli owns. `default-features = false` keeps out what this program does not use: no `fmt` layer (the human
+# format is six lines of `format!`, and pinned bytes on stderr predate tracing), no `env-filter` (`NP_LOG` precedence is the
+# *inverse* of the ecosystem's env-beats-file habit — see `np_core::config::DIAG_ENV_VAR`), no ansi. `registry` is the part
+# that matters: it gives spans somewhere to live, which is what request correlation and span durations read from.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
-# Pinned exactly, unlike the caret ranges above. `np-core::catalog` breaks a wrapped line on
-# display width (F12), so the classification of one character decides published bytes: a Unicode
-# revision that reclassified an ideograph or emoji would silently move a break point in a future
-# build. The pin makes that an explicit dependency change, and `tests/catalog.rs` fails a test if
+# Pinned exactly, unlike the caret ranges above: `np-core::catalog` breaks a wrapped line on display width, so one
+# character's classification decides published bytes. A Unicode revision that reclassified an ideograph or emoji would move
+# a break point silently in a future build; the pin makes it an explicit dependency change, and `tests/catalog.rs` fails if
 # the widths this code depends on ever move.
 unicode-width = "=0.2.2"
 walkdir = "2.5"

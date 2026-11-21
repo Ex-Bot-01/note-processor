@@ -1,7 +1,7 @@
 //! Markdown parse: the frontmatter subset, the title, the heading outline and `#tags`.
 //!
-//! Pure text in, structs out — no files, no database, no clock. Task 7 fills in links from
-//! the same raw text, Task 8 items, so this module stays the single place that decides what
+//! Pure text in, structs out — no files, no database, no clock. The link pass fills in links from
+//! the same raw text, the item pass fills in items, so this module stays the single place that decides what
 //! a note *is* before anything is stored about it.
 //!
 //! Two rules hold everything together:
@@ -37,8 +37,8 @@ use crate::links::{extract_links, RawLink};
 ///
 /// Version 1 is the first versioned build, so the value it has to describe is *absence*: a database from
 /// before this constant recorded nothing at all, which is not a version and therefore refreshes on its
-/// first scan. That single refresh is what carries R3's frontmatter-recognition (F7) and tag-display
-/// (F8) changes into the files M1 already indexed.
+/// first scan. That single refresh is what carries the current frontmatter-recognition and tag-display
+///   changes into the files M1 already indexed.
 pub const PARSE_VERSION: u32 = 1;
 
 /// Which source supplied a note's title, so the catalog can say where it came from.
@@ -71,7 +71,7 @@ impl TitleSource {
 pub struct Heading {
     /// Number of `#` markers, 1..=6.
     pub level: u8,
-    /// Heading text with surrounding whitespace removed. May be empty (`##   `), which is why
+    /// Heading text with surrounding whitespace removed. May be empty (`## `), which is why
     /// title selection skips such a heading instead of titling the note `""`.
     pub text: String,
     /// 1-based line number in the file.
@@ -80,7 +80,7 @@ pub struct Heading {
 
 /// What one markdown note yields before anything is stored about it.
 ///
-/// Built at exactly one place — the end of [`parse_markdown`] — so that Task 7's `links` field
+/// Built at exactly one place — the end of [`parse_markdown`] — so that the link pass's `links` field
 /// is filled in by one constructor rather than by scattered struct literals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteDoc {
@@ -162,11 +162,11 @@ struct Frontmatter {
     recognised: bool,
 }
 
-/// The hand-rolled YAML subset of spec §9: a scalar `title:` and `tags:` as either an inline
+/// The hand-rolled YAML subset this accepts: a scalar `title:` and `tags:` as either an inline
 /// `[a, b]` list or an indented `- item` block. Every other key is ignored without error —
 /// frontmatter may hold anything the note editor puts there, and none of it may fail a scan.
 ///
-/// **Which `---` regions are frontmatter** (M2 backlog F7). Two fences are not enough evidence:
+/// **Which `---` regions are frontmatter.** Two fences are not enough evidence:
 /// a markdown note may open with a thematic break, and reading its first section as metadata
 /// would silently drop that section from the outline, the word count and the item scan. So the
 /// region between the opening `---` and the next `---` line counts as frontmatter only when it
@@ -198,7 +198,7 @@ fn read_frontmatter(raw: &str) -> Frontmatter {
     let mut head = absent();
     // `true` while the indented `- item` list under a bare `tags:` is still being read.
     let mut block_tags = false;
-    // The two halves of the F7 test, collected on the way to the closing fence.
+    // The two halves of that ruling's test, collected on the way to the closing fence.
     let mut keyed = false;
     let mut blank_only = true;
     for (number, text) in rest {
@@ -398,8 +398,8 @@ fn blocked_by(prev: char) -> bool {
 
 /// A frontmatter scalar: one layer of matching quotes removed, then trimmed on both ends, and
 /// `None` when nothing usable is left. Trimming happens **after** unquoting, so a quoted blank
-/// (`title: "   "`) falls through to the next title source instead of becoming a title of three
-/// spaces, and `title: "  Vendor  "` cannot put padded text into `INDEX.md`.
+/// (`title: " "`) falls through to the next title source instead of becoming a title of three
+/// spaces, and `title: " Vendor "` cannot put padded text into `INDEX.md`.
 fn scalar(value: &str) -> Option<String> {
     let value = unquote(value.trim()).trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -440,7 +440,7 @@ fn unquote(value: &str) -> &str {
 /// Tags in first-seen order, deduplicated ignoring case, and shown as written — the three rules
 /// applied in one place so frontmatter tags and body tags behave identically.
 ///
-/// Identity and display are separate on purpose (M2 backlog F8): [`case_key`] decides whether two
+/// Identity and display are separate on purpose: [`case_key`] decides whether two
 /// spellings are one tag, while `order` keeps the text the author wrote, so `#ÄNER-TAG` followed by
 /// `#äner-tag` yields the single tag `ÄNER-TAG`. Folding touches the key only and never the order:
 /// [`crate::scan`] stores tags in this Vec's order and [`crate::scan::note_tags`] reads them back
@@ -468,7 +468,7 @@ impl TagList {
 /// than swapped for `to_ascii_lowercase` (which folds only `A`–`Z` and would leave `#ÄNER-TAG` beside
 /// `#äner-tag`) or for a case *fold*.
 ///
-/// The F8 report blamed ASCII folding, and that half does not reproduce on `3f86529`: the dedup key
+/// An earlier report blamed ASCII folding, and that half does not reproduce at `3f86529`: the dedup key
 /// was already `to_lowercase`. What was missing is that the folded text was also the *displayed*
 /// text, so a note's own spelling never reached `INDEX.md` — which is what [`TagList`] now keeps
 /// separate. Which folding is used stays written down because it is equally visible there:

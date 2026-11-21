@@ -1,6 +1,6 @@
 //! Hand-written `extern "C"` declarations for llama.cpp **v0.8.0**, behind `local-model`.
 //!
-//! No bindgen (§14): the public API is C, every handle is opaque to us, and the surface R6b1 needs is
+//! No bindgen: the public API is C, every handle is opaque to us, and the surface R6b1 needs is
 //! a dozen functions. What bindgen would give us — the whole header, including the deprecated and
 //! experimental halves of it — is smaller than what it costs: libclang on three OSes plus the
 //! `bindgen`/`cc`/`cmake` build-dependency chain we are deliberately not taking.
@@ -18,8 +18,8 @@
 //!   `llama_add_bos_token`, `llama_add_eos_token`) — are deliberately absent. Declaring them would make it
 //!   possible to reach the wrong one without a compile error, since they still exist in v0.8.0. The last
 //!   three matter more than a rename usually does: `llama_n_embd` answers with the model's **internal**
-//!   width, so a loader that used it would read 512 for a model whose vectors are 768 (§5's width decision
-//!   would be enforced against the wrong number and pass).
+//!   width, so a loader that used it would read 512 for a model whose vectors are 768 — the width check would
+//!   then be enforced against the wrong number and pass.
 //! * `llama_backend_init` is **not** declared here and `load` never calls it, which deviates from the header's
 //!   "call once at the start of the program" (`include/llama.h:489`). It is safe on this build for two reasons read out
 //!   of the pinned tree rather than assumed: the f16 tables that call initializes come from any `ggml_init`
@@ -29,7 +29,7 @@
 //!   `GGML_USE_CPU`). Measured corroboration: every artifact-gated load and decode here returns rc 0 with a finite
 //!   pooled row. A future build that offloads to another device must revisit this (A1 review P2-4).
 //! * The `llama_batch_ext_*` family is also absent, on purpose: choosing it over
-//!   [`llama_batch_get_one`] plus the `logits` array of [`llama_batch`] is R6b1's design question (§14),
+//!   [`llama_batch_get_one`] plus the `logits` array of [`llama_batch`] is R6b1's design question,
 //!   and declaring both would decide it by accident.
 //!
 //! # Safety
@@ -228,7 +228,7 @@ extern "C" {
     /// Route llama.cpp's and ggml's log lines through our callback.
     ///
     /// Passing `None` restores upstream's behaviour, which its header spells out: “If this is not called, or NULL
-    /// is supplied, everything is output on stderr” (`include/llama.h:1672-1676`) — the load transcript F33 exists
+    /// is supplied, everything is output on stderr” (`include/llama.h:1672-1676`) — the load transcript this build's log-level control exists
     /// to quiet. The state is **process-global and not thread safe** by the same comment (“The logger state is global
     /// so these functions are NOT thread safe”), which is why `local_model::set_log_level` installs once, before any
     /// model load, rather than per embedder.
@@ -245,7 +245,7 @@ extern "C" {
     /// somewhere else on the loader path — which is why `tests/local_runtime.rs` checks its prefix.
     pub fn llama_version() -> *const std::ffi::c_char;
 
-    /// CPU/feature flags of the built library, e.g. `CPU : SSE3 = 1 | ... | OPENMP = 1`.
+    /// CPU/feature flags of the built library, e.g. `CPU: SSE3 = 1 |... | OPENMP = 1`.
     ///
     /// Memory: v0.8.0 builds this into a function-local `static std::string` (`src/llama.cpp`,
     /// `llama_print_system_info`), so the pointer is owned by llama.cpp and **invalidated by the next
@@ -292,8 +292,8 @@ extern "C" {
     /// accepts null, and it does not.
     pub fn llama_model_get_vocab(model: *const llama_model) -> *const llama_vocab;
 
-    /// Trained context window — a fact about the artifact (§5's token ceiling reads this rather than a
-    /// constant). Reads metadata only, so it is valid on a `no_alloc` model.
+    /// Trained context window — a fact about the artifact: the token ceiling is read from here rather than from a
+    /// constant. Reads metadata only, so it is valid on a `no_alloc` model.
     pub fn llama_model_n_ctx_train(model: *const llama_model) -> i32;
 
     /// Width of the vector this model **answers with** — for an embedding model, the width of one stored
@@ -328,7 +328,7 @@ extern "C" {
 
     /// Whether a tokenisation request with `add_special = true` appends the EOS token. Same owner and same
     /// deprecation warning as [`llama_vocab_get_add_bos`]; both are set for `embeddinggemma-2`, which is why
-    /// this round reads them separately instead of assuming one.
+    /// this build reads them separately instead of assuming one.
     pub fn llama_vocab_get_add_eos(vocab: *const llama_vocab) -> bool;
 
     // ---- context --------------------------------------------------------------
@@ -501,9 +501,9 @@ extern "C" {
     ///
     /// Memory: as [`llama_get_embeddings_seq`] — context-owned, short-lived, never freed here.
     ///
-    /// **Declared and not called** (A1 review P2-3). Production code reads only the pooled row; this accessor is mirrored
-    /// because §7's per-token verification is the next thing that will want it, and a half-mirrored API is how a later
-    /// round invents a signature under time pressure. Read [`llama_get_embeddings_seq`]'s width rule first: what exists at
+    /// **Declared and not called.** Production code reads only the pooled row; this accessor is mirrored
+    /// because per-token verification is the next thing that will want it, and a half-mirrored API is how someone
+    /// later invents a signature under time pressure. Read [`llama_get_embeddings_seq`]'s width rule first: what exists at
     /// all depends on the pooling type (`include/llama.h:1163-1169`), and this row belongs to the **token**, not the
     /// sequence — copying `n_embd_out` floats out of it is the same class of over-read that RANK pooling was refused for.
     pub fn llama_get_embeddings_ith(ctx: *mut llama_context, i: i32) -> *mut f32;
@@ -529,7 +529,7 @@ extern "C" {
 // `void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn)` (`include/llama.h:1114`) and
 // `bool llama_get_causal_attn(const struct llama_context * ctx)` (`:1117`).
 //
-// Mirrored for one reason, recorded in `crates/np-core/tests/probes/vision-spike-2026-11-02.md`:
+// Mirrored for one reason, recorded in the vision spike record under `tests/probes/`:
 // `mtmd_decode_use_non_causal` answers **true** for this architecture, so the image rows must be decoded with a
 // non-causal mask. The get-half exists so the set is reversible: a seam that left the flag flipped would make
 // every later *text* vector in the process quietly wrong while every image vector kept looking healthy — a
@@ -559,9 +559,8 @@ extern "C" {
 /// the text-path block — each one says who owns what, because that is the only thing between us and a
 /// use-after-free across a language boundary.
 ///
-/// What is **not** declared here is deliberate: audio (`mtmd_support_audio`, the stream and generation APIs — §3
-/// of `docs/design-m2-image-embeddings.md` makes audio a non-goal, and the seam refuses an audio bitmap rather
-/// than modelling it), video, batching (`mtmd_batch_*`: one image per call is what [`crate::vision`] promises),
+/// What is **not** declared here is deliberate: audio (`mtmd_support_audio`, the stream and generation APIs —
+/// audio is out of scope by design, and the seam refuses an audio bitmap rather than modelling it), video, batching (`mtmd_batch_*`: one image per call is what [`crate::vision`] promises),
 /// chunk save/load/copy, and M-RoPE position helpers (`mtmd_decode_use_mrope` answers false for this projector and
 /// the seam refuses a true answer rather than guessing at section-major positions). Declaring an API we never call
 /// would only make the wrong one reachable without a compile error.
@@ -591,7 +590,7 @@ pub mod mtmd {
     pub const MTMD_INPUT_CHUNK_TYPE_TEXT: i32 = 0;
     /// An image chunk: [`mtmd_encode_chunk`] turns it into embedding rows.
     pub const MTMD_INPUT_CHUNK_TYPE_IMAGE: i32 = 1;
-    /// An audio chunk — refused by [`crate::vision`], never encoded (§3's non-goal).
+    /// An audio chunk — refused by [`crate::vision`], never encoded: out of scope by design.
     pub const MTMD_INPUT_CHUNK_TYPE_AUDIO: i32 = 2;
     /// Validation sentinel, not a real chunk type.
     pub const MTMD_INPUT_CHUNK_TYPE_COUNT: i32 = 3;
@@ -610,8 +609,8 @@ pub mod mtmd {
         pub device: *mut std::ffi::c_void,
         /// Per-encode timing lines on stderr. Off: our output is one line per image, not llama.cpp's.
         pub print_timings: bool,
-        /// Worker count for the vision encoder's own ggml graph. Left at mtmd's default (4) — R7c's worker policy
-        /// governs the text context, and §11 says an image encode runs on the same llama context.
+        /// Worker count for the vision encoder's own ggml graph. Left at mtmd's default (4): this build's worker policy
+        /// governs the text context, and an image encode runs on that same llama context.
         pub n_threads: i32,
         /// Deprecated in favour of [`mtmd_context_params::media_marker`] (`mtmd.h:113`), but still a field: leaving
         /// it out would shift every offset after it.
@@ -623,8 +622,8 @@ pub mod mtmd {
         /// Whether to run a warmup encode after init. Off: nothing here needs a warmed encoder, and it costs an
         /// image-sized pass at open time.
         pub warmup: bool,
-        /// Soft-token floor; -1 means "read from the artifact" (the card's 70–1120 lever, unused this round — the
-        /// spike note measured that it *is* honoured, and §8 measures cost per encode instead of choosing a budget).
+        /// Soft-token floor; -1 means "read from the artifact" (the card's 70–1120 lever, unused so far — the
+        /// spike measured that it *is* honoured, and cost is measured per encode instead of choosing a budget).
         pub image_min_tokens: i32,
         /// Soft-token ceiling; -1 means "read from the artifact".
         pub image_max_tokens: i32,
@@ -686,8 +685,8 @@ pub mod mtmd {
     /// defaults ON, so the force-off at `tools/mtmd/CMakeLists.txt:9-12` does not fire) and a buffer that reaches
     /// the video path would fill it, so [`crate::vision`] frees both.
     ///
-    /// **Do not read this mirror as the thing that keeps non-raster formats out.** What bounds the corpus is §7's
-    /// extension gate in `crate::media`, not this decoder: measured on 2026-11-03, a BMP payload reached
+    /// **Do not read this mirror as the thing that keeps non-raster formats out.** What bounds the corpus is the
+    /// extension gate in `crate::media`, not this decoder: measured, a BMP payload reached
     /// [`mtmd_helper_bitmap_init_from_buf`] through a `.png` filename and came back a live bitmap and then a vector
     /// (80 tokens). `stb_image` inside `libmtmd` decodes bmp/tga/gif/psd/pnm/qoi as well as png and jpeg, and the webp
     /// and video arms need ffmpeg (`mtmd-helper.cpp:417-427`), which is not installed on this host — so the promise
@@ -725,7 +724,7 @@ pub mod mtmd {
 
         /// Whether the loaded projector has a vision graph (`mtmd.h:157`).
         ///
-        /// True for the pinned `mmproj` (measured in the spike note). The seam refuses a false answer as §8's
+        /// True for the pinned `mmproj` (measured in the spike record). The seam refuses a false answer as
         /// `vision-unavailable` rather than decoding into an encoder that is not there.
         ///
         /// # Safety
@@ -763,7 +762,7 @@ pub mod mtmd {
 
         // ---- bitmap ----------------------------------------------------------
 
-        /// Whether a decoded bitmap holds audio (`mtmd.h:205`). The seam's guard for §3's audio non-goal: this
+        /// Whether a decoded bitmap holds audio (`mtmd.h:205`). The seam's guard for audio being out of scope: this
         /// projector answers `mtmd_support_audio == true`, so without this check WAV bytes would reach the encoder.
         ///
         /// # Safety
@@ -784,13 +783,13 @@ pub mod mtmd {
         pub fn mtmd_helper_init_opt_default() -> mtmd_helper_init_opt;
 
         /// Decode an image or audio buffer into a bitmap (`mtmd-helper.h:75-79`) — PNG and JPEG through the
-        /// `stb_image` already inside `libmtmd` (§8's reason no new dependency enters this build).
+        /// `stb_image` already inside `libmtmd` — which is why no new dependency enters this build.
         ///
         /// Ownership: on success **both** wrapper fields are ours if non-null. The bitmap copies the buffer, so
         /// `buf` may be dropped as soon as this returns; the id it stamps is a sha256 of these bytes
         /// (`mtmd-helper.cpp:381-383`), which is why no caller needs to name the file. A null bitmap means "these
         /// bytes are not media this build can decode" — mtmd's own error text goes to stderr and never into our
-        /// refusal (§12 rule 8). Unlike [`mtmd_init_from_file`] this function has no `try`/`catch`: the image path
+        /// refusal. Unlike [`mtmd_init_from_file`] this function has no `try`/`catch`: the image path
         /// is C (stb) plus one hash, so nothing throws short of an allocation failure, which aborts either way.
         ///
         /// `placeholder == false`, always, for us: a placeholder bitmap is a token-counting stand-in that
@@ -847,7 +846,7 @@ pub mod mtmd {
         pub fn mtmd_input_chunk_get_type(chunk: *const mtmd_input_chunk) -> i32;
 
         /// Tokens this chunk occupies in the decoder (`mtmd.h:263`) — for an image chunk, its patch count, which
-        /// is the number §8's budget rule and [`crate::vision::VisionModel::last_token_cost`] report.
+        /// is the number the budget rule and [`crate::vision::VisionModel::last_token_cost`] report.
         ///
         /// # Safety
         ///
@@ -902,8 +901,8 @@ pub mod mtmd {
         //! is C reading past what Rust wrote.
         //!
         //! ```text
-        //! $ cc -O1 -std=c11 -I .vendor/llama.cpp-v0.8.0/include -I .vendor/llama.cpp-v0.8.0/ggml/include \
-        //!       -I .vendor/llama.cpp-v0.8.0/tools/mtmd -o /tmp/mtmd_layout /tmp/mtmd_layout.c && /tmp/mtmd_layout
+        //! $ cc -O1 -std=c11 -I.vendor/llama.cpp-v0.8.0/include -I.vendor/llama.cpp-v0.8.0/ggml/include \
+        //!       -I.vendor/llama.cpp-v0.8.0/tools/mtmd -o /tmp/mtmd_layout /tmp/mtmd_layout.c && /tmp/mtmd_layout
         //! sizeof(struct mtmd_context_params)=96 align=8
         //!   use_gpu=0 device=8 print_timings=16 n_threads=20 image_marker=24 media_marker=32
         //!   flash_attn_type=40 warmup=44 image_min_tokens=48 image_max_tokens=52 cb_eval=56
@@ -912,12 +911,12 @@ pub mod mtmd {
         //!   text=0 text_len=8 add_special=16 parse_special=17
         //! sizeof(struct mtmd_helper_video_init_params)=32 align=8
         //!   fps_target=0 ffmpeg_bin_dir=8 timestamp_interval_ms=16 no_soundtrack=24
-        //! sizeof(mtmd_helper_init_opt)=32 align=8  video_params=0
-        //! sizeof(struct mtmd_helper_bitmap_wrapper)=16 align=8  bitmap=0 video_ctx=8
+        //! sizeof(mtmd_helper_init_opt)=32 align=8 video_params=0
+        //! sizeof(struct mtmd_helper_bitmap_wrapper)=16 align=8 bitmap=0 video_ctx=8
         //! sizeof(enum mtmd_input_chunk_type)=4 sizeof(enum llama_flash_attn_type)=4
         //! ```
         //!
-        //! Measured on this host on 2026-11-03 against the tree `third_party/llama-cpp.toml` pins. The header itself
+        //! Measured on this host against the tree `third_party/llama-cpp.toml` pins. The header itself
         //! is not digest-pinned (see this module's note), which is exactly why these numbers exist: they turn a
         //! silent layout disagreement into a build failure on the first feature-on compile after a re-pin.
 
@@ -1001,7 +1000,7 @@ mod layout {
     //! the pinned header with a C probe, not transcribed by eye:
     //!
     //! ```text
-    //! $ gcc -I .vendor/llama.cpp-v0.8.0/include -I .vendor/llama.cpp-v0.8.0/ggml/include \
+    //! $ gcc -I.vendor/llama.cpp-v0.8.0/include -I.vendor/llama.cpp-v0.8.0/ggml/include \
     //!       -std=c11 -o /tmp/layout_probe /tmp/layout_probe.c && /tmp/layout_probe
     //! sizeof(llama_batch)=56
     //!   n_tokens=0 token=8 embd=16 pos=24 n_seq_id=32 seq_id=40 logits=48
@@ -1018,14 +1017,14 @@ mod layout {
     //! sizeof(llama_pos)=4 sizeof(llama_seq_id)=4
     //! ```
     //!
-    //! Run on 2026-10-29 against `include/llama.h` whose sha256 is `c0854771…` — the value pinned in
+    //! Run against `include/llama.h` whose sha256 is `c0854771…` — the value pinned in
     //! `third_party/llama-cpp.toml` and re-checked by `build.rs` on every feature-on build, so these numbers
     //! belong to a named tree rather than to "some 0.8.x". The same run produced the field-name list checked
     //! below; a re-pin re-runs the probe and updates the constants deliberately.
     //!
     //! **Names and order too, not just offsets.** A second check compares the three header structs against
     //! this file field by field: `llama_batch` 7 fields, `llama_model_params` 17, `llama_context_params` 38 —
-    //! identical names in identical order as measured on 2026-10-29. That matters because Rust does not care
+    //! identical names in identical order as measured. That matters because Rust does not care
     //! what a field is called: a mirror that renames `n_seq_id` to `pos` compiles, keeps every offset, and
     //! hands R6b1 a plausible-looking wrong field.
     //!

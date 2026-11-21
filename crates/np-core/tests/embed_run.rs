@@ -1,7 +1,7 @@
-//! `np_core::embed_run` against a fake provider: §6's currency rule, writer loop, exit arms and stamp rule.
+//! `np_core::embed_run` against a fake provider: the currency rule, the writer loop, the exit arms and the stamp rule.
 //!
 //! Every case here runs without the `local-model` feature and without the 310 MB artifact — that is the point of
-//! the injected [`Embedder`] seam (`docs/design-m2-local-embeddings.md` §9), and it is what lets the arms be
+//! the injected [`Embedder`] seam, and it is what lets the arms be
 //! tested at all: the real runtime's answer today is `RuntimeNotBuilt`, which cannot produce a vector to assert
 //! on. Each test names the production mutation that would make it fail.
 //!
@@ -45,7 +45,7 @@ struct Setup {
 impl Setup {
     /// The configuration every case hands to `embed`: this tempdir's data dir, and a `[embeddings]` section
     /// naming [`MODEL_ID`] under `provider = "local-model"`. Default configuration is `provider = "none"`, which
-    /// is §6's exit state (ii) and would answer every case below with a refusal instead of a run — the two cases
+    /// is exit state (ii) and would answer every case below with a refusal instead of a run — the two cases
     /// that want that arm replace this section.
     fn cfg(&self) -> Config {
         Config {
@@ -56,7 +56,7 @@ impl Setup {
                 dim: None,
                 max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
                 // The policy default, spelled out: these fixtures must not inherit a worker count by
-                // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+                // accident if `Auto` ever stops being the default.
                 threads: np_core::config::ThreadCount::Auto,
                 log_level: None,
             },
@@ -393,7 +393,7 @@ fn chunks_reach_the_provider_in_chunk_order_and_are_stamped_with_what_it_read() 
         "the batch is the chunk texts in order"
     );
 
-    // The stamp rule (§6, backlog D4): digest of the bytes handed over — here an empty prefix, so the text.
+    // The stamp rule: digest of the bytes handed over — here an empty prefix, so the text.
     let stored: HashMap<i64, String> = setup.vectors().into_iter().collect();
     assert_eq!(stored.len(), 3);
     for (id, text) in &live {
@@ -420,7 +420,7 @@ fn every_text_in_a_batch_travels_with_its_own_prefix() {
     setup.touch_artifact();
 
     // The fake carries the row's prefix because a provider is built from its own row. `Fake::new()` here would be
-    // a provider that ignores prefixes — §3's bug, and it now fails this case rather than passing it quietly.
+    // a provider that ignores prefixes — the bug this fixture exists to catch, and it now fails here rather than passing quietly.
     let mut fake = Fake::prefixing("doc: ");
     let report = embed(&setup.root, &setup.cfg(), &mut fake).expect("run");
     assert!(report.succeeded(), "{:?}", report.outcome);
@@ -470,7 +470,7 @@ fn every_text_in_a_batch_travels_with_its_own_prefix() {
     }
 }
 
-/// §7's "unchanged chunk → provider called zero times", the warm-path claim of the whole design.
+/// "unchanged chunk → provider called zero times": the warm-path claim of the whole run.
 #[test]
 fn an_unchanged_corpus_never_reaches_the_provider() {
     assert_recorder_works();
@@ -581,7 +581,7 @@ fn a_provider_answering_the_wrong_number_of_texts_writes_nothing() {
 ///
 /// The declared-width check upstream cannot see this: the fake answers with `dim()` intact while the vectors it
 /// returns are wider, which is what a provider that miscounts its own output looks like from here. The schema's
-/// `CHECK (length(vector) = 4 * dim)` would be the next line of defence, and §6 refuses mid-run CHECK failures in
+/// `CHECK (length(vector) = 4 * dim)` would be the next line of defence, and a mid-run CHECK failure is refused in
 /// favour of naming both numbers first. Self-review mutant M5: deleting this width arm left all 19 other cases
 /// green, so before this case the sentence existed without a fence.
 #[test]
@@ -786,7 +786,7 @@ fn a_repeated_batch_updates_instead_of_failing() {
 // the liveness fence (backlog D3)
 // ---------------------------------------------------------------------------
 
-/// §6's stale-note fixture: one note whose `files.state` is `stale` must never be owed.
+/// The stale-note fixture: one note whose `files.state` is `stale` must never be owed.
 #[test]
 fn a_stale_note_s_chunks_are_never_owed() {
     assert_recorder_works();
@@ -849,7 +849,7 @@ fn provider_none_is_configuration_disabled_and_reads_nothing() {
             dim: None,
             max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
             // The policy default, spelled out: these fixtures must not inherit a worker count by
-            // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+            // accident if `Auto` ever stops being the default.
             threads: np_core::config::ThreadCount::Auto,
             log_level: None,
         },
@@ -872,9 +872,9 @@ fn provider_none_is_configuration_disabled_and_reads_nothing() {
     assert!(!report.succeeded(), "arm (ii) is exit 1 (§6)");
 }
 
-/// **F41 option A.** The same refusal, but read as the operator reads it: this is the first run on an air-gapped
+/// The same refusal, but read as the operator reads it: this is the first run on an air-gapped
 /// machine, and `configuration disabled: embeddings.model = "…"` sends a person to edit a key they set correctly.
-/// The label stays (F32 §6's taxonomy is not up for revision here), but the detail now carries the same remedy arm
+/// The label stays (the refusal taxonomy is not up for revision here), but the detail now carries the same remedy arm
 /// (iii) gives — a command that exists in this binary — because the state "a `model` names no row" is the artifact
 /// absent *seen from before the first install*.
 #[test]
@@ -910,7 +910,7 @@ fn a_model_naming_no_row_names_the_command_that_fixes_it() {
     );
 }
 
-/// The other half of arm (ii), asserted separately on purpose (**F41**): `provider = "none"` is an instruction,
+/// The other half of arm (ii), asserted separately on purpose: `provider = "none"` is an instruction,
 /// not a gap, so it gets **no** install hint. A mutant that appends the hint to every configuration refusal would
 /// pass the test above and fail this one — which is why the two halves are not one assertion about "arm (ii)".
 #[test]
@@ -1040,7 +1040,7 @@ fn nothing_owed_exits_zero_even_with_no_artifact() {
 /// Arm (iv): owed and not produced — the only arm that means "gave up", and the one that arrives when a caller hands
 /// the run a provider that refuses every batch.
 ///
-/// **Not what `np embed` does on a build without the runtime any more** (**F40**): np-cli now resolves such a build to
+/// **Not what `np embed` does on a build without the runtime any more**: np-cli now resolves such a build to
 /// [`Resolution::RuntimeNotBuilt`] so it answers arm (v) before reading a chunk. This case stays, because arm (iv) has to
 /// keep meaning "we owed work and did not produce it" for whoever *does* hand over a live provider — a `local-model` run
 /// whose bytes will not load is the real one.
@@ -1069,7 +1069,7 @@ fn owed_and_not_produced_is_the_gave_up_arm() {
     assert!(!report.succeeded());
 }
 
-/// Arm (v), **F40**: this binary links no runtime, and the run says so before it reads one chunk row. The counts are the
+/// Arm (v): this binary links no runtime, and the run says so before it reads one chunk row. The counts are the
 /// point — `seen 0` is what separates an honest early refusal from the report this arm replaced, which scanned the corpus
 /// and then borrowed arm (iv)'s sentence about it (`errors 1`, on Windows and Linux alike, for a user who had installed the
 /// model correctly). Nothing may be written in either case, which is the one thing both arms already got right.
@@ -1112,7 +1112,7 @@ fn runtime_not_built_refuses_before_the_currency_read() {
     // which is why the label is asserted first.
 }
 
-/// Arm (vi), **F38**: fetching was allowed and needed, and nothing answered. The counts are the argument — `chunks_seen 0`
+/// Arm (vi): fetching was allowed and needed, and nothing answered. The counts are the argument — `chunks_seen 0`
 /// because refusing before the currency read is the whole point, `errors 0` because an outage is not a failure count, and
 /// `offline: true` because a caller must be able to learn that without string-matching a label.
 ///
@@ -1213,11 +1213,11 @@ fn a_busy_batch_stamps_nothing_and_is_reported() {
     assert_eq!(after.embedded, 2);
 }
 
-/// §6's contention rule: a `np scan` must succeed while an embed sits **between** batches.
+/// The contention rule: a `np scan` must succeed while an embed sits **between** batches.
 ///
 /// The hook runs between batches, outside every transaction. Mutation that fails it: one transaction for the
-/// whole corpus — the scan would then wait out `busy_timeout` and fail, which is exactly what §6 opens this
-/// command to avoid.
+/// whole corpus — the scan would then wait out `busy_timeout` and fail, which is the failure this rule exists to
+/// prevent.
 #[test]
 fn a_scan_can_take_the_write_lock_between_batches() {
     assert_recorder_works();
@@ -1262,7 +1262,7 @@ fn a_scan_can_take_the_write_lock_between_batches() {
 // the report's shape
 // ---------------------------------------------------------------------------
 
-/// §7's caveat line travels on every report, including the arms that did no work: "a caveat nobody reads at
+/// The caveat line travels on every report, including the arms that did no work: "a caveat nobody reads at
 /// 2 a.m. is not a caveat".
 #[test]
 fn every_report_carries_the_caveat_line() {
@@ -1280,7 +1280,7 @@ fn every_report_carries_the_caveat_line() {
             dim: None,
             max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
             // The policy default, spelled out: these fixtures must not inherit a worker count by
-            // accident if `Auto` ever stops being the default (`docs/design-m2-thread-policy.md` §3).
+            // accident if `Auto` ever stops being the default.
             threads: np_core::config::ThreadCount::Auto,
             log_level: None,
         },
@@ -1342,10 +1342,10 @@ fn the_worker_plan_describes_itself_in_one_line() {
 /// Every [`NoProvider`] sentence, on one line and without a run of two spaces.
 ///
 /// The wrap class is not hypothetical: the first `np search` refusal broke mid-sentence and printed twenty spaces between
-/// "be" and "embedded" (R7c Task 6 review P1). Two of the four arms cannot be reached from argv at all — `Config::load`
+/// "be" and "embedded", found in review. Two of the four arms cannot be reached from argv at all — `Config::load`
 /// refuses `local-model` with no `model`, and `np models install --dim` bounds what can be installed — so this file is the
-/// only place those sentences are read by anything. F32 §6 records that as their limit rather than pretending a CLI case
-/// covers them.
+/// only place those sentences are read by anything. That is their limit, stated plainly rather than papered over by
+/// pretending a CLI case covers them.
 #[test]
 fn no_provider_sentences_are_one_line_and_free_of_double_spaces() {
     let ws = PathBuf::from("/vault/notes");
@@ -1426,8 +1426,8 @@ fn the_row_missing_arm_points_at_the_same_door_as_embeds_arm_three() {
 }
 
 /// **A hint must not send a reader to bytes that change nothing.** `fetch` is default-on and `local-model` is default-off,
-/// so the build someone gets from `cargo install np-cli` can download 309 MB and still be refused by F40's arm (v). That
-/// made arm (ii)'s new **F41** remedy a trap: "fetch it, or install bytes you already hold" about a binary that will refuse
+/// so the build someone gets from `cargo install np-cli` can download 309 MB and still be refused at arm (v). That
+/// made arm (ii)'s newer remedy a trap: "fetch it, or install bytes you already hold" about a binary that will refuse
 /// either way. So the hint carries the build fact beside the command.
 ///
 /// Each feature row asserts only its own half, which is what makes this falsifiable in both directions: a mutant that drops
@@ -1459,13 +1459,13 @@ fn an_install_hint_says_when_this_binary_cannot_embed_anyway() {
     }
 }
 
-/// **The shape of `fetched`, pinned without a network.** The real-origin run that found this spelling is recorded in
-/// `docs/design-f38-auto-fetch.md` §5b — 309,855,456 bytes fetched and verified, and the document it printed said
+/// **The shape of `fetched`, pinned without a network.** The real-origin run that found this spelling fetched and
+/// verified 309,855,456 bytes, and the document it printed said
 /// `digest-verified` where the design sketch had said `digest_verified`. A test that needs no transport is what keeps that
 /// class of drift on the *type* from coming back: both structs are `rename_all = "kebab-case"`, which is how every other key
 /// in an embed report is spelled, and this asserts the consequence rather than trusting the attribute.
 ///
-/// The second claim is the one §12 rule 8 cares about: there is no field here that *could* carry a host, so no future change
+/// The second claim is the one origin privacy cares about: there is no field here that *could* carry a host, so no future change
 /// can leak one without adding it to this document — which is what makes the assertion below a tripwire instead of a wish.
 #[test]
 fn the_fetched_record_spells_its_keys_as_the_contract_does() {

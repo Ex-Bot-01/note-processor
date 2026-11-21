@@ -13,7 +13,7 @@ pub enum Phase {
     /// true of a half-written caller rather than false.
     #[default]
     Resolving,
-    /// Waiting for the F44 workspace write lock.
+    /// Waiting for the workspace write lock.
     Locking,
     /// Walking and parsing the vault.
     Indexing,
@@ -38,7 +38,7 @@ pub struct ProgressEvent<'a> {
     pub member: Option<&'a str>,
     /// Bytes written for `member` so far.
     pub bytes_done: u64,
-    /// The **pinned** size of `member`. Deliberately not the size the transport announced (**§12 rule 12**): a chunked
+    /// The **pinned** size of `member`. Deliberately not the size the transport announced: a chunked
     /// transfer announces nothing, and two denominators behind one key is how a client renders two different
     /// percentages from the same field. Absent means this build has no total to offer.
     pub bytes_total: Option<u64>,

@@ -1,28 +1,28 @@
 //! The embedding provider seam: one vector type, one trait, and the states between them.
 //!
 //! What lives here is the *seam* and its two offline providers: [`NoEmbeddingProvider`] behind
-//! `embeddings.provider = "none"`, the default (`docs/design-m2-embeddings.md` §2), and
+//! `embeddings.provider = "none"`, the default, and
 //! [`LocalModelProvider`] behind `embeddings.provider = "local-model"` — the API of a local inference
-//! runtime, without one inside it yet (`docs/design-m2-local-embeddings.md` §3, §9 item 1).
+//! runtime, without one inside it yet.
 //! Deliberately absent, and absent in this round rather than in this design: no HTTP client, no model
 //! loader, no weight file, no base URL, no key. Those arrive with the providers that need them, and
-//! until one does, nothing reachable from `np_core::scan` can contact anything — which is the property
-//! §7 asks for and §9 makes a hard rule ("No LLM, no network in the indexing path").
+//! until one does, nothing reachable from `np_core::scan` can contact anything — which is the property behind the hard rule
+//! this module keeps: "No LLM, no network in the indexing path".
 //!
 //! Four names carry the whole contract:
 //!
 //! - [`Vector`] — a whole number of little-endian `f32` components, i.e. exactly the shape migration 7
 //!   stores (`vector BLOB CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim)`). Its two
-//!   conversions are the Rust twins of that `CHECK`, and they refuse rather than truncate (§3).
+//!   conversions are the Rust twins of that `CHECK`, and they refuse rather than truncate.
 //! - [`Embedder`] — what a scan calls: "which model are you", "how wide is your vector", "embed these
 //!   texts". Nothing else, so adding a provider means implementing three methods and touching no caller.
 //! - [`EmbedError`] — one variant per thing that can go wrong, each saying one true thing. Notably
 //!   `Unavailable`'s payload is an opaque label rather than an endpoint, because this text ends up in
-//!   test-failure output and CI logs (§9).
+//!   test-failure output and CI logs.
 //! - [`LocalModelProvider`] — the type `local-model` resolves to, **feature or no feature**: the cargo feature builds a
-//!   runtime, it does not change this provider's refusal, which stays unconditional until R6c wires storage. A [`ModelRow`], an
+//!   runtime, it does not change this provider's refusal, which stays unconditional until storage is wired to a provider. A [`ModelRow`], an
 //!   artifact that exists, the row's document prefix, and a refusal where the forward pass goes. Nothing
-//!   constructs it from a config yet; R6c wires `[embeddings]` to a provider (§9's split), so today it is
+//!   constructs it from a config yet; wiring `[embeddings]` to a provider is a separate seam, so today it is
 //!   reachable API only.
 //! - `local_model::LocalEmbedder` (feature `local-model`, so not a link: this module documents both builds) —
 //!   the same shape **with** the runtime inside: one loaded model, the row's two
@@ -31,7 +31,7 @@
 //!   "this build has no runtime" quietly become "this call happened to fail".
 //!
 //! The heavy dependency stays behind the `local-model` cargo feature (`crates/np-core/Cargo.toml`), while
-//! everything in this module compiles by default: §9 item 1 wants CI and callers to exercise the seam
+//! everything in this module compiles by default: CI and callers have to exercise the seam
 //! *while* the runtime is being chosen, and a refusal that only compiles under a feature flag is a
 //! refusal nobody sees.
 
@@ -56,13 +56,12 @@ pub const COMPONENT_BYTES: usize = 4;
 /// **Defined once in [`crate::media`]** and re-exported here, because the trait's default refusal has to answer with it in
 /// a build where `crate::vision` is not compiled at all (`vision` is a cargo feature; this module and `media` are always
 /// built), and a second `const` with the same value would let the two halves of one class drift apart — measured rather
-/// than argued: renaming one copy on 2026-11-03 left all 534 default-build tests green. `crate::vision` re-exports it too,
-/// under the path the design document names (§8 of
-/// `docs/design-m2-image-embeddings.md`); the re-export carries no value of its own.
+/// than argued: renaming one copy left all 534 default-build tests green. `crate::vision` re-exports it too,
+/// under a fixed, documented path; the re-export carries no value of its own.
 ///
 /// The class is about the pair, never about the caller's bytes — that distinction is what vision's `undecodable` class
 /// exists next to it for (see `crate::vision`, compiled only under the feature, hence no link here) — and it carries no
-/// path, URL, or runtime diagnostic text (§12 rule 8).
+/// path, URL, or runtime diagnostic text.
 pub use crate::media::VISION_UNAVAILABLE;
 
 /// One embedding, held as `dim` `f32` components and stored as those components little-endian.
@@ -88,7 +87,7 @@ impl Vector {
     /// The components themselves, in order.
     ///
     /// The read side of [`Vector::to_bytes`]: a stored row is bytes, an in-memory one is numbers, and anything
-    /// that compares two vectors (R6d's cosine ranking) needs this rather than a round trip through the storage
+    /// that compares two vectors (cosine ranking) needs this rather than a round trip through the storage
     /// form. Borrowed, not copied — a 768-component row is 3 KiB and a search reads thousands of them.
     pub fn components(&self) -> &[f32] {
         &self.0
@@ -96,7 +95,7 @@ impl Vector {
 
     /// The bytes to store: every component little-endian, so exactly `4 * dim()` of them.
     ///
-    /// Little-endian is not a preference but the schema's rule (§3): the stored form is raw `f32`, never
+    /// Little-endian is not a preference but the schema's rule: the stored form is raw `f32`, never
     /// hex or JSON, and a writer that picked the other order would produce vectors whose cosines are
     /// garbage while every length check still passed.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -189,7 +188,7 @@ impl ArtifactCheck {
     /// The one-line sentence for `np embed`'s report and its `--json`.
     ///
     /// Sized to sit beside [`crate::embed_run::EmbedReport::verification`] without being confused with it: that field
-    /// answers "were these vectors checked against a reference implementation" (§7) and never changes; this answers
+    /// answers "were these vectors checked against a reference implementation" and never changes; this answers
     /// "were the model's bytes checked this run".
     pub fn label(&self) -> String {
         use crate::catalog::size_human;
@@ -213,16 +212,16 @@ impl ArtifactCheck {
 /// Why one call to [`Embedder::embed`] — or one attempt to build a provider — did not produce vectors.
 ///
 /// Every variant states a distinct fact, because the scan's report has to distinguish "nothing was
-/// embedded because nobody chose a provider" (§2) from "something tried and failed" (§5) — those two
+/// embedded because nobody chose a provider" from "something tried and failed" — those two
 /// become different sentences in the catalog's durable-record line, and one of them is not an error at
 /// all.
 ///
-/// The taxonomy grew from four variants to nine under `docs/design-m2-local-embeddings.md` §3, which names
-/// the failure classes a local runtime needs typed *before* it exists (parent §7's "four things and no
-/// fifth" describes Round 3a's seam, not this one). Two rules bind every variant, old and new:
+/// The taxonomy grew from four variants to nine as the failure classes a local runtime needs typed *before*
+/// it exists were named. ("Four things and no fifth" described an earlier seam, not this one.)
+/// Two rules bind every variant, old and new:
 ///
 /// - **input-free**: none formats note text into its message. A vault is private and an error log outlives
-///   the run (§3);
+///   the run;
 /// - **secret-free**: no endpoint, host, port or credential. An artifact path is neither — it names a file
 ///   this program wrote under the data dir, and naming it is what makes the refusal actionable, exactly as
 ///   [`crate::models::ModelError`] does for the same file.
@@ -230,20 +229,20 @@ impl ArtifactCheck {
 pub enum EmbedError {
     /// No provider was chosen (`embeddings.provider = "none"`), so nothing was embedded and nothing was
     /// contacted. This is the default state of a fresh install, reported as a count rather than as a
-    /// fault (§2, §5).
+    /// fault.
     #[error("embedding disabled: embeddings.provider = \"none\"")]
     Disabled,
     /// A provider exists and could not serve this call — no artifact installed, no memory to load a model
-    /// with. Not version debt: §5's P0 is that availability never becomes `EMBED_VERSION` debt, so the scan
+    /// with. Not version debt: the hard rule is that availability never becomes `EMBED_VERSION` debt, so the scan
     /// reports the count and keeps its chunks.
     ///
     /// The payload is an **opaque label** (a provider kind, a host category, anything a secret could not
     /// take): this enum's text lands in test-failure output and CI logs, so an error that formatted one
-    /// would leak it on the first flake (§9). R6b1's loader and R6b2's forward pass raise it — `local-model`'s
-    /// refusals are the specific ones below, which is what §10 of `docs/design-m2-local-embeddings.md` did to the
+    /// would leak it on the first flake. R6b1's loader and R6b2's forward pass raise it — `local-model`'s
+    /// refusals are the specific ones below, which is what the taxonomy did to the
     /// class this variant was sketched for: there is no endpoint left that could be down.
     ///
-    /// **Its home is §3's fifth class**, "runtime error with a bounded message": every label is one we chose, never
+    /// **Its home is the taxonomy's fifth class**, "runtime error with a bounded message": every label is one we chose, never
     /// the runtime's own diagnostic text — that text is exactly what this payload rule exists to keep out of logs,
     /// and [`EmbedError::ArtifactNotLoadable`] deliberately declines to be its carrier.
     ///
@@ -285,10 +284,10 @@ pub enum EmbedError {
     /// window label cannot fire on this artifact** (it has no KV cache — `create_memory` returns null, so
     /// `llama_decode` diverts to the encoder path, which answers 0, `2` for an aborted run, or negative — never a
     /// `1`), and the last three normalisation
-    /// labels have never been produced by any input here (§8's "untested" list in the round report says so too).
+    /// labels have never been produced by any input here.
     /// They exist because storing such a row is how a search silently returns nothing.
     ///
-    /// Not one of them is llama.cpp's diagnostic text, which is §3's fifth class in the abstract and this payload
+    /// Not one of them is llama.cpp's diagnostic text, which is that fifth class in the abstract and this payload
     /// rule in practice. If a failure arrives that none of the twenty-two describes, the honest move is a
     /// twenty-third label named for that class — not a wider payload here.
     #[error("embedding provider unavailable [{0}]")]
@@ -322,7 +321,7 @@ pub enum EmbedError {
     ///
     /// This is the seam's placeholder for R6b1's forward pass, and it has to stay an error rather than an
     /// empty batch: `Ok(vec![])` would let a report say "0 chunks needed embedding" about a corpus that was
-    /// never embedded — F21's false status claim with a different noun.
+    /// never embedded — a false status claim with a different noun.
     #[error(
         "the local embedding runtime is not built yet: model `{model_id}` was asked to embed and produced nothing"
     )]
@@ -333,7 +332,7 @@ pub enum EmbedError {
     /// which (`NotFound` is the missing case) and a second variant would draw a distinction no caller acts
     /// on.
     ///
-    /// Not folded into [`crate::models::ModelError::Artifact`], which is the reuse §3's "existing
+    /// Not folded into [`crate::models::ModelError::Artifact`], which is the reuse the taxonomy calls for: an existing
     /// `ModelError`" line invites: that variant's message says the artifact could not be read **to compare
     /// it with its row**, and the two callers of *this* variant only stat the file — [`LocalModelProvider::new`] and
     /// [`crate::embed::artifact_is_readable`] never hash. The comparison exists now, in
@@ -357,7 +356,7 @@ pub enum EmbedError {
     /// were reached and meant nothing. `local_model::load` raises it when llama.cpp returns null — bad magic, an unknown
     /// architecture, or a file whose tensor data runs past its end (measured: a 310 MB artifact truncated to
     /// 128 MiB comes back null rather than aborting) — and it is deliberately
-    /// not the home for a runtime's own diagnostic text: §3 keeps "runtime error with a bounded message"
+    /// not the home for a runtime's own diagnostic text: the taxonomy keeps "runtime error with a bounded message"
     /// as its own class, and giving that a payload no runtime has produced yet would be a variant written
     /// backwards.
     #[error("{} is not loadable as a model by this build", .path.display())]
@@ -365,7 +364,7 @@ pub enum EmbedError {
     /// A sequence needs more tokens than `embeddings.max_tokens` allows, so it was refused instead of
     /// truncated.
     ///
-    /// Truncation is the thing this variant exists to forbid (`docs/design-m2-local-embeddings.md` §5): a
+    /// Truncation is the thing this variant exists to forbid: a
     /// truncated chunk stamps `source_hash = <the whole chunk's digest>` onto a vector that read part of it
     /// — "a row claiming currency for bytes it never saw". The message carries both numbers and no text:
     /// the reader needs to know how far over, and must not need the note to say so.
@@ -386,7 +385,7 @@ pub enum EmbedError {
     /// `configured` is what the caller needs vectors to be (`[embeddings] dim`, or the width already stored
     /// under this id); `provider` is what the row says it will produce.
     ///
-    /// Refusing at construction is the point (§6: "Wrong-dim provider is refused before any write, naming
+    /// Refusing at construction is the point: "a wrong-dim provider is refused before any write, naming
     /// both numbers — today a mismatch surfaces as a raw `DbError` from a CHECK constraint mid-run"). It is
     /// also not [`EmbedError::DimensionMismatch`], which is about a *buffer* whose component count
     /// disagrees: this is two declarations disagreeing, and once there is a buffer to compare, the write
@@ -413,12 +412,12 @@ pub enum EmbedError {
     /// Raised by `local_model::verify_artifact` (behind the `local-model` feature) — D12's verify-on-change, reached
     /// whenever a hash is taken and disagrees: bytes that moved since the last verified read, or a row with no stamp
     /// yet (one written before this build existed, or a half stamp). An unchanged, stamped file is not re-hashed, and
-    /// that skip is what makes the check cheap enough to run on every embed (§14: 11.32 s to hash this artifact against
+    /// that skip is what makes the check cheap enough to run on every embed (measured: 11.32 s to hash this artifact against
     /// ~0.09 s for llama.cpp's first pass over the same bytes).
     ///
     /// Both digests are spelled out because the reader's next action depends on which one is wrong: `expected` is
     /// what `np models install` was told and what every stored vector was made from, `found` is what the file is
-    /// now. Naming the path is safe under §3's rule for the same reason [`EmbedError::ArtifactUnreadable`] gives —
+    /// now. Naming the path is safe under the origin-privacy rule for the same reason [`EmbedError::ArtifactUnreadable`] gives —
     /// a data-dir file this program wrote, never note text.
     #[error(
         "the model artifact {path} hashes to {found}, but its row says {expected}; refused before embedding anything, because a swapped artifact would stamp vectors as made by a model that never ran"
@@ -433,11 +432,11 @@ pub enum EmbedError {
     },
 }
 
-/// Why a provider cannot encode an image, spelled as the two sentences a report can print (F28).
+/// Why a provider cannot encode an image, spelled as the two sentences a report can print.
 ///
 /// **Why a type rather than the refusal class itself.** The class is decided where the refusal is counted
 /// ([`crate::embed_run`]'s image pass), and this is answered by whoever knows the reason; keeping them separate means a
-/// provider says *what is missing* and the report decides *which §8 class that is*, so adding a class cannot silently
+/// provider says *what is missing* and the report decides *which refusal class that is*, so adding a class cannot silently
 /// re-label what a provider meant. It also keeps the pair honest in one place: [`Embedder::supports_images`] answers
 /// whether asking is worth a file read, and this answers why not, for the same reason laziness does — a caller deciding
 /// what to tell a user must not have to load weights to ask.
@@ -448,7 +447,7 @@ pub enum ImageBlocker {
     Build,
     /// This build has the image code and the workspace has no projector for it to load — not recorded by this
     /// database, or present but not the bytes that record vouches for. The fix is one file: install or fetch the
-    /// `mmproj` member (§13 of the image-embeddings design), which is why this is not folded into [`Self::Build`].
+    /// `mmproj` member, which is why this is not folded into [`Self::Build`].
     ProjectorAbsent,
 }
 
@@ -458,10 +457,10 @@ pub enum ImageBlocker {
 /// model it is writing rows under ([`Embedder::model_id`]), how wide the result is
 /// ([`Embedder::dim`], checked against [`Vector::dim`] at write time by the schema's `CHECK`), and the
 /// vectors themselves ([`Embedder::embed`]). Providers are `&self`-callable so a scan can hold one and
-/// batch through it (§5: vector writes commit per batch, outside the scan's transaction).
+/// batch through it (vector writes commit per batch, outside the scan's transaction).
 pub trait Embedder {
     /// Model identity exactly as it belongs in `models.id` / `embeddings.model`: id plus version,
-    /// verbatim, one fact in one place (§3, §4).
+    /// verbatim, one fact in one place.
     fn model_id(&self) -> &str;
 
     /// Component count every returned [`Vector`] must have. A provider that returns anything else has a
@@ -480,7 +479,7 @@ pub trait Embedder {
     ///
     /// The contract: [`Self::embed`] must read the model on exactly the bytes this returns, in the same order, with
     /// nothing added or removed in between. A provider whose dressing changes — a re-installed row with a new
-    /// `prefix_doc`, say — therefore invalidates what it stored, which is §3's rule about prefixes turning into
+    /// `prefix_doc`, say — therefore invalidates what it stored, which is the rule about prefixes turning into
     /// lies enforced by a digest instead of by hope.
     fn model_inputs(&self, texts: &[&str]) -> Vec<String>;
 
@@ -490,10 +489,10 @@ pub trait Embedder {
     /// here as well, from the same rule, and a caller that pre-applies anything is double-applying it.
     ///
     /// Implementations that cannot serve return an [`EmbedError`]; they never panic on absence of a
-    /// model or an endpoint (§7: CI runs `--ignored`, so a panicking path poisons a green run).
+    /// model or an endpoint (CI runs `--ignored`, so a panicking path poisons a green run).
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError>;
 
-    /// Embed one **search query** under the model's query-side prefix (`docs/design-m2-image-embeddings.md` §12).
+    /// Embed one **search query** under the model's query-side prefix.
     ///
     /// Separate from [`Self::embed`] because the two sides of an asymmetric retrieval pair are not interchangeable: a
     /// vector written under `prefix_query` is not comparable with a stored document row, so which side a piece of text is
@@ -518,7 +517,7 @@ pub trait Embedder {
     /// promises is that asking is worth the file read, which is how a caller gets to refuse an image *before* reading it.
     /// It says nothing about the bytes about to be handed over.
     ///
-    /// **An image carries no instruction prefix** (§1.2): prefixes are how a text chunk is dressed for a task, and media
+    /// **An image carries no instruction prefix**: prefixes are how a text chunk is dressed for a task, and media
     /// rows are embedded bare and compared against prefixed text rows — so there is no `prefix` parameter on either half
     /// of this pair, which is stronger than a rule telling callers not to pass one.
     fn supports_images(&self) -> bool {
@@ -550,7 +549,7 @@ pub trait Embedder {
     /// doing it.
     ///
     /// The default refuses with [`EmbedError::Unavailable`] carrying [`VISION_UNAVAILABLE`], because "this provider has no
-    /// image encoder" is a fact about the build and model pair. **A refusal is a class, never a path** (§12 rule 8): no
+    /// image encoder" is a fact about the build and model pair. **A refusal is a class, never a path**: no
     /// filename, URL or runtime diagnostic text reaches the payload — the caller's bytes are named nowhere in what we
     /// report.
     fn embed_image(&mut self, _bytes: &[u8]) -> Result<Vector, EmbedError> {
@@ -558,11 +557,11 @@ pub trait Embedder {
     }
 }
 
-/// The provider behind `embeddings.provider = "none"` (§2's default): it refuses, and could not do
+/// The provider behind `embeddings.provider = "none"`, the default: it refuses, and could not do
 /// otherwise.
 ///
 /// **This type holds no client, no base URL, no key, and no field of any kind.** That is the
-/// load-bearing property rather than an accident of emptiness: §7 wants "`none` contacts nothing" to be
+/// load-bearing property rather than an accident of emptiness: "`none` contacts nothing" has to be
 /// a fact about the *type* — where a later reader cannot add a connection pool, a `reqwest::Client`, or
 /// a `String` of URL by oversight — and not about one code path that happens not to dial out. A unit
 /// struct has nowhere to put those, so "constructs no HTTP client at all" needs no test that watches the
@@ -575,13 +574,13 @@ impl Embedder for NoEmbeddingProvider {
     /// Identity — and it never matters, because this provider refuses every batch
     /// ([`EmbedError::Disabled`]) so no bytes of its making reach a model. Implemented rather than defaulted
     /// because the writer stamps whatever this returns, and a placeholder claiming "the model would read exactly
-    /// this" about a provider that embeds nothing is the sort of sentence §3 exists to stop.
+    /// this" about a provider that embeds nothing is the sort of sentence this taxonomy exists to stop.
     fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
         texts.iter().map(|text| (*text).to_string()).collect()
     }
 
     /// `"none"` — the same spelling as the config value, and usable only as a report label: this
-    /// provider never produces a row, so no `models.id` is derived from it (§3).
+    /// provider never produces a row, so no `models.id` is derived from it.
     fn model_id(&self) -> &str {
         "none"
     }
@@ -593,7 +592,7 @@ impl Embedder for NoEmbeddingProvider {
     }
 
     /// Always [`EmbedError::Disabled`], with no argument inspection and nothing to contact: the refusal
-    /// is the whole behaviour (§2).
+    /// is the whole behaviour.
     fn embed(&self, _texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
         Err(EmbedError::Disabled)
     }
@@ -602,7 +601,7 @@ impl Embedder for NoEmbeddingProvider {
     /// embed a search query* and that is not what is wrong: nothing is unavailable, embedding is switched off, and the
     /// setting that switches it off has a name (`embeddings.provider = "none"`).
     ///
-    /// **Nothing in `np` prints this text any more** (F32): `np search` now refuses on the [`crate::embed_run::NoProvider`]
+    /// **Nothing in `np` prints this text any more**: `np search` now refuses on the [`crate::embed_run::NoProvider`]
     /// reason it was handed, before asking a placeholder for a vector, and `np embed`'s arms come from
     /// [`crate::embed_run::EmbedOutcome`]. The override stays because a provider that is asked to embed while embedding is off
     /// still has to answer with the setting's name rather than "this provider cannot", and `tests/embed.rs` exercises it
@@ -618,33 +617,32 @@ impl Embedder for NoEmbeddingProvider {
 /// **Why it exists before it can work:** every part of a local provider that is *not* the forward pass is a
 /// decision R6b1 cannot cheaply undo — where identity comes from, who applies the prefix, which width
 /// disagreement is refused and when — so those are built and tested now, while getting them wrong costs a
-/// rename rather than a corpus of vectors no reference can re-derive
-/// (`docs/design-m2-local-embeddings.md` §3, §9 item 1).
+/// rename rather than a corpus of vectors no reference can re-derive.
 ///
 /// Three rules it carries, each forced by the shape of [`Embedder`]:
 ///
 /// - **Identity comes from the row.** [`Embedder::model_id`] *is* `models.id`, so no second source of model
-///   identity exists (§3, §4). That is why construction takes a row rather than a bare path: a provider built
+///   identity exists. That is why construction takes a row rather than a bare path: a provider built
 ///   from a path alone would have to invent an id or let every caller supply its own.
 /// - **The prefix is the provider's job.** `embed(&[&str])` takes no prefix argument, so either the
 ///   constructor carries `prefix_doc` and [`Embedder::model_inputs`] applies it, or the prefix gets
-///   applied nowhere — and "a provider that ignores prefixes is a bug" (parent §3).
+///   applied nowhere — and "a provider that ignores prefixes is a bug".
 /// - **It refuses.** Until R6b1 there is no runtime, so [`Embedder::embed`] answers
 ///   [`EmbedError::RuntimeNotBuilt`] naming the model id: never an empty batch, never a zero vector, never a
 ///   silent no-op.
 ///
 /// What it does **not** do: load anything, hold weights, or read a note. Construction stats the artifact and
-/// stops there — existence is checkable today, loading is R6b1's (§3: "Loading is explicit and bounded. One
+/// stops there — existence is checkable today, loading is explicit and bounded ("one
 /// load per process, never per note"). `Clone` is deliberately **not** derived: today the struct holds only
-/// metadata, so a derive would be harmless, and in R6b1 it would either deep-copy weights or become a breaking
-/// removal. Nothing clones a provider (asserted by this round compiling without the derive).
+/// metadata, so a derive would be harmless, and once it holds a loaded model it would either deep-copy weights or become a breaking
+/// removal. Nothing clones a provider — asserted by compiling without the derive.
 #[derive(Debug)]
 pub struct LocalModelProvider {
     /// `models.id`, verbatim.
     model_id: String,
     /// The row's declared width, which [`LocalModelProvider::new`] refused to build anything over.
     dim: usize,
-    /// `models.prefix_doc`: what every stored vector was prefixed with (parent §3 — "`prefix_doc` describes
+    /// `models.prefix_doc`: what every stored vector was prefixed with ("`prefix_doc` describes
     /// every row of `embeddings`"), and therefore what this provider must prepend.
     prefix_doc: String,
     /// The artifact file, as the caller resolved it from
@@ -656,7 +654,7 @@ pub struct LocalModelProvider {
 ///
 /// Both local provider shapes ask it before any model work — `LocalModelProvider::new` because that is all it
 /// does, and `local_model::LazyLocalEmbedder::new` (behind the `local-model` feature, so named in prose rather
-/// than linked: this item has to resolve in a default build too) because §6's *artifact absent* arm must be settled
+/// than linked: this item has to resolve in a default build too) because the *artifact absent* arm must be settled
 /// **before** [`crate::embed_run`] is asked whether the workspace owes anything. One function is what keeps that
 /// arm one sentence in both builds, which is R6c1 D-2's rule: a missing file is a fact about the filesystem, never
 /// a configuration complaint.
@@ -700,7 +698,7 @@ impl LocalModelProvider {
     ///
     /// `configured` is the width this run needs vectors to be — `[embeddings] dim`, or the width already
     /// stored under this id — and it is an argument rather than something read off the row because the row
-    /// and it are the pair §6 requires to agree. `artifact` is where that row's bytes live.
+    /// and it are the pair that has to agree. `artifact` is where that row's bytes live.
     ///
     /// Two refusals, in this order, both before anything is loaded or written:
     ///
@@ -714,15 +712,15 @@ impl LocalModelProvider {
     ///
     /// **Digest verification was an open, costed decision; this constructor still does not make it.** Nothing here
     /// compares the file against `models.sha256`: construction stats one path. The case for hashing was always strong —
-    /// `docs/design-m2-models-install.md` states as a safety property that "nothing embeds against a mismatching row",
-    /// which install alone does not enforce, since it proves the bytes once and never again — and R6d measured the cost
-    /// of closing it the obvious way: one streaming SHA-256 pass over this artifact is **11.32 s** (§9), against ~0.09 s
-    /// for llama.cpp to page in every byte (§14). D12 closed the decision on those numbers, in
+    /// the stated safety property is that "nothing embeds against a mismatching row",
+    /// which install alone does not enforce, since it proves the bytes once and never again — and the cost was measured
+    /// of closing it the obvious way: one streaming SHA-256 pass over this artifact is **11.32 s**, against ~0.09 s
+    /// for llama.cpp to page in every byte. D12 closed the decision on those numbers, in
     /// `local_model::verify_artifact` (behind `local-model`): verify on change, stamp what you hashed, refuse with both
     /// digests when they disagree.
     ///
     /// It is not here because construction is the wrong place for it twice over. A provider is resolved before anyone
-    /// knows whether the workspace owes a single chunk (R6c2's laziness argument, §14), so hashing at construction
+    /// knows whether the workspace owes a single chunk (the laziness argument), so hashing at construction
     /// would spend 11 s on runs that write nothing; and this constructor serves both provider shapes and a default
     /// build, while the digest rule belongs to the runtime that will read the bytes. What stays true in every build is
     /// the ordering: stat first, refuse cheaply, never repair.
@@ -767,11 +765,11 @@ impl Embedder for LocalModelProvider {
     /// Each text with this row's `prefix_doc` in front, verbatim, with nothing added between the two: the
     /// [`Embedder::model_inputs`] contract, applied by the provider that owns the row.
     ///
-    /// **This is the sequence [`crate::config::EmbeddingsConfig::max_tokens`] counts** (§5): prefix + text +
+    /// **This is the sequence [`crate::config::EmbeddingsConfig::max_tokens`] counts**: prefix + text +
     /// special tokens, not the chunk's bytes alone. R6b2 enforces the budget and measures it over what this
     /// returns — bounding the un-prefixed text would leave every existing test green while limiting something else.
     ///
-    /// The prefix is applied in exactly one place per provider, which is what makes parent §3's "a provider that
+    /// The prefix is applied in exactly one place per provider, which is what makes "a provider that
     /// ignores prefixes is a bug" checkable: `tests/embed.rs` hands the result to a recording fake and asserts the
     /// stored prefix sits in front of text the caller never touched. In this build [`Self::embed`] refuses before
     /// reaching the model, so the method's production callers are the writer's stamp and, behind the feature flag,
@@ -784,19 +782,19 @@ impl Embedder for LocalModelProvider {
     }
 
     /// The installed row's `id`, verbatim: the provider adds and strips nothing, because `embeddings.model`
-    /// is a foreign key to `models.id` and one spelling of an identity is the rule §4 exists to keep.
+    /// is a foreign key to `models.id`, and one spelling of an identity is what that keeps.
     fn model_id(&self) -> &str {
         &self.model_id
     }
 
     /// The row's declared width. A provider that returned anything other than what its rows say would be the
-    /// §6 mismatch this type refuses at construction.
+    /// The mismatch this type refuses at construction.
     fn dim(&self) -> usize {
         self.dim
     }
 
     /// Always [`EmbedError::RuntimeNotBuilt`], naming the model, with the batch untouched: this type is the seam's
-    /// default half, and a build that links no C++ has no way to turn text into numbers (§9 item 1).
+    /// default half, and a build that links no C++ has no way to turn text into numbers.
     ///
     /// Not a statement about the program: in a `local-model` build `np-cli` resolves
     /// `local_model::LazyLocalEmbedder` instead and vectors are computed, so this refusal is what a **default**
@@ -812,7 +810,7 @@ impl Embedder for LocalModelProvider {
     ///
     /// Overriding is not cosmetic. The trait's default refuses too, but with "this provider cannot embed a search query",
     /// which reads as a capability the seam lacks rather than the one fact a reader can act on — that this binary was
-    /// compiled without the runtime (§9 item 1). Task 6 review P1.
+    /// compiled without the runtime.
     fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
         Err(EmbedError::RuntimeNotBuilt {
             model_id: self.model_id.clone(),

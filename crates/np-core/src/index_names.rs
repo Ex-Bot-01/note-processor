@@ -1,4 +1,4 @@
-//! The one spelling of the catalog file names this program writes (spec §7).
+//! The one spelling of the catalog file names this program writes.
 //!
 //! `INDEX.md` at the workspace root, plus `INDEX-<first>-<last>.md` shards when a catalog is too big for
 //! one file. Three callers read these names and none of them may hold its own copy: [`crate::catalog`]

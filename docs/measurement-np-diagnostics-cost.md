@@ -4,7 +4,7 @@ Measurement, not design — and **not a gate**. One memory-tight box produced ev
 nothing else loud on the machine. Nobody should read these as a fence a CI run can assert against: they are here so that
 "diagnostics are free when you do not ask for them" is a number somebody wrote down rather than an assertion nobody
 tested. The design decisions they support are in
-[`docs/superpowers/specs/2026-12-10-np-diagnostics-design.md`](superpowers/specs/2026-12-10-np-diagnostics-design.md);
+[`docs/superpowers/specs/2026-11-09-np-diagnostics-design.md`](superpowers/specs/2026-11-09-np-diagnostics-design.md);
 how to read the output is in [`docs/reference-diagnostics.md`](reference-diagnostics.md).
 
 ## Method
