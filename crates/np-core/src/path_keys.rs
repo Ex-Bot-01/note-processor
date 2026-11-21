@@ -4,7 +4,7 @@
 //! two names and two functions:
 //!
 //! - [`rel_bytes`] is the row's identity — the bytes of the path, stored in a BLOB column so an invalid byte
-//!   survives instead of becoming U+FFFD (F13 §1). Uniqueness lives here and on its fold, never on the
+//!   survives instead of becoming U+FFFD. Uniqueness lives here and on its fold, never on the
 //!   display text: two live files may spell themselves identically once the lossy spelling is admitted.
 //! - [`case_fold`] of those bytes is the ASCII-case guard — it is what still reports `a.md` beside `A.md` as
 //!   one file on a case-sensitive filesystem (`files.case_bytes UNIQUE`).
@@ -12,7 +12,7 @@
 //!   an author spelled a name and feeds link resolution (`links::resolve` looks a target up by it). It must
 //!   not move with the byte key, or `[[ÄMLI]]` stops finding `Ämli.md`.
 //!
-//! No other module may write either column without calling through here (F13 §4: "one owner for the folds").
+//! No other module may write either column without calling through here: one owner for the folds.
 //! [`crate::walk`] builds a row's whole key set — [`rel_bytes`], [`case_fold`] and [`display_fold`] together,
 //! so neither is ever written without the others — and migration 4's copy loop calls the same functions on the
 //! one population it can only copy faithfully ([`rel_bytes_of_display`]). The statements that *carry* a key
@@ -21,13 +21,13 @@
 //! their own rule.
 //!
 //! Both spellings of a path travel together, so they are one type: [`RelPath`]. A change list, a link corpus
-//! or a write call that named only one of them would either lose the identity (text alone, which is F13) or
+//! or a write call that named only one of them would either lose the identity (text alone cannot key anything) or
 //! lose the line the report renders (bytes alone, which nobody can read).
 //!
 //! One thing this module cannot do is spell a Windows name exactly: its paths are UTF-16 code units and
 //! `os_bytes` has to fall back to lossy text there. `name_is_lossless` is the refusal that keeps an
 //! unspellable name from overwriting the twin whose key it collides with — a refusal, not byte
-//! identity, which stays open in `docs/backlog-m2-followups.md`.
+//! identity, which stays open.
 
 use std::ffi::OsStr;
 
@@ -35,12 +35,12 @@ use std::ffi::OsStr;
 ///
 /// The pair exists so that no call site has to choose. Identity decisions — change classification, row
 /// resolution, ordering, the note key — read [`RelPath::rel_bytes`]; reports and the rendered catalog read
-/// [`RelPath::rel`], which stays the honest lossy spelling (F13 §3: display sites keep reading text *because*
+/// [`RelPath::rel`], which stays the honest lossy spelling: display sites keep reading text *because*
 /// they were always display-only). Two live rows may carry byte-identical `rel` values, so nothing that has
 /// to tell rows apart may compare or store that field alone.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RelPath {
-    /// The identity: OS bytes of the `/`-joined path (F13 §4.1).
+    /// The identity: OS bytes of the `/`-joined path.
     pub rel_bytes: Vec<u8>,
     /// The display spelling: `rel_bytes` decoded with replacements for anything UTF-8 cannot hold.
     pub rel: String,
@@ -71,12 +71,12 @@ impl RelPath {
 /// platform, because `rel` is this program's own relative spelling rather than the OS's absolute one. On Unix
 /// the bytes are the raw ones, which is the whole point: `caf\xe9.md` and `caf\xe8.md` key apart while both
 /// decode to `caf\u{FFFD}.md`. Windows has no byte spelling (its paths are UTF-16 and unpaired surrogates are
-/// the lossy case — **and that was true of this function until F18 round four.** Windows now encodes through [`wtf8`],
+/// the lossy case — **and that was not always true of this function.** It now encodes through [`wtf8`],
 /// which gives a lone surrogate bytes of its own, so two NTFS names differing only in *which* surrogate key apart here as
-/// well. What survives of F13 §5's residual is the neither-Unix-nor-Windows target, where no
+/// well. What survives as a residual is the neither-Unix-nor-Windows target, where no
 /// exact spelling exists to take (the third arm of `os_bytes`, which is private, so it is named rather than linked — rustdoc lints a
 /// public page that points at an item with no page). The claim this line replaced stayed stale for six days because only a Windows runner
-/// can exercise it, and none ran until 2026-11-14 (issue #9).
+/// can exercise it, and there was no Windows runner to run one when that claim was written.
 pub fn rel_bytes<'a>(components: impl IntoIterator<Item = &'a OsStr>) -> Vec<u8> {
     let mut joined: Vec<u8> = Vec::new();
     for component in components {
@@ -90,9 +90,9 @@ pub fn rel_bytes<'a>(components: impl IntoIterator<Item = &'a OsStr>) -> Vec<u8>
 
 /// The identity key of a row written before byte keys existed: the UTF-8 bytes of its stored display text.
 ///
-/// Migration cannot invent bytes it never held (F13 §2), so migration 4's copy uses this rule and every
+/// Migration cannot invent bytes it never held, so migration 4's copy uses this rule and every
 /// affected path is counted into [`crate::db::PATHS_LOSSY_KEY`] for a person to read against the churn the
-/// first byte-keyed scan reports (F13 §4.2). For an ASCII or valid-UTF-8 name these *are* the OS bytes and
+/// first byte-keyed scan reports. For an ASCII or valid-UTF-8 name these *are* the OS bytes and
 /// nothing moves; for a lossy one the key is repaired by that first scan, not here.
 pub fn rel_bytes_of_display(display: &str) -> Vec<u8> {
     display.as_bytes().to_vec()
@@ -102,11 +102,11 @@ pub fn rel_bytes_of_display(display: &str) -> Vec<u8> {
 ///
 /// Deliberately not `str::to_lowercase`. This fold guards identity (`files.case_bytes UNIQUE`) and so has to
 /// keep ruling the P3 case — one file spelled two ways on a case-sensitive filesystem — while being total on
-/// bytes that form no character. It also has to be exactly the rule [F13 §4]'s migration copy applies to rows
+/// bytes that form no character. It also has to be exactly the rule migration 4's copy applies to rows
 /// written before this module existed, and any two paths equal under it are already equal under
 /// `str::to_lowercase`, so the new `UNIQUE` cannot refuse a database that was legal at version 3.
 ///
-/// The consequence stated out loud (F13 §3's residual): a fold that stops at ASCII no longer folds `Ä` onto
+/// The consequence stated out loud: a fold that stops at ASCII no longer folds `Ä` onto
 /// `ä`, so two names differing *only* in a non-ASCII letter become two live rows where the old
 /// `case_key UNIQUE` reported one skipped path. The Unicode half of that question stays with
 /// [`display_fold`], which still answers it for authors.
@@ -143,12 +143,12 @@ pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
 /// The bytes of one Windows name: its UTF-16 units encoded without inventing a replacement character.
 ///
 /// This is **exact**, in the sense that two OS names that differ produce two byte keys — which the lossy spelling this replaced could not promise,
-/// and the reason F18 had to refuse a name holding an unpaired surrogate rather than index it ([`name_is_lossless`]). Encoding lives in [`wtf8`]
+/// and the reason a name holding an unpaired surrogate has to be refused rather than indexed ([`name_is_lossless`]). Encoding lives in [`wtf8`]
 /// because only its caller can be compiled on Windows; the rule itself is pure over `u16` and tested on every host.
 ///
 /// **Exactness here does not make such a name indexable yet, and that is deliberate.** Identity is bytes
 /// ([`rel_bytes`]) but display, link resolution and any later re-open go through `rel`, which stays lossy text: a reader that reconstructs the path
-/// from the key would open the wrong file. Refusal therefore stays in force, and lifting it is the part of F18 that still needs a Windows run — see
+/// from the key would open the wrong file. Refusal therefore stays in force, and lifting it is the part that still needs a Windows run — see
 /// the card's "what exact bytes cost" section for the two steps left.
 #[cfg(windows)]
 pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
@@ -163,7 +163,7 @@ pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
 /// **This arm is also more reachable than it looks, and the reachability is a finding rather than a nitpick.** [`name_is_lossless`] is gated
 /// `cfg(unix)` / `cfg(windows)` with no fallback, so any other target fails to build *there* long before reaching this function. Keeping `os_bytes`
 /// total anyway is the cheap half of making that asymmetry visible: one item missing an arm is a compile error to fix, where a silently different
-/// key rule would be a data defect. Recorded on F18.
+/// key rule would be a data defect.
 #[cfg(all(not(unix), not(windows)))]
 pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
     name.to_string_lossy().into_owned().into_bytes()
@@ -174,13 +174,13 @@ pub(crate) fn os_bytes(name: &OsStr) -> Vec<u8> {
 /// The rule is three arms, and only the third is interesting:
 ///
 /// - a unit below `0xD800`, or a well-formed high+low pair, encodes as ordinary UTF-8 — one to four bytes, byte-identical to what
-///   `to_string_lossy` produced before **F18**, which is why switching to this encoder moves no existing key;
+///   `to_string_lossy` produced before this encoder landed, which is why the switch moves no existing key;
 /// - a **lone** surrogate (a high with no low behind it, or a low with no high in front) encodes as the three-byte form of its 11-bit value:
 ///   `0xE0 | v >> 12`, `0x80 | (v >> 6) & 0x3F`, `0x80 | v & 0x3F`.
 ///
 /// That third arm is what makes the encoding *injective*: two unit sequences that differ produce bytes that differ, so identity cannot merge two OS
 /// names. It is also reversible — a decoder recognises `ED A0..BF xx` as one code unit — which is the property a future Windows reader needs to turn
-/// a stored key back into a path (F18's remaining step). The exact bytes are pinned by test rather than left implied, because an encoder someone
+/// a stored key back into a path — that step is still open. The exact bytes are pinned by test rather than left implied, because an encoder someone
 /// writes later has to agree with the ones already in a database.
 ///
 /// Pure over `u16` and public for the same reason [`has_unpaired_surrogate`] is: no filesystem this test suite can reach holds an unpaired surrogate,
@@ -258,7 +258,7 @@ fn push_surrogate(out: &mut Vec<u8>, value: u32) {
 ///
 /// Pure over `u16`, and public so it stays testable on every platform: only Windows can reach this shape
 /// through a filesystem, and `name_is_lossless`'s Unix arm answers `true` without looking, so without a
-/// callable predicate F18's rule would be covered by nothing that CI can run.
+/// callable predicate for that rule would be covered by nothing that CI can run.
 pub fn has_unpaired_surrogate(units: &[u16]) -> bool {
     let mut index = 0;
     while index < units.len() {
@@ -299,14 +299,13 @@ fn is_low_surrogate(unit: u16) -> bool {
 /// shortcut: [`os_bytes`]'s Unix arm takes the bytes straight out of the `OsStr`, so the key *is* the name
 /// and there is no lossy step for a predicate to catch — not for a raw non-UTF-8 byte, and not for anything
 /// else a path can hold. Checking here could therefore only ever refuse a file Unix indexes correctly today,
-/// which F18 names as the worse failure (a silently skipped note costs more than the overwrite this refusal
+/// which is the worse failure of the two (a silently skipped note costs more than the overwrite this refusal
 /// prevents), so this answer is pinned by a test rather than by the argument above.
 ///
 /// The other arm is Windows's, the platform whose paths are UTF-16 code units (see [`os_bytes`]). There a
 /// name holding an unpaired surrogate reaches `to_string_lossy` as U+FFFD, so two names can share one key and
-/// round 2's lookup overwrites the twin's row without any constraint firing. Such a name is refused instead:
-/// [`crate::walk`] leaves it out of the catalog, its existing row untouched, and names it in the report
-/// (F18 §3).
+/// the lookup that follows overwrites the twin's row without any constraint firing. Such a name is refused instead:
+/// [`crate::walk`] leaves it out of the catalog, its existing row untouched, and names it in the report.
 #[cfg(unix)]
 pub(crate) fn name_is_lossless(_name: &OsStr) -> bool {
     true
@@ -328,7 +327,7 @@ pub(crate) fn name_is_lossless(name: &OsStr) -> bool {
 ///
 /// `true`, which buys a compile and promises nothing: [`os_bytes`]'s non-Unix spelling still runs through
 /// `to_string_lossy` here, so such a target has **no byte identity and no refusal guarantee either** — two
-/// names that decode to the same lossy text share one key, and the overwrite F18 refuses on Windows stays
+/// names that decode to the same lossy text share one key, and the overwrite this refusal prevents on Windows stays
 /// possible. That is the honest statement of an untested platform, and it is deliberately not the Unix answer
 /// above: Unix returns `true` because its keys are exact, which nothing here can claim for a target whose
 /// names it cannot inspect.
@@ -349,14 +348,14 @@ mod tests {
     use std::ffi::OsStr;
 
     /// A high surrogate, and the low unit that completes it — spelled as numbers because no `char` can hold
-    /// either one alone. That inability is F18: a name holding one has no text spelling, so Windows' lossy
+    /// either one alone. That inability is the whole problem: a name holding one has no text spelling, so Windows' lossy
     /// byte key replaces it with U+FFFD and two different names collide.
     const HIGH: u16 = 0xD800;
     const LOW: u16 = 0xDC00;
 
     #[test]
     fn a_high_surrogate_with_no_low_behind_it_is_unrepresentable() {
-        // `caf\u{e9}` followed by a lone high — the name F18 refuses.
+        // `caf\u{e9}` followed by a lone high — the name this module refuses.
         let units: Vec<u16> = "caf\u{e9}".encode_utf16().chain([HIGH]).collect();
         assert!(
             has_unpaired_surrogate(&units),
@@ -458,9 +457,9 @@ mod tests {
     /// Every name Unix can hand the walk is lossless, because `os_bytes` takes its bytes from the `OsStr`
     /// itself — there is nothing for the surrogate rule to catch.
     ///
-    /// This is the guard F18 asks for by name: a mitigation that silently skipped a real Unix file would cost
+    /// This is the guard the rule asks for by name: a mitigation that silently skipped a real Unix file would cost
     /// more than the Windows overwrite it prevents, so the no-op is pinned rather than assumed. It covers the
-    /// byte-named case F13 indexes (latin-1, an invalid UTF-8 sequence, a raw 0xFF) and the bytes that *are*
+    /// byte-named case this module indexes (latin-1, an invalid UTF-8 sequence, a raw 0xFF) and the bytes that *are*
     /// a surrogate's UTF-8 encoding — three ordinary bytes to Unix, which keys them exactly.
     #[cfg(unix)]
     #[test]
@@ -468,7 +467,7 @@ mod tests {
         use super::name_is_lossless;
         use std::os::unix::ffi::OsStrExt;
 
-        // The F13 names, straight from the disk-facing tests.
+        // The non-UTF-8 names, straight from the disk-facing tests.
         for name in [
             b"caf\xe9.md".as_slice(),
             b"we\xff.md".as_slice(),
@@ -508,10 +507,10 @@ mod tests {
     fn rel_bytes_joins_the_component_bytes_with_slash() {
         let components = [OsStr::new("notes"), OsStr::new("a.md")];
         assert_eq!(rel_bytes(components), b"notes/a.md".to_vec());
-        // No components at all is the workspace root, which has no relative path (F13 §4.1).
+        // No components at all is the workspace root, which has no relative path.
         assert_eq!(rel_bytes([]), Vec::<u8>::new());
 
-        // The one case F13 is about, as far as this module can show it on a platform that will not let a
+        // The one case this module exists for, as far as it can show it on a platform that will not let a
         // `&str` hold the byte: a raw byte survives the key while the display text cannot. The end-to-end
         // form — a name built with `OsStrExt::from_bytes`, read off the disk, stored and reopened — is
         // `crates/np-core/tests/walk.rs` and `crates/np-core/tests/scan.rs`.
@@ -569,7 +568,7 @@ mod tests {
         assert_eq!(case_fold(&rel_bytes_of_display("A.md")), b"a.md".to_vec());
     }
 
-    /// **The property F18 is about.** Two Windows names differing only where UTF-16 cannot spell a character — one unpaired surrogate — used to
+    /// **The property this encoder exists for.** Two Windows names differing only where UTF-16 cannot spell a character — one unpaired surrogate — used to
     /// reach the same byte key, because `to_string_lossy` replaced each with U+FFFD. That collision is reproduced here rather than described: it is
     /// the reason [`name_is_lossless`] refuses such a name on Windows, and a refusal nobody can demonstrate is a refusal nobody believes.
     #[test]
