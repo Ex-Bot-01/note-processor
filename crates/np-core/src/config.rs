@@ -17,10 +17,10 @@ use crate::loglevel::{resolve_level_from_env, LogLevel};
 
 /// Name of the registry database inside the data dir.
 ///
-/// Public because **F37**'s fallback has to ask a directory whether it holds our index, and a test that spells the name by
+/// Public because the nesting fallback has to ask a directory whether it holds our index, and a test that spells the name by
 /// hand would pass even if the two stopped agreeing.
 pub const REGISTRY_FILE: &str = "workspaces.sqlite";
-/// The directory of per-workspace databases inside the data dir — the other half of the same question (**F37**): an
+/// The directory of per-workspace databases inside the data dir — the other half of the same question: an
 /// interrupted first run can leave one of these without a registry beside it, and that still counts as our index.
 pub const WORKSPACES_DIR: &str = "workspaces";
 /// Leading bytes of the workspace-path digest used as its database file name,
@@ -125,7 +125,7 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
 /// leave room for the prefix and specials too. [`crate::chunk`] caps a chunk at `MAX_CHUNK_BYTES = 1800`, which makes
 /// a four-digit-token sequence unlikely for prose; **unlikely is the whole claim** (the holes are named there:
 /// normalisation can expand bytes, `decode` emits U+FFFD runs, prefix and specials cost tokens from no chunk bytes).
-/// R6d measures bytes-per-token on this corpus.
+/// Bytes-per-token is measured on this corpus.
 ///
 /// Three honest limits on the number itself. **(1) It is a global constant doing a per-model job**: 8,192 happens to
 /// be *this* build's window, and a spec-named fallback (MiniLM, ~512 tokens) needs a smaller bound — so the follow-up
@@ -139,7 +139,7 @@ pub const MAX_EMBEDDING_TOKENS: usize = 8_192;
 
 /// How the catalog (`INDEX.md` and its shards) is laid out.
 ///
-/// **`deny_unknown_fields`, since F35.** This used to be the lenient half of the file — "rendering choices,
+/// **`deny_unknown_fields`.** This used to be the lenient half of the file — "rendering choices,
 /// where an unrecognised key costs one wrong-looking line" — and the argument held for a key *inside* the
 /// section. It never covered the case that started the round: `[catalogg]`, one letter off, is not a stray key
 /// in this struct at all but the whole struct going unread, so `max_entries_per_file` stayed 600 under a config
@@ -274,7 +274,7 @@ impl ModelsConfig {
     }
 
     /// The environment half of [`ModelsConfig::auto_fetch_allowed`], on its own because **argv needs to consult it
-    /// without the file** (**F38**): `--auto-fetch` overrides `[models] auto_fetch = false`, and nothing overrides the
+    /// without the file**: `--auto-fetch` overrides `[models] auto_fetch = false`, and nothing overrides the
     /// kill switch — so a caller that has been explicitly asked to fetch still owes this question before it dials.
     ///
     /// Splitting it out is also what keeps the two halves from drifting: one reader of `NP_NO_AUTO_FETCH` answers for
@@ -304,8 +304,8 @@ pub enum ThreadCount {
     /// derived from the machine rather than from a header file.
     #[default]
     Auto,
-    /// An explicit count the operator chose. Honoured as given, including values above `available_parallelism` —   of
-    /// the policy design: an operator may know something this program cannot see. What is *not* honoured is a count past
+    /// An explicit count the operator chose. Honoured as given, including values above `available_parallelism()`:
+    /// an operator may know something this program cannot see. What is *not* honoured is a count past
     /// `MAX_REQUESTED_WORKERS`, and that refusal lives in the deserializer so it arrives as a key name rather than as a
     /// runtime failure or, as it did the first time, an uncatchable abort.
     Workers(std::num::NonZeroU32),
@@ -442,7 +442,7 @@ impl<'de> serde::Deserialize<'de> for ThreadCount {
 
 /// Which embedding provider to ask for work from.
 ///
-/// An **enum**, not a `String`, and that choice is the whole of   argument. A free-text provider field
+/// An **enum**, not a `String`, and that choice is the whole of the provider-field argument. A free-text provider field
 /// would take a hand-typed `provide = "openai-compatible"` — the key misspelled, the value perfect — and load it
 /// as *no provider at all*, in silence, on a machine whose owner believes they configured embeddings. In a
 /// project whose F-series exists to stop exactly that shape of lie about status, the spelling has to be refused
@@ -450,11 +450,11 @@ impl<'de> serde::Deserialize<'de> for ThreadCount {
 /// `tests/config.rs` pins.
 ///
 /// (This paragraph used to add "every other config struct here is `#[serde(default)]` with no unknown-key
-/// refusal" as the contrast. F35 removed that contrast — every container refuses now — so the enum's argument
+/// refusal" as the contrast. That contrast is gone — every container refuses now — so the enum's argument
 /// stands on its own: refusing a bad *key* was never enough if a bad *value* could still name a provider this
 /// build cannot honour.)
 ///
-/// The accepted spellings are exactly the ones   writes — `"none"`, `"local-model"`,
+/// The accepted spellings are exactly the ones this program writes — `"none"`, `"local-model"`,
 /// `"openai-compatible"` — via `rename_all` plus one hand-written exception noted on
 /// [`EmbeddingProvider::OpenAiCompatible`]. A config value with two accepted spellings would be two
 /// values, so nothing here aliases.
@@ -469,26 +469,26 @@ pub enum EmbeddingProvider {
     /// provider: `local_model::LazyLocalEmbedder` (that module is behind `local-model`, so no link) when the binary was built with the runtime — loaded on the first
     /// batch rather than at resolution, so a run with nothing owed pays no load — and [`crate::embed::LocalModelProvider`]
     /// when it was not, which answers every batch it is handed with *runtime not built*. `embed_run` matches this same
-    /// variant to decide which of   arms are reachable, so the claim that only validation reads it (true before R6c)
-    /// stopped being true when the wiring landed. What loading one costs is   benchmark's question, measured in R6d.
+    /// variant to decide which of its own arms are reachable: the claim that only validation reads it was true
+    /// before the wiring landed, and stopped being true when it did. What loading one costs is a benchmark's
+    /// question, measured here.
     ///
     /// Refused at [`Config::load`] unless [`EmbeddingsConfig::model`] names something `np models install`
     /// would accept — a local provider with no identity has nothing to write `embeddings.model` under, and
     /// guessing one would be a second source of model identity.
     LocalModel,
     /// An OpenAI-compatible HTTP endpoint. **Kept parseable and refused at [`Config::load`]**, because
-    /// embeddings are local now:   records that the self-hosted server
-    /// exposes no embeddings route and nothing in this program dials out for a vector, so the spelling names
+    /// embeddings are local now: the self-hosted server exposes no embeddings route and nothing in this program dials out for a vector, so the spelling names
     /// something no code path can satisfy.
     ///
     /// Deleting it instead was decided against: an existing
     /// `config.toml` would then fail with serde's verbatim "unknown variant" text — which
     /// [`ConfigError::Parse`] passes through — accusing a valid file of being broken and stopping `np scan`
-    /// cold without naming a reason. F17's `continuation_indent` precedent is this exact shape: refuse at load
+    /// cold without naming a reason. The `continuation_indent` precedent is this exact shape: refuse at load
     /// in our own words, naming what changed and which key to set instead.
     ///
     /// Renamed by hand because `rename_all` cannot know it: serde kebab-cases `OpenAiCompatible` into
-    /// `open-ai-compatible`, while   and the roadmap spell the config value `openai-compatible`. The explicit
+    /// `open-ai-compatible`, while the docs and the roadmap spell the config value `openai-compatible`. The explicit
     /// attribute is what keeps the documented spelling the only one that reaches our refusal, and
     /// `tests/config.rs` sends every variant through a file precisely so this cannot drift — a lost rename
     /// turns the refusal into serde's, which that test fails on.
@@ -499,13 +499,13 @@ pub enum EmbeddingProvider {
 /// The `[embeddings]` section: which provider to ask, and the two identity fields that provider will
 /// need.
 ///
-/// Every field has a default, and `max_tokens` is no exception: a config written before R6a keeps parsing to
+/// Every field has a default, and `max_tokens` is no exception: a config written before the key existed keeps parsing to
 /// exactly the values it parsed to then, plus [`DEFAULT_EMBEDDING_TOKENS`] — which is the property
 /// `tests/config.rs` pins, because "adding a key must not change what an existing file means" is the half of
 /// a strict-section story that a refusal test cannot see.
 ///
-/// **`deny_unknown_fields`, and since F35 that is no longer special** — every container in this file carries
-/// it, so what   argued for this section is now the file's single rule.
+/// **`deny_unknown_fields`, which is no longer special here** — every container in this file carries
+/// it, so what that argument wanted for this section is now the file's single rule.
 ///   reasoning still explains why this struct was the first: it guards a *status claim* — whether the corpus
 /// is embedded at all — where an unrecognised key could become `provider = "none"` by omission. What F35 added
 /// is the observation that a rendering section can lose just as much through a different door: `[catalogg]` is
@@ -518,16 +518,16 @@ pub struct EmbeddingsConfig {
     /// Model identity as the provider will name it (`embeddinggemma-2-text@1`-shaped), i.e. what
     /// `models.id` and `embeddings.model` will hold.
     ///
-    /// **Nothing reads this yet, and that is the state of Round 3a rather than an oversight:** the
+    /// **Nothing reads this yet, and that is the state of the runtime seam rather than an oversight:** the
     /// provider that would put a value here into a database row arrives with the scan wiring. It lives
-    /// in config now so   "one config key apart" promise describes the whole surface a user touches,
-    /// and so a chosen model is already expressible while   benchmark is still running.
+    /// in config now so the "one config key apart" promise describes the whole surface a user touches, and so a
+    /// chosen model is already expressible while the throughput benchmark is still running.
     pub model: Option<String>,
     /// Vector width the provider must produce, in `f32` components — the number
     /// `embeddings.dim`/[`crate::embed::Vector::dim`] speaks.
     ///
     /// Still unread by any decision, and that is not this round's oversight: it becomes the `configured`
-    /// argument of [`crate::embed::LocalModelProvider::new`] when R6c wires a config to a provider, and until
+    /// argument of [`crate::embed::LocalModelProvider::new`] when something wires a config to a provider, and until
     /// then nothing can disagree with it. `u16` rather than `usize` because it is a *declared* width and the
     /// schema's `CHECK (length(vector) = 4 * dim)` has to hold: 65 535 components is 256 KiB per row, already
     /// past any model this project would run, so the type refuses an absurdity before a provider has to.
@@ -537,18 +537,18 @@ pub struct EmbeddingsConfig {
     /// chunk's bytes alone, because `include_prompt = true` means the model sees the prefix too.
     ///
     /// An over-budget chunk is *reported*, never silently truncated: truncation would stamp the whole chunk's
-    /// digest onto a vector that read part of it. Enforcing the budget needs a tokenizer and so belongs to
-    /// R6b2; what R6a does is make the key legal, defaulted and bounded, since `deny_unknown_fields` means
-    /// this section refused it by name before this round.
+    /// digest onto a vector that read part of it. Enforcing the budget needs a tokenizer and so belongs to the
+    /// embedder; what this build does is make the key legal, defaulted and bounded — without
+    /// `deny_unknown_fields`, this section would have refused the key by name.
     pub max_tokens: usize,
     /// Worker threads the local embedder may use — **default [`ThreadCount::Auto`]**, the rule in
     /// [`ThreadCount::resolve`] rather than llama.cpp's compile-time four.
     ///
     /// Read only when `provider = "local-model"` (`dim` and `model` are likewise unread by the other providers, so this
-    /// is not a new looseness —   records the choice, including why there is no
+    /// is not a new looseness — the thread policy records the choice, including why there is no
     /// `[local_model]` section and no environment override). Accepted spellings and refusals: [`ThreadCount`].
     pub threads: ThreadCount,
-    /// How loud llama.cpp may be on this program's stderr — **absent means unset, not `off`** (F32's sibling F33).
+    /// How loud llama.cpp may be on this program's stderr — **absent means unset, not `off`**.
     ///
     /// Three things worth writing down, because each one was a review finding against the first draft:
     ///
@@ -556,7 +556,7 @@ pub struct EmbeddingsConfig {
     ///   np-cli builds np-core with `default-features = false`: gating the enum would make one key parse in a build with `local-model` and
     ///   refuse as unknown without it. Only installing a sink is gated, in `local_model`.
     /// * `Option`, because "the file said nothing" must stay distinguishable from "the file said `off`": the environment fills the first and
-    ///   must not outvote the second ([`crate::loglevel::resolve_level`],   precedence).
+    ///   must not outvote the second ([`crate::loglevel::resolve_level`], which owns that precedence).
     /// * It is validated at load but **not** merged from the environment into this field, unlike `[models]`: the effective level is asked for
     ///   by name through [`crate::loglevel::resolve_level_from_env`], and a field that sometimes held the file's word and sometimes the
     ///   environment's would leave a reader unable to tell which they edited.
@@ -623,7 +623,7 @@ fn marker_list(markers: &[&str]) -> Vec<String> {
 
 /// Loaded configuration: where data lives, catalog layout, status markers, embedding provider.
 ///
-/// **`deny_unknown_fields`, since F35 — and this is the one that mattered.** A key inside a known section could
+/// **`deny_unknown_fields` — and this is the container where it mattered.** A key inside a known section could
 /// already be refused by that section; an *invented section* never reached any struct, so `[catalogg]` loaded
 /// clean and left `[catalog]` at its defaults in silence. Refusing at the root is what closes the gap between
 /// "a typo costs one setting" and "a typo costs a subsystem", and it gives up forward compatibility with
@@ -636,7 +636,7 @@ fn marker_list(markers: &[&str]) -> Vec<String> {
 pub struct SearchConfig {
     /// Which lists a query may consult. Absent means [`SearchMode::Hybrid`](crate::search::SearchMode::Hybrid) — the default the human chose,
     /// with `semantic` and `keyword` one key away for anyone who wants one list alone. A value outside those three words is
-    /// refused at parse time (F35's rule), naming what it expected rather than falling back.
+    /// refused at parse time, naming what it expected rather than falling back.
     pub mode: crate::search::SearchMode,
 }
 
@@ -654,7 +654,7 @@ impl Default for SearchConfig {
 /// is deliberately no `[log] format`: JSON appears in a file and nowhere else (a `np serve` test refuses any stderr line that
 /// starts with `{`), so a format switch would be a knob with one legal position.
 ///
-/// **`deny_unknown_fields`, by F35's rule for every container in this file.**
+/// **`deny_unknown_fields`, as for every container in this file.**
 /// Every field is an `Option`, so "the file said nothing" is one representation and derived `Default` is the honest one: an
 /// absent `[log]` section leaves the level unresolved, the destination unopened and the budget unset (which the sink reads as
 /// [`DEFAULT_LOG_MAX_BYTES`]) rather than inventing a value for any of them.
@@ -691,10 +691,10 @@ pub const DEFAULT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// OS data dir, from `$XDG_DATA_HOME` else `$HOME/.local/share`
-    /// (Windows: `%LOCALAPPDATA%\note-processor`, nested since **F37**). Empty only when the environment names none.
+    /// (Windows: `%LOCALAPPDATA%\note-processor`, nested rather than flat). Empty only when the environment names none.
     pub data_dir: PathBuf,
-    /// **F37**: set when the OS default resolved to its nested location but this program's index was found at the pre-F37
-    /// one, so `data_dir` points back at the old place for this release. A diagnostic for stderr, never part of a report
+    /// Set when the OS default resolved to its nested location but this program's index was found at the
+    /// pre-nesting one, so `data_dir` points back at the old place for this release. A diagnostic for stderr, never part of a report
     /// (`#[serde(skip)]`): every path a document prints is already the effective one, and a second path in the same document
     /// would read as though two indexes existed.
     #[serde(skip)]
@@ -759,18 +759,18 @@ impl Config {
     }
 
     /// [`Config::load`] with the data-directory **shape** supplied rather than taken from `cfg` — the same seam
-    /// [`resolve_data_dir`] exists for (**F37**), pushed up to the entry point that actually assembles a run.
+    /// [`resolve_data_dir`] exists for, pushed up to the entry point that actually assembles a run.
     ///
     /// Production never passes anything but [`platform_of_default`]; the parameter exists because the question this answers
     /// ("did we fall back, and must we say so?") is decided by code Linux cannot reach through `load`, and a layout fix whose
-    /// wiring is only exercised on the platform nobody here can run is how **F37**'s note shipped silent. One test drives the
+    /// wiring is only exercised on the platform nobody here can run is how the nesting change shipped silent. One test drives the
     /// Windows shape end to end on this host; see `crates/np-core/tests/config.rs`.
     pub fn load_with_platform(
         override_: Option<&Path>,
         platform: DataDirPlatform,
     ) -> Result<Config, ConfigError> {
         // Which file the values came from, so the data-dir step below can ask that file a second question — *did you name a
-        // `data_dir` yourself?* — instead of trusting the merged struct. Measured on Windows (**F37**): an upgraded machine
+        // `data_dir` yourself?* — instead of trusting the merged struct. Measured on Windows: an upgraded machine
         // fell back to `%LOCALAPPDATA%` exactly as designed (its new workspaces landed there) and printed no note, because
         // [`Config::default`] had already resolved the fallback into `data_dir`, and "non-empty after merging" cannot tell an
         // instruction from a landing place. The directory was always right; only the announcement was missing.
@@ -795,11 +795,11 @@ impl Config {
             },
         };
         {
-            // One call answers both halves (**F37**): the file's `data_dir` wins when it named one — an instruction, not a
+            // One call answers both halves: the file's `data_dir` wins when it named one — an instruction, not a
             // location we moved — and only the OS default is eligible for the pre-nesting fallback. Resolving through
             // [`resolve_data_dir`] rather than branching here is what lets a Linux test assert the explicit-directory rule in
             // the *Windows* shape, where the fallback could actually have applied.
-            // Only the file's own key counts (**F37**). Reading `cfg.data_dir` here was the bug: on Windows it is non-empty by
+            // Only the file's own key counts. Reading `cfg.data_dir` here was the bug: on Windows it is non-empty by
             // default, so every run looked like an operator instruction, the fallback was reported as absent, and the stderr
             // note never printed on the one platform that has a fallback.
             let declared = source.as_deref().and_then(declared_data_dir);
@@ -829,13 +829,13 @@ impl Config {
         }
         validate_embeddings(&cfg)?;
         resolve_models(&mut cfg)?;
-        // F33: the log level is *checked* here and stored nowhere. Two reasons, both stated because they are not obvious from the call:
+        // The log level is *checked* here and stored nowhere. Two reasons, both stated because they are not obvious from the call:
         // the value can arrive from the environment, and a rule watching only the file would let an env typo route around it (the same
         // argument `resolve_models` gives for validating its merged values); and the effective level is then asked for by name through
         // [`crate::loglevel::resolve_level_from_env`] by the one caller that installs a sink, so merging it into `embeddings.log_level`
         // would make that field mean "the file's word" or "the environment's word" depending on load order.
         resolve_level_from_env(cfg.embeddings.log_level).map_err(invalid_data)?;
-        // The same shape as F33's check one line above: **checked here, stored nowhere**, because the effective level arrives
+        // The same shape as the check one line above: **checked here, stored nowhere**, because the effective level arrives
         // from three sources and is resolved by name through [`resolve_diag`]. A `[log] level` that cannot be read refuses at
         // load rather than becoming a run that silently logged less than it was told to — and the refusal names the key, as
         // every other value in this file does.
@@ -929,10 +929,10 @@ fn validate_embeddings(cfg: &Config) -> Result<(), ConfigError> {
         ));
     }
     // A zero width is refused here as well as in `np models install --dim`, and for the same stated reason:
-    // migration 7's `CHECK (length(vector) = 4 * dim)` admits a zero-byte vector when `dim` is 0. R6a made this
-    // value load-bearing — it becomes [`crate::embed::LocalModelProvider::new`]'s `configured` argument — so the
+    // migration 7's `CHECK (length(vector) = 4 * dim)` admits a zero-byte vector when `dim` is 0. A config-supplied
+    // `dim` is load-bearing — it becomes [`crate::embed::LocalModelProvider::new`]'s `configured` argument — so the
     // bound cannot live only in np-cli's `NonZeroU16`, which a config file routes around without ever parsing an
-    // argv. Refuse, do not clamp: F17's posture again.
+    // argv. Refuse, do not clamp: the same posture as the indent ceiling.
     if cfg.embeddings.dim == Some(0) {
         return Err(invalid_data(
             "invalid embeddings.dim = 0 (a zero-width model has no vector to compare; omit the key to leave the \
@@ -968,20 +968,20 @@ fn validate_embeddings(cfg: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// A config *value* refused as data, the way F17 refuses an oversized indent — see [`validate_embeddings`].
+/// A config *value* refused as data, the way the indent ceiling refuses an oversized value — see [`validate_embeddings`].
 fn invalid_data(message: String) -> ConfigError {
     ConfigError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
 /// Take any `[models]` value the file left unset from the environment, normalise both spellings, and refuse what
-/// cannot be honoured ([`ModelsConfig`],  ).
+/// cannot be honoured (see [`ModelsConfig`]).
 ///
 /// **Precedence follows `data_dir` in [`Config::load`]**, this file's only existing config-versus-environment rule:
 /// a value the file spelled out wins, and the environment (`NP_MODELS_BASE_URL`, `NP_MODELS_SHA256`) supplies a key
 /// the file left unset — never an override of a file that names one. `[embeddings]` had no env rule to copy because
 /// it has none at all, so borrowing its shape would have meant inventing one.
 ///
-/// Validation runs on the merged value for the reason F17's ceiling gives at the indent check above: a key can
+/// Validation runs on the merged value for the reason the indent ceiling gives above: a key can
 /// arrive from either place, and a rule watching only the file would let the environment route around it. Each
 /// refusal names both the config key and the variable the value came from, because telling someone to edit a file
 /// that does not hold the value wastes the one thing a refusal is for.
@@ -1047,7 +1047,7 @@ fn validate_base_url(url: &str, origin: &str) -> Result<(), ConfigError> {
         return refuse("no host follows the scheme".to_string());
     }
     if authority.contains('@') {
-        // Credentials here would be a secret in an ordinary config file, which is not   class — and a base URL
+        // Credentials here would be a secret in an ordinary config file, which is not the guarded-secret class — and a base URL
         // that needs them is a mirror configured in the wrong place.
         return refuse(
             "carries credentials; a fetch source authenticates some other way".to_string(),
@@ -1146,7 +1146,7 @@ fn read_config(path: &Path) -> Result<Config, ConfigError> {
 ///
 /// A second, deliberate parse of the same text with a lenient shape (no `deny_unknown_fields`, no defaults): the question is
 /// narrow — is there a top-level `data_dir` key? — and asking it through [`Config`] would answer with whatever
-/// [`Config::default`] resolved, which is precisely the confusion **F37** shipped with. An unreadable or unparsable file yields
+/// [`Config::default`] resolved, which is precisely the confusion the nesting change shipped with. An unreadable or unparsable file yields
 /// `None`, never an error: by the time [`Config::load`] asks this question it has already parsed the file strictly and refused
 /// anything broken, so a `None` here can only mean "the key is not there".
 ///
@@ -1213,7 +1213,7 @@ pub(crate) fn abs_path(path: &Path) -> PathBuf {
 /// things worth knowing: `.` carries no meaning, a repeated separator carries no meaning, and Windows
 /// splits on both separator styles. Rebuilding is also what keeps this total on a path made of bytes that
 /// decode to nothing — components hand back the OS's own [`OsStr`] pieces, so no lossy text is introduced
-/// between the path and its digest (`path_bytes` still decides the byte spelling, and F13's Windows
+/// between the path and its digest (`path_bytes` still decides the byte spelling, and the Windows
 /// residual stays exactly where it was).
 ///
 /// The separator between two pieces is inserted by this function and nowhere else, which is what keeps a
@@ -1262,7 +1262,7 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 /// The bytes of a path as the OS holds them. Windows paths are UTF-16 and reach this program as
 /// text, so its spelling stays lossy — see [`Config::workspace_db`]. This arm covers *any* non-Unix target, not
 /// Windows alone: wherever it applies, two paths differing only in units Rust cannot represent share one
-/// database. F18   refuses such a name *inside* a workspace and never the root's own name, which is relative to
+/// database. The lossless-name rule refuses such a name *inside* a workspace and never the root's own name, which is relative to
 /// nothing, so that collision is the one level the refusal does not reach.
 #[cfg(not(unix))]
 fn path_bytes(path: &Path) -> Vec<u8> {
@@ -1311,7 +1311,7 @@ fn config_dir() -> Option<PathBuf> {
     )
 }
 
-/// The folder this program nests its data files in on Windows (**F37**).
+/// The folder this program nests its data files in on Windows.
 ///
 /// `config_dir` has always appended a program folder (`%APPDATA%\note-processor`); the data side appended nothing, so a
 /// Windows user shared `%LOCALAPPDATA%` — the directory every application shares — with two generically-named entries
@@ -1321,14 +1321,14 @@ pub const WINDOWS_DATA_SUBDIR: &str = "note-processor";
 
 /// Which data-directory shape to resolve.
 ///
-/// **A value rather than a `cfg`, on purpose** (**F37**). Production picks the platform with `cfg` below and cannot do
+/// **A value rather than a `cfg`, on purpose.** Production picks the platform with `cfg` below and cannot do
 /// otherwise; but CI is Linux, this development host cannot compile the Windows arm at all (`ring` and `libsqlite3-sys` need
 /// MSVC `lib.exe`), and a layout fix whose Windows half never executes is a layout fix nobody verified — which is exactly how
 /// the shape this card describes survived six CI rows. Passing the shape in lets `tests/config.rs` resolve both layouts on
 /// one machine. It chooses *paths*, nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataDirPlatform {
-    /// `$XDG_DATA_HOME`, else `$HOME/.local/share`. Unchanged by F37: an unqualified `workspaces/` inside
+    /// `$XDG_DATA_HOME`, else `$HOME/.local/share`. Unchanged by the nesting: an unqualified `workspaces/` inside
     /// `~/.local/share` is far less exposed than in a shared Windows directory — which is why this is a Windows-only card.
     Unix,
     /// `%LOCALAPPDATA%\note-processor`: nested, as config already was.
@@ -1344,7 +1344,7 @@ pub fn data_dir_for(
     lookup: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     match platform {
-        // Nested since F37; `%LOCALAPPDATA%` is otherwise used as-is, with no `$HOME` fallback under it.
+        // Nested rather than flat; `%LOCALAPPDATA%` is otherwise used as-is, with no `$HOME` fallback under it.
         DataDirPlatform::Windows => lookup("LOCALAPPDATA").map(|dir| dir.join(WINDOWS_DATA_SUBDIR)),
         DataDirPlatform::Unix => dir_from(
             lookup("XDG_DATA_HOME"),
@@ -1354,7 +1354,7 @@ pub fn data_dir_for(
     }
 }
 
-/// The one-release read-fallback (**F37**): when the nested location holds no index of ours and the pre-F37 location does,
+/// The one-release read-fallback: when the nested location holds no index of ours and the pre-nesting location does,
 /// this run keeps using the old directory.
 ///
 /// What it prevents is a lie about the user's own files: an index is keyed by workspace path, so a moved data directory reads
@@ -1397,7 +1397,7 @@ pub fn platform_of_default() -> DataDirPlatform {
 
 /// Which directory a run uses, and whether it fell back: `(effective dir, legacy dir we are reading instead)`.
 ///
-/// **The whole decision, in one pure function** — which is what makes the Windows shape testable on Linux (**F37**). Both
+/// **The whole decision, in one pure function** — which is what makes the Windows shape testable on Linux. Both
 /// questions the layout asks are here: does the operator's own `data_dir` win (it always does; it is an instruction, not a
 /// place we moved), and if we are using the OS default, is our index still sitting at the pre-nesting location? Passing the
 /// platform and the environment in — rather than reading `cfg` and `env::var_os` inside — lets `tests/config.rs` drive the
@@ -1421,7 +1421,7 @@ pub fn resolve_data_dir(
     }
 }
 
-/// Where this program's data sat **before** F37 nested it, or `None` on a shape that never had a separate location.
+/// Where this program's data sat **before** the nesting, or `None` on a shape that never had a separate location.
 ///
 /// Takes the environment as a parameter so [`resolve_data_dir`] stays pure — which is what lets the Windows arm run on Linux CI
 /// against a `%LOCALAPPDATA%` that is a tempdir rather than a registry this host cannot create. Empty counts as unset, the way
@@ -1438,7 +1438,7 @@ fn legacy_location(
     }
 }
 
-/// The OS default, with **F37**'s one-release fallback applied: `(effective dir, legacy dir we fell back to)`. Both halves come
+/// The OS default, with the one-release fallback applied: `(effective dir, legacy dir we fell back to)`. Both halves come
 /// from one call so no entry point can apply the nesting and forget the fallback. An empty first element means the
 /// environment named nothing, which [`Config::load`] refuses.
 fn os_default_data_dir() -> (PathBuf, Option<PathBuf>) {
@@ -1453,10 +1453,10 @@ fn os_data_dir_on(
     resolve_data_dir(explicit, platform, &|key| env_path(key))
 }
 
-/// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows `%LOCALAPPDATA%\note-processor` (**F37**).
+/// OS data dir: `$XDG_DATA_HOME` else `$HOME/.local/share`; on Windows `%LOCALAPPDATA%\note-processor`.
 /// `None` when the environment names no data directory at all — what [`Config::load`] refuses rather than deriving paths
-/// relative to the current directory. Note this is the *nested* answer on its own: a run also applies F37's one-release fallback,
-/// so the directory it actually uses may be the pre-F37 location. Pairing those two halves is what the private
+/// relative to the current directory. Note this is the *nested* answer on its own: a run also applies the
+/// one-release fallback, so the directory it actually uses may be the pre-nesting location. Pairing those two halves is what the private
 /// `os_default_data_dir` does, so no entry point can apply the nesting and forget the fallback.
 #[cfg(windows)]
 pub fn default_data_dir() -> Option<PathBuf> {
@@ -1485,7 +1485,8 @@ pub fn default_data_dir() -> Option<PathBuf> {
 /// `crates/np-core/tests/config.rs` parses every name in it, so dropping one from [`Level`]'s parser while leaving it here
 /// turns a green suite red instead of shipping a word the documentation promised.
 ///
-/// Six where F33 has five. `[embeddings] log_level` stops at `debug` because ggml has no word above it, and the two knobs stay
+/// Six where the runtime's own knob has five. `[embeddings] log_level` stops at `debug` because ggml has no word
+/// above it, and the two knobs stay
 /// separate on purpose: asking to trace the search path must not also dump a model loader's hundred-and-twenty
 /// line transcript, which is the only reason F33 exists.
 pub const DIAG_LEVEL_NAMES: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
@@ -1505,7 +1506,7 @@ pub const DIAG_DEFAULT_LEVEL: Level = Level::Warn;
 /// and by `crates/np-cli/tests/cli.rs`. One variable, one order, documented in.
 pub const DIAG_ENV_VAR: &str = "NP_LOG";
 
-/// The config key this vocabulary is read from, spelled as a refusal spells it (**F35**'s habit: name the key, not the struct).
+/// The config key this vocabulary is read from, spelled as a refusal spells it: name the key, not the struct.
 pub const DIAG_CONFIG_KEY: &str = "log.level";
 
 /// The flag that outvotes both of them, spelled as a refusal spells it.
@@ -1712,7 +1713,7 @@ impl DiagSource {
 ///
 /// Two rules travel with the order, both inherited rather than invented here:
 ///
-/// * **The file outranks the environment** (, amended by the human and already pinned for
+/// * **The file outranks the environment** (amended by the human, and already pinned for
 ///   `[embeddings] log_level` at [`crate::loglevel::resolve_level`] / `crates/np-cli/tests/cli.rs`). What [`DIAG_ENV_VAR`]
 ///   buys is a level without editing a file, not a way to outvote a file that named one.
 /// * **Every present value is parsed, even a losing one.** A bad `NP_LOG` refuses even when the file would have won, because a
