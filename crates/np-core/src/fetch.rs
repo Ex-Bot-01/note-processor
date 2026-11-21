@@ -1,21 +1,20 @@
 //! Fetching a pinned artifact: stream it, hash it while it arrives, verify it, publish it by rename
-//! (`docs/design-m2-local-embeddings.md` §12 rules 4–8 and 12).
+//! (liveness is consent, the digest decides, the origin stays private).
 //!
-//! ## Where the origin comes from — corrected 2026-11-04
+//! ## Where the origin comes from
 //!
 //! This module still names no host: what reaches it from outside is a `&dyn Transport` and an already-resolved origin
 //! string, and [`resolve_origin`] is where that string is chosen.
 //!
-//! The sentence this replaces read "**Nothing in this module names a host**, because §12 rule 7 keeps the origin out of
-//! the binary", and it is now wrong in its second half. Rule 7 permits exactly one compiled-in origin since
-//! 2026-11-04 — [`crate::pins::DEFAULT_ORIGIN`] — decided by the human in the R7c scope decisions
-//! (`docs/design-m2-image-embeddings.md` §13), because an install that cannot reach a network is an install nobody
+//! An earlier version of this header said "**Nothing in this module names a host**, because the pin table keeps the origin out of
+//! the binary", and it is now wrong in its second half: exactly one origin is compiled in by deliberate call
+//! — [`crate::pins::DEFAULT_ORIGIN`] — because an install that cannot reach a network is an install nobody
 //! completes and `np models fetch` is now the documented install step. The default lives in [`crate::pins`] beside the
 //! bytes it was derived from, not here.
 //!
 //! What the old argument still buys, and why the default sits at the **end** of a precedence instead of replacing it:
 //! a mirror stays one config line away (`[models] base_url`, or `NP_MODELS_BASE_URL` when the file leaves that key
-//! out), the accepted-bytes list stays one reviewable table, and — the half this module owns — §12 rule 8 keeps the
+//! out), the accepted-bytes list stays one reviewable table, and — the half this module owns — origin privacy keeps the
 //! origin out of every *refusal*, because client error strings carry URLs and this program's reports land in CI logs.
 //! [`FetchError`] is therefore built from classes and counts, never from a URL. `tests/fetch.rs` checks that claim where it
 //! can bite — the arms whose text comes from something this module was handed (a transport failure, an `io::Error`) — by
@@ -25,21 +24,21 @@
 //! ## What is deferred, on purpose
 //!
 //! A fetch writes **bytes**, not a model row. Creating the row needs `dim`, `prefix_doc` and `prefix_query`, and the
-//! pin table deliberately carries none of them (§12 rule 7 lists what it holds: what to accept). Inventing a width at
-//! download time would be a declared-by-nothing identity — §2 of the install design makes the human declare it, and
+//! pin table deliberately carries none of them: it holds what to accept, and nothing else. Inventing a width at
+//! download time would be a declared-by-nothing identity — installing makes the human declare it, and
 //! `models.dim` is fenced by migration 7's `CHECK`. So this stage ends with a verified artifact on disk plus its member
-//! rows when a row exists to hang them on, and the "what does a fetched model *declare*" question is recorded in
-//! `todo.md` rather than answered by a constant here.
+//! rows when a row exists to hang them on, and the "what does a fetched model *declare*" question is left open
+//! rather than answered by a constant here.
 //!
 //! ## The lifecycle one call runs
 //!
-//! 1. Refuse if a marker already exists (§12 rule 4: liveness is consent, never a clock).
-//! 2. Preflight free space against **every** pinned member of the id plus a margin (rule 6) — an admission check, not
+//! 1. Refuse if a marker already exists: liveness is consent, never a clock.
+//! 2. Preflight free space against **every** pinned member of the id plus a margin — an admission check, not
 //!    a promise, and skipped with a stated reason where the platform cannot answer.
 //! 3. Write `.fetching.<id>.json`, atomically, then for each member stream into `.part.<id>.<nonce>` **inside the
-//!    models directory** (same filesystem, so the publish is a rename and never a second 310 MB copy — rule 5),
+//!    models directory**, so the publish is a rename and never a second 310 MB copy,
 //!    hashing while counting and rewriting the marker as progress changes.
-//! 4. Verify length first, then digest (rule 6's two different sentences), then `rename` into an **absent** target.
+//! 4. Verify length first, then digest — two different failures, two different messages — then `rename` into an **absent** target.
 //! 5. Remove this call's marker and any `.part` it left, on every path out — including the error paths. A marker only
 //!    ever means "a fetch is running in this process", which is a fact this function can still tell truthfully when
 //!    it returns.
@@ -75,7 +74,7 @@ const MARKER_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 ///
 /// **Two spellings, one rule.** Production answers with [`crate::pins::PinnedModel`] — `&'static` fields compiled in
 /// by [`crate::pins::PINNED`], which is what makes an expectation impossible to change at runtime. Tests answer with
-/// their own type holding a few dozen bytes, because verifying §12's rules against the real 309,855,456-byte artifact
+/// their own type holding a few dozen bytes, because verifying these rules against the real 309,855,456-byte artifact
 /// would need a disk this host does not have. The trait exists so *the rules* are the same code in both cases; it is
 /// not an extension point for a table someone assembles at runtime, and nothing outside a test passes anything else.
 pub trait MemberPin {
@@ -113,7 +112,7 @@ impl MemberPin for PinnedModel {
 pub struct Body {
     /// The body itself. Boxed because a transport decides what type that is.
     pub reader: Box<dyn Read + Send>,
-    /// The size the transfer announced, when it announced one (§12 rule 12: chunked or absent `Content-Length`
+    /// The size the transfer announced, when it announced one (chunked or absent `Content-Length`
     /// leaves this `None`, and the report prints "size unknown" rather than inventing a denominator).
     pub bytes_total: Option<u64>,
 }
@@ -133,7 +132,7 @@ pub trait Transport {
     fn open(&self, member: &dyn MemberPin) -> Result<Body, FetchError>;
 }
 
-/// What can stop a fetch. Each arm is §12 rule 6's or rule 4's named case, and none of them is an accusation this
+/// What can stop a fetch. Each arm is a named case of the digest rule or the marker rule, and none of them is an accusation this
 /// program cannot support.
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -176,7 +175,7 @@ pub enum FetchError {
     MarkerExists {
         /// The id being fetched.
         id: String,
-        /// The marker that caused the refusal — §12 rule 4's advice is useless without the path.
+        /// The marker that caused the refusal — the "delete it if no fetch is running" advice is useless without the path.
         path: PathBuf,
         /// The nonce linking the marker to its `.part` file, as written.
         nonce: String,
@@ -198,7 +197,7 @@ pub enum FetchError {
     },
     /// The id has pinned bytes but no declared identity. Refused before any request: 865 MB that cannot be recorded
     /// as a model is a download with no purpose, and inventing a `dim` at the end of one would be an identity
-    /// declared by nobody (install design §2).
+    /// declared by nobody.
     #[error("`{id}` has pinned artifacts but no declared dim or prefixes in this build, so a fetch could not record it")]
     NoIdentity {
         /// The id asked for.
@@ -225,7 +224,7 @@ pub enum FetchError {
         /// The database's own failure.
         source: crate::db::DbError,
     },
-    /// Free space is below the pinned total plus [`PREFLIGHT_MARGIN_BYTES`] (rule 6). Both numbers, no advice about
+    /// Free space is below the pinned total plus [`PREFLIGHT_MARGIN_BYTES`]. Both numbers, no advice about
     /// what to delete.
     #[error(
         "not enough free space to fetch this model: {needed} bytes needed (pinned members plus a {margin} byte \
@@ -241,8 +240,8 @@ pub enum FetchError {
     },
     /// The transport could not deliver a stream at all — refused connection, a status with no body, a DNS failure.
     ///
-    /// **`class` is the whole payload on purpose.** A client's own error string names the host and the full URL; §12
-    /// rule 8 says those do not belong in a report that lands in CI logs, so transports summarise into a class here
+    /// **`class` is the whole payload on purpose.** A client's own error string names the host and the full URL, and a report
+    /// a report that lands in CI logs does not carry those, so transports summarise into a class here
     /// (`"not found"`, `"forbidden"`, `"server error"`, `"transport failure"`) and log detail stays where the human
     /// who can reach the host will look for it.
     #[error("could not open {member} for {id}: {class}")]
@@ -254,7 +253,7 @@ pub enum FetchError {
         /// A class, never a URL.
         class: String,
     },
-    /// The stream ended short of the pinned length, or announced a length it did not deliver (rule 6's
+    /// The stream ended short of the pinned length, or announced a length it did not deliver (the preflight's
     /// `FetchInterrupted`). Saying "short" is supportable; saying "corrupted" is not — nothing here knows why.
     #[error("the transfer for member `{member}` of `{id}` ended after {got} bytes; this build pins {expected}")]
     Interrupted {
@@ -267,9 +266,9 @@ pub enum FetchError {
         /// The pinned length.
         expected: u64,
     },
-    /// **Issue #13.** The body was longer than the pin, so the read loop stopped where the pin said to rather than at
+    /// The body was longer than the pin, so the read loop stopped where the pin said to rather than at
     /// EOF — and `got` is therefore a lower bound, which is why the sentence says "at least". Distinct from
-    /// [`FetchError::Interrupted`] for the same reason rule 6 keeps short and wrong-digest apart: "it stopped early",
+    /// [`FetchError::Interrupted`] for the same reason the rules keep short-read and wrong-digest apart: "it stopped early",
     /// "it ran on past what we asked for" and "it was different bytes" are three facts with three next commands, and a
     /// refusal that claims to have seen the end of a stream it abandoned has overstated the evidence.
     #[error("the transfer for member `{member}` of `{id}` sent at least {got} bytes; this build pins {expected}")]
@@ -284,7 +283,7 @@ pub enum FetchError {
         /// The pinned length.
         expected: u64,
     },
-    /// Right number of bytes, different digest (rule 6's `FetchDigestMismatch`). The wording is §12's: the published
+    /// Right number of bytes, different digest (`FetchDigestMismatch`). The wording is the rule's: the published
     /// file **is not the file this build pins** — an upstream re-upload or an alteration in transit are both
     /// consistent with what we know, and "your download is corrupted" blames the human for either.
     #[error(
@@ -304,7 +303,7 @@ pub enum FetchError {
         /// The length both agree on — printed because it is the fact that separates this from [`FetchError::Interrupted`].
         size: u64,
     },
-    /// The artifact path is occupied. Rule 5 publishes into an **absent** target and refuses otherwise: overwriting
+    /// The artifact path is occupied. Publishing needs an **absent** target and refuses otherwise: overwriting
     /// verified bytes is `install`'s `ArtifactDisagrees` problem, not a fetch's answer.
     #[error("refusing to overwrite the existing artifact {}", .path.display())]
     TargetExists {
@@ -325,7 +324,7 @@ pub enum FetchError {
 /// One member that made it all the way: verified bytes, published by rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedMember {
-    /// `main`, or a later member's name (§12 rule 10's `model_files.name`).
+    /// `main`, or a later member's name (`model_files.name`).
     pub member: String,
     /// Where the verified bytes now live.
     pub path: PathBuf,
@@ -418,8 +417,8 @@ pub struct Declaration {
 /// Fetch every pinned member of `id` into `models_dir` and record the model.
 ///
 /// **Order matters and is the point:** the marker exists before byte one (so a listing during the transfer can say
-/// so), the `.part` lives in the destination directory (so publishing is a rename, rule 5), length is checked before
-/// digest (rule 6's two different sentences), and the target must be absent. The marker this call wrote is removed on
+/// so), the `.part` lives in the destination directory (so publishing is a rename), and length is checked before
+/// digest — two different failures — with the target required to be absent. The marker this call wrote is removed on
 /// every path out, success or failure — see the module docs for why that is the honest lifetime rather than a cleanup.
 /// The member names to fetch are **passed in**, and every one of them must be pinned. That shape is what makes
 /// [`FetchError::MemberUnpinned`] reachable rather than decorative: the CLI asks for the whole pair by default, and a
@@ -522,7 +521,7 @@ impl<'a> Transfer<'a> {
     }
 }
 
-/// Fetch the named members of `id`, then take back the directory if nothing ever landed (**F46**).
+/// Fetch the named members of `id`, then take back the directory if nothing ever landed.
 ///
 /// [`fetch`] against an explicit pin table. **The table is a parameter; the values are not.** Production calls this
 /// through [`fetch`], which passes the compiled-in [`crate::pins::PINNED`], so nothing at runtime can swap an
@@ -585,8 +584,8 @@ pub fn fetch_with_progress<T: MemberPin>(
     transfer: &Transfer<'_>,
 ) -> Result<FetchReport, FetchError> {
     // The transfer phase (diagnostics design point 7): one span per attempt, so a slow mirror shows up as time spent in
-    // `fetch` rather than as a command that appeared to hang. It carries no fields of its own: no origin (§12 rule 8
-    // holds as loudly here as anywhere), and the workspace is inherited from the `embed` or `setup` span wrapped around
+    // `fetch` rather than as a command that appeared to hang. It carries no fields of its own: no origin, because
+    // a report names no host as loudly here as anywhere, and the workspace is inherited from the `embed` or `setup` span
     // it, which is the same value spelled in one place rather than two.
     let _span = tracing::info_span!(target: crate::diagnostics::target::FETCH, "fetch").entered();
     // `try_exists` rather than `metadata`: the difference shows up only for a path we cannot stat, and "someone else's problem, do not remove it"
@@ -674,7 +673,7 @@ fn fetch_attempt<T: MemberPin>(
         }
     }
 
-    // Rule 4, before any byte: a marker is consent, and consent was already given to someone else.
+    // Before any byte: a marker is consent, and consent was already given to someone else.
     match models::fetch_state(models_dir, id) {
         FetchState::Absent => {}
         FetchState::Present(fields) => {
@@ -712,10 +711,10 @@ fn fetch_attempt<T: MemberPin>(
         source,
     })?;
 
-    // Rule 5's other half, checked for **every** member before any byte of any member moves. This used to sit inside the
+    // The other half of the preflight, checked for **every** member before any byte of any member moves. This used to sit inside the
     // transfer loop below, where it was correct for one member and wrong for two: the first artifact was published, then the
     // second target refused, leaving a file on disk with no `models` row to explain it and a retry that refuses forever.
-    // Two-member plans stopped being hypothetical when §13 made a projector a fetchable member of the default set, so the
+    // Two-member plans stopped being hypothetical when a projector became a fetchable member of the default set, so the
     // loop below now trusts this one and does not re-check.
     for member in &members {
         let target = models_dir.join(local_name(id, member.member()));
@@ -761,7 +760,7 @@ fn fetch_attempt<T: MemberPin>(
             Ok(published) => published,
             Err(err) => {
                 // The `.part` is this call's own garbage once the digest or length refused it; the marker goes with it
-                // (there is no resume in R7b — `--discard-marker` is the only door, §12 rule 4). Both removals are
+                // (there is no resume — `--discard-marker` is the only door). Both removals are
                 // best-effort: a refusal whose cleanup also failed still reports the *reason*, not the cleanup.
                 remove_part(models_dir, id, &nonce);
                 let _ = fs::remove_file(models::marker_path(models_dir, id));
@@ -786,7 +785,7 @@ fn fetch_attempt<T: MemberPin>(
         });
     }
 
-    // Durable artifact first, then the rows that name it — `install`'s order, for the same reason (F21: a record
+    // Durable artifact first, then the rows that name it — `install`'s order, for the same reason: a record
     // before the echo). A crash between the rename and here is the state `list` already reports as an artifact with
     // no row, and re-running resolves it: the target-exists rule refuses until the human says otherwise, which is
     // why the row insert happens last rather than first.
@@ -814,7 +813,7 @@ fn fetch_attempt<T: MemberPin>(
 /// Record the fetched members on an existing model row (migration 9).
 ///
 /// **Separate from [`fetch`] because the row is a different decision.** `models.dim`, `prefix_doc` and `prefix_query`
-/// are declared by a human (install design §2), and nothing in the pin table declares them, so a fetch cannot create
+/// are declared by a human, and nothing in the pin table declares them, so a fetch cannot create
 /// the row honestly. When one exists — installed, or declared by whatever command that gap ends up needing — this is
 /// where the pair's digests get stored under their names.
 pub fn record_members(db: &crate::db::Db, report: &FetchReport) -> Result<(), crate::db::DbError> {
@@ -911,7 +910,7 @@ fn receive_member(
             })?;
         digest.update(&buffer[..read]);
         count += read as u64;
-        // **Stop at the pin, not at EOF** (**issue #13**). The pin already says how many bytes are wanted, so a body
+        // **Stop at the pin, not at EOF**. The pin already says how many bytes are wanted, so a body
         // that passes it cannot become the pinned artifact no matter how much further the mirror goes — and reading on
         // was what made "unbounded resource use" a real description of this loop: a chunked transfer announces no
         // length, so a `base_url` aimed at a log tail wrote all 500 MB of it to disk before refusing. One buffer is
@@ -979,7 +978,7 @@ fn receive_member(
     })
 }
 
-/// Write the marker atomically: temp in the same directory, then rename (§12 rule 2, which also names why the temp's
+/// Write the marker atomically: temp in the same directory, then rename (which also says why the temp's
 /// name has to be recognisable — [`models::FetchName::MarkerTemp`]).
 fn write_marker(
     models_dir: &Path,
@@ -1069,11 +1068,11 @@ fn remove_part(models_dir: &Path, id: &str, nonce: &str) {
 /// Free bytes on the filesystem holding `path`, or `None` where this platform cannot say.
 ///
 /// **What this host answers with is measured; what the other arms claim is not**. This half is `statvfs`, whose block
-/// size times free blocks is the number §12 rule 6's preflight wants.
+/// size times free blocks is the number the preflight wants.
 ///
 /// The sentence here used to read "Windows and macOS get `None`", and it was wrong about macOS: macOS is `cfg(unix)`, so it
 /// compiles **this** arm (`libc` declares `statvfs` for every unix but linux-gnu, and np-core's `libc` dependency is gated on
-/// `cfg(unix)`), which means the shipped `aarch64-apple-darwin` binary answers rule 6 with a number today. What nobody has measured
+/// `cfg(unix)`), which means the shipped `aarch64-apple-darwin` binary answers the preflight with a number today. What nobody has measured
 /// is whether that number is right — no macOS runner exists here, so this round says nothing about it either way.
 ///
 /// Where an arm genuinely cannot answer it returns `None`, which the report prints as "free space not checked on this platform" —
@@ -1085,7 +1084,7 @@ fn available_bytes(path: &Path) -> Option<u64> {
 
     // **Climb to something that exists.** A first fetch of a workspace has no models directory yet — it is about to
     // create one — and `statvfs` on a missing path answers ENOENT, which would turn the preflight into a silent
-    // "cannot check" on exactly the fresh machine §12's amendment is about. Walking up to the nearest existing
+    // "cannot check" on exactly the fresh machine this rule was amended for. Walking up to the nearest existing
     // ancestor asks the question actually meant: how much room is on the filesystem this directory will live on.
     let mut cursor = path;
     let c_path = loop {
@@ -1118,7 +1117,7 @@ fn available_bytes(path: &Path) -> Option<u64> {
     block.checked_mul(free)
 }
 
-/// §12 rule 6's admission check, given what the platform could say about free space.
+/// The preflight's admission check, given what the platform could say about free space.
 ///
 /// Pure **because of how this check was once written**: the decision and the OS query were fused in one inline `if let Some(_)`, so
 /// the only test of it asserted a refusal that only a `statvfs` answer can produce, and "the preflight does not happen on Windows"
@@ -1133,7 +1132,7 @@ fn preflight(needed: u64, available: Option<u64>) -> Result<(), FetchError> {
         }),
         // Room enough, by the platform's own answer.
         Some(_) => Ok(()),
-        // Cannot say — which is a stated absence in the report, not a pass. Rule 6 is an admission check rather than a promise, and
+        // Cannot say — which is a stated absence in the report, not a pass. The preflight is an admission check rather than a promise, and
         // the checks after it (a marker that lives, a target that exists) run regardless.
         None => Ok(()),
     }
@@ -1143,7 +1142,7 @@ fn preflight(needed: u64, available: Option<u64>) -> Result<(), FetchError> {
 /// fetch may actually write. `total_number_of_free_bytes` would over-report it — the same *shape* of choice as this module's unix
 /// half preferring `f_bavail` to `f_bfree`, though there the difference is reserved blocks rather than quota.
 ///
-/// Design and the evidence behind each row: `docs/design-f34-windows-disk-preflight.md`.
+/// Each row is platform behaviour measured on the host kind it names, not a guess from documentation.
 #[cfg(windows)]
 fn available_bytes(path: &Path) -> Option<u64> {
     // Climb to something that exists, for the reason the unix half gives in full: this runs *before* `create_dir_all`, so a first
@@ -1173,7 +1172,7 @@ fn available_bytes(path: &Path) -> Option<u64> {
     let spelled = PathBuf::from(walk::long_prefix(&existing.to_string_lossy(), true));
     let name = wide_name(spelled.as_os_str())?;
     // Zero-initialised so a failing call that writes nothing cannot be read as data, and so `Some(0)` can only mean "the volume
-    // answered zero" — which rule 6 refuses, correctly.
+    // answered zero" — which the preflight refuses, correctly.
     let mut available: u64 = 0;
     let mut total: u64 = 0;
     let mut total_free: u64 = 0;
@@ -1255,7 +1254,7 @@ pub trait FailureClass {
 
 impl FetchError {
     /// Whether this failure means **no connection**, so a caller may skip an automatic fetch and carry on with what does not
-    /// need one (**F38**). Only [`FetchError::Transport`] can say that; see [`ClassKind`] for why the rest must not.
+    /// need one. Only [`FetchError::Transport`] can say that; see [`ClassKind`] for why the rest must not.
     pub fn is_offline(&self) -> bool {
         match self {
             FetchError::Transport { class, .. } => class_kind(class).is_offline(),
@@ -1277,7 +1276,7 @@ impl FailureClass for FetchError {
 /// Summarise a transport's own error text into a class that is safe to print.
 ///
 /// **This function never echoes its input, and that is its whole contract.** HTTP client errors read like
-/// `https://mirror.example/models/main.gguf: status code 404`, and §12 rule 8 says a host and a full URL do not belong
+/// `https://mirror.example/models/main.gguf: status code 404`, and a host with a full URL does not belong
 /// in a report that lands in CI logs — so the branches below return **fixed strings** chosen from what the text says,
 /// never the text itself. A caller that wants detail logs it where the human who can reach the host will look; this is
 /// the program's public sentence about the failure.
@@ -1285,7 +1284,7 @@ impl FailureClass for FetchError {
 /// The classes are deliberately coarse: "not found" and "forbidden" change what a human does next (fix the member name,
 /// or fix the mirror's ACL), while "server error" and "transport failure" both mean try again. Distinguishing a 500
 /// from a 503 would buy nothing and cost a number in a message that must stay class-shaped.
-/// What a failure says about **whether there is a connection at all** (**F38**).
+/// What a failure says about **whether there is a connection at all**.
 ///
 /// This exists because fetching became automatic. Before that, every failure ended the command and printed one sentence, so
 /// the *shape* of the failure was decoration; now it decides whether `np setup` degrades to index-plus-keyword-search or
@@ -1305,7 +1304,7 @@ pub enum ClassKind {
     RefusedByServer,
     /// The origin answered badly (5xx). Reachable, unhealthy — try again, but do not call it an outage.
     ServerError,
-    /// A redirect that would change origin; refused rather than followed (§12 rule 7's pin is per-origin by shape).
+    /// A redirect that would change origin; refused rather than followed (a pin is per-origin by shape).
     RedirectRefused,
     /// The name would not resolve: no DNS, wrong spelling, or a network with nothing behind it.
     Unresolved,
@@ -1411,7 +1410,7 @@ pub fn failure_class(raw: &str) -> String {
     }
 }
 
-/// The origin a fetch dials, from whatever `[models] base_url` resolved to (§12 rule 7 as amended 2026-11-04).
+/// The origin a fetch dials, from whatever `[models] base_url` resolved to — or the compiled-in default when it is unset.
 ///
 /// **One question, one answer, in one place**: the configured value if there is one, else
 /// [`crate::pins::DEFAULT_ORIGIN`]. Config has already merged its two sources before a caller reaches here — the file's
@@ -1432,7 +1431,7 @@ pub fn pinned_member_names(id: &str) -> Vec<&'static str> {
     pins::pinned(id).map(|member| member.member).collect()
 }
 
-/// Every distinct id this build can fetch — the pin table's, and nothing else's (§12 rule 7: the binary decides).
+/// Every distinct id this build can fetch — the pin table's, and nothing else's: the binary decides.
 pub fn fetchable_ids() -> Vec<&'static str> {
     let mut ids = BTreeSet::new();
     for pinned in crate::pins::PINNED {
@@ -1447,11 +1446,11 @@ pub const PRIMARY_MEMBER: &str = MAIN_FILE;
 
 /// The production transport: plain HTTP GETs against an origin the operator configured.
 ///
-/// **Lives behind cargo feature `fetch`, which is default-on** (§12's premises: a fetch path release builds compile
+/// **Lives behind cargo feature `fetch`, which is default-on** (the premise: a fetch path release builds compile
 /// out would defeat the amendment; opting out is an explicit `--no-default-features`). It is also the only place in
 /// the workspace that names a network client, and it holds one string — the origin — which arrives from
 /// `[models] base_url`, `NP_MODELS_BASE_URL`, or [`crate::pins::DEFAULT_ORIGIN`] via [`resolve_origin`]. Nothing here
-/// knows or cares which host that is; §12 rule 7 keeps the accepted bytes in the binary and the origin in
+/// knows or cares which host that is; the accepted bytes stay in the binary and the origin stays in
 /// config-plus-default so a mirror is an edit, not a rebuild.
 ///
 /// # The URL shape, and why the model id is not in it
@@ -1502,7 +1501,7 @@ impl Transport for HttpTransport {
         match self.agent.get(&url).call() {
             Ok(response) => {
                 // `Content-Length` is the only size hint that means anything here. A chunked transfer omits it and
-                // §12 rule 12 wants "size unknown", never an invented denominator — and a `transfer-encoding: chunked`
+                // "size unknown", never an invented denominator — and a `transfer-encoding: chunked`
                 // response decoded by the client would otherwise tempt us to report the decoded length as if the
                 // server had announced it.
                 let bytes_total = response
@@ -1514,7 +1513,7 @@ impl Transport for HttpTransport {
                 })
             }
             // The class is the only thing that leaves this function. `ureq`'s own text names the URL and sometimes
-            // the resolved address; §12 rule 8 keeps both out of a report that lands in CI logs.
+            // the resolved address; neither belongs in a report that lands in CI logs.
             Err(err) => Err(FetchError::Transport {
                 id: member.id().to_string(),
                 member: member.member().to_string(),
@@ -1540,7 +1539,7 @@ fn http_class(err: &ureq::Error) -> String {
     }
 }
 
-/// What `--discard-marker` did (§12 rule 4: the explicit door, and the only one).
+/// What `--discard-marker` did — the explicit door, and the only one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discarded {
     /// Whether a marker file was removed. `false` means there was nothing to discard, which is a fact worth printing
@@ -1554,7 +1553,7 @@ pub struct Discarded {
 
 /// Remove this workspace's fetch marker for `id`, and the partial download it names.
 ///
-/// **An unreadable marker is still removed.** §12 rule 4's advice is "if no fetch is running, delete this file and
+/// **An unreadable marker is still removed.** The advice this honours is "if no fetch is running, delete this file and
 /// re-run", and a marker truncated mid-write is exactly the case where the human knows best whether a fetch is
 /// running — refusing to help because *this build* cannot parse the file would make the door unusable in the one
 /// situation it exists for. The part file, by contrast, can only be named if the marker could be read, so an
@@ -1594,7 +1593,7 @@ pub fn discard_marker(models_dir: &Path, id: &str) -> Result<Discarded, FetchErr
 mod tests {
     use super::*;
 
-    /// The three arms of rule 6, asserted directly rather than through an OS query — which is the point of extracting
+    /// The three arms of the preflight, asserted directly rather than through an OS query — which is the point of extracting
     /// [`preflight`]: on a Linux runner these are the arms a Windows-only `available_bytes` can never reach.
     #[test]
     fn preflight_arms_are_the_three_outcomes() {
@@ -1619,7 +1618,7 @@ mod tests {
         assert!(preflight(1_000, Some(1_000)).is_ok());
         assert!(preflight(u64::MAX, Some(u64::MAX)).is_ok());
         // Cannot say is the third outcome, and it is not a shortfall. The report's "not checked on this platform" line is
-        // what makes this honest; a silent pass here would be the defect F34 was filed for, one level down.
+        // what makes this honest; a silent pass here would be the same class of defect, one level down.
         assert!(preflight(u64::MAX, None).is_ok());
     }
 
@@ -1654,12 +1653,12 @@ mod tests {
     ///    or one read at the wrong width. It does **not** catch a mislabelled declaration: FFI binds by position, so renaming
     ///    `free_bytes_available_to_caller` to mean something else is runtime-inert.
     /// 2. So the arm's own answer is compared against this test's independent read of `total_free`: an implementation that returns
-    ///    total bytes instead of free-bytes-available over-reports how much a fetch may write, which is the F34 defect class. The
+    ///    total bytes instead of free-bytes-available over-reports how much a fetch may write, which is the defect class this preflight exists to prevent. The
     ///    slack is for writers racing us between the two calls on a shared runner.
     ///
     /// What stays **unkillable**, stated rather than glossed: returning `total_number_of_free_bytes` instead of
     /// `free_bytes_available_to_caller` cannot be detected on a volume with no quota in force, where those two values are equal —
-    /// and that is the common case on a CI runner. §12 rule 6 errs low there anyway, so the choice is argued in §3 of the design and
+    /// and that is the common case on a CI runner. The preflight errs low there anyway, so the choice is argued below and
     /// not claimed as tested.
     #[cfg(windows)]
     #[test]
