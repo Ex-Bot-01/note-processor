@@ -1,11 +1,11 @@
 //! Builds and links the pinned llama.cpp into `np-core` — under `local-model`, and only there.
 //!
-//! Design authority: `docs/design-m2-local-embeddings.md` §14 (we own this build; no bindgen, no
-//! pinned Rust binding) and §2's promise that a default `cargo test --workspace` never grows a C++
+//! Two obligations, and the whole script follows from them: **we own this build** — no bindgen, no pinned
+//! Rust binding, no build-dependencies — and a default `cargo test --workspace` must never grow a C++
 //! build. So the first thing this script does is check whether it was asked to exist at all:
 //! with the feature off it prints one `rerun-if-changed` line and touches nothing — no cmake probe,
 //! no filesystem read beyond cargo's own. That is what makes "default build unchanged" a fact rather
-//! than a hope (measured in the round report: identical stripped bytes with and without this file).
+//! than a hope (measured: identical stripped bytes with and without this file).
 //!
 //! With the feature on it does four things, in this order, and refuses loudly at each failure:
 //!
@@ -22,7 +22,7 @@
 //! `local-model` builds one target and links four archives. `local-model,vision` adds one cmake option
 //! (`LLAMA_BUILD_MTMD=ON`, which v0.8.0 defaults to off — that is why a text-only build has never compiled
 //! `tools/mtmd`), one target (`mtmd`) and **two** archives: `libmtmd.a` needs `hash_sha256_hex`, which lives in
-//! `libvendor-hash.a`. Measured, not inferred — `crates/np-core/tests/probes/vision-spike-2026-11-02.md` links six
+//! `libvendor-hash.a`. Measured, not inferred — the vision spike record under `tests/probes/` links six
 //! archives and records the `undefined reference to hash_sha256_hex[abi:cxx11]` failure of the five-archive attempt.
 //! The option joins the pin's list before the configure, so the machinery below still covers it: an option cmake filed
 //! as `UNINITIALIZED` is a refusal either way, and an option set that changed still forces a fresh directory rather
@@ -31,7 +31,7 @@
 //! Two rules it exists to enforce:
 //!
 //!   * **Never fetch.** The fetch belongs to `scripts/vendor-llama-cpp.sh`, which a human or the one
-//!     CI job runs. A build script that quietly reaches out fails in ways we cannot reproduce (§14).
+//!     CI job runs. A build script that quietly reaches out fails in ways we cannot reproduce.
 //!   * **Never silently disable.** Every failure here is a panic naming what was missing and the
 //!     command that fixes it. A release that quietly loses inference is worse than a loud failure —
 //!     and unlike `cargo:warning=`, a panic cannot be scrolled past.
@@ -98,13 +98,13 @@ const SYSTEM_LIBS: [&str; 4] = ["stdc++", "m", "pthread", "dl"];
 /// The Windows set, and the difference is measured rather than translated: a `x86_64-w64-mingw32` link of
 /// these same four archives resolved with `ws2_32` and `bcrypt`, needed no `pthread` (ggml's threading rides
 /// the Win32 API under the win32 threading model) and no `dl`. `stdc++` stays because llama.cpp is C++.
-/// Measured 2026-11-08 in the cross-build spike: `ADVAPI32`, `KERNEL32`, `msvcrt` and nothing else in the
+/// Measured in the cross-build spike: `ADVAPI32`, `KERNEL32`, `msvcrt` and nothing else in the
 /// import table of an exe that references `llama_model_load_from_file`.
 const WINDOWS_SYSTEM_LIBS: [&str; 3] = ["m", "ws2_32", "bcrypt"];
 
 /// Set this to a cmake toolchain file to build `local-model` for a target that is not the host. Its existence
 /// is the whole opt-in: without it, a non-Linux target still meets the refusal below rather than a half-built
-/// C++ tree. Read from a cross recipe (`docs/ops-cross-build-windows-gnu.md`), never guessed at here.
+/// C++ tree. Read from the Windows-GNU cross-build recipe under `docs/`, never guessed at here.
 const TOOLCHAIN_ENV: &str = "NP_LLAMA_CMAKE_TOOLCHAIN";
 
 /// Set this to build llama.cpp for **any** x86-64 machine rather than for the one running cmake. The release
@@ -137,7 +137,7 @@ const PORTABLE_ISA_OPTIONS: [&str; 6] = [
 const PORTABLE_MARCH_FLAG: &str = "-march=x86-64";
 
 /// What a baseline x86-64 compiler must **not** predefine. Read from the compiler rather than from a flag list, because the
-/// flags were never the whole story: on 2026-11-13 a hosted runner's `cc` predefined `__AVX__` and `__AVX2__` from an empty
+/// flags were never the whole story: a hosted runner's `cc` predefined `__AVX__` and `__AVX2__` from an empty
 /// command line — its *default* target sits above the floor — which is how a tree with every `GGML_<ISA>` option OFF and no
 /// `-m` token in any of its 76 compile commands still produced 36,203 wide-vector instructions.
 const PORTABLE_FORBIDDEN_MACROS: [&str; 12] = [
@@ -165,11 +165,11 @@ const LINK_STAGE_DIR: &str = "llama-link-windows-gnu";
 const OPENMP_CACHE_KEY: &str = "GGML_OPENMP_ENABLED";
 const OPENMP_LIB: &str = "gomp";
 
-/// The architecture token that made v0.8.0 the pin (§13, §14): a tree without it cannot resolve
+/// The architecture token that made v0.8.0 the pin: a tree without it cannot resolve
 /// `general.architecture = gemma-embedding2`, whatever its version numbers say.
 const REQUIRED_ARCH_TOKEN: &str = "LLM_ARCH_GEMMA_EMBEDDING2";
 
-/// Ceiling on cmake's `-j`. Not a guess at the fastest build but at the largest safe one: §14 measured
+/// Ceiling on cmake's `-j`. Not a guess at the fastest build but at the largest safe one, measured:
 /// 23 s at `-j 14` on a host with ~6.3 GB free RAM, and llama.cpp's translation units are large
 /// enough that outrunning memory looks like a compiler being killed, not like a slow build. Override
 /// with `NP_LLAMA_CPP_JOBS`.
@@ -274,9 +274,9 @@ fn link_pinned_llama(shape: &Shape) -> Result<(), String> {
     println!("cargo::rerun-if-env-changed={TOOLCHAIN_ENV}");
     println!("cargo::rerun-if-env-changed={PORTABLE_ENV}");
 
-    // §14 claimed nothing about Windows or macOS, so this refused every non-Linux target: better a refusal
-    // naming the design section than a stranger meeting `-l stdc++` cannot find (macOS) or four wrong archive
-    // names (MSVC). That scope still stands for anything not spelled out below. What changed on 2026-11-08 is
+    // The original scope said nothing about Windows or macOS, so this refused every non-Linux target: better
+    // a refusal naming what is missing than a stranger meeting `-l stdc++` cannot find (macOS) or four wrong
+    // archive names (MSVC). That scope still stands for anything not spelled out below. What changed is
     // that `windows` + `gnu` stopped being a claim and became a measurement: llama.cpp v0.8.0 configures and
     // builds with mingw-w64 from this Linux host, all 30 functions in `llama_ffi.rs` are defined by the
     // resulting archives, and an exe linked against them imports only system DLLs. It stays opt-in, because a
@@ -377,8 +377,8 @@ fn link_pinned_llama(shape: &Shape) -> Result<(), String> {
         cross.as_deref(),
     )?;
     compile(&cmake, &build_dir, shape.targets())?;
-    // `ggml/CMakeLists.txt:80` clears `CMAKE_STATIC_LIBRARY_PREFIX` on Windows for its own targets — measured
-    // 2026-11-08: the build tree came out `libllama.a`, `ggml.a`, `ggml-cpu.a`, `ggml-base.a`, and no `-D` of
+    // `ggml/CMakeLists.txt` clears `CMAKE_STATIC_LIBRARY_PREFIX` on Windows for its own targets — measured
+    // here: the build tree came out `libllama.a`, `ggml.a`, `ggml-cpu.a`, `ggml-base.a`, and no `-D` of
     // ours overrides a subdirectory's own `set()`. GNU ld will not look at `ggml.a` for `-l ggml` ("rename it to
     // libggml-base.a", it says), so the cross link gets prefixed copies in one directory of ours. Copies, not
     // renames: the cmake tree keeps owning its build directory, and a re-run of cmake below must find what it
@@ -389,7 +389,7 @@ fn link_pinned_llama(shape: &Shape) -> Result<(), String> {
     };
     if cross.is_some() {
         // rustc only searches the `-L native=` paths we hand it, and the mingw sysroot is not one of them: the
-        // first attempt failed with "could not find native static library `stdc++`" (measured 2026-11-08). Ask
+        // first attempt failed with "could not find native static library `stdc++`" (measured here). Ask
         // the compiler that actually built the archives where its own runtime archives live, rather than
         // hard-coding a path that belongs to whoever installed this toolchain.
         let compiler = configured_compiler(&build_dir)
@@ -669,7 +669,7 @@ fn configure(
     // only if something acts on it; this line is that something.
     // The cross arguments belong in the stamp even though they come from this invocation rather than the pin.
     // Left out — as they were on the first attempt — a warm **host** cache is certified to a windows build:
-    // measured 2026-11-08, "already configured for the pin's options; skipping configure" followed by an archive
+    // measured here, "already configured for the pin's options; skipping configure" followed by an archive
     // set built with the host compiler and no `lib` prefix. Same reasoning as the CMakeLists digest above: name
     // an input only if something acts on it.
     let mut extras = match cross {
@@ -687,7 +687,7 @@ fn configure(
             extras.push_str(&format!("{option}=OFF\n"));
         }
         // The compiler flags belong to the configure's identity for the same reason: they, not the options above, are what
-        // decided the instruction set on 2026-11-13, so a cache that predates them must not be certified fresh.
+        // decided the instruction set, so a cache that predates them must not be certified fresh.
         extras.push_str(&format!(
             "CMAKE_C_FLAGS={}\nCMAKE_CXX_FLAGS={}\n",
             portable_cflags("CFLAGS"),
@@ -733,7 +733,7 @@ fn configure(
     if set_changed || untracked_cache {
         // **A reconfigure cannot undo a deletion.** cmake keeps a cache entry whose `-D` disappeared, so removing
         // `GGML_OPENMP = "OFF"` from the pin would leave `GGML_OPENMP:BOOL=OFF` in charge while that file's own preamble
-        // promises unlisted options keep llama.cpp's default — and R6d's stated lever is flipping exactly that line, so
+        // promises unlisted options keep llama.cpp's default — and the stated throughput lever is flipping exactly that line, so
         // this failure mode sits one edit away (A2 review P1-2). Only a fresh directory fixes it. Ours to wipe when it
         // lives under `OUT_DIR`; a build directory inside someone's source checkout is not ours to delete, so that case
         // refuses and names the command — refuse rather than repair, as everywhere else in this file.
@@ -797,7 +797,7 @@ fn configure(
     // Both halves matter, and the first draft of this fix got the second one wrong.
     //
     // `GGML_NATIVE=ON` (upstream's default for a native build) means `-march=native`: SIMD chosen by the CPU of
-    // whoever ran cmake. Measured 2026-11-13 on the first CI-built Linux asset, built on a hosted runner: 14,540
+    // whoever ran cmake. Measured on the first CI-built Linux asset, built on a hosted runner: 14,540
     // `%zmm` instructions in `np`, and `np --version` on an x86-64 host whose flags stop at SSE4.2 answered
     // `Illegal instruction (core dumped)` before printing anything.
     //
@@ -851,7 +851,7 @@ fn configure(
         // is OFF when the target is not the host), so only the native switch has to be made here.
         args.push("-DGGML_NATIVE=OFF".to_string());
         // mingw gives a static library **no prefix**: the build tree came out as `ggml.a`, `ggml-cpu.a`,
-        // `ggml-base.a`, `libllama.a` (measured 2026-11-08), and GNU ld only ever searches `lib<name>.a` for
+        // `ggml-base.a`, `libllama.a` (measured here), and GNU ld only ever searches `lib<name>.a` for
         // `-l <name>`. Asking cmake for the Unix prefix keeps one archive spelling across both targets, so
         // [`find_archive`]'s "this target stopped producing that library" check stays a real check instead of
         // firing on every Windows build — and rustc's `static=` flags resolve without link-arg gymnastics.
@@ -1004,9 +1004,9 @@ fn emit_link_flags(build_dir: &Path, shape: &Shape, windows: bool) -> Result<(),
         }
     }
     // The order above is **load-bearing**, and that is a measurement rather than a style rule. The spike's link wrapped all
-    // six archives in `-Wl,--start-group … --end-group` (`vision-spike-2026-11-02.md`, "Link"), so its printed order carried
+    // six archives in `-Wl,--start-group … --end-group` (the vision spike record's "Link" section), so its printed order carried
     // no information; here GNU ld resolves strictly left to right, and `libggml.a` ↔ `libggml-cpu.a` refer to each other.
-    // A linker group was tried on 2026-11-03 and cannot be emitted this way: `-C link-arg` values land *after* rustc's own
+    // A linker group was tried once and cannot be emitted this way: `-C link-arg` values land *after* rustc's own
     // `-l static=` flags in the `cc` line (verified with `cargo build -vv`), so `--start-group` would open a group behind
     // the libraries it is meant to protect. Order, therefore, is the mechanism — and a re-pin that moves a symbol between
     // two of these archives will fail with an undefined reference no local edit explains, which is what this comment is for.
@@ -1025,7 +1025,7 @@ fn emit_link_flags(build_dir: &Path, shape: &Shape, windows: bool) -> Result<(),
     if windows {
         // The C++ runtime, and the *spelling* is a measurement: emitted as `dylib=stdc++` the linker produced an
         // exe importing **`libstdc++-6.dll`** — a mingw runtime file that is not on anyone's clean Windows
-        // machine, found by reading the import table rather than by watching the link fail (measured 2026-11-08).
+        // machine, found by reading the import table rather than by watching the link fail (measured here).
         // Named as a static archive it links `libstdc++.a` in and the import table drops to system DLLs. `gcc_eh`
         // joins it because C++ exceptions need the unwinder, and dynamic would break the same promise.
         println!("cargo::rustc-link-lib=static=stdc++");
@@ -1056,7 +1056,7 @@ fn emit_link_flags(build_dir: &Path, shape: &Shape, windows: bool) -> Result<(),
 fn find_archive(build_dir: &Path, name: &str, built: &str) -> Result<PathBuf, String> {
     // Three spellings, because two build systems and one upstream `set()` are involved: Unix cmake writes
     // `libggml.a`, MSVC would write `ggml.lib`, and mingw writes `ggml.a` — `ggml/CMakeLists.txt:80` clears the
-    // static prefix for its own targets on Windows (measured 2026-11-08, while [`stage_prefixed_archives`] exists
+    // static prefix for its own targets on Windows (measured here, while [`stage_prefixed_archives`] exists
     // to hand the linker a name it will actually open). A tree carrying two of these for one library still
     // refuses below rather than choosing by spelling.
     let names = [
@@ -1128,7 +1128,7 @@ struct Pin {
 
 impl Pin {
     /// A line scan for `key = "value"`, with `[section]` headers — no TOML crate here on purpose
-    /// (build-dependencies are dependencies, and §14's rule is that we add none to avoid bindgen).
+    /// (build-dependencies are dependencies, and the rule is that we add none, so bindgen cannot creep back in).
     /// Anything that is not that shape is refused rather than ignored: a silently dropped option is a
     /// binary built with settings nobody wrote down.
     ///
@@ -1175,7 +1175,7 @@ impl Pin {
                 None if key.trim() == "tag" => tag = Some(value.to_string()),
                 None if key.trim() == "header_sha256" => header_sha256 = Some(value.to_string()),
                 // `url` and the tarball `sha256` are the vendor script's business; a build script that could
-                // download them would be the thing §14 rules out. `header_sha256` is ours: it identifies what
+                // download them would be exactly what this rule forbids. `header_sha256` is ours: it identifies what
                 // is already on disk.
                 None => {}
                 Some("cmake") => options.push((key.trim().to_string(), value.to_string())),
@@ -1306,11 +1306,11 @@ fn path_env(name: &str) -> Result<PathBuf, String> {
 }
 
 /// SHA-256 (FIPS 180-4) over a whole file, written out rather than pulled from a crate: this script's rule is
-/// zero build-dependencies (§14 added none precisely so bindgen could not creep back in), and the alternative
+/// zero build-dependencies (none were added, precisely so bindgen could not creep back in), and the alternative
 /// to hashing is trusting a directory name — which is what this replaces. A wrong implementation fails loudly
 /// as a refusal, never as a wrong binary.
 ///
-/// Verified against coreutils `sha256sum` on 2026-10-29 for: an empty file, a 3-byte file, and files of 55,
+/// Verified against coreutils `sha256sum` for: an empty file, a 3-byte file, and files of 55,
 /// 56 and 64 bytes (the three padding shapes), 3 MB of random bytes, and the pinned `include/llama.h` itself.
 fn sha256_hex(bytes: &[u8]) -> String {
     const K: [u32; 64] = [
@@ -1456,7 +1456,7 @@ fn require_portable_codegen(build_dir: &Path, portable: bool) -> Result<(), Stri
         }
     }
     // **Then ask the compiler what it would compile for, with those options gone.** The option check above reads cmake's
-    // intentions; this one measures the toolchain's defaults, and on 2026-11-13 only this one was true: every `GGML_<ISA>`
+    // intentions; this one measures the toolchain's defaults, and only this one held: every `GGML_<ISA>`
     // option OFF, no `-m` token in any of the tree's 76 compile commands, and a hosted runner's `cc` that predefined
     // `__AVX__`/`__AVX2__` from an empty command line. The asset built from that "portable" configuration still refused to
     // start on a pre-AVX machine. Options can withdraw features something asked for; they cannot withdraw the compiler's own
@@ -1549,7 +1549,7 @@ fn predefined_macros(compiler: &str, flags: &str) -> Result<Vec<String>, String>
 }
 
 /// A posix-threaded mingw-w64 produces an exe that imports `libwinpthread-1.dll`, and that DLL is not on a
-/// Windows machine. Measured 2026-11-08: `-Wl,-Bstatic -lwinpthread` keeps the import, and so does naming
+/// Windows machine. Measured here: `-Wl,-Bstatic -lwinpthread` keeps the import, and so does naming
 /// `libwinpthread.a` by full path, because mingw's static archive carries a `/DEFAULTLIB` directive for its own
 /// import library. The only recipe that produced a clean import table built with the `-win32` compiler drivers,
 /// where ggml's `std::mutex` rides Win32 primitives and no pthread runtime exists at all.
@@ -1578,7 +1578,7 @@ fn require_win32_threading(build_dir: &Path) -> Result<(), String> {
 ///
 /// Not from `CMakeCache.txt`: a toolchain file that sets `CMAKE_C_COMPILER` with a plain `set()` — the usual
 /// spelling — keeps it an internal variable, and the cache then holds only the derived `_AR`/`_RANLIB` entries
-/// (measured 2026-11-08: the file has `CMAKE_C_COMPILER_AR` and no `CMAKE_C_COMPILER`). cmake writes the real
+/// (measured here: the file has `CMAKE_C_COMPILER_AR` and no `CMAKE_C_COMPILER`). cmake writes the real
 /// answer into `CMakeFiles/<version>/CMakeCXXCompiler.cmake`, so that is read first, with the cache as a
 /// fallback for toolchain files that do use `set(... CACHE ...)`.
 fn configured_compiler(build_dir: &Path) -> Option<String> {
