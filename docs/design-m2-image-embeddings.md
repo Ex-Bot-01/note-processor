@@ -448,8 +448,8 @@ The re-measurement is the row that earns a claim about *this* build, because it 
 printed `TOKEN COST: 512x384 -> 88, 1024x768 -> 336 (card's flat default: 280)`:
 
 ```text
-NP_TEST_MODEL_PATH=/home/agent/models/embeddinggemma-2-Q8_0.gguf \
-NP_TEST_MMPROJ_PATH=/home/agent/models/mmproj-embeddinggemma-2-Q8_0.gguf \
+NP_TEST_MODEL_PATH=$HOME/models/embeddinggemma-2-Q8_0.gguf \
+NP_TEST_MMPROJ_PATH=$HOME/models/mmproj-embeddinggemma-2-Q8_0.gguf \
   cargo test -p np-core --features local-model,vision --test local_vision -- \
     --nocapture --test-threads=1 token_cost
 ```

@@ -2,19 +2,19 @@
 //!
 //! Two steps, in this order and no other: [`image_links`] reads note bytes for markdown image syntax, then
 //! [`resolve_image`] places one target in the workspace, and [`crate::hash::sha256_file_with_size`] digests whatever it
-//! found — the digest stays in `hash.rs`, where §12 rule 9 keeps the one definition. Design §7 of
-//! `docs/design-m2-image-embeddings.md` owns the rules; this module is where they are executed.
+//! found — the digest stays in `hash.rs`, where the one definition lives.
+//! The rules below are stated here because this module is where they are executed.
 //!
 //! **Everything here works on bytes.** A note body, a link target and a resolved path are `&[u8]` end to end, and no
-//! function decodes one — F13's `caf\xe9.png` is a legal name on Unix and the image it names has to be embeddable.
+//! function decodes one — a `caf\xe9.png` is a legal name on Unix and the image it names has to be embeddable.
 //! That is also why resolution does not reuse [`crate::links`]: its targets are display text, resolved through
-//! case-folded lookups, and §7 makes media resolution byte-exact with a percent-decode and nothing else. A fold would
+//! case-folded lookups, and media resolution is byte-exact with a percent-decode and nothing else. A fold would
 //! not merely be redundant here (media identity is a content hash, so two spellings of one figure already reach one
 //! row — see `crate::db::link_media_path`) — on a case-sensitive filesystem it would embed a *different* file than
 //! the author wrote.
 //!
-//! Refusals are classes ([`MediaRefusal`]), never messages: no path, URL or origin crosses this boundary (§8's rule
-//! 8), and none of them is an exit code — every one is a count on an embed report.
+//! Refusals are classes ([`MediaRefusal`]), never messages: no path, URL or origin crosses this boundary, and none
+//! of them is an exit code — every one is a count on an embed report.
 
 use serde::Serialize;
 use std::ffi::OsStr;
@@ -92,7 +92,7 @@ fn strip_cr(line: &[u8]) -> &[u8] {
 /// [`crate::parse`]'s rule and deliberately not a wider one.
 ///
 /// Two definitions of "inside a code block" would have to be kept in step forever, and this one is not the authority on
-/// markdown — §5's rule 3 is, and `parse::prose_lines` implements it for headings, tags, words and links. So an image in
+/// markdown — `parse::prose_lines` is, one definition covering headings, tags, words and links. So an image in
 /// a `~~~`-fenced example *is* embedded (the chunker indexes that block's words as prose too), and an indented ``` fence
 /// is not a fence here either, because it is not one for the chunker. The CommonMark-faithful reading may well be the
 /// better markdown rule; adopting it here while `parse` kept the column-0 rule would mean a diagram being embedded from a
@@ -146,7 +146,7 @@ fn image_at(line: &[u8], bang: usize) -> Option<(Vec<u8>, usize)> {
         // A destination ends at the first ASCII whitespace: everything after it is a title (`![a](x.png "Kafka ingest")`),
         // and a name that genuinely contains a space has to be written `<with space.png>` — which is the branch above,
         // where nothing is trimmed because there the bytes *are* the name. Without this cut the title becomes part of the
-        // extension and a real file refuses as `unsupported-format`, a class §8 reserves for extensions outside the set.
+        // extension and a real file refuses as `unsupported-format`, the class reserved for extensions outside the set.
         let destination = line[start..close_paren]
             .trim_ascii_start()
             .split(|byte| byte.is_ascii_whitespace())
@@ -186,18 +186,19 @@ fn find(haystack: &[u8], needle: u8, from: usize) -> Option<usize> {
 pub struct ResolvedImage {
     /// The workspace-relative path in `/`-separated bytes, normalised: this is the identity `media_path.rel_bytes`
     /// stores, so two spellings of one file (`./a/../b.png`, `b.png`) produce one row. Raw bytes are kept rather than
-    /// text because a non-UTF-8 name has to key apart from its lossy spelling (F13). No case-folded twin travels with
+    /// text because a non-UTF-8 name has to key apart from its lossy spelling. No case-folded twin travels with
     /// it: media identity is the content hash, and `media_path` stopped carrying a folded column for it in `e2180da`.
     pub rel_bytes: Vec<u8>,
     /// The same path under `root`, spelled the way this OS wants it — what the caller opens.
     pub abs: PathBuf,
-    /// `image/png` or `image/jpeg`, decided by extension and nothing else (§8's accepted set).
+    /// `image/png` or `image/jpeg`, decided by extension and nothing else — the accepted set.
     pub mime: &'static str,
 }
 
-/// Why one image link will not be embedded, in §8's words.
+/// Why one image link will not be embedded, in the words a report prints.
 ///
-/// A class and nothing else: no variant carries a path, a URL or an origin (models-install §12 rule 8), because these
+/// A class and nothing else: no variant carries a path, a URL or an origin — origin privacy covers a refusal as well
+/// as a report line — because these
 /// are counts on a report and the row that produced one already names itself. None of them is an exit code either —
 /// runtime refusals stay `1`, argv problems stay `2`, and an image that will not embed changes neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -209,45 +210,45 @@ pub enum MediaRefusal {
     /// An absolute target, or one that pops past the workspace root. Decided from the path text, before anything is
     /// opened.
     OutsideWorkspace,
-    /// An extension outside the accepted set (§8: `.png`, `.jpg`, `.jpeg` and nothing else).
+    /// An extension outside the accepted set: `.png`, `.jpg`, `.jpeg` and nothing else.
     UnsupportedFormat,
-    /// An accepted extension whose bytes do not decode to an image. Produced by the encoder (Task 4), never by
+    /// An accepted extension whose bytes do not decode to an image. Produced by the encoder, never by
     /// resolution — a malformed percent-escape is `MissingTarget`, because a name that matches no file needs no new
     /// class to say so.
     Undecodable,
-    /// The encoded image needs more of the context window than the run allows (§8 measures this after encoding).
+    /// The encoded image needs more of the context window than the run allows — measured after encoding.
     OverBudget,
-    /// This build cannot read images: it was compiled without the image code. (Before F28 this class also covered "the
+    /// This build cannot read images: it was compiled without the image code. (This class used to also cover "the
     /// projector is not installed", which sent someone to rebuild a binary when the fix was one file — see
     /// [`Self::ProjectorAbsent`].)
     VisionUnavailable,
     /// This build has the image code and this workspace has no projector for it to load: not recorded by this database,
     /// or present but not the bytes that record vouches for. Emitted from [`crate::embed_run`]'s image pass out of
     /// [`crate::embed::ImageBlocker::ProjectorAbsent`], and the reason it is its own class rather than a sentence inside
-    /// `vision-unavailable` is that the two advise different actions — fetch a file, or build with a feature (F28).
+    /// `vision-unavailable` is that the two advise different actions — fetch a file, or build with a feature.
     ProjectorAbsent,
 }
 
-/// These bytes are not a raster this build can decode (§8). **The one definition**; `crate::vision` re-exports it, and
+/// These bytes are not a raster this build can decode. **The one definition**; `crate::vision` re-exports it, and
 /// `MediaRefusal::label` answers with it, so the seam's refusal and the report's label cannot drift apart.
 pub const UNDECODABLE: &str = "undecodable";
-/// The encode measured larger than the context can hold (§8). **The one definition**, same reasoning as
+/// The encode measured larger than the context can hold. **The one definition**, same reasoning as
 /// [`UNDECODABLE`].
 pub const OVER_BUDGET: &str = "over-budget";
-/// This build and model pair cannot serve the request (§8). **The one definition**, shared by three readers: this label,
+/// This build and model pair cannot serve the request. **The one definition**, shared by three readers: this label,
 /// [`crate::embed::Embedder::embed_image`]'s default refusal, and the vision seam that emits it most often (a module
 /// compiled only under the `vision` feature, so it is named in prose rather than linked — a doc link here would break
 /// every default-build `cargo doc`).
 pub const VISION_UNAVAILABLE: &str = "vision-unavailable";
 
 impl MediaRefusal {
-    /// The §8 kebab-case spelling, which is what an embed report prints and its JSON repeats; Tasks 5, 6 and 8 label
+    /// The kebab-case spelling, which is what an embed report prints and its JSON repeats; every caller labels
     /// through this one function so a class cannot be spelled two ways.
     ///
     /// **Three of these seven return a `const`, not a literal** — [`UNDECODABLE`], [`OVER_BUDGET`] and
     /// [`VISION_UNAVAILABLE`] are also emitted by code outside this module (the vision seam, and
     /// [`crate::embed::Embedder::embed_image`]'s default refusal), so they have exactly one spelling in the tree. A
-    /// measured consequence of keeping them literal: renaming `embed`'s copy on 2026-11-03 left every default-build test
+    /// measured consequence of keeping them literal: renaming `embed`'s copy left every default-build test
     /// green (534 passed, 0 failed) because the only assertion comparing the two sits behind `--features vision`.
     /// `missing-target`, `outside-workspace` and `unsupported-format` are emitted here alone, so they stay literals —
     /// pinned by name in `tests/media_resolve.rs`.
@@ -274,14 +275,14 @@ impl MediaRefusal {
 ///
 /// 1. **one percent-decode pass**, which fails closed — a malformed escape leaves the name
 ///    exactly as written, so it matches no file and lands in `missing-target`;
-/// 2. **absolute targets are refused** (§7), whatever follows the leading `/`;
-/// 3. **a target that names nothing** (``, `.`, `./`) is `missing-target`: §8 has no class for "that is a directory",
+/// 2. **absolute targets are refused**, whatever follows the leading `/`;
+/// 3. **a target that names nothing** (``, `.`, `./`) is `missing-target`: there is no class for "that is a directory",
 ///    and "no file behind this link" is the truth;
 /// 4. **normalisation by component walking** — `.` and empty components drop, `..` pops, and popping past the start
 ///    is `outside-workspace`. The base is the note's own directory, walked by the same rule, so the result is inside
 ///    the workspace *by construction* and no path ever leaves it. This happens before any filesystem call, which is
 ///    what keeps `/etc/x.png` a refusal rather than a read;
-/// 5. **then the extension**: outside §8's accepted set is `unsupported-format`, whether or not the file exists —
+/// 5. **then the extension**: outside the accepted set is `unsupported-format`, whether or not the file exists —
 ///    a format we would not decode is not looked for on disk;
 /// 6. **then the file**: absent, unreadable-as-metadata, or not a regular file is `missing-target`. A directory with
 ///    an image suffix belongs here: its name passed step 5, so what is wrong about it is that it is not a file.
@@ -301,7 +302,8 @@ pub fn resolve_image(
 ///
 /// This is public so the rule can be *tested* rather than hoped for: the escape that only exists on Windows
 /// (`C:\shots\a.png`, `\\srv\share\a.png`, `..\..\outside.png`) has to be refused by code this Linux host can run,
-/// because a claim about Windows behaviour nobody executed is exactly what F18 forbids. The refusal happens in the walk,
+/// because a claim about Windows behaviour nobody executed is exactly what this project refuses to ship. The refusal
+/// happens in the walk,
 /// before any [`PathBuf::push`], so it does not depend on how the host OS would have interpreted the component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathStyle {
@@ -379,7 +381,7 @@ pub fn resolve_image_in(
         return Err(MediaRefusal::MissingTarget);
     }
     // A trailing separator names a directory (`![a](assets.png/)`), so a regular file at that spelling is not what the
-    // author pointed at. §8 has no class for it; "names nothing" is the honest one, because at that spelling it does.
+    // author pointed at. There is no class for it; "names nothing" is the honest one, because at that spelling it does.
     let names_a_directory = style.is_separator(*written.last().unwrap_or(&b'/'));
 
     let path = place_in_workspace(style, note_rel, &written)?;
@@ -419,7 +421,7 @@ pub fn resolve_image_in(
 /// no symlink test, no extension check.
 ///
 /// This is the walk [`resolve_image_in`] performs, split out because a second caller needs exactly this much of it and not
-/// one step more: §7 rule 4's lifecycle question is *"does a live note link this path?"*, which is answered by the note's
+/// one step more: the lifecycle question is *"does a live note link this path?"*, which is answered by the note's
 /// text and nothing else. A figure whose file is momentarily unopenable — unmounted, Sync-in-flight, evicted from a
 /// network volume — is still linked, and a sweep that reads "no file" as "no link" deletes a vector the author never
 /// removed.
@@ -447,21 +449,21 @@ fn place_in_workspace(
 /// path?", with no claim about whether anything is there.
 ///
 /// **Which targets answer `None`, and why each one must:** rooted (`/assets/d.png`, `C:\shots\a.png`), NUL-containing,
-/// naming nothing (`.`), ending in a separator (a directory), escaping the root with `..`, or carrying an extension §8 does
-/// not accept (a `.gif` link never linked the `.png` row that held those bytes). Every one of these is a refusal
+/// naming nothing (`.`), ending in a separator (a directory), escaping the root with `..`, or carrying an extension the
+/// accepted set does not accept (a `.gif` link never linked the `.png` row that held those bytes). Every one of these is a refusal
 /// [`resolve_image_in`] makes **before or during the walk**, and this function reproduces exactly that set — it answers a
 /// narrower question, never a more permissive one.
 ///
 /// What it cannot see is the filesystem, so one case differs in the other direction: a path intercepted by a symlink refuses
 /// resolution (`escapes_through_a_link`) while this answers `Some`, because the note really does link that path and only the
-/// disk's shape changed. That row survives until the note's text changes, which is §7 rule 4 read literally; if keeping a
+/// disk's shape changed. That row survives until the note's text changes, which is that question read literally; if keeping a
 /// vector for a figure whose directory now points outside the vault ever looks wrong, the fix is a containment-aware variant
 /// of this function, not a quietly narrower sweep.
 ///
 /// Percent-decoding follows the resolver exactly — one definition of where a target points lives in
 /// `place_in_workspace`, which is also what [`resolve_image_in`] walks.
 ///
-/// **Why this exists as its own question:** the stale-figure sweep asks §7 rule 4, "which figures did no live note link?",
+/// **Why this exists as its own question:** the stale-figure sweep asks "which figures did no live note link?",
 /// and answering it from resolution results conflates two events — the author deleting a link, and the disk failing to
 /// produce a file today. The second is not the author's edit, and a vector destroyed by it costs a full re-encode when the
 /// volume comes back.
@@ -520,7 +522,7 @@ fn names_nothing(target: &[u8]) -> bool {
 ///
 /// `.` and an empty component (a doubled or trailing slash) drop out; `..` pops the last name and **refuses** to pop
 /// past the start, which is what makes an escape visible to [`resolve_image`] instead of quietly producing a path
-/// above the root. Every other name is pushed exactly as written — no case fold, no sort, no second decode (§7).
+/// above the root. Every other name is pushed exactly as written — no case fold, no sort, no second decode.
 fn push_component(path: &mut Vec<Vec<u8>>, name: &[u8]) -> bool {
     if name.is_empty() || name == CURRENT_DIR {
         return true;
@@ -543,15 +545,15 @@ fn extension_of(name: &[u8]) -> Option<&[u8]> {
     (!name[..dot].is_empty() && !name[dot + 1..].is_empty()).then_some(&name[dot + 1..])
 }
 
-/// The eight bytes every PNG starts with (§7's format list, straight from the format's own signature block).
+/// The eight bytes every PNG starts with, straight from the format's own signature block.
 pub const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
 /// What a file **actually is**, judged from its first bytes rather than its name — `image/png`, `image/jpeg`, or nothing.
 ///
-/// This exists because the extension gate alone was measurably not the promise. On 2026-11-03 a BMP payload reached the
+/// This exists because the extension gate alone was measurably not the promise: a BMP payload reached the
 /// pinned decoder under a `.png` filename and came back a live bitmap, then a vector at 80 image tokens; `stb_image`
-/// inside `libmtmd` also takes tga, gif, psd, pnm and qoi. So §7's "png/jpg/jpeg only" needs enforcing where the bytes are
-/// read, which is what closes backlog **F26**.
+/// inside `libmtmd` also takes tga, gif, psd, pnm and qoi. So "png/jpg/jpeg only" needs enforcing where the bytes are
+/// read — that is the hole this closes.
 ///
 /// **Why a pure prefix function rather than a check inside [`resolve_image`]:** that function's whole job is placing a path
 /// in the workspace — every refusal it makes is about *where* bytes live, and its 37 cases say so. Format is a question
@@ -573,7 +575,7 @@ pub fn image_kind_of_prefix(prefix: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// The MIME type of an accepted extension, or nothing for one §8 does not accept.
+/// The MIME type of an accepted extension, or nothing for one outside the set.
 ///
 /// Case-folded, because `DIAGRAM.PNG` is the same format as `diagram.png`: this fold judges a **kind of file**, which
 /// is a different question from which file a path names — and the one place in this module where case may be ignored.
@@ -587,7 +589,7 @@ fn mime_of(extension: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// `components` joined with `/` — the workspace-relative byte key §7's normalisation produced.
+/// `components` joined with `/` — the workspace-relative byte key this module's normalisation produces.
 ///
 /// Not [`crate::path_keys::rel_bytes`], which builds a key out of OS components: these bytes came out of a note, not
 /// out of a directory entry, and putting them through `OsStr` on the way would be where a non-UTF-8 name gets lost on
@@ -616,7 +618,7 @@ fn abs_path(root: &Path, components: &[Vec<u8>]) -> Option<PathBuf> {
 /// spell one of its components.
 ///
 /// This is the reader's half of `join_rel` (the writer that produces a stored `rel_bytes`): paths come out of notes and out of `media_path.rel_bytes` as bytes, and a
-/// non-UTF-8 name has to reopen the file it names rather than the U+FFFD spelling of it (F13). The refusal arm is
+/// non-UTF-8 name has to reopen the file it names rather than the U+FFFD spelling of it. The refusal arm is
 /// therefore load-bearing on Windows and inert here, where the conversion is the identity.
 pub fn workspace_path(root: &Path, rel: &[u8]) -> Option<PathBuf> {
     let components: Vec<Vec<u8>> = rel
@@ -638,7 +640,7 @@ fn component_name(bytes: &[u8]) -> Option<&OsStr> {
 ///
 /// A name that is not valid UTF-8 answers `None`, and [`resolve_image`] turns that into `missing-target`: this
 /// platform cannot spell the name, so it must refuse rather than substitute the U+FFFD spelling of it and embed
-/// whichever other file happens to carry that. Same stance as [`crate::path_keys::name_is_lossless`] (F18) — refuse
+/// whichever other file happens to carry that. Same stance as [`crate::path_keys::name_is_lossless`] — refuse
 /// what cannot be represented exactly — and unlike `os_bytes`, which has to produce *something* for a row the walk
 /// already found on disk.
 #[cfg(not(unix))]
@@ -656,7 +658,7 @@ fn fs_metadata(abs: &Path) -> io::Result<std::fs::Metadata> {
 /// Only `%XX` with two hex digits becomes a byte. Anything else — a lone `%`, `%z`, `%2`, a `%` ending the string —
 /// abandons **the whole decode**, so no caller can end up with half a name decoded and half as written; the raw bytes
 /// go back to [`resolve_image`], which then finds no such file. Decoding yields bytes, never characters: `%E9` is the
-/// single byte 0xe9 that F13's non-UTF-8 names are built from, and one pass is what §7's "percent-decoded" means —
+/// single byte 0xe9 that non-UTF-8 Unix names are built from, and one pass is what "percent-decoded" means here —
 /// `%2520` becomes a literal `%20`, not a space.
 fn percent_decode(target: &[u8]) -> Option<Vec<u8>> {
     let mut decoded: Vec<u8> = Vec::with_capacity(target.len());

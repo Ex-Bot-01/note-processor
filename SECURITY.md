@@ -55,4 +55,4 @@ correctness bug rather than a security one — most of what people find here is 
 entry names the measurement that found it, and several record that the original report's diagnosis was wrong.
 
 Please include the version (`np --version`) and the operating system. Note that release binaries are built without CI grading (see
-`docs/ops-actions-minutes.md`) and that the Windows asset is a mingw cross-build rather than MSVC — both matter when reproducing something.
+`docs/developing.md`) and that the Windows asset is a mingw cross-build rather than MSVC — both matter when reproducing something.

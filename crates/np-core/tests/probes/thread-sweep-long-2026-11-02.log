@@ -1,9 +1,9 @@
 # D13 thread sweep — LONG profile (~7,992-token chunks, near-window), passes 1 and 2, started 2026-11-02T08:19:35Z
 # host: nproc=16, threads_per_core=1, MemTotal=7597988 kB
-# artifact: /home/agent/models/embeddinggemma-2-Q8_0.gguf (309855456 bytes, sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135)
+# artifact: $HOME/models/embeddinggemma-2-Q8_0.gguf (309855456 bytes, sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135)
 # produced by probes/thread_sweep.sh (one process per cell; /usr/bin/time -v wraps each cell; determinism table appended)
 === PASS 1 long ===
-SWEEP      profile=long tokens_target=7992 repeats=2 threads='2 4 8 16' prefix='none' dumps=/home/agent/tmp/thread-sweep-SjXU8P
+SWEEP      profile=long tokens_target=7992 repeats=2 threads='2 4 8 16' prefix='none' dumps=$TMPDIR/thread-sweep-SjXU8P
 CELLCPU    threads=2 wall_s=553.6 user_s=1101.4 sys_s=0.4 cpu_pct_whole_process=199%
 CELL_BEGIN threads=2 tokens_target=7992 profile=long rc=0
 CELL       threads_requested=2 readback_generation=2 readback_batch=2 available_parallelism=16 os_threads_after_load=2
@@ -46,13 +46,13 @@ PAIR       vec-4.f32 vs vec-16.f32: cosine=1.000000000000 max|d|=0.000000e+00 ->
 PAIR       vec-4.f32 vs vec-2.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
 PAIR       vec-4.f32 vs vec-4.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
 PAIR       vec-4.f32 vs vec-8.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
-DUMPS      dir=/home/agent/tmp/thread-sweep-SjXU8P (one raw little-endian float-32 row per worker count)
-/home/agent/tmp/thread-sweep-SjXU8P/vec-16.f32
-/home/agent/tmp/thread-sweep-SjXU8P/vec-2.f32
-/home/agent/tmp/thread-sweep-SjXU8P/vec-4.f32
-/home/agent/tmp/thread-sweep-SjXU8P/vec-8.f32
+DUMPS      dir=$TMPDIR/thread-sweep-SjXU8P (one raw little-endian float-32 row per worker count)
+$TMPDIR/thread-sweep-SjXU8P/vec-16.f32
+$TMPDIR/thread-sweep-SjXU8P/vec-2.f32
+$TMPDIR/thread-sweep-SjXU8P/vec-4.f32
+$TMPDIR/thread-sweep-SjXU8P/vec-8.f32
 === PASS 2 long ===
-SWEEP      profile=long tokens_target=7992 repeats=2 threads='2 4 8 16' prefix='none' dumps=/home/agent/tmp/thread-sweep-Y14WkO
+SWEEP      profile=long tokens_target=7992 repeats=2 threads='2 4 8 16' prefix='none' dumps=$TMPDIR/thread-sweep-Y14WkO
 CELLCPU    threads=2 wall_s=553.2 user_s=1100.6 sys_s=0.4 cpu_pct_whole_process=199%
 CELL_BEGIN threads=2 tokens_target=7992 profile=long rc=0
 CELL       threads_requested=2 readback_generation=2 readback_batch=2 available_parallelism=16 os_threads_after_load=2
@@ -95,9 +95,9 @@ PAIR       vec-4.f32 vs vec-16.f32: cosine=1.000000000000 max|d|=0.000000e+00 ->
 PAIR       vec-4.f32 vs vec-2.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
 PAIR       vec-4.f32 vs vec-4.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
 PAIR       vec-4.f32 vs vec-8.f32: cosine=1.000000000000 max|d|=0.000000e+00 -> bit-identical
-DUMPS      dir=/home/agent/tmp/thread-sweep-Y14WkO (one raw little-endian float-32 row per worker count)
-/home/agent/tmp/thread-sweep-Y14WkO/vec-16.f32
-/home/agent/tmp/thread-sweep-Y14WkO/vec-2.f32
-/home/agent/tmp/thread-sweep-Y14WkO/vec-4.f32
-/home/agent/tmp/thread-sweep-Y14WkO/vec-8.f32
+DUMPS      dir=$TMPDIR/thread-sweep-Y14WkO (one raw little-endian float-32 row per worker count)
+$TMPDIR/thread-sweep-Y14WkO/vec-16.f32
+$TMPDIR/thread-sweep-Y14WkO/vec-2.f32
+$TMPDIR/thread-sweep-Y14WkO/vec-4.f32
+$TMPDIR/thread-sweep-Y14WkO/vec-8.f32
 DONE

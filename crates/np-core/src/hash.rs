@@ -1,19 +1,19 @@
 //! Content hashing: sha256 as lowercase hex, over a byte slice or a file on disk.
 //!
-//! The digest is the identity every later task compares (spec §2: size and mtime only
+//! The digest is the identity every later step compares — size and mtime alone
 //! trigger the look, the hash decides what happened), so its spelling has to be stable —
 //! lowercase hex, 64 characters, no separators — and reading a file must not depend on how
 //! big that file happens to be.
 //!
-//! **[`Sha256Stream`] is the program's one SHA-256 definition** (`docs/design-m2-local-embeddings.md`
-//! §12 rule 9), and [`sha256_file`] / [`sha256_bytes`] are its two callers rather than two more
+//! **[`Sha256Stream`] is the program's one SHA-256 definition**, and [`sha256_file`] / [`sha256_bytes`]
+//! are its two callers rather than two more
 //! implementations. That ordering exists because a third caller is coming and it cannot be served by
 //! either helper: a fetcher hashes **while it counts bytes**, so the digest has to be fed piecewise,
 //! from whatever buffer the transfer happens to hand over, and neither `sha256_file` (which owns its
 //! read loop) nor `sha256_bytes` (which needs the whole artifact in memory — 310 MB of it) can take
 //! part in that. Exposing the stream is therefore the reason this module still has one digest path:
 //! a second home for `sha2` would be a second place where the hex spelling could drift, and install
-//! design §3 refuses exactly that dependency spread.
+//! this project refuses exactly that dependency spread.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -36,7 +36,7 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 pub struct Snapshot {
     /// The identity: OS bytes of the `/`-separated path. Both sides of every comparison key on this and
     /// on [`Snapshot::case_bytes`] — matching two snapshots by display `rel` is what merged `caf\xe9.md`
-    /// with `caf\xe8.md` before F13 §4.1.
+    /// with `caf\xe8.md` before paths were keyed by bytes.
     pub rel_bytes: Vec<u8>,
     /// [`crate::path_keys::case_fold`] of [`Snapshot::rel_bytes`]: the identity on a case-insensitive
     /// filesystem.
@@ -55,7 +55,7 @@ pub struct Snapshot {
     /// Modification time in whole seconds since the Unix epoch.
     pub mtime: i64,
     /// The OS's durable identity for this file: device and inode, widened to fixed width and encoded, on the
-    /// platforms that expose one (design-a4 §2).
+    /// platforms that expose one.
     ///
     /// **`None` means unknown, never "different".** It is what every non-Unix platform reports, what a row
     /// written before migration 6 carries until its path is next walked, and what a filesystem without the
@@ -87,10 +87,10 @@ impl Snapshot {
     }
 }
 
-/// One sha256, fed in pieces: the program's single SHA-256 definition (§12 rule 9).
+/// One sha256, fed in pieces: the program's single SHA-256 definition.
 ///
 /// It exists for the caller that cannot produce its input all at once — a fetch hashes each buffer as
-/// it arrives, because the byte count and the digest are read off the same pass (§12 rule 5). Both
+/// it arrives, because the byte count and the digest are read off the same pass. Both
 /// [`sha256_file`] and [`sha256_bytes`] are written on top of it so that "what a digest looks like"
 /// (lowercase hex, 64 characters, spelled by the module's private `hex`) is decided once: delegating costs them one
 /// extra `update` call and buys the guarantee that no later caller can spell the same bytes' digest
@@ -157,15 +157,15 @@ pub enum HashError {
 /// sha256 of a file's contents as lowercase hex.
 ///
 /// The file is opened through [`walk::to_open_path`], so a Windows path past `MAX_PATH`
-/// still opens instead of failing or being truncated (spec §11), and it is consumed in
+/// still opens instead of failing or being truncated, and it is consumed in
 /// fixed-size chunks rather than read whole.
 ///
 /// A failure is reported, never swallowed: an empty string here would be read downstream
 /// as a real digest, so callers that want to keep going must record the path as unreadable
 /// (an empty `Snapshot::hash`) instead of hashing on.
 ///
-/// The loop feeds [`Sha256Stream`]; it owns nothing about the digest itself. That is the shape §12
-/// rule 9 asks for — one definition, and this is one of its callers.
+/// The loop feeds [`Sha256Stream`]; it owns nothing about the digest itself. That is the shape
+/// one definition asks for, and this is one of its callers.
 pub fn sha256_file(p: &Path) -> Result<String, HashError> {
     let (hex, _size) = sha256_file_with_size(p)?;
     Ok(hex)
@@ -192,7 +192,7 @@ pub fn sha256_file_with_size(p: &Path) -> Result<(String, u64), HashError> {
 /// The same digest over anything readable, with the byte count that came out of the read loop.
 ///
 /// This is the loop [`sha256_file_with_size`] runs — that function is this one plus an open, so there is still exactly one
-/// place that decides where a file ends (§12 rule 9). It exists for the caller that must look at a file's first bytes and
+/// place that decides where a file ends. It exists for the caller that must look at a file's first bytes and
 /// digest **the same bytes**: `crate::media`'s format check reads a prefix to decide whether a `.png` really is a PNG, and
 /// re-opening for the digest would hash a second read of a file that may have changed in between — a row whose `size` and
 /// signature describe different moments. A caller chains what it peeked back on (`std::io::Read::chain`) and digests once.

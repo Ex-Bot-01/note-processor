@@ -56,7 +56,7 @@ Two serve methods, two commands, one document, feature-detectable off `initializ
  "provider": "local-model",
  "model": "embeddinggemma-2",
  "fetch": {"bytes_total": 309855456, "members": ["main"]},
- "persisted_to": "/home/agent/.config/note-processor/config.toml"}
+ "persisted_to": "$XDG_CONFIG_HOME/note-processor/config.toml"}
 ```
 
 `np embeddings enable embeddinggemma-2` prints the same document with `--json`, and `embeddings.disable` /

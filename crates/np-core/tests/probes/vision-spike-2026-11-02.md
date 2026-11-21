@@ -9,7 +9,7 @@ sequence at the bottom.
 
 | File | Bytes | sha256 |
 |---|---|---|
-| `/home/agent/models/embeddinggemma-2-Q8_0.gguf` | 309,855,456 | `2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135` |
+| `$HOME/models/embeddinggemma-2-Q8_0.gguf` | 309,855,456 | `2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135` |
 | `/dev/shm/mmproj-embeddinggemma-2-Q8_0.gguf` (fetched, tmpfs only) | 554,821,056 | `0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8` |
 
 Both match the pins in `crates/np-core/src/pins.rs`. The header reading from the design (§1.1) said
@@ -111,7 +111,7 @@ must pass items explicitly and check for at least one `image tokens` line.
 
 ```text
 --- probe inputs ---
-model                = /home/agent/models/embeddinggemma-2-Q8_0.gguf
+model                = $HOME/models/embeddinggemma-2-Q8_0.gguf
 mmproj               = /dev/shm/mmproj-embeddinggemma-2-Q8_0.gguf
 mtmd.min_image_tokens= -1
 mtmd.max_image_tokens= -1

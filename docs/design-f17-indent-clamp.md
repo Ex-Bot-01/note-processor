@@ -34,7 +34,7 @@ at load**, the way a `data_dir` that resolves to nothing is refused rather than 
 ## 3. Decision D2 — where the error type goes, without touching the mandated enum
 
 The plan fixes the error shape: `ConfigError { Io, Parse, MissingField(&'static str) }`
-(`docs/superpowers/plans/2026-10-23-note-processor-m1-core-catalog.md:88`). Options weighed:
+(`docs/archive/plans/2026-10-23-note-processor-m1-core-catalog.md:88`). Options weighed:
 
 - **New variant** `InvalidValue { .. }` — cleanest API, and rejected: it amends a mandated shape for a message. If the human
   wants it, it is one variant plus a plan edit, and nothing here would have to change but the constructor.

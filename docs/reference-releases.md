@@ -3,7 +3,7 @@
 Which assets exist, what is compiled into each one, and which claims about them have never been measured. Written because a downloaded binary
     cannot tell you its own build flags, and because "it is the same version" is not the same as "it can do the same things".
 
-> *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
+> *Moved out of `README.md` on 2026-11-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
 ### Pre-built binaries
 
@@ -21,7 +21,7 @@ is. Since `v0.4.0` `.github/workflows/release.yml` builds both shipped assets by
 one build definition and CI grades it. Before that the workflow carried its own `cargo build` over a Windows/Linux/macOS matrix while
 the published files came from those scripts, and the two disagreed about features: an asset CI produced could not embed although the
 page said it could (**F40**). Hosted runners are also metered, so when an account is out of included minutes no release can be built
-there at all (`docs/ops-actions-minutes.md`); a locally packaged release carries **the one platform the packager was standing on**,
+there at all (`docs/developing.md`); a locally packaged release carries **the one platform the packager was standing on**,
 and its notes say so. Source builds need no CI and no minutes:
 
 ```sh

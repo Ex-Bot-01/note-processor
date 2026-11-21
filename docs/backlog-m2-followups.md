@@ -28,7 +28,7 @@ one stale registry row rather than a lost note, and the human accepted option A 
 and closed below. Audited the same day: **F30 closed** — both halves of the storage measurement are in (`docs/measurement-f30-vector-surface.md`) and the human ruled
 to **keep 768**, with the numbers that decided it written into the card; **F31 stays open and blocked**, needing about twenty labelled queries from a real vault or a
 recorded decline, and it is also what keeps F30's ranking question unanswerable. Still open: **F18** (needs real Windows hardware), **F21** and **F28** (both
-implemented; their closure paragraphs wait on a graded tree — see `docs/ops-actions-minutes.md` for what CI grades now and how to buy a full grade for one SHA).
+implemented; their closure paragraphs wait on a graded tree — see `docs/developing.md` for what CI grades now and how to buy a full grade for one SHA).
 
 
 These are not new features. They are the items the Milestone 1 reviews judged *correct enough to ship* but
@@ -266,8 +266,8 @@ What these numbers can and cannot carry:
   is cheaper to build once now than to retrofit after clustering stores derived data too.
 
 **Closed on 2026-11-06 by audit — `parse_version` exists, is compared at scan start, and forces exactly one rewrite.** The constant is
-`crates/np-core/src/parse.rs:42`, the `meta` key `scan.rs:75`, the comparison `parse_version()` / `refresh_needed()` at `scan.rs:2016` /
-`:2026`, and the write at `scan.rs:565`; migrations stayed schema-only, and a refresh is not a modification — the report stays
+`crates/np-core/src/parse.rs`, the `meta` key `PARSE_VERSION_KEY` (`crates/np-core/src/scan/state.rs`), the comparison in `parse_version()` /
+`refresh_needed()` (same file), and the write in `scan_inner` (`crates/np-core/src/scan.rs`); migrations stayed schema-only, and a refresh is not a modification — the report stays
 `(added, modified, moved, removed) == (0, 0, 0, 0)` in every case below. Each “Done when” clause is a test that ran green in this audit's scan
 suite: `a_stale_parse_version_reparses_every_unchanged_note` (`tests/scan.rs:1691`: hand-built lagging database, derived rows equal to a
 reference workspace, catalog equal, and `[[Real Heading]](thematic-break.md)` present in `INDEX.md`),
@@ -477,10 +477,11 @@ and the rename experiments (Stage 7).
   future migration admits keyless note rows.** What is pinned instead is the reachable half of the same shape: a
   merged survivor with no `rel` at all (`a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key`).
 
-**Closed on 2026-11-06 by audit — the entry said “the entry is closed”; now it carries the evidence.** Migration 5 is registered at
-`crates/np-core/src/db.rs:161` (`Migration::Code(merge_duplicate_notes)`) and defined at `:1350`; the receipt lands in `meta` under
-`note_merges` (`:1305`) and reaches a person through `Db::merged_notes` (`:580`) → `ScanReport::merged_notes`; `PRAGMA foreign_key_check`
-runs inside that same transaction (`:781`, `:1020`). Both “Met by” tests passed in this audit's runs:
+**Closed on 2026-11-06 by audit — the entry said “the entry is closed”; now it carries the evidence.** Migration 5 is registered in
+`MIGRATIONS` (`crates/np-core/src/db/migrations.rs`) (`Migration::Code(merge_duplicate_notes)`) and the function itself is defined in
+`db/upgrades.rs`; the receipt lands in `meta` under `note_merges` (`NOTE_MERGE_KEY` in `db/meta.rs`) and reaches a person through
+`Db::merged_notes` → `ScanReport::merged_notes`; `PRAGMA foreign_key_check`
+runs inside that same transaction (`db/migrations.rs`, `db/upgrades.rs`). Both “Met by” tests passed in this audit's runs:
 `a_merged_duplicate_pair_clears_the_charge_and_records_the_parse_version` (`tests/scan.rs:4975`) and
 `the_scan_that_merges_reports_the_string_it_stored` (`tests/db.rs:3997`). The card's note about the unfixtureable `WHERE rel_bytes IS NOT NULL`
 arm is still true: `notes.rel_bytes` carries `CHECK (typeof(rel_bytes) = 'blob')` at `db.rs:348`, and `typeof(NULL)` is `'null'`.
@@ -572,7 +573,7 @@ floor on one `skipped` line.
 **Audited 2026-11-06 — the panic is gone and verified; the card's own Do-when is not met, so it stays open.** In the tree and under test: the
 receipt is written before anything deletes, pinned by `a_receipt_that_cannot_be_written_rolls_the_cleanup_back` (`tests/db.rs:1911`, passed);
 the echo dropped its `.expect` and moved after the commit (`src/db.rs:676` → `:688`); the stored string reaches
-`ScanReport::upgrade_orphans` (`scan.rs:209`). Two CLI cases ran green here: `an_error_is_reported_rather_than_panicked_when_stderr_refuses_it`
+`ScanReport::upgrade_orphans` (`crates/np-core/src/scan.rs`). Two CLI cases ran green here: `an_error_is_reported_rather_than_panicked_when_stderr_refuses_it`
 (`crates/np-cli/tests/cli.rs:701`) and `a_scan_upgrades_when_stderr_refuses_writes`. The remaining ask is unmet as written:
 `upgrade_orphans` is `Some` only on the open that ran the cleanup (`scan.rs:189-193`), so somebody asking today what an upgrade deleted last
 month still needs `sqlite3`. F22's shape — a bounded `meta` record whose one string is printed on stdout and in `--json` — now exists for
@@ -593,7 +594,7 @@ instead of `meta` fails the CLI case immediately and, once the np-core case gain
 because that assertion was missing at first, and a durability test that only checks the field this open also wrote proves nothing.
 
 **Still not closed, on the same ground as F28: CI cannot grade it.** Actions has been out of included minutes since `2026-11-07T01:57Z`
-(`docs/ops-actions-minutes.md`). What is graded locally: 17 gate rows exit 0, workspace tests green, `GOLDEN CHECK: pass`, plus the CLI case through argv.
+(`docs/developing.md`). What is graded locally: 17 gate rows exit 0, workspace tests green, `GOLDEN CHECK: pass`, plus the CLI case through argv.
 The closure paragraph goes in when a run that has steps grades `main`. **No new exit code and no second echo**, as this card's own "Do when" required.
 
 ## F22 — a refusal exists only as one report line, with no reason attached
@@ -745,7 +746,7 @@ which is why nothing here waits on a capability.
 **How this was verified, and why that is not a CI claim.** `cargo test -p np-core --test scan` → **78 passed / 0 failed**, with **zero `NOT COVERAGE` lines**, on host
 `pi`, euid 1000 — the runner condition this card's own caveat demands be named, because these fixtures build their obstruction with `chmod 000` and latin-1 directory
 names and print `NOT COVERAGE` instead of passing quietly where the filesystem or a privileged account declines. Full local gates: 17 rows exit 0, workspace **693
-passed / 0 failed**, `GOLDEN CHECK: pass`. Actions minutes are exhausted (`docs/ops-actions-minutes.md`), so no run graded this tree and the last CI-graded tree stays
+passed / 0 failed**, `GOLDEN CHECK: pass`. Actions minutes are exhausted (`docs/developing.md`), so no run graded this tree and the last CI-graded tree stays
 `5e368ac`. That is disclosed rather than papered over, and it is also the weaker argument here than it usually is: by this card's own caveat a green CI run is *not*
 proof these cases executed, so naming the host and the euid carries more than a job that might have skipped them. The closure rests on measurement plus text, as F29's
 did, and says so in the same breath.
@@ -916,6 +917,27 @@ be mistaken for them, and no table or module in this file pre-implements them.
 Found across the seams between rounds, where per-round review structurally cannot look. D2 and D5 are **decisions to
 make before round 4b embeds anything** — after that they cost vectors, not just rows.
 
+### Triage of D1–D10, 2026-11-20 — re-read from the tree, not from this page
+
+Each row below was checked against the code at integration `a64d33d`, and the file:line is where the claim lives now. Two of
+the ten turned out to say something other than what they said when filed; both are corrected here rather than in a comment.
+
+| Item | What the tree actually shows today | Decision | Next action, and who owes it |
+| --- | --- | --- | --- |
+| **D1** decode is unversioned | `CHUNKER_VERSION` (`chunk.rs:64`) is the only number inside a chunk's currency; `PARSE_VERSION` (`parse.rs:42`) stamps parsing, not decoding; nothing stamps the decoder | **open — accepted, with the trigger named** | whoever changes decoding bumps `CHUNKER_VERSION` in the same commit. Deciding it structurally means defining a decode component of chunk currency, which re-cuts every row — that is a release decision, not a cleanup |
+| **D2** frontmatter inside the embed domain | fixture `frontmatter_is_part_of_the_text_being_cut` still asserts the current shape (`chunk.rs`) | **open — product decision, not code** | ruling needed: strip metadata from the embed domain (costs a chunker bump = full re-cut) or define citations against file offsets and say so in M2b |
+| **D3** a stale note reads as current | `chunk_digest` is `SELECT ordinal, chunker, source_hash FROM chunks WHERE note_id = ?1` (`db.rs:2343`) — no join to `files`, so no liveness predicate; the catalog has exactly that fence and these readers do not | **open — a bug, not a preference** | one join, one predicate, one stale-note fixture. It changes what "current" answers for every caller, so it belongs in its own reviewed branch, not in a triage commit |
+| **D4** `source_hash`'s level unenforced | the pinning test is still there (`db.rs`); both levels remain plain `String` | **open — deliberately waiting for 4b** | introduce the newtype *with* the code that writes real vectors: a type no production path constructs enforces nothing, and pretending otherwise buys a false green |
+| **D5** delete or compare stale vectors | `delete_vectors_for_chunk` (`crates/np-core/src/db/embeddings.rs`) has exactly one caller, its own test (`tests/db.rs:1594`) | **open — 4b's brief owes the rule** | today's behaviour ("the old vector survives with its old stamp") is what falls out of nobody having chosen. The brief must name delete-vs-compare before it embeds anything |
+| **D6** no chunk-write numbers | `tests/perf.rs` prints ms, added/modified/unchanged, notes, unresolved links (`perf.rs:85-93`) — **no chunk rows, no database bytes** | **open — measurement not taken** | the two counters belong in that same print. It is also half of task 13's "chunks owed but unembedded" ask, and `ScanReport` has no chunk counters at all today (`scan.rs:162-193`), so that field needs its own short design before code |
+| **D7** `install` copies before discovering a busy database | the message is still `model database: {0}` (`models.rs:1051`); the ~540 MB comment stands at `models.rs:1089` and `:1119` | **open — small and user-visible** | an error variant that names the workspace path and says re-run. No change to the copy itself, so no new risk |
+| **D8** `access()` long-path case | `access` at `models.rs:1648`; `cfg(windows)` tests exist (`tests/config.rs`, `tests/walk.rs`) but none drives a long path through `access` | **open — needs Windows hardware** | belongs with the hardware-bound half of task 13. A Linux stand-in would prove nothing about the UNC prefix and would read as coverage |
+| **D9** chunk-gap stderr line | asserted: `an_incomplete_chunk_pass_reports_its_own_gap_on_stderr` (`crates/np-cli/tests/cli.rs`) | **closed — already done** | nothing owed. The entry stays because the reason originally given for not writing it ("no capture seam") was false, and that is the part worth remembering |
+| **D10** migration 5's child-row list | **the filed reason is wrong.** `chunks` and `embeddings` are created by **migration 4** (`crates/np-core/src/db/migrations.rs`, in `MIGRATIONS`), not after the heal; `merge_duplicate_notes` is version 5 (`crates/np-core/src/db/upgrades.rs`, `NOTE_MERGE_VERSION` in `db/migrations.rs`) and deletes headings, tags, items, links and notes — not chunks or embeddings (same file). The schema's real protection is `ON DELETE CASCADE`, but `migrate` runs with foreign-key enforcement switched **off** — the `PRAGMA foreign_keys = OFF` that wraps its `apply_migrations` call, in `crates/np-core/src/db/migrations.rs` — and restores it after, so a cascade does not fire inside a migration | **open — restated as a possible orphan-write, and untested** | no test names duplicate-healing together with chunks or embeddings. Before anything is "fixed": a migration test that seeds a duplicate note pair each holding chunk and vector rows, heals, and asserts nothing survives the loser. If it passes, D10 closes with the cascade as the reason and this row says so; if it fails, the fix is two more tables in the heal list — which is what the original entry guessed at, for the wrong reason |
+
+D11 (deferred with its reason), D12 (closed 2026-10-31) and D13 (needs a thread-count measurement) were re-read and still say
+what they said.
+
 - **D1 — no version stamp covers `decode`, yet decode output is the chunker's domain.** Bumping `PARSE_VERSION` does
   *not* re-cut chunks: `EMBED_VERSION` counts chunker coverage only. Either fold decode into that key's stated scope or
   add a decode component to chunk currency. Until then a decoder change silently leaves every chunk describing bytes no
@@ -1055,7 +1077,7 @@ Measured against `main` = `64a6b73`, the ruling's first half is already shipped 
 this card is asking for:
 
 - **"its own separate vector" — exists.** `media_embeddings` keys a vector by `(media_id, model)` with `dim > 0` and
-  `length(vector) = 4 * dim` (`crates/np-core/src/db.rs:362-375`), one row per figure per model. Image vectors are not folded into
+  `length(vector) = 4 * dim` (`crates/np-core/src/db/migrations.rs`), one row per figure per model. Image vectors are not folded into
   text chunks, and nothing about the ruling asks them to be.
 - **"linked to the place where an image is mentioned or placed" — only partly exists, at the wrong grain.** What links a figure to
   somewhere is `media_path`: every workspace *path* whose bytes hash to that figure (`db.rs:347-359`). It answers "which files hold
@@ -1185,10 +1207,10 @@ the link is recorded in `links` like any other attachment — which is the card'
 `links.kind = 'attachment'`") turned into something a reader can rely on rather than a surprise count.
 
 **Closed without CI grading, deliberately, and that choice is stated rather than skipped past.** CI has been out of included minutes since
-`2026-11-07T01:57Z` (`docs/ops-actions-minutes.md`), and this card's "done when" is satisfied by text a reader can open — no code path changed, so there is
+`2026-11-07T01:57Z` (`docs/developing.md`), and this card's "done when" is satisfied by text a reader can open — no code path changed, so there is
 no behaviour for a runner to grade. What was run on the tree: 17 local gate rows exit 0 and `GOLDEN CHECK: pass`. The one *factual* claim added here that a
 test could hold — that an unsupported attachment link still lands in `links` as an `attachment` row — is already pinned elsewhere (F26's content gate cases
-in `crates/np-core/tests/embed_media.rs`, and the resolver cases in `tests/media.rs`), so no new assertion was invented to make a docs commit look like work.
+in `crates/np-core/tests/embed_media.rs`, and the resolver cases in `tests/media_resolve.rs`), so no new assertion was invented to make a docs commit look like work.
 
 **A stale sentence this closure retired on the way.** README's "Does not" row still claimed "no image encoding in a shipped binary yet (F28)" — untrue since
 step ② merged at `736a66d`. It now says image encoding needs a `--features local-model,vision` build plus an installed projector, that release binaries are
@@ -1271,7 +1293,7 @@ one thing still untested: that slack stays put when the payload shrinks — noth
 
 Verified as measurement, not as CI grading: 17 local gate rows exit 0, workspace **693 passed / 0 failed**, `GOLDEN CHECK: pass`, and the figure half was produced by
 the real release+`vision` binary against both artifacts installed through `np models install [--member mmproj]`. Actions minutes are exhausted
-(`docs/ops-actions-minutes.md`), so nothing about this tree was graded remotely; the last CI-graded tree remains `5e368ac`. No code changed — this card's remaining
+(`docs/developing.md`), so nothing about this tree was graded remotely; the last CI-graded tree remains `5e368ac`. No code changed — this card's remaining
 deliverable was a decision, and the card says so rather than inventing work.
 
 ## F31 — nothing can be said about whether search finds the right diagram, because there is no labelled set
@@ -1407,7 +1429,7 @@ production arm, the climb out of an absent directory, and the NUL refusal. macOS
 API: this private repository spent **2,028 billed minutes in October** (stopping at the moment CI went zero-step) and **2,137 in the first 6.4 days of
 November**, crossing the allowance at `2026-11-07T01:57:05Z` — seven seconds before the first zero-step failure. The account ran out of included minutes;
 nothing about the tree was involved, and a zero-step job spends nothing. Numbers, method and the options for spending less are in
-`docs/ops-actions-minutes.md`. **This does not reopen F34**, which was closed on its own evidence (the Windows preflight answering through
+`docs/developing.md`. **This does not reopen F34**, which was closed on its own evidence (the Windows preflight answering through
 `GetDiskFreeSpaceExW`, green on the runner at `b2840f9`). What it changes is what "CI is red" means operationally: the first question is whether the jobs
 have steps, and this card exists because four days of *executed-but-red* Windows runs were read as absent — a mistake in the opposite direction from
 treating an unprovisioned runner as a defect.
@@ -1495,7 +1517,7 @@ three rows fail for a reason that reads like a code defect.
 **Implemented on 2026-11-08; closure withheld.** Merged into `main` at `0fa2f0b` (branch `f36/hybrid-search`: `e872c66` the change,
 `7ce7335` the rulings and measurements). CI still cannot grade anything: run `42394486534` on the merged tree completed as a failure with
 **zero steps on every job** — `Decide the matrix` failed before step one and the other three reported `skipped`, which is the account-out-of-
-included-minutes signature recorded in `docs/ops-actions-minutes.md`, not a code defect (count `[.steps[]?] | length` before believing red).
+included-minutes signature recorded in `docs/developing.md`, not a code defect (count `[.steps[]?] | length` before believing red).
 So this card carries local gate evidence and no graded run, and says so. Design and rulings: `docs/design-m3-hybrid-search.md`.
 
 ### What was asked, by whom
@@ -1755,7 +1777,7 @@ nested-first without anyone hand-writing it — and Stage 9b's refusal to move l
 **Opened 2026-11-07 as a question, ruled 2026-11-08 by the human partner: default ON.** The reason is in the ruling's own words — the
 consumer of this program is increasingly another program, and what it wants is *for vectors to simply exist*, not a sequence of three
 commands whose exit codes it has to interpret. Design `docs/design-f38-auto-fetch.md`, plan
-`docs/superpowers/plans/2026-11-08-auto-fetch-and-setup.md`; this card is the record of what shipped and what it still owes.
+`docs/archive/plans/2026-11-08-auto-fetch-and-setup.md`; this card is the record of what shipped and what it still owes.
 
 **Default-on is defensible only because of what can be fetched, not because of who asked.** One id (`embeddinggemma-2`), from one
 origin that is compiled in unless `[models] base_url` replaces it, verified against the pinned digest before a single byte is put in
@@ -1778,7 +1800,7 @@ silenced without editing anything), and every transfer announces id, members, by
 
 ### Evidence
 
-+ **Gates: 19 rows, all exit 0, `NOT COVERAGE` 0**, with both real artifacts exported — `/home/agent/tmp/gates-f38t6b`, tree
++ **Gates: 19 rows, all exit 0, `NOT COVERAGE` 0**, with both real artifacts exported — `$TMPDIR/gates-f38t6b`, tree
   `2c56b9a` whose only difference from the committed tree here is documentation and CI environment. No row was skipped.
 + Tests that carry the claims: `embed_fetches_a_missing_pinned_model_and_refuses_honestly_when_there_is_no_connection`,
   `the_kill_switch_leaves_the_old_refusal_word_for_word`, `an_unpinned_id_is_refused_before_any_transport_is_chosen`,
@@ -1816,7 +1838,7 @@ silenced without editing anything), and every transfer announces id, members, by
   not exist. The Windows script's Stage 8 was rewritten against this table the same day.
 
 + **CI grading.** No workflow run has had steps since the included minutes ran out at `2026-11-07T01:57:05Z`; the last CI-graded tree is
-  still `5e368ac`. Local gates are not closure (`docs/ops-actions-minutes.md`), so **this card stays open** and F36/F40's closures stay
+  still `5e368ac`. Local gates are not closure (`docs/developing.md`), so **this card stays open** and F36/F40's closures stay
   withheld for the same reason.
 + **Windows, in the field.** Stage 8 of the operator script (sha256 `feadc2c7…508a7c`, uploaded on v0.2.1) asks the four questions this
   card can only ask on Linux — including that a release asset must *not* speak of fetching at all. Written here, never executed by
@@ -1967,7 +1989,7 @@ its assertion with `cfg!`.
 Evidence, all re-run rather than inherited: np-core `--test embed_run` **26 / 0**; np-cli default **37 / 0** including the new
 `embed_without_a_runtime_refuses_before_reading_a_note`; np-cli with `local-model` **42 / 0**; and with the real 310 MB artifact exported,
 the same suite **42 / 0** plus **39 / 0** in `models_cli`, no `NOT COVERAGE` line anywhere. Full local gate list at `e361e03`, `dirty=0`:
-**17 rows exit 0**, two artifact rows SKIPPED by unset env, `NOT COVERAGE` count **0** (`/home/agent/tmp/gates-f40`). Mutation — mapping
+**17 rows exit 0**, two artifact rows SKIPPED by unset env, `NOT COVERAGE` count **0** (`$TMPDIR/gates-f40`). Mutation — mapping
 `ProviderState::Ready` back to `Resolution::Provider` in a default build — FAILS the new test and passes again after revert; the core arm (v)
 test asserts the label *before* the counts, because deleting the early return leaves every count at zero and would otherwise pass on numbers.
 
@@ -2016,10 +2038,10 @@ sentence §12 leans on when arguing that a default-on fetch is safe.
 **Done when:** a ruling is recorded and either the warning, the command, or the documentation carries a dated test; and `models list`'s empty
 prefixes under a pinned id are no longer a state a careful user can enter without a word of warning.
 
-**Ruled 2026-12-08: option A**, on the implementer's recommendation, and implemented in the same change. **A correction first, because this
+**Ruled 2026-11-08: option A**, on the implementer's recommendation, and implemented in the same change. **A correction first, because this
 card's premise was wrong.** It says the drift is "empty prefixes … where the pin declares `represent this sentence for retrieval:` /
 `query for note search:`". `pins::PINNED_IDENTITIES` has declared **empty** prefixes since it was introduced (`864ef95`, and at `v0.2.3` —
-checked with `git show v0.2.3:crates/np-core/src/pins.rs` on 2026-12-08), deliberately: no instruction convention has been measured in this
+checked with `git show v0.2.3:crates/np-core/src/pins.rs` on 2026-11-08), deliberately: no instruction convention has been measured in this
 repository, and prefixes are part of an id's identity, so a measured convention must arrive as a new `@n` id rather than an edit. So the
 round-four row (`prefix_doc "" prefix_query ""`) **agreed** with the pin, and the two cosines on this card compared a pin-conformant install
 against one carrying prefixes the pin does *not* declare. Different vector bytes, yes — which was the point — but the card described the
@@ -2042,7 +2064,7 @@ different from a fetched model's, and no command rewrites them (`np models list`
 nothing at all.
 
 Tests: `installing_a_pinned_model_with_an_undeclared_prefix_says_so`, `installing_a_pinned_model_without_prefixes_stays_silent`, and
-`an_unpinned_id_is_never_told_it_disagrees_with_a_pin` (np-cli `models_cli`, 2026-12-08) plus
+`an_unpinned_id_is_never_told_it_disagrees_with_a_pin` (np-cli `models_cli`, 2026-11-08) plus
 `embedding_a_pinned_model_with_undeclared_prefixes_notes_the_drift_and_still_reports_its_own_outcome` (np-cli `cli`). Two mutants, one per
 failure mode a warning can have: making `prefix_drift` always return `None` kills the install and embed cases; making it always claim a
 document drift kills the silent case. Neither mutant survives, which is the whole reason the silent case has its own test — a warning that
@@ -2211,7 +2233,7 @@ Three things worth naming before anyone fixes it:
 release binary has no runtime, so `embed` refuses before touching the database. Reproduce with: two concurrent `np scan <vault>` in a loop,
 capturing exit codes and stdout byte counts separately.
 
-**Ruled 2026-12-08: the coarse advisory lock, default on, no flag** (the implementer's recommendation, adopted). Implemented the same day.
+**Ruled 2026-11-08: the coarse advisory lock, default on, no flag** (the implementer's recommendation, adopted). Implemented the same day.
 
 **What shipped.** `np_core::lock::WorkspaceLock` ([`crates/np-core/src/lock.rs`](../crates/np-core/src/lock.rs)) is a `BEGIN IMMEDIATE`
 transaction on `<data-dir>/<workspace-key>.lock.db`, opened and left uncommitted for the life of the command, released by `Drop`. Five commands
@@ -2251,7 +2273,7 @@ would not contend and a test written that way would pass whether or not exclusio
 2 000-note vault for the same reason and prints an un-contended scan's duration beside the counts, because "nobody was refused" means something
 different on a box where a scan takes 200 ms than on one where it takes 2 s.
 
-**Tests** (`crates/np-cli/tests/cli.rs`, 2026-12-08): `a_second_writer_refuses_as_a_state_and_still_prints_one_document` (all five mutating
+**Tests** (`crates/np-cli/tests/cli.rs`, 2026-11-08): `a_second_writer_refuses_as_a_state_and_still_prints_one_document` (all five mutating
 commands, plus text mode printing nothing on stdout), `readers_answer_while_a_writer_holds_the_workspace`,
 `one_workspace_being_written_does_not_stop_another_being_written` (second vault *inside the same data directory*, so it proves scoping rather than
 unrelated paths), `concurrent_writers_never_emit_the_raw_sqlite_error`; and in np-core, `acquiring_and_dropping_leaves_the_workspace_lockable_again`
@@ -2305,7 +2327,7 @@ the machine-readable channel carries no explanation either (same failure shape a
 
 ## F47 — a runtime-bearing release ships MIT code and the project has no license of its own
 
-Filed 2026-12-08 while writing `THIRD_PARTY_NOTICES.md`, prompted by §14's decision to own the llama.cpp build. Two separate obligations, one
+Filed 2026-11-08 while writing `THIRD_PARTY_NOTICES.md`, prompted by §14's decision to own the llama.cpp build. Two separate obligations, one
 card because they land in the same change:
 
 **The third-party half is done.** Since `v0.3.0` every published asset statically links `libllama.a`, `libggml.a`, `libggml-cpu.a` and
@@ -2334,7 +2356,7 @@ card is the reason printed in the release notes rather than a footnote here.
 be a list that is wrong more often than right, so the item is tooling — and the reason it is written down rather than dropped is that a copyleft
 crate in the tree would need stronger treatment than disclosure, which is exactly what a generated report catches and prose does not.
 
-**Closed 2026-12-08: the operator chose MIT**, on the question of what to put in the copyright line giving no name, I wrote
+**Closed 2026-11-08: the operator chose MIT**, on the question of what to put in the copyright line giving no name, I wrote
 `Copyright (c) 2026 The note-processor authors` and said so out loud rather than inventing a person — it is theirs to replace, and README's
 licensing section says exactly that, so nobody has to guess whether the grant is provisional. It is not.
 
@@ -2365,7 +2387,7 @@ distinguish real installs from stubs by looking inside — which is exactly the 
 says. B: keep creating it and document that emptiness is normal, then fix consumers (my script now counts `.models` directories *containing
 files* and prints both numbers). A is the smaller lie; B is the smaller change. **Owed:** ruling plus, either way, a test that `scan` on a fresh workspace never makes one.
 
-**Ruled 2026-12-08: option A**, on the implementer's recommendation ("directory existence should mean a model is there"), and implemented the same
+**Ruled 2026-11-08: option A**, on the implementer's recommendation ("directory existence should mean a model is there"), and implemented the same
 day. One correction to the premise first, because it changed where the fix went.
 
 **What actually reproduces, and what does not.** The card says the stub appeared "during a plain `np scan`", attributed to
@@ -2384,7 +2406,7 @@ fails on a non-empty path: a fetch interrupted mid-transfer leaves its `.fetchin
 removed, and §12 rule 4's marker survives untouched. Cleanup errors are dropped deliberately — a stub we could not delete is untidiness next to
 the refusal the caller is about to print.
 
-**Tests** (`crates/np-core/tests/fetch.rs`, 2026-12-08): `a_transport_that_never_opens_leaves_no_directory_at_all`,
+**Tests** (`crates/np-core/tests/fetch.rs`, 2026-11-08): `a_transport_that_never_opens_leaves_no_directory_at_all`,
 `a_truncated_transfer_also_leaves_no_directory_behind`, `a_directory_this_call_did_not_create_is_never_removed`, and
 `an_empty_directory_this_call_did_not_create_survives_a_failed_fetch`. All four were written red first — the two "leaves no directory" cases failed
 against the old code, which is the point of filing the card.
@@ -2453,7 +2475,7 @@ its line changes to the degraded wording on the next Windows run, which is the d
 
 **Still owed:** CI grading (local rows: default 42 np-cli cases, `local-model,fetch` 56 with real artifacts), and the operator's Windows run to
 confirm the first-install fetch behaves the same on a machine whose network stack they actually have.
-## F18 — round four (2026-12-08): Windows identity now has exact bytes, and the refusal stays for a different reason
+## F18 — round four (2026-11-08): Windows identity now has exact bytes, and the refusal stays for a different reason
 
 Prompted by the operator's instruction to finish what of this card is reachable from Linux. Two things changed; one thing did not, and the reason it
 did not is the useful part.

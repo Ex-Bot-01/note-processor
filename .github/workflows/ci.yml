@@ -1,22 +1,10 @@
 name: CI
 
-# **Reshaped 2026-11-07 for the account's Actions allowance** — measured arithmetic in
-# `docs/ops-actions-minutes.md`, including why the earlier "option E" recommendation was wrong. The shape now is:
-#
-# * **a push to `main`** → `Test (ubuntu-latest)` and nothing else (~4.6 billed minutes). This is the row a closure
-#   paragraph has always been able to cite for fmt/clippy/rustdoc/tests, and it lands within minutes of the merge.
-# * **nightly schedule, a manual dispatch, or any pull request** → the full matrix: Windows plus both C++ feature rows
-#   (~25.4 billed minutes). This is where platform and feature-gated evidence comes from now; `gh workflow run ci.yml
-#   --ref <sha>` buys it for one specific tree before a card closes on it.
-# * **a push to any other branch** → nothing. Branch pushes were never the graded artifact here: local gates (17 rows,
-#   including the `local-model` and `vision` clippy/test rows) are the branch evidence, and they already ran before every
-#   merge this week.
-#
-# What that trades, said plainly: between a merge and the next nightly, `main` is graded on Linux only. A Windows-only
-# lint or platform answer, or a feature-gated compile break, can therefore sit on `main` for up to a day — which is what
-# the local gate rows are for in the meantime, and what a manual dispatch before a closure paragraph is for. The
-# allowance (inferred at ~2,000 billed minutes/month from two months stopping just past it) does not support anything
-# richer at this repository's November cadence: 91 runs in 6.4 days, 38 of them on `main`.
+# The matrix policy, in one sentence: a push to `main` grades Linux; Windows and both C++ feature rows run on the
+# nightly schedule, on any pull request, and on `workflow_dispatch`, where `gh workflow run ci.yml --ref <sha>` buys the
+# full matrix for one tree. Why it is cut there, and what stands in between a merge and the next nightly, is in
+# `docs/developing.md`.
+
 on:
   push:
     branches: [main]
@@ -32,7 +20,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # **The hermeticity lock (F38).** Since F38 a missing model artifact makes `np embed` dial out by default — which is what
+  # **The hermeticity lock.** A missing model artifact makes `np embed` dial out by default — which is what
   # the product needs and what a test run must never do. Every test harness already strips this variable so its own cases
   # decide, and this is the lock for everything else that runs a binary here (smoke checks, packaging, a future step nobody
   # has written yet). It costs nothing and it means "the CI runner phoned home" cannot be discovered in a bill.
@@ -41,7 +29,7 @@ env:
 jobs:
   # Which OS rows this event pays for. A job-level `if` cannot see `matrix`, so the choice is made once here and the
   # test job matrices over it — one set of steps for both platforms rather than two near-identical jobs that drift
-  # apart (the F24 complaint, applied to YAML). Windows is dropped only for `push`; schedule, dispatch and pull
+  # apart (the same complaint, applied to YAML). Windows is dropped only for `push`; schedule, dispatch and pull
   # requests all pay for it.
   prepare:
     name: Decide the matrix
@@ -73,8 +61,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # A `run:` block with its quotes nested wrong is not a YAML error (the file loads) and not a Rust error (no gate sees it),
-      # and Actions does not parse a step's script until that step starts — which is how one character cost a full Windows
-      # llama.cpp cross-build on `43496323581`. Parsing every block costs milliseconds, so it runs first, before any compile.
       - name: Workflow shell steps parse
         if: runner.os == 'Linux'
         run: .github/scripts/check-workflow-shells.sh
@@ -94,7 +80,7 @@ jobs:
       # `CMAKE` points at nothing on purpose. Both runners have cmake preinstalled, so "the default build never
       # touches the C++" would otherwise be unprovable here: a regression that probed cmake with the feature off
       # would stay green and just get slower. With this set, build.rs meeting cmake at all is impossible - it
-      # returns before reading the variable (R6b0 review P2-10), and if that ever stops being true this row fails.
+      # returns before reading the variable, and if that ever stops being true this row fails.
       - name: Test
         env:
           CMAKE: /nonexistent
@@ -104,26 +90,25 @@ jobs:
       - name: Release tests
         run: cargo test --locked --release -- --ignored
 
-  # The `local-model` row that design-m2-local-embeddings.md §2 promised, now that there is something
+  # The `local-model` row that `docs/design-m2-local-embeddings.md` promised, now that there is something
   # behind the feature to rot. A feature nothing compiles is invisible in exactly three ways - clippy
   # lints inside `cfg(feature)`, rustdoc warnings in gated docs, and tests whose early return looks like
   # a pass - and this job is what makes each of those fail loudly instead.
   #
-  # Linux only, on purpose. §14 measured the C++ build here (23 s for target `llama`) and has seen
+  # Linux only, on purpose. The C++ build was measured here (23 s for target `llama`) and has seen
   # nothing on Windows or macOS, so adding those rows would put a claim in YAML that nobody has watched
-  # happen - F18's mistake with a different noun. The Windows feature row lands when someone has seen it
-  # green, and §2 keeps release binaries on the feature off until then.
+  # happen - the same mistake, made with a different noun. The Windows feature row lands when someone has seen it
+  # green, and release policy keeps binaries on the feature off until then.
   #
-  # Honest caveat, corrected 2026-11-05 from the Actions API (and note it describes the shape *before* the 2026-11-07
-  # reshaping above — since then this row runs only on schedule, dispatch and pull requests): hosted jobs ran until 2026-10-29T13:11 UTC,
-  # created zero steps from 2026-10-29T14:39 through 2026-10-31T20:23, and have run on every push since
-  # 2026-11-01T20:08. So this HAS run in CI — and the next 43 runs failed `Test (windows-latest)` until F34
-  # landed at b2840f9, which is what reading the runs beats assuming the silence. Local gates remain the
-  # primary evidence; a Windows-only lint or platform answer is visible only here.
-  # Gated to schedule / dispatch / pull_request since 2026-11-07: at November's cadence this row costs ~6.0 billed
-  # minutes per run and there were 5.9 `main` pushes a day, which is the whole monthly allowance on its own. Its checks
-  # still run locally before every merge (the `clippy-localmodel`, `rustdoc-deny-localmodel` and feature-test rows of the
-  # 17-row gate list), so what CI now adds is an independent machine rather than the first sighting.
+  # Honest about what this row proves. It *has* run on hosted runners — which is worth writing down because the opposite was
+  # believed here for days, and reading the runs beat assuming the silence — and a Windows-only lint or a platform-specific
+  # answer is visible only here. Local gates stay the primary evidence, not the only evidence.
+  #
+  # Gated to schedule, dispatch and pull requests because it rebuilds the vendored C++ on every run. What that costs, and how
+  # the matrix is cut against a finite hosted-minute budget, is `docs/developing.md`'s business; keeping arithmetic out of
+  # this file means a change in price cannot make these comments lie. The same checks run locally before every merge
+  # (`clippy-localmodel`, `rustdoc-deny-localmodel` and the feature-test rows), so what CI adds is an independent machine,
+  # not a first sighting.
   feature-local-model:
     name: Feature local-model (ubuntu-latest)
     if: github.event_name != 'push'
@@ -135,7 +120,7 @@ jobs:
       # The one network step in this repository's build. Keyed on the pin file (where both digests live) *and*
       # on the script that produces the directory: an unpack layout change - strip-components, stamp location -
       # has to invalidate the cache too, or CI keeps restoring the old-shaped tree while the new script refuses
-      # to re-unpack over it (R6b0 review P2-3). The script is idempotent and verifies content by header digest,
+      # to re-unpack over it. The script is idempotent and verifies content by header digest,
       # so a cache miss costs one 38.7 MB download rather than a stale-tree surprise.
       - name: Cache the pinned llama.cpp source
         uses: actions/cache@v4
@@ -153,13 +138,13 @@ jobs:
       # The third way a feature is invisible, and the reason this step exists: `llama_ffi` is gated in
       # `src/lib.rs`, so the default job's Docs step never compiles the module and none of its intra-doc links
       # are resolved by any run. The job comment names rustdoc as one of the three gaps it closes, so it has
-      # to run here (R6b0 review P1-4). Measured locally on 2026-10-29: this passes today, so it is coverage
+      # to run here. It passes today, so this is coverage
       # being closed rather than a warning being unhidden.
       - name: Docs (feature on)
         env:
           RUSTDOCFLAGS: "--deny warnings"
         run: cargo doc --locked -p np-core --features local-model --no-deps
-      # **The pair `np serve`'s wire tests are gated on (added 2026-12-09 after a review found it missing).**
+      # **The pair `np serve`'s wire tests are gated on.**
       # `crates/np-cli/tests/serve.rs` gates its fetch- and chunk-narration cases on `all(feature = "local-model",
       # feature = "fetch")`, because a default build has no transport to narrate and no runtime to embed with — and no
       # other job built that pair for np-cli: the vision job uses `vision`, and the default job's features exclude
@@ -176,10 +161,10 @@ jobs:
 
 
       # with the feature on, and a wrong field order is an unsound memory bug rather than a compile
-      # error. §2 step 4 wants skipped work printed as `NOT COVERAGE`. `local_runtime.rs` cannot skip at all -
+      # error. The reporting rule wants skipped work printed as `NOT COVERAGE`. `local_runtime.rs` cannot skip at all -
       # no artifact gate, no env-var escape - so a green run there means llama.cpp was called.
       #
-      # `--test local_load` is here so R6b1's loader compiles and runs on this row. What it does NOT prove on a
+      # `--test local_load` is here so the loader compiles and runs on this row. What it does NOT prove on a
       # runner: there is no 310 MB artifact, so **four** of its seven cases print `NOT COVERAGE` and pass - the
       # real-file facts (768/512/262144/MEAN), the declared-vs-actual width refusal, the three-round load/drop
       # cycle, and the truncated-artifact refusal. Those are measured locally with `NP_TEST_MODEL_PATH` set.
@@ -188,7 +173,7 @@ jobs:
       # the module's synthetic unit tests for pooling/positive-count refusals. Say it that plainly because
       # "every refusal" was false: every `Unavailable` arm and the width refusal need an artifact.
       #
-      # `--test local_embed` is R6b2's forward pass, and on GitHub it is **compilation plus thirteen printed
+      # `--test local_embed` is the forward pass, and on GitHub it is **compilation plus thirteen printed
       # `NOT COVERAGE` lines and nothing else** - every case there asks a model for a vector (four of
       # local_load's seven, the same way). What runs locally
       # with the artifact (and is the actual deliverable) is the unit-length and determinism checks, the cosine
@@ -196,12 +181,10 @@ jobs:
       # figures. Listing it here still earns its place: a test file that does not compile against the pinned
       # header is caught on the row, which is where a re-pin first shows up.
       - name: Link proof
-        # `--nocapture` is load-bearing, not cosmetics (Scope B review P1-3). libtest captures a passing test's stdout
-        # and throws it away, so the `NOT COVERAGE` lines this job exists to print never reached the log: measured
+        # `--nocapture` is load-bearing, not cosmetics. libtest captures a passing test's stdout
         # under the command of that day with no artifact the count was **0**, and 12 only with the flag - the same
-        # measurement returned 20 on 2026-10-31 and **29 today** (see the floor below), because the files have grown since.
         # The count is then
-        # echoed so "compiled, never ran" is written on the record (§2 step 4) rather than implied - and the test exit
+        # echoed so "compiled, never ran" is written on the record rather than implied - and the test exit
         # code, not the grep, is what fails the job.
         run: |
           # `set +e` first, deliberately: the runner starts these blocks with errexit on, and under errexit a failing
@@ -221,31 +204,28 @@ jobs:
             echo "the feature test row failed (exit $status); the count above is context, not the verdict" >&2
             exit "$status"
           fi
-          # The step asserts something about the number it exists to print (A2 review P2-4). Measured on 2026-10-31
-          # with no artifact configured, this command prints **20**: thirteen in local_embed (twelve since R6b2 plus
-          # R6c2's provider-shape case), four of seven in local_load, three in local_window. `local_runtime` prints
-          # none because it cannot skip - it is the row that proves the seam refuses without a runtime.
-          # `artifact_verify` (D12) prints none either: its ten cases hash a few hundred fixture bytes rather than
-          # the pinned artifact, so they run for real on a runner with no model file. It is on this row because the
-          # function it tests lives behind `local-model`.
-          # `local_corpus` (R6d round 3) adds four since R8's re-measurement: every case there needs the weights, so on
-          # GitHub it is compilation plus four printed skips - the honest state of a corpus benchmark on a runner with no
-          # model and no budget for ten minutes of CPU. The fourth is `auto`'s pass (181 s at twelve workers here), which
-          # is exactly the kind of case this floor exists to keep honest: it cannot run on a runner, so it must say so.
+          # With no artifact configured the floor below counts 29 lines: thirteen in `local_embed`, four of seven in
+          # `local_load`, three in `local_window`, four in `local_corpus`, plus the remainder from other cases in the same binaries — this comment lists what is
+          # known per file, and does not pretend to have re-derived the total.
+          # Two files print none on purpose. `local_runtime` cannot skip - it is the row that proves the seam refuses
+          # without a runtime - and `artifact_verify`'s cases hash a few hundred fixture bytes rather than the pinned
+          # artifact, so they run for real here; they are on this row because the function under test lives behind
+          # `local-model`. `local_corpus` is the case this floor exists to keep honest: three of its four need weights and
+          # ten minutes of CPU a runner does not have, and the fourth (`auto`, ~181 s at twelve workers locally) must say
+          # out loud that it did not run.
           # `local_threads` (D13) adds four - **two cases, two lines each**, because a gated case prints what it could
           # not measure and then prints how to measure it. On a runner this row is compilation plus four printed skips:
           # the sweep cell needs both the artifact and `$NP_THREAD_*`, and the worker-count readback needs the runtime.
-          # `local_vision` (R7c) adds **one** line to this row, not ten. The row builds `--features local-model`, so
+          # `local_vision` adds **one** line to this row, not ten. The row builds `--features local-model`, so
           # the file's ten projector cases are not even compiled (`#[cfg(not(feature = "vision"))]` replaces them) and
           # what prints is the feature-off statement `vision_feature_is_off`: no projector was opened, re-run with
           # `--features local-model,vision`. That is the whole of what this row says about images - that a file gated
           # on a feature it does not have still compiles and still refuses to claim anything.
           #
           # What the row does NOT prove about vision, stated because "local_vision is on the link-proof row" reads like
-          # image coverage and is not any. Measured 2026-11-04 with the same command at `--features local-model,vision`
-          # and no artifact: **38** lines. That is +9 net over the 29 above, not +10: enabling `vision` replaces the
-          # feature-off statement with the ten gated cases, so one line leaves as nine arrive. The ten are one per case that
-          # needs both files
+          # image coverage and is not any. With the pair on and no artifact the same command prints 38 lines: +9 net over
+          # the 29 above, not +10, because enabling `vision` retires the feature-off statement as its ten gated cases
+          # arrive. The ten are one per case that needs both files
           # (`an_image_embeds_to_768_components_of_unit_length`, `the_same_bytes_twice_give_bit_identical_components`,
           # `text_still_matches_what_it_was_after_an_image_ran`, `the_provider_seam_and_the_facade_agree_bit_for_bit`,
           # `a_truncated_png_refuses_rather_than_returning_a_vector`,
@@ -260,7 +240,6 @@ jobs:
           # `refusal_classes_are_the_report_labels_verbatim` is the file's one artifact-free case - it prints `CLASSES:`,
           # not `NOT COVERAGE`, so neither count includes it.
           #
-          # Total with no artifact, re-measured 2026-11-04 with this exact command after `--test local_vision` joined
           # it: **29**, twice (28 before the file was added). A smaller total means the
           # prints stopped reaching the log - `--nocapture` lost, or a case silently became a real pass with no
           # artifact - and "compiled, never ran" would be implied rather than stated again.
@@ -270,11 +249,11 @@ jobs:
           fi
       # "A green run means llama.cpp was called" is only worth saying if the run can also say *which* llama.cpp.
       # `-l static=llama` is not an exclusive search path, so two cheap probes back it up: no shared llama in the
-      # test binary, and `llama_version` defined in it. Read what the two do and do not say (A2 review P2-5): together
+      # test binary, and `llama_version` defined in it. Read what the two do and do not say: together
       # they show **static linkage from an archive this run produced**. A runner that happened to have llama.cpp
       # installed statically would satisfy both just the same - every post-v0.8.0 revision reports `0.8.0-dev` as well
       # (`LLAMA_BUILD_IS_DEV=ON`) - so the pinned header digest enforced in build.rs is what identifies the tree, and
-      # this step proves only which linkage we got (R6b0 review P2-5).
+      # this step proves only which linkage we got.
       - name: Link identity probes
         run: |
           set -euo pipefail
@@ -293,14 +272,14 @@ jobs:
           fi
           echo "ok: llama_version defined locally (static linkage from an archive this build produced)"
 
-  # **F28's gap, closed.** Every `--features local-model,vision` row this repository ever ran was graded on `-p np-core`,
+  # **The gap this closes.** Every `--features local-model,vision` row this repository ever ran was graded on `-p np-core`,
   # while the crate a user actually builds — np-cli — did not declare the feature at all. That pair therefore failed at
   # *feature resolution* ("the package 'np-cli' does not contain this feature: vision", exit 101), which is a different
   # failure from a compile error and one no np-core row can produce. A green row proving a library builds some way says
   # nothing about whether the binary can be built that way; this job is the difference between those two claims, and it is
   # why the card could stay open while CI was green for five days.
-  # Same gating as the row above, for the same reason (~0.9 billed minutes per run; cheap next to its neighbour, but
-  # it is still a C++ build and this row is what proves `np` itself compiles with the pair).
+  # Same gating as the row above: it is a C++ build too, and this is the row that proves `np` itself compiles with the
+  # pair rather than only np-core.
   feature-vision:
     name: Feature local-model,vision (ubuntu-latest)
     if: github.event_name != 'push'
@@ -309,8 +288,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Toolchain components
         run: rustup component add clippy rustfmt
-      # Same cache key as the row above — one tree, two feature sets. Keyed on the pin file *and* the unpack script for the
-      # reason R6b0 review P2-3 recorded: an layout change must invalidate the cache too.
+      # Same cache key as the row above — one tree, two feature sets. Keyed on the pin file *and* the unpack script, because
+      # a layout change (strip-components, where the stamp lands) has to invalidate the cache too, or CI keeps restoring the
+      # old-shaped tree while the new script refuses to re-unpack over it.
       - name: Cache the pinned llama.cpp source
         uses: actions/cache@v4
         with:
@@ -318,15 +298,15 @@ jobs:
           key: llama-cpp-${{ hashFiles('third_party/llama-cpp.toml', 'scripts/vendor-llama-cpp.sh') }}
       - name: Vendor llama.cpp
         run: ./scripts/vendor-llama-cpp.sh
-      # The mechanical half of F28 as a gate: `np` itself, with the pair. This is the step that would have failed on
-      # 2026-11-04 when the card was filed, and it costs one `cargo check`.
+      # The mechanical half of that gap as a gate: `np` itself, built with the pair. This is the step that would have failed
+      # while the gap was open, and it costs one `cargo check`.
       - name: Check the CLI with the pair
         run: cargo check --locked -p np-cli --features local-model,vision
       - name: Clippy (np-core and np-cli, pair on)
         run: cargo clippy --locked -p np-core -p np-cli --features local-model,vision --all-targets -- -D warnings
       # Rustdoc is the second invisible way a feature goes ungraded, and it bites in both directions across this workspace:
       # a doc link to `crate::local_model::…` resolves on no default build, while a bare `[ImageBlocker]` link resolves *only*
-      # here and breaks the other two. Both were measured on 2026-11-06, in the order "default passes, this row fails".
+      # here and breaks the other two. The asymmetry is real and reproducible: default passes, this row fails.
       - name: Docs (pair on)
         env:
           RUSTDOCFLAGS: "--deny warnings"
@@ -339,3 +319,30 @@ jobs:
       # "compiled" and "ran" that F18's rule exists to keep loud.
       - name: Test (pair on, artifacts absent ⇒ printed NOT COVERAGE)
         run: cargo test --locked -p np-core --features local-model,vision --test local_vision -- --nocapture
+
+  # **AddressSanitizer over the FFI boundary, nightly and on demand.** Not per pull request: it rebuilds std and the pinned
+  # C++ with sanitizer flags, which is minutes a merge should not wait on. It exists because nearly every `unsafe` site in
+  # this tree calls into llama.cpp — the lints (`#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]` in both
+  # crates) keep each block argued in writing; only a sanitizer can catch the class of mistake where the argument was wrong.
+  # The script is the gate: it builds a private copy of the pinned source so cmake cannot hand back an unsanitized cache, and
+  # prints `NOT COVERAGE` rather than a pass if the archives carry no ASan symbols. Findings get filed as cards, not silenced.
+  asan-local-model-vision:
+    name: AddressSanitizer local-model,vision (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain, rust-src, and cmake
+        run: |
+          rustup toolchain install nightly --component rust-src
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      - name: Cache the pinned llama.cpp source
+        uses: actions/cache@v4
+        with:
+          path: .vendor
+          key: llama-cpp-${{ hashFiles('third_party/llama-cpp.toml', 'scripts/vendor-llama-cpp.sh') }}
+      - name: Vendor llama.cpp
+        run: ./scripts/vendor-llama-cpp.sh
+      - name: Build with ASan, prove the archives are instrumented, run the loader and decoder tests
+        run: ./.github/scripts/asan-localmodel.sh

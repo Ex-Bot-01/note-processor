@@ -115,7 +115,7 @@ Two things did **not** change, and both are asserted rather than asserted-about:
   pinned sentences in `crates/np-cli/tests/cli.rs` still pass word for word. Degrading is what you do when you can still answer, and hybrid
   can. (The same reasoning keeps semantic mode from fetching: spending 309 MB to produce nothing is not a degraded answer, it is a bill.)
 
-**Issue #11 added one token here on 2026-12-18 without touching either ruling.** A `--mode semantic` query that reached the vector list and
+**Issue #11 added one token here on 2026-11-19 without touching either ruling.** A `--mode semantic` query that reached the vector list and
 found the workspace holding no vectors at all answered `hits: []` with `reason: null` — which is a true document and a useless one, because "nothing
 matched" and "this folder has never been embedded" print the same empty list. It now answers with `semantic-without-vectors` and its own sentence.
 Refusals stay refusals: this is the state where semantic mode *did* run its only half and that half had nothing to read.

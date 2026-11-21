@@ -1,4 +1,4 @@
-//! One writer per workspace (**F44**).
+//! One writer per workspace.
 //!
 //! Two `np` processes pointed at one vault used to interleave and one of them died with a raw SQLite string: measured on the packaged 0.2.3
 //! binary, two concurrent `scan` runs produced `added 1` and `np: workspace database: sqlite: database is locked` after **5 ms**, exit 1, and —

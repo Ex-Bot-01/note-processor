@@ -5,7 +5,7 @@ Where artifacts live, and the two doors by which bytes get there: `np models fet
     [`np embeddings enable`](#the-third-door-that-moves-no-bytes-turning-embeddings-on) (**#7**) — and it is still worth reading
     this page before editing `embeddings.model` by hand.
 
-> *Moved out of `README.md` on 2026-12-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
+> *Moved out of `README.md` on 2026-11-09, when the README became a document you read before installing rather than one you read after something broke. The wording is the same as it was there — including the dates, the measured numbers and the claims about what has not been measured — because those are the parts that carry weight.*
 
 
 Embedding is opt-in twice over: a feature at build time and an artifact at run time. One model identity is pinned in this

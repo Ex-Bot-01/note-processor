@@ -1,9 +1,8 @@
-//! `np search`: a read-only cosine top-k over both vector sources of one model
-//! (`docs/design-m2-image-embeddings.md` §12).
+//! `np search`: a read-only cosine top-k over both vector sources of one model.
 //!
 //! **This module writes nothing.** No migration, no `INSERT`, no `UPDATE`, no stamp — not even a benign-looking
-//! `last_seen`. A command that cannot write cannot drift out of sync with the index it reads, which is the whole reason
-//! §12 keeps it a proof of concept rather than folding ranking into `np scan`. Every statement below is a `SELECT`, and
+//! `last_seen`. A command that cannot write cannot drift out of sync with the index it reads, which is the whole
+//! reason this stays a proof of concept rather than folding ranking into `np scan`. Every statement below is a `SELECT`, and
 //! `searching_writes_nothing` in `tests/search.rs` pins the rule (a test name is not a documentation target, so it is
 //! named in plain text rather than linked) by running [`search`] on a connection where every
 //! write fails with `SQLITE_READONLY` (`PRAGMA query_only`).
@@ -11,7 +10,7 @@
 //! **Ordering is part of the contract, not a side effect of the planner.** Hits come back by descending score, and a tie
 //! breaks on `Hit::path` ascending — so a stable index answers the same query with the same list on every host and after
 //! every re-embed. Ordering by rowid would do the opposite: re-embedding one note moves its `chunks.id`, and a hit that
-//! was second could become first without a single score changing (§6's argument for the same rule on
+//! was second could become first without a single score changing (the argument for the same rule on
 //! [`Hit::source_note`]).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,7 +21,7 @@ use crate::db::{self, Db, DbError};
 use crate::embed::{EmbedError, Vector, COMPONENT_BYTES};
 use crate::media;
 
-/// What a hit is: a note's prose, or an image a note links (§12).
+/// What a hit is: a note's prose, or an image a note links.
 /// What a hit points at.
 ///
 /// The derive order (`Note`, `Image`) is the search tie-break's last resort after path and stored bytes, so it is part of the
@@ -62,12 +61,12 @@ pub struct Hit {
     pub score: f64,
     /// Which table the vector came from.
     pub kind: HitKind,
-    /// Workspace-relative path, lossy-decoded for display (F20's rule: bytes are the identity, text is a rendering).
+    /// Workspace-relative path, lossy-decoded for display (bytes are the identity, text is a rendering).
     ///
     /// For an image this is the lexicographically smallest `media_path.rel_bytes` holding those bytes, so one figure
-    /// copied to three folders names one path and answers once (§6's content-identity rule).
+    /// copied to three folders names one path and answers once (content identity).
     pub path: String,
-    /// The note to open: the lexicographically smallest **live** note linking that path (§6) — which is to say,
+    /// The note to open: the lexicographically smallest **live** note linking that path — which is to say,
     /// [`Hit::linked_notes`]`[0]`, assembled by the one constructor that builds an image hit and never chosen
     /// independently. (That constructor is private on purpose, so this says what it is rather than linking to it.)
     ///
@@ -75,9 +74,9 @@ pub struct Hit {
     /// spelling of a figure's name in `links.target` is a lossy decode of bytes that never round-trip. Undercounting a
     /// linker is a reportable fact; inventing one is not.
     pub source_note: Option<String>,
-    /// Every live note linking this image, byte-ordered — the relation itself rather than a sample of it (F28).
+    /// Every live note linking this image, byte-ordered — the relation itself rather than a sample of it.
     ///
-    /// **Why this exists next to the two fields above.** §6 picked one note because a text line has one column, and
+    /// **Why this exists next to the two fields above.** A text line has one column, so the report picks one note, and
     /// `linked_from` counted the rest; together they answered "how many" and "open this", and discarded everything in
     /// between. A figure linked from four notes rendered as one name and the number 4, so the three nobody named were
     /// invisible to the reader trying to work out why the hit came back. This is the set; `source_note` is its head and
@@ -90,8 +89,8 @@ pub struct Hit {
     pub linked_from: usize,
     /// Cosine as the vector list computed it, or `None` when no vector list vouched for this hit.
     ///
-    /// **Why this sits beside [`Hit::score`] instead of replacing it.** In hybrid mode `score` is a fused rank sum (§4 of
-    /// `docs/design-m3-hybrid-search.md`) and a reader who mistakes it for a similarity will draw conclusions about how close
+    /// **Why this sits beside [`Hit::score`] instead of replacing it.** In hybrid mode `score` is a fused rank sum, not a
+    /// similarity, and a reader who mistakes it for one will draw conclusions about how close
     /// the match was — a claim the number cannot support. The raw evidence is therefore carried separately rather than
     /// recovered from context, and a hit that no vector list held says so with `None` instead of a plausible 0.0.
     pub cosine: Option<f64>,
@@ -106,7 +105,7 @@ pub struct Hit {
     /// not produce — including every image, which has no prose to snippet.
     pub snippet: Option<String>,
     /// Whether this note contains every query word **whole**: `Some(true)` an exact hit, `Some(false)` one that only began
-    /// with a queried word (**F49**), `None` one the keyword list never held.
+    /// with a queried word (prefix matching), `None` one the keyword list never held.
     ///
     /// `None` is not `false`, and that distinction is the reason this is an `Option` rather than a bit: a vector hit has not
     /// failed a whole-word test, it was never in one. Under a query that asked for no prefixes every keyword hit is
@@ -119,7 +118,7 @@ impl Hit {
     /// written together, which is what makes them one fact rather than three that happen to agree — the head and the
     /// length of a list cannot drift from it while there is one statement computing all three.
     fn image(score: f64, path: String, notes: &[Vec<u8>]) -> Hit {
-        // Lossy-decoded on the way out for the same reason `path` is (F20: bytes are the identity, text is a rendering).
+        // Lossy-decoded on the way out for the same reason `path` is: bytes are the identity, text is a rendering.
         let linked_notes: Vec<String> = notes
             .iter()
             .map(|note| String::from_utf8_lossy(note).to_string())
@@ -189,10 +188,10 @@ pub enum SearchError {
     /// No `models` row answers to that id.
     /// The configured model id holds no vectors while this database holds some under a **different** id.
     ///
-    /// This is the mismatch §12's exit-1 refusal is for: a stale `[embeddings] model`, a typo, or an index built before a
+    /// This is the mismatch the exit-1 refusal is for: a stale `[embeddings] model`, a typo, or an index built before a
     /// re-install. It is not "nothing indexed" — somebody did embed this workspace, and answering with an empty list would
     /// send the reader to `np embed` for nothing. The message names the configured id and what to change, never another
-    /// model's artifact path or URL (§8's rule 8).
+    /// model's artifact path or URL (a report names no origin).
     #[error("no vectors indexed for model \"{model}\" while this index holds vectors under another model id; run np models list to see the ids, then np embed (or point [embeddings] model at the one that was embedded)")]
     NoVectorsForModel {
         /// The configured id that answered with nothing.
@@ -233,13 +232,13 @@ pub enum SearchError {
 /// * **Read-only.** See the module note; nothing here can write.
 /// * **One hit per note, its best chunk winning.** `embeddings` is keyed per chunk, so a note with six chunks would
 ///   otherwise fill a ten-hit list by itself. The score reported is the maximum over that note's live chunks — the chunk
-///   identity is deliberately not reported (§12 shows a path, and §6 keeps a note's identity at its path).
+///   identity is deliberately not reported: the report shows a path, and a note's identity stays at its path.
 /// * **Liveness fenced exactly like [`db::live_chunks`]**: `JOIN files f ON f.rel_bytes = n.rel_bytes WHERE f.state =
 ///   'ok'`. A deleted note keeps its rows and its vectors (D3), so an un-fenced read would rank a file no catalog can
 ///   show. Media rows get no fence here, and the reason is worth stating exactly: [`db::prune_unlinked_media`] deletes media
 ///   rows that hold **no path row at all**, so a figure whose last linking note was deleted still has its path row and its
 ///   vector until an embed pass runs its sweep. A stale figure can therefore be ranked by this command; retiring it is the
-///   writer's job (§6's lifecycle), and a read-only reader cannot run a sweep without breaking the rule above.
+///   writer's job, and a read-only reader cannot run a sweep without breaking the rule above.
 /// * **Vectors compared as stored.** Stored rows are not re-normalised (the encoder wrote unit rows, and re-scaling
 ///   would hide a corrupt one); the query's length is asserted instead — see [`SearchError::NotUnitNorm`].
 /// * **Empty is a fact, and coverage is not a condition.** Search never embeds anything itself, so it answers from
@@ -267,14 +266,14 @@ pub fn search(
         // **Which kind is indexed is not a question search asks.** It never embeds anything itself, so it can only answer
         // from the half that is indexed — note-only, image-only, or both — and that is exactly why every [`Hit`] carries a
         // `kind`. What is still worth distinguishing is *whose* vectors they are: nothing indexed anywhere is a fact the
-        // caller prints and exits 0 (§12), while an index that holds vectors under some other id means this command was
+        // caller prints and exits 0, while an index that holds vectors under some other id means this command was
         // pointed at a model nobody embedded, which is a refusal.
         if any_vectors_exist(conn)? {
             return Err(SearchError::NoVectorsForModel {
                 model: model.to_string(),
             });
         }
-        // **The empty list is reported where it is decided** (diagnostics design §1 point 4). This function is the only
+        // **The empty list is reported where it is decided**: one diagnostic per degraded state. This function is the only
         // place that knows the difference between "this model stores nothing" and "this model was not embedded"; the
         // second half is the error above, and the first is a state a reader acts on (`np embed`), so it goes out as
         // `no-vectors` at `warn` — a state to fix, not a fault. A caller that never reaches this line because its build
@@ -441,7 +440,7 @@ fn note_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Ranked>, Sear
         })
         .map_err(DbError::from)?;
     // Best score per note, keyed by the **stored bytes** of its path. Keying on the rendered form was the first version, and
-    // it is wrong in a way the display hides: two files whose names differ only in bytes that are not valid UTF-8 (F13 lets
+    // it is wrong in a way the display hides: two files whose names differ only in bytes that are not valid UTF-8 (the byte-path rules let
     // them exist) lossy-decode to one string, so two unrelated notes would fold into one hit reporting the higher of their
     // two scores — a merged row no note owns.
     let mut best: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
@@ -533,7 +532,7 @@ fn image_hits(conn: &Db, model: &str, query: &Vector) -> Result<Vec<Ranked>, Sea
 ///
 /// The linkers come back as the **whole set**, byte-ordered, and it is up to [`Hit::image`] to decide what a reader sees:
 /// the head becomes `source_note`, the length becomes `linked_from`. This function used to do that narrowing itself —
-/// returning one note and a count — which is where F28's information went missing: the set was assembled here, complete,
+/// returning one note and a count — which is where the image information went missing: the set was assembled here, complete,
 /// and then reduced before any caller could use it.
 ///
 /// Both the path and the notes are chosen by **smallest bytes**, not by insertion order: `media_path` is keyed by
@@ -560,7 +559,7 @@ fn media_report(
         return Ok(None);
     };
     // Every path those bytes were seen at contributes its linkers: one figure copied to two folders, linked from three
-    // notes, is one hit with `linked_from: 3` (§6), not two hits with 2 and 1.
+    // notes, is one hit with `linked_from: 3`, not two hits with 2 and 1.
     let mut notes: BTreeSet<Vec<u8>> = BTreeSet::new();
     for path in &paths {
         if let Some(holders) = linkers.get(path) {
@@ -574,13 +573,13 @@ fn media_report(
 
 /// Which live notes link each workspace figure path.
 ///
-/// **Why this reads `links` rather than the files.** §6 rules `links` out as the *resolver* — its `target` is TEXT, so a
+/// **Why this reads `links` rather than the files.** `links` is ruled out as the *resolver* — its `target` is TEXT, so a
 /// name that is not valid UTF-8 arrives already lossy-decoded, and it is not relative to the linking note's directory.
 /// Neither half of that objection binds here: the second is fixed by re-running the one resolution rule the embed pass
 /// uses ([`media::link_target_rel`], which takes the note's own `rel_bytes`), and the first only costs a linker for a
 /// name whose bytes cannot round-trip through TEXT, which [`Hit::source_note`] documents as an undercount. The
 /// alternatives were worse: re-reading every note body needs the workspace root, which this signature does not carry and
-/// §12's read-only command should not need; a `note → media` edge would be an eleventh migration, which Task 6 forbids.
+/// a read-only command should not need; a `note → media` edge would be an eleventh migration, which this scope forbids.
 ///
 /// Live means what [`db::live_chunks`] means by it — `files.state = 'ok'`, joined on the byte key — and only `prose`
 /// origins count, because an approved edge is a claim a human made about a note that may no longer exist.
@@ -623,10 +622,10 @@ type Linkers = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 /// signature deserves the words anyway.
 type MediaReport = (Vec<u8>, Vec<Vec<u8>>);
 
-// --- keyword and hybrid ranking (`docs/design-m3-hybrid-search.md`) ------------------
+// --- keyword and hybrid ranking ------------------------------------------
 
 /// Which lists a query may consult. The three spellings below are the whole vocabulary: `--mode`, `[search] mode` in config,
-/// and `--json` all read these strings, so a fourth spelling appearing in one door and not another (F28's split-refusal
+/// and `--json` all read these strings, so a fourth spelling appearing in one door and not another (the split-refusal
 /// lesson) cannot happen while this stays the only definition. The serde derive renames to lowercase, which is the same set
 /// [`std::str::FromStr`] accepts — one list, two doors, no drift possible; [`SearchMode::label`] is what both print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -636,7 +635,7 @@ pub enum SearchMode {
     Semantic,
     /// SQLite `bm25()` over note titles and bodies only. Answers with no model installed, and never returns a figure.
     Keyword,
-    /// Both lists, fused by rank (§4). The default the human chose on 2026-11-07.
+    /// Both lists, fused by rank. The default the human chose.
     Hybrid,
 }
 
@@ -657,7 +656,7 @@ impl std::fmt::Display for SearchMode {
     }
 }
 
-/// A mode name that is not one of the three. Named rather than swallowed: F35's rule is that an unrecognised config value is
+/// A mode name that is not one of the three. Named rather than swallowed: the strict-config rule is that an unrecognised config value is
 /// refused, and a CLI flag deserves the same sentence as a config key.
 #[derive(Debug, thiserror::Error)]
 #[error("unknown search mode `{0}`: expected `hybrid`, `semantic` or `keyword`")]
@@ -681,13 +680,13 @@ pub struct KeywordHit {
     /// Display path of the live note (`notes.rel`), which is what a reader opens.
     pub path: String,
     /// `bm25(notes_fts)` exactly as SQLite returned it: **lower is better**, and corpus-relative. Not rescaled — any
-    /// constant applied here would be one nobody measured (F31 has no labelled set to fit against).
+    /// constant applied here would be one nobody measured: there is no labelled set to fit against.
     pub bm25: f64,
     /// A fragment of the body with the matched term in brackets; falls back to the title when the body holds no hit term.
     pub snippet: String,
     /// Whether this note contains **every** query word whole, rather than satisfying a marked (or `EveryTerm`) prefix.
     ///
-    /// Computed by a second `MATCH` of [`Plan::exact_expression`] inside the same statement (**F49**), so it describes the
+    /// Computed by a second `MATCH` of [`Plan::exact_expression`] inside the same statement, so it describes the
     /// same row set the hit came from rather than a re-query that could disagree with it. `true` whenever nothing in the
     /// query asked for word beginnings — the honest reading is "this one needed no prefix", not "this one was checked".
     pub matched_exactly: bool,
@@ -700,39 +699,39 @@ pub enum RankNote {
     /// The workspace holds no vectors at all, so hybrid's semantic half had nothing to read. A state, not an error: this is a
     /// machine that has not downloaded an artifact yet. Vectors under some *other* model id stay a refusal — see [`SearchError::NoVectorsForModel`].
     NoVectors,
-    /// **Issue #11 (2026-12-18).** The same workspace state as [`Self::NoVectors`] — no vectors at all — seen by a search that
+    /// The same workspace state as [`Self::NoVectors`] — no vectors at all — seen by a search that
     /// asked for meanings only. It gets its own variant rather than sharing hybrid's because the two sentences cannot be one:
     /// every other note says **which half answered**, and in a `semantic` run neither did, so printing hybrid's "ranked by
-    /// keyword only" there would describe a fallback this mode refuses by design (**F45**'s reason for keeping the refusal).
+    /// keyword only" there would describe a fallback this mode refuses by design (the reason for keeping the refusal).
     /// The `reason` token is therefore distinct, and `mode` beside it stays the word for what was asked for.
     SemanticWithoutVectors,
-    /// **F45 (A).** Configuration names no provider (`embeddings.provider = "none"`, or no `[embeddings]` section at all), so
+    /// Configuration names no provider (`embeddings.provider = "none"`, or no `[embeddings]` section at all), so
     /// there is nothing that could turn the query into a vector. This is an instruction, not a gap: the answer came from FTS5,
     /// and the note says what would add the other half. It used to be a refusal at exit 1 with **zero bytes on stdout**, which
     /// a caller could not tell apart from "search is broken" while `--mode keyword` answered fine in the same state.
     ProviderDisabled,
-    /// **F45.** Configuration names a model this workspace has never installed. Distinct from [`Self::ProviderDisabled`] because
+    /// Configuration names a model this workspace has never installed. Distinct from [`Self::ProviderDisabled`] because
     /// the reader's next command differs: one edits a file, the other downloads 309 MB.
     ModelNotInstalled,
-    /// **F45.** A row exists and its bytes do not (deleted, or a moved data folder): the artifact this build would load is absent,
+    /// A row exists and its bytes do not (deleted, or a moved data folder): the artifact this build would load is absent,
     /// and no fetch was permitted to put it back. Vectors from an earlier run may well be in the index — they are simply
     /// unusable without a model to embed the *query* with.
     ArtifactMissing,
-    /// **F45/F38.** A fetch was allowed and attempted, and nothing was reached. `--json` carries `offline:true` beside this note:
+    /// A fetch was allowed and attempted, and nothing was reached. `--json` carries `offline:true` beside this note:
     /// offline is a state, and it belongs to the machine-readable channel even when the run answered — search's exit code says
     /// "did you get an answer", which for a keyword list is yes.
     FetchOffline,
-    /// **F45.** The artifact is missing, this build could fetch it, and policy said no: `[models] auto_fetch = false` or
+    /// The artifact is missing, this build could fetch it, and policy said no: `[models] auto_fetch = false` or
     /// `NP_NO_AUTO_FETCH=1`. Named separately because "it did not download" and "it was not allowed to" read as the same bug to
     /// whoever set the switch and forgot.
     FetchDisabled,
-    /// **F45's first-install case (ruled 2026-11-09).** The artifact arrived during this search. The answer is still keyword-only,
+    /// The first-install case: the artifact arrived during this search. The answer is still keyword-only,
     /// because a model on disk writes no vectors by itself: `np embed` (or `np setup`) owes the index its rows. Saying so here is
     /// the difference between "search downloaded 309 MB for nothing" and a reader who knows what the next call is for.
     ArtifactFetched,
 }
 
-/// The whole sentence for a build that can fetch: which doors this reader can actually walk through. F32's rule, because a
+/// The whole sentence for a build that can fetch: which doors this reader can actually walk through — because a
 /// `fetch`-less binary that names `np models fetch` sends them to a help screen that has never heard of it — the same reason
 /// `embed_run::install_hint` is two functions rather than one. Two consts, one per feature shape, so the wording a build
 /// prints is the wording that build can honour; `tests/cli.rs` pins each of them with the matching `cfg`.
@@ -749,7 +748,7 @@ const NO_VECTORS_SENTENCE: &str = concat!(
     "`np embed` adds the semantic half once a model is installed"
 );
 
-/// **Issue #11.** The sentence for an empty meanings-only answer. It keeps the rule every other note follows — name the state,
+/// The sentence for an empty meanings-only answer. It keeps the rule every other note follows — name the state,
 /// then name the command that changes it, and never a host — with one difference: what it names is that there was **no
 /// fallback**, which is exactly why this mode's emptiness needs words and hybrid's does not.
 #[cfg(feature = "fetch")]
@@ -763,9 +762,9 @@ const SEMANTIC_WITHOUT_VECTORS_SENTENCE: &str = concat!(
     "`np embed` adds the semantic half once a model is installed"
 );
 
-// **F45's sentences, one pair per state that names a command.** Same rule `NO_VECTORS_SENTENCE` follows and for the same reason:
+// One sentence pair per state that names a command. Same rule `NO_VECTORS_SENTENCE` follows and for the same reason:
 // a build that compiled the HTTP client out must not send its reader to `np models fetch`, so each of these exists twice and the
-// wording a binary prints is wording that binary can honour. None of them names a host (§12 rule 8), and none of them tells the
+// wording a binary prints is wording that binary can honour. None of them names a host, and none of them tells the
 // reader to run something that would not help: `ProviderDisabled` says *configure*, never *download*.
 #[cfg(feature = "fetch")]
 const PROVIDER_DISABLED_SENTENCE: &str = concat!(
@@ -837,7 +836,7 @@ impl RankNote {
             Self::ProviderDisabled => PROVIDER_DISABLED_SENTENCE,
             Self::ModelNotInstalled => MODEL_NOT_INSTALLED_SENTENCE,
             Self::ArtifactMissing => ARTIFACT_MISSING_SENTENCE,
-            // "the pinned origin" and no host (§12's rule 8): the transport's failure is reported as a state, the way
+            // "the pinned origin" and no host: the transport's failure is reported as a state, the way
             // `embed_run`'s offline arm reports it, and one build's truth about fetching comes from the same const pair.
             Self::FetchOffline => FETCH_OFFLINE_SENTENCE,
             Self::FetchDisabled => FETCH_DISABLED_SENTENCE,
@@ -863,7 +862,7 @@ impl RankNote {
         }
     }
 
-    /// This note's token on the **diagnostics** side (design §1 point 4), which is search's `rule` field.
+    /// This note's token on the **diagnostics** side, which is search's `rule` field.
     ///
     /// One spelling differs from [`Self::token`], and it is worth the sentence: the result document says
     /// `fetch-offline` because that key names *which step of this command* declined, while a diagnostic says
@@ -888,17 +887,17 @@ impl RankNote {
     /// Report this note as a diagnostic, naming the model it is about where one is known.
     ///
     /// Called by whoever decided the note — np-cli's search path, at the point the note is final for this run — because
-    /// §4 asks for one event per degraded state, and that is not what emitting inside each variant's
+    /// The diagnostics rule asks for one event per degraded state, and that is not what emitting inside each variant's
     /// construction site: a hybrid search can decide `NoVectors` twice over (its own branch, and [`ranked`]'s check) and
     /// a reader should see one record.
     ///
     /// `ArtifactFetched` is the one note that is not a degradation — an artifact arrived — so it reports at `info`. The
-    /// rest say a half of the answer is missing, which is a state to fix: `warn` (§4).
+    /// rest say a half of the answer is missing, which is a state to fix: `warn`.
     pub fn report(&self, model: Option<&str>) {
         let rule = self.diag_rule();
         let what = model.unwrap_or("the semantic half");
         // The sentence is this note's own label, so the event and the printed line cannot disagree about what happened;
-        // no query text travels here (§12 of the diagnostics design), only the id and the rule.
+        // no query text travels here, only the id and the rule.
         if matches!(self, Self::ArtifactFetched) {
             tracing::info!(
                 target: crate::diagnostics::target::SEARCH,
@@ -935,7 +934,7 @@ pub struct Answer {
     /// Whether the keyword list ran (it does not in [`SearchMode::Semantic`], and there is nothing to ask when the query has
     /// no word characters in it).
     pub keyword_used: bool,
-    /// Whether any term was matched at the **start of a word** rather than as a whole word (**F49**): `true` for a marked
+    /// Whether any term was matched at the **start of a word** rather than as a whole word (prefix matching): `true` for a marked
     /// `grand*`, or for any query under [`Prefix::EveryTerm`]. Beside `keyword_used` because "the keyword half ran" and "the
     /// keyword half widened your words" are two facts, and a client that prints the query as though the notes contained it is
     /// putting words on screen the bytes did not support.
@@ -965,14 +964,14 @@ pub fn vectors_present(conn: &Db) -> Result<bool, SearchError> {
 /// cap exists so a pasted page of text cannot turn one search into a thousand phrase lookups.
 const MAX_QUERY_TERMS: usize = 32;
 
-/// How much of a query is allowed to match at the start of a word rather than as one whole word (**F49**).
+/// How much of a query is allowed to match at the start of a word rather than as one whole word.
 ///
 /// Keyword search matches whole tokens, and that stance is kept: `runner` does not match `runners`, because a vault holds
 /// identifiers and a search that quietly widened them would report notes the reader never asked about. What this adds is a
-/// way to *ask* — the gap issue #6 named, where `grand` could not reach `grandma` by any route at all.
+/// way to *ask*: before it, `grand` could not reach `grandma` by any route at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefix {
-    /// Only a term the caller **marked** is a prefix: a trailing `*`, as in `np search . "grand*"`. The default, because a
+    /// Only a term the caller **marked** is a prefix: a trailing `*`, as in `np search. "grand*"`. The default, because a
     /// query nobody marked contains no prefix term and keeps matching exactly what it matched before — the README's
     /// "no stemming" rule still describes every unmarked word.
     #[default]
@@ -992,11 +991,11 @@ pub struct Term {
     pub marked: bool,
 }
 
-/// Split query text into [`Term`]s, which is where F49's one piece of syntax lives.
+/// Split query text into [`Term`]s, which is where the one piece of query syntax lives.
 ///
 /// Word characters are alphanumerics and `_`, exactly as they were; every other character separates. A `*` immediately after
 /// a word marks that term and is **not** a separator, which is what makes `grand*` mean "a word beginning with grand" while
-/// `glob*` in a note about globs still needs the reader to know the trade (F49 §"what `*` costs"). Two consequences worth
+/// `glob*` in a note about globs still needs the reader to know the trade. Two consequences worth
 /// stating because they are the whole cost of the feature:
 ///
 /// * A trailing asterisk cannot be searched for. There is no escape spelling, and inventing one would put an FTS5 grammar in
@@ -1034,9 +1033,9 @@ pub fn terms(query: &str) -> Vec<Term> {
 ///
 /// The query stays a bag of words rather than becoming FTS5 syntax — deliberately, and it is why this exists. A raw query
 /// string would make `"`, `-`, `(` and `:` a supported input surface whose malformed forms return SQLite parse errors from
-/// inside a library call, and exposing that grammar is a decision of its own (§8 of the design note). Quoting each token also
-/// keeps an identifier like `GGML_DEFAULT_N_THREADS` — the reason hybrid became the default — out of the parser's way. F49
-/// widens that by exactly one character: a term marked for prefix matching is emitted unquoted with a trailing `*`, which is
+/// inside a library call, and exposing that grammar is a decision of its own. Quoting each token also
+/// keeps an identifier like `GGML_DEFAULT_N_THREADS` — the reason hybrid became the default — out of the parser's way.
+/// Prefix matching widens that by exactly one character: a term marked for prefix matching is emitted unquoted with a trailing `*`, which is
 /// safe because a term contains nothing but word characters, so there is no metacharacter left to reach the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -1093,9 +1092,9 @@ pub fn plan(query: &str, prefix: Prefix) -> Option<Plan> {
 }
 
 /// The keyword list: live notes whose title or body contains every word of `query`, ordered by `bm25()` and then by path
-/// **bytes** (F20's rule — the display text is a rendering, so it never decides an order on its own).
+/// **bytes** — the display text is a rendering, so it never decides an order on its own.
 ///
-/// `prefix` decides how much of the query may match at the start of a word ([`Prefix`], **F49**). Each row also answers the
+/// `prefix` decides how much of the query may match at the start of a word ([`Prefix`]). Each row also answers the
 /// whole-word question in the same statement (`matched_exactly`), because a hit found by `grand*` and a hit that contains
 /// `grand` are different facts and a client must be able to say which it is showing.
 pub fn keyword(
@@ -1171,8 +1170,8 @@ fn keyword_planned(conn: &Db, plan: &Plan, limit: usize) -> Result<Vec<KeywordHi
     Ok(hits)
 }
 
-/// The reciprocal-rank constant the fusion is defined with (§4). Not tuned here — there is no labelled set to tune against
-/// (F31), and inventing a number this repository cannot measure would be the worse invention.
+/// The reciprocal-rank constant the fusion is defined with. Not tuned here — there is no labelled set to
+/// tune against, and inventing a number this repository cannot measure would be the worse invention.
 const RRF_K: f64 = 60.0;
 
 fn rrf(rank: usize) -> f64 {
@@ -1185,7 +1184,7 @@ fn rrf(rank: usize) -> f64 {
 /// keyword-only mode, should not have to embed anything. Absent vector input simply means no semantic list — hybrid answers
 /// from keywords and sets [`RankNote::NoVectors`] when the workspace holds no vectors at all; [`SearchMode::Semantic`]
 /// answers empty rather than inventing a ranking it cannot compute, and sets [`RankNote::SemanticWithoutVectors`] so the
-/// emptiness is a stated state rather than silence (**issue #11**).
+/// emptiness is a stated state rather than silence.
 ///
 /// Ordering is the existing contract extended, not replaced: fused score descending, then display path ascending, then kind,
 /// then the raw evidence as bit patterns — so an equal-score pair still has exactly one order on every host and after every
@@ -1219,7 +1218,7 @@ pub fn ranked(
     }
 
     // Planned once and used twice: for whether the half ran at all, and for the terms it widened. A query with no word in it
-    // has no plan, which is the same `keyword_used == false` as before F49 — prefix mode cannot conjure a keyword half out of
+    // has no plan, which is the same `keyword_used == false` as before prefix matching existed — it cannot conjure a keyword half out of
     // a query that asks for nothing.
     let plan = if mode == SearchMode::Semantic {
         None
@@ -1288,7 +1287,7 @@ pub fn ranked(
     });
     hits.truncate(limit);
 
-    // **An empty answer says why** (**F45** for hybrid, **issue #11** for semantic). Both notes ask the same question of the
+    // **An empty answer says why** (the refusal sentence for hybrid, the empty-answer note for semantic). Both notes ask the same question of the
     // workspace — are there any vectors at all? — and differ only in what their sentence may claim: hybrid's can name the half
     // that answered, because one did; a meanings-only run has no fallback to describe. Keyword mode gets nothing, because it
     // never asked ("the semantic half is missing" is not news to a query that refused to look).

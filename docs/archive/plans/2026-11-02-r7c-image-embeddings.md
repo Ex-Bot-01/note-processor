@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Gate list, run by exit code, log read before the code is believed: `cargo fmt --all -- --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` · `env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config` · `RUSTDOCFLAGS="--deny warnings" cargo doc --locked --workspace --no-deps` · the three `.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog/check_*.py` fences · `verify_catalog_goldens.py` → `GOLDEN CHECK: pass`.
+- Gate list, run by exit code, log read before the code is believed: `cargo fmt --all -- --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace` · `env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config` · `RUSTDOCFLAGS="--deny warnings" cargo doc --locked --workspace --no-deps` · the three `.github/scripts/check_*.py` / `verify_catalog_goldens.py` fences · `verify_catalog_goldens.py` → `GOLDEN CHECK: pass`.
 - Feature rows add, with `CMAKE=$HOME/tools/cmake/bin/cmake NP_LLAMA_CPP_JOBS=4`: `cargo clippy -p np-core --all-targets --features local-model,vision -- -D warnings`, the same for `--features local-model,fetch`, `RUSTDOCFLAGS="--deny warnings" cargo doc --locked -p np-core --features local-model --no-deps`, and `cargo clippy --locked -p np-cli --features local-model --all-targets -- -D warnings`. Never pass `--locked` after `--` to clippy.
 - **Never regenerate goldens.** Any diff under `tests/golden*` stops the task and gets reported.
 - No new exit codes: argv problems stay clap's `2`, runtime refusals stay `1`.

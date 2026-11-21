@@ -1,10 +1,10 @@
 # Plan: what is built, what is next, and the steps in between
 
 Date: 2026-10-28 · **refreshed 2026-10-29 at `main` = `6b46a12`, branch `m13/local-embeddings` = `f526751`**
-Companion to `docs/roadmap-2026-10-27.md` (milestones, protocol, gate list) and `todo.md` (handoff).
+Companion to `docs/archive/roadmap-2026-10-27.md` (milestones, protocol, gate list) and `todo.md` (handoff).
 This document answers a different question: **what does the machine do today, and in what order does the rest arrive?**
 For the full feature-gap table — everything the spec promises that no code implements yet — read
-`docs/roadmap-2026-10-27.md` §3B; this page is the shape of it, not the inventory.
+`docs/archive/roadmap-2026-10-27.md` §3B; this page is the shape of it, not the inventory.
 
 Legend used by every diagram below:
 

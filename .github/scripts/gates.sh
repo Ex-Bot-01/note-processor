@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The gate list, as one command, on any machine. CI grades `main` when it has minutes; this script is what "graded" means
-# when it does not (`docs/ops-actions-minutes.md`), and it is the same list CI runs — so a green local log and a green run
+# when it does not (`docs/developing.md`), and it is the same list CI runs — so a green local log and a green run
 # say the same thing about the same tree.
 #
 # Usage:
@@ -87,12 +87,14 @@ cmake_missing=""
 row_or_skip clippy-localmodel "$cmake_missing" cargo clippy -p np-core -p np-cli --features local-model --all-targets -- -D warnings
 row_or_skip clippy-lm-vision "$cmake_missing" cargo clippy -p np-core -p np-cli --features local-model,vision --all-targets -- -D warnings
 row clippy-nodefaults cargo clippy -p np-core -p np-cli --no-default-features --all-targets -- -D warnings
-row check-cli-vision cargo check -p np-cli --features local-model,vision
+# Needs the same cmake as the two clippy rows above: `build.rs` refuses to guess where cmake lives, so without it this
+# row panics in the build script and prints a red that reads exactly like a compile break.
+row_or_skip check-cli-vision "$cmake_missing" cargo check -p np-cli --features local-model,vision
 row test-workspace cargo test --workspace -- --nocapture
 row test-cli-nodefaults cargo test -p np-cli --no-default-features -- --nocapture
 row_or_skip test-cli-vision "$cmake_missing" cargo test -p np-cli --features local-model,vision -- --nocapture
 row_or_skip test-core-vision "$cmake_missing" cargo test -p np-core --features local-model,vision -- --nocapture
-# **The row that was missing until 2026-12-09.** `crates/np-cli/tests/serve.rs` gates its fetch and chunk-narration cases on
+# **The row that was missing until 2026-11-09.** `crates/np-cli/tests/serve.rs` gates its fetch and chunk-narration cases on
 # `all(feature = "local-model", feature = "fetch")`, because a default build has no transport to narrate and no runtime to embed
 # with. No other row compiles that pair for np-cli — `test-cli-vision` uses `vision`, `test-cli-realmodel` uses `local-model`
 # alone — so every one of those cases ran as its "NOT COVERAGE" stub in every graded log, and the wire-level claims about byte
@@ -105,23 +107,71 @@ RUSTDOCFLAGS="--deny warnings" row rustdoc-deny-default cargo doc --workspace --
 row_or_skip rustdoc-deny-localmodel "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model --no-deps
 row_or_skip rustdoc-deny-lm-vision "$cmake_missing" env RUSTDOCFLAGS=--deny\ warnings cargo doc -p np-core -p np-cli --features local-model,vision --no-deps
 
-S=.superpowers/sdd/2026-10-23-note-processor-m1-core-catalog
-row cfg-dead-code python3 "$S/check_cfg_dead_code.py"
-row attr-displacement python3 "$S/check_attr_displacement.py"
-row catalog-goldens python3 "$S/verify_catalog_goldens.py"
+# Path to the fence scripts, defined before the first row that needs one: `set -u` makes a use-before-definition
+# an immediate abort rather than a row that quietly exits 127 further down the log.
+G=.github/scripts
+
+# **The hand-written FFI against the header it mirrors.** `crates/np-core/src/llama_ffi.rs` declares llama.cpp's C API by
+# hand (§14 says why), so a re-pin that changes a signature produces no compile error — only behaviour nothing predicts. This
+# compares name, arity and parameter/return shape against the pinned tree's own headers, admits what it cannot compare
+# (callbacks, opaque handles) instead of passing it silently, and fails on anything else. Skips when the pinned source is not
+# on disk: `./scripts/vendor-llama-cpp.sh` once, or `NP_LLAMA_CPP_SRC`.
+llama_src="${NP_LLAMA_CPP_SRC:-$PWD/.vendor/llama.cpp-v$(sed -n 's/^tag *= *"v\{0,1\}\([^"]*\)".*/\1/p' third_party/llama-cpp.toml | head -1)}"
+decl_missing=""
+[ -d "$llama_src" ] || decl_missing="no pinned llama.cpp source at $llama_src (run ./scripts/vendor-llama-cpp.sh or set NP_LLAMA_CPP_SRC)"
+row_or_skip llama-decls "$decl_missing" env NP_LLAMA_CPP_SRC="$llama_src" python3 "$G/check-llama-decls.py"
+
+# The three static fences. They live beside this script because a gate that is not in the repository is a gate that
+# quietly stops running: these three lived in a git-ignored scratch directory, and every row here kept exiting 2 with
+# "can't open file" until somebody noticed.
+row cfg-dead-code python3 "$G/check_cfg_dead_code.py"
+row attr-displacement python3 "$G/check_attr_displacement.py"
+row catalog-goldens python3 "$G/verify_catalog_goldens.py"
+# The fences that check the fences. Each python fence carries `--self-test`: a tree of planted violations it must name,
+# one per rule it claims to enforce. A rule nobody has ever seen fail is indistinguishable from a rule someone deleted,
+# which is how three of these rows sat red for weeks with nothing but an exit code to say so.
+for fence in check-comment-only check_cfg_dead_code check_attr_displacement verify_catalog_goldens check-dates-ahead check-links check-deps check-llama-decls check-unsafe-lints; do
+  row "selftest-${fence}" python3 "$G/${fence}.py" --self-test
+done
+
 # **F31's harness arithmetic, with no binary and no model.** The metric functions are self-tested against hand-computed numbers, so
 # this row costs milliseconds and catches the one failure mode that would matter: a scoring function that quietly flatters itself (an
 # MRR computed over only the answered queries rises when recall falls). The harness's *usefulness* still needs labelled queries — see
 # `docs/design-f31-quality-harness.md`, which is written to keep that distinction visible.
-# Not `$S`: the three checkers above live under `.superpowers/sdd/…`, this one lives beside this script. The first version of
-# this row used `$S` and failed with "can't open file", which is the sound of a gate row skipping itself while still printing
-# a red exit code — better than silently passing, but only just.
-row f31-selftest python3 .github/scripts/f31_eval.py --self-test
+row f31-selftest python3 "$G/f31_eval.py" --self-test
 # **A `run:` block that is not a program bash can read.** Actions parses a step's script when the step starts, so on 2026-11-13
 # a mis-nested quote in `release.yml` was discovered by a runner — after it had compiled llama.cpp for Windows. This row costs
-# milliseconds and is the difference between that and a red local run. Not `$S`: it lives beside this script, like the self-test
-# above.
-row workflow-shells .github/scripts/check-workflow-shells.sh
+# milliseconds and is the difference between that and a red local run.
+row workflow-shells "$G/check-workflow-shells.sh"
+# **A date in the future, which is how a month gets written wrong.** A stretch of this project's prose was dated one
+# month ahead of the work it described — "while cutting v0.3.0" beside a tag dated 2026-11-09, a spec first committed
+# 2026-11-09 whose file name claimed another month — and a wrong month reads exactly like a right one, so nothing caught
+# it. This row costs milliseconds: any calendar date in a tracked file later than HEAD's own commit date is reported.
+row dates-ahead python3 "$G/check-dates-ahead.py"
+
+# **A link is a promise.** Both spellings are checked — `[text](target)` and a backticked path — because documents move
+# directories and the paths inside them do not move with them. The exclusions (sample data, archived plans, syntax written
+# inside backticks) are listed in the script and pinned by its `--self-test` row below, so they cannot quietly widen into a
+# checker that passes everything.
+row links python3 "$G/check-links.py"
+
+# **What this tree links, checked offline.** Licenses (every dependency must offer a permissive option) and one major version
+# per crate unless an exception is recorded with a reason — plus a staleness check on `docs/dependency-licenses.md`, so the
+# notices file's claim that the list is "derived, not hand-written" cannot mean "nobody regenerated it". The advisory half
+# lives in CI (`supply-chain.yml`), because RustSec's database is not readable from a machine without network.
+row deps python3 "$G/check-deps.py"
+# **Nobody may mute the unsafe lints from inside a module.** Both crates deny them at the top; this fence fails if a crate
+# stops denying either one, or if any file under `crates/` — tests included — allows one. A denial with a silent exception is
+# a denial of everything except the block that needed it.
+row unsafe-lints python3 "$G/check-unsafe-lints.py"
+
+# **A comment diet may not move a token.** Given `NP_COMMENT_BASE`, this strips the comments out of every source file the range
+# touched and compares what is left, so "only prose changed" is computed rather than asserted. Without a base it skips by name:
+# a row that quietly passes because there was nothing to compare against is the failure mode this repository keeps meeting.
+comment_base="${NP_COMMENT_BASE:-}"
+comment_missing=""
+[ -n "$comment_base" ] || comment_missing="no NP_COMMENT_BASE — set it to the revision the range starts at"
+row_or_skip comment-only "$comment_missing" python3 "$G/check-comment-only.py" "$comment_base"
 
 # The two rows that need real artifacts. They run only when the paths are set, because a vacuous pass here is the exact
 # failure mode F33's review named: green because nothing was loaded.
@@ -131,9 +181,22 @@ row_or_skip test-cli-realmodel "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p
 [ -n "${NP_TEST_MMPROJ_PATH:-}" ] || artifacts="NP_TEST_MODEL_PATH or NP_TEST_MMPROJ_PATH unset"
 row_or_skip test-core-realvision "$artifacts" env CARGO_BUILD_JOBS=2 cargo test -p np-core --features local-model,vision -- --nocapture
 
+# **AddressSanitizer over the FFI boundary.** Nearly every `unsafe` site in this tree calls into llama.cpp, so the sanitizer
+# has to be under the Rust as well as around it — which is why the row is a script that refuses to trust a cmake cache
+# (`asan-localmodel.sh`: it builds a private copy of the pinned source with sanitizer flags and checks the archives for ASan
+# symbols before running a single test). Skips, each naming what to install or export: no nightly toolchain, no `rust-src`,
+# no cmake, or no pinned llama.cpp tree.
+llama_src="${NP_LLAMA_CPP_SRC:-$PWD/.vendor/llama.cpp-v$(sed -n 's/^tag *= *"v\{0,1\}\([^"]*\)".*/\1/p' third_party/llama-cpp.toml | head -1)}"
+asan_missing=""
+[ "$have_cmake" = 1 ] || asan_missing="no cmake on PATH; set CMAKE"
+rustup toolchain list 2>/dev/null | grep -q '^nightly' || asan_missing="$asan_missing; no nightly toolchain (rustup toolchain install nightly)"
+rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src.*installed' || asan_missing="$asan_missing; no rust-src for nightly"
+[ -d "$llama_src" ] || asan_missing="$asan_missing; no pinned llama.cpp source at $llama_src (run ./scripts/vendor-llama-cpp.sh or set NP_LLAMA_CPP_SRC)"
+row_or_skip asan-localmodel-vision "$asan_missing" env NP_LLAMA_CPP_SRC="$llama_src" .github/scripts/asan-localmodel.sh
+
 # **`--exclude=driver.log`, and the reason it is a guard rather than a fix.** On a fresh log directory this cannot matter: the count
-# runs *before* the summary line is echoed, so the phrase is not in that file yet — measured on 2026-12-09, where the tally over
-# `/home/agent/tmp/gates-progress2` was 14 with and without the exclusion. It matters when a run reuses a directory holding an older
+# runs *before* the summary line is echoed, so the phrase is not in that file yet — measured on 2026-11-09, where the tally over
+# `$TMPDIR/gates-progress2` was 14 with and without the exclusion. It matters when a run reuses a directory holding an older
 # log, because the previous verdict sentence does contain the phrase; that is exactly how the v0.3.0 release notes came to publish
 # "zero" beside a tally of 1. Excluding it makes the count independent of what happened to be in the directory before.
 vacuous=$(grep -rho --exclude=driver.log 'NOT COVERAGE' "$logs" 2>/dev/null | wc -l | tr -d ' ')

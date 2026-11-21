@@ -189,15 +189,18 @@ are listed with defaults and refusal behaviour in [Configuration reference](docs
 same work as the commands, on a channel that does not fork. Ask for `notifications` in the handshake and it also narrates the slow
 parts, which is what a GUI needs while a 295 MiB model downloads:
 
+(Temp paths in the transcript below are elided to `$TMPDIR`; the rest is captured output — provenance in
+[the serve reference](docs/reference-serve.md).
+
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"/home/agent/tmp/cap/run.IaDK9X/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
+{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/run.IaDK9X/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":61}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1494}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4036}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6589}}
-{"error":{"code":-32000,"message":"cannot write /home/agent/tmp/cap/run.IaDK9X/C/data/workspaces/39e6b8caca57d6ee.models/.part.embeddinggemma-2.1323809-1794227836518406938-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
+{"error":{"code":-32000,"message":"cannot write $TMPDIR/cap/run.IaDK9X/C/data/workspaces/39e6b8caca57d6ee.models/.part.embeddinggemma-2.1323809-1794227836518406938-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
 {"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7704}}
 {"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7704,"phase":"refused","request":2},"running":null}}
 {"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":0}}
@@ -232,8 +235,8 @@ the files it can read.
 
 The whole interface — every method, every phase, four captured transcripts and a Python walkthrough including what to show after a
 page reload — is in [`docs/reference-serve.md`](docs/reference-serve.md); the reasoning is in
-[`np serve` over stdio](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) and its
-[progress design](docs/superpowers/specs/2026-12-09-np-serve-progress-design.md).
+[`np serve` over stdio](docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md) and its
+[progress design](docs/superpowers/specs/2026-11-09-np-serve-progress-design.md).
 
 Diagnostics stay off the protocol: `-v`, `NP_LOG` or `[log] level` puts human text on stderr, `[log] file` writes JSONL, and every
 record raised inside a request carries that request's id. You are not obliged to read stderr — np drops diagnostics rather than
@@ -311,11 +314,11 @@ The decisions behind those, each with its measurements:
 | [`docs/design-m2-models-install.md`](docs/design-m2-models-install.md) | What "installed" means: rows, digests, per-workspace artifacts |
 | [`docs/design-m2-image-embeddings.md`](docs/design-m2-image-embeddings.md) | R7c: media tables, discovery and sniffing, the vision seam, §8's refusal classes, §14's measured numbers |
 | [`docs/design-m2-thread-policy.md`](docs/design-m2-thread-policy.md) | The `"auto"` worker rule and the measurements behind it |
-| [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-12-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
+| [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
 | [`docs/design-f48-links-as-a-query.md`](docs/design-f48-links-as-a-query.md) | What a client may assume about link identity: display paths and lines, what `rel` scopes, and why figures and stale notes are absent from `links.list` |
 | [`docs/design-f50-consent-has-a-door.md`](docs/design-f50-consent-has-a-door.md) | Who may write `config.toml`, and how the write is checked: validation by loading, refusal over half-configuration, provenance in the file |
 | [`docs/design-f49-word-beginnings.md`](docs/design-f49-word-beginnings.md) | What a query may ask for besides a whole word: the one character of syntax, why the default did not move, and how an answer admits it widened |
-| [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
+| [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/archive/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
 
 Code comments carry the local reasoning; those files carry the decisions and the measurements.
 
@@ -324,7 +327,7 @@ Repository layout: `crates/np-core` (discovery, parsing, links, catalog, databas
 
 ## License
 
-MIT — [`LICENSE`](LICENSE), adopted 2026-12-08. Both release archives carry it beside the binary, and
+MIT — [`LICENSE`](LICENSE), adopted 2026-11-08. Both release archives carry it beside the binary, and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) carries the verbatim MIT text for the llama.cpp / ggml code statically linked in,
 plus exactly which archives are linked — because that obligation attaches to the artefact you download, not to the repository it came
 from. Model weights are a separate matter and are not redistributed: `embeddinggemma-2` is fetched on your explicit action,
