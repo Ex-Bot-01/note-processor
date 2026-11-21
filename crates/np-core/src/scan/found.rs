@@ -191,7 +191,7 @@ fn read_one(file: &DiscoveredFile) -> Found {
 /// replacement characters instead of a failed scan. `true` means the text is lossy.
 ///
 /// The BOM has to go before [`parse_markdown`] sees the text, or a Windows export whose first line is
-/// `\u{feff}---` loses its frontmatter block and with it its title (ruling from Task 6). Only the copy
+/// `\u{feff}---` loses its frontmatter block and with it its title — a deliberate ruling, not an oversight. Only the copy
 /// used for parsing is stripped — see [`read_one`] for the bytes that are hashed.
 fn decode(bytes: &[u8]) -> (String, bool) {
     let text = bytes.strip_prefix(BOM).unwrap_or(bytes);

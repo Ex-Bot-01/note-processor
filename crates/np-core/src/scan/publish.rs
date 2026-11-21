@@ -124,7 +124,7 @@ pub(crate) fn write_index_files(
 /// separating an edited shard from a hand-written note would mean rendering the corpus and comparing
 /// bytes, the guess the fingerprint exists to avoid — so the header decides, not who typed the body.
 /// `a_hand_written_file_carrying_our_header_under_a_generated_name_is_deleted` pins that as intended
-/// behaviour, and `docs/backlog-m2-followups.md` records it as an accepted residual.
+/// behaviour, and it stands as an accepted residual.
 ///
 /// A `meta` name no longer on disk appears in neither list. Its absence is already the state this call
 /// wanted — which is exactly how the delete loop in [`write_index_files`] reads an

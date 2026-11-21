@@ -727,7 +727,7 @@ impl NoProvider {
     ///
     /// `workspace` is a parameter because the remedy pastes argv a human can run, and argv needs the workspace — the same
     /// reason [`install_hint`] takes it. Every sentence here is asserted to stay one line and free of double spaces:
-    /// Task 6 shipped a search refusal that wrapped mid-sentence and printed twenty spaces between two words.
+    /// An earlier release shipped a search refusal that wrapped mid-sentence and printed twenty spaces between two words.
     pub fn sentence(&self, workspace: &Path) -> String {
         match self {
             Self::ConfigDisabled => concat!(

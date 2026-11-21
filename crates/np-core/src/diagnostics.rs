@@ -1,6 +1,6 @@
 //! The published diagnostics vocabulary: the targets an event can name and the rule tokens it can report.
 //!
-//! Design: `docs/superpowers/specs/2026-11-09-np-diagnostics-design.md` §1 (contract), §4 (levels), §12 (privacy).
+//! Three things bind this vocabulary: it is a contract, its levels are bounded, and it never names an origin.
 //! This module holds **names only** — no formatting, no sink, no subscriber. Choosing a subscriber and writing to
 //! stderr or a file is np-cli's job ([`np_cli::diag`](../../np_cli/diag/index.html)); np-core emits events against the
 //! names here and nothing else, which is what lets a library embed in a process that has its own logging.
@@ -9,7 +9,7 @@
 //!
 //! A rule token is an interface: an integrator's alerting rule matches on it. Interfaces rot when their list lives in a
 //! document nobody edits, so `RULE_TOKENS` and `TARGETS` are what the documentation test compares the manual against
-//! (`crates/np-cli/tests/diag.rs`, plan Task 6 Step 2) and what every emitted token is checked to belong to here. Adding
+//! (`crates/np-cli/tests/diag.rs`) and what every emitted token is checked to belong to here. Adding
 //! an event without adding its token therefore fails a test, in this crate or the one that documents it.
 //!
 //! # What a rule token is *not*
@@ -23,7 +23,7 @@
 /// The ten targets, in the order the design lists them: one per module whose failures a reader needs to tell apart.
 ///
 /// A target is set with `tracing`'s `target:` field at the emission site. Filtering by target is how an operator says
-/// "only the fetcher" (`NP_LOG=fetch=debug`, plan Task 5), so the ten names are stable strings, not a module path
+/// "only the fetcher" (`NP_LOG=fetch=debug`), so the ten names are stable strings, not a module path
 /// derived from `module_path!()`: renaming a module must not silently rename a published filter.
 pub const TARGETS: [&str; 10] = [
     target::CONFIG,
@@ -67,7 +67,7 @@ pub mod target {
 /// Sites reference these constants rather than repeating literals, so a token cannot be emitted by one call site and
 /// documented under another spelling.
 pub mod rule {
-    /// A `config.toml` was refused; the command may still serve from defaults (**F35**).
+    /// A `config.toml` was refused; the command may still serve from defaults.
     pub const CONFIG_REFUSED: &str = "config-refused";
     /// Embeddings are switched off — `embeddings.provider = "none"`, or a key that names no provider.
     pub const PROVIDER_DISABLED: &str = "provider-disabled";
@@ -75,7 +75,7 @@ pub mod rule {
     pub const LOCAL_MODEL_NOT_BUILT: &str = "local-model-not-built";
     /// A row names an artifact the disk does not have.
     pub const ARTIFACT_MISSING: &str = "artifact-missing";
-    /// A transfer was allowed and attempted, and the transport said no connection (**F38**).
+    /// A transfer was allowed and attempted, and the transport said no connection.
     pub const OFFLINE: &str = "offline";
     /// Work was asked for and a run finished without producing it — arm (iv), the failure half of `np embed`.
     pub const NOT_PRODUCED: &str = "not-produced";
@@ -96,7 +96,7 @@ pub mod rule {
     /// a reader that sees vectors where it saw none last run needs to know which run made them.
     pub const ARTIFACT_FETCHED: &str = "artifact-fetched";
 
-    // ---- scan: one token per reason a file on disk was not indexed (**design §1 point 4**, plan Task 4).
+    // ---- scan: one token per reason a file on disk was not indexed.
     //
     // `ScanReport::skipped` merges several of these into one list of paths, and two of them (`not-markdown`,
     // `unchanged-content`) were never in it at all: they are not failures, so prose had no reason to name them. The
@@ -123,7 +123,7 @@ pub mod rule {
     /// Another path already holds this note identity (case-folded collision), so this file kept no new rows and its
     /// existing note was left exactly as it was.
     pub const IDENTITY_TAKEN: &str = "identity-taken";
-    /// More than one note row sits on this path's key — the legacy duplicate F13 §7 refuses to guess about — so no note
+    /// More than one note row sits on this path's key — a legacy duplicate this program refuses to guess about — so no note
     /// was re-parsed and nothing about its contents was rewritten.
     pub const DUPLICATE_ROWS: &str = "duplicate-rows";
 }

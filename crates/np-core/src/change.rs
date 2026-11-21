@@ -32,7 +32,7 @@ pub enum Change {
 /// Output is one entry per path, sorted by byte key ascending, where the key is the path as it reads
 /// **now** — so a move is reported once, on its new path, and never also as a `Removed`. Each entry
 /// names its path as a [`RelPath`], because this list carries an identity decision into the write pass:
-/// text alongside for the report, bytes for everything that has to find the row (F13 §4.1).
+/// text alongside for the report, bytes for everything that has to find the row.
 ///
 /// Matching uses `case_sensitive` to pick the identity: `true` (Linux, macOS) keys on
 /// `rel`, `false` (Windows) keys on `case_key`. It is an argument rather than a
@@ -135,7 +135,7 @@ pub fn classify_with_identities(
         }
     }
 
-    // Identity pairing (design-a4 §3), and it runs **here, over the leftovers only**, not as a first route.
+    // Identity pairing, and it runs **here, over the leftovers only**, not as a first route.
     // A row whose own path was listed matched that path positionally above and is not eligible for anything; a
     // listed file already consumed by such a match must not be paired again, however uniquely its id reads —
     // pairing it would put two known rows on one file, which is the duplicate this whole item exists to remove.
@@ -219,7 +219,7 @@ pub fn classify_with_identities(
 /// The identity a path is matched on: its exact bytes where the filesystem keeps two names that differ
 /// only in ASCII case, the ASCII fold of those bytes where it keeps one file.
 ///
-/// Bytes, not display text (F13 §4.1): `caf\xe9.md` and `caf\xe8.md` spell themselves identically once
+/// Bytes, not display text: `caf\xe9.md` and `caf\xe8.md` spell themselves identically once
 /// decoded, so a `&str` key here is where a twin pair used to die — one bucket, one positional pair,
 /// one file dropped.
 fn key_of(snapshot: &Snapshot, case_sensitive: bool) -> &[u8] {
@@ -296,7 +296,7 @@ fn closest_to<'a>(candidates: &[&'a Snapshot], added: &Snapshot) -> Option<&'a S
 }
 
 /// Which leftovers the OS says are one and the same file — computed **once** per scan, from every row and every
-/// listed path, and shared by both places that consult it (design-a4 §3, §4).
+/// listed path, and shared by both places that consult it.
 ///
 /// An identity is *eligible* when exactly one known row carries it and exactly one listed path carries it, and no
 /// other listed path does. Anything else abstains: two rows on one id means a hard link or a corrupted registry,
@@ -330,7 +330,7 @@ impl FileIdentities {
     /// the whole workspace — an id carried by a second row has to disqualify the pairing even when that row is out
     /// of scope. `in_scope` decides which rows may be paired at all, and belongs to the caller: the population this
     /// feature is scoped to (display-derived keys) is derived from a predicate in `scan.rs`, and moving it here
-    /// would widen a public API to serve one call site (design-a4 §3).
+    /// would widen a public API to serve one call site.
     pub fn build(
         all_known: &[Snapshot],
         all_listed: &[Snapshot],
@@ -357,7 +357,7 @@ impl FileIdentities {
                 continue;
             }
             // Two-sided uniqueness, checked once here so that admission and pairing cannot disagree about who is
-            // eligible — the coupling design-a4 §3 names. A row admitted without a partner would have its
+            // eligible — the coupling that pairing exists to keep. A row admitted without a partner would have its
             // `Removed` stripped and gain no `Moved`: permanent duplicate plus permanent charge forever.
             if known_count.get(id.as_slice()) != Some(&1) {
                 continue;

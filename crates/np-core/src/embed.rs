@@ -810,7 +810,7 @@ impl Embedder for LocalModelProvider {
     ///
     /// Overriding is not cosmetic. The trait's default refuses too, but with "this provider cannot embed a search query",
     /// which reads as a capability the seam lacks rather than the one fact a reader can act on — that this binary was
-    /// compiled without the runtime. Task 6 review P1.
+    /// compiled without the runtime.
     fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
         Err(EmbedError::RuntimeNotBuilt {
             model_id: self.model_id.clone(),

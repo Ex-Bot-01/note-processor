@@ -2,7 +2,7 @@
 //!
 //! Three steps, three functions: [`extract_links`] turns note text into [`RawLink`]s, [`resolve`]
 //! places each target in the corpus without ever guessing, and [`store_links`] writes the rows
-//! Task 9 counts as `→out ←in` and Task 10 reports as `unresolved_links`.
+//! The catalog renders them as `→out ←in`; the scan report counts them as `unresolved_links`.
 //!
 //! Two rules hold the module together.
 //!
@@ -560,7 +560,7 @@ fn basename_index(corpus: &BTreeMap<String, Vec<RelPath>>) -> HashMap<String, Ve
 const INSERT_LINK: &str = "INSERT INTO links (src_note_id, dst_note_id, kind, target, line, origin)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
-/// Write the link rows Task 9 counts and Task 10 reports.
+/// Write the link rows the catalog renders and the scan report counts.
 ///
 /// Source and destination become note ids through `notes.rel_bytes`, because a move rewrites a path and
 /// not a note — the id is what keeps a link attached across a rename ([`crate::db`]) — and because display
@@ -573,7 +573,7 @@ const INSERT_LINK: &str = "INSERT INTO links (src_note_id, dst_note_id, kind, ta
 ///   parsed — lands in that same NULL state, because there is genuinely no note on the other end.
 ///
 /// Both mean `unresolved` to [`crate::db::note_counts`], whose `unresolved_links` counts every NULL
-/// destination at database level; `ScanReport::unresolved_links` (Task 10) counts only the
+/// destination at database level; `ScanReport::unresolved_links` counts only the
 /// non-attachment ones, since that number is the "notes I could not place" signal. The two are
 /// different questions and must not be compared with each other.
 ///
@@ -582,7 +582,7 @@ const INSERT_LINK: &str = "INSERT INTO links (src_note_id, dst_note_id, kind, ta
 ///
 /// Nothing is deleted — storing twice writes twice. The caller owns replacement, so a re-parse has
 /// to drop that note's `origin = 'prose'` rows in the same transaction before calling this again
-/// (Task 10), or every scan duplicates its links.
+/// on the report, or every scan duplicates its links.
 ///
 /// `origin` is written verbatim into `links.origin` and so has to be one of the schema's spellings,
 /// `prose` or `approved`; anything else is refused by the CHECK constraint and returned as

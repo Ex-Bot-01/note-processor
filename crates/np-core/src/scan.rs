@@ -120,7 +120,7 @@ pub enum ScanError {
     },
 }
 
-/// How many names [`ScanReport::attachment_examples`] may hold (**issue #12**).
+/// How many names [`ScanReport::attachment_examples`] may hold.
 ///
 /// Five because it is what a summary line can carry without turning into a file listing, and because the number
 /// beside it answers the question a caller actually asks. The count is never capped with the names.
@@ -153,7 +153,7 @@ pub struct ScanReport {
     /// `crates/np-core/tests/walk.rs` pins the behaviour. A later change replaced that byte spelling with
     /// [`crate::path_keys::wtf8`], so a Windows refusal's identity bytes carry the lone surrogate itself and two such
     /// names produce **two** lines here; `tests/walk.rs` now pins those six bytes instead, on the Windows row that first
-    /// ran and caught the stale pair of them (issue #9). A key that is genuinely lossy still exists — a row
+    /// ran and caught the stale pair of them. A key that is genuinely lossy still exists — a row
     /// whose key migration 4 derived from display text, or an entry that only ever existed as text and reached the report
     /// through `UnknownPath::from_display` (private, so named rather than linked) — and *those* collapse, which is what the sentence
     /// should have been about.
@@ -162,7 +162,7 @@ pub struct ScanReport {
     pub skipped: Vec<String>,
     /// Live note rows — the same number of entries the catalog holds.
     pub notes: i64,
-    /// Live tracked files that are **not** notes (**issue #12**): every `.txt`, `.org`, `.png` and `.pdf` the walk
+    /// Live tracked files that are **not** notes: every `.txt`, `.org`, `.png` and `.pdf` the walk
     /// found, hashed and listed but never parsed, so search cannot reach any of them.
     ///
     /// This exists because the distinction was otherwise invisible from outside. A front end that read `added: 5`
@@ -174,7 +174,7 @@ pub struct ScanReport {
     /// bucket. Unlike [`Self::added`] this describes the **workspace**, like [`Self::notes`], not this run's delta.
     pub attachments: i64,
     /// Up to [`ATTACHMENT_EXAMPLE_LIMIT`] of [`Self::attachments`], sorted by path bytes and printed as display
-    /// text — names, not a sample chosen for variety (**issue #12**). Capped because the list is "everything else in
+    /// text — names, not a sample chosen for variety. Capped because the list is "everything else in
     /// the folder": a vault holding 300 PDFs pays for five strings per scan rather than three hundred, and
     /// [`Self::attachments`] stays exact whatever the cap prints.
     pub attachment_examples: Vec<String>,
@@ -564,7 +564,7 @@ fn scan_inner(
     // print the names directly under the number.
     let unresolved = unresolved_links(&db)?;
     let targets = db::unresolved_targets(&db)?;
-    // Read beside `notes`, from the same predicate as its names, so the two counts describe one walk (**issue #12**).
+    // Read beside `notes`, from the same predicate as its names, so the two counts describe one walk.
     let attachments = db::attachments(&db, ATTACHMENT_EXAMPLE_LIMIT)?;
     let previous = index_list(&db)?;
     // Rendering is pure, so the set this scan is about to publish is known here — and `meta` records it

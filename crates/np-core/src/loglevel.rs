@@ -2,7 +2,7 @@
 //!
 //! llama.cpp writes its load transcript to stderr through a process-global sink, and v0.8.0's own header says what happens when nobody
 //! installs one: “If this is not called, or NULL is supplied, **everything** is output on stderr” (`include/llama.h:1672-1676`). On a
-//! healthy run that is roughly 120 lines ahead of a one-line answer — `docs/design-f33-llama-log-level.md` §1 measures it for both
+//! healthy run that is roughly 120 lines ahead of a one-line answer, measured on both knobs
 //! commands. This module decides *which* of those lines a user asked to see. It decides; it never writes anything and never installs a
 //! callback.
 //!
@@ -96,7 +96,7 @@ impl LogLevel {
     ///   `llama_model_default_params()`, so llama.cpp installs its own progress callback and that callback's entire output is `.` at
     ///   `CONT` (`src/llama.cpp:413-423`). Forwarding a fragment of a line whose opening was filtered out would print half a sentence, so a
     ///   continuation is treated as informational: visible when informational output is wanted, silent otherwise. This is a decision
-    ///   (design §4), not a fact from the header.
+    ///   as this program defines them, not a fact from the header.
     /// * **An unrecognised number forwards nothing.** A level this file has never seen is a reason to write nothing rather than to guess;
     ///   inventing a line on someone's stderr is not a safe default, and if upstream renumbers, silence in an unexpected row is what makes
     ///   `tests/loglevel.rs` fail loudly instead of quietly leaking the transcript.
@@ -161,10 +161,11 @@ impl FromStr for LogLevel {
 /// [`DEFAULT_LEVEL`] applies only when both are silent.
 ///
 /// This is this program's one existing config-versus-environment rule — `Config::load` states it for `data_dir`, every `[models]` key
-/// follows it, and §12 rule 7 of the M2 design says the environment “supplies a key the file left unset — never an override of a file that
+/// follows it, and the same words bind both: the environment “supplies a key the file left unset — never an override of a file that
 /// names one”. That rule was amended by the human, so a diagnostic hatch does not get to invent an exception to it: what
 /// [`LEVEL_ENV_VAR`] buys is a level without editing a file, not a way to outvote a file that named one. An earlier draft of
-/// `docs/design-f33-llama-log-level.md` said the opposite and cited this very rule as its precedent; review caught the contradiction.
+/// An earlier draft of the design for this knob said the opposite and cited this very rule as its precedent;
+/// review caught the contradiction.
 ///
 /// A value that is not one of [`LEVEL_NAMES`] refuses **even when the file would have won**, for the reason `[models]` gives: a mistyped
 /// hatch should be visible rather than silently meaning “whatever the file said”. An *empty* value counts as unset, which is also
