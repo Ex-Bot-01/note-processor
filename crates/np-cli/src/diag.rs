@@ -722,7 +722,7 @@ pub(crate) fn bootstrap(
     // Phase two must resolve with this string or the flag is inert (see [`Sink::flag`]).
     sink().remember_flag(flag.as_deref());
     // The `[log]` table is **peeked** here — read leniently, ignoring a file that refuses for any other reason — because the
-    // level announced on stderr has to be the answer that is *final*, and the file outranks the environment (§12 rule 7).
+    // level announced on stderr has to be the answer that is *final*, and the file outranks the environment.
     // Without the peek, `NP_LOG=trace` next to `[log] level = "info"` would announce `trace from NP_LOG` and then quietly run
     // at info: precisely the invisibility the announce line exists to remove. The second benefit is the one spec point 3 asks
     // for — a config that refuses for an unrelated reason still says where its diagnostics go.

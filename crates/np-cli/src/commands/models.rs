@@ -400,7 +400,7 @@ pub(crate) fn models_install_member(
     Ok(())
 }
 
-/// `np models hash <file>` — `<sha256>  <path>`, the two-space spelling `sha256sum` writes, so the first field
+/// `np models hash <file>` — `<sha256> <path>`, the two-space spelling `sha256sum` writes, so the first field
 /// pastes straight into `install --sha256`.
 ///
 /// No database and no digest of its own: [`sha256_file`] streams the file and returns lowercase hex, which is
