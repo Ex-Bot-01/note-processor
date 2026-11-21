@@ -80,7 +80,7 @@ pub const MAX_CONTINUATION_INDENT: usize = 16;
 
 /// `[embeddings] max_tokens` when the key is absent (`docs/design-m2-local-embeddings.md` §5).
 ///
-/// The default is a *budget*, not a target: an over-budget chunk is reported, never truncated (§5), so the
+/// The default is a *budget*, not a target: an over-budget chunk is reported, never truncated, so the
 /// number has to sit above what the chunker normally produces while still being a fence. **1,024** is the human's
 /// decision of 2026-10-30 (design §5, "decision B"), taken from R6b2's measured cost curve rather than from an
 /// argument: at ~120–141 tokens/s a 1,024-token chunk is **~8 s** of CPU on this host — interpolated between the
@@ -97,7 +97,7 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
 /// Largest `embeddings.max_tokens` a config file may ask for: **8,192 tokens**, which is the width of the context
 /// this build asks llama.cpp for (`local_model::REQUESTED_CTX`), not a fact about any model card.
 ///
-/// **Set by the human on 2026-10-30, superseding the same day's §5 option B (4,096) with option C.** What did not
+/// **Set by the human, superseding the same day's §5 option B (4,096) with option C.** What did not
 /// change is the rule that made B worth having: **the ceiling equals the window this build creates**, so a config
 /// value near the ceiling describes something the runtime can actually do. Raising the number alone would have
 /// re-opened the exact defect B closed — `max_tokens = 8192` parsing happily and then being refused by a different
@@ -117,7 +117,7 @@ pub const DEFAULT_EMBEDDING_TOKENS: usize = 1_024;
 ///   context, which is the A1 review P1-1 pair this build now checks in Rust too.
 ///
 /// Earlier versions of this constant cited Google's `embeddinggemma-2` card (8,192) and before that
-/// `max_position_embeddings = 262144`, a RoPE/train-length property the design disowned (§5). Both were the wrong
+/// `max_position_embeddings = 262144`, a RoPE/train-length property the design disowned. Both were the wrong
 /// *kind* of authority: what a model was trained on says nothing about what one embedding run can hold. The card's
 /// number is now recorded in §5 as context for a long-note experiment, not as a bound we enforce.
 ///
@@ -333,8 +333,8 @@ impl ThreadCount {
     /// The count to ask for on a machine where `available_parallelism()` answered `available`.
     ///
     /// ```text
-    /// auto  →  min(available, max(min(available, 4), floor(0.8 × available)))
-    /// n     →  n
+    /// auto → min(available, max(min(available, 4), floor(0.8 × available)))
+    /// n → n
     /// ```
     ///
     /// Each bound is a measurement rather than a preference (`docs/design-m2-thread-policy.md` §2):
@@ -465,7 +465,7 @@ impl<'de> serde::Deserialize<'de> for ThreadCount {
 #[serde(rename_all = "kebab-case")]
 pub enum EmbeddingProvider {
     /// No provider: nothing is embedded, downloaded or contacted. **The default**, and the shipping
-    /// behaviour for anyone who has not chosen a model (§2) — not a stub awaiting a real one.
+    /// behaviour for anyone who has not chosen a model — not a stub awaiting a real one.
     #[default]
     None,
     /// A model running inside this process (`local-model`). `np-cli`'s `embed_provider` is what turns this value into a
@@ -477,7 +477,7 @@ pub enum EmbeddingProvider {
     ///
     /// Refused at [`Config::load`] unless [`EmbeddingsConfig::model`] names something `np models install`
     /// would accept — a local provider with no identity has nothing to write `embeddings.model` under, and
-    /// guessing one would be a second source of model identity (§4).
+    /// guessing one would be a second source of model identity.
     LocalModel,
     /// An OpenAI-compatible HTTP endpoint. **Kept parseable and refused at [`Config::load`]**, because
     /// embeddings are local now: `docs/design-m2-embeddings.md` §10 records that the self-hosted server
@@ -519,7 +519,7 @@ pub struct EmbeddingsConfig {
     /// Which provider to ask. Absent means [`EmbeddingProvider::None`].
     pub provider: EmbeddingProvider,
     /// Model identity as the provider will name it (`embeddinggemma-2-text@1`-shaped), i.e. what
-    /// `models.id` and `embeddings.model` will hold (§3).
+    /// `models.id` and `embeddings.model` will hold.
     ///
     /// **Nothing reads this yet, and that is the state of Round 3a rather than an oversight:** the
     /// provider that would put a value here into a database row arrives with the scan wiring. It lives
@@ -586,7 +586,7 @@ impl Default for EmbeddingsConfig {
 /// Status markers (spec §8.7). Stored exactly as written here; later tasks match
 /// them case-insensitively against the lowercased line.
 ///
-/// `deny_unknown_fields` for the same reason and by the same rule as [`CatalogConfig`] (F35): a marker list that
+/// `deny_unknown_fields` for the same reason and by the same rule as [`CatalogConfig`]: a marker list that
 /// silently failed to arrive does not look wrong on the file — it looks like a corpus with no done items.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -638,7 +638,7 @@ fn marker_list(markers: &[&str]) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchConfig {
-    /// Which lists a query may consult. Absent means [`SearchMode::Hybrid`](crate::search::SearchMode::Hybrid) — the default the human chose on 2026-11-07,
+    /// Which lists a query may consult. Absent means [`SearchMode::Hybrid`](crate::search::SearchMode::Hybrid) — the default the human chose,
     /// with `semantic` and `keyword` one key away for anyone who wants one list alone. A value outside those three words is
     /// refused at parse time (F35's rule), naming what it expected rather than falling back.
     pub mode: crate::search::SearchMode,
@@ -708,9 +708,9 @@ pub struct Config {
     /// Status markers.
     pub markers: MarkerConfig,
     /// Embedding provider choice. An absent `[embeddings]` section is `provider = "none"`, which is
-    /// the default and not a degraded state (§2).
+    /// the default and not a degraded state.
     pub embeddings: EmbeddingsConfig,
-    /// Fetch source and the digest override (§12 rule 7). An absent `[models]` section names neither, which is the
+    /// Fetch source and the digest override. An absent `[models]` section names neither, which is the
     /// shipped state: nothing to fetch from, and the pin stands.
     pub models: ModelsConfig,
     /// Ranking choice for `np search`. An absent `[search]` section means hybrid, which is the default rather than a
@@ -750,7 +750,7 @@ impl Config {
     /// only changes the keys it spells out; unparsable content is
     /// [`ConfigError::Parse`], which names the file it refused.
     ///
-    /// **Every key in the file must be one this build knows** (F35): all five containers — [`Config`] itself,
+    /// **Every key in the file must be one this build knows**: all five containers — [`Config`] itself,
     /// [`CatalogConfig`], [`MarkerConfig`], [`EmbeddingsConfig`], [`ModelsConfig`] — carry
     /// `deny_unknown_fields`, so an unknown key or an invented section is [`ConfigError::Parse`] naming the file,
     /// the line and the key as written. Before F35 only `[embeddings]` and `[models]` refused anything, which
@@ -1197,7 +1197,7 @@ pub fn declared_data_dir(path: &Path) -> Option<PathBuf> {
 ///   a picker's path, which holds no `..`.
 ///
 /// **What it costs.** A workspace first indexed under a spelling this function now rewrites — a trailing
-/// separator, or a `.` (`np scan .`) — keys elsewhere after the change, so its index and its model cache
+/// separator, or a `.` (`np scan.`) — keys elsewhere after the change, so its index and its model cache
 /// start empty: one `np scan` and, if vectors were wanted, one `np embed`. Nothing is lost (the old files
 /// stay under the old key) and a clean spelling such as `/home/ana/notes` hashes exactly as it did before,
 /// which `crates/np-core/tests/config.rs::a_clean_spelling_keys_where_it_did_before` pins by digest.
@@ -1507,7 +1507,7 @@ pub const DIAG_DEFAULT_LEVEL: Level = Level::Warn;
 ///
 /// **`RUST_LOG` is deliberately not honoured**, even though every reader of this line knows it. Two variables with opposite
 /// precedence orders in one binary is a support story nobody wins: `RUST_LOG` follows the ecosystem's env-beats-file rule, and
-/// this program's house rule (§12 rule 7) is file-beats-env, pinned for the other log knob at [`crate::loglevel::resolve_level`]
+/// this program's house rule is file-beats-env, pinned for the other log knob at [`crate::loglevel::resolve_level`]
 /// and by `crates/np-cli/tests/cli.rs`. One variable, one order, documented in `docs/reference-diagnostics.md`.
 pub const DIAG_ENV_VAR: &str = "NP_LOG";
 
@@ -1718,7 +1718,7 @@ impl DiagSource {
 ///
 /// Two rules travel with the order, both inherited rather than invented here:
 ///
-/// * **The file outranks the environment** (§12 rule 7, amended by the human on 2026-11-04 and already pinned for
+/// * **The file outranks the environment** (§12 rule 7, amended by the human and already pinned for
 ///   `[embeddings] log_level` at [`crate::loglevel::resolve_level`] / `crates/np-cli/tests/cli.rs`). What [`DIAG_ENV_VAR`]
 ///   buys is a level without editing a file, not a way to outvote a file that named one.
 /// * **Every present value is parsed, even a losing one.** A bad `NP_LOG` refuses even when the file would have won, because a
@@ -1750,7 +1750,7 @@ pub fn resolve_diag(
         .map(|value| parse_named(value, DIAG_CONFIG_KEY))
         .transpose()?;
 
-    // Chosen in precedence order: the flag is this run's word, the file outranks the environment (§12 rule 7), and the
+    // Chosen in precedence order: the flag is this run's word, the file outranks the environment, and the
     // environment speaks only where both above it are silent.
     Ok(from_flag
         .map(|spec| (spec, DiagSource::Flag))

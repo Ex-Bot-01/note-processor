@@ -22,7 +22,7 @@ use crate::db::{self, Db, DbError};
 use crate::embed::{EmbedError, Vector, COMPONENT_BYTES};
 use crate::media;
 
-/// What a hit is: a note's prose, or an image a note links (§12).
+/// What a hit is: a note's prose, or an image a note links.
 /// What a hit points at.
 ///
 /// The derive order (`Note`, `Image`) is the search tie-break's last resort after path and stored bytes, so it is part of the
@@ -67,7 +67,7 @@ pub struct Hit {
     /// For an image this is the lexicographically smallest `media_path.rel_bytes` holding those bytes, so one figure
     /// copied to three folders names one path and answers once (§6's content-identity rule).
     pub path: String,
-    /// The note to open: the lexicographically smallest **live** note linking that path (§6) — which is to say,
+    /// The note to open: the lexicographically smallest **live** note linking that path — which is to say,
     /// [`Hit::linked_notes`]`[0]`, assembled by the one constructor that builds an image hit and never chosen
     /// independently. (That constructor is private on purpose, so this says what it is rather than linking to it.)
     ///
@@ -75,7 +75,7 @@ pub struct Hit {
     /// spelling of a figure's name in `links.target` is a lossy decode of bytes that never round-trip. Undercounting a
     /// linker is a reportable fact; inventing one is not.
     pub source_note: Option<String>,
-    /// Every live note linking this image, byte-ordered — the relation itself rather than a sample of it (F28).
+    /// Every live note linking this image, byte-ordered — the relation itself rather than a sample of it.
     ///
     /// **Why this exists next to the two fields above.** §6 picked one note because a text line has one column, and
     /// `linked_from` counted the rest; together they answered "how many" and "open this", and discarded everything in
@@ -267,7 +267,7 @@ pub fn search(
         // **Which kind is indexed is not a question search asks.** It never embeds anything itself, so it can only answer
         // from the half that is indexed — note-only, image-only, or both — and that is exactly why every [`Hit`] carries a
         // `kind`. What is still worth distinguishing is *whose* vectors they are: nothing indexed anywhere is a fact the
-        // caller prints and exits 0 (§12), while an index that holds vectors under some other id means this command was
+        // caller prints and exits 0, while an index that holds vectors under some other id means this command was
         // pointed at a model nobody embedded, which is a refusal.
         if any_vectors_exist(conn)? {
             return Err(SearchError::NoVectorsForModel {
@@ -560,7 +560,7 @@ fn media_report(
         return Ok(None);
     };
     // Every path those bytes were seen at contributes its linkers: one figure copied to two folders, linked from three
-    // notes, is one hit with `linked_from: 3` (§6), not two hits with 2 and 1.
+    // notes, is one hit with `linked_from: 3`, not two hits with 2 and 1.
     let mut notes: BTreeSet<Vec<u8>> = BTreeSet::new();
     for path in &paths {
         if let Some(holders) = linkers.get(path) {
@@ -636,7 +636,7 @@ pub enum SearchMode {
     Semantic,
     /// SQLite `bm25()` over note titles and bodies only. Answers with no model installed, and never returns a figure.
     Keyword,
-    /// Both lists, fused by rank (§4). The default the human chose on 2026-11-07.
+    /// Both lists, fused by rank. The default the human chose.
     Hybrid,
 }
 
@@ -765,7 +765,7 @@ const SEMANTIC_WITHOUT_VECTORS_SENTENCE: &str = concat!(
 
 // **F45's sentences, one pair per state that names a command.** Same rule `NO_VECTORS_SENTENCE` follows and for the same reason:
 // a build that compiled the HTTP client out must not send its reader to `np models fetch`, so each of these exists twice and the
-// wording a binary prints is wording that binary can honour. None of them names a host (§12 rule 8), and none of them tells the
+// wording a binary prints is wording that binary can honour. None of them names a host, and none of them tells the
 // reader to run something that would not help: `ProviderDisabled` says *configure*, never *download*.
 #[cfg(feature = "fetch")]
 const PROVIDER_DISABLED_SENTENCE: &str = concat!(
@@ -893,7 +893,7 @@ impl RankNote {
     /// a reader should see one record.
     ///
     /// `ArtifactFetched` is the one note that is not a degradation — an artifact arrived — so it reports at `info`. The
-    /// rest say a half of the answer is missing, which is a state to fix: `warn` (§4).
+    /// rest say a half of the answer is missing, which is a state to fix: `warn`.
     pub fn report(&self, model: Option<&str>) {
         let rule = self.diag_rule();
         let what = model.unwrap_or("the semantic half");
@@ -972,7 +972,7 @@ const MAX_QUERY_TERMS: usize = 32;
 /// way to *ask* — the gap issue #6 named, where `grand` could not reach `grandma` by any route at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefix {
-    /// Only a term the caller **marked** is a prefix: a trailing `*`, as in `np search . "grand*"`. The default, because a
+    /// Only a term the caller **marked** is a prefix: a trailing `*`, as in `np search. "grand*"`. The default, because a
     /// query nobody marked contains no prefix term and keeps matching exactly what it matched before — the README's
     /// "no stemming" rule still describes every unmarked word.
     #[default]
@@ -1171,8 +1171,8 @@ fn keyword_planned(conn: &Db, plan: &Plan, limit: usize) -> Result<Vec<KeywordHi
     Ok(hits)
 }
 
-/// The reciprocal-rank constant the fusion is defined with (§4). Not tuned here — there is no labelled set to tune against
-/// (F31), and inventing a number this repository cannot measure would be the worse invention.
+/// The reciprocal-rank constant the fusion is defined with. Not tuned here — there is no labelled set to
+/// tune against, and inventing a number this repository cannot measure would be the worse invention.
 const RRF_K: f64 = 60.0;
 
 fn rrf(rank: usize) -> f64 {

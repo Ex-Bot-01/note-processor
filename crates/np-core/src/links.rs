@@ -722,7 +722,7 @@ pub enum LinkScope<'a> {
 ///   reads prose, because an `approved` edge is a claim a human made about a note that may no longer exist. One rule
 ///   everywhere is what lets `np scan --json`'s number and this list be read side by side.
 /// * **Attachments appear in neither list.** A figure's `target` is relative to the linking note's directory and arrives
-///   in TEXT already lossy-decoded (§6), so this table cannot say whether a figure exists, let alone where it moved.
+///   in TEXT already lossy-decoded, so this table cannot say whether a figure exists, let alone where it moved.
 ///   "Which notes embed this figure" is answered by [`crate::search`]'s `linked_notes`, which re-runs the one resolution
 ///   rule that can — and a rename tool that needs figure edges must go through that rule rather than guessing here.
 /// * **The source note has to be live.** `files.state = 'stale'` is history np keeps on purpose, and a scan's unresolved

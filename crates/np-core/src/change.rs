@@ -2,7 +2,7 @@
 //!
 //! Two rules decide everything here. `size` + `mtime` is only the **cheap trigger** that
 //! says whether to look closer; the content hash is the **identity** that says what
-//! happened (spec §2). And a path whose contents could not be read is *unknown*, neither
+//! happened. And a path whose contents could not be read is *unknown*, neither
 //! present nor absent, so it produces no change at all — the caller reports it under
 //! `skipped` and leaves its row untouched.
 
@@ -35,7 +35,7 @@ pub enum Change {
 /// text alongside for the report, bytes for everything that has to find the row (F13 §4.1).
 ///
 /// Matching uses `case_sensitive` to pick the identity: `true` (Linux, macOS) keys on
-/// `rel`, `false` (Windows) keys on `case_key` (spec §11). It is an argument rather than a
+/// `rel`, `false` (Windows) keys on `case_key`. It is an argument rather than a
 /// `#[cfg]` so both rules are testable on one machine; the call site passes `!cfg!(windows)`.
 ///
 /// Input contract: each side holds **at most one snapshot per identity**, which is what

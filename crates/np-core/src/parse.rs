@@ -37,8 +37,8 @@ use crate::links::{extract_links, RawLink};
 ///
 /// Version 1 is the first versioned build, so the value it has to describe is *absence*: a database from
 /// before this constant recorded nothing at all, which is not a version and therefore refreshes on its
-/// first scan. That single refresh is what carries R3's frontmatter-recognition (F7) and tag-display
-/// (F8) changes into the files M1 already indexed.
+/// first scan. That single refresh is what carries R3's frontmatter-recognition and tag-display
+///   changes into the files M1 already indexed.
 pub const PARSE_VERSION: u32 = 1;
 
 /// Which source supplied a note's title, so the catalog can say where it came from.
@@ -71,7 +71,7 @@ impl TitleSource {
 pub struct Heading {
     /// Number of `#` markers, 1..=6.
     pub level: u8,
-    /// Heading text with surrounding whitespace removed. May be empty (`##   `), which is why
+    /// Heading text with surrounding whitespace removed. May be empty (`## `), which is why
     /// title selection skips such a heading instead of titling the note `""`.
     pub text: String,
     /// 1-based line number in the file.
@@ -398,8 +398,8 @@ fn blocked_by(prev: char) -> bool {
 
 /// A frontmatter scalar: one layer of matching quotes removed, then trimmed on both ends, and
 /// `None` when nothing usable is left. Trimming happens **after** unquoting, so a quoted blank
-/// (`title: "   "`) falls through to the next title source instead of becoming a title of three
-/// spaces, and `title: "  Vendor  "` cannot put padded text into `INDEX.md`.
+/// (`title: " "`) falls through to the next title source instead of becoming a title of three
+/// spaces, and `title: " Vendor "` cannot put padded text into `INDEX.md`.
 fn scalar(value: &str) -> Option<String> {
     let value = unquote(value.trim()).trim();
     (!value.is_empty()).then(|| value.to_string())

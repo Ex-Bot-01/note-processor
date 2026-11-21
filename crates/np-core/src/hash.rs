@@ -87,10 +87,10 @@ impl Snapshot {
     }
 }
 
-/// One sha256, fed in pieces: the program's single SHA-256 definition (§12 rule 9).
+/// One sha256, fed in pieces: the program's single SHA-256 definition.
 ///
 /// It exists for the caller that cannot produce its input all at once — a fetch hashes each buffer as
-/// it arrives, because the byte count and the digest are read off the same pass (§12 rule 5). Both
+/// it arrives, because the byte count and the digest are read off the same pass. Both
 /// [`sha256_file`] and [`sha256_bytes`] are written on top of it so that "what a digest looks like"
 /// (lowercase hex, 64 characters, spelled by the module's private `hex`) is decided once: delegating costs them one
 /// extra `update` call and buys the guarantee that no later caller can spell the same bytes' digest
@@ -157,7 +157,7 @@ pub enum HashError {
 /// sha256 of a file's contents as lowercase hex.
 ///
 /// The file is opened through [`walk::to_open_path`], so a Windows path past `MAX_PATH`
-/// still opens instead of failing or being truncated (spec §11), and it is consumed in
+/// still opens instead of failing or being truncated, and it is consumed in
 /// fixed-size chunks rather than read whole.
 ///
 /// A failure is reported, never swallowed: an empty string here would be read downstream
@@ -192,7 +192,7 @@ pub fn sha256_file_with_size(p: &Path) -> Result<(String, u64), HashError> {
 /// The same digest over anything readable, with the byte count that came out of the read loop.
 ///
 /// This is the loop [`sha256_file_with_size`] runs — that function is this one plus an open, so there is still exactly one
-/// place that decides where a file ends (§12 rule 9). It exists for the caller that must look at a file's first bytes and
+/// place that decides where a file ends. It exists for the caller that must look at a file's first bytes and
 /// digest **the same bytes**: `crate::media`'s format check reads a prefix to decide whether a `.png` really is a PNG, and
 /// re-opening for the digest would hash a second read of a file that may have changed in between — a row whose `size` and
 /// signature describe different moments. A caller chains what it peeked back on (`std::io::Read::chain`) and digests once.
