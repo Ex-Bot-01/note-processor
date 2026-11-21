@@ -266,8 +266,8 @@ What these numbers can and cannot carry:
   is cheaper to build once now than to retrofit after clustering stores derived data too.
 
 **Closed on 2026-11-06 by audit — `parse_version` exists, is compared at scan start, and forces exactly one rewrite.** The constant is
-`crates/np-core/src/parse.rs:42`, the `meta` key `scan.rs:75`, the comparison `parse_version()` / `refresh_needed()` at `scan.rs:2016` /
-`:2026`, and the write at `scan.rs:565`; migrations stayed schema-only, and a refresh is not a modification — the report stays
+`crates/np-core/src/parse.rs`, the `meta` key `PARSE_VERSION_KEY` (`crates/np-core/src/scan/state.rs`), the comparison in `parse_version()` /
+`refresh_needed()` (same file), and the write in `scan_inner` (`crates/np-core/src/scan.rs`); migrations stayed schema-only, and a refresh is not a modification — the report stays
 `(added, modified, moved, removed) == (0, 0, 0, 0)` in every case below. Each “Done when” clause is a test that ran green in this audit's scan
 suite: `a_stale_parse_version_reparses_every_unchanged_note` (`tests/scan.rs:1691`: hand-built lagging database, derived rows equal to a
 reference workspace, catalog equal, and `[[Real Heading]](thematic-break.md)` present in `INDEX.md`),
@@ -477,10 +477,11 @@ and the rename experiments (Stage 7).
   future migration admits keyless note rows.** What is pinned instead is the reachable half of the same shape: a
   merged survivor with no `rel` at all (`a_merged_pair_with_no_display_text_is_named_by_the_lossy_spelling_of_its_key`).
 
-**Closed on 2026-11-06 by audit — the entry said “the entry is closed”; now it carries the evidence.** Migration 5 is registered at
-`crates/np-core/src/db.rs:161` (`Migration::Code(merge_duplicate_notes)`) and defined at `:1350`; the receipt lands in `meta` under
-`note_merges` (`:1305`) and reaches a person through `Db::merged_notes` (`:580`) → `ScanReport::merged_notes`; `PRAGMA foreign_key_check`
-runs inside that same transaction (`:781`, `:1020`). Both “Met by” tests passed in this audit's runs:
+**Closed on 2026-11-06 by audit — the entry said “the entry is closed”; now it carries the evidence.** Migration 5 is registered in
+`MIGRATIONS` (`crates/np-core/src/db/migrations.rs`) (`Migration::Code(merge_duplicate_notes)`) and the function itself is defined in
+`db/upgrades.rs`; the receipt lands in `meta` under `note_merges` (`NOTE_MERGE_KEY` in `db/meta.rs`) and reaches a person through
+`Db::merged_notes` → `ScanReport::merged_notes`; `PRAGMA foreign_key_check`
+runs inside that same transaction (`db/migrations.rs`, `db/upgrades.rs`). Both “Met by” tests passed in this audit's runs:
 `a_merged_duplicate_pair_clears_the_charge_and_records_the_parse_version` (`tests/scan.rs:4975`) and
 `the_scan_that_merges_reports_the_string_it_stored` (`tests/db.rs:3997`). The card's note about the unfixtureable `WHERE rel_bytes IS NOT NULL`
 arm is still true: `notes.rel_bytes` carries `CHECK (typeof(rel_bytes) = 'blob')` at `db.rs:348`, and `typeof(NULL)` is `'null'`.
@@ -572,7 +573,7 @@ floor on one `skipped` line.
 **Audited 2026-11-06 — the panic is gone and verified; the card's own Do-when is not met, so it stays open.** In the tree and under test: the
 receipt is written before anything deletes, pinned by `a_receipt_that_cannot_be_written_rolls_the_cleanup_back` (`tests/db.rs:1911`, passed);
 the echo dropped its `.expect` and moved after the commit (`src/db.rs:676` → `:688`); the stored string reaches
-`ScanReport::upgrade_orphans` (`scan.rs:209`). Two CLI cases ran green here: `an_error_is_reported_rather_than_panicked_when_stderr_refuses_it`
+`ScanReport::upgrade_orphans` (`crates/np-core/src/scan.rs`). Two CLI cases ran green here: `an_error_is_reported_rather_than_panicked_when_stderr_refuses_it`
 (`crates/np-cli/tests/cli.rs:701`) and `a_scan_upgrades_when_stderr_refuses_writes`. The remaining ask is unmet as written:
 `upgrade_orphans` is `Some` only on the open that ran the cleanup (`scan.rs:189-193`), so somebody asking today what an upgrade deleted last
 month still needs `sqlite3`. F22's shape — a bounded `meta` record whose one string is printed on stdout and in `--json` — now exists for
@@ -927,12 +928,12 @@ the ten turned out to say something other than what they said when filed; both a
 | **D2** frontmatter inside the embed domain | fixture `frontmatter_is_part_of_the_text_being_cut` still asserts the current shape (`chunk.rs`) | **open — product decision, not code** | ruling needed: strip metadata from the embed domain (costs a chunker bump = full re-cut) or define citations against file offsets and say so in M2b |
 | **D3** a stale note reads as current | `chunk_digest` is `SELECT ordinal, chunker, source_hash FROM chunks WHERE note_id = ?1` (`db.rs:2343`) — no join to `files`, so no liveness predicate; the catalog has exactly that fence and these readers do not | **open — a bug, not a preference** | one join, one predicate, one stale-note fixture. It changes what "current" answers for every caller, so it belongs in its own reviewed branch, not in a triage commit |
 | **D4** `source_hash`'s level unenforced | the pinning test is still there (`db.rs`); both levels remain plain `String` | **open — deliberately waiting for 4b** | introduce the newtype *with* the code that writes real vectors: a type no production path constructs enforces nothing, and pretending otherwise buys a false green |
-| **D5** delete or compare stale vectors | `delete_vectors_for_chunk` (`db.rs:2428`) has exactly one caller, its own test (`tests/db.rs:1594`) | **open — 4b's brief owes the rule** | today's behaviour ("the old vector survives with its old stamp") is what falls out of nobody having chosen. The brief must name delete-vs-compare before it embeds anything |
+| **D5** delete or compare stale vectors | `delete_vectors_for_chunk` (`crates/np-core/src/db/embeddings.rs`) has exactly one caller, its own test (`tests/db.rs:1594`) | **open — 4b's brief owes the rule** | today's behaviour ("the old vector survives with its old stamp") is what falls out of nobody having chosen. The brief must name delete-vs-compare before it embeds anything |
 | **D6** no chunk-write numbers | `tests/perf.rs` prints ms, added/modified/unchanged, notes, unresolved links (`perf.rs:85-93`) — **no chunk rows, no database bytes** | **open — measurement not taken** | the two counters belong in that same print. It is also half of task 13's "chunks owed but unembedded" ask, and `ScanReport` has no chunk counters at all today (`scan.rs:162-193`), so that field needs its own short design before code |
 | **D7** `install` copies before discovering a busy database | the message is still `model database: {0}` (`models.rs:1051`); the ~540 MB comment stands at `models.rs:1089` and `:1119` | **open — small and user-visible** | an error variant that names the workspace path and says re-run. No change to the copy itself, so no new risk |
 | **D8** `access()` long-path case | `access` at `models.rs:1648`; `cfg(windows)` tests exist (`tests/config.rs`, `tests/walk.rs`) but none drives a long path through `access` | **open — needs Windows hardware** | belongs with the hardware-bound half of task 13. A Linux stand-in would prove nothing about the UNC prefix and would read as coverage |
 | **D9** chunk-gap stderr line | asserted: `an_incomplete_chunk_pass_reports_its_own_gap_on_stderr` (`crates/np-cli/tests/cli.rs`) | **closed — already done** | nothing owed. The entry stays because the reason originally given for not writing it ("no capture seam") was false, and that is the part worth remembering |
-| **D10** migration 5's child-row list | **the filed reason is wrong.** `chunks` and `embeddings` are created by **migration 4** (`db.rs:197`, tables at `:209` and `:225`), not after the heal; `merge_duplicate_notes` is version 5 (`db.rs:161`, `NOTE_MERGE_VERSION` at `:726`) and deletes headings, tags, items, links and notes — not chunks or embeddings (`db.rs:1450-1456`). The schema's real protection is `ON DELETE CASCADE`, but `apply_migrations` runs with foreign-key enforcement switched **off** (`db.rs:698`) and restores it after (`:700`), so a cascade does not fire inside a migration | **open — restated as a possible orphan-write, and untested** | no test names duplicate-healing together with chunks or embeddings. Before anything is "fixed": a migration test that seeds a duplicate note pair each holding chunk and vector rows, heals, and asserts nothing survives the loser. If it passes, D10 closes with the cascade as the reason and this row says so; if it fails, the fix is two more tables in the heal list — which is what the original entry guessed at, for the wrong reason |
+| **D10** migration 5's child-row list | **the filed reason is wrong.** `chunks` and `embeddings` are created by **migration 4** (`crates/np-core/src/db/migrations.rs`, in `MIGRATIONS`), not after the heal; `merge_duplicate_notes` is version 5 (`crates/np-core/src/db/upgrades.rs`, `NOTE_MERGE_VERSION` in `db/migrations.rs`) and deletes headings, tags, items, links and notes — not chunks or embeddings (same file). The schema's real protection is `ON DELETE CASCADE`, but `migrate` runs with foreign-key enforcement switched **off** — the `PRAGMA foreign_keys = OFF` that wraps its `apply_migrations` call, in `crates/np-core/src/db/migrations.rs` — and restores it after, so a cascade does not fire inside a migration | **open — restated as a possible orphan-write, and untested** | no test names duplicate-healing together with chunks or embeddings. Before anything is "fixed": a migration test that seeds a duplicate note pair each holding chunk and vector rows, heals, and asserts nothing survives the loser. If it passes, D10 closes with the cascade as the reason and this row says so; if it fails, the fix is two more tables in the heal list — which is what the original entry guessed at, for the wrong reason |
 
 D11 (deferred with its reason), D12 (closed 2026-10-31) and D13 (needs a thread-count measurement) were re-read and still say
 what they said.
@@ -1076,7 +1077,7 @@ Measured against `main` = `64a6b73`, the ruling's first half is already shipped 
 this card is asking for:
 
 - **"its own separate vector" — exists.** `media_embeddings` keys a vector by `(media_id, model)` with `dim > 0` and
-  `length(vector) = 4 * dim` (`crates/np-core/src/db.rs:362-375`), one row per figure per model. Image vectors are not folded into
+  `length(vector) = 4 * dim` (`crates/np-core/src/db/migrations.rs`), one row per figure per model. Image vectors are not folded into
   text chunks, and nothing about the ruling asks them to be.
 - **"linked to the place where an image is mentioned or placed" — only partly exists, at the wrong grain.** What links a figure to
   somewhere is `media_path`: every workspace *path* whose bytes hash to that figure (`db.rs:347-359`). It answers "which files hold

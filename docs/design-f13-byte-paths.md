@@ -108,7 +108,7 @@ anyway as a second spelling.
 **(b) A byte-preserving column alongside; `rel` demoted to display text.** Add `rel_bytes BLOB NOT NULL
 UNIQUE` and `case_bytes BLOB NOT NULL UNIQUE`; make `notes.rel_bytes` the FK target; keep `rel`/`abs` as
 derived lossy display. Identity statements move to `rel_bytes`, display sites — the rendered target
-(`catalog.rs:163-177`) and the report lines (`scan.rs:113-127`) — keep reading text and stay honest because they
+(`catalog.rs:163-177`) and the report lines (`ScanReport` in `crates/np-core/src/scan.rs`) — keep reading text and stay honest because they
 were always display-only. Ordering is *not* in that set: `sort_key`'s tie-break moves to bytes with the rest of
 the identity work (§3). Four things in
 those three sentences are load-bearing, and the first review round found each of them understated.
@@ -171,7 +171,8 @@ bytes). No schema change, no new column, and `notes.rel`/`case_key` keep working
 least: the stored spelling stops being the spelling an author types, so link resolution's exact-match step
 (`links.rs:405-414`) and its basename index (`links.rs:427-441`) can never match a real name; `INDEX.md`
 prints escapes (goldens move for any corpus holding such a name); `rebase_abs`'s suffix swap and the
-`skipped` / `unresolved_targets` report lines (`scan.rs:113-127`, `crates/np-cli/src/main.rs:81-87`) all
+`skipped` / `unresolved_targets` report lines (`ScanReport` in `crates/np-core/src/scan.rs`, printed by `print_summary` in
+`crates/np-cli/src/commands/scan.rs`) all
 show escapes to the user; and an escape scheme is ambiguous unless escaped-for-real input (`caf%E9.md`) is
 also escaped, which changes ASCII paths' spelling too.
 
@@ -257,7 +258,7 @@ candidates, so it stays unresolved rather than guessing — consistent with `res
 (`links.rs:364-383`) and reported once in `unresolved_targets`. That promise is carried entirely by
 `live_corpus` keeping both candidates (list above); without it the corpus collapses to one entry and the
 target resolves by accident. The CLI JSON shape does **not** change in (b): `skipped` and
-`unresolved_targets` stay arrays of display strings (`scan.rs:113-127`); only their contents gain the paths
+`unresolved_targets` stay arrays of display strings (`ScanReport` in `crates/np-core/src/scan.rs`); only their contents gain the paths
 that used to vanish silently.
 
 ## 4. Recommendation
@@ -478,7 +479,7 @@ byte key, in the same change as the statement re-keying of §3:
   be permanent instead of one-time.
 
 Deliberately **not** moved: `links::resolve`'s corpus keys (`links.rs:364-383`, `links.rs:405-414`) and the
-report strings (`scan.rs:113-127`). Author-facing spelling is display text by design — a wikilink names a
+report strings (`ScanReport` in `crates/np-core/src/scan.rs`). Author-facing spelling is display text by design — a wikilink names a
 title, not a byte sequence — and §3 already says what happens when two files share one spelling. The only
 thing that changes there is `live_corpus` keeping both candidates (§3's list), so ambiguity is detected
 rather than resolved by whoever was read last.
@@ -777,7 +778,7 @@ First, it would not run at all: `rel_bytes` and `case_bytes` are `NOT NULL UNIQU
 `SQLITE_CONSTRAINT_NOTNULL` — which `is_identity_conflict` (`scan.rs:690-702`) does not accept as an identity
 clash, so it is not a `skipped` entry but a scan that ends in error, on every workspace, from the first file it
 writes. Second, migration 4 drops `files.case_key UNIQUE`, and that constraint is what rules P3's `skipped`
-report today (`db.rs:72`, `scan.rs:688-702`); a round that removes it before anything writes `case_bytes` deletes
+report today (`files.case_key UNIQUE` in `crates/np-core/src/db/migrations.rs`, `is_identity_conflict` in `scan/write.rs`); a round that removes it before anything writes `case_bytes` deletes
 P3 outright, so `a.md` beside `A.md` would get two live rows and one note. Writing both keys in round 1 keeps the
 guard at ASCII-fold strength from the moment the old one goes away.
 

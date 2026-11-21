@@ -10,16 +10,16 @@ half wrong — and what therefore actually needs building.
 ## 1. The two halves of the requirement, measured
 
 **"Its own separate vector" — shipped, and it is not a footnoted version of a text chunk.** `media` keys a figure by content hash
-(`hash TEXT NOT NULL UNIQUE`, `crates/np-core/src/db.rs:326-332`), `media_path` records every workspace path those bytes were seen at
-(`:347-359`), and `media_embeddings` holds one row per `(media_id, model)` with `dim > 0` and `length(vector) = 4 * dim`
-(`:362-375`). Migration 10's own comment states the reason it is a separate table rather than a `chunks` row: an image is not prose
+(`hash TEXT NOT NULL UNIQUE`, `crates/np-core/src/db/migrations.rs`), `media_path` records every workspace path those bytes were seen at
+(same file), and `media_embeddings` holds one row per `(media_id, model)` with `dim > 0` and `length(vector) = 4 * dim`
+(same file). Migration 10's own comment states the reason it is a separate table rather than a `chunks` row: an image is not prose
 whose `ordinal` and byte offsets could be recorded honestly. Nothing here needs changing.
 
 **"Linked to the place where it is mentioned" — already derived, then thrown away.** The card said this part does not exist; that was
 too pessimistic, and the correction matters because it removes a migration from the plan:
 
 - `links` stores every written attachment target with its **source note** (`src_note_id`, `kind = 'attachment'`, `target`, `line`;
-  `db.rs:123-132`), so a note → figure relation exists in the database today.
+  `links` is created in `crates/np-core/src/db/migrations.rs`), so a note → figure relation exists in the database today.
 - `np search` already reads it. `linker_index` (`crates/np-core/src/search.rs:484-510`) selects every live note's attachment links and
   re-runs the one resolution rule the embed pass uses (`media::link_target_rel`, called at `:501`), and `media_report` (`:437-469`) unions
   those linkers across every path holding the figure, producing `linked_from = N` — "one figure copied to two folders, linked from three
