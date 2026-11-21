@@ -340,7 +340,7 @@ pub const MIGRATIONS: &[Migration] = &[
     ALTER TABLE model_files ADD COLUMN verified_mtime INTEGER;
     "#,
     ),
-    // **Migration 11 — the keyword half of search** (`docs/design-m3-hybrid-search.md`). External content: the index stores
+    // **Migration 11 — the keyword half of search.** External content: the index stores
     // terms pointing at `notes.id`, never a second copy of the prose, which is why the three triggers below are load-bearing
     // rather than an optimisation — a shadow table cannot notice a change on its own. They are installed **after** the
     // backfill so seeding cannot double-insert.

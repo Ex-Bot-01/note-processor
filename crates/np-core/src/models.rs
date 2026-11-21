@@ -1,6 +1,6 @@
 //! Installing a pinned model artifact and reporting what is on disk.
 //!
-//! This is the whole of round 4a's behaviour, as core functions rather than as CLI code: `install` puts a
+//! This is the whole of the install and status behaviour, as core functions rather than as CLI code: `install` puts a
 //! file the human already holds under the workspace's artifact directory, verifies it against a digest the
 //! human declared, and records the row; `list` says what each row's artifact looks like **and any fetch in
 //! progress beside the rows**. Both take `&Db` and
@@ -201,7 +201,7 @@ pub enum ArtifactState {
     /// The row expects an artifact and none is there — named, never repaired.
     Missing,
     /// `sha256 IS NULL`: a provider with no local weights. Calling this `missing` is a false alarm, and
-    /// round 4b creates exactly these rows.
+    /// the install path creates exactly these rows.
     NoArtifactExpected,
     /// An artifact is there and does not hash to its row — reported, never overwritten. A non-file (a
     /// directory named after the id) lands here too: it can never hash to anything.
@@ -861,7 +861,7 @@ pub struct FetchEntry {
     /// The id the marker's **name** carries — not read from the file, so a marker whose fields disagree with its
     /// own name cannot rename a fetch this listing did not see.
     pub id: String,
-    /// The marker file itself, for a report to name (rule 4's delete-this-file advice needs a path).
+    /// The marker file itself, for a report to name — "delete it if no fetch is running" needs a path.
     pub path: PathBuf,
     /// What reading it produced. `Absent` means the marker vanished between listing the directory and reading
     /// it — a fetch that finished inside that window — and [`list`] drops such an entry rather than announcing
@@ -1346,7 +1346,7 @@ pub fn install_projector(
 /// An artifact directory that cannot be **listed** leaves as [`ModelError::ModelsDir`] with no [`Listing`] at
 /// all, so a per-row `missing` verdict cannot be produced for rows nobody looked at. A directory that is
 /// simply **absent** is not that failure: it is a workspace nothing has been installed into, and its rows —
-/// round 4b's `sha256 IS NULL` providers, or a hand-deleted directory — answer `NoArtifactExpected` and
+/// an installed row with `sha256 IS NULL`, or a hand-deleted directory — answer `NoArtifactExpected` and
 /// `Missing` honestly.
 ///
 /// The directory is therefore looked at **first**, before any row is hashed: it decides whether a per-row
@@ -1724,7 +1724,7 @@ fn artifact_present(models_dir: &Path, id: &str) -> bool {
 /// One row's [`ArtifactState`], from its digest and what the directory holds (the state table).
 fn artifact_state(models_dir: &Path, row: &ModelRow) -> Result<ArtifactState, ModelError> {
     // A provider with no local weights expects no file. Reaching for `missing` here would be a false alarm
-    // on every row round 4b creates.
+    // on every row the install path creates.
     let Some(expected) = row.sha256.as_deref() else {
         return Ok(ArtifactState::NoArtifactExpected);
     };

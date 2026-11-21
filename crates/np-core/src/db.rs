@@ -105,7 +105,7 @@ pub enum DbError {
         /// Why it failed.
         source: io::Error,
     },
-    /// SQLite rejected a statement. Constraint violations arrive unchanged, because Task 10
+    /// SQLite rejected a statement. Constraint violations arrive unchanged, because the scan's
     /// reports the offending path under `skipped` and carries on with the next one.
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -178,7 +178,7 @@ pub enum DbError {
 
 /// An open workspace database.
 ///
-/// The connection is public because Task 10 runs a whole scan inside one transaction, which
+/// The connection is public because a scan runs its whole write phase inside one transaction, which
 /// needs the [`Connection`] itself rather than a helper this module would have to grow.
 ///
 /// The second field is what an upgrade tells *its own process* about itself ([`Db::upgrade_orphans`],
@@ -186,7 +186,7 @@ pub enum DbError {
 /// is this open's memory, so a second `Db::open` of the same database starts with nothing to announce.
 #[derive(Debug)]
 pub struct Db(
-    /// The live connection, public for Task 10's whole-scan transaction.
+    /// The live connection, public for the scan's whole-write transaction.
     pub Connection,
     /// What this open's own migration steps wrote into `meta`, field by field. Read through
     /// [`Db::upgrade_orphans`] and [`Db::merged_notes`].

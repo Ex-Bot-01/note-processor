@@ -2,12 +2,12 @@
 //!
 //! Pure text in, structs out — no files, no database, no clock, and deliberately no identity or
 //! timeline work. Deciding *which* lines claim a status is this module's whole job; M3 turns the
-//! candidates into item timelines, Task 9 writes the rows.
+//! candidates into item timelines; the writer of item rows turns them into records.
 //!
 //! Three rules hold the module together.
 //!
 //! - **A marker is what makes a line an item.** Prose with no marker yields nothing, which is how
-//!   "open" stays the absence of a marker *on an item* (spec §8.7) instead of a row for every
+//!   "open" stays the absence of a marker *on an item* instead of a row for every
 //!   sentence in the file. An explicit open claim is written, not inferred: `- [ ]`.
 //! - **Three kinds of line never reach the scan.** A fenced region and both of its fence lines come
 //!   out of `crate::parse::prose_lines`, the same iterator that decides headings, tags, words and
@@ -25,7 +25,7 @@ use crate::config::MarkerConfig;
 use crate::parse::{body_start, is_heading_line, prose_lines};
 
 /// The checkbox spellings and what each claims. These are not read from [`MarkerConfig`]: `- [ ]`,
-/// the Open spelling, is in no marker list at all (spec §8.7 has open as everything else), and a box
+/// the Open spelling, is in no marker list at all — open is everything else — and a box
 /// has to be recognised before the vocabulary scan for it to outrank a keyword on the same line.
 const CHECKBOXES: [(&str, ItemState); 2] = [("[ ]", ItemState::Open), ("[x]", ItemState::Done)];
 

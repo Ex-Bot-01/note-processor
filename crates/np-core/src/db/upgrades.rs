@@ -196,7 +196,7 @@ pub(crate) fn byte_path_keys(conn: &Connection) -> Result<(), DbError> {
     //
     // `rel` stops being a foreign key. Two live notes may spell themselves identically once the lossy
     // spelling is admitted, and a key that two rows share cannot be a key; `notes.rel`'s `ON UPDATE CASCADE`
-    // was the only thing maintaining that column, so [`apply_move`] takes over the job in round 1.
+    // was the only thing maintaining that column, so [`apply_move`] takes over the job on this pass.
     conn.execute_batch(
         "CREATE TABLE notes_new (
             id           INTEGER PRIMARY KEY,
@@ -218,8 +218,8 @@ pub(crate) fn byte_path_keys(conn: &Connection) -> Result<(), DbError> {
 
     // Both tables are back under their own names, so the keys they name exist and the indexes land on the
     // live table. `files_rel` and `notes_rel` are lookup-only now — neither column is unique or a key any
-    // more. Round 1 needed both, because row resolution (`SELECT id FROM files WHERE rel = ?1`) and
-    // `mark_stale` asked about display text once per file inside the write phase; round 2 moved those readers
+    // more. The first upgrade pass needed both, because row resolution (`SELECT id FROM files WHERE rel = ?1`)
+    // and `mark_stale` asked about display text once per file inside the write phase; the next pass moved those readers
     // to `rel_bytes`, so **no production statement queries either index any more** — they are maintained on
     // every insert and update and read by nothing. They stay because dropping an index from an existing
     // database is a second migration rather than a comment edit, and `the_schema_is_what_the_plan_mandates`
