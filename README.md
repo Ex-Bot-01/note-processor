@@ -54,7 +54,7 @@ sha256sum -c SHA256SUMS.txt        # Linux/macOS, run next to the archive
 
 | Platform | What you get | Worth knowing |
 | --- | --- | --- |
-| **Linux** `x86_64-unknown-linux-gnu` | one binary, inference runtime **in** it | built by CI running `.github/scripts/package-assets.sh`; byte-reproducible |
+| **Linux** `x86_64-unknown-linux-gnu` | one binary, inference runtime **in** it | built by CI running `.github/scripts/package-assets.sh`; reproducible **between CI runs of one tag** (three measured), not across machines — an archive you build yourself digests differently ([why](docs/reference-releases.md)) |
 | **Windows** `x86_64-pc-windows-gnu-cross.zip` | one `np.exe`, runtime **in** it | cross-built here with mingw-w64 — **unsigned, not an MSVC build**; import table checked at packaging so it stays a single file |
 | **macOS** | *no asset exists* | needs an Apple SDK no cross-compiler here has → [build from source](docs/developing.md) |
 

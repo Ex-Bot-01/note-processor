@@ -36,6 +36,34 @@ A source build is the only shape you can choose features on: `--features local-m
 layout (`main.rs` 3,234 lines → 328; `db.rs` and `scan.rs` split at their seams) and what the comments cite. Its page carries the one caveat
 below, because it is a property of *how* an archive is built rather than of any release.
 
+The two `v0.6.1` archives, as published (2026-11-21), measured from a fresh download of the page and confirmed by `sha256sum -c SHA256SUMS.txt`
+(which lists exactly these two names and nothing inside them):
+
+```text
+f3fc23f784756630a2b521fd74bce0f849d40f022bcd4a6b2eb31ac2e8acbd76  np-0.6.1-x86_64-unknown-linux-gnu.tar.gz
+cc54b917a3f80ab4b9829236805b873bc098570f77d62984868daf379b23164a  np-0.6.1-x86_64-pc-windows-gnu-cross.zip
+```
+
+Both came from one run of the tag ([`44944733875`](https://github.com/Ex-Bot-01/note-processor/actions/runs/44944733875)), which published at
+20:12 UTC; `ABOUT-windows-gnu-cross.md` rides along beside them.
+
+What was measured in the downloaded Linux archive before this paragraph went up: `np --version` → `np 0.6.1`; a `scan` that reported the dead
+wikilink and wrote `INDEX.md`; an `initialize` handshake answering `local_model: true`, `fetch: true`, `protocol 1` and ten methods. Its `.text`
+holds **zero `%zmm`** and 4,940 `%ymm` references — the same figures `v0.4.0`, `v0.5.0` and `v0.6.0` carry: four releases, one instruction-set
+floor.
+
+**Compared against the previous release's archive, not against a build of the source.** Each archive was run over an identical vault with its own
+scratch `HOME`, so neither reads the other's registry or database. Identical after normalising only the version string, each side's paths and
+elapsed times: first `scan`, unchanged second `scan`, `INDEX.md` bytes (sha256 `b91fdf537cc9dbbf9e4b23331d7f9d07c7ee77a555a7e396c7fc8603ce168c55`),
+the keyword `--json` document, the `initialize` + `links.list` pair, `models install --path`, the `embed` report, and the hybrid answer **including
+its cosines** (`0.7255075720287169`, `0.673628975333305`, `0.6135603431420221`). Nothing in the two archives behaves differently.
+
+**One reproducibility sentence, narrowed rather than extended.** `.github/scripts/package-assets.sh` run on this commit produced a Linux archive
+digesting to `7bb5fa0132b2a3bb9b260d94d086bf6b4ab7d635a5034762f93e0cef274e8d0a` — not the page's `f3fc23f7…`. That contradicts nothing above:
+the claim with three runs behind it is between CI runs of one tag, and this was a different machine with different paths compiled into the binary.
+It does mean "byte-reproducible" had never been demonstrated *across* machines, and now has a counter-example keeping it honest — `README.md` says
+so in as many words. The Windows archive stays non-reproducible by design: unsigned, cross-built, its digest identifying one file at one moment.
+
 - **A build of this tree is not bit-comparable with an asset unless you ask for the floor.** Embedding the same three notes on the same host,
   the published `v0.6.0` asset and a plain `cargo build --release` of `v0.6.1` answered `0.7255075720287169` and `0.7253269295809867` for the
   same hit — about 2 × 10⁻⁴ apart, same hits in the same order, each side bit-stable across runs, and the stored vectors themselves differing.
