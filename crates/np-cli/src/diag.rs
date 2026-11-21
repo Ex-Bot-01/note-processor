@@ -16,12 +16,10 @@
 //! * **A diagnostic is never the reason a command fails.** An unopenable log path warns once and carries on; a full budget
 //!   stops writing and says so in one final record; a deleted file costs records, not the run.
 //!
-//! Design: `docs/superpowers/specs/2026-11-09-np-diagnostics-design.md`.
-//!
 //! # Two phases, because configuration is itself a thing that can fail
 //!
 //! [`bootstrap`] runs before any config file is read, so the most common integrator failure — a `config.toml` with one section
-//! name one letter off (**F35**) — already has somewhere to be reported. [`apply_config`] upgrades it once the file has loaded:
+//! name one letter off — already has somewhere to be reported. [`apply_config`] upgrades it once the file has loaded:
 //! the level may change, and `[log] file` opens then. Both mutate the *same* sink through an `Arc`, because tracing's global
 //! default can be set only once; a level chosen at start-up is therefore still replaceable mid-run without a reload handle or a
 //! second subscriber.
@@ -648,7 +646,7 @@ pub(crate) fn apply_config(cfg: &Config) {
         source,
     );
     // The announce line belongs *after* configuration when the file is what chose the level: that is the first moment the answer
-    // is final. One ordering caveat is accepted rather than worked around — on Windows, **F37**'s legacy-data-dir note prints
+    // is final. One ordering caveat is accepted rather than worked around — on Windows, the legacy-data-dir note prints
     // inside `load_config`, so it can precede this line. It is a one-release notice, and both lines are stderr anyway.
 }
 
@@ -908,7 +906,7 @@ impl Visit for Record {
     }
 }
 
-/// What a span hands to every record opened inside it (spec §"Serve": *each request span carries the JSON-RPC `id` (or
+/// What a span hands to every record opened inside it: *each request span carries the JSON-RPC `id` (or
 /// none) and the workspace path*).
 ///
 /// Only two keys are inherited — `request` and `workspace` — because those are the two a reader cannot recover from the
@@ -1099,7 +1097,7 @@ where
         let meta = event.metadata();
         let mut record = Record::default();
         event.record(&mut record);
-        // **Correlation before formatting** (spec §"Serve"): whatever the enclosing spans declared rides on this
+        // **Correlation before formatting**: whatever the enclosing spans declared rides on this
         // record, innermost first, and a field the event set itself is never overwritten — an emitter that named its own
         // workspace knows better than the span wrapped around it.
         if let Some(current) = ctx.event_span(event) {

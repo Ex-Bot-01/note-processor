@@ -92,26 +92,26 @@ impl Clock for FakeClock {
     }
 }
 
-/// The shortest gap between two progress lines **within one phase** (**§4**).
+/// The shortest gap between two progress lines **within one phase**.
 const THROTTLE: Duration = Duration::from_millis(1_000);
 
 /// Every response and notification `np serve` writes.
 pub struct Channel<'a> {
     sink: &'a mut dyn LineSink,
     clock: &'a dyn Clock,
-    /// Set once by `initialize`, on this connection's own request (**§1**). It is the only session-level fact the
+    /// Set once by `initialize`, on this connection's own request. It is the only session-level fact the
     /// server keeps; every request still names its own workspace.
     notifications: bool,
     /// The phase of the last line written, and when — the throttle's whole memory.
     emitted_phase: Option<Phase>,
     emitted_at: Duration,
-    /// When the request now being handled began, on this clock. `since_ms` is measured from here (**§2**): a client
+    /// When the request now being handled began, on this clock. `since_ms` is measured from here: a client
     /// that has had the pipe open for ten minutes wants "this fetch has run four seconds".
     request_at: Duration,
     /// Set when a client sends `shutdown`. The loop finishes writing that response and stops reading, so a client that
     /// asked to be done does not have to also close the pipe to be believed.
     shutdown: bool,
-    /// The one slot of session memory: the last finished activity, for `status.get` (**§5**).
+    /// The one slot of session memory: the last finished activity, for `status.get`.
     last: Option<Value>,
     /// The terminal notification for the request being handled. It is *queued* rather than written because it has to go
     /// out **after** the response line, and `handle_line` builds the response without writing it — so the loop writes
@@ -224,7 +224,7 @@ impl<'a> Channel<'a> {
         self.notifications = on;
     }
 
-    /// Write one `np/progress` notification, subject to the throttle (**§4**): a phase change is written immediately,
+    /// Write one `np/progress` notification, subject to the throttle: a phase change is written immediately,
     /// and within one phase at most one line per second. A first-run download is ~40 lines over its life; without this
     /// rule the status stream would out-volume the answer it is describing.
     pub fn notify(&mut self, phase: Phase, params: Value) {
@@ -323,7 +323,7 @@ pub fn report(reporter: &ServeProgress<'_, '_>, phase: Phase, mut event: Progres
     reporter.publish(&event);
 }
 
-/// The `params` of one notification, in exactly the spec's key names (**§2**, **§3**).
+/// The `params` of one notification, in exactly the published key names.
 ///
 /// Keys appear only when they mean something. `bytes_total` is absent when this build has no pinned size to offer, and
 /// a chunk count never rides on a byte checkpoint: an absent key says "this phase has no such number", where a zero says
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(parsed["params"]["since_ms"], 0);
     }
 
-    /// The throttle (**§4**): a phase change is worth a line immediately, and within one phase at most one line per
+    /// The throttle: a phase change is worth a line immediately, and within one phase at most one line per
     /// second. Five byte checkpoints inside a second are one line; the move to `embedding` is another, 50 ms later.
     #[test]
     fn throttle_allows_one_line_per_phase_change_and_one_per_second() {
@@ -647,7 +647,7 @@ mod tests {
         );
     }
 
-    /// `since_ms` measures the **request**, not the connection (**§2**): a client that has been open for ten minutes and
+    /// `since_ms` measures the **request**, not the connection: a client that has been open for ten minutes and
     /// starts an embed wants "this fetch has run four seconds", not "this process started 600 seconds ago". A shared
     /// clock reading is the bug this pins.
     #[test]
