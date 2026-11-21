@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/np-core", "crates/np-cli"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 # **MIT** — `docs/adr/0010-the-crate-is-mit.md` records who ruled it and why; `LICENSE` at the root is the authority. It sits
 # in `[workspace.package]` so a member crate cannot drift from it while still publishing metadata.

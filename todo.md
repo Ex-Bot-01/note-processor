@@ -26,12 +26,13 @@ TODO segment generated from the last *n* days by a self-hosted OpenAI-compatible
 questions from the index/graph with `file:line` citations and shows **both** sides of any contradiction,
 unresolved.
 
-## Where things stand (2026-11-20)
+## Where things stand (2026-11-21)
 
-* **Shipped through `v0.6.0`** (2026-11-19): scan and index with byte-exact identity, the deterministic catalog and its
+* **Shipped through `v0.6.1`** (2026-11-21): scan and index with byte-exact identity, the deterministic catalog and its
   shards, the link graph, hybrid search, local embeddings behind a consent door, image vectors, `np serve` with progress
-  notifications, diagnostics that stay off until asked for, and packaged releases. Notes: `release-notes/v0.4.0.md`,
-  `v0.5.0.md`, `v0.5.1.md`, `v0.6.0.md`.
+  notifications, diagnostics that stay off until asked for, and packaged releases. `v0.6.1` adds nothing a client can see:
+  it is the build of `main` after the module splits and the comment diet, measured against `v0.6.0`'s own asset and found
+  identical down to the cosines. Notes: `release-notes/v0.4.0.md`, `v0.5.0.md`, `v0.5.1.md`, `v0.6.0.md`, `v0.6.1.md`.
 * **The second job has not started.** Everything above is the navigation half. The status half — daily files, item
   timelines, the generated TODO segment, the chat panel — needs np to write inside a note file for the first time, which
   is why it is a decision rather than a task: `docs/decision-memo-m3-or-indexer.md`.

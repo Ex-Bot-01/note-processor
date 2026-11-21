@@ -25,13 +25,27 @@ there at all (`docs/developing.md`); a locally packaged release carries **the on
 and its notes say so. Source builds need no CI and no minutes:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.6.0 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.6.1 -p np-cli --locked
 ```
 
 A source build is the only shape you can choose features on: `--features local-model` puts the inference runtime in the binary, and adding
 `,vision` adds figure encoding. Neither is needed to index or to search by keyword.
 
-**Current release: `v0.6.0` (2026-11-19).** Five findings from one reporter's pass over the shipped binary, each reproduced before it was
+**Current release: `v0.6.1` (2026-11-21).** A patch in this repository's strict sense: nothing a client or a vault can see changed — protocol
+**1**, ten methods, no key added or removed, `INDEX.md`'s bytes identical, and the same cosines to the last digit. What moved is the source
+layout (`main.rs` 3,234 lines → 328; `db.rs` and `scan.rs` split at their seams) and what the comments cite. Its page carries the one caveat
+below, because it is a property of *how* an archive is built rather than of any release.
+
+- **A build of this tree is not bit-comparable with an asset unless you ask for the floor.** Embedding the same three notes on the same host,
+  the published `v0.6.0` asset and a plain `cargo build --release` of `v0.6.1` answered `0.7255075720287169` and `0.7253269295809867` for the
+  same hit — about 2 × 10⁻⁴ apart, same hits in the same order, each side bit-stable across runs, and the stored vectors themselves differing.
+  The variable is the instruction-set floor: `.github/scripts/package-assets.sh` compiles at baseline x86-64 (`NP_LLAMA_PORTABLE=1`,
+  `-C target-cpu=x86-64`, `-march=x86-64` for the C that never reaches cmake) while a default build compiles llama.cpp for the CPU building it,
+  and different SIMD paths sum dot products in a different order. Re-packaging through the script reproduced the asset's numbers exactly.
+  So: to compare your build against an archive, build portable first; and if you want byte-identical vectors across machines, build portable
+  every time. Ordering is stable either way, which is why mixing them is untidy rather than wrong.
+
+**Previous release: `v0.6.0` (2026-11-19).** Five findings from one reporter's pass over the shipped binary, each reproduced before it was
 touched. The protocol stays **1** and no method is added — but keys appear, so this is a minor release rather than a patch: a client that
 asserts an exact key list must add two names, and `INDEX.md`'s bytes change for one class of file name.
 
