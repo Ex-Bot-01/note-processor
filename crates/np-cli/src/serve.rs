@@ -52,7 +52,7 @@ pub const METHODS: &[&str] = &[
     "embed",
     "models.list",
     // `links.list` is second-to-last because it is the newest reader and, like `status.get`, answers a question the
-    // terminal does not ask. **Issue #2** added it inside protocol 1: an added method is a compatible change, and a client
+    // terminal does not ask. It was added inside protocol 1: an added method is a compatible change, and a client
     // that wants to know whether this build has it reads this array — which is the same way `status.get` shipped.
     "links.list",
     // The door a consent answer needs. Added inside protocol 1 for the same reason `links.list` was —

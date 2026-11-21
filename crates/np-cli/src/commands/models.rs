@@ -204,7 +204,7 @@ pub(crate) fn models_fetch(
     // line stays true of every run: the resolved origin is read here and printed nowhere.
     let origin = fetch::resolve_origin(config.models.base_url.as_deref());
 
-    // **Say which origin this run is about to dial, in class terms, before any byte moves.** Rule 8 still forbids the host, so
+    // **Say which origin this run is about to dial, in class terms, before any byte moves.** Origin privacy still forbids the host, so
     // the line names where the answer came from rather than what it is. It exists because `NP_MODELS_BASE_URL=` (set, empty)
     // counts as unset — a rule `tests/config.rs` pins on purpose, mirroring how an empty `$XDG_*` is treated — and
     // "unset" no longer means "refuse": it means the compiled-in origin. A mirror whose value
