@@ -27,7 +27,7 @@ pub mod fetch;
 pub mod hash;
 pub mod index_names;
 pub mod items;
-// The log-level vocabulary behind `[embeddings] log_level` (F33): names, gate and precedence, deliberately ungated so a build with no
+// The log-level vocabulary behind `[embeddings] log_level`: names, gate and precedence, deliberately ungated so a build with no
 // runtime still parses the same config as one with it. Installing anything is `local_model`'s business, not this file's.
 pub mod links;
 pub mod lock;
@@ -52,7 +52,7 @@ pub mod path_keys;
 #[cfg(feature = "vision")]
 pub mod vision;
 // The pin table is data with no dependency and no I/O, so it carries no feature gate: the fetch engine behind it
-// arrives later (§12 rule 7), and a pin a build could compile out would pin nothing.
+// arrives later, and a pin a build could compile out would pin nothing.
 pub mod pins;
 // What a long-running command is doing right now, as data rather than prose. No JSON and no clock here on purpose:
 // np-core has no serde_json dependency, and the throttle that keeps a status stream from becoming the traffic is a
