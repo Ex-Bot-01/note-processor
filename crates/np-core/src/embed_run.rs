@@ -9,7 +9,7 @@
 //! What it is, in one paragraph: read the chunks the scan already cut, decide which of them are *owed* a
 //! vector for the configured model, hand the owed ones to an [`Embedder`] in bounded batches, and store what
 //! comes back — one short transaction per batch, never one per corpus, and never any model work inside a
-//! transaction (§6). It reads chunking and never writes it: no `chunks` row is created or restamped here, and
+//! transaction. It reads chunking and never writes it: no `chunks` row is created or restamped here, and
 //! [`crate::scan::EMBED_VERSION_KEY`] stays the scan's to record.
 //!
 //! Four rules are load-bearing, and each is where it is because §6 put it there:
@@ -28,7 +28,7 @@
 //!   batch that met the lock stamps nothing, and [`embed_with_inject`]'s hook is what lets a test prove an
 //!   embed holds no write lock *between* batches.
 //! - **Over-budget text is reported, never truncated** ([`EmbedReport::refused_budget`]): a truncated chunk
-//!   would stamp a whole chunk's digest onto a vector that read part of it (§5).
+//!   would stamp a whole chunk's digest onto a vector that read part of it.
 //! - **Counting tokens is not this module's job.** Nothing here measures a sequence against
 //!   [`Config::embeddings`](crate::config::EmbeddingsConfig)::`max_tokens`; the number comes from the provider's own
 //!   [`EmbedError::TokenBudgetExceeded`], because pricing a sequence needs the model's tokenizer and that lives behind
@@ -82,7 +82,7 @@ use crate::walk;
 /// §6 asks for "bounded transactions — one per batch, not one per corpus" without naming a size, so this is a
 /// scope bound rather than a tuned number: small enough that a batch's transaction is over before another
 /// process's `busy_timeout` runs out, large enough that a provider call amortises over several texts. Nothing
-/// in the schema or the report depends on it, and R6d's throughput benchmark (§8) is the round that would
+/// in the schema or the report depends on it, and R6d's throughput benchmark is the round that would
 /// change it with a measurement.
 pub const EMBED_BATCH_CHUNKS: usize = 8;
 
@@ -170,7 +170,7 @@ pub enum EmbedOutcome {
     /// that refused.
     NotProduced {
         /// What stopped the work, assembled from [`EmbedReport`]'s own counts. Carries a provider's message,
-        /// which [`EmbedError`] guarantees to hold no note text and no secret (§3).
+        /// which [`EmbedError`] guarantees to hold no note text and no secret.
         reason: String,
     },
 }
@@ -178,7 +178,7 @@ pub enum EmbedOutcome {
 impl EmbedOutcome {
     /// The arm's label, as the report prints it. Stable text: it is what a reader greps for.
     /// Every arm's detail must add something to its label rather than restate it — `np embed` composes the refusal as
-    /// `"{}: {}"` of the two, and on 2026-11-08 the packaged 0.3.0 asset printed `np: offline: offline: could not reach …` because
+    /// `"{}: {}"` of the two, and the packaged 0.3.0 asset printed `np: offline: offline: could not reach …` because
     /// arm (vi)'s sentence began by repeating its own label. Asserting the invariant over all arms (not just fixing that one string) is
     /// what stops the next arm doing the same, and asserting the two halves separately keeps this falsifiable: a `label()` or `detail()`
     /// edit that reintroduces the echo fails here, while an edit that strips labels wholesale fails the second loop.
@@ -370,8 +370,8 @@ pub struct EmbedReport {
     pub current: usize,
     /// Chunks this run embedded and stamped.
     pub embedded: usize,
-    /// Chunks refused because the prefixed sequence is over `embeddings.max_tokens`. Reported, never truncated
-    /// (§5), so they stay owed and the run exits non-zero.
+    /// Chunks refused because the prefixed sequence is over `embeddings.max_tokens`. Reported, never
+    /// truncated, so they stay owed and the run exits non-zero.
     pub refused_budget: usize,
     /// Batches that met `SQLITE_BUSY` and stamped nothing (§6's reported gap).
     pub busy_gap: usize,
@@ -413,7 +413,7 @@ pub struct EmbedReport {
     /// permanent.
     pub offline: bool,
     /// Image links this run looked at, counted **per link occurrence after per-note de-duplication of the written
-    /// target** — so a figure linked twice in one note is one here (§7 rule 1), and a byte-identical copy in a second note
+    /// target** — so a figure linked twice in one note is one here, and a byte-identical copy in a second note
     /// is two.
     ///
     /// **Counted before resolution, so it includes the links that then refused.** The first version counted only links that
@@ -422,7 +422,7 @@ pub struct EmbedReport {
     /// nothing while its refusals sat unread in `--json`. A count that silences the line reporting it reports nothing.
     ///
     /// These fields count images; [`EmbedReport::chunks_seen`] and its siblings count chunks. Nothing an image did moves any
-    /// of those, and nothing an image failed to do moves the exit code (§8 rule 6).
+    /// of those, and nothing an image failed to do moves the exit code.
     pub images_seen: usize,
     /// Images this run encoded and stamped for this model id.
     pub images_embedded: usize,
@@ -660,7 +660,7 @@ enum BatchWrite {
 ///
 /// A caller that does not run an embed gets nothing from this enum, which is why [`NoProvider`] exists: `np search`
 /// needs the reason as a value too, and re-deriving it at its print site is what made it say
-/// `embeddings.provider = "none"` about a configuration that said `local-model` (F32).
+/// `embeddings.provider = "none"` about a configuration that said `local-model`.
 pub enum Resolution<'a> {
     /// This build links no inference runtime (**F40**). Carried as its own resolution rather than handed to the writer
     /// loop as a provider that refuses every batch, because doing that reported arm (iv) — see
@@ -855,7 +855,7 @@ fn run(
     let row = match db::model_row(&db, &model_id)? {
         Some(row) => row,
         // The other half of arm (ii): a `model` naming no installed row. Naming the key and the id is what
-        // makes this readable as a configuration state rather than a fault (§6).
+        // makes this readable as a configuration state rather than a fault.
         None => {
             // **F41 option A.** The configuration is correct — it names a provider and an id this build pins. What is
             // missing is 309 MB, which is arm (iii)'s problem seen from before the first install, so this refusal
@@ -873,7 +873,7 @@ fn run(
         }
     };
 
-    // ---- wrong width: refused here, before the corpus is read and long before any write (§6).
+    // ---- wrong width: refused here, before the corpus is read and long before any write.
     // `configured` is what this run needs a vector to be — `[embeddings] dim`, or the installed row's own
     // declaration when the config declares none, which is the only width that row can honour — and
     // `provider.dim()` is what would actually be written. Reading `dim` here is the whole reason its doc comment
@@ -1104,7 +1104,7 @@ fn run(
     // The token numbers of the last over-budget refusal, kept for §6's report line.
     let mut budget_detail: Option<String> = None;
     // The provider's own sentence for the last refusal it raised, which becomes arm (iv)'s reason. Every
-    // `EmbedError` message is input-free and secret-free by that type's own rule (§3).
+    // `EmbedError` message is input-free and secret-free by that type's own rule.
     let mut reason: Option<String> = None;
 
     // The pass says where it starts, and how much work it starts with. `owed.len()` is free — this is the vector the run
@@ -1137,7 +1137,7 @@ fn run(
                 }
             },
             // One over-budget chunk must not refuse the batch it travelled in, and must not be truncated
-            // either, so its batch is retried one text at a time to find which ones are over (§5).
+            // either, so its batch is retried one text at a time to find which ones are over.
             Err(EmbedError::TokenBudgetExceeded { .. }) => {
                 for item in batch {
                     match provider.embed(&[item.text.as_str()]) {
@@ -1318,7 +1318,7 @@ fn run_media_pass(
         // the claim was false, and a dead arm is a bad place to hide one.
         Err(_) => tally_after_stop(&mut tally),
         // A non-lock failure cannot be a refusal (§8's classes are about images, not about the workspace), and cannot
-        // change the exit code either (§8 rule 6). What it can do is say so: the notes past the fault count as unchecked,
+        // change the exit code either. What it can do is say so: the notes past the fault count as unchecked,
         // which holds the sweep back too, so a database that went busy halfway through does not spend the rest of the
         // corpus' vectors on the strength of never having read them.
     }
@@ -1347,7 +1347,7 @@ fn run_media_pass(
 ///    and [`EmbedReport::images_unchecked`] says how many notes this pass could not ask. Destroying a figure's vector
 ///    because `read` returned `EACCES` is not what "nothing links it" means.
 ///
-/// **No image outcome reaches the exit code** (§8 rule 6): every per-image failure below becomes a counted refusal, and
+/// **No image outcome reaches the exit code**: every per-image failure below becomes a counted refusal, and
 /// only a workspace-database failure leaves this function with an `Err`, which is the same answer the text half gives for
 /// the same fault.
 fn media_pass(
@@ -1365,7 +1365,7 @@ fn media_pass(
     let capable = provider
         .as_ref()
         .is_some_and(|provider| provider.supports_images());
-    // …and asked in the same breath, for the same reason, is *why not* (F28). "This build has no image code" and "this
+    // …and asked in the same breath, for the same reason, is *why not*. "This build has no image code" and "this
     // workspace has no projector" were one class until here; they advise different actions — build with a feature, or
     // fetch one file — so folding them kept the counts honest and the advice wrong. `None` means either the provider can
     // encode or there is no provider to ask, and both keep the pre-F28 label below.
@@ -1403,7 +1403,7 @@ fn media_pass(
         let mut resolved_paths: HashSet<Vec<u8>> = HashSet::new();
         for link in links {
             // Counted here, before the target is placed: a link that refuses is still a figure the author wrote, and this
-            // count gates the text line (§6). Deduplication happens first, so §7 rule 1 holds.
+            // count gates the text line. Deduplication happens first, so §7 rule 1 holds.
             if !named.insert(link.target.clone()) {
                 continue;
             }
@@ -1427,7 +1427,7 @@ fn media_pass(
                     continue;
                 }
             };
-            // One row and one encode per resolved path per note (§7 rule 1), independent of the count above.
+            // One row and one encode per resolved path per note, independent of the count above.
             if !resolved_paths.insert(resolved.rel_bytes.clone()) {
                 continue;
             }
@@ -1460,7 +1460,7 @@ fn media_pass(
                         tally.refusals.push((shown, MediaRefusal::MissingTarget));
                         continue;
                     };
-                    // Content, not the filename, decides what a figure is (F26): `.gif`-shaped bytes that are not a
+                    // Content, not the filename, decides what a figure is: `.gif`-shaped bytes that are not a
                     // raster this build decodes refuse here rather than reaching an encoder.
                     let Some(kind) = media::image_kind_of_prefix(&bytes) else {
                         tally
@@ -1559,7 +1559,7 @@ fn media_pass(
                     )?;
                     tally.embedded += 1;
                 }
-                // A provider's refusal is a count, never a failed run (§8 rule 6).
+                // A provider's refusal is a count, never a failed run.
                 Err(error) => tally.refusals.push((shown, image_refusal_of(&error))),
             }
         }
@@ -1656,7 +1656,7 @@ fn media_fields(media: &MediaTally) -> EmbedReport {
 /// `provider = "none"` (there is no provider to ask, so no id can be named), then a `local-model` provider with
 /// no `model` value. [`Config::load`] already refuses the second for a file it parsed, so that arm is reachable
 /// only from a hand-built [`Config`] — it stays a refusal rather than a guess because inventing an id would be a
-/// second source of model identity (§4).
+/// second source of model identity.
 fn configured_model(cfg: &Config) -> Result<String, EmbedOutcome> {
     match cfg.embeddings.provider {
         EmbeddingProvider::None => Err(EmbedOutcome::ConfigurationDisabled {
@@ -1770,7 +1770,7 @@ fn paired<'a>(
 ///
 /// The transaction is opened *after* the provider ran and committed before the next batch is inferred — §6's
 /// "model work never runs inside a transaction", and the reason an interrupted run leaves a consistent
-/// database. `upsert_vector`'s `ON CONFLICT` keeps a repeated batch idempotent rather than fatal (§5).
+/// database. `upsert_vector`'s `ON CONFLICT` keeps a repeated batch idempotent rather than fatal.
 fn write_batch(
     db: &Db,
     model: &str,

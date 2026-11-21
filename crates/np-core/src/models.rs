@@ -7,7 +7,7 @@
 //! `&Config` so np-cli stays a parser of text into [`Install`] plus a printer of [`InstallOutcome`] and
 //! [`Listing`] — the reason §6 names reads and writes in `db.rs` instead of letting a command hold SQL.
 //!
-//! Nothing here contacts anything: no HTTP client, no URL, no key, no model execution (§5). The one digest
+//! Nothing here contacts anything: no HTTP client, no URL, no key, no model execution. The one digest
 //! implementation is [`crate::hash::sha256_file`] — this module defines no second SHA-256, and §7's test 9
 //! exists to keep it that way. R7a keeps that sentence true: reading a fetch marker ([`fetch_state`]) opens one
 //! file in the workspace's own artifact directory, and nothing in this module can name a host or open a socket.
@@ -16,7 +16,7 @@
 //! *this program's own* to report. A marker any other hand placed is still reported: [`list`] reads names, not
 //! authorship, which is what makes the first-start case work before R7b writes its first byte.
 //!
-//! **`fetching` is not an [`ArtifactState`]** (§12 rule 3). The four arms above are mutually exclusive verdicts
+//! **`fetching` is not an [`ArtifactState`]**. The four arms above are mutually exclusive verdicts
 //! on one artifact, while a fetch is orthogonal to all of them: on a first start there is *no row at all*, and a
 //! row that is `present` can be re-fetching. So a fetch is reported beside the rows — [`Listing::fetching`],
 //! which the listing renders as its own section — and adding a fifth arm would make "the artifact is fine and it
@@ -26,7 +26,7 @@
 //!
 //! - **The row and the artifact are one workspace's.** Both come from [`Config::workspace_db`] and
 //!   [`Config::workspace_models_dir`], which share one private name derivation; a second derivation anywhere
-//!   else would separate them by another door (§3 step 0).
+//!   else would separate them by another door.
 //! - **No half-states.** The artifact is written through a temporary name and renamed, the row is inserted
 //!   only after the rename, and every outcome is a variant of [`InstallOutcome`] or [`ArtifactState`]. What
 //!   cannot be expressed — "the directory could not be listed", which is *not* a per-row verdict — has no
@@ -52,7 +52,7 @@ use crate::walk;
 /// `[a-z0-9][a-z0-9._@-]{0,63}`.
 const ID_MAX_CHARS: usize = 64;
 
-/// Length of a sha256 spelled as hex, which is what `--sha256` has to be (§3 step 4) and what
+/// Length of a sha256 spelled as hex, which is what `--sha256` has to be and what
 /// [`crate::hash::sha256_file`] returns.
 ///
 /// `pub(crate)` because `[models] sha256` is the same fact about the same kind of value: `config` validates that key
@@ -86,19 +86,19 @@ pub const MAIN_FILE: &str = "main";
 /// `crate::scan`'s catalog writes ("no reader ever sees half an artifact"), kept separate because a
 /// `<generated>.INDEX.md.tmp` corpse and a `<id>.<nonce>.tmp` one are cleaned up by different rules: the
 /// scan clears only names [`crate::index_names`] recognises, while a model leftover is *reported* under
-/// `list`'s unclaimed heading (§3) rather than deleted, because nothing here deletes anything a row may
+/// `list`'s unclaimed heading rather than deleted, because nothing here deletes anything a row may
 /// still be naming.
 const TEMP_SUFFIX: &str = ".tmp";
 
 /// Leading dot of both fetch names, and the half that makes them unforgeable: [`validate_id`] refuses an id whose
-/// first character is not a lowercase letter or a digit (§12 rule 2).
+/// first character is not a lowercase letter or a digit.
 const FETCH_MARKER_PREFIX: &str = ".fetching.";
 
 /// The marker's extension. Spelled `.json` because the file holds §12's four fields as one JSON object, and read
 /// back by [`parse_marker`] rather than by a dependency this crate does not have.
 const FETCH_MARKER_SUFFIX: &str = ".json";
 
-/// Leading dot plus the word for a partial download: `.part.<id>.<nonce>` (§12 rule 2). R7a recognises this name
+/// Leading dot plus the word for a partial download: `.part.<id>.<nonce>`. R7a recognises this name
 /// and reads nothing from it — its only consumer today is `list`'s rule that a fetch is never announced as junk.
 const PART_PREFIX: &str = ".part.";
 
@@ -117,12 +117,12 @@ const WINDOWS_DEVICE_NAMES: [&str; 22] = [
 #[derive(Debug, Clone)]
 pub struct Install {
     /// Model identity, i.e. `models.id` and the artifact's file name. Refused before any file access by
-    /// [`validate_id`] (§3 step 1), because a bad id is not a reason to read half a gigabyte.
+    /// [`validate_id`], because a bad id is not a reason to read half a gigabyte.
     pub id: String,
     /// The artifact the human already has. It is **read** and copied; never moved, truncated or deleted, so
     /// a failed install leaves the source where it was.
     pub source: PathBuf,
-    /// Declared vector width — declared by the human, never probed (§2).
+    /// Declared vector width — declared by the human, never probed.
     ///
     /// `NonZeroU16` is §2's bound expressed as a type rather than as a runtime check this module could skip:
     /// `u16` because [`crate::config::EmbeddingsConfig`] already measures that quantity in `u16`, non-zero
@@ -132,7 +132,7 @@ pub struct Install {
     /// with a width outside it.
     pub dim: NonZeroU16,
     /// The digest this artifact must hash to, as the human spelled it — any case. [`install`] validates it
-    /// and lowers it **once** (§3 step 4); everything downstream uses that lowered spelling.
+    /// and lowers it **once**; everything downstream uses that lowered spelling.
     pub sha256: String,
     /// Prefix added to documents, `''` when the command names none (migration 7's default).
     pub prefix_doc: String,
@@ -160,7 +160,7 @@ pub struct ProjectorInstall {
 }
 
 /// What one `install` call ended as. An enum because these are three different facts about the workspace,
-/// and a caller must be able to match on them rather than parse a sentence (§3).
+/// and a caller must be able to match on them rather than parse a sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallOutcome {
     /// The artifact was copied and the row inserted — this call is what put the model on the table.
@@ -170,7 +170,7 @@ pub enum InstallOutcome {
     AlreadyInstalled,
     /// The row was there, the tuple agreed, and the artifact was gone; the file was re-materialised from a
     /// source whose digest the row already attests. No column was rewritten — this is re-materialising what
-    /// the row attests, not repairing it (§3 step 6).
+    /// the row attests, not repairing it.
     Restored,
 }
 
@@ -201,7 +201,7 @@ pub enum ArtifactState {
     /// The row expects an artifact and none is there — named, never repaired.
     Missing,
     /// `sha256 IS NULL`: a provider with no local weights. Calling this `missing` is a false alarm, and
-    /// round 4b creates exactly these rows (§3).
+    /// round 4b creates exactly these rows.
     NoArtifactExpected,
     /// An artifact is there and does not hash to its row — reported, never overwritten. A non-file (a
     /// directory named after the id) lands here too: it can never hash to anything.
@@ -256,7 +256,7 @@ pub struct ListedMember {
     pub present: bool,
 }
 
-/// Something under the models directory that no row names, reported under its own heading (§3).
+/// Something under the models directory that no row names, reported under its own heading.
 ///
 /// Reachable **by design**: [`install`] renames before it inserts the row, so a process killed between those
 /// two steps leaves an artifact with no row — and step 6's temporary name is a second way in. `list` reports
@@ -270,7 +270,7 @@ pub struct Unclaimed {
     /// so a bytes field here would be a second spelling with no reader, which is the thing this crate refuses
     /// elsewhere rather than a simplification.
     pub name: String,
-    /// A subdirectory is **reported as one and not recursed** (§3): whatever is under it belongs to nobody
+    /// A subdirectory is **reported as one and not recursed**: whatever is under it belongs to nobody
     /// this command knows about, and walking a user's arbitrary tree inside the data dir is not this
     /// listing's job.
     pub kind: UnclaimedKind,
@@ -291,7 +291,7 @@ pub enum UnclaimedKind {
 
 /// Which fetch name one directory entry spells, per [`fetch_name`].
 ///
-/// Two arms because two names exist (§12 rule 2), and the id is borrowed from the entry name rather than copied:
+/// Two arms because two names exist, and the id is borrowed from the entry name rather than copied:
 /// the caller that wants an owned one says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchName<'a> {
@@ -299,7 +299,7 @@ pub enum FetchName<'a> {
     Marker(&'a str),
     /// `.part.<id>.<nonce>` — bytes of `id`'s artifact that are still arriving.
     Part(&'a str),
-    /// `.fetching.<id>.json.tmp<nonce>` — the temporary file an **atomic marker rewrite** passes through (§12 rule 2).
+    /// `.fetching.<id>.json.tmp<nonce>` — the temporary file an **atomic marker rewrite** passes through.
     ///
     /// It exists for microseconds and it must still be recognised, which is the sentence §12 rule 2 insists on: a
     /// listing's `unclaimed` list keeps meaning "nothing this program recognises", so the transient name of a marker
@@ -369,7 +369,7 @@ pub fn fetch_name(name: &OsStr) -> Option<FetchName<'_>> {
 ///
 /// `tests/models.rs` pins the round trip: for every id shape `validate_id` accepts, the name this returns is
 /// recognised back as [`FetchName::Marker`] with that same id. Without that fence the reader and the writer
-/// (R7b) could drift apart and `list` would report a fetch it cannot find.
+///   could drift apart and `list` would report a fetch it cannot find.
 pub fn marker_path(models_dir: &Path, id: &str) -> PathBuf {
     models_dir.join(format!("{FETCH_MARKER_PREFIX}{id}{FETCH_MARKER_SUFFIX}"))
 }
@@ -378,7 +378,7 @@ pub fn marker_path(models_dir: &Path, id: &str) -> PathBuf {
 ///
 /// Four fields, all **displayed and never acted on**: §12 rule 4 makes liveness a matter of consent, so
 /// `started_at` is printed rather than compared with a clock. `bytes_total` is optional because a chunked
-/// transfer or a missing `Content-Length` really does leave it unknown (§12 rule 12); `None` prints as "size
+/// transfer or a missing `Content-Length` really does leave it unknown; `None` prints as "size
 /// unknown", never as a denominator this program invented.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchFields {
@@ -393,12 +393,12 @@ pub struct FetchFields {
     pub started_at: i64,
     /// Bytes received so far.
     pub bytes_done: u64,
-    /// The size this fetch expects, when the transfer announced one (§12 rule 12).
+    /// The size this fetch expects, when the transfer announced one.
     pub bytes_total: Option<u64>,
 }
 
 /// What reading one workspace's fetch marker for one id said. Never a `Result`: no marker condition is a fault
-/// of the listing (§12 rule 3), so every answer below is data the report prints.
+/// of the listing, so every answer below is data the report prints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchState {
     /// No marker file. The ordinary state of a workspace with no fetch running.
@@ -609,7 +609,7 @@ fn parse_marker(bytes: &[u8]) -> Result<FetchFields, String> {
     let mut started_at: Option<i64> = None;
     let mut bytes_done: Option<u64> = None;
     // Two layers on purpose: outer "the field was there", inner "and it was not `null`". Both spellings of
-    // unknown size mean the same thing to the report (§12 rule 12), so they meet at `flatten()` below.
+    // unknown size mean the same thing to the report, so they meet at `flatten()` below.
     let mut bytes_total: Option<Option<u64>> = None;
 
     loop {
@@ -634,7 +634,7 @@ fn parse_marker(bytes: &[u8]) -> Result<FetchFields, String> {
                     return Err(duplicate("nonce"));
                 }
                 // Empty is refused, not stored: `.part.<id>.` is a name [`fetch_name`] rejects, so an empty nonce
-                // would be a link to nothing (§12 rule 2). Keeping the two spellings of "no nonce" in step here is
+                // would be a link to nothing. Keeping the two spellings of "no nonce" in step here is
                 // cheaper than trusting R7b to write one and read the other.
                 let written = value.text("nonce")?;
                 if written.is_empty() {
@@ -717,7 +717,7 @@ impl<'a> MarkerValue<'a> {
         }
     }
 
-    /// A count that may be negative: `started_at` is a clock reading this program only **displays** (§12 rule 4),
+    /// A count that may be negative: `started_at` is a clock reading this program only **displays**,
     /// so refusing a value it cannot explain would be inventing a rule the design does not state.
     fn signed(self, field: &str) -> Result<i64, String> {
         let digits = self.digits(field)?;
@@ -731,7 +731,7 @@ impl<'a> MarkerValue<'a> {
         digits.parse::<u64>().map_err(|_| unparsable(field, digits))
     }
 
-    /// `bytes_total`, where `null` and an absent field both mean "size unknown" (§12 rule 12).
+    /// `bytes_total`, where `null` and an absent field both mean "size unknown".
     fn optional_count(self, field: &str) -> Result<Option<u64>, String> {
         match self {
             Self::Null => Ok(None),
@@ -887,7 +887,7 @@ pub struct Listing {
     /// Entries come from the **directory**, not from the rows: a marker nothing claims is exactly the case the
     /// human asked about ("is it downloading?"), and answering it from the row list would drop it.
     pub fetching: Vec<FetchEntry>,
-    /// Entries no row names **and this program does not recognise**, sorted by display name (§3). These never
+    /// Entries no row names **and this program does not recognise**, sorted by display name. These never
     /// change an exit code. Fetch names are absent by construction — see [`fetch_name`].
     pub unclaimed: Vec<Unclaimed>,
 }
@@ -896,7 +896,7 @@ pub struct Listing {
 /// the caller has to re-derive from text.
 #[derive(Debug, Error)]
 pub enum ModelError {
-    /// The workspace operand is not a directory that exists (§3 step 0). Refusing it is the whole point:
+    /// The workspace operand is not a directory that exists. Refusing it is the whole point:
     /// [`Config::workspace_db`] is infallible by contract and derives a name from a typo as happily as from
     /// a real path, so accepting one would mint an empty database and an artifact directory no scan will
     /// ever read — a wrong status claim, which this project treats as a defect.
@@ -916,7 +916,7 @@ pub enum ModelError {
         /// The rule it broke.
         rule: &'static str,
     },
-    /// `--sha256` is not exactly `DIGEST_HEX_CHARS` (crate-private) hex characters (§3 step 4). Refused rather than
+    /// `--sha256` is not exactly `DIGEST_HEX_CHARS` (crate-private) hex characters. Refused rather than
     /// treated as "does not match": a truncated paste and a different artifact are different problems, and
     /// only one of them is fixed by re-running `np models hash`.
     #[error("`--sha256` must be exactly {DIGEST_HEX_CHARS} hexadecimal characters; this argument holds {chars}")]
@@ -925,7 +925,7 @@ pub enum ModelError {
         /// of noise in a message that has to stay readable, and the caller already knows what they typed.
         chars: usize,
     },
-    /// The source file is empty (§3 step 2). This refusal happens **before** hashing so that a download
+    /// The source file is empty. This refusal happens **before** hashing so that a download
     /// truncated to nothing reads as "the file is empty" rather than as a digest mismatch against a real
     /// artifact — the two diagnoses call for opposite actions.
     #[error("refusing a zero-length artifact: {} hashes to the digest of nothing, which pins no model", .path.display())]
@@ -933,7 +933,7 @@ pub enum ModelError {
         /// The file that turned out to be empty.
         path: PathBuf,
     },
-    /// The source does not hash to the declared digest (§3 step 4). **Both digests are named**: the file's
+    /// The source does not hash to the declared digest. **Both digests are named**: the file's
     /// digest is public information about a file the human already holds, and leaving it out is what makes a
     /// mismatch undiagnosable.
     /// The **installed artifact** no longer hashes to its own row (§3 step 6's verification). Distinct from
@@ -960,7 +960,7 @@ pub enum ModelError {
         /// The file's actual digest.
         found: String,
     },
-    /// A row already names this id and disagrees with the declaration somewhere (§3 step 5). `column` is the
+    /// A row already names this id and disagrees with the declaration somewhere. `column` is the
     /// schema's own name for the first disagreement, and both values are printed side by side because "you
     /// are re-installing a model under a different meaning" is only actionable if it says which meaning
     /// changed. No `--force` exists to override this: replacing a model identity invalidates every vector
@@ -977,7 +977,7 @@ pub enum ModelError {
         declared: String,
     },
     /// The artifact directory could not be created or listed. Named at the **workspace** level on purpose:
-    /// it is a fact about one directory, never a verdict on a row (§3), which is why [`Listing`] has no field
+    /// it is a fact about one directory, never a verdict on a row, which is why [`Listing`] has no field
     /// able to hold it.
     #[error("cannot use the model artifact directory {}: {source}", .path.display())]
     ModelsDir {
@@ -1088,7 +1088,7 @@ pub fn install(
     // Step 4's **format** check runs first, deliberately ahead of steps 2 and 3: a mistyped or truncated digest
     // is a fact about argv, and making the human watch up to ~540 MB get read before "must be exactly 64
     // hexadecimal characters" spends the expensive operation to learn something the command line already said.
-    // Lowering still happens exactly once (§3), just earlier.
+    // Lowering still happens exactly once, just earlier.
     let declared = normalize_digest(&request.sha256)?;
 
     // Step 2, now that the arguments are known good: an empty file is a truncated download, and the digest of
@@ -1116,7 +1116,7 @@ pub fn install(
 
     // Step 3, and the only digest computed over the source by this call. Step 6 does not re-hash what it copied:
     // the row's sha equals `--sha256` (step 5) and `--sha256` equals the file's, so a second pass would read
-    // ~540 MB to confirm arithmetic (§3).
+    // ~540 MB to confirm arithmetic.
     let found = hash::sha256_file(&open_source).map_err(|err| ModelError::Source {
         path: request.source.clone(),
         source: hash_io(err),
@@ -1189,7 +1189,7 @@ pub fn install(
         now,
     )?;
     if inserted {
-        // The primary member's name, recorded beside the row that carries its digest (§12 rule 10). A failure here is
+        // The primary member's name, recorded beside the row that carries its digest. A failure here is
         // a database failure like any other in this function: the artifact is on disk and the row exists, which is
         // exactly the crash state `list` reports as a model with no recorded files — never a reason to pretend the
         // install did not happen.
@@ -1204,7 +1204,7 @@ pub fn install(
     }
 
     // A second process inserted this id between step 5 and here. Its row is the authority now, so apply the
-    // same full-tuple test rather than reporting a conflict-free success or a bare constraint violation (§6).
+    // same full-tuple test rather than reporting a conflict-free success or a bare constraint violation.
     match db::model_row(db, &request.id)? {
         Some(row) => {
             compare_declaration(&row, request, &declared)?;
@@ -1219,7 +1219,7 @@ pub fn install(
 /// Install the projector member of an already-installed model from a file the human already has — offline, with no
 /// transport anywhere near it.
 ///
-/// **Why this exists (F28).** Step 1 gave "this workspace has no projector" its own refusal class, and step 2 made a
+/// **Why this exists.** Step 1 gave "this workspace has no projector" its own refusal class, and step 2 made a
 /// vision build load one; both tell an operator to install or fetch the `mmproj` member. Until now only `fetch` could
 /// place it, so the advice was impossible on a machine that cannot reach Hugging Face — which is most of the machines
 /// this artifact's 554 MB size makes offline. The digest is still mandatory: an unverified projector would encode every
@@ -1334,7 +1334,7 @@ pub fn install_projector(
 /// Report every installed model of `workspace`, any fetch in progress, and what each artifact looks like.
 ///
 /// Reads only: nothing here repairs, re-hashes into place, or deletes — including the unclaimed entries,
-/// which are leftovers this command cannot prove are garbage (§3), and including a marker that will not parse
+/// which are leftovers this command cannot prove are garbage, and including a marker that will not parse
 /// ([`fetch_state`] reports it and leaves it alone).
 ///
 /// A marker that is malformed, truncated, unreadable, or a directory **cannot fail this call**: `fetching` holds
@@ -1367,7 +1367,7 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
         }
     };
 
-    // Claimed means "some row names this exact file name". Row ids are validated ASCII (§2), so comparing
+    // Claimed means "some row names this exact file name". Row ids are validated ASCII, so comparing
     // the OS spelling against them needs no lossy round trip — a name UTF-8 cannot hold is by construction
     // not an id and lands in `unclaimed`, rendered with replacements.
     let mut claimed: HashSet<OsString> = rows.iter().map(|row| OsString::from(&row.id)).collect();
@@ -1469,7 +1469,7 @@ fn fetch_entries(models_dir: &Path, mut marker_ids: Vec<String>) -> Vec<FetchEnt
     entries
 }
 
-/// Refuse a `workspace` operand that is not a directory that exists (§3 step 0).
+/// Refuse a `workspace` operand that is not a directory that exists.
 ///
 /// Public because the check has to happen **before** [`Config::workspace_db`] is opened, not merely inside
 /// [`install`] and [`list`]: deriving a database path is infallible by contract (`config.rs`'s own doc says
@@ -1521,7 +1521,7 @@ pub fn validate_id(id: &str) -> Result<(), ModelError> {
     if let Some(device) = windows_device_name(id) {
         // Ahead of the charset rules on purpose. `NUL.txt` fails both, and the reader who typed it cannot do
         // anything with "use lowercase" — the file name is impossible on Windows whatever the case is, because
-        // Windows folds it and refuses the device name either way (§2).
+        // Windows folds it and refuses the device name either way.
         return Err(ModelError::InvalidId {
             // Naming the reserved word itself, not just the id: in `nul.md` it is `nul` that Windows refuses,
             // and a reader who knows which half is the problem can rename the other half.
@@ -1564,8 +1564,8 @@ fn windows_device_name(id: &str) -> Option<&'static str> {
         .copied()
 }
 
-/// Validate a declared digest as exactly `DIGEST_HEX_CHARS` (crate-private) hex characters and return it lowered
-/// (§3 step 4). `config` reuses this for `[models] sha256`, so the format rule has one home; only the sentence each
+/// Validate a declared digest as exactly `DIGEST_HEX_CHARS` (crate-private) hex characters and return it
+/// lowered. `config` reuses this for `[models] sha256`, so the format rule has one home; only the sentence each
 /// caller prints differs, because each names a different place to go and fix.
 pub(crate) fn normalize_digest(declared: &str) -> Result<String, ModelError> {
     // Characters on both sides. `len()` is bytes, so a pasted argument holding one non-ASCII character (a stray
@@ -1629,7 +1629,7 @@ fn compare_declaration(
     Ok(())
 }
 
-/// Copy `source` to `<models_dir>/<id>` through a temporary name (§3 step 6).
+/// Copy `source` to `<models_dir>/<id>` through a temporary name.
 ///
 /// Three paths, all spelled through [`walk::to_open_path`] — the directory creation, the temp write and the
 /// rename — because a long temp name can cross the Windows prefix threshold while the final name does not,
@@ -1714,7 +1714,7 @@ pub(crate) fn nonce() -> String {
 ///
 /// "There" means *some name exists*: a directory counts, and install then reports `already installed` rather
 /// than writing. The bytes behind it are a separate question: `install` verifies this one artifact when it is
-/// already there (§3), and [`artifact_state`] answers it for every row during `list`.
+/// already there, and [`artifact_state`] answers it for every row during `list`.
 fn artifact_present(models_dir: &Path, id: &str) -> bool {
     fs::metadata(walk::to_open_path(&access(&models_dir.join(id)))).is_ok()
 }
@@ -1766,13 +1766,13 @@ impl EntryList {
     ///
     /// Two outputs from one pass because the two rules are one decision, made per name, in this order:
     ///
-    /// 1. A name [`fetch_name`] recognises is never unclaimed (§12 rule 2). A marker *and* a `.part` both leave
+    /// 1. A name [`fetch_name`] recognises is never unclaimed. A marker *and* a `.part` both leave
     ///    here rather than being announced as junk — otherwise a first start reports its own progress file as
     ///    garbage, which is the defect §11's addendum records the first draft having.
     /// 2. Of those names, only a marker contributes an id to report; a `.part` is recognised and left at that,
     ///    because it holds no fields and R7a writes none (§12 rule 5 gives it to the fetcher).
     /// 3. Otherwise a row naming the name claims it; what nothing claims is reported, sorted by its lossy display
-    ///    name so output is deterministic (§3).
+    ///    name so output is deterministic.
     fn split(self, claimed: &HashSet<OsString>) -> (Vec<Unclaimed>, Vec<String>) {
         let mut unclaimed = Vec::new();
         let mut markers = Vec::new();
@@ -1780,7 +1780,7 @@ impl EntryList {
             match fetch_name(&name) {
                 Some(FetchName::Marker(id)) => markers.push(id.to_owned()),
                 // Recognised, so not `unclaimed`; and a marker rewrite in flight says nothing about whether a fetch
-                // is running, which is the only thing the `fetching` section is allowed to assert (§12 rule 3).
+                // is running, which is the only thing the `fetching` section is allowed to assert.
                 Some(FetchName::Part(_) | FetchName::MarkerTemp(_)) => {}
                 None => {
                     if !claimed.contains(&name) {

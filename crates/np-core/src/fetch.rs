@@ -56,7 +56,7 @@ use crate::models::{self, FetchFields, FetchState, MAIN_FILE};
 use crate::pins::{self, PinnedModel};
 use crate::walk;
 
-/// Free bytes the preflight demands **above** the pinned total (§12 rule 6).
+/// Free bytes the preflight demands **above** the pinned total.
 ///
 /// 64 MiB is not a guess at a filesystem's behaviour — it is the size of the two things this command writes that no
 /// pinned number covers: the marker and its temp, plus whatever the platform's journal wants. It cannot make ENOSPC
@@ -164,7 +164,7 @@ pub enum FetchError {
         /// Which member was missing.
         member: String,
     },
-    /// A marker already exists (§12 rule 4). **Refuse, and hand the human the decision** — the fields are displayed,
+    /// A marker already exists. **Refuse, and hand the human the decision** — the fields are displayed,
     /// never compared with a clock, because a resumed laptop moves wall time further than any heartbeat.
     #[error(
         "a fetch of `{id}` is already recorded: {} (started_at {started_at}, {bytes_done} bytes done{}, \
@@ -184,7 +184,7 @@ pub enum FetchError {
         started_at: i64,
         /// Displayed only.
         bytes_done: u64,
-        /// Pre-formatted so the message can say "size unknown" without a nested conditional (§12 rule 12).
+        /// Pre-formatted so the message can say "size unknown" without a nested conditional.
         total_label: Option<String>,
     },
     /// A marker exists and cannot be read. Reported, never deleted, never treated as absent — the same posture as
@@ -853,8 +853,8 @@ fn receive_member(
         class,
     };
     // Keep the transport's **class** and drop anything else it carried: every arm of `FetchError` other than
-    // `Transport` describes this module's own file work, so a member that never opened stays a transport refusal
-    // (§12 rule 8).
+    // `Transport` describes this module's own file work, so a member that never opened stays a transport
+    // refusal.
     let body = transfer
         .transport
         .open(member)
@@ -870,7 +870,7 @@ fn receive_member(
         phase: crate::progress::Phase::Fetching,
         member: Some(member.member()),
         bytes_done,
-        // The **pinned** size, never `body.bytes_total` (§12 rule 12): a chunked transfer announces nothing, and two
+        // The **pinned** size, never `body.bytes_total`: a chunked transfer announces nothing, and two
         // denominators behind one key makes the same field mean two different percentages.
         bytes_total: Some(member.size_bytes()),
         members_done: index,
@@ -947,7 +947,7 @@ fn receive_member(
     })?;
     drop(file);
 
-    // Length before digest (§12 rule 6): "short" and "different bytes of the same length" are different facts with
+    // Length before digest: "short" and "different bytes of the same length" are different facts with
     // different advice, and a mismatch message that had to guess which one it was would be the less useful of them.
     // The member is complete and verified: this is the last line a client can treat as progress for this member, and
     // it is why `bytes_done` on the closing line equals `bytes_total` rather than merely approaching it.
@@ -1068,7 +1068,7 @@ fn remove_part(models_dir: &Path, id: &str, nonce: &str) {
 
 /// Free bytes on the filesystem holding `path`, or `None` where this platform cannot say.
 ///
-/// **What this host answers with is measured; what the other arms claim is not** (F18). This half is `statvfs`, whose block
+/// **What this host answers with is measured; what the other arms claim is not**. This half is `statvfs`, whose block
 /// size times free blocks is the number §12 rule 6's preflight wants.
 ///
 /// The sentence here used to read "Windows and macOS get `None`", and it was wrong about macOS: macOS is `cfg(unix)`, so it
@@ -1122,7 +1122,7 @@ fn available_bytes(path: &Path) -> Option<u64> {
 ///
 /// Pure **because of how this check was once written**: the decision and the OS query were fused in one inline `if let Some(_)`, so
 /// the only test of it asserted a refusal that only a `statvfs` answer can produce, and "the preflight does not happen on Windows"
-/// survived two rounds of green gates until a runner existed to say otherwise (F34). Split out, all three outcomes are covered on
+/// survived two rounds of green gates until a runner existed to say otherwise. Split out, all three outcomes are covered on
 /// every host; what stays platform-shaped is the query alone.
 fn preflight(needed: u64, available: Option<u64>) -> Result<(), FetchError> {
     match available {
@@ -1193,7 +1193,7 @@ fn available_bytes(path: &Path) -> Option<u64> {
 // including the ones that never fetch.
 //
 // Plain comments, not `///`: rustdoc generates no documentation for an `extern` block, so a doc comment here is
-// `-D unused_doc_comments` — and that is what the `windows-latest` clippy row failed on for this commit on 2026-11-05,
+// `-D unused_doc_comments` — and that is what the `windows-latest` clippy row failed on for this commit,
 // four hours after it looked locally green. Nothing on a Linux host compiles this block, so nothing here can catch it.
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -1274,7 +1274,7 @@ impl FailureClass for FetchError {
     }
 }
 
-/// Summarise a transport's own error text into a class that is safe to print (§12 rule 8).
+/// Summarise a transport's own error text into a class that is safe to print.
 ///
 /// **This function never echoes its input, and that is its whole contract.** HTTP client errors read like
 /// `https://mirror.example/models/main.gguf: status code 404`, and §12 rule 8 says a host and a full URL do not belong
