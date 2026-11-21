@@ -2,16 +2,16 @@
 //!
 //! Two claims, each narrower than the milestone it belongs to.
 //!
-//! **R6b1:** llama.cpp v0.8.0 (the tree `third_party/llama-cpp.toml` pins) loads
+//! llama.cpp v0.8.0 (the tree `third_party/llama-cpp.toml` pins) loads
 //! `embeddinggemma-2-Q8_0.gguf` on this host through the hand-written declarations in [`crate::llama_ffi`],
 //! and the numbers it answers with are the numbers in that file's header.
 //!
-//! **R6b2:** text goes in and one unit-length [`Vector`] comes out — [`LoadedModel::embed_text`] tokenizes,
+//! Text goes in and one unit-length [`Vector`] comes out — [`LoadedModel::embed_text`] tokenizes,
 //! runs a single forward pass, reads the pooled row and L2-normalises it, and [`LocalEmbedder`] is that path
 //! behind [`crate::embed::Embedder`]. What is still **not** here: nothing constructs a
 //! [`LocalEmbedder`] from a config, no caller embeds anything, and
 //! [`LocalModelProvider`](crate::embed::LocalModelProvider) therefore still answers
-//! [`EmbedError::RuntimeNotBuilt`] — R6c decides who holds a loaded model and when (§3's one load per
+//! [`EmbedError::RuntimeNotBuilt`] — this module decides who holds a loaded model and when (one load per
 //! process), because 420 MB is not a thing to acquire as a side effect of resolving a provider.
 //!
 //! ## The window is three numbers, not one
@@ -31,7 +31,7 @@
 //! 600-token sequence **aborted the process** (measured: exit 134, no return code at all). Since
 //! `embeddings.max_tokens` accepted up to 8,192, that abort was reachable from an ordinary ~1,800-byte note. See
 //! `REQUESTED_CTX` for what the wider window costs and [`LoadedModel::window`] for the refusal that guards it. The
-//! budget ceiling is **8,192** and the context this file creates is 8,192 wide (§5's decision C), so the two numbers
+//! budget ceiling is **8,192** and the context this file creates is 8,192 wide, so the two numbers
 //! meet: no validated config can ask for more
 //! than this context can hold, which is what the assertion under `REQUESTED_CTX` keeps true.
 //!
@@ -47,8 +47,8 @@
 //! `embeddinggemma-2-Q8_0.gguf` answers `n_embd_out = 768` and `n_embd_inp = 512`: the model runs at 512
 //! inside and projects to 768, which is why [`load`] compares a declared width against **out**, and why the
 //! deprecated `llama_n_embd` is not declared anywhere in this crate. It also answers `n_ctx_train = 262_144`
-//! while `MAX_EMBEDDING_TOKENS` is 8,192 — a 32× gap §5 used to keep as an open question and has now closed as a
-//! decision (2026-10-30): the trained window is not something one embedding can spend here, so the ceiling follows the
+//! while `MAX_EMBEDDING_TOKENS` is 8,192 — a 32× gap, closed by decision rather than left open: the trained window
+//! is not something one embedding can spend here, so the ceiling follows the
 //! context we build rather than the artifact's number. `ModelFacts::n_ctx_train` still reports the artifact's figure,
 //! because a refusal that names the wrong limit wastes the reader's time.
 //!
@@ -57,7 +57,7 @@
 //! Paths reach C through `c_string_path`, which is per-platform on purpose. Everything else in this module is
 //! portable Rust plus the FFI mirror.
 //!
-//! Until 2026-11-08 this file used `std::os::unix::ffi::OsStrExt` directly and compiled on Unix only, because
+//! This file used `std::os::unix::ffi::OsStrExt` directly and compiled on Unix only for a while, because
 //! `build.rs` refused to build `local-model` for any target but Linux. That refusal now admits
 //! `x86_64-pc-windows-gnu` behind an explicit cmake toolchain, so the conversion has to say what it does on
 //! each platform instead of assuming bytes — see `c_string_path` for why a lossy conversion is the failure
@@ -81,24 +81,24 @@ use crate::walk;
 /// The context window [`load`] asks llama.cpp for, and the number it also gets for `n_batch` and `n_ubatch`:
 /// `min(REQUESTED_CTX, n_ctx_train)`.
 ///
-/// Not the model's trained window (262,144 here; §5 closed that gap as decision B), and not
+/// Not the model's trained window (262,144 here — see the note on `REQUESTED_CTX`), and not
 /// `embeddings.max_tokens` either — the budget decides what a caller may submit, this decides what the runtime can
 /// hold, and [`LoadedModel::embed_text`] refuses between the two rather than letting llama.cpp decide with an assert.
 /// Since decision B those two numbers are equal for a validated config, which is what the assertion below turns into a
 /// compile-time fact.
 ///
 /// **What it costs, measured** by `tests/probes/decode_probe.c` — the bare C loader plus one forward pass, so the
-/// baseline is that program's own 419.4 MiB with the model open (§14; our Rust process sits 1.7 MiB higher, at
+/// baseline is the probe's own 419.4 MiB with the model open (our Rust process sits 1.7 MiB higher, at
 /// 421.1 MiB): 133 tokens **+0 MiB**, 513 **+47**, 1,026 **+109**, 2,052 **+218**, 4,085 **+458**. The compute
 /// buffer is reserved at context creation but its pages are touched per forward pass, so the price
 /// tracks the **longest sequence actually run**, not the ceiling asked for — which is why a window this wide costs
 /// on ordinary chunks and why a smaller ceiling would not have bought much. Keeping it a constant rather than
 /// a parameter is [`load`]'s choice, not the design's: legal input length comes from `embeddings.max_tokens`,
-/// so when R6c wires config to a provider this becomes an argument, and until then a workspace configured
+/// so when config is wired to a provider this becomes an argument, and until then a workspace configured
 /// above it gets [`LoadedModel::window`]'s refusal instead of an abort.
 ///
-/// **8,192 since 2026-10-30**, moved up beside `MAX_EMBEDDING_TOKENS` when the human restored that ceiling (§5's
-/// decision C): a ceiling the context cannot reach is a config that lies, so the two move together or not at all —
+/// **8,192**, moved up beside `MAX_EMBEDDING_TOKENS` when that ceiling was restored: a ceiling the context cannot
+/// reach is a config that lies, so the two move together or not at all —
 /// which is what the assertion below enforces. Measured here before asking for it (`tests/probes/decode_probe.c
 /// nctx=8192`): the context reports `n_ctx = 8192`, `n_ubatch = 8192` back, a short sequence through the wider window
 /// costs +0 MiB, and a near-ceiling 7,999-token chunk peaks at 1,478 MiB in ~101 s.
@@ -112,7 +112,7 @@ const REQUESTED_CTX: usize = 8_192;
 ///
 /// Outside `#[cfg(test)]` deliberately, like the layout pins in [`crate::llama_ffi`]: someone widening
 /// `MAX_EMBEDDING_TOKENS` to spend a bigger window has to touch this file to do it safely, and a test-only check would
-/// let the two constants drift apart in a build that still compiles (design §5's decision B is what pairs them today).
+/// let the two constants drift apart in a build that still compiles; pairing them is what this assertion is for.
 const _: () = assert!(
     crate::config::MAX_EMBEDDING_TOKENS <= REQUESTED_CTX,
     "embeddings.max_tokens must never allow a budget wider than the context this build creates"
@@ -129,7 +129,7 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pooling {
     /// Mean over the sequence's real tokens — what `embeddinggemma-2` declares (`pooling_type = 1`), and the
-    /// pooling §5 describes: mean, then L2-normalise.
+    /// the pooling this recipe uses: mean, then L2-normalise.
     Mean,
     /// The first token's row.
     Cls,
@@ -174,8 +174,8 @@ pub struct ModelFacts {
     pub n_embd_inp: usize,
     /// Tokens the model was trained with (unit: tokens) — a fact about the artifact, **not** our ceiling.
     /// `embeddings.max_tokens` inside `MAX_EMBEDDING_TOKENS` is the bound a sequence is refused against, and the
-    /// window we ask llama.cpp for is `REQUESTED_CTX`; §5 closed the gap between those and this number as a decision
-    /// on 2026-10-30 rather than leaving it open. It is reported anyway because it is the number a reader reaches
+    /// window we ask llama.cpp for is `REQUESTED_CTX`, and the gap between those and this number is closed by
+    /// decision rather than left open. It is reported anyway because it is the number a reader reaches
     /// for first, and because on an artifact trained *narrower* than `REQUESTED_CTX` it is `window()` that saves the
     /// run.
     pub n_ctx_train: usize,
@@ -185,7 +185,7 @@ pub struct ModelFacts {
     /// token of the budget (`tokenizer.ggml.add_bos_token` is true for this artifact).
     pub add_bos: bool,
     /// Whether the same request appends EOS. Read separately from [`ModelFacts::add_bos`] because both are set
-    /// here, and a token count that assumed one would be one short (§5's budget counts specials).
+    /// here, and a token count that assumed one would be one short (the budget counts specials).
     pub add_eos: bool,
     /// How this context pools (unit: none — a strategy, not a number). Never `NONE` and never `Rank`: [`load`]
     /// refuses both — the first cannot produce a sentence vector at all, the second produces one of a different
@@ -202,7 +202,7 @@ pub struct ModelFacts {
 ///
 /// It is also neither `Send` nor `Sync`, because [`NonNull`] is neither and nothing here claims otherwise: no
 /// comment in v0.8.0's header says a context may be driven from two threads, so the type does not assert that
-/// it may. R6b2 shares one loaded model per process by **holding** it (§3's "one load per process, never per
+/// it may. This module shares one loaded model per process by **holding** it ("one load per process, never per
 /// note"), not by wrapping it in an `Arc`.
 pub struct LoadedModel {
     /// A token identifying **this loaded instance**, shared with anything that must not outlive it — today only
@@ -295,8 +295,8 @@ impl LoadedModel {
     /// (`src/llama-context.cpp:204-205` copies `cparams.n_threads`; `:954-960` returns it), so this reports *what the
     /// context was asked to use*, not what ran — unlike [`window`](Self::window), where llama.cpp's own header warns the
     /// built value may differ and the readback is therefore load-bearing. Measured proof that a count took effect is a
-    /// rate: on this host one worker runs at 49 tok/s and sixteen at 462 (`docs/design-m2-local-embeddings.md` §14's D13
-    /// subsection). It still earns its place, because the failure it catches is the honest one — a caller asked for N
+    /// rate: on this host one worker runs at 49 tok/s and sixteen at 462. It still earns its place, because the
+    /// failure it catches is the honest one — a caller asked for N
     /// and llama.cpp reported back something else, which is what happened above with 3,000,000,000 → 2147483647.
     pub fn threads(&self) -> (usize, usize) {
         // SAFETY: `self.ctx` is a live context — this method holds `&self`, so `Drop` (which needs `&mut self` and
@@ -314,7 +314,7 @@ impl LoadedModel {
     /// How many tokens the model would see for **`prefix + text`** with its special tokens, without running a
     /// forward pass.
     ///
-    /// The prefix argument is not decoration: §5's budget counts `prefix_doc + chunk + specials`, so counting
+    /// The prefix argument is not decoration: the budget counts `prefix_doc + chunk + specials`, so counting
     /// `text` alone prices a different string than the one [`LoadedModel::embed_text`] refuses on, and a
     /// pre-flight "it fits" would be wrong by exactly the prefix (R6b2 re-review P1-1). Pass the prefix you will
     /// embed with; [`LocalEmbedder`] keeps both halves of that decision together, so a caller built on it cannot
@@ -341,14 +341,14 @@ impl LoadedModel {
     /// Tokenize `prefix + text`, run **one** forward pass, and return the pooled row as a unit-length vector.
     ///
     /// `budget` is `embeddings.max_tokens` for this workspace — the caller's number, not this module's, because
-    /// §5 makes the budget a configured fact and this function has no opinion about what it should be.
+    /// The budget is a configured fact, and this function has no opinion about what it should be.
     /// `prefix` is what the model is asked to read the text under ([`TextKind`]'s side of that decision lives
     /// in [`LocalEmbedder`]; pass `""` for none).
     ///
     /// Four refusals before any vector exists, then two that mean the runtime failed:
     ///
     /// 1. [`EmbedError::TokenBudgetExceeded`] when the **token** count (not the byte count) exceeds `budget`
-    ///    — the first production call site for that variant, and the reason §5's counting rule exists;
+    ///    — the first production call site for that variant, and the reason the counting rule exists;
     /// 2. [`EmbedError::Unavailable`] *"the sequence is longer than this context can hold"* when it passes the
     ///    budget but not [`LoadedModel::window`]. Worded as it is on purpose: "context too small" would send a
     ///    user to free memory, when the fix is a shorter chunk or a re-tuned `REQUESTED_CTX`;
@@ -361,7 +361,7 @@ impl LoadedModel {
     /// pointer past the `Vector` built from it.
     ///
     /// One text per call, therefore one decode per text: a caller wanting N vectors pays N decodes today.
-    /// Multi-text batching is R6d's optimisation to take with throughput evidence, not something to assume in
+    /// Multi-text batching is an optimisation to take with throughput evidence, not something to assume in
     /// the shape of this API.
     pub fn embed_text(
         &self,
@@ -388,7 +388,7 @@ impl LoadedModel {
 
         // **Belt-and-braces, unreachable today** (R6b2 re-review P2-3): `tokenize` already refused a count above
         // `budget` before allocating, and `truncate(n)` guarantees `n <= needed <= budget`. It stays because the
-        // invariant it guards — no sequence longer than the budget reaches the runtime — is what §5's
+        // invariant it guards — no sequence longer than the budget reaches the runtime — is what the budget
         // never-truncated rule rests on, and a local check costs less than a proof about `tokenize`. The
         // *operative* guard is the one in `tokenize`; both raise identical payloads, so
         // `the_budget_counts_tokens_and_says_so` passes for the right reason either way. Counting is over tokens
@@ -396,7 +396,7 @@ impl LoadedModel {
         if n > budget {
             return Err(EmbedError::TokenBudgetExceeded { tokens: n, budget });
         }
-        // Then the window. Since §5's decision B the configured budget and this window are the same number, so no
+        // Then the window. Since the two were paired, the configured budget and this window are the same number, so no
         // validated config lands between the two refusals (Scope B review P2-6). The check still earns its place twice:
         // an artifact trained narrower than `REQUESTED_CTX` makes `window()` the smaller bound, and a direct caller may
         // pass any budget it likes — which is exactly how `tests/local_embed.rs` exercises this arm.
@@ -544,7 +544,7 @@ impl LoadedModel {
         // `i32` (checked by the caller) and is read, not freed; `tokens` has exactly `tokens.len()` writable
         // slots, which is what `n_tokens_max` promises — including the empty slice the probe passes, where
         // `as_mut_ptr` yields a valid aligned pointer that C must not write through, and per the rule above does
-        // not. `add_special = true` because §5's budget counts what the model sees, and `parse_special = false`
+        // not. `add_special = true` because the budget counts what the model sees, and `parse_special = false`
         // because a note's text is data — treating it as markup would let a file containing a control token spell
         // vocabulary entries the tokenizer then obeys.
         let n = unsafe {
@@ -590,10 +590,10 @@ impl LoadedModel {
 
 /// Scale a pooled row to unit L2 length, refusing anything that cannot be scaled.
 ///
-/// §5's recipe is mean-then-L2 and llama.cpp has already done the mean (`pooling_type = MEAN`, refused
+/// The recipe is mean-then-L2 and llama.cpp has already done the mean (`pooling_type = MEAN`, refused
 /// otherwise by [`load`]), so this is the whole of our arithmetic. Measured on this artifact the raw pooled row
 /// has ‖v‖ ≈ 184–220 depending on sequence length, so the scaling is load-bearing rather than cosmetic: stored
-/// as-is, every cosine in §5's search would be a dot product weighted by how long the note was.
+/// as-is, every cosine downstream would be a dot product weighted by how long the note was.
 ///
 /// A row that is all zeros, or contains a component that is not a number, is a **refusal**: a zero vector
 /// survives every width check, stores fine, and then scores 0.0 against everything — which is how a silent
@@ -637,10 +637,10 @@ enum Tokenize {
 
 /// Which side of a search a piece of text is on.
 ///
-/// Not a cosmetic distinction: §5 and the `models` table store `prefix_doc` and `prefix_query` separately
+/// Not a cosmetic distinction: the budget rules and the `models` table store `prefix_doc` and `prefix_query` separately
 /// because a query and a document reach the model under different instructions, and a vector written under one
 /// prefix is not comparable with a vector written under the other. Both kinds are implemented now — `np search`
-/// needs the query side in R6d — while **only [`TextKind::Document`] has a caller today**, which is what
+/// will need the query side later — while **only [`TextKind::Document`] has a caller today**, which is what
 /// [`LocalEmbedder`]'s doc says rather than what this one pretends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextKind {
@@ -654,11 +654,11 @@ pub enum TextKind {
 ///
 /// This is what `[embeddings] provider = "local-model"` will resolve to, and it is deliberately **not**
 /// [`LocalModelProvider`](crate::embed::LocalModelProvider): that type is the seam's default half, reachable
-/// without the feature and answering [`EmbedError::RuntimeNotBuilt`], and R6c decides how a config becomes this.
+/// without the feature and answering [`EmbedError::RuntimeNotBuilt`], and the provider wiring decides how a config becomes this.
 /// Constructing it is also the last place the three widths can disagree cheaply — see [`LocalEmbedder::new`].
 ///
 /// Owns one [`LoadedModel`], so it owns ~420 MB of resident weights and is neither `Send` nor `Sync`
-/// because the handles inside it are neither. One per process, held for the run's lifetime: §3's "one load per
+/// because the handles inside it are neither. One per process, held for the run's lifetime: "one load per
 /// process, never per note".
 ///
 /// **It is also the one struct in this crate allowed to hold a projector**, because it is the one struct that owns a
@@ -704,7 +704,7 @@ impl LocalEmbedder {
     /// Refuses [`EmbedError::ProviderDimMismatch`] when `row.dim` disagrees with what the artifact answers:
     /// [`load`] compared the caller's *configured* width, and this is the check that the row being embedded
     /// under is **that** row. Without it, a provider built from one model's row around another model's handles
-    /// would write 768-wide vectors stamped with a different id — the exact §6 defect the schema's `CHECK`
+    /// would write 768-wide vectors stamped with a different id — the exact defect the schema's `CHECK`
     /// catches only after something has been computed.
     pub fn new(model: LoadedModel, row: &ModelRow, max_tokens: usize) -> Result<Self, EmbedError> {
         let declared = usize::try_from(row.dim);
@@ -743,7 +743,7 @@ impl LocalEmbedder {
     /// provider keeps [`Embedder`]`s` defaults and behaves exactly as it did before images existed.
     ///
     /// Opening is deferred to the first [`Embedder::embed_image`], so a wrong path refuses there — with
-    /// [`crate::embed::VISION_UNAVAILABLE`, §8's class for "this build and model pair cannot serve it" — rather than
+    /// [`crate::embed::VISION_UNAVAILABLE`, the refusal class for "this build and model pair cannot serve it" — rather than
     /// turning construction into a second place a projector file can fail.
     #[cfg(feature = "vision")]
     #[must_use]
@@ -865,7 +865,7 @@ impl LoadFailure {
 /// The provider `[embeddings] provider = "local-model"` resolves to in a build that has the runtime.
 ///
 /// **Why it exists at all.** `np embed` has to name a provider before it knows whether the workspace owes
-/// anything — §6's exit state (i) is a success with no model work behind it — and one loaded model is ~420 MiB
+/// anything — exit state (i) is a success with no model work behind it — and one loaded model is ~420 MiB
 /// resident for the life of the process. Loading eagerly would make every up-to-date run pay that and the
 /// load time on top, for a command whose common case is "nothing changed". So this type answers `model_id` and
 /// `dim` from the row, which is all [`crate::embed_run`] needs to work out what is owed, and touches llama.cpp
@@ -873,10 +873,10 @@ impl LoadFailure {
 ///
 /// **What that trades away.** A disagreement the eager path would have caught up front — bytes that will not
 /// load, a row whose width is not the artifact's — surfaces on the first batch instead, as arm (iv) with the same
-/// typed reason and the same sentence. Nothing is written either way, and §6's ordering ("refused before any
+/// typed reason and the same sentence. Nothing is written either way, and the ordering ("refused before any
 /// write") still holds: the refusal happens inside the first `embed` call, before the writer's transaction opens.
 /// The two refusals that need no model — a width the row cannot answer, and an artifact that is not a file — are
-/// taken in [`LazyLocalEmbedder::new`] exactly as [`crate::embed::LocalModelProvider::new`] takes them, so §6's
+/// taken in [`LazyLocalEmbedder::new`] exactly as [`crate::embed::LocalModelProvider::new`] takes them, so the
 /// *artifact absent* arm stays arm (iii) rather than arriving late as a failure.
 ///
 /// **Nothing image-shaped is stored here, and that is deliberate.** The rule `crate::vision` states is that the one struct
@@ -894,7 +894,7 @@ pub struct LazyLocalEmbedder {
     dim: usize,
     max_tokens: usize,
     /// What `[embeddings] threads` said, kept as written so the report can say whether the count came from the rule or
-    /// from an operator (`docs/design-m2-thread-policy.md` §4).
+    /// from an operator.
     threads: crate::config::ThreadCount,
     /// The CPU allowance this process may use, read once at construction. Kept rather than re-read per load because a
     /// changing answer mid-run would make the reported number belong to a different machine than the run.
@@ -910,7 +910,7 @@ impl LazyLocalEmbedder {
     /// Check what can be checked without a model, and remember everything a later load needs.
     ///
     /// `threads` is the configuration value rather than a resolved count: resolving it needs this process's CPU
-    /// allowance, which is read here (`available_parallelism()`, affinity-aware — see §14's affinity log) so that the
+    /// allowance, which is read here (`available_parallelism()`, affinity-aware) so that the
     /// number in `np embed`'s report and the number handed to llama.cpp come from one reading instead of two that could
     /// disagree.
     pub fn new(
@@ -994,7 +994,7 @@ impl LazyLocalEmbedder {
         }
     }
 
-    /// Whether the model is resident in this process. False until the first batch; §14's whole argument, as an
+    /// Whether the model is resident in this process. False until the first batch — the whole argument for lazy loading, as an
     /// assertion a test can make rather than a sentence in a comment.
     pub fn loaded(&self) -> bool {
         self.loaded.get().is_some_and(|result| result.is_ok())
@@ -1055,7 +1055,7 @@ impl LazyLocalEmbedder {
 /// **Why this exists at all.** [`crate::models::install`] verifies the digest once, when the human supplies the file.
 /// After that the row is trusted blindly: R6c2's review named the consequence — swap in a same-width artifact and this
 /// program embeds with it and stamps vectors as though the installed model produced them. Re-hashing every run would
-/// close that, and R6d measured what "every run" costs: **11.32 s** to hash the pinned artifact at 26 MiB/s,
+/// close that, and what "every run" costs was measured: **11.32 s** to hash the pinned artifact at 26 MiB/s,
 /// against ~0.09 s for llama.cpp to page in every byte of it — which is why this function hashes on change and
 /// not on principle, and why the cheap answer still has to be honest about what it did.
 ///
@@ -1150,10 +1150,10 @@ pub fn verify_artifact(db: &Db, row: &ModelRow, path: &Path) -> Result<ArtifactC
 }
 
 /// Which projector file, if any, this install may hand to [`LazyLocalEmbedder::with_mmproj`] — and the only rule for that
-/// question (F28 step 2).
+/// question.
 ///
 /// **Three answers, because there are three facts.** `Ok(None)` means *this workspace has no projector*: the member was never
-/// recorded here, or the file is not on disk. That is not a failure — it is the fact behind §8's `projector-absent` refusal,
+/// recorded here, or the file is not on disk. That is not a failure — it is the fact behind the `projector-absent` refusal,
 /// whose advice ("fetch or install the `mmproj` member") is only correct if an unrecorded file really is treated as absent.
 /// `Ok(Some(path))` means the bytes at that path are the ones this database vouches for. `Err` means a file is present,
 /// recorded, and **not** what the record says — which refuses the run rather than encoding every figure in the vault with an
@@ -1234,7 +1234,7 @@ pub fn projector_artifact(
     Ok(Some(path))
 }
 
-/// The label raised when the index cannot say what it recorded about the projector (§3's fifth class: a label we chose,
+/// The label raised when the index cannot say what it recorded about the projector (the fifth class: a label we chose,
 /// never the driver's own text — see [`EmbedError::Unavailable`]'s payload rule).
 #[cfg(feature = "vision")]
 const PROJECTOR_RECORD: &str = "the projector record could not be read from the index";
@@ -1261,7 +1261,7 @@ impl Embedder for LazyLocalEmbedder {
         self.dim
     }
 
-    /// Load on first use, then reuse: §3's "one load per process, never per note", enforced by a cell rather than
+    /// Load on first use, then reuse — "one load per process, never per note" — enforced by a cell rather than
     /// by discipline. A failed load is remembered, so a run that cannot load does not spend 310 MB of reading per
     /// batch on its way to arm (iv).
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
@@ -1291,7 +1291,7 @@ impl Embedder for LazyLocalEmbedder {
     ///
     /// Those paths are spelled in full because this module imports none of `embed`'s image vocabulary. A bare
     /// `[ImageBlocker]` link resolves on the `local-model,vision` rustdoc row and breaks the other two — measured
-    /// 2026-11-06, which is the argument for keeping the rustdoc rows on every feature set rather than on defaults.
+    /// which is the argument for keeping the rustdoc rows on every feature set rather than on defaults.
     #[cfg(feature = "vision")]
     fn image_blocker(&self) -> Option<crate::embed::ImageBlocker> {
         if self.mmproj.is_some() {
@@ -1374,7 +1374,7 @@ impl Embedder for LocalEmbedder {
 
     /// One image's bytes to one row of the same space [`Self::embed`]'s text rows live in.
     ///
-    /// No prefix is applied, because §1.2 dresses text only; the pixels go to the encoder bare. The projector opens on the
+    /// No prefix is applied, because the text recipe dresses text only; the pixels go to the encoder bare. The projector opens on the
     /// first call and is reused after that, and a refusal leaves it open — one bad file does not cost a reload.
     #[cfg(feature = "vision")]
     fn embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError> {
@@ -1425,14 +1425,14 @@ impl Drop for LoadedModel {
 /// **The default is today's behaviour in every field**, and it is the only thing production passes: the one production
 /// caller of [`load`] is `LazyLocalEmbedder::model`, which uses `LoadOptions::default()`. (`embed.rs`'s unbuilt
 /// `LocalModelProvider` never reaches a loader at all — it answers `RuntimeNotBuilt` first, so naming it here would
-/// credit a caller that does not exist.) The type exists because D13 (the
-/// thread-count sweep, `docs/backlog-m2-followups.md`) has to ask a context for a specific worker count to measure it,
+/// credit a caller that does not exist.) The type exists because the thread-count sweep has to ask a context for a
+/// specific worker count to measure it,
 /// and the alternative was a measurement path that bypassed our loader — which would have measured llama.cpp rather
 /// than this program, and could not have answered the question the sweep actually asks: do *the vectors `np embed`
 /// writes* change when the thread count does.
 ///
 /// Keeping the seam narrow is also a decision about behaviour: **capability is not a default.** Nothing here changes how
-/// many threads a normal run uses, and §14's measurement decides whether a follow-up should. A config key would land on
+/// many threads a normal run uses, and the measurement decides whether a follow-up should. A config key would land on
 /// top of this type rather than replacing it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LoadOptions {
@@ -1449,7 +1449,7 @@ pub struct LoadOptions {
 ///
 /// `configured_dim` is the width this run needs vectors to be — `[embeddings] dim`, or the width already stored
 /// under this model id — and it is compared against what the **artifact answers** (`llama_model_n_embd_out`),
-/// which is the pair §6 requires to agree. This is the check a declared row cannot make for itself:
+/// which is the pair that has to agree. This is the check a declared row cannot make for itself:
 /// `models.dim` is a number someone typed, and until now nothing compared it with the file.
 ///
 /// Four refusals, cheapest first, none of them a panic:
@@ -1464,10 +1464,10 @@ pub struct LoadOptions {
 ///    context exists, because the context is the expensive part;
 /// 4. [`EmbedError::Unavailable`] with a fixed label when the runtime answers nonsense instead: no vocabulary,
 ///    a non-positive width or window, a null context, or pooling that cannot yield a sentence vector. This is
-///    §3's "runtime error with a bounded message" class, and the labels are this file's own strings — never
+///    the "runtime error with a bounded message" class, and the labels are this file's own strings — never
 ///    llama.cpp's diagnostic text, which is exactly what that variant's payload rule keeps out of logs.
 ///
-/// No new [`EmbedError`] variant: R6a's nine already cover every thing that can go wrong here, including the
+/// No new [`EmbedError`] variant: the nine already there cover every thing that can go wrong here, including the
 /// runtime-refusal class it reserved for this round.
 ///
 /// Every error path frees what it allocated. The model is freed in exactly one place — the `Err` arm below —
@@ -1501,14 +1501,14 @@ pub fn set_log_level(level: crate::loglevel::LogLevel) {
 
 /// The hook itself: write the line if this threshold wants it, and otherwise cost one integer comparison.
 ///
-/// Three rules bind here, in this order, and each exists because of something specific in v0.8.0 rather than as general FFI hygiene
-/// (`docs/design-f33-llama-log-level.md` §4):
+/// Three rules bind here, in this order, and each exists because of something specific in v0.8.0 rather than as
+/// general FFI hygiene:
 ///
 /// 1. **Gate before reading.** The signature carries no length, so the only way to read `text` is
 ///    [`std::ffi::CStr::from_ptr`](std::ffi::CStr::from_ptr) over whatever bytes upstream NUL-terminated — and a line we have already
 ///    decided to drop should never be walked at all.
 /// 2. **Write it as it arrived, or not at all.** `to_str()` then one `write_all`, ignoring the `Result`: a progress line this program
-///    cannot spell is not worth re-encoding, and nothing in this repo parses these bytes (design §1's finding 6). Not
+///    cannot spell is not worth re-encoding, and nothing in this repo parses these bytes. Not
 ///    `to_string_lossy`, which allocates to repair characters nobody asked about.
 /// 3. **Never re-enter llama.cpp or ggml.** The body touches stderr and nothing else; the logger state is global and not thread safe, so
 ///    calling upstream from inside its own callback is how a log line becomes a deadlock.
@@ -1640,7 +1640,7 @@ fn open_context(
     }
 
     // SAFETY: value-type struct of plain data, as above. `embeddings` is the switch that makes a forward pass
-    // produce embeddings at all; `pooling_type` stays `LLAMA_POOLING_TYPE_UNSPECIFIED` on purpose — §5 takes
+    // produce embeddings at all; `pooling_type` stays `LLAMA_POOLING_TYPE_UNSPECIFIED` on purpose — the recipe takes
     // the pooling strategy from the artifact, and overriding it here would be the design's exact "we know
     // better than the file" defect.
     //
@@ -1689,7 +1689,7 @@ fn open_context(
     // `src/llama-context.cpp:1631`'s abort out of reach is the built `n_ubatch`, not our request. Reading both back costs
     // two calls at load time and converts "we set three fields equal and llama.cpp's arithmetic happens to preserve it"
     // (`src/llama-context.cpp:342`, `:344`, `GGML_PAD` at `:387`) into a checked fact — A1 review P1-1, which is worth
-    // landing here rather than in R6c because R6c makes the budget config-derived and this is the bound it leans on.
+    // landing here rather than with the provider wiring, which makes the budget config-derived and leans on this bound.
     //
     // SAFETY: `ctx` is non-null (checked above), and both calls read that context's own parameters without mutating it or
     // taking ownership of anything.
@@ -1839,7 +1839,7 @@ fn requested_ctx(n_ctx_train: usize) -> u32 {
 /// `as usize` would turn `-1` into 18446744073709551615: the width check would still refuse, but it would
 /// report an arithmetic artefact instead of what happened, and a zero would pass as a legitimate width.
 /// `label` is always a literal from this file — [`EmbedError::Unavailable`] carries our own bounded words,
-/// never runtime text (§3's payload rule).
+/// never runtime text (the payload rule).
 fn positive(value: i32, label: &'static str) -> Result<usize, EmbedError> {
     match usize::try_from(value) {
         Ok(count) if count > 0 => Ok(count),
@@ -1854,7 +1854,7 @@ fn positive(value: i32, label: &'static str) -> Result<usize, EmbedError> {
 ///
 /// **Windows:** UTF-8, or a refusal. An `OsStr` there is WTF-16, and llama.cpp v0.8.0 does its own UTF-8 →
 /// UTF-16 conversion before `_wfopen_s`, so UTF-8 is the spelling it wants. A path that is not valid UTF-8 —
-/// an unpaired surrogate, which F18 established a note can legitimately carry in its name — has no faithful
+/// an unpaired surrogate, which a note can legitimately carry in its name — has no faithful
 /// UTF-8 form at all, so this refuses rather than `to_string_lossy()`-ing a filename that does not exist and
 /// reporting a real file as unreadable. The refusal is the same shape as every other "this path cannot be
 /// opened" answer: [`EmbedError::ArtifactUnreadable`], naming the path the user can act on.
@@ -1944,7 +1944,7 @@ mod tests {
         // `REQUESTED_CTX` is four digits, and the compile-time assertion above is what keeps it below any real limit.
         assert_eq!(requested_ctx(262_144), REQUESTED_CTX as u32);
         assert_eq!(requested_ctx(REQUESTED_CTX), REQUESTED_CTX as u32);
-        // The pair §5's decision C holds together: the widest budget a config may name has to fit the context this
+        // The pair that has to hold together: the widest budget a config may name has to fit the context this
         // file creates. Asserted at compile time above; asserted here as a number too, because `requested_ctx` is
         // where a future re-tune could quietly make the two disagree.
         assert!(
