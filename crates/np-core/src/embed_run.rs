@@ -1,7 +1,6 @@
 //! `np embed`'s work: read the scan's chunks, hand them to a provider, store the vectors.
 //!
-//! Design authority is `docs/design-m2-local-embeddings.md` **§6** (the command), **§7** (verification and the
-//! caveat line) and **§9.5**. This module holds every decision behind `np embed`; `np-cli` parses argv and
+//! This module holds every decision behind `np embed`; `np-cli` parses argv and
 //! prints, exactly as it does for [`scan`](mod@crate::scan). *(The `mod@` is needed here and nowhere else in this
 //! crate: `lib.rs` re-exports the **function** `scan` at the root beside the module of the same name, so a bare
 //! `[`crate::scan`]` in a module header is ambiguous to rustdoc — which fails the `--deny warnings` doc gate.)*
@@ -12,15 +11,15 @@
 //! transaction. It reads chunking and never writes it: no `chunks` row is created or restamped here, and
 //! [`crate::scan::EMBED_VERSION_KEY`] stays the scan's to record.
 //!
-//! Four rules are load-bearing, and each is where it is because §6 put it there:
+//! The rules that are load-bearing, each sitting where the work needs it:
 //!
-//! - **Currency is per-row and liveness-fenced** ([`db::live_chunks`] joins `files.state = 'ok'`, backlog D3):
+//! - **Currency is per-row and liveness-fenced** ([`db::live_chunks`] joins `files.state = 'ok'`):
 //!   a stale note's chunks are never owed, so this command cannot be the thing that computes vectors for a
 //!   deleted file's text and reports them current.
-//! - **The stamp is the digest of the bytes the model will read** (backlog D4). For each owed chunk the provider
+//! - **The stamp is the digest of the bytes the model will read.** For each owed chunk the provider
 //!   is asked [`Embedder::model_inputs`] and the digest covers *that* string, while [`Embedder::embed`] receives the
 //!   raw chunk text: the provider owns how a chunk is dressed, so it is the only witness that can say what was read.
-//!   Spelling the rule here as well is R6c2's P1 — `prefix_doc` applied twice, once by this module and once by
+//!   Why the rule is spelled out here as well: it was broken once — `prefix_doc` applied twice, once by this module and once by
 //!   `local_model::LocalEmbedder` (behind the `local-model` feature) — which left the stamp covering one copy of a string the model saw twice.
 //!   Changing `prefix_doc` still makes every stored vector stale, which is the point: a vector made from different
 //!   bytes is not the same fact.
@@ -32,15 +31,15 @@
 //! - **Counting tokens is not this module's job.** Nothing here measures a sequence against
 //!   [`Config::embeddings`](crate::config::EmbeddingsConfig)::`max_tokens`; the number comes from the provider's own
 //!   [`EmbedError::TokenBudgetExceeded`], because pricing a sequence needs the model's tokenizer and that lives behind
-//!   `local-model`. A fake provider therefore cannot make this module *disagree* with §5's budget — it can only relay
-//!   one (R6c1 review D-5, stated here rather than left to inference).
+//!   `local-model`. A fake provider therefore cannot make this module *disagree* with the configured budget — it can only relay
+//!   one.
 //!
 //! ## The four exit arms, and one refusal that rides with the last of them
 //!
-//! [`EmbedOutcome`] carries §6's states verbatim: (i) nothing owed → 0, (ii) *configuration disabled* → 1
+//! [`EmbedOutcome`] carries the command's states verbatim: (i) nothing owed → 0, (ii) *configuration disabled* → 1
 //! before anything is read or written, (iii) artifact absent → 1 naming a command that exists, (iv) owed and
-//! not produced → 1, the only arm that means "gave up". §6 lists three of these and §9's table says four; this
-//! build implements four, as the round brief directs. No new exit codes exist here: every non-zero arm is
+//! not produced → 1, the only arm that means "gave up". Three of them are states of the corpus and one is a
+//! refusal to start; this build implements all four. No new exit codes exist here: every non-zero arm is
 //! `ExitCode::FAILURE`, and argv problems stay clap's 2.
 //!
 //! A caller that could not build a provider says so through [`Resolution`] rather than handing over something
@@ -48,7 +47,7 @@
 //! supplies a fact, not a verdict — and [`Resolution::ArtifactAbsent`] exists because arm (iii) is the one
 //! state the caller knows and this module cannot recover from configuration.
 //!
-//! A wrong-dim provider is refused **before any write** naming both numbers, as §6 requires — but it is not a
+//! A wrong-dim provider is refused **before any write** naming both numbers, as the command's contract requires — but it is not a
 //! fifth arm. It leaves as [`EmbedRunError::ProviderDimMismatch`], which np-cli prints on stderr with exit 1,
 //! because "this run cannot be served at all" is a refusal rather than a state of the corpus.
 //!
@@ -79,24 +78,25 @@ use crate::walk;
 
 /// How many owed chunks one provider call — and therefore one write transaction — covers.
 ///
-/// §6 asks for "bounded transactions — one per batch, not one per corpus" without naming a size, so this is a
-/// scope bound rather than a tuned number: small enough that a batch's transaction is over before another
-/// process's `busy_timeout` runs out, large enough that a provider call amortises over several texts. Nothing
-/// in the schema or the report depends on it, and R6d's throughput benchmark is the round that would
-/// change it with a measurement.
+/// The rule this honours is *bounded transactions — one per batch, not one per corpus*, and that rule names no
+/// size, so this is a scope bound rather than a tuned number: small enough that a batch's transaction is over
+/// before another process's `busy_timeout` runs out, large enough that a provider call amortises over several
+/// texts. Nothing in the schema or the report depends on it, and only a throughput benchmark would be entitled
+/// to change it.
 pub const EMBED_BATCH_CHUNKS: usize = 8;
 
-/// §7's caveat line, verbatim: `self-consistent, not verified`.
+/// The caveat every embed report carries, verbatim: `self-consistent, not verified`.
 ///
-/// **It is unconditional in this build because no reference golden exists to make it conditional.** §7's three
-/// primary checks (batch invariance, unit norm, cross-quantisation agreement) all need the real runtime and
-/// artifact, i.e. R6c2 and R6d; until one of them has produced a golden, every report this module writes
-/// describes self-consistency only — determinism is not correctness, and §7 says the caveat "must not live in a
-/// design doc". A build that *did* have a golden would make this a field rather than a constant; nothing today
-/// can tell it otherwise, so claiming "verified" anywhere would be the false green §7 exists to prevent.
+/// **It is unconditional in this build because no reference golden exists to make it conditional.** The three
+/// primary checks that would retire it — batch invariance, unit norm, cross-quantisation agreement — all need the
+/// real runtime and artifact; until one of those runs has produced a golden, every report this module writes
+/// describes self-consistency only. Determinism is not correctness, and a caveat that lived only in a design
+/// document would tell the person reading a report nothing. A build that *did* have a golden would make this a
+/// field rather than a constant; nothing today can tell it otherwise, so claiming "verified" anywhere would be
+/// the false green this caveat exists to prevent.
 pub const CAVEAT: &str = "self-consistent, not verified";
 
-/// Why this run stopped where it did — §6's four exit states, one variant each.
+/// Why this run stopped where it did — the command's four exit states, one variant each.
 ///
 /// The labels are what a person reads, so they are printed by np-cli rather than inferred from a count: arm
 /// (ii) is documented as "the default state of a fresh install … must not read as a fault", and the only thing
@@ -114,7 +114,7 @@ pub enum EmbedOutcome {
         key: &'static str,
         /// What that key currently says, or `None` when it names nothing at all.
         id: Option<String>,
-        /// **F41 option A.** A command that fixes it, present only for the half of this arm where configuration is
+        /// A command that fixes it, present only for the half of this arm where configuration is
         /// *correct* and the artifact has simply never been installed here — `model` naming no row. The other half,
         /// `provider = "none"`, gets `None`: a switch that was thrown deliberately is not an invitation to download
         /// 309 MB, and an install hint there would be a sentence about a file nobody decided to want.
@@ -131,11 +131,12 @@ pub enum EmbedOutcome {
         model: String,
         /// Where it was looked for.
         artifact: PathBuf,
-        /// What to run instead — `np models install`, because fetching (§12's `np models fetch`) has not
-        /// shipped, and §6's wording "run `np models fetch`" therefore names a command R7b owes.
+        /// What to run instead: [`install_hint`], which names `np models fetch` when this build compiled the fetch
+        /// path, and says in words that it cannot otherwise when the feature is off — a hint that named a command the
+        /// binary does not have would send a reader to a help screen that never heard of it.
         hint: String,
     },
-    /// Arm (vi): fetching was allowed and needed, and **nothing was reached** (**F38** §5).
+    /// Arm (vi): fetching was allowed and needed, and **nothing was reached**.
     ///
     /// The arm exists because offline is a state, not an error to be dressed up as one. `np embed` may fetch a missing
     /// pinned artifact by default; when the transport says no connection (never a probe — the attempt *is* the probe),
@@ -150,7 +151,7 @@ pub enum EmbedOutcome {
         /// The pinned model this run could not obtain.
         id: String,
     },
-    /// Arm (v): this **binary** cannot embed at all — no inference runtime was compiled into it (**F40**).
+    /// Arm (v): this **binary** cannot embed at all — no inference runtime was compiled into it.
     ///
     /// It exists because arm (iv) was answering here and lying about it. `(iv)` means *our accounting said vectors
     /// were owed and none arrived*, which points at chunking, stamping or the database; a build that links no C++ is a
@@ -213,7 +214,7 @@ impl EmbedOutcome {
     pub fn detail(&self) -> Option<String> {
         match self {
             Self::Current => None,
-            // The key and id lead, because F32 §6's reading ("this is a configuration state") is what the label carries;
+            // The key and id lead, because the label has to read as what this state is — a configuration decision;
             // the hint follows after an em dash so a reader who only needs the command still finds it in one line.
             Self::ConfigurationDisabled { key, id, hint } => {
                 let stated = match id {
@@ -228,8 +229,8 @@ impl EmbedOutcome {
             Self::ArtifactAbsent { hint, .. } => Some(hint.clone()),
             // Two ways forward and the one fact that matters: nothing was written, so the model is still owed rather
             // than half-embedded. Names a flag that exists (`--features local-model`) and a command that exists in this
-            // very binary (`np search --mode keyword`, F36) — the rule §6's hints follow, because arm (iii)'s first
-            // version named `np models fetch` before it shipped.
+            // very binary (`np search --mode keyword`) — the rule every hint follows, because an earlier version of
+            // arm (iii) named `np models fetch` before that command existed here.
             // The sentence must not open with its own label: `np embed` prints `"{}: {}"` of label and detail, and this arm's first
             // version produced `np: offline: offline: could not reach the pinned origin …` (measured on the packaged 0.3.0 asset, the
             // first shape where the arm is reachable in a release). Pinned by `a_refusal_never_prints_its_state_twice`.
@@ -246,10 +247,10 @@ impl EmbedOutcome {
     }
 }
 
-/// The diagnostics rule, level and `what` for one arm of an embed refusal (diagnostics design §1 point 4, §4).
+/// The diagnostics rule, level and `what` for one arm of an embed refusal.
 ///
 /// Arm (i) answers `None`: a run that produced everything it owed is not a degraded state, and an event per successful
-/// embed would be the noise §4 keeps out of the log. Everything else maps one-to-one onto a published token, with two
+/// embed would be the noise that stays out of the log. Everything else maps one-to-one onto a published token, with two
 /// readings worth stating:
 ///
 /// * arm (ii) splits by **which key** refused — `embeddings.provider` is a switched-off feature (`provider-disabled`),
@@ -289,8 +290,8 @@ fn diag_of(
             tracing::Level::WARN,
             id.clone(),
         )),
-        // The failure half: something this run could have done did not happen (§4 — "a state to fix" is `warn`,
-        // "something failed" is `error`).
+        // The failure half: something this run could have done did not happen (the rule: "a state to fix" is
+        // `warn`, "something failed" is `error`).
         EmbedOutcome::NotProduced { .. } => Some((
             rule::NOT_PRODUCED,
             tracing::Level::ERROR,
