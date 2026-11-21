@@ -22,8 +22,8 @@ On the other side of that flag an attachment is *tracked*: hashed, stored, lista
 `scan.rs:788-789` is what keeps a scan from ever re-reading one: it returns false unless the file is markdown.
 
 **Issue #12's second ask already shipped, in v0.6.0 (tag dated 2026-11-19, commit `e435985`).** The scan report carries
-`attachments` (`scan.rs:204`) — live tracked files that are not notes — and up to five of their names in
-`attachment_examples` (`scan.rs:209`, cap `ATTACHMENT_EXAMPLE_LIMIT = 5` at `scan.rs:156`), documented in
+`attachments` (`ScanReport` in `crates/np-core/src/scan.rs`) — live tracked files that are not notes — and up to five of their names in
+`attachment_examples` (same struct, cap `ATTACHMENT_EXAMPLE_LIMIT = 5` in the same file), documented in
 `docs/reference-cli-and-reports.md:22-24` with the identity `notes + attachments` = every live tracked file. The rule has
 a diagnostic name too: `rule::NOT_MARKDOWN` (`crates/np-core/src/diagnostics.rs:107`). A front end can now print np's own
 numbers instead of inferring them, which is what the issue asked for on that side.
