@@ -1,9 +1,9 @@
-//! The only writer of `config.toml` in this program (**F50**, issue **#7**).
+//! The only writer of `config.toml` in this program.
 //!
 //! Until now every surface read config and none wrote it, so an application that had just been told *yes, download the
 //! embedding model* had one move left: open np's TOML and edit it from outside. That is a caller re-implementing this module's
 //! own rules badly — `provider = "openai-compatible"` refused in our words, `local-model` without a model refused, every
-//! unknown key refused since **F35** — and the failure mode of getting them wrong is silent: an `[embeddings]` section that
+//! unknown key refused on sight — and the failure mode of getting them wrong is silent: an `[embeddings]` section that
 //! resolves to nothing embeds zero notes and answers *success*. So np writes the file, and says what it changed.
 //!
 //! The one design decision worth stating before the code: **the write is validated by loading it.** The prospective bytes go
@@ -50,7 +50,7 @@ pub enum EmbeddingsTarget<'a> {
     Off,
 }
 
-/// What a write did. The caller renders this into the document both surfaces answer (**F50**), where it travels beside the
+/// What a write did. The caller renders this into the document both surfaces answer, where it travels beside the
 /// provider, the model and the price of a fetch rather than instead of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingsWrite {
@@ -78,8 +78,8 @@ const PROVIDER_NONE: &str = "none";
 ///
 /// Production passes [`Runtime::of_this_build`]; the parameter exists because the refusal this drives is compiled away on
 /// every host that has the runtime, and a rule whose failure arm nobody runs is a rule nobody checks — the same reasoning
-/// that pushed the data-dir **shape** up to [`crate::config::Config::load_with_platform`] for **F37**, so the Windows fallback
-/// could be graded on Linux. Here it means both arms of "may this build turn embeddings on?" are tested on every host,
+/// that pushed the data-dir **shape** up to [`crate::config::Config::load_with_platform`], so the Windows fallback
+/// can be graded on Linux. Here it means both arms of "may this build turn embeddings on?" are tested on every host,
 /// including the default-feature CI row that has no runtime at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Runtime {
@@ -96,10 +96,10 @@ impl Runtime {
     }
 }
 
-/// The door a write came through, recorded in the file's provenance line (**#10**).
+/// The door a write came through, recorded in the file's provenance line.
 ///
-/// This is not decoration. F50's argument for np writing `config.toml` instead of letting an application edit TOML was that np can be
-/// trusted to record what happened: validate by loading, refuse rather than half-configure, read the file back after the rename. A line
+/// This is not decoration. The argument for np writing `config.toml`, rather than letting an application edit TOML, is
+/// that np can be trusted to record what happened: validate by loading, refuse rather than half-configure, read the file back after the rename. A line
 /// that credits the write to a surface that did not perform it breaks that promise in the one place the file itself speaks — and it is
 /// the *only* record an application's audit trail has. Measured on the published v0.5.0 asset: one `embeddings.enable` request over the
 /// pipe, and the file said ``# note-processor set by `np embeddings enable embeddinggemma-2` …``, sending whoever audits the app's
@@ -187,11 +187,11 @@ pub fn set_embeddings_in(
         ),
     };
 
-    // **Rule 1: a file that does not load today is refused, not edited.** This also refuses a config whose `data_dir` neither
+    // **A file that does not load today is refused, not edited.** This also refuses a config whose `data_dir` neither
     // the file nor the environment supplied — that config does not load either, and writing into it would leave the same
     // refusal standing with one more key in the file.
     // An absent file is not a refusal: writing the first `[embeddings]` into an installation that has no config yet is the
-    // ordinary shape of "the person said yes". A file that exists and does **not** load is the refusal (rule 1).
+    // ordinary shape of "the person said yes". A file that exists and does **not** load is the refusal.
     let current = match Config::load(Some(path)) {
         Ok(loaded) => Some(loaded),
         Err(ConfigError::Io(err)) if err.kind() == io::ErrorKind::NotFound => None,
@@ -214,7 +214,7 @@ pub fn set_embeddings_in(
     // `["embeddings.model"]` rather than claiming the provider moved too, and an empty list means no write happened at all.
     // An absent file is compared against np's own defaults rather than treated as "everything is new": `provider` is already
     // `none` by default, so **disabling on an installation that has no config writes no file at all**. Creating a TOML to say
-    // the thing that happens anyway would be exactly the byte-nobody-asked-for that rule 3 refuses elsewhere.
+    // the thing that happens anyway would be exactly the byte-nobody-asked-for this module refuses elsewhere.
     let effective = current.unwrap_or_default();
     let changed: Vec<String> = all_keys
         .into_iter()
@@ -243,7 +243,7 @@ pub fn set_embeddings_in(
         surface,
     );
 
-    // **Rule 4 plus the validation seam:** publish into a sibling temp file and load *it*. A cross-device rename would copy
+    // **Publish into a sibling temp file and load *it* — that is the validation seam.** A cross-device rename would copy
     // rather than link, so the temp lives in the same directory by construction; and if the bytes are wrong the real file is
     // still exactly what it was.
     let temp = temporary_sibling(path);
@@ -256,7 +256,7 @@ pub fn set_embeddings_in(
         ConfigError::Io(err)
     })?;
 
-    // **Rule 6: read it back.** A rule added later that rejects what this writer wrote shows up here rather than as a config
+    // **Read it back.** A rule added later that rejects what this writer wrote shows up here rather than as a config
     // that silently stops loading, and the previous bytes go back before anything is reported.
     match Config::load(Some(path)) {
         Ok(loaded)
