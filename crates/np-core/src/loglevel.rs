@@ -1,4 +1,4 @@
-//! The log-level vocabulary behind `[embeddings] log_level` (F33).
+//! The log-level vocabulary behind `[embeddings] log_level`.
 //!
 //! llama.cpp writes its load transcript to stderr through a process-global sink, and v0.8.0's own header says what happens when nobody
 //! installs one: “If this is not called, or NULL is supplied, **everything** is output on stderr” (`include/llama.h:1672-1676`). On a
@@ -162,7 +162,7 @@ impl FromStr for LogLevel {
 ///
 /// This is this program's one existing config-versus-environment rule — `Config::load` states it for `data_dir`, every `[models]` key
 /// follows it, and §12 rule 7 of the M2 design says the environment “supplies a key the file left unset — never an override of a file that
-/// names one”. That rule was amended by the human on 2026-11-04, so a diagnostic hatch does not get to invent an exception to it: what
+/// names one”. That rule was amended by the human, so a diagnostic hatch does not get to invent an exception to it: what
 /// [`LEVEL_ENV_VAR`] buys is a level without editing a file, not a way to outvote a file that named one. An earlier draft of
 /// `docs/design-f33-llama-log-level.md` said the opposite and cited this very rule as its precedent; review caught the contradiction.
 ///

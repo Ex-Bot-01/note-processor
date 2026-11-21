@@ -14,7 +14,7 @@
 //!   links; an ATX heading comes out via `crate::parse::is_heading_line`, because a heading names a
 //!   topic rather than an item — `## Erledigt` is an outline entry and creates no candidate; and a
 //!   recognised frontmatter block is skipped by starting the scan at `crate::parse::body_start`,
-//!   because `tags:` with a `  - done` under it is metadata, not an item claiming to be done. None
+//!   because `tags:` with a ` - done` under it is metadata, not an item claiming to be done. None
 //!   of these rules is re-implemented here.
 //! - **One line yields at most one candidate.** The checkbox wins over the vocabulary, and among the
 //!   configured markers the earliest in config order wins — every done marker before every paused
@@ -82,11 +82,11 @@ pub struct ItemCandidate {
 /// A line is a candidate when it carries a checkbox or one of `markers`' entries — as a bullet, an
 /// ordered item, or a standalone line. Nothing else is: a paragraph with no marker yields nothing,
 /// and so does `- buy milk`, a bullet with neither a box nor a keyword. That is the spec's rule that
-/// **open is the absence of a marker on an item** (§8.7) rather than a property of prose.
+/// **open is the absence of a marker on an item** rather than a property of prose.
 ///
 /// Three exclusions come from shared decisions, not from local rules: lines inside a ``` fenced
 /// region (including both fence lines), ATX heading lines `# …` through `###### …`, and a recognised
-/// frontmatter block — the scan starts at `crate::parse::body_start`, so `tags:` with a `  - done`
+/// frontmatter block — the scan starts at `crate::parse::body_start`, so `tags:` with a ` - done`
 /// under it yields no Done item and `status: erledigt` yields none whose text is `status:`. A
 /// heading with a marker word in it names a topic and yields no item; seven hashes is not a heading
 /// by the outline's own test, so it is prose like any other.
@@ -167,7 +167,7 @@ fn strip_bullet(line: &str) -> &str {
 /// task, and rejecting it would silently lose the item.
 ///
 /// The two spellings in [`CHECKBOXES`] are the only boxes this reads. GFM would also take `[ x]`,
-/// `[  ]` or `[-]` for a box, and none of them is one here: a line carrying only a malformed box
+/// `[ ]` or `[-]` for a box, and none of them is one here: a line carrying only a malformed box
 /// matches no checkbox and no keyword either, so it yields no candidate rather than a state its
 /// author did not write.
 ///
@@ -231,7 +231,7 @@ struct Marker {
     /// Whether the word-boundary rule applies. A keyword or phrase is built only from word
     /// characters and spaces (`done`, `on hold`, `erledigt`); anything else — `✅`, `- [x]` — is a
     /// literal that matches verbatim wherever it appears. A phrase matches on exactly the whitespace
-    /// it was written with, so `on hold` needs one plain space: `on  hold`, a tab or a non-breaking
+    /// it was written with, so `on hold` needs one plain space: `on hold`, a tab or a non-breaking
     /// space is not that marker and yields no item.
     wordish: bool,
 }

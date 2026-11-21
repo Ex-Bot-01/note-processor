@@ -11,7 +11,7 @@
 //!   seam reads the flag before changing it and puts back what it read, rather than assuming it was ever true.
 //!
 //!   **On this pin that restore changes nothing observable**, and that is a measurement rather than an argument: the text
-//!   context loads with `llama_get_causal_attn` answering false (checked here on 2026-11-03, and printed as
+//!   context loads with `llama_get_causal_attn` answering false (checked here, and printed as
 //!   `ctx.causal_attn = false` in the spike note's run), so setting false over false is a no-op and deleting the restore
 //!   left `tests/local_vision.rs::text_still_matches_what_it_was_after_an_image_ran` passing. It stays for the re-pin whose
 //!   default is causal, and because the seam should not be the thing that leaves shared state modified.
@@ -32,7 +32,7 @@
 //! `undecodable` is about these bytes: empty, not a raster, audio, or the vision encoder refusing them.
 //! `vision-unavailable` is about this build and model pair: no projector, no vision graph, tokenization refused, a chunk
 //! shape or position scheme this seam does not implement, a decoder that would not take the rows, a pooled row that is not
-//! usable. `over-budget` is the measured cost. A refusal carries no prose (§12 rule 8), so the class itself has to say
+//! usable. `over-budget` is the measured cost. A refusal carries no prose, so the class itself has to say
 //! whether the file or the runtime is the problem — that is the whole difference between "re-encode it later" and
 //! "this machine cannot serve images".
 //!
@@ -49,7 +49,7 @@ use crate::embed::{EmbedError, Vector};
 use crate::llama_ffi::{self, mtmd};
 use crate::local_model::LoadedModel;
 
-/// This **build and model pair** cannot serve the request (§8): the projector would not load beside this model, carries no
+/// This **build and model pair** cannot serve the request: the projector would not load beside this model, carries no
 /// vision graph, tokenized wrong, asked for a position scheme this seam does not implement, refused the rows, or pooled to
 /// nothing usable. Not a statement about the caller's bytes — that distinction is why this class exists next to
 /// [`UNDECODABLE`].
@@ -58,16 +58,16 @@ use crate::local_model::LoadedModel;
 /// [`crate::embed::Embedder::embed_image`]'s default refusal and `MediaRefusal::label`. A re-pin that needs a different
 /// wording changes `media.rs` — nowhere else, because there is no other spelling to find.
 pub use crate::embed::VISION_UNAVAILABLE;
-/// The encode measured larger than the context can hold (§8). Decided from the patch count this encode produced, never
+/// The encode measured larger than the context can hold. Decided from the patch count this encode produced, never
 /// from file size — the spike measured 336 tokens for a 1024×768 image and 88 for 512×384.
 ///
-/// **Not reachable with one image on this pin**, which is a measurement: a 4096×3072 PNG cost 1,064 tokens on 2026-11-03,
+/// **Not reachable with one image on this pin**, which is a measurement: a 4096×3072 PNG cost 1,064 tokens,
 /// because mtmd clamps the patch grid to the artifact's own soft-token ceiling and this build's window is 8,192. The check
 /// is not decoration — it runs before the decode, and past the window llama.cpp asserts instead of returning a code, so a
 /// missing guard turns a refusal into an abort (`tests/local_vision.rs::a_large_image_either_embeds_within_the_window_or_refuses_over_budget`
 /// prints whichever branch a given image takes). Re-exported from [`crate::media`], which owns §8's spellings.
 pub use crate::media::OVER_BUDGET;
-/// These bytes are not a raster this build can decode (§8). Audio arrives here too: the pinned projector *does* accept
+/// These bytes are not a raster this build can decode. Audio arrives here too: the pinned projector *does* accept
 /// audio bytes, and §3 makes it a non-goal, so "not an image" and "did not decode" get the same answer — the caller's
 /// action is identical either way, and §8's list has no audio class to invent one for.
 ///
@@ -153,7 +153,7 @@ impl Projector {
     /// and exactly what moves the "projector dies before the model" rule from the borrow checker into field order.
     pub fn open(model: &LoadedModel, mmproj: &Path) -> Result<Self, EmbedError> {
         let unavailable = || EmbedError::Unavailable(VISION_UNAVAILABLE.to_string());
-        // The whole feature is Linux-only in practice — `build.rs` refuses to build the runtime anywhere else (§14) —
+        // The whole feature is Linux-only in practice — `build.rs` refuses to build the runtime anywhere else —
         // and this is where that shows up in Rust: bytes-to-OsStr is a unix trait, so the spelling stays honest about it.
         // A path containing a NUL cannot reach C at all. That is a fact about this machine's paths, not about any image,
         // so it answers `vision-unavailable` rather than blaming bytes that were never read.
@@ -214,7 +214,7 @@ impl Projector {
     /// One image's bytes to one L2-normalised row of `model`'s output width, plus the cost of the encode.
     ///
     /// Every refusal is one of §8's three classes — see this module's header for how they are split — and carries no path,
-    /// no URL and none of mtmd's error text (§12 rule 8); mtmd writes its own detail to stderr, which is where a filename
+    /// no URL and none of mtmd's error text; mtmd writes its own detail to stderr, which is where a filename
     /// belongs.
     ///
     /// **`model` must be the model this projector was opened against.** Its context is where the encoder's rows are
@@ -269,7 +269,7 @@ impl Projector {
         // Not the only guard: remove this arm and the same bytes are refused again one step later, when `mtmd_tokenize`
         // hands back an `AUDIO` chunk that [`Projector::decode_chunks`] does not recognise. The two answer differently on
         // purpose — `undecodable` here, `vision-unavailable` there — so the artifact test pins *which* guard fired: deleting
-        // this one makes that case fail instead of passing quietly (verified by mutation on 2026-11-03).
+        // this one makes that case fail instead of passing quietly (verified by mutation).
         // SAFETY: `bitmap` is live and owned by us until the free below.
         let is_audio = unsafe { mtmd::mtmd_bitmap_is_audio(bitmap.as_ptr()) };
         if is_audio {
@@ -306,7 +306,7 @@ impl Projector {
             return Err(unavailable());
         }
 
-        // The prompt is the marker and nothing else: no instruction prefix (§1.2), no surrounding prose.
+        // The prompt is the marker and nothing else: no instruction prefix, no surrounding prose.
         // `parse_special` has to be true or the marker is ordinary text and matches no bitmap.
         let marker = self.marker.clone();
         let input = mtmd::mtmd_input_text {
@@ -431,7 +431,7 @@ impl Projector {
                 _ => {
                     // An AUDIO chunk (this projector accepts audio; §3 says we do not) or a type this pin added after the
                     // mirror was written. The named audio guard in [`Projector::embed_image`] normally refuses audio
-                    // first — measured here on 2026-11-03, `mtmd_bitmap_is_audio` answered true for PCM — so reaching
+                    // first — measured here, `mtmd_bitmap_is_audio` answered true for PCM — so reaching
                     // this arm with audio means that guard stopped working, and the class differs on purpose: a refusal
                     // that says "this seam cannot serve it" instead of "these bytes did not decode" is the difference
                     // between a bug in our crate and a bad file in someone's vault.
@@ -617,7 +617,7 @@ impl<'model> VisionModel<'model> {
     /// not be able to swap the model out from under it mid-encode.
     ///
     /// Every refusal is [`Projector::embed_image`]'s — one of §8's three classes, carrying no path, no URL and none of
-    /// mtmd's error text (§12 rule 8).
+    /// mtmd's error text.
     pub fn embed_image(&mut self, bytes: &[u8]) -> Result<Vector, EmbedError> {
         self.projector
             .embed_image(self.model, bytes)

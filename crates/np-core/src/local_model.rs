@@ -58,7 +58,7 @@
 //! portable Rust plus the FFI mirror.
 //!
 //! Until 2026-11-08 this file used `std::os::unix::ffi::OsStrExt` directly and compiled on Unix only, because
-//! `build.rs` refused to build `local-model` for any target but Linux (§14). That refusal now admits
+//! `build.rs` refused to build `local-model` for any target but Linux. That refusal now admits
 //! `x86_64-pc-windows-gnu` behind an explicit cmake toolchain, so the conversion has to say what it does on
 //! each platform instead of assuming bytes — see `c_string_path` for why a lossy conversion is the failure
 //! this still refuses to make.
@@ -81,7 +81,7 @@ use crate::walk;
 /// The context window [`load`] asks llama.cpp for, and the number it also gets for `n_batch` and `n_ubatch`:
 /// `min(REQUESTED_CTX, n_ctx_train)`.
 ///
-/// Not the model's trained window (262,144 here; §5 closed that gap as decision B on 2026-10-30), and not
+/// Not the model's trained window (262,144 here; §5 closed that gap as decision B), and not
 /// `embeddings.max_tokens` either — the budget decides what a caller may submit, this decides what the runtime can
 /// hold, and [`LoadedModel::embed_text`] refuses between the two rather than letting llama.cpp decide with an assert.
 /// Since decision B those two numbers are equal for a validated config, which is what the assertion below turns into a
@@ -657,7 +657,7 @@ pub enum TextKind {
 /// without the feature and answering [`EmbedError::RuntimeNotBuilt`], and R6c decides how a config becomes this.
 /// Constructing it is also the last place the three widths can disagree cheaply — see [`LocalEmbedder::new`].
 ///
-/// Owns one [`LoadedModel`], so it owns ~420 MB of resident weights (§14) and is neither `Send` nor `Sync`
+/// Owns one [`LoadedModel`], so it owns ~420 MB of resident weights and is neither `Send` nor `Sync`
 /// because the handles inside it are neither. One per process, held for the run's lifetime: §3's "one load per
 /// process, never per note".
 ///
@@ -866,7 +866,7 @@ impl LoadFailure {
 ///
 /// **Why it exists at all.** `np embed` has to name a provider before it knows whether the workspace owes
 /// anything — §6's exit state (i) is a success with no model work behind it — and one loaded model is ~420 MiB
-/// resident for the life of the process (§14). Loading eagerly would make every up-to-date run pay that and the
+/// resident for the life of the process. Loading eagerly would make every up-to-date run pay that and the
 /// load time on top, for a command whose common case is "nothing changed". So this type answers `model_id` and
 /// `dim` from the row, which is all [`crate::embed_run`] needs to work out what is owed, and touches llama.cpp
 /// the first time it is actually handed text.
@@ -1055,8 +1055,8 @@ impl LazyLocalEmbedder {
 /// **Why this exists at all.** [`crate::models::install`] verifies the digest once, when the human supplies the file.
 /// After that the row is trusted blindly: R6c2's review named the consequence — swap in a same-width artifact and this
 /// program embeds with it and stamps vectors as though the installed model produced them. Re-hashing every run would
-/// close that, and R6d measured what "every run" costs: **11.32 s** to hash the pinned artifact at 26 MiB/s (§9),
-/// against ~0.09 s for llama.cpp to page in every byte of it (§14) — which is why this function hashes on change and
+/// close that, and R6d measured what "every run" costs: **11.32 s** to hash the pinned artifact at 26 MiB/s,
+/// against ~0.09 s for llama.cpp to page in every byte of it — which is why this function hashes on change and
 /// not on principle, and why the cheap answer still has to be honest about what it did.
 ///
 /// **The rule.** If `models.sha256` is NULL there is nothing to verify ([`ArtifactCheck::NothingToVerify`]). Otherwise
@@ -1281,7 +1281,7 @@ impl Embedder for LazyLocalEmbedder {
         self.mmproj.is_some()
     }
 
-    /// The reason this provider cannot encode, in the one build where there are two reasons to choose between (F28).
+    /// The reason this provider cannot encode, in the one build where there are two reasons to choose between.
     ///
     /// Under `vision` this type *has* the image code, so an absent projector is the only thing left that can make
     /// [`Self::supports_images`] answer `false` — hence [`crate::embed::ImageBlocker::ProjectorAbsent`] rather than the
@@ -1335,7 +1335,7 @@ impl Embedder for LocalEmbedder {
 
     /// `prefix_doc` then the text — the document kind's dressing, which is what [`Embedder::embed`] applies and
     /// therefore the only answer that can be stamped. The query prefix is deliberately absent: a vector written
-    /// under `prefix_query` is not comparable with a stored one (§3), so it is reachable only through
+    /// under `prefix_query` is not comparable with a stored one, so it is reachable only through
     /// [`LocalEmbedder::embed_as`] with [`TextKind::Query`] spelled out.
     fn model_inputs(&self, texts: &[&str]) -> Vec<String> {
         document_inputs(&self.prefix_doc, texts)
@@ -1479,7 +1479,7 @@ pub struct LoadOptions {
 /// `include/llama.h:1674` warns about in its own words (“The logger state is global so these functions are NOT thread safe”).
 static LOG_LEVEL: std::sync::OnceLock<crate::loglevel::LogLevel> = std::sync::OnceLock::new();
 
-/// Route llama.cpp's and ggml's log lines through a private gate, which writes only what `level` allows (F33).
+/// Route llama.cpp's and ggml's log lines through a private gate, which writes only what `level` allows.
 ///
 /// **Nothing in np-core calls this.** The sink is process-global, so choosing it is the host program's decision: a library that quieted
 /// its caller's stderr would be doing something nobody asked for. `np` opts in from `embed_provider`, once, before anything can load a

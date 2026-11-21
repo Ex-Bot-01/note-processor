@@ -13,12 +13,12 @@
 //!
 //! - [`Vector`] — a whole number of little-endian `f32` components, i.e. exactly the shape migration 7
 //!   stores (`vector BLOB CHECK (typeof(vector) = 'blob' AND length(vector) = 4 * dim)`). Its two
-//!   conversions are the Rust twins of that `CHECK`, and they refuse rather than truncate (§3).
+//!   conversions are the Rust twins of that `CHECK`, and they refuse rather than truncate.
 //! - [`Embedder`] — what a scan calls: "which model are you", "how wide is your vector", "embed these
 //!   texts". Nothing else, so adding a provider means implementing three methods and touching no caller.
 //! - [`EmbedError`] — one variant per thing that can go wrong, each saying one true thing. Notably
 //!   `Unavailable`'s payload is an opaque label rather than an endpoint, because this text ends up in
-//!   test-failure output and CI logs (§9).
+//!   test-failure output and CI logs.
 //! - [`LocalModelProvider`] — the type `local-model` resolves to, **feature or no feature**: the cargo feature builds a
 //!   runtime, it does not change this provider's refusal, which stays unconditional until R6c wires storage. A [`ModelRow`], an
 //!   artifact that exists, the row's document prefix, and a refusal where the forward pass goes. Nothing
@@ -56,13 +56,13 @@ pub const COMPONENT_BYTES: usize = 4;
 /// **Defined once in [`crate::media`]** and re-exported here, because the trait's default refusal has to answer with it in
 /// a build where `crate::vision` is not compiled at all (`vision` is a cargo feature; this module and `media` are always
 /// built), and a second `const` with the same value would let the two halves of one class drift apart — measured rather
-/// than argued: renaming one copy on 2026-11-03 left all 534 default-build tests green. `crate::vision` re-exports it too,
+/// than argued: renaming one copy left all 534 default-build tests green. `crate::vision` re-exports it too,
 /// under the path the design document names (§8 of
 /// `docs/design-m2-image-embeddings.md`); the re-export carries no value of its own.
 ///
 /// The class is about the pair, never about the caller's bytes — that distinction is what vision's `undecodable` class
 /// exists next to it for (see `crate::vision`, compiled only under the feature, hence no link here) — and it carries no
-/// path, URL, or runtime diagnostic text (§12 rule 8).
+/// path, URL, or runtime diagnostic text.
 pub use crate::media::VISION_UNAVAILABLE;
 
 /// One embedding, held as `dim` `f32` components and stored as those components little-endian.
@@ -96,7 +96,7 @@ impl Vector {
 
     /// The bytes to store: every component little-endian, so exactly `4 * dim()` of them.
     ///
-    /// Little-endian is not a preference but the schema's rule (§3): the stored form is raw `f32`, never
+    /// Little-endian is not a preference but the schema's rule: the stored form is raw `f32`, never
     /// hex or JSON, and a writer that picked the other order would produce vectors whose cosines are
     /// garbage while every length check still passed.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -189,7 +189,7 @@ impl ArtifactCheck {
     /// The one-line sentence for `np embed`'s report and its `--json`.
     ///
     /// Sized to sit beside [`crate::embed_run::EmbedReport::verification`] without being confused with it: that field
-    /// answers "were these vectors checked against a reference implementation" (§7) and never changes; this answers
+    /// answers "were these vectors checked against a reference implementation" and never changes; this answers
     /// "were the model's bytes checked this run".
     pub fn label(&self) -> String {
         use crate::catalog::size_human;
@@ -213,7 +213,7 @@ impl ArtifactCheck {
 /// Why one call to [`Embedder::embed`] — or one attempt to build a provider — did not produce vectors.
 ///
 /// Every variant states a distinct fact, because the scan's report has to distinguish "nothing was
-/// embedded because nobody chose a provider" (§2) from "something tried and failed" (§5) — those two
+/// embedded because nobody chose a provider" from "something tried and failed" — those two
 /// become different sentences in the catalog's durable-record line, and one of them is not an error at
 /// all.
 ///
@@ -222,7 +222,7 @@ impl ArtifactCheck {
 /// fifth" describes Round 3a's seam, not this one). Two rules bind every variant, old and new:
 ///
 /// - **input-free**: none formats note text into its message. A vault is private and an error log outlives
-///   the run (§3);
+///   the run;
 /// - **secret-free**: no endpoint, host, port or credential. An artifact path is neither — it names a file
 ///   this program wrote under the data dir, and naming it is what makes the refusal actionable, exactly as
 ///   [`crate::models::ModelError`] does for the same file.
@@ -239,7 +239,7 @@ pub enum EmbedError {
     ///
     /// The payload is an **opaque label** (a provider kind, a host category, anything a secret could not
     /// take): this enum's text lands in test-failure output and CI logs, so an error that formatted one
-    /// would leak it on the first flake (§9). R6b1's loader and R6b2's forward pass raise it — `local-model`'s
+    /// would leak it on the first flake. R6b1's loader and R6b2's forward pass raise it — `local-model`'s
     /// refusals are the specific ones below, which is what §10 of `docs/design-m2-local-embeddings.md` did to the
     /// class this variant was sketched for: there is no endpoint left that could be down.
     ///
@@ -433,7 +433,7 @@ pub enum EmbedError {
     },
 }
 
-/// Why a provider cannot encode an image, spelled as the two sentences a report can print (F28).
+/// Why a provider cannot encode an image, spelled as the two sentences a report can print.
 ///
 /// **Why a type rather than the refusal class itself.** The class is decided where the refusal is counted
 /// ([`crate::embed_run`]'s image pass), and this is answered by whoever knows the reason; keeping them separate means a
@@ -518,7 +518,7 @@ pub trait Embedder {
     /// promises is that asking is worth the file read, which is how a caller gets to refuse an image *before* reading it.
     /// It says nothing about the bytes about to be handed over.
     ///
-    /// **An image carries no instruction prefix** (§1.2): prefixes are how a text chunk is dressed for a task, and media
+    /// **An image carries no instruction prefix**: prefixes are how a text chunk is dressed for a task, and media
     /// rows are embedded bare and compared against prefixed text rows — so there is no `prefix` parameter on either half
     /// of this pair, which is stronger than a rule telling callers not to pass one.
     fn supports_images(&self) -> bool {
@@ -550,7 +550,7 @@ pub trait Embedder {
     /// doing it.
     ///
     /// The default refuses with [`EmbedError::Unavailable`] carrying [`VISION_UNAVAILABLE`], because "this provider has no
-    /// image encoder" is a fact about the build and model pair. **A refusal is a class, never a path** (§12 rule 8): no
+    /// image encoder" is a fact about the build and model pair. **A refusal is a class, never a path**: no
     /// filename, URL or runtime diagnostic text reaches the payload — the caller's bytes are named nowhere in what we
     /// report.
     fn embed_image(&mut self, _bytes: &[u8]) -> Result<Vector, EmbedError> {
@@ -581,7 +581,7 @@ impl Embedder for NoEmbeddingProvider {
     }
 
     /// `"none"` — the same spelling as the config value, and usable only as a report label: this
-    /// provider never produces a row, so no `models.id` is derived from it (§3).
+    /// provider never produces a row, so no `models.id` is derived from it.
     fn model_id(&self) -> &str {
         "none"
     }
@@ -593,7 +593,7 @@ impl Embedder for NoEmbeddingProvider {
     }
 
     /// Always [`EmbedError::Disabled`], with no argument inspection and nothing to contact: the refusal
-    /// is the whole behaviour (§2).
+    /// is the whole behaviour.
     fn embed(&self, _texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
         Err(EmbedError::Disabled)
     }
@@ -602,7 +602,7 @@ impl Embedder for NoEmbeddingProvider {
     /// embed a search query* and that is not what is wrong: nothing is unavailable, embedding is switched off, and the
     /// setting that switches it off has a name (`embeddings.provider = "none"`).
     ///
-    /// **Nothing in `np` prints this text any more** (F32): `np search` now refuses on the [`crate::embed_run::NoProvider`]
+    /// **Nothing in `np` prints this text any more**: `np search` now refuses on the [`crate::embed_run::NoProvider`]
     /// reason it was handed, before asking a placeholder for a vector, and `np embed`'s arms come from
     /// [`crate::embed_run::EmbedOutcome`]. The override stays because a provider that is asked to embed while embedding is off
     /// still has to answer with the setting's name rather than "this provider cannot", and `tests/embed.rs` exercises it
@@ -716,8 +716,8 @@ impl LocalModelProvider {
     /// compares the file against `models.sha256`: construction stats one path. The case for hashing was always strong —
     /// `docs/design-m2-models-install.md` states as a safety property that "nothing embeds against a mismatching row",
     /// which install alone does not enforce, since it proves the bytes once and never again — and R6d measured the cost
-    /// of closing it the obvious way: one streaming SHA-256 pass over this artifact is **11.32 s** (§9), against ~0.09 s
-    /// for llama.cpp to page in every byte (§14). D12 closed the decision on those numbers, in
+    /// of closing it the obvious way: one streaming SHA-256 pass over this artifact is **11.32 s**, against ~0.09 s
+    /// for llama.cpp to page in every byte. D12 closed the decision on those numbers, in
     /// `local_model::verify_artifact` (behind `local-model`): verify on change, stamp what you hashed, refuse with both
     /// digests when they disagree.
     ///
@@ -767,7 +767,7 @@ impl Embedder for LocalModelProvider {
     /// Each text with this row's `prefix_doc` in front, verbatim, with nothing added between the two: the
     /// [`Embedder::model_inputs`] contract, applied by the provider that owns the row.
     ///
-    /// **This is the sequence [`crate::config::EmbeddingsConfig::max_tokens`] counts** (§5): prefix + text +
+    /// **This is the sequence [`crate::config::EmbeddingsConfig::max_tokens`] counts**: prefix + text +
     /// special tokens, not the chunk's bytes alone. R6b2 enforces the budget and measures it over what this
     /// returns — bounding the un-prefixed text would leave every existing test green while limiting something else.
     ///
@@ -796,7 +796,7 @@ impl Embedder for LocalModelProvider {
     }
 
     /// Always [`EmbedError::RuntimeNotBuilt`], naming the model, with the batch untouched: this type is the seam's
-    /// default half, and a build that links no C++ has no way to turn text into numbers (§9 item 1).
+    /// default half, and a build that links no C++ has no way to turn text into numbers.
     ///
     /// Not a statement about the program: in a `local-model` build `np-cli` resolves
     /// `local_model::LazyLocalEmbedder` instead and vectors are computed, so this refusal is what a **default**
@@ -812,7 +812,7 @@ impl Embedder for LocalModelProvider {
     ///
     /// Overriding is not cosmetic. The trait's default refuses too, but with "this provider cannot embed a search query",
     /// which reads as a capability the seam lacks rather than the one fact a reader can act on — that this binary was
-    /// compiled without the runtime (§9 item 1). Task 6 review P1.
+    /// compiled without the runtime. Task 6 review P1.
     fn embed_query(&self, _text: &str) -> Result<Vector, EmbedError> {
         Err(EmbedError::RuntimeNotBuilt {
             model_id: self.model_id.clone(),

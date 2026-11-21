@@ -26,7 +26,7 @@
 //!
 //! One thing this module cannot do is spell a Windows name exactly: its paths are UTF-16 code units and
 //! `os_bytes` has to fall back to lossy text there. `name_is_lossless` is the refusal that keeps an
-//! unspellable name from overwriting the twin whose key it collides with (F18) — a refusal, not byte
+//! unspellable name from overwriting the twin whose key it collides with — a refusal, not byte
 //! identity, which stays open in `docs/backlog-m2-followups.md`.
 
 use std::ffi::OsStr;
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn the_two_folds_are_different_facts() {
-        // The ASCII fold keeps P3's case pair together ...
+        // The ASCII fold keeps P3's case pair together...
         assert_eq!(case_fold(b"A.md"), case_fold(b"a.md"));
         // ... and stops short of the Unicode pair, while the display fold goes on to `ÄMLI` -> `ämli`.
         assert_ne!(

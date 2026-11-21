@@ -1,6 +1,6 @@
 //! Hand-written `extern "C"` declarations for llama.cpp **v0.8.0**, behind `local-model`.
 //!
-//! No bindgen (§14): the public API is C, every handle is opaque to us, and the surface R6b1 needs is
+//! No bindgen: the public API is C, every handle is opaque to us, and the surface R6b1 needs is
 //! a dozen functions. What bindgen would give us — the whole header, including the deprecated and
 //! experimental halves of it — is smaller than what it costs: libclang on three OSes plus the
 //! `bindgen`/`cc`/`cmake` build-dependency chain we are deliberately not taking.
@@ -29,7 +29,7 @@
 //!   `GGML_USE_CPU`). Measured corroboration: every artifact-gated load and decode here returns rc 0 with a finite
 //!   pooled row. A future build that offloads to another device must revisit this (A1 review P2-4).
 //! * The `llama_batch_ext_*` family is also absent, on purpose: choosing it over
-//!   [`llama_batch_get_one`] plus the `logits` array of [`llama_batch`] is R6b1's design question (§14),
+//!   [`llama_batch_get_one`] plus the `logits` array of [`llama_batch`] is R6b1's design question,
 //!   and declaring both would decide it by accident.
 //!
 //! # Safety
@@ -245,7 +245,7 @@ extern "C" {
     /// somewhere else on the loader path — which is why `tests/local_runtime.rs` checks its prefix.
     pub fn llama_version() -> *const std::ffi::c_char;
 
-    /// CPU/feature flags of the built library, e.g. `CPU : SSE3 = 1 | ... | OPENMP = 1`.
+    /// CPU/feature flags of the built library, e.g. `CPU: SSE3 = 1 |... | OPENMP = 1`.
     ///
     /// Memory: v0.8.0 builds this into a function-local `static std::string` (`src/llama.cpp`,
     /// `llama_print_system_info`), so the pointer is owned by llama.cpp and **invalidated by the next
@@ -687,7 +687,7 @@ pub mod mtmd {
     /// the video path would fill it, so [`crate::vision`] frees both.
     ///
     /// **Do not read this mirror as the thing that keeps non-raster formats out.** What bounds the corpus is §7's
-    /// extension gate in `crate::media`, not this decoder: measured on 2026-11-03, a BMP payload reached
+    /// extension gate in `crate::media`, not this decoder: measured, a BMP payload reached
     /// [`mtmd_helper_bitmap_init_from_buf`] through a `.png` filename and came back a live bitmap and then a vector
     /// (80 tokens). `stb_image` inside `libmtmd` decodes bmp/tga/gif/psd/pnm/qoi as well as png and jpeg, and the webp
     /// and video arms need ffmpeg (`mtmd-helper.cpp:417-427`), which is not installed on this host — so the promise
@@ -790,7 +790,7 @@ pub mod mtmd {
         /// `buf` may be dropped as soon as this returns; the id it stamps is a sha256 of these bytes
         /// (`mtmd-helper.cpp:381-383`), which is why no caller needs to name the file. A null bitmap means "these
         /// bytes are not media this build can decode" — mtmd's own error text goes to stderr and never into our
-        /// refusal (§12 rule 8). Unlike [`mtmd_init_from_file`] this function has no `try`/`catch`: the image path
+        /// refusal. Unlike [`mtmd_init_from_file`] this function has no `try`/`catch`: the image path
         /// is C (stb) plus one hash, so nothing throws short of an allocation failure, which aborts either way.
         ///
         /// `placeholder == false`, always, for us: a placeholder bitmap is a token-counting stand-in that
@@ -902,8 +902,8 @@ pub mod mtmd {
         //! is C reading past what Rust wrote.
         //!
         //! ```text
-        //! $ cc -O1 -std=c11 -I .vendor/llama.cpp-v0.8.0/include -I .vendor/llama.cpp-v0.8.0/ggml/include \
-        //!       -I .vendor/llama.cpp-v0.8.0/tools/mtmd -o /tmp/mtmd_layout /tmp/mtmd_layout.c && /tmp/mtmd_layout
+        //! $ cc -O1 -std=c11 -I.vendor/llama.cpp-v0.8.0/include -I.vendor/llama.cpp-v0.8.0/ggml/include \
+        //!       -I.vendor/llama.cpp-v0.8.0/tools/mtmd -o /tmp/mtmd_layout /tmp/mtmd_layout.c && /tmp/mtmd_layout
         //! sizeof(struct mtmd_context_params)=96 align=8
         //!   use_gpu=0 device=8 print_timings=16 n_threads=20 image_marker=24 media_marker=32
         //!   flash_attn_type=40 warmup=44 image_min_tokens=48 image_max_tokens=52 cb_eval=56
@@ -912,12 +912,12 @@ pub mod mtmd {
         //!   text=0 text_len=8 add_special=16 parse_special=17
         //! sizeof(struct mtmd_helper_video_init_params)=32 align=8
         //!   fps_target=0 ffmpeg_bin_dir=8 timestamp_interval_ms=16 no_soundtrack=24
-        //! sizeof(mtmd_helper_init_opt)=32 align=8  video_params=0
-        //! sizeof(struct mtmd_helper_bitmap_wrapper)=16 align=8  bitmap=0 video_ctx=8
+        //! sizeof(mtmd_helper_init_opt)=32 align=8 video_params=0
+        //! sizeof(struct mtmd_helper_bitmap_wrapper)=16 align=8 bitmap=0 video_ctx=8
         //! sizeof(enum mtmd_input_chunk_type)=4 sizeof(enum llama_flash_attn_type)=4
         //! ```
         //!
-        //! Measured on this host on 2026-11-03 against the tree `third_party/llama-cpp.toml` pins. The header itself
+        //! Measured on this host against the tree `third_party/llama-cpp.toml` pins. The header itself
         //! is not digest-pinned (see this module's note), which is exactly why these numbers exist: they turn a
         //! silent layout disagreement into a build failure on the first feature-on compile after a re-pin.
 
@@ -1001,7 +1001,7 @@ mod layout {
     //! the pinned header with a C probe, not transcribed by eye:
     //!
     //! ```text
-    //! $ gcc -I .vendor/llama.cpp-v0.8.0/include -I .vendor/llama.cpp-v0.8.0/ggml/include \
+    //! $ gcc -I.vendor/llama.cpp-v0.8.0/include -I.vendor/llama.cpp-v0.8.0/ggml/include \
     //!       -std=c11 -o /tmp/layout_probe /tmp/layout_probe.c && /tmp/layout_probe
     //! sizeof(llama_batch)=56
     //!   n_tokens=0 token=8 embd=16 pos=24 n_seq_id=32 seq_id=40 logits=48
@@ -1018,14 +1018,14 @@ mod layout {
     //! sizeof(llama_pos)=4 sizeof(llama_seq_id)=4
     //! ```
     //!
-    //! Run on 2026-10-29 against `include/llama.h` whose sha256 is `c0854771…` — the value pinned in
+    //! Run against `include/llama.h` whose sha256 is `c0854771…` — the value pinned in
     //! `third_party/llama-cpp.toml` and re-checked by `build.rs` on every feature-on build, so these numbers
     //! belong to a named tree rather than to "some 0.8.x". The same run produced the field-name list checked
     //! below; a re-pin re-runs the probe and updates the constants deliberately.
     //!
     //! **Names and order too, not just offsets.** A second check compares the three header structs against
     //! this file field by field: `llama_batch` 7 fields, `llama_model_params` 17, `llama_context_params` 38 —
-    //! identical names in identical order as measured on 2026-10-29. That matters because Rust does not care
+    //! identical names in identical order as measured. That matters because Rust does not care
     //! what a field is called: a mirror that renames `n_seq_id` to `pos` compiles, keeps every offset, and
     //! hands R6b1 a plausible-looking wrong field.
     //!

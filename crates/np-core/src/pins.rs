@@ -12,14 +12,14 @@
 //! The split is deliberate and load-bearing: **a [`PinnedModel`] says what to accept; the host is config**
 //! (`[models] base_url`, plus `NP_MODELS_BASE_URL`, in [`crate::config`]) so that a mirror works and the origin is
 //! not a compile-time secret. Keep the **rows** that way, and do not "fix" a row's missing URL by adding one — the
-//! module-level default below is a separate decision, made deliberately on 2026-11-04: **a public
+//! module-level default below is a separate decision, made deliberately: **a public
 //! artifact host is not the secret class the parent design's §9 protects** — that section guards the self-hosted
 //! chat server's URL and key — so writing a host here buys no secrecy while costing three things the pin table
 //! exists to give: mirror-ability, one reviewable list of accepted bytes, and a build that refuses an upstream
 //! re-upload instead of following it. §12 rule 8 keeps the other half of the boundary (a *refusal* names a class,
 //! never a URL), and `tests/pins.rs` turns both halves into assertions so a future edit has to be deliberate.
 //!
-//! ## What changed on 2026-11-04: one origin, deliberately
+//! ## What changed: one origin, deliberately
 //!
 //! The argument above is why there is still no host in any **row**, and it stands. What changed is that one origin is
 //! now compiled in beside the table ([`DEFAULT_ORIGIN`]) — decided by the human in the R7c scope decisions recorded in
@@ -89,7 +89,7 @@ const MAIN: PinnedModel = PinnedModel {
     filename: "embeddinggemma-2-Q8_0.gguf",
     // Both numbers come from `docs/design-m2-local-embeddings.md` §3 ("The artifact's own header, measured",
     // R6b1, 2026-10-30): the size is the file's length on disk and the digest is sha256 over every one of those
-    // bytes, read from the artifact itself rather than from a model card. Re-measured on this host on 2026-11-01
+    // bytes, read from the artifact itself rather than from a model card. Re-measured on this host
     // with `np models hash $HOME/models/embeddinggemma-2-Q8_0.gguf`, which printed
     // `2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135` — the value below, and 64 characters.
     size_bytes: 309_855_456,
@@ -127,13 +127,13 @@ pub const PINNED: &[PinnedModel] = &[MAIN, MMPROJ];
 
 /// The origin a fetch dials when `[models] base_url` and `NP_MODELS_BASE_URL` both leave the choice unmade.
 ///
-/// **The one host in this module, and it is here on purpose** — see "What changed on 2026-11-04" in the module docs
+/// **The one host in this module, and it is here on purpose** — see "What changed" in the module docs
 /// for what that amendment did and did not move. It is a module-level default rather than a row field for exactly
 /// that reason: no pin gained a URL, so `tests/pins.rs`'s scan of every row still refuses a host-shaped value, and
 /// §12 rule 8 still keeps this string out of every refusal and report line.
 ///
 /// The value is where the pinned digests came from — [`PINNED`]'s second row records downloading that file from this
-/// repository on 2026-11-02 — so a default pointing elsewhere would be asking a stranger for bytes this build only
+/// repository — so a default pointing elsewhere would be asking a stranger for bytes this build only
 /// ever vouched for here. Shape facts three callers rely on, each asserted in `tests/pins.rs`: an `https` scheme, no
 /// credentials in the authority, and no trailing `/`, because [`crate::fetch::HttpTransport`] joins
 /// `origin` + `/` + filename.
@@ -181,7 +181,7 @@ pub struct PinnedIdentity {
     pub dim: u16,
     /// Text prepended to documents before they reach the model.
     pub prefix_doc: &'static str,
-    /// Text prepended to queries. Never used to compare against a stored vector (§3).
+    /// Text prepended to queries. Never used to compare against a stored vector.
     pub prefix_query: &'static str,
 }
 

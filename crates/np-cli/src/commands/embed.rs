@@ -474,14 +474,14 @@ pub(crate) fn embed_provider(
             // lock through someone else's egress.
             //
             // Four things must all be true, and each one is a different mistake prevented:
-            //   * `auto_fetch`             — the operator said so (argv, config, or the default), and `NP_NO_AUTO_FETCH`
+            //   * `auto_fetch` — the operator said so (argv, config, or the default), and `NP_NO_AUTO_FETCH`
             //                              has already had its veto inside [`AutoFetch::allowed`];
-            //   * `pins::identity(id)`     — this build pins bytes for the id. That is what makes a default-on fetch
+            //   * `pins::identity(id)` — this build pins bytes for the id. That is what makes a default-on fetch
             //                              defensible: the target is one known artifact from one origin verified by
             //                              digest, never "whatever config named";
             //   * `feature = "local-model"`— a binary that links no inference runtime must not spend 310 MB it can never
             //                              read; here it is a compile-time gate, not a runtime guess;
-            //   * `feature = "fetch"`      — a build that compiled the HTTP client out cannot advertise a dial-out.
+            //   * `feature = "fetch"` — a build that compiled the HTTP client out cannot advertise a dial-out.
             //
             // Nothing here prints in `--json` mode (`announce`), and nothing here ever names a host: the only
             // origin fact allowed out is *which kind* of origin was resolved.
@@ -756,7 +756,7 @@ const FREE_SPACE_KEY: &str = "free space  ";
 ///
 /// Built by a function so the second arm can be asserted at all: a successful CLI fetch has to serve bytes that hash to the
 /// **pinned** digest, which no fixture can do, so no end-to-end test ever reaches either sentence — which is precisely how this line
-/// acquired a dangling preposition and a column one wider than its sibling `fetched     `. Both are pinned now.
+/// acquired a dangling preposition and a column one wider than its sibling `fetched `. Both are pinned now.
 ///
 /// Stated, never implied: an arm that could not run is not an arm that passed.
 #[cfg(feature = "fetch")]

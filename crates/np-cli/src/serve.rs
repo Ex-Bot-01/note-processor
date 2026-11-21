@@ -365,7 +365,7 @@ fn initialize(
     params: &Value,
     ch: &mut crate::serve_channel::Channel<'_>,
 ) -> Result<Value, ServeError> {
-    // **The only session-level fact this server keeps** (spec §1): progress is off unless this connection asked for it,
+    // **The only session-level fact this server keeps**: progress is off unless this connection asked for it,
     // and asking changes nothing else. A v0.3.0 client that never sends `notifications` sees the byte-identical stream
     // it saw before this feature existed.
     // **A wrong type is a fault, not a silence.** `"notifications": "yes"` reads as a request for progress that was
@@ -491,7 +491,7 @@ fn scan(
 ) -> Result<Value, ServeError> {
     let workspace = workspace_of(params)?;
     let cfg = crate::commands::common::load_config().map_err(refused)?;
-    // **`locking` before the attempt, not after the grant** (spec §2): a client watching a first run needs to see that
+    // **`locking` before the attempt, not after the grant**: a client watching a first run needs to see that
     // np is waiting on another writer, because from outside a blocked write and a slow scan look identical. The walk
     // itself stays unreported until Task 8 gives scan a seam; this line is the part that needs none.
     let progress = crate::serve_channel::ServeProgress::new(ch, request.cloned(), "scan");
@@ -502,7 +502,7 @@ fn scan(
         crate::commands::common::LockGrant::Contended(document) => return Ok(document),
         crate::commands::common::LockGrant::Held(guard) => guard,
     };
-    // **Bookended, not live** (spec §9): one line when the walk starts, one when it ends with its counts. A solo scan of
+    // **Bookended, not live**: one line when the walk starts, one when it ends with its counts. A solo scan of
     // 4 000 notes measured 2.6 s, so per-file callbacks would mean threading a reporter through the hottest loop in
     // np-core to narrate two seconds — and `files_seen` / `notes_seen` already exist in the report the walk produces.
     // The opening bookend: no counts yet, because none have been counted.

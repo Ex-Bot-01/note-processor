@@ -9,7 +9,7 @@
 //!   Unicode property lookup either (`char::is_whitespace` and friends). A blank line is four ASCII
 //!   bytes and nothing else, because a Unicode revision that reclassified one character would otherwise
 //!   move chunk boundaries without anyone changing a rule — the same reason the workspace pins
-//!   `unicode-width` exactly (F12) — and because the seam rules below stay readable from the bytes alone.
+//!   `unicode-width` exactly — and because the seam rules below stay readable from the bytes alone.
 //! - **Slice identity.** For every chunk, `&text[byte_start..byte_end] == chunk.text`, with both offsets
 //!   on char boundaries. Enforced by the [`debug_assert!`]s in [`chunk`] and pinned by `tests/chunk.rs`:
 //!   an off-by-one here silently misaligns every citation M2b writes, and a boundary through a multi-byte
@@ -66,7 +66,7 @@ pub const CHUNKER_VERSION: i64 = 1;
 /// The hard byte bound every chunk obeys, and the number [`chunk`] measures its tolerance against.
 ///
 /// **Why 1800.** The spec (`spec:223`) puts the target at "~350 tokens ±overlap", and tokens need a tokenizer
-/// this milestone does not have (§4), so the bound is stated in bytes and picked to put the corpus's
+/// this milestone does not have, so the bound is stated in bytes and picked to put the corpus's
 /// common case near that target: prose here is mostly German and English running ~4 ASCII bytes per
 /// subword token, which places 350 tokens at ~1400 bytes, and 1800 is the next round step up. The
 /// headroom over 1400 is not slack about the target, it is seam quality — a bound sitting just below a
@@ -90,7 +90,7 @@ const _: () = assert!(
     "one window has to hold the longest UTF-8 sequence"
 );
 
-/// One embeddable piece of one note, in the shape `chunks` rows store (§3).
+/// One embeddable piece of one note, in the shape `chunks` rows store.
 ///
 /// `text` is the slice, not a re-spelling of it — see the module doc's slice identity. `ordinal` is
 /// `u32` because it counts positions within one note, and 4 billion chunks of one note would be ~7 TB of

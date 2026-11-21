@@ -186,7 +186,7 @@ fn find(haystack: &[u8], needle: u8, from: usize) -> Option<usize> {
 pub struct ResolvedImage {
     /// The workspace-relative path in `/`-separated bytes, normalised: this is the identity `media_path.rel_bytes`
     /// stores, so two spellings of one file (`./a/../b.png`, `b.png`) produce one row. Raw bytes are kept rather than
-    /// text because a non-UTF-8 name has to key apart from its lossy spelling (F13). No case-folded twin travels with
+    /// text because a non-UTF-8 name has to key apart from its lossy spelling. No case-folded twin travels with
     /// it: media identity is the content hash, and `media_path` stopped carrying a folded column for it in `e2180da`.
     pub rel_bytes: Vec<u8>,
     /// The same path under `root`, spelled the way this OS wants it — what the caller opens.
@@ -224,17 +224,17 @@ pub enum MediaRefusal {
     /// This build has the image code and this workspace has no projector for it to load: not recorded by this database,
     /// or present but not the bytes that record vouches for. Emitted from [`crate::embed_run`]'s image pass out of
     /// [`crate::embed::ImageBlocker::ProjectorAbsent`], and the reason it is its own class rather than a sentence inside
-    /// `vision-unavailable` is that the two advise different actions — fetch a file, or build with a feature (F28).
+    /// `vision-unavailable` is that the two advise different actions — fetch a file, or build with a feature.
     ProjectorAbsent,
 }
 
-/// These bytes are not a raster this build can decode (§8). **The one definition**; `crate::vision` re-exports it, and
+/// These bytes are not a raster this build can decode. **The one definition**; `crate::vision` re-exports it, and
 /// `MediaRefusal::label` answers with it, so the seam's refusal and the report's label cannot drift apart.
 pub const UNDECODABLE: &str = "undecodable";
-/// The encode measured larger than the context can hold (§8). **The one definition**, same reasoning as
+/// The encode measured larger than the context can hold. **The one definition**, same reasoning as
 /// [`UNDECODABLE`].
 pub const OVER_BUDGET: &str = "over-budget";
-/// This build and model pair cannot serve the request (§8). **The one definition**, shared by three readers: this label,
+/// This build and model pair cannot serve the request. **The one definition**, shared by three readers: this label,
 /// [`crate::embed::Embedder::embed_image`]'s default refusal, and the vision seam that emits it most often (a module
 /// compiled only under the `vision` feature, so it is named in prose rather than linked — a doc link here would break
 /// every default-build `cargo doc`).
@@ -247,7 +247,7 @@ impl MediaRefusal {
     /// **Three of these seven return a `const`, not a literal** — [`UNDECODABLE`], [`OVER_BUDGET`] and
     /// [`VISION_UNAVAILABLE`] are also emitted by code outside this module (the vision seam, and
     /// [`crate::embed::Embedder::embed_image`]'s default refusal), so they have exactly one spelling in the tree. A
-    /// measured consequence of keeping them literal: renaming `embed`'s copy on 2026-11-03 left every default-build test
+    /// measured consequence of keeping them literal: renaming `embed`'s copy left every default-build test
     /// green (534 passed, 0 failed) because the only assertion comparing the two sits behind `--features vision`.
     /// `missing-target`, `outside-workspace` and `unsupported-format` are emitted here alone, so they stay literals —
     /// pinned by name in `tests/media_resolve.rs`.
@@ -274,7 +274,7 @@ impl MediaRefusal {
 ///
 /// 1. **one percent-decode pass**, which fails closed — a malformed escape leaves the name
 ///    exactly as written, so it matches no file and lands in `missing-target`;
-/// 2. **absolute targets are refused** (§7), whatever follows the leading `/`;
+/// 2. **absolute targets are refused**, whatever follows the leading `/`;
 /// 3. **a target that names nothing** (``, `.`, `./`) is `missing-target`: §8 has no class for "that is a directory",
 ///    and "no file behind this link" is the truth;
 /// 4. **normalisation by component walking** — `.` and empty components drop, `..` pops, and popping past the start
@@ -520,7 +520,7 @@ fn names_nothing(target: &[u8]) -> bool {
 ///
 /// `.` and an empty component (a doubled or trailing slash) drop out; `..` pops the last name and **refuses** to pop
 /// past the start, which is what makes an escape visible to [`resolve_image`] instead of quietly producing a path
-/// above the root. Every other name is pushed exactly as written — no case fold, no sort, no second decode (§7).
+/// above the root. Every other name is pushed exactly as written — no case fold, no sort, no second decode.
 fn push_component(path: &mut Vec<Vec<u8>>, name: &[u8]) -> bool {
     if name.is_empty() || name == CURRENT_DIR {
         return true;
@@ -616,7 +616,7 @@ fn abs_path(root: &Path, components: &[Vec<u8>]) -> Option<PathBuf> {
 /// spell one of its components.
 ///
 /// This is the reader's half of `join_rel` (the writer that produces a stored `rel_bytes`): paths come out of notes and out of `media_path.rel_bytes` as bytes, and a
-/// non-UTF-8 name has to reopen the file it names rather than the U+FFFD spelling of it (F13). The refusal arm is
+/// non-UTF-8 name has to reopen the file it names rather than the U+FFFD spelling of it. The refusal arm is
 /// therefore load-bearing on Windows and inert here, where the conversion is the identity.
 pub fn workspace_path(root: &Path, rel: &[u8]) -> Option<PathBuf> {
     let components: Vec<Vec<u8>> = rel
@@ -638,7 +638,7 @@ fn component_name(bytes: &[u8]) -> Option<&OsStr> {
 ///
 /// A name that is not valid UTF-8 answers `None`, and [`resolve_image`] turns that into `missing-target`: this
 /// platform cannot spell the name, so it must refuse rather than substitute the U+FFFD spelling of it and embed
-/// whichever other file happens to carry that. Same stance as [`crate::path_keys::name_is_lossless`] (F18) — refuse
+/// whichever other file happens to carry that. Same stance as [`crate::path_keys::name_is_lossless`] — refuse
 /// what cannot be represented exactly — and unlike `os_bytes`, which has to produce *something* for a row the walk
 /// already found on disk.
 #[cfg(not(unix))]

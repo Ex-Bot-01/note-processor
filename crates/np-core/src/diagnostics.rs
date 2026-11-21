@@ -83,7 +83,7 @@ pub mod rule {
     pub const TOKEN_BUDGET: &str = "token-budget";
     /// An installed row's prefix no longer matches the pinned prefix, so its vectors are stale by construction.
     pub const PREFIX_DRIFT: &str = "prefix-drift";
-    /// Another writer holds this workspace and the wait expired (F44).
+    /// Another writer holds this workspace and the wait expired.
     pub const LOCKED: &str = "locked";
     /// No vectors are stored under the configured model, so the semantic half has nothing to rank.
     pub const NO_VECTORS: &str = "no-vectors";
@@ -108,7 +108,7 @@ pub mod rule {
     /// This scan could not read the file (permission denied, or it changed between the listing and the read). The rows
     /// it already had are kept, because unknown is not absent.
     pub const UNREADABLE: &str = "unreadable";
-    /// A name this build's byte key cannot hold — on Windows, a name carrying an unpaired surrogate (F18). Refused for
+    /// A name this build's byte key cannot hold — on Windows, a name carrying an unpaired surrogate. Refused for
     /// good, so re-running changes nothing; the fix is the filename.
     pub const UNREPRESENTABLE_PATH: &str = "unrepresentable-path";
     /// The bytes matched the stored digest, so nothing was re-parsed or rewritten. Reported at `trace`: on a warm vault
@@ -117,7 +117,7 @@ pub mod rule {
     /// A live note row sits under a directory this scan could not read, so it is hidden from the catalog rather than
     /// deleted. The directory is `unreadable`; this names the note it swallowed.
     pub const HIDDEN_BEHIND_UNREADABLE: &str = "hidden-behind-unreadable";
-    /// A stored row whose path only has a lossy spelling (F23) and which no route could account for this scan, so it
+    /// A stored row whose path only has a lossy spelling and which no route could account for this scan, so it
     /// stayed out of the catalog. The remedy is on disk: make the file listable with a lossless name.
     pub const UNRESOLVED_AMBIGUITY: &str = "unresolved-ambiguity";
     /// Another path already holds this note identity (case-folded collision), so this file kept no new rows and its

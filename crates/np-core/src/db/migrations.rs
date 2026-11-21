@@ -418,7 +418,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<Carried, DbError> {
 
     // Foreign-key enforcement is switched off for the whole loop and back on after it, whatever the
     // loop returns. A table rebuild cannot happen with it on — dropping a table fails while another one
-    // references it, and `ALTER TABLE ... RENAME` rewrites the references it finds — and the pragma has
+    // references it, and `ALTER TABLE... RENAME` rewrites the references it finds — and the pragma has
     // no effect inside a transaction (sqlite.org/lang_altertable.html, step 7 of the documented
     // procedure), so it cannot move into the one migration that needs it. Both open paths ask for
     // `foreign_keys = ON` before calling this, so restoring it keeps that promise to the caller even

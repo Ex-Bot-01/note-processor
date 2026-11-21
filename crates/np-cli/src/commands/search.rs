@@ -393,7 +393,7 @@ pub(crate) fn search_workspace(
         if limit > 0 {
             // Three sentences, because the old two printed a lie on Windows' most likely first run. With no `[embeddings]`
             // section and no vectors, `model` is the empty string — and the hybrid arm interpolated it, producing
-            // `nothing indexed for  by hybrid`: a double space where a model name should be, and a claim about an index that
+            // `nothing indexed for by hybrid`: a double space where a model name should be, and a claim about an index that
             // the keyword half had just consulted. When there is no model to name, the sentence names the query and says the
             // vectors are missing instead (found by the first interactive Windows run, 2026-11-07).
             // **"Never indexed" gets its own sentence** (#5). A person who has just pointed `np` at a folder types

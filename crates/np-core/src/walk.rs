@@ -21,7 +21,7 @@ use crate::path_keys;
 const LONG_PATH_CHARS: usize = 260;
 /// Windows extended-length path prefix.
 const WINDOWS_PREFIX: &str = r"\\?\";
-/// Regenerated compressed copies live here; derived output, never an input (spec §7).
+/// Regenerated compressed copies live here; derived output, never an input.
 const PROCESSED_DIR: &str = "processed";
 /// Markdown extension, matched against the already-lowercased `rel`. Whether a name is one of the catalog
 /// files this program writes is a different question, and [`crate::index_names`] answers it.
@@ -56,8 +56,8 @@ pub struct DiscoveredFile {
     /// Display spelling of the relative path: `rel_bytes` decoded with replacements. Reports and the
     /// catalog render this; nothing uses it to decide which file a row is (F13 §3).
     pub rel: String,
-    /// `rel` lowercased — the Unicode display fold link resolution matches an author's target against
-    /// (spec §11). Not an identity: two live rows may share it.
+    /// `rel` lowercased — the Unicode display fold that link resolution matches an author's target
+    /// against. Not an identity: two live rows may share it.
     pub case_key: String,
     /// The real OS path, byte-exact even when `rel` had to be decoded lossily.
     /// This is what [`to_open_path`] turns into an argument for `open()`.
@@ -81,7 +81,7 @@ pub struct DiscoveredFile {
 #[derive(Debug, Clone, Default)]
 pub struct WalkOptions {
     /// Extra names to leave out at every depth. Matched case-insensitively, because
-    /// these come from user config and Windows path comparison folds case (spec §11);
+    /// these come from user config and Windows path comparison folds case;
     /// the built-in exclusions stay exact-case, since this program writes those names.
     pub extra_excludes: Vec<String>,
 }
@@ -140,10 +140,10 @@ pub struct Walked {
     /// than naming each file inside it. A reason is deliberately not part of this type: the report names the
     /// path either way, and what a caller must do is identical. Matching is by [`UnknownPath::bytes`] and
     /// printing by [`UnknownPath::display`], because two byte-distinct directories can share one display
-    /// spelling (F20).
+    /// spelling.
     pub unreadable: Vec<UnknownPath>,
     /// Paths of **files whose own name** the byte key cannot hold — on Windows, a name carrying an unpaired
-    /// surrogate, which `path_keys::name_is_lossless` refuses (F18). They are left out of [`Walked::files`]
+    /// surrogate, which `path_keys::name_is_lossless` refuses. They are left out of [`Walked::files`]
     /// rather than indexed under a key two different names may share.
     ///
     /// The two lists answer the same question and differ only in what they name and how wide a hole they cut:
@@ -154,7 +154,7 @@ pub struct Walked {
     /// [`mod@crate::scan`] names every entry in [`crate::ScanReport::skipped`] and keeps the row each path
     /// already has. Empty on Unix, where `os_bytes` is exact and no name can fail the test. Matched by
     /// [`UnknownPath::bytes`], printed by [`UnknownPath::display`] — which is why two refused twins publish
-    /// two report lines rather than one (F20).
+    /// two report lines rather than one.
     pub unrepresentable: Vec<UnknownPath>,
 }
 
@@ -165,7 +165,7 @@ pub struct Walked {
 /// recorded, so a link back to a parent directory cannot loop and a link to a file is
 /// never counted as a second copy of its target. `INDEX.md`, `INDEX-<range>.md`,
 /// `processed/`, dot-files and dot-directories stay out; the catalog names only at the
-/// root, which is where they are written (spec §7).
+/// root, which is where they are written.
 ///
 /// `root` must be a readable directory: missing, unreadable and non-directory roots
 /// all fail as [`WalkError::Root`], because returning an empty list for them would
@@ -379,7 +379,7 @@ pub fn normalize_rel(os: &Path) -> (Vec<u8>, String, String) {
 
 /// Path spelling to hand to `open()` and friends. Identity everywhere except
 /// Windows, where a long path gets the extended-length prefix so `MAX_PATH` cannot
-/// truncate it (spec §11). Every file open in this crate goes through here.
+/// truncate it. Every file open in this crate goes through here.
 #[cfg(not(windows))]
 pub fn to_open_path(abs: &Path) -> PathBuf {
     abs.to_path_buf()
@@ -387,7 +387,7 @@ pub fn to_open_path(abs: &Path) -> PathBuf {
 
 /// Path spelling to hand to `open()` and friends. Identity everywhere except
 /// Windows, where a long path gets the extended-length prefix so `MAX_PATH` cannot
-/// truncate it (spec §11). Every file open in this crate goes through here.
+/// truncate it. Every file open in this crate goes through here.
 #[cfg(windows)]
 pub fn to_open_path(abs: &Path) -> PathBuf {
     PathBuf::from(long_prefix(&abs.to_string_lossy(), true))
@@ -535,7 +535,7 @@ mod tests {
     ];
 
     /// The name prefix [`refuse_that_name`] refuses — a stand-in for the unpaired surrogate that only Windows
-    /// can put into a directory entry (F18). Two words are refused so one tree can hold both shapes: the
+    /// can put into a directory entry. Two words are refused so one tree can hold both shapes: the
     /// directory `refused-dir` and the file `refused-file.md`.
     const REFUSED: &str = "refused";
 
@@ -555,7 +555,7 @@ mod tests {
     /// The bytes here are the text's own `str::as_bytes`, with no key rule between — deliberately not named like
     /// `scan::tests::display_keyed_unknown`, which routes the same text through
     /// [`crate::path_keys::rel_bytes_of_display`] to stand for a **stored row key**. Equal results, different
-    /// provenance: this is what [`crate::walk`] records on the platform that refuses names (F18), where an entry's
+    /// provenance: this is what [`crate::walk`] records on the platform that refuses names, where an entry's
     /// bytes already are its lossy text.
     fn unknown_from_text_bytes(display: &str) -> UnknownPath {
         UnknownPath {
@@ -623,7 +623,7 @@ mod tests {
     /// A refusal is recorded by **path**, not by file name. Every other refusal fixture puts the refused
     /// directory at depth 1, where the two spellings coincide — so a `rel` built from `file_name()` instead of
     /// `strip_prefix(root)` would pass them all and then hide the wrong subtree the moment a real workspace
-    /// nested one (F18 review).
+    /// nested one.
     #[test]
     fn a_refused_directory_is_recorded_by_its_path_not_its_file_name() {
         let tmp = tree(&["deep/refused-dir/x.md", "refused-dir/y.md", "kept.md"]);
