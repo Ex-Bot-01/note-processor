@@ -1,10 +1,10 @@
 //! Catalog render: [`CatalogEntry`] values in, `(filename, contents)` pairs out.
 //!
-//! Rendering is pure — Task 10 owns writing the files and deleting the ones that disappeared —
+//! Rendering is pure — whoever writes the files also deletes the ones that disappeared —
 //! so the whole contract of this module is that equal entries produce equal bytes. Nothing here
 //! reads a clock, a locale or a hash map: entries are put in one total order, wrapped by a fixed
 //! column budget and split by a configured threshold, which makes a regeneration diff show real
-//! changes only (spec §10, line format §14).
+//! changes only, which is what lets a regeneration be compared byte for byte.
 
 use unicode_width::UnicodeWidthStr;
 
@@ -42,7 +42,7 @@ pub struct CatalogEntry {
     /// Workspace-relative path, already in the `/`-separated spelling used inside markdown. This is what
     /// the entry renders.
     pub rel: String,
-    /// The same path as bytes — read by `sort_key` as the last tie-break and rendered by nothing (F13 §3).
+    /// The same path as bytes — read by `sort_key` as the last tie-break and rendered by nothing.
     /// Two live twins spell `rel` identically, so a display tie-break orders nothing and the rendered bytes
     /// would fall to whichever row SQLite happened to read.
     pub rel_bytes: Vec<u8>,
@@ -137,7 +137,7 @@ pub fn render(entries: &[CatalogEntry], cfg: &CatalogConfig) -> Vec<(String, Str
 
 /// Sort position of an entry: bucket, then lowercased title, then the byte key.
 ///
-/// The last component is bytes rather than `rel` (F13 §3) because for two twins the first two components and
+/// The last component is bytes rather than `rel` because for two twins the first two components and
 /// the rendered target are all identical — only the byte key separates them, which is what makes a
 /// regeneration byte-stable instead of dependent on rowid order. For an ASCII or valid-UTF-8 corpus this is
 /// the same comparison `rel` gave, since UTF-8 byte order is code-point order.
@@ -169,19 +169,19 @@ fn bucket_rank(bucket: char) -> u8 {
     }
 }
 
-/// Whether `ch` is an ASCII control character — the class that cannot appear inside a line of the catalog at all
-/// (**issue #15**), newline included, because "one entry per line" is what makes the file a list.
+/// Whether `ch` is an ASCII control character — the class that cannot appear inside a line of the catalog at
+/// all, newline included, because "one entry per line" is what makes the file a list.
 fn is_ascii_control(ch: char) -> bool {
     matches!(ch as u32, 0x00..=0x1f | 0x7f)
 }
 
-/// The label half of an entry line, escaped for markdown (**issue #15**).
+/// The label half of an entry line, escaped for markdown.
 ///
 /// Square brackets end a link text where the author meant prose: `[[[bracket](paren) title]]` reads to a renderer as a
 /// wikilink called "bracket" pointing nowhere. So `[`, `]` and the backslash that escapes them get one backslash each.
 /// A control character cannot be escaped that way — `\␊` is a markdown hard break, not a newline — and percent-encoding
 /// would print four characters in the text a person reads, so it becomes U+FFFD: the same posture `np` already takes when
-/// it decodes bytes it cannot (F20 — the bytes are the identity, this is a rendering).
+/// it decodes bytes it cannot: the bytes are the identity, and this is a rendering.
 fn escape_label(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
     for ch in title.chars() {
@@ -197,7 +197,7 @@ fn escape_label(title: &str) -> String {
     out
 }
 
-/// The destination half of an entry line, percent-encoded where a label is escaped (**issue #15**).
+/// The destination half of an entry line, percent-encoded where a label is escaped.
 ///
 /// A destination is resolved rather than read, so what matters is that the bytes still name the same file: `<`, `>`,
 /// brackets, parentheses, `#`, `?`, a backslash and every ASCII control character get their `%XX` spelling. A newline in
@@ -258,7 +258,7 @@ fn entry_line(entry: &CatalogEntry) -> String {
 ///
 /// **The one exemption:** a token wider than the columns left on its line — more than `COLUMN_LIMIT` on the
 /// first line, more than `COLUMN_LIMIT - indent` on a continuation — keeps a line of its own rather than
-/// being split (spec §14 forbids breaking inside a path), so that single-token line can reach
+/// being split — a path is never broken mid-token — so that single-token line can reach
 /// `COLUMN_LIMIT + indent` columns. There is no alternative break point without splitting the token or
 /// dropping the indent, and both change published bytes.
 ///
@@ -274,11 +274,11 @@ fn entry_line(entry: &CatalogEntry) -> String {
 /// that shape only changes company (`2 + token` where the token had `token` to itself). **A link of exactly 99
 /// or 100 columns gains an over-budget first line the old layout did not have** — 101 or 102 columns where the
 /// three-line shape stayed inside the promise. That trade is the whole card, and it was taken for the bullet:
-/// the column limit is a courtesy this file already breaks for any path long enough (spec §14 forbids splitting
-/// one), while `- ` at the start of a line is what makes that line *an entry* — to R2, to `grep '^- \[\['`,
+/// the column limit is a courtesy this file already breaks for any path long enough (a path is never split),
+/// while `- ` at the start of a line is what makes that line *an entry* — to R2, to `grep '^- \[\['`,
 /// and to whoever opens `INDEX.md` in a viewer.
 ///
-/// No committed golden exercises either shape: F16's fixture stays inside the budget precisely so this case has
+/// No committed golden exercises either shape: the fixture stays inside the budget precisely so this case has
 /// no bytes to move, and the widest second token in any committed golden is 12 columns. That is why the shape
 /// is pinned in `tests/catalog.rs` rather than by a golden — R4's width exemption accepts an over-wide line
 /// only when it holds a *single* token, so the verifier would refuse a golden reading `- [[…]](…)`, and
@@ -295,8 +295,8 @@ fn entry_line(entry: &CatalogEntry) -> String {
 /// which is what makes "the second token" mean "the start of the entry" rather than some other pair.
 fn wrap(line: &str, indent: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
-    // Indexed rather than counted by hand: index 1 is the entry's second token, and that is the break F25
-    // forbids (clippy's `explicit_counter_loop` is right that a hand-kept counter reads worse here, and the
+    // Indexed rather than counted by hand: index 1 is the entry's second token, and that is the break this
+    // module refuses (clippy's `explicit_counter_loop` is right that a hand-kept counter reads worse here, and the
     // index says the same thing).
     for (index, token) in line.split(' ').enumerate() {
         // A continuation line spends `indent` columns on its prefix before its first token, so those
@@ -304,7 +304,7 @@ fn wrap(line: &str, indent: usize) -> String {
         // out of the budget let a wrapped entry reach `COLUMN_LIMIT + indent` on screen — 101 visible
         // columns against a 100-column promise.
         let prefix = if lines.len() > 1 { indent } else { 0 };
-        // **F25:** no break before an entry's second token. The first is the bullet, so a break taken there
+        // **No break before an entry's second token.** The first is the bullet, so a break taken there
         // publishes a physical line holding nothing but `-` — refused by R2 of the golden verifier and shown
         // by a Markdown viewer as an empty list item plus two orphan lines.
         //
