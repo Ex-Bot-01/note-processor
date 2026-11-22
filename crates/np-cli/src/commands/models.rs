@@ -202,7 +202,16 @@ pub(crate) fn models_fetch(
     // in that section), then the origin baked into the pin table. A machine with no configuration therefore makes one
     // outbound request during installation instead of being refused; a mirror is still one config line away, and this
     // line stays true of every run: the resolved origin is read here and printed nowhere.
-    let origin = fetch::resolve_origin(config.models.base_url.as_deref());
+    // A default origin exists for every id this build can fetch, so `None` means the pin table and the origin table
+    // disagree — a bug in this build rather than a state a user can be in. Refusing by id names it, and naming no host
+    // is origin privacy applied to an error path.
+    let Some(origin) = fetch::resolve_origin(id, config.models.base_url.as_deref()) else {
+        return Err(format!(
+            "`{id}` is pinned by digest but this build compiles in no origin for it; \
+             set [models] base_url to where its files are hosted"
+        )
+        .into());
+    };
 
     // **Say which origin this run is about to dial, in class terms, before any byte moves.** Origin privacy still forbids the host, so
     // the line names where the answer came from rather than what it is. It exists because `NP_MODELS_BASE_URL=` (set, empty)

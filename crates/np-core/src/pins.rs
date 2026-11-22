@@ -21,7 +21,7 @@
 //! ## What changed: one origin, deliberately
 //!
 //! The argument above is why there is still no host in any **row**, and it stands. What changed is that one origin is
-//! now compiled in beside the table ([`DEFAULT_ORIGIN`]) — a deliberate scope call, taken with the projector's
+//! now compiled in beside the table ([`default_origin`]) — a deliberate scope call, taken with the projector's
 //! membership of the default set. The reason is practical rather than theoretical: the documented install step became "place the binary, then run
 //! `np models fetch`", and an install that cannot reach a network is an install nobody completes — while at that
 //! moment there is no config file yet to read.
@@ -46,6 +46,37 @@
 //! characters are kept out of this table on purpose: a digest nobody can reproduce is not an expectation, it is a
 //! permanent refusal waiting to fire against good bytes.
 
+/// What a pinned artifact is *for*, which decides what a successful install has to record.
+///
+/// The field exists because a second kind of artifact arrived, not because one kind needed labelling. An embedding
+/// model's bytes come with a declared identity — a vector width and two prefixes, in [`PINNED_IDENTITIES`] — and
+/// installing one writes a `models` row so the index can tell whether two vectors are comparable. A cross-encoder has
+/// no vectors to be the width *of*: giving it a row would put it in the list `np models set-default` reads and let a
+/// workspace choose a reranker as its embedder, which is a broken index waiting to happen.
+///
+/// So the role decides two things and nothing else: whether an identity is required ([`identity`] answers `None` for a
+/// reranker, on purpose) and whether a fetch writes a row. It does **not** decide where the bytes come from — that is
+/// [`default_origin`], keyed by id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Produces stored vectors: needs a [`PinnedIdentity`], and installing one writes a `models` row.
+    Embedding,
+    /// Scores (query, document) pairs at search time: declares no width, owns no row, and is never selectable as an
+    /// embedder. See [`crate::local_model::load_rank`] for what its bytes are checked against instead.
+    Rerank,
+}
+
+impl Role {
+    /// The spelling this role takes in JSON output and in a refusal that names it.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Embedding => "embedding",
+            Self::Rerank => "rerank",
+        }
+    }
+}
+
 /// One accepted file, named by its member role inside a model id's set of files.
 ///
 /// Every field describes bytes this build will accept — never a place to get them from (module docs explain
@@ -69,6 +100,10 @@ pub struct PinnedModel {
     /// The sha256 the bytes must hash to, lowercase hex as [`crate::hash::Sha256Stream`] spells it. Compared in
     /// full; a prefix is never enough — the point of this table is that nothing but this number is trusted.
     pub sha256: &'static str,
+    /// What these bytes are for, and therefore whether installing them declares a model. Uniform within an id —
+    /// [`role`] reads it from the first member and `tests/pins.rs` refuses an id whose members disagree, because two
+    /// halves of one artifact cannot be for two different jobs.
+    pub role: Role,
     /// Provenance for the two numbers above: where and when they were read. Pin rot is real — nobody notices an
     /// upstream re-upload until first start refuses — so a refusal has to be able to say how old the expectation
     /// is without anyone re-deriving it from a design document.
@@ -91,6 +126,7 @@ const MAIN: PinnedModel = PinnedModel {
     // `2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135` — the value below, and 64 characters.
     size_bytes: 309_855_456,
     sha256: "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135",
+    role: Role::Embedding,
     read_on: "design-m2-local-embeddings.md §3, measured 2026-10-30",
 };
 
@@ -111,7 +147,38 @@ const MMPROJ: PinnedModel = PinnedModel {
     filename: "mmproj-embeddinggemma-2-Q8_0.gguf",
     size_bytes: 554_821_056,
     sha256: "0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8",
+    role: Role::Embedding,
     read_on: "downloaded and hashed on this host 2026-11-02; matches the host's LFS metadata the same day",
+};
+
+/// The id of the cross-encoder `np search --rerank` scores with, spelled once. Named by [id](crate::models) rather than
+/// by file so every caller — the stage that loads it, the command that installs it, the listing that reports whether it
+/// is there — agrees on one string.
+pub const RERANKER_ID: &str = "bge-reranker-v2-m3";
+
+/// The reranker: one file, no projector, and **no row in [`PINNED_IDENTITIES`]**.
+///
+/// That absence is the design, not an omission. A `models` row exists to say "vectors of width N written under these
+/// prefixes are comparable", and none of that is true of a scoring head: it has no stored vectors, so there is no width
+/// to declare, and giving it a row would list it beside embedders for `np models set-default` to choose. What its bytes
+/// are checked against instead is in [`crate::local_model::load_rank`] — a declared classifier label, RANK pooling that
+/// came back RANK, and a head exactly one number wide.
+///
+/// The quant is in the published filename and nowhere else: the installed file is `<models_dir>/bge-reranker-v2-m3`, so
+/// a re-pin to another quantization changes this row's three numbers without renaming anything on disk or in the
+/// database. `Q8_0` was chosen over the smaller quants because it is what the reference implementation ships and the
+/// first measurement should not be of a variable nobody chose.
+const RERANKER: PinnedModel = PinnedModel {
+    id: RERANKER_ID,
+    member: crate::models::MAIN_FILE,
+    filename: "bge-reranker-v2-m3-Q8_0.gguf",
+    // Both numbers re-read on the host that wrote this row, over every byte of the downloaded file, and agreed by the
+    // published length the origin announced. The commit that adds this row carries where they were read from; a table
+    // row says what to accept, and provenance belongs beside it rather than inside it.
+    size_bytes: 635_674_432,
+    sha256: "d32a877b7266f5275172458616824ce6728502416672052c2da795da3389201e",
+    role: Role::Rerank,
+    read_on: "downloaded and hashed on this host 2026-11-22",
 };
 
 /// Every artifact this build will accept, in id order.
@@ -120,22 +187,64 @@ const MMPROJ: PinnedModel = PinnedModel {
 /// is the only way to teach this build a new artifact, and `tests/pins.rs` refuses rows whose digest is not 64
 /// lowercase hex characters or whose size is zero — a truncated paste and an unknown length are both refusals waiting
 /// to be misread as "the download was corrupted".
-pub const PINNED: &[PinnedModel] = &[MAIN, MMPROJ];
+pub const PINNED: &[PinnedModel] = &[RERANKER, MAIN, MMPROJ];
 
-/// The origin a fetch dials when `[models] base_url` and `NP_MODELS_BASE_URL` both leave the choice unmade.
+/// Where the embedding pair comes from by default — **one of the two hosts in this module**, and both are here on
+/// purpose for the reason [`DEFAULT_ORIGINS`] explains.
+const EMBEDDING_ORIGIN: &str = "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main";
+
+/// Where the reranker comes from by default. A different publisher from [`EMBEDDING_ORIGIN`], which is the whole reason
+/// the default stopped being one string.
+const RERANK_ORIGIN: &str =
+    "https://huggingface.co/smarttasks/bge-reranker-v2-m3-GGUF/resolve/main";
+
+/// The origin a fetch dials for `id` when `[models] base_url` and `NP_MODELS_BASE_URL` both leave the choice unmade.
 ///
-/// **The one host in this module, and it is here on purpose** — see "What changed" in the module docs
-/// for what that amendment did and did not move. It is a module-level default rather than a row field for exactly
-/// that reason: no pin gained a URL, so `tests/pins.rs`'s scan of every row still refuses a host-shaped value, and
-/// Origin privacy still keeps this string out of every refusal and report line.
+/// **Two hosts in this module, both on purpose** — see "What changed" in the module docs for what baking one default
+/// did and did not move. They sit here rather than in a row field for the same reason the single default did: no pin
+/// gained a URL, so `tests/pins.rs`'s scan of every row still refuses a host-shaped value, and origin privacy still
+/// keeps these strings out of every refusal and report line.
 ///
-/// The value is where the pinned digests came from — [`PINNED`]'s second row records downloading that file from this
-/// repository — so a default pointing elsewhere would be asking a stranger for bytes this build only
-/// ever vouched for here. Shape facts three callers rely on, each asserted in `tests/pins.rs`: an `https` scheme, no
+/// **Why this stopped being one string.** The table replaced a single `DEFAULT_ORIGIN`, and the reason is two publishers
+/// rather than a refactor: the embedding pair comes from `ggml-org` and the reranker from whoever quantized
+/// `bge-reranker-v2-m3`. One default could only ever point at one of them, and pointing it at the wrong one would fetch
+/// bytes this build never vouched for at that address. Each entry is where *its* digests came from, which is the claim
+/// a default has to be able to make.
+///
+/// `[models] base_url` keeps its older meaning unchanged: **one flat directory holding every pinned filename**. That
+/// works because filenames are unique across ids — `embeddinggemma-2-Q8_0.gguf`, `mmproj-…`, `bge-reranker-v2-m3-Q8_0.gguf`
+/// — so `{base_url}/{filename}` still needs no id in the path, and a mirror that hosts all three files serves every
+/// fetch with one config line. A mirror holding only some of them is a per-file 404, which is what the digest check
+/// would have caught anyway.
+///
+/// Shape facts three callers rely on, asserted over **every** entry in `tests/pins.rs`: an `https` scheme, no
 /// credentials in the authority, and no trailing `/`, because [`crate::fetch::HttpTransport`] joins
 /// `origin` + `/` + filename.
-pub const DEFAULT_ORIGIN: &str =
-    "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main";
+pub const DEFAULT_ORIGINS: &[(&str, &str)] = &[
+    (RERANKER_ID, RERANK_ORIGIN),
+    ("embeddinggemma-2", EMBEDDING_ORIGIN),
+];
+
+/// The default origin for `id`, or `None` when this build has no default for it.
+///
+/// `None` is a refusal and not "fall back to something": dialing the embedding model's host for an id that was not
+/// fetched from there would ask a stranger for bytes this build never vouched for at that address. A caller that gets
+/// `None` says so and stops — which is also the answer for any future id whose row lands before its origin does.
+pub fn default_origin(id: &str) -> Option<&'static str> {
+    DEFAULT_ORIGINS
+        .iter()
+        .find(|(pinned, _)| *pinned == id)
+        .map(|(_, origin)| *origin)
+}
+
+/// What `id`'s pinned bytes are for, or `None` when nothing is pinned for it.
+///
+/// Read from the first member, and uniform within an id by construction: [`PINNED`] gives every member of one id the
+/// same role, and `tests/pins.rs` asserts it — two halves of one artifact cannot be for two different jobs, and an id
+/// that mixed roles would make this function's answer depend on table order.
+pub fn role(id: &str) -> Option<Role> {
+    pinned(id).next().map(|member| member.role)
+}
 
 /// The projector member's role name, spelled once — the [`PINNED`] row and [`members_for_build`]'s vision set are the
 /// only two places it is needed.

@@ -815,7 +815,16 @@ pub(crate) fn fetch_pinned_missing(
         emit(origin_kind_line(cfg));
     }
 
-    let origin = fetch::resolve_origin(cfg.models.base_url.as_deref());
+    // The id here is the workspace's configured embedder, which this build pins with a default origin. The refusal arm
+    // exists for the case that stops being true — an id pinned by bytes but not by address — because dialing another
+    // id's origin would ask a stranger for bytes nobody vouched for there.
+    let Some(origin) = fetch::resolve_origin(id, cfg.models.base_url.as_deref()) else {
+        return Err(format!(
+            "this build compiles in no default origin for `{id}`; \
+             set [models] base_url to where its files are hosted"
+        )
+        .into());
+    };
     let transport = fetch::HttpTransport::new(origin);
     let requested: Vec<&str> = members.to_vec();
     match fetch::fetch_reporting(

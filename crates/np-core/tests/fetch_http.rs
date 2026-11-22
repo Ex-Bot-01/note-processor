@@ -154,7 +154,7 @@ fn fetch_from(origin: &str, models: &Path, db: &Db) -> Result<(), FetchError> {
     let table = vec![spec()];
     let plan = Expectation {
         table: &table,
-        declaration: &declaration(),
+        declaration: Some(&declaration()),
     };
     let transport = HttpTransport::new(origin);
     fetch::fetch_with_table(
