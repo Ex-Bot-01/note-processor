@@ -115,6 +115,18 @@ np search ./notes retro --mode keyword --json
 `bm25` is SQLite's own number, unremapped (better is more negative, so `score` carries its negation to keep "higher first"
 true across modes), and the text channel prints small magnitudes in scientific notation rather than `-0.0000`. With a hybrid
 list whose semantic half could not run, `note` holds the sentence that stderr got and `cosine`/`semantic_rank` hold nulls.
+
+**How to read `cosine`, and how not to.** It is the similarity between two unit-length rows — this query's vector and that
+chunk's — under the prefixes the installed row declares. It is not a probability, not a percentage of the query answered, and
+not comparable across model ids: width and prefixes are part of an id's identity, so `0.72` under one id is a different claim
+than `0.72` under another. A query does take the query side of that pair — `TextKind::Query` reads `models.prefix_query`, and
+the two halves are stored and refused separately for exactly that reason — but for the pinned `embeddinggemma-2` both prefixes
+are empty strings, because no instruction convention has been measured for it here; a later round that measures one ships a
+**new id**, since editing those strings would silently change what every stored vector means. What np does not yet report is
+whether its own top hits are within noise of each other: it knows the spread and a caller cannot see it, which is
+**issue #19**. Until that exists, a short gap between the first rows of a
+semantic list is ordering detail, not confidence.
+
 Remember the `AND` rule when a list comes back empty on a vault you know holds the words: they have to be in **one** note, and
 each has to be a **whole** word — which is what [a word can match at its beginning](#a-word-can-match-at-its-beginning) is about.
 
