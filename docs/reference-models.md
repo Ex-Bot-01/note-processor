@@ -163,13 +163,27 @@ vector means; see [Troubleshooting](reference-troubleshooting.md) for the senten
 behind your back: `np scan` volunteers the embedding model and stops there, because a reranker only helps someone who asked
 for reranking.
 
+Two commands place these bytes, and exactly one of them dials out:
+
 ```sh
+# downloads from the pinned origin, verifies the digest, publishes the file (a build with `fetch`)
+np models fetch ~/Notes --id bge-reranker-v2-m3
+
+# or places bytes you already hold: offline, behind a mirror, on an air-gapped machine
 np models install ~/Notes --id bge-reranker-v2-m3 \
   --path ~/models/bge-reranker-v2-m3-Q8_0.gguf --sha256 d32a877b7266f5275172458616824ce6728502416672052c2da795da3389201e
 ```
 
-The digest is the pin's, and saying a different one refuses the run — for a reranker the bytes are not a choice you make at
-the command line. Three flags are refused **by name** on this id rather than ignored: `--dim`, `--prefix-doc` and
+**Neither is a `np serve` method, and that is the whole answer to "how does an app install it?"** No method writes
+`[search] rerank` and none moves these bytes, because a ranking preference that fires on every search must not spend half a
+gigabyte unasked — and `[models] auto_fetch` covers embedding ids only, on both channels, so no `search` or `embed` will do it
+instead. A front end builds its settings row from `models.list`'s `reranker` object (`pinned_bytes` is the price to quote, and
+`state` says whether the file is there) and offers one of the two commands above for the person to run. Whether this build
+even understands the `rerank` parameter is advertised by `"rerank"` in `np serve`'s `initialize.features` — an older server
+ignores the parameter rather than refusing it, so the key is what to read, not a version string.
+
+On the install path the digest is the pin's, and saying a different one refuses the run — for a reranker the bytes are not a
+choice you make at the command line. Three flags are refused **by name** on this id rather than ignored: `--dim`, `--prefix-doc` and
 `--prefix-query` describe how a model stores vectors, and a scoring head stores none. So does `--member`: a reranker is one
 file.
 
@@ -188,8 +202,8 @@ unclaimed  0
 `null` on a build that pins no reranker, so a reader never has to distinguish "absent" from "this question was not answered".
 The state is decided by **one stat**, never by hashing 635 MB to answer "is it there": `absent`, `present, size matches the
 pin`, or `present, size differs` — the last one says a partial download or somebody else's quantization is sitting at that
-name, and points at `install` above as both diagnosis and fix. Byte verification happens where reading those bytes is already
-being paid for: at install, and at load.
+name, and points at the two commands above as both diagnosis and fix. Byte verification happens where reading those bytes is
+already being paid for: during a fetch, at install, and at load.
 
 `--dim` became optional in the argument parser with this artifact, because one subcommand now serves both shapes: an
 embedding install that omits it is still refused, by `np` rather than by the parser, in the same words.
