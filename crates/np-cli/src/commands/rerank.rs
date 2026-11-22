@@ -146,7 +146,7 @@ mod verify {
 /// **Why a line at all.** Verifying and loading the pinned artifact is about 15 s on this machine and more on a slow disk, and a
 /// search that prints nothing for that long reads as hung — which is how a person ends up killing a run that was one second from
 /// answering. The embedding path announces a 309 MB download the same way; a reranker's first load deserves the same courtesy, and
-/// it says *once per process* because that is exactly what it is (see [`verify`]'s cached verdict).
+/// it says *once per process* because that is exactly what it is (see this module's private `verify` cache).
 pub(crate) fn prepare(
     cfg: &Config,
     workspace: &Path,

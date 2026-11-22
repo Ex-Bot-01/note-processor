@@ -62,7 +62,8 @@ pub enum Role {
     /// Produces stored vectors: needs a [`PinnedIdentity`], and installing one writes a `models` row.
     Embedding,
     /// Scores (query, document) pairs at search time: declares no width, owns no row, and is never selectable as an
-    /// embedder. See [`crate::local_model::load_rank`] for what its bytes are checked against instead.
+    /// embedder. See `local_model::load_rank` (a module that exists only with `local-model`) for what its bytes are
+    /// checked against instead.
     Rerank,
 }
 
@@ -161,7 +162,8 @@ pub const RERANKER_ID: &str = "bge-reranker-v2-m3";
 /// That absence is the design, not an omission. A `models` row exists to say "vectors of width N written under these
 /// prefixes are comparable", and none of that is true of a scoring head: it has no stored vectors, so there is no width
 /// to declare, and giving it a row would list it beside embedders for `np models set-default` to choose. What its bytes
-/// are checked against instead is in [`crate::local_model::load_rank`] — a declared classifier label, RANK pooling that
+/// are checked against instead is in `local_model::load_rank` — a module built only with `local-model`, which requires a
+/// declared classifier label, RANK pooling that
 /// came back RANK, and a head exactly one number wide.
 ///
 /// The quant is in the published filename and nowhere else: the installed file is `<models_dir>/bge-reranker-v2-m3`, so

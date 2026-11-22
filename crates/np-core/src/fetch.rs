@@ -1481,7 +1481,7 @@ pub const PRIMARY_MEMBER: &str = MAIN_FILE;
 /// **Lives behind cargo feature `fetch`, which is default-on** (the premise: a fetch path release builds compile
 /// out would defeat the amendment; opting out is an explicit `--no-default-features`). It is also the only place in
 /// the workspace that names a network client, and it holds one string — the origin — which arrives from
-/// `[models] base_url`, `NP_MODELS_BASE_URL`, or [`crate::pins::DEFAULT_ORIGIN`] via [`resolve_origin`]. Nothing here
+/// `[models] base_url`, `NP_MODELS_BASE_URL`, or [`crate::pins::default_origin`] via [`resolve_origin`]. Nothing here
 /// knows or cares which host that is; the accepted bytes stay in the binary and the origin stays in
 /// config-plus-default so a mirror is an edit, not a rebuild.
 ///

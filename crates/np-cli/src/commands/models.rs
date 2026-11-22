@@ -166,7 +166,7 @@ fn parse_dim(raw: &str) -> Result<NonZeroU16, String> {
 /// the members, sizes and digests, which is everything a person can act on. The one thing that must not appear is the
 /// URL, because a mirror's hostname is someone's infrastructure detail and this program has no business publishing it
 /// in a build log. Since 2026-11-04 an origin exists on every run — `[models] base_url` and `NP_MODELS_BASE_URL` both
-/// silent means [`np_core::pins::DEFAULT_ORIGIN`] — which makes *not* printing it the more important half of the rule.
+/// silent means [`np_core::pins::default_origin`] — which makes *not* printing it the more important half of the rule.
 #[cfg(feature = "fetch")]
 pub(crate) fn models_fetch(
     workspace: &Path,

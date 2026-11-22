@@ -166,7 +166,7 @@ impl Default for CatalogConfig {
 /// The `[models]` section: where artifacts may be fetched from, and the one door around the pin table.
 ///
 /// Both keys are `Option`, and **absent is still a valid state** — but that has been amended, so it no
-/// longer means "quiet": with no `base_url` a fetch dials the origin compiled into [`crate::pins::DEFAULT_ORIGIN`], and `np
+/// longer means "quiet": with no `base_url` a fetch dials the origin compiled into [`crate::pins::default_origin`], and `np
 /// models fetch` says in words that it resolved to that default rather than doing it silently. With no `sha256` a fetch accepts
 /// nothing that disagrees with [`crate::pins`].
 ///
@@ -644,7 +644,7 @@ pub struct SearchConfig {
     /// reranker behind this key's back.
     pub rerank: bool,
     /// How many of the top hits to score. Absent means [`DEFAULT_RERANK_TOP_N`]; outside `1..=MAX_RERANK_CANDIDATES` is refused
-    /// by [`deserialize_rerank_top_n`] rather than clamped.
+    /// by `deserialize_rerank_top_n` rather than clamped.
     #[serde(deserialize_with = "deserialize_rerank_top_n")]
     pub rerank_top_n: usize,
     /// Which text of a note the reranker reads. Absent means [`RerankText::TitleBody`](crate::search::RerankText::TitleBody).
