@@ -104,6 +104,15 @@ use crate::walk;
 /// costs +0 MiB, and a near-ceiling 7,999-token chunk peaks at 1,478 MiB in ~101 s.
 const REQUESTED_CTX: usize = 8_192;
 
+/// The window a rank-mode context asks for — one scored (query, document) pair, not a note.
+///
+/// 2,048 because it is the number `llama-rerank` runs with (`tools/rerank/rerank.cpp:195`) and the pinned artifact was
+/// trained on 512 positions, so the extra room costs KV cache without changing what the model attends to for a normal
+/// pair. The number makes a limit real; what to do at the limit is the scorer's rule, and it is *not* truncation — a
+/// pair that does not fit is refused rather than scored from half a document, which would be a judgement about words
+/// the user never asked about.
+const RERANK_CTX_TOKENS: usize = 2_048;
+
 /// The one cross-file invariant worth compiling rather than commenting: **a validated budget must fit the context we
 /// build**. `window()` is `min(REQUESTED_CTX, n_ctx_train)`, so this guarantees that any `embeddings.max_tokens` which
 /// passed config validation reaches the runtime inside the window on an artifact trained at least this wide — and that
@@ -156,6 +165,81 @@ impl Pooling {
             llama_ffi::LLAMA_POOLING_TYPE_LAST => Some(Self::Last),
             llama_ffi::LLAMA_POOLING_TYPE_RANK => Some(Self::Rank),
             _ => None,
+        }
+    }
+}
+
+/// What a context is being built to answer.
+///
+/// One enum for both loaders because the two differ in exactly three places — whether the declared-width check runs,
+/// how wide the window is, and who chooses the pooling strategy — and are identical everywhere else. Those shared
+/// refusals are what keeps a forward pass inside what the context can hold (the `SIGABRT` at
+/// `src/llama-context.cpp:1631`, the module header's "the window is three numbers"), so a second loader written by
+/// copying this one would be free to forget one.
+pub enum Purpose {
+    /// One sentence vector per sequence, of the width the caller declared.
+    ///
+    /// **Pooling comes from the artifact**: `pooling_type` stays `LLAMA_POOLING_TYPE_UNSPECIFIED`, so llama.cpp
+    /// resolves it from the file, and [`Pooling::Rank`] is refused on the way back because a RANK row is
+    /// [`llama_ffi::llama_model_n_cls_out`] floats wide rather than `n_embd_out`.
+    Embed { configured_dim: usize },
+    /// One relevance score per (query, document) pair, over a window this crate chose.
+    ///
+    /// **Pooling is ours**: a reranker GGUF declares no `bert.pooling_type`, and `src/llama-hparams.h` defaults that
+    /// field to NONE, so a context left to the file would answer with per-token rows and never a score — the same
+    /// reason `llama-server` needs `--reranking` (`tools/server/server.cpp:105`). Rank mode therefore *asks* for RANK
+    /// and [`load_rank`] reads back what it got, refusing rather than reading garbage.
+    ///
+    /// `ctx_tokens` is the ceiling for one scored pair. It must be non-zero — llama.cpp reads `n_ctx == 0` as "no
+    /// ceiling" — and [`load_rank`] is the only caller, passing [`RERANK_CTX_TOKENS`].
+    Rank { ctx_tokens: usize },
+}
+
+impl Purpose {
+    /// The window to ask the constructor for, bounded by what this model was trained with.
+    ///
+    /// `open_context` writes the answer into all three of `n_ctx`, `n_batch` and `n_ubatch`, which is the only thing
+    /// that makes a long input a refusal instead of an abort; the built values are read back afterwards because
+    /// `include/llama.h:575-577` says the request "may differ from the actual values used".
+    fn window(&self, n_ctx_train: usize) -> usize {
+        match self {
+            // The embedding recipe's own ceiling: the minimum of the constant and the trained window, never 0.
+            Self::Embed { .. } => requested_ctx(n_ctx_train) as usize,
+            // A pair is short by construction, so the caller's number wins — still bounded by the trained window,
+            // because a context wider than the model was trained on attends to positions it never saw.
+            Self::Rank { ctx_tokens } => (*ctx_tokens).min(n_ctx_train),
+        }
+    }
+}
+
+/// Whether the pooling this context **actually** applies is the one `purpose` asked for, or the sentence explaining
+/// why it is not.
+///
+/// A table rather than an arm inside [`open_context`] because both purposes now read the same number back and must
+/// refuse it differently: [`llama_pooling_type`] reports what the context resolved, not what was requested
+/// (`src/llama-context.cpp` keeps `params.pooling_type` when it is not UNSPECIFIED and otherwise copies the model's
+/// own value), so an artifact can disagree with either plan.
+fn accepted_pooling(purpose: &Purpose, answered: i32) -> Result<Pooling, &'static str> {
+    match (purpose, Pooling::from_c(answered)) {
+        (Purpose::Embed { .. }, Some(kind @ (Pooling::Mean | Pooling::Cls | Pooling::Last))) => {
+            Ok(kind)
+        }
+        (Purpose::Embed { .. }, Some(Pooling::Rank)) => {
+            Err("this artifact produces a score, not a sentence vector")
+        }
+        (Purpose::Embed { .. }, None) => Err(if answered == llama_ffi::LLAMA_POOLING_TYPE_NONE {
+            "this artifact cannot produce a sentence vector: the context pools with NONE"
+        } else {
+            // Not `NONE` and not any value the pinned header declares: the mirror no longer matches the
+            // tree it mirrors, which is a re-pin problem rather than an artifact problem.
+            "the runtime reported a pooling strategy this build does not know"
+        }),
+        (Purpose::Rank { .. }, Some(Pooling::Rank)) => Ok(Pooling::Rank),
+        (Purpose::Rank { .. }, Some(_)) => {
+            Err("this artifact pools a sentence vector, so it cannot produce a relevance score")
+        }
+        (Purpose::Rank { .. }, None) => {
+            Err("the runtime reported a pooling strategy this build does not know")
         }
     }
 }
@@ -1420,6 +1504,137 @@ impl Drop for LoadedModel {
     }
 }
 
+/// A loaded cross-encoder: a model whose context answers with one relevance score per scored pair.
+///
+/// A second type rather than a second mode of [`LoadedModel`], because the two read different widths out of the same
+/// call and a caller must not be able to hold both by accident: under [`Pooling::Rank`] the pooled row is
+/// [`llama_ffi::llama_model_n_cls_out`] floats (`include/llama.h:1167`), so [`LoadedModel::embed_text`] reading
+/// `n_embd_out` of them would return numbers that describe nothing — the over-read [`Pooling::Rank`] was written
+/// against. The type is what makes that read unreachable instead of merely discouraged.
+///
+/// Like [`LoadedModel`], this is neither `Send` nor `Sync`: it owns two raw llama.cpp handles, and a context has no
+/// documented thread-safety (`include/llama.h:560-563` describes one context per thread).
+pub struct LoadedRanker {
+    /// Freed second — a context stores this pointer without retaining it (see [`LoadedModel`]'s field of the same name).
+    model: NonNull<llama_model>,
+    /// Freed first, by the `Drop` below.
+    ctx: NonNull<llama_context>,
+    /// Tokens one scored pair may occupy. Read back from the built context, not requested (see [`LoadedModel::window`]).
+    window: usize,
+    /// Numbers a pooled row holds, from [`llama_ffi::llama_model_n_cls_out`]. [`load_rank`] refuses anything but 1, so
+    /// reading this is a sanity check rather than a branch a caller has to get right.
+    n_cls_out: usize,
+}
+
+impl LoadedRanker {
+    /// Tokens one scored pair may occupy in a single forward pass — the same three-numbers bound [`LoadedModel::window`]
+    /// describes for an embedding pass, and the number a caller refuses over rather than truncates.
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// Numbers a pooled row holds. Always 1 here — see [`llama_ffi::llama_model_n_cls_out`] for why that is a fact to
+    /// read rather than one to assume.
+    pub fn n_cls_out(&self) -> usize {
+        self.n_cls_out
+    }
+}
+
+impl Drop for LoadedRanker {
+    fn drop(&mut self) {
+        // SAFETY: both pointers came from llama.cpp's constructors in [`load_rank`] and were non-null there. This type
+        // is not `Clone`/`Copy` and owns both, so `drop` runs once per pair — and the order is not interchangeable: a
+        // context holds a raw pointer to its model without retaining it.
+        unsafe {
+            llama_ffi::llama_free(self.ctx.as_ptr());
+            llama_ffi::llama_model_free(self.model.as_ptr());
+        }
+    }
+}
+
+/// Load an artifact as a reranker: RANK pooling, a window sized for one pair, and no width check against anything.
+///
+/// **Capability is measured here, not declared.** There is no registry row for a reranker (a `models` row carries a
+/// vector width and embedding prefixes, and this artifact has neither), so nothing upstream can promise what a given
+/// file is. What this refuses instead: a missing or unreadable file, a context that did not become RANK
+/// ([`accepted_pooling`]), and a head that answers with more than one number per pair.
+///
+/// The consequence of "measured" is worth stating plainly: **any** artifact can be handed to this function, including
+/// an embedding model, and the refusal may come from the pooling check rather than from a name. That is fine for the
+/// `np` commands, which resolve a pinned id before opening a path, and is why this is `pub`: a caller that hands in an
+/// arbitrary path is told what the artifact turned out to be.
+pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError> {
+    // The same spelling `load` uses: absolute, no symlink resolution, prefixed when long. A file that is not there is
+    // not checked for here — the runtime answers null for both "missing" and "not a GGUF", and both come back as the
+    // one refusal a caller can act on, which is [`load`]'s precedent rather than an extra stat.
+    let open_path = walk::to_open_path(&models::access(path));
+    let c_path = c_string_path(path, &open_path)?;
+
+    // SAFETY: value-type struct of plain data; the defaults are llama.cpp's own.
+    let model_params = unsafe { llama_ffi::llama_model_default_params() };
+    // SAFETY: `c_path` is a NUL-terminated path to a file that exists (checked just above); llama.cpp opens and closes
+    // it inside this call. The answer is null on failure.
+    let Some(model) = NonNull::new(unsafe {
+        llama_ffi::llama_model_load_from_file(c_path.as_ptr(), model_params)
+    }) else {
+        return Err(EmbedError::ArtifactNotLoadable {
+            path: path.to_path_buf(),
+        });
+    };
+
+    // `_facts` is deliberately unread here: the one fact this loader cares about (pooling) is already decided by
+    // `open_context`, which refuses a context that did not resolve to RANK. Widths are the embedding recipe's business.
+    let (ctx, _facts, window) = match open_context(
+        model,
+        Purpose::Rank {
+            ctx_tokens: RERANK_CTX_TOKENS,
+        },
+        LoadOptions::default(),
+    ) {
+        Ok(built) => built,
+        Err(problem) => {
+            // SAFETY: `model` came from the load above and no context outlived `open_context`'s failure paths (each
+            // frees the one it made), so this is the first and only free of this handle.
+            unsafe { llama_ffi::llama_model_free(model.as_ptr()) };
+            return Err(problem);
+        }
+    };
+
+    // SAFETY: `model` is non-null (it came from a checked load) and still alive — the context does not own it, and
+    // nothing frees it on this path. The read is metadata only, which is what makes it valid after the context exists.
+    let n_cls_out = unsafe { llama_ffi::llama_model_n_cls_out(model.as_ptr()) };
+    // A refusal below has to hand back both handles, so the count is decided before any of them are freed.
+    let width_problem = match usize::try_from(n_cls_out) {
+        Ok(1) => None,
+        Ok(other) => Some(format!(
+            "this artifact answers with {other} scores per pair; this build reads one"
+        )),
+        // `u32` into `usize` cannot fail on a supported target, so this arm keeps `as` out of the file rather than
+        // naming a branch anyone expects to reach.
+        Err(_) => {
+            Some("this artifact reports a classifier head this build cannot count".to_string())
+        }
+    };
+    if let Some(sentence) = width_problem {
+        // SAFETY: both handles came from the constructors above and are owned by nobody else — no `LoadedRanker` was
+        // built, so nothing else will free them. Context first, for the reason in [`LoadedRanker::drop`].
+        unsafe {
+            llama_ffi::llama_free(ctx.as_ptr());
+            llama_ffi::llama_model_free(model.as_ptr());
+        }
+        return Err(EmbedError::Unavailable(sentence));
+    }
+
+    Ok(LoadedRanker {
+        model,
+        ctx,
+        window,
+        // `usize::try_from` above proved this is 1; storing the converted value rather than a literal keeps the
+        // number's owner in one place.
+        n_cls_out: 1,
+    })
+}
+
 /// How to build a context, for the few callers that need to say more than "use the runtime's defaults".
 ///
 /// **The default is today's behaviour in every field**, and it is the only thing production passes: the one production
@@ -1597,7 +1812,7 @@ pub fn load_with_options(
     // From here the model is ours, and every failure below must hand it back. One arm does that, so a new
     // refusal inside `open_context` cannot leak it — which is why the fallible work lives in a function whose
     // only success value is "the context is now owned too".
-    match open_context(model, configured_dim, options) {
+    match open_context(model, Purpose::Embed { configured_dim }, options) {
         Ok((ctx, facts, window)) => Ok(LoadedModel {
             #[cfg(feature = "vision")]
             identity: std::sync::Arc::new(()),
@@ -1624,7 +1839,7 @@ pub fn load_with_options(
 /// the number actually built.
 fn open_context(
     model: NonNull<llama_model>,
-    configured_dim: usize,
+    purpose: Purpose,
     options: LoadOptions,
 ) -> Result<(NonNull<llama_context>, ModelFacts, usize), EmbedError> {
     let numbers = read_numbers(model)?;
@@ -1632,11 +1847,17 @@ fn open_context(
     // The width check compares our `usize` against the runtime's own `i32`, so a refusal prints the number
     // llama.cpp gave rather than a converted approximation of it (`ProviderDimMismatch::provider` is `i64`
     // because the database column is, and `i64::from(i32)` is exact).
-    if numbers.n_embd_out != configured_dim {
-        return Err(EmbedError::ProviderDimMismatch {
-            configured: configured_dim,
-            provider: i64::from(numbers.raw_out),
-        });
+    //
+    // An embedding width is a promise about stored vectors, so a mismatch is the caller's mistake. A rank head has no
+    // such promise — its output width is [`llama_ffi::llama_model_n_cls_out`], checked after the context exists — and
+    // running this check anyway would refuse every reranker on the field that says "I am not an embedder".
+    if let Purpose::Embed { configured_dim } = purpose {
+        if numbers.n_embd_out != configured_dim {
+            return Err(EmbedError::ProviderDimMismatch {
+                configured: configured_dim,
+                provider: i64::from(numbers.raw_out),
+            });
+        }
     }
 
     // SAFETY: value-type struct of plain data, as above. `embeddings` is the switch that makes a forward pass
@@ -1651,9 +1872,15 @@ fn open_context(
     // [`LoadedModel::embed_text`] refuses above the same number instead of discovering the limit downstream.
     let mut ctx_params = unsafe { llama_ffi::llama_context_default_params() };
     ctx_params.embeddings = true;
-    ctx_params.n_ctx = requested_ctx(numbers.n_ctx_train);
+    ctx_params.n_ctx = purpose.window(numbers.n_ctx_train) as u32;
     ctx_params.n_batch = ctx_params.n_ctx;
     ctx_params.n_ubatch = ctx_params.n_ctx;
+    // Rank mode is the one place this build *declares* a pooling strategy, and it declares the one the artifact cannot
+    // supply for itself (see [`Purpose::Rank`]). `embeddings = true` stays set for both purposes: under RANK the pooled
+    // row lands in `get_seq_embeddings`, which is where [`llama_get_embeddings_seq`] looks.
+    if matches!(purpose, Purpose::Rank { .. }) {
+        ctx_params.pooling_type = llama_ffi::LLAMA_POOLING_TYPE_RANK;
+    }
     // Both worker counts, or neither. llama.cpp keeps them separate (generation vs batch) and an embedding run takes the
     // batch path, so setting only `n_threads` would report success while changing nothing that matters; `LoadedModel::
     // threads()` reads both back for exactly that reason.
@@ -1717,19 +1944,8 @@ fn open_context(
 
     // SAFETY: `ctx` is non-null (checked above) and owned by us; the call reads one field of its parameters.
     let pooling = unsafe { llama_ffi::llama_pooling_type(ctx.as_ptr()) };
-    match Pooling::from_c(pooling) {
-        Some(Pooling::Rank) => {
-            // A reranker's pooled row is `float[n_cls_out]` (`include/llama.h:1167`), so every read in
-            // `embed_text` would run past it. Refused here, where there is still a context to hand back and no
-            // vector has been promised — see [`Pooling::Rank`].
-            // SAFETY: as in the arm below — this context came from `llama_init_from_model` above and is not owned
-            // by any `LoadedModel` yet.
-            unsafe { llama_ffi::llama_free(ctx.as_ptr()) };
-            Err(EmbedError::Unavailable(
-                "this artifact produces a score, not a sentence vector".to_string(),
-            ))
-        }
-        Some(kind) => Ok((
+    match accepted_pooling(&purpose, pooling) {
+        Ok(kind) => Ok((
             ctx,
             ModelFacts {
                 n_embd_out: numbers.n_embd_out,
@@ -1742,22 +1958,13 @@ fn open_context(
             },
             window,
         )),
-        None => {
+        Err(why) => {
             // Refusing is also the only place a context dies outside `LoadedModel`'s `Drop`, so it has to die
             // here: leaking it would keep hundreds of MB reachable behind an error nobody can retry past.
             // SAFETY: this context came from `llama_init_from_model` above and is not owned by any
             // `LoadedModel` yet; nothing reads through it after this call.
             unsafe { llama_ffi::llama_free(ctx.as_ptr()) };
-            Err(EmbedError::Unavailable(
-                if pooling == llama_ffi::LLAMA_POOLING_TYPE_NONE {
-                    "this artifact cannot produce a sentence vector: the context pools with NONE"
-                        .to_string()
-                } else {
-                    // Not `NONE` and not any value the pinned header declares: the mirror no longer matches the
-                    // tree it mirrors, which is a re-pin problem rather than an artifact problem.
-                    "the runtime reported a pooling strategy this build does not know".to_string()
-                },
-            ))
+            Err(EmbedError::Unavailable(why.to_string()))
         }
     }
 }
@@ -2015,6 +2222,81 @@ mod tests {
         assert!(
             matches!(problem, EmbedError::ArtifactUnreadable { .. }),
             "expected an unreadable-artifact refusal, got {problem:?}"
+        );
+    }
+
+    /// The window a rank context asks for is the one it was handed, bounded by what the model was trained on.
+    ///
+    /// Both halves matter separately. The first is the point of [`RERANK_CTX_TOKENS`]: a pair is short, and a 2,048-token
+    /// context is what `llama-rerank` runs with. The second is the bound that keeps a context from attending to positions
+    /// past the artifact's training — the same reason [`requested_ctx`] takes a minimum rather than a constant.
+    #[test]
+    fn rank_window_is_the_pair_ceiling_bounded_by_training() {
+        let pair = Purpose::Rank {
+            ctx_tokens: RERANK_CTX_TOKENS,
+        };
+        assert_eq!(pair.window(8_192), RERANK_CTX_TOKENS);
+        assert_eq!(
+            pair.window(512),
+            512,
+            "a short artifact wins over our request"
+        );
+    }
+
+    /// The embedding purpose still asks for exactly what it asked for before the enum existed — the refactor must not
+    /// have moved a window by one token, because that number is what `embed_text` refuses against.
+    #[test]
+    fn embed_window_is_unchanged_by_the_purpose_enum() {
+        let embed = Purpose::Embed {
+            configured_dim: 768,
+        };
+        assert_eq!(embed.window(1_048_576), REQUESTED_CTX);
+        assert_eq!(embed.window(1_024), 1_024);
+    }
+
+    /// Each purpose accepts the pooling it asked for and refuses the other's, in both directions.
+    ///
+    /// The table is worth pinning because the two refusals are different sentences about different mistakes: "this is a
+    /// reranker" told to someone who ran `np embed`, and "this is not a reranker" told to whoever pointed an artifact at
+    /// rank mode that only pools sentence vectors.
+    #[test]
+    fn each_purpose_accepts_only_its_own_pooling() {
+        let embed = Purpose::Embed {
+            configured_dim: 768,
+        };
+        let rank = Purpose::Rank {
+            ctx_tokens: RERANK_CTX_TOKENS,
+        };
+
+        for answered in [
+            llama_ffi::LLAMA_POOLING_TYPE_MEAN,
+            llama_ffi::LLAMA_POOLING_TYPE_CLS,
+            llama_ffi::LLAMA_POOLING_TYPE_LAST,
+        ] {
+            assert!(accepted_pooling(&embed, answered).is_ok());
+            assert!(accepted_pooling(&rank, answered).is_err());
+        }
+        assert_eq!(
+            accepted_pooling(&rank, llama_ffi::LLAMA_POOLING_TYPE_RANK),
+            Ok(Pooling::Rank)
+        );
+        assert_eq!(
+            accepted_pooling(&embed, llama_ffi::LLAMA_POOLING_TYPE_RANK),
+            Err("this artifact produces a score, not a sentence vector")
+        );
+    }
+
+    /// A NONE context is still refused by rank mode, even though rank mode *wants* a head: NONE means the runtime ignored
+    /// the request, and reading per-token rows as one score would be the garbage this whole path exists to avoid.
+    #[test]
+    fn rank_mode_refuses_a_context_that_stayed_none() {
+        let rank = Purpose::Rank {
+            ctx_tokens: RERANK_CTX_TOKENS,
+        };
+        assert!(accepted_pooling(&rank, llama_ffi::LLAMA_POOLING_TYPE_NONE).is_err());
+        assert!(
+            accepted_pooling(&rank, llama_ffi::LLAMA_POOLING_TYPE_UNSPECIFIED).is_err(),
+            "an unresolvable number is not a pooling strategy"
         );
     }
 }
