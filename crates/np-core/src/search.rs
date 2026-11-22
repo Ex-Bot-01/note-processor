@@ -674,6 +674,61 @@ impl std::str::FromStr for SearchMode {
     }
 }
 
+/// Which text of a note the reranker is shown. Two spellings, and they are the whole vocabulary for the same reason
+/// [`SearchMode`] is the single definition of its three: `--rerank-text`, `[search] rerank_text` and `--json` all read these
+/// strings, so a word accepted by one door and refused by another — this project's split-refusal lesson — has nowhere to
+/// enter. [`RerankText::label`] is what every door prints.
+///
+/// The default scores the title and body together, which is what a cross-encoder trained on query/document pairs expects to
+/// read: a note titled "Kaffeemühle entkalken" with a body of three bullet points is a better match for "wie entkalkt man
+/// eine Kaffeemühle" than its bullets alone, because the title is where a vault says what a note *is*. `body` exists because
+/// that claim is worth measuring rather than believing — titles in some vaults are dates, or paths, or noise — and because
+/// the pair has to be built one way or the other anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RerankText {
+    /// `notes.title`, a newline, then `notes.body`. Front matter is in neither: it is metadata about the file, not prose
+    /// a reader of the note would want scored.
+    #[default]
+    TitleBody,
+    /// `notes.body` alone. Identical to [`RerankText::TitleBody`] for a note with no title — neither mode prepends a blank
+    /// line, because a leading newline is not "no title" but a token the model would attend to.
+    Body,
+}
+
+impl RerankText {
+    /// The one spelling of each policy, shared by the CLI flag, the config value and `--json`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::TitleBody => "title-body",
+            Self::Body => "body",
+        }
+    }
+}
+
+impl std::fmt::Display for RerankText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// A text policy that is not one of the two. Named rather than swallowed, and its message lists both accepted words — the
+/// same sentence from a flag and from a config key.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown rerank text `{0}`: expected `title-body` or `body`")]
+pub struct UnknownRerankText(pub String);
+
+impl std::str::FromStr for RerankText {
+    type Err = UnknownRerankText;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "title-body" => Ok(Self::TitleBody),
+            "body" => Ok(Self::Body),
+            other => Err(UnknownRerankText(other.to_string())),
+        }
+    }
+}
+
 /// One answer from the keyword list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeywordHit {

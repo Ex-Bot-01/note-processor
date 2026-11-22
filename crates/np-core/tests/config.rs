@@ -25,9 +25,9 @@ use np_core::config::{
     DataDirPlatform, DiagSource, EmbeddingProvider, EmbeddingsConfig, Level, LogPeek, MarkerConfig,
     ModelsConfig, SearchConfig, ThreadCount, WorkspaceRegistry, DEFAULT_EMBEDDING_TOKENS,
     DEFAULT_LOG_MAX_BYTES, DIAG_LEVEL_NAMES, MAX_CONTINUATION_INDENT, MAX_EMBEDDING_TOKENS,
-    REGISTRY_FILE, WINDOWS_DATA_SUBDIR, WORKSPACES_DIR,
+    MAX_RERANK_CANDIDATES, REGISTRY_FILE, WINDOWS_DATA_SUBDIR, WORKSPACES_DIR,
 };
-use np_core::search::SearchMode;
+use np_core::search::{RerankText, SearchMode};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -2368,6 +2368,160 @@ fn an_invented_search_mode_is_refused_and_names_the_three() {
     // Mutations this catches: adding a serde `other` arm that swallows the value into the default, and renaming a mode in
     // one door only — `SearchMode` is the single definition behind config, `--mode` and `--json`, so a fourth spelling has
     // nowhere to enter. The argv door is pinned by `an_invented_mode_refuses_with_claps_exit_two` in `np-cli`.
+}
+
+// ---------------------------------------------------------------------------
+// F51: `[search] rerank`, `rerank_top_n`, `rerank_text` (`docs/design-f51-rerank-stage.md`). The section that changes an
+// answer rather than what is stored, so its defaults are pinned in both directions — a stage that came on by accident would
+// silently reorder every search on this machine.
+// ---------------------------------------------------------------------------
+
+/// **Off, five deep, title and body.** Absent means the retrieval order reaches the terminal untouched: the reranker is a
+/// thing a human asks for, never a thing an upgrade decides. Asserted against both the parser and `Default`, because those
+/// two agreeing is the whole reason no code path can rank differently from another.
+#[test]
+fn search_section_defaults_to_no_rerank() {
+    let _env = hold_env();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "");
+
+    let cfg = Config::load(Some(&path)).expect("an empty file is a valid file");
+    assert!(!cfg.search.rerank, "a reranker costs a model load; nothing turns that on behind a human's back — and `[models] auto_fetch = true` must not fetch one either, which is why the artifact is never volunteered by a scan");
+    assert_eq!(cfg.search.rerank_top_n, 5);
+    assert_eq!(cfg.search.rerank_text, RerankText::TitleBody);
+    assert_eq!(RerankText::default(), RerankText::TitleBody);
+
+    let defaults = SearchConfig::default();
+    assert!(!defaults.rerank);
+    assert_eq!(defaults.rerank_top_n, cfg.search.rerank_top_n);
+    assert_eq!(defaults.rerank_text, cfg.search.rerank_text);
+}
+
+/// The three values read back as written, with the file spelling — `true`, a bare integer, `"body"` — rather than the Rust
+/// one. A key that parses only in its default form is a key nobody can turn on.
+#[test]
+fn rerank_keys_read_from_the_file_as_written() {
+    let _env = hold_env();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        "[search]\nrerank = true\nrerank_top_n = 25\nrerank_text = \"body\"\n",
+    );
+
+    let cfg = Config::load(Some(&path)).expect("the three keys are valid together");
+    assert!(cfg.search.rerank);
+    assert_eq!(cfg.search.rerank_top_n, 25);
+    assert_eq!(cfg.search.rerank_text, RerankText::Body);
+    assert_eq!(
+        cfg.search.rerank_text.label(),
+        "body",
+        "and the label is the spelling the file used — one word, three doors"
+    );
+}
+
+/// A depth outside `1..=64` is refused **naming the key and the bound**, not clamped: F35's rule is that nonsense is
+/// refused rather than quietly repaired, and `rerank_top_n = 0` in particular would mean "retrieval's order, then reorder
+/// nothing" — a run that loads a 635 MB model to change no bytes. The cap is checked at the boundary as well as past it,
+/// because an off-by-one in either direction is exactly what a `>` vs `>=` mistake looks like.
+#[test]
+fn rerank_top_n_outside_its_range_is_refused_naming_the_key_and_the_bound() {
+    let _env = hold_env();
+    for (spelling, why) in [
+        (
+            "0",
+            "no candidates means no work, so asking for it is a mistake rather than a preference",
+        ),
+        (&(MAX_RERANK_CANDIDATES + 1).to_string(), "one past the cap"),
+    ] {
+        let (_path, err) = root_refusal(&format!("[search]\nrerank_top_n = {spelling}\n"));
+        let message = err.to_string();
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "`{spelling}` ({why}) must be a parse refusal, got {err:?}"
+        );
+        assert!(
+            message.contains("search.rerank_top_n"),
+            "the refusal has to name the key it is refusing (`{spelling}`): {message}"
+        );
+        assert!(
+            message.contains(&MAX_RERANK_CANDIDATES.to_string()) && message.contains("1"),
+            "and the accepted range, so the human does not have to look it up: {message}"
+        );
+    }
+
+    // The boundary itself loads: the cap is a bound, not a suggestion.
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(
+        tmp.path(),
+        &format!("[search]\nrerank_top_n = {MAX_RERANK_CANDIDATES}\n"),
+    );
+    assert_eq!(
+        Config::load(Some(&path))
+            .expect("the cap is allowed")
+            .search
+            .rerank_top_n,
+        MAX_RERANK_CANDIDATES
+    );
+}
+
+/// Two spellings, both accepted, and a third refused **while naming both accepted words** — the shape `SearchMode`'s own
+/// refusal established. This value is the one place where the same bytes can be scored two ways, so a typo that silently
+/// became the default would change an answer with no diagnosis; the CLI door for these words is pinned in `np-cli`.
+#[test]
+fn rerank_text_accepts_two_spellings_and_refuses_a_third() {
+    let _env = hold_env();
+    for (spelling, want) in [
+        ("title-body", RerankText::TitleBody),
+        ("body", RerankText::Body),
+    ] {
+        let tmp = TempDir::new().expect("test setup: tempdir");
+        let path = write_config_with_data_dir(
+            tmp.path(),
+            &format!("[search]\nrerank_text = \"{spelling}\"\n"),
+        );
+        let cfg = Config::load(Some(&path)).expect("`{spelling}` is an accepted spelling");
+        assert_eq!(cfg.search.rerank_text, want);
+        assert_eq!(
+            cfg.search.rerank_text.label(),
+            spelling,
+            "the label round-trips the file's own word"
+        );
+    }
+
+    let (_path, err) = root_refusal("[search]\nrerank_text = \"titles\"\n");
+    let message = err.to_string();
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "a third spelling is a refusal, got {err:?}"
+    );
+    assert!(
+        message.contains("titles"),
+        "the value held must be named: {message}"
+    );
+    for word in ["title-body", "body"] {
+        assert!(
+            message.contains(word),
+            "and both accepted words have to be listed (`{word}` missing): {message}"
+        );
+    }
+}
+
+/// Adding three keys to `[search]` must not loosen the container: an invented key beside real ones is still refused, naming
+/// what it was given. This is the same fence that makes `[catalogg]` impossible — a section that accepts typos turns a typo
+/// into a silently default-valued subsystem, and here the subsystem is ranking itself.
+#[test]
+fn an_invented_search_key_is_still_refused_beside_the_new_ones() {
+    let _env = hold_env();
+    for body in [
+        "[search]\nreranked = true\n",
+        "[search]\nrerank_top_n = 5\nrerank_txt = \"body\"\n",
+    ] {
+        let (_path, err) = root_refusal(body);
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "an invented key must still be refused ({body:?}), got {err:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
