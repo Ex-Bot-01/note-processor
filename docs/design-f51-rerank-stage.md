@@ -201,12 +201,25 @@ to the embedder; pointing it at the reranker would make a consent-gated embeddin
 embeddings switched off, and inventing `[search] rerank_threads` would ship a knob nobody measured. `LoadedModel::threads()`
 already reports what the context was told, so the latency table states its thread count instead of implying one.
 
-**Which bytes are scored — the human's ruling: `notes.title` + a newline + `notes.body`,** front matter excluded. "Yes
-`notes.title + notes.body` is a good idea." That is the text the keyword half ranks (`notes_fts` over title and body), it is what
-a reader recognises as the note, and for 1–3 word queries the title is likely decisive. The alternative — the whole decoded file
-including front matter, which is what the chunker embedded (`chunk.rs:31-37`) — would have aligned rerank with the semantic half
-and pre-empted **D2** ("is front matter part of the embedded text?"), which stays open in `todo.md`. A note with no title scores
-its body alone, and that pair is not padded with a blank line: an empty title is a fact about the note, not a missing field.
+**Which bytes are scored — the human's ruling: both variants, one switch.** The default pair is **`notes.title` + a newline +
+`notes.body`**, front matter excluded; `--rerank-text body` scores the body alone. "Sometimes the file names are not meaningful at
+all and so we can test both versions at the end."
+
+| Spelling | Config | CLI / serve | What the model is handed |
+| --- | --- | --- | --- |
+| `title-body` (default) | `[search] rerank_text = "title-body"` | `--rerank-text title-body`, `"rerank_text": "title-body"` | title, newline, body — what the keyword half ranks (`notes_fts` over title and body) and what a reader recognises as the note |
+| `body` | `[search] rerank_text = "body"` | `--rerank-text body`, `"rerank_text": "body"` | body alone, for a vault whose titles are dates or `Untitled` and so add words that mean nothing beside the query |
+
+One enum, one lowercase spelling of each value in both doors — the rule `SearchMode` states about itself: a fourth spelling
+appearing in one door and not the other is the bug that enum prevents. Two details fall out of it:
+
+* A note with **no title** scores its body under either setting, and the default does not pad a missing title with a blank line —
+  an empty title is a fact about the note, not a field to render.
+* The third candidate, the whole decoded file *including* front matter (what the chunker embedded, `chunk.rs:31-37`), stays out
+  of this round: it would pre-empt **D2** ("is front matter part of the embedded text?"), still open in `todo.md`.
+
+The switch is a measurement instrument as much as a setting, so §9 runs the fixture **both ways** and prints two nDCG rows rather
+than picking a winner on one run.
 
 ## 8. When it does not run — the two-sided rule
 
@@ -281,6 +294,7 @@ compiling; macOS refuses inference outright.
 | notes beyond N keep retrieval order and follow the reranked block | the tail got re-sorted by a score it never received |
 | images are never candidates and keep their relative order | a figure was scored against text it does not have |
 | truncation: over-long note cut at a token boundary, query kept whole, over-long query refused | bytes were cut instead of tokens, or the question was truncated |
+| `rerank_text = "body"` scores no title; the default scores title then body; a titleless note is identical under both | the switch silently did nothing, or a missing title became an empty line the model paid tokens for |
 | missing artifact × {config, flag} → warn+exit 0 / refuse+exit 1, both naming the fix | the two cases collapsed into one sentence |
 | runtime-not-built × {config, flag}, same pair of outcomes | a default build promised to rerank |
 | digest mismatch → declines, never scores | unverified bytes reached a forward pass |

@@ -32,6 +32,7 @@ The five things no single task's tests will make obvious, each of which a real u
 - **A stage that is silently dead on an unconsented vault.** `[embeddings] provider = "none"` is the default, and `--mode keyword` needs no embedder; rerank must still run there, because a cross-encoder reads two strings. → Tasks 8 and 9 pin it.
 - **`--limit` smaller than N.** "Rerank the top 25" with the default `--limit 10` has to score 25 and print 10; getting this wrong makes every N above 10 quietly mean 10. → Task 8 pins it.
 - **Reading a RANK row at the wrong width** is a memory-safety bug, not a wrong number: the pooled buffer is `n_cls_out` floats, not `n_embd_out`. Rank mode reads `llama_model_n_cls_out` back and refuses anything but 1, and refuses a context that did not become RANK. → Task 4 pins it.
+- **A switch that silently does nothing.** `--rerank-text body` must hand the model different bytes than the default, and a note with no title must be identical under both — otherwise "we tested both versions" means we tested one. → Tasks 7 and 8 pin it.
 - **Frozen output.** With no flag and no config key, stdout, stderr and `--json` are byte-identical to today, including the key set of every hit. → Tasks 8 and 9 pin it with a golden document.
 
 ---
@@ -217,22 +218,32 @@ pub const RERANKER_ID: &str = "bge-reranker-v2-m3";
 
 ---
 
-### Task 7: `[search] rerank` and `rerank_top_n`, refused above the cap
+### Task 7: `[search] rerank`, `rerank_top_n` and `rerank_text`
 
 **Files:**
+- Modify: `crates/np-core/src/search.rs` (a `RerankText` enum beside `SearchMode` and `Prefix`)
 - Modify: `crates/np-core/src/config.rs` (`SearchConfig`, `Default`, one new const)
-- Test: `crates/np-core/tests/config.rs`
+- Test: `crates/np-core/tests/config.rs`, `crates/np-core/tests/search_modes.rs` (the value spellings live beside the mode spellings)
 - Modify: `docs/reference-config.md` (the `[search]` block in both the annotated sample and the key table)
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `pub const MAX_RERANK_CANDIDATES: usize = 64;`, `SearchConfig { mode, rerank: bool, rerank_top_n: usize }` with defaults `Hybrid / false / 5`.
+- Produces:
 
-- [ ] **Step 1: Write the failing tests** — `search_section_defaults_to_no_rerank`; `rerank_top_n_above_the_cap_is_refused_naming_it` (`rerank_top_n = 65` refuses, and the sentence names `search.rerank_top_n` and `64`, because F35's rule is that nonsense is refused rather than clamped); `an_unknown_search_key_is_still_refused` (the new keys must not loosen `deny_unknown_fields`); `rerank_keys_read_from_the_file_as_written` (`rerank = true`, `rerank_top_n = 25`).
+```rust
+pub const MAX_RERANK_CANDIDATES: usize = 64;
+pub enum RerankText { #[default] TitleBody, Body }   // label() + FromStr + serde, one lowercase spelling each
+// SearchConfig { mode, rerank: bool, rerank_top_n: usize, rerank_text: RerankText }
+// defaults: Hybrid / false / 5 / TitleBody
+```
+
+  `RerankText` follows `SearchMode`'s shape exactly — serde rename, a `FromStr` accepting the same two words it serialises, and `label()` as the single spelling both doors print — because that type's own doc comment is the argument for it: a value spelled in one door and not the other is the bug this shape prevents. Accepted spellings: `title-body`, `body`.
+
+- [ ] **Step 1: Write the failing tests** — `search_section_defaults_to_no_rerank`; `rerank_top_n_above_the_cap_is_refused_naming_it` (`rerank_top_n = 65` refuses, and the sentence names `search.rerank_top_n` and `64`, because F35's rule is that nonsense is refused rather than clamped); `rerank_text_accepts_two_spellings_and_refuses_a_third` (`title-body`, `body`, and `titles` refused while naming both accepted words); `an_unknown_search_key_is_still_refused` (the new keys must not loosen `deny_unknown_fields`); `rerank_keys_read_from_the_file_as_written` (`rerank = true`, `rerank_top_n = 25`, `rerank_text = "body"`).
 - [ ] **Step 2: Run, expect failures.**
 - [ ] **Step 3: Implement**, hand-writing the error like `[embeddings] threads` does (its comment explains why a derived message cannot name the key). No environment override — every other per-run lever for search is a flag.
-- [ ] **Step 4: Run** `cargo test -p np-core --test config` and the no-HOME variant `env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config`.
-- [ ] **Step 5: Commit** `git commit -am "feat(config): [search] rerank and rerank_top_n, capped"`
+- [ ] **Step 4: Run** `cargo test -p np-core --test config --test search_modes` and the no-HOME variant `env -u HOME -u XDG_CONFIG_HOME cargo test -p np-core --test config`.
+- [ ] **Step 5: Commit** `git commit -am "feat(config): [search] rerank, rerank_top_n and rerank_text"`
 
 ---
 
@@ -244,14 +255,14 @@ pub const RERANKER_ID: &str = "bge-reranker-v2-m3";
 - Test: `crates/np-core/tests/rerank_stage.rs` (new; a scripted fake `Reranker`, no weights), `crates/np-core/tests/search.rs` (the read-only fence must still pass)
 
 **Interfaces:**
-- Consumes: `rerank::{Reranker, rank_order}` (Task 3), `config::MAX_RERANK_CANDIDATES` (Task 7).
+- Consumes: `rerank::{Reranker, rank_order}` (Task 3), `config::MAX_RERANK_CANDIDATES` and `search::RerankText` (Task 7).
 - Produces:
 
   The reorder is `rerank::rank_order` — the function `docs/design-f51-rerank-stage.md` §3 calls `rerank_top`. It takes the scores and returns a permutation so it needs no `Hit` type, which is what lets Task 3 test it with slices.
 
 ```rust
 pub enum RerankAsk { ByConfig, Explicit }                       // decides warn-vs-refuse
-pub struct RerankInput<'a> { pub reranker: &'a mut dyn Reranker, pub ask: RerankAsk, pub top_n: usize }
+pub struct RerankInput<'a> { pub reranker: &'a mut dyn Reranker, pub ask: RerankAsk, pub top_n: usize, pub text: RerankText }
 pub enum RerankNote { ArtifactAbsent, RuntimeNotBuilt, ArtifactUnverified(String), CannotScore(String) }
 impl RerankNote { pub fn label(&self) -> String; pub fn token(&self) -> &'static str; pub fn diag_rule(&self) -> &'static str; pub fn report(&self); }
 pub enum RerankSkip { Disabled, NoCandidates }                  // the two non-fault reasons
@@ -271,11 +282,11 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
   - `figures_are_never_candidates_and_keep_their_relative_order` — an image hit at retrieval rank 2 with N=3 stays behind the reranked notes and ahead of the tail's figures.
   - `a_tie_in_rerank_score_breaks_on_path_bytes_then_kind` — extend `search.rs`'s existing total-order argument rather than inventing a new one.
   - `the_stage_needs_no_embeddings_provider` — `ranked(..., model = None, query_vector = None, ...)` in keyword mode still reranks; this is the Review Focus line about a silently dead stage.
-  - `note_text_is_title_then_body_and_a_note_without_a_title_loses_no_line` — the fake records the strings it was handed.
+  - `rerank_text_picks_what_the_model_is_handed` — the fake records the strings it was sent. Under `TitleBody` a titled note arrives as `title + "\n" + body`; under `Body` the same note arrives as its body with no title and no leading newline, and the two differ (that is what makes the switch real). For a note whose `title` column is NULL the two settings produce **the same string**, with no blank first line.
   - `a_declined_stage_reports_once_with_its_token` — capture diagnostics with the existing `tests/capture.rs` helper; exactly one event, correct rule token, and (config ask) no error raised.
   - `an_explicit_ask_that_cannot_be_honoured_is_an_error` — same cause, `RerankAsk::Explicit` → `Err(SearchError::RerankUnavailable { .. })`, which is what makes the CLI exit 1.
 - [ ] **Step 2: Run, expect failures** (`ranked`'s new arity).
-- [ ] **Step 3: Implement.** Order of operations inside `ranked`: fuse and truncate as today at depth `max(limit, top_n)` when a stage is present (the fused list is built to that depth, then truncated to `limit` at the end — one line in the function's doc says why output size does not move), select the first N note hits, read their text with **one read-only `SELECT title, body`** (`fn note_texts(conn, &[(kind, path)])`; bytes are identity, so match on `rel_bytes`, and a hit whose row vanished keeps its position with `None` evidence rather than scoring empty), score, reorder with `rank_order`, splice. Every statement stays a `SELECT` — `searching_writes_nothing` runs this path now, so the read-only fence covers the stage for free.
+- [ ] **Step 3: Implement.** Order of operations inside `ranked`: fuse and truncate as today at depth `max(limit, top_n)` when a stage is present (the fused list is built to that depth, then truncated to `limit` at the end — one line in the function's doc says why output size does not move), select the first N note hits, read their text with **one read-only `SELECT title, body`** (`fn note_texts(conn, &[(kind, path)], text: RerankText)`; bytes are identity, so match on `rel_bytes`, and a hit whose row vanished keeps its position with `None` evidence rather than scoring empty), score, reorder with `rank_order`, splice. Every statement stays a `SELECT` — `searching_writes_nothing` runs this path now, so the read-only fence covers the stage for free.
 - [ ] **Step 4: Update every in-tree caller** (`np-cli`'s `search_run` passes `None` for now) and run `cargo test --workspace`; expect the existing search suites green without edits (a changed expectation there means the default path moved — stop).
 - [ ] **Step 5: Commit** `git commit -am "feat(search): an optional rerank stage between retrieval and the report"`
 
@@ -294,12 +305,12 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
 ```jsonc
 // per hit (always present):  "rerank_score": null, "rerank_rank_before": null, "rerank_rank_after": null
 // beside hits (always present):
-"rerank": { "ran": false, "reason": "disabled", "candidates": 0, "model": null }
+"rerank": { "ran": false, "reason": "disabled", "candidates": 0, "model": null, "text": "title-body" }
 ```
 
-- [ ] **Step 1: Write the failing CLI tests** — `search_json_carries_the_rerank_keys_when_nothing_was_asked` (a full golden document for a default run: this is the Review Focus's frozen-output line, and it must fail if any key appears, disappears or reorders), `rerank_by_config_with_no_artifact_warns_and_exits_zero_naming_the_fetch`, `explicit_rerank_without_the_artifact_refuses_at_exit_one`, `rerank_top_n_from_config_scores_more_than_the_limit_and_prints_the_limit` (the Review Focus depth line: 12 notes, `--limit 3`, `rerank_top_n = 8` → 8 scored, 3 printed), `rerank_runs_with_embeddings_switched_off`, `serve_search_matches_cli_json_for_the_same_query` (parity, including the decline case), `serve_rerank_param_must_be_a_boolean_or_null`, and — cfg-gated per feature shape like the existing pairs — `a_build_without_the_runtime_declines_by_config_and_refuses_by_flag`.
+- [ ] **Step 1: Write the failing CLI tests** — `search_json_carries_the_rerank_keys_when_nothing_was_asked` (a full golden document for a default run: this is the Review Focus's frozen-output line, and it must fail if any key appears, disappears or reorders), `rerank_by_config_with_no_artifact_warns_and_exits_zero_naming_the_fetch`, `explicit_rerank_without_the_artifact_refuses_at_exit_one`, `rerank_top_n_from_config_scores_more_than_the_limit_and_prints_the_limit` (the Review Focus depth line: 12 notes, `--limit 3`, `rerank_top_n = 8` → 8 scored, 3 printed), `rerank_runs_with_embeddings_switched_off`, `serve_search_matches_cli_json_for_the_same_query` (parity, including the decline case), `serve_rerank_param_must_be_a_boolean_or_null`, `rerank_text_body_sends_no_title_to_the_model` (flag over config in both directions, and the document names which policy ran), and — cfg-gated per feature shape like the existing pairs — `a_build_without_the_runtime_declines_by_config_and_refuses_by_flag`.
 - [ ] **Step 2: Run, expect failures.**
-- [ ] **Step 3: Implement the resolution door** in `commands/rerank.rs`: config first (`[search] rerank`), flag over it in both directions; resolve `<models_dir>/bge-reranker-v2-m3`; **verify against the pin once per process** — a `OnceLock` verdict keyed by path + size + mtime, hashing when there is no verdict or the stamp moved, refusing on any mismatch; then `RankModel::open`. In a build without `local-model`, the same function returns `NoReranker(RerankError::RuntimeNotBuilt)`, which is what makes one code path serve both feature shapes. `np search` never fetches: no transport is constructed on this path at all, and a test asserts it by running with `[models] auto_fetch = true` and an absent artifact.
+- [ ] **Step 3: Implement the resolution door** in `commands/rerank.rs`: config first (`[search] rerank`, `[search] rerank_text`), flags over them in both directions (`--rerank`/`--no-rerank`, `--rerank-text`), with serve mirroring both as `"rerank"` and `"rerank_text"`; resolve `<models_dir>/bge-reranker-v2-m3`; **verify against the pin once per process** — a `OnceLock` verdict keyed by path + size + mtime, hashing when there is no verdict or the stamp moved, refusing on any mismatch; then `RankModel::open`. In a build without `local-model`, the same function returns `NoReranker(RerankError::RuntimeNotBuilt)`, which is what makes one code path serve both feature shapes. `np search` never fetches: no transport is constructed on this path at all, and a test asserts it by running with `[models] auto_fetch = true` and an absent artifact.
 - [ ] **Step 4: Implement the document and the text line.** Text channel: when the stage ran, print the rerank score in the score column (it is what ordered the list) and keep `cos … bm25 …` in brackets beside it; when it declined by config, one line on stderr naming the cause and the fix, exit 0. JSON keeps `score` as the retrieval number and carries `rerank_score` beside it, so a reader can tell which pass produced the order. Serve: same document, refusals as the `-32000` fault carrying the CLI's sentence verbatim.
 - [ ] **Step 5: Run** `cargo test -p np-cli --test cli --test serve --test rerank_cli`, then `cargo test -p np-cli --no-default-features` (the no-runtime shapes), then the `local-model` and `local-model,fetch` CLI rows with `CMAKE` set.
 - [ ] **Step 6: Commit** `git commit -am "feat(cli): --rerank/--no-rerank, the serve option, and the two exit codes"`
@@ -318,7 +329,7 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
 - Produces: `ndcg_at(results, k)`, and `--rerank` which passes `"rerank": true` per query; the fixture as data.
 
 - [ ] **Step 1: Write the metric's own test first** — extend `--self-test` with a hand-computed nDCG@10 case (planted gains, one known answer at rank 4 → a number computed on paper and written into the script) plus the mutant that flatters itself (nDCG over answered queries only must **not** rise when recall falls). Run `python3 .github/scripts/f31_eval.py --self-test` and watch it fail before implementing.
-- [ ] **Step 2: Implement `ndcg_at` and the rerank axis.** Binary relevance, as F31 does everywhere else; print nDCG@k beside recall@k and MRR per mode, and print the run's shape above the table (binary, modes, k, rerank on/off, label path) so a 0.02 difference over eight queries cannot be read as a finding.
+- [ ] **Step 2: Implement `ndcg_at` and the rerank axis.** Binary relevance, as F31 does everywhere else; add `--rerank` and `--rerank-text <title-body|body>` as pass-throughs to every `np search` call (the harness's job is to drive the binary, not to reimplement a flag), and print nDCG@k beside recall@k and MRR per mode. Print the run's shape above the table — binary, modes, k, rerank on/off, which text policy ran, label path — so a 0.02 difference over eight queries cannot be read as a finding.
 - [ ] **Step 3: Write the fixture.** ~100 notes of two to eight lines each, DE and EN, plausibly vault-shaped (a meeting note, a recipe, a project log, an invoice reminder) with deliberately flat vocabulary overlap between neighbours so retrieval genuinely misses; include 1-3 word queries in both languages and label every one. No private text, no real names, no host paths.
 - [ ] **Step 4: Write `crates/np-core/tests/rerank_fixture.rs`** — `every_labelled_answer_is_an_indexed_path` (scan the fixture into a temp DB once; an unresolvable label is a broken fixture, not a bad search) and `the_fixture_vault_scans_clean` (no skipped files). These run with no model, so a rotting fixture fails a gate row rather than someone's measurement.
 - [ ] **Step 5: Run** `python3 .github/scripts/f31_eval.py --self-test`, `cargo test -p np-core --test rerank_fixture`, `python3 .github/scripts/check-links.py`.
@@ -337,7 +348,7 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
 - Consumes: everything above.
 - Produces: the numbers, and the documents that carry them.
 
-- [ ] **Step 1: Run the stage over the fixture both ways** with a `local-model` release build and both artifacts installed: `python3 .github/scripts/f31_eval.py tests/fixtures/rerank-vault --labels tests/fixtures/rerank-labels.tsv --modes keyword,semantic,hybrid --k 10 [--rerank]`. Record recall@10, MRR and nDCG@10 per mode, rerank off then on.
+- [ ] **Step 1: Run the stage over the fixture every way it can be asked** with a `local-model` release build and both artifacts installed: the harness plain, then with `--rerank`, then with `--rerank --rerank-text body` (both flags passed through to each `np search`). Record recall@10, MRR and nDCG@10 per mode for **all three rows** — comparing title+body against body alone is the thing you asked to be able to test, so a table that cannot make that comparison is the wrong table. Say in the doc which of the fixture's titles are meaningful, since that is what this axis measures on a corpus we wrote.
 - [ ] **Step 2: Measure the stage's cost** from the artifact-gated harness in `local_rerank.rs`: p50/p95 over ≥30 scored queries at N ∈ {5, 10, 15, 20, 25} and at 50 candidates, with `RankModel::facts().window` and the context's read-back thread counts printed beside the table; peak RSS of one-shot `np search --rerank` versus without it (`/usr/bin/time -v`); the end-to-end wall time of a fresh process including the pin hash.
 - [ ] **Step 3: Compare the quants** through the same seam with `NP_TEST_RERANK_PATH` pointed at Q5_K_M and Q4_K_M: top-1 agreement, top-10 overlap against Q8_0's order, latency, size. Pin nothing new; if a smaller quant is equivalent on those numbers, that is a follow-up card with its own decision, not an edit here.
 - [ ] **Step 4: Attempt the reference cross-check** (an isolated `uv` environment, `sentence-transformers`, the HF weights). If it installs and runs, report score deltas **and** order agreement against np's scores, with §4 of the design beside it. If it does not fit, write that row as not measured — an attempted-and-declined row is a fact; a silent gap is not.
