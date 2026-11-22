@@ -23,6 +23,12 @@ np embeddings disable [--json]            # provider = "none"; the model you cho
   `attachments` counts the live tracked files that are not notes — hashed, listed, linkable, never searchable — and
   `attachment_examples` names up to five of them, sorted by path. The count is exact whatever the cap prints, and
   `notes + attachments` is every live file the scan tracks.
+- **What counts as a link.** `[[Note]]`, `[[Note|alias]]` and `[text](relative.md)` are matched against the corpus case-insensitively
+  (by `case_key`, the way a case-insensitive filesystem types). A destination may wear angle brackets —
+  `[text](<a note.md>)` finds `a note.md` — which is how a destination holds spaces. An ambiguous or missing target is left
+  unresolved and *named* in the report (`unresolved_targets`), never guessed. And a link inside code is an example rather than an
+  edge: nothing inside a fenced region yields a link, and neither does an inline code span, so quoting markdown in a note adds no
+  unresolved link you do not have.
 - **Incremental both ways.** A note whose bytes have not moved keeps its vector; a figure's vectors are keyed to its *content
   hash*, so the same image linked from six notes is encoded once, and deleting the last link to it prunes the row and its
   vectors on the next run.
@@ -60,12 +66,13 @@ np embeddings disable [--json]            # provider = "none"; the model you cho
   the mode that was **asked for**, which halves actually ran, whether this workspace holds vectors at all, whether anyone has
   ever scanned it, a sentence and a token about a half that could not run (`null` when nothing was missing), and what auto-fetch
   did — so "no semantic hits", "no model installed" and "this folder is not indexed" stay three different reports. Each key's
-  question is tabulated under [the search document](#the-search-document-keys-three-kinds-of-no-answer). Every hit carries the same **eleven** keys whatever the kind and whatever the mode —
-  `score`, `cosine`, `bm25`, `semantic_rank`, `keyword_rank`, `kind`, `path`, `snippet`, `linked_from`, `source_note`,
-  `linked_notes` and `matched_exactly` — because an absent key and a null are two different claims. The five evidence keys are F36's, and they exist so
+  question is tabulated under [the search document](#the-search-document-keys-three-kinds-of-no-answer). Every hit carries the same **fifteen** keys whatever the kind and whatever the mode —
+  `score`, `cosine`, `bm25`, `semantic_rank`, `keyword_rank`, `rerank_score`, `rerank_rank_before`, `rerank_rank_after`, `kind`,
+  `path`, `snippet`, `linked_from`, `source_note`, `linked_notes` and `matched_exactly` — because an absent key and a null are two
+  different claims. The five evidence keys are F36's, and they exist so
   a fused score can be argued with: in `keyword` mode `cosine` and `semantic_rank` are `null`, in `semantic` mode the reverse.
   `matched_exactly` is **#6**'s and its third value is load-bearing: `true` whole words, `false` reached only because a widened word
-  *begins* with one of them, `null` not from the keyword list at all. The last three are F28's: **every** live note linking a figure, byte-ordered, where the other two were its head and its length.
+  *begins* with one of them, `null` not from the keyword list at all. The linker trio — `source_note`, `linked_notes`, `linked_from` — is F28's: **every** live note linking a figure, byte-ordered, where the other two were its head and its length.
   A note hit and an orphaned figure both get `[]`, never `null` — "this hit has no live linker" is one true statement about
   either, and telling them apart is what `kind` is for.
 
