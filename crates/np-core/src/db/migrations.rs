@@ -404,11 +404,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<Carried, DbError> {
     // The bookkeeping table is not itself a migration entry: it has to exist before the first
     // entry can be recorded in it.
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")?;
-    let current: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-        [],
-        |row| row.get(0),
-    )?;
+    let current = recorded_version(conn)?;
     if current > MIGRATIONS.len() as i64 {
         return Err(DbError::TooNew {
             found: current,
@@ -424,7 +420,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<Carried, DbError> {
     // `foreign_keys = ON` before calling this, so restoring it keeps that promise to the caller even
     // when a migration fails.
     conn.execute_batch("PRAGMA foreign_keys = OFF")?;
-    let applied = apply_migrations(conn, current);
+    let applied = apply_missing(conn, current);
     let restored = conn.execute_batch("PRAGMA foreign_keys = ON");
     // The receipt travels out through `applied`, but the `?` stays where it is: enforcement has to go
     // back on before any migration error leaves this function, and a failed open keeps no handle that
@@ -432,6 +428,53 @@ pub(crate) fn migrate(conn: &Connection) -> Result<Carried, DbError> {
     let carried = applied?;
     restored?;
     Ok(carried)
+}
+
+/// The version this file records as applied, `0` for a database with no schema yet.
+fn recorded_version(conn: &Connection) -> Result<i64, DbError> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// How many times [`apply_missing`] will re-read and resume after a step found the work already done. Each pass moves past
+/// at least one recorded version, so this bounds the pathological case — two openers repeatedly colliding on the *same*
+/// step — rather than the ordinary one.
+const RESUME_LIMIT: u32 = 8;
+
+/// Apply what is missing, **re-reading and resuming when a step discovers that somebody else already applied it**.
+///
+/// The recorded version is read once, before any of this, and nothing holds it while the steps run. Two processes creating
+/// the same workspace therefore both see `0`, both start at entry 1, and one of them meets `table files already exists` — a
+/// statement about a schema that exists, arriving as a failure to the application that was asked to create it. The same
+/// collision lands on the version row instead when the other opener happens to commit between our step and our insert.
+///
+/// Re-reading answers both without making every migration idempotent, which would be the wrong fix: eleven steps written to
+/// be re-runnable is eleven chances for a genuinely half-built database to read as finished, and the steps that rebuild a
+/// table cannot be made harmless that way at all. What the file *has* recorded is evidence of committed work — each step is
+/// its own transaction, so a recorded version means a peer committed it whole — and an unrecorded version means nobody did,
+/// which is the case that must still fail with its own error.
+fn apply_missing(conn: &Connection, from: i64) -> Result<Carried, DbError> {
+    let mut carried = Carried::default();
+    let mut from = from;
+    let mut resumes = 0u32;
+    loop {
+        match apply_migrations(conn, from, &mut carried) {
+            Ok(()) => return Ok(carried),
+            Err(source) => {
+                // A failed re-read says nothing about who did what, so the step's own error is the fact worth reporting.
+                let now = recorded_version(conn).unwrap_or(from);
+                if now <= from || resumes >= RESUME_LIMIT {
+                    return Err(source);
+                }
+                resumes += 1;
+                from = now;
+            }
+        }
+    }
 }
 
 /// The 1-based [`MIGRATIONS`] entry that removes orphan rows and writes their receipt — entry 3,
@@ -455,8 +498,7 @@ const NOTE_MERGE_VERSION: i64 = 5;
 
 /// Apply every migration above `from`, one transaction each, remembering a step's receipt when one of
 /// those steps wrote it — and echoing each receipt **after** that step commits, never from inside it.
-fn apply_migrations(conn: &Connection, from: i64) -> Result<Carried, DbError> {
-    let mut carried = Carried::default();
+fn apply_migrations(conn: &Connection, from: i64, carried: &mut Carried) -> Result<(), DbError> {
     for (index, migration) in MIGRATIONS.iter().enumerate() {
         let version = index as i64 + 1;
         if version <= from {
@@ -511,10 +553,10 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<Carried, DbError> {
         // nothing. Migration 4 and 5 run right after migration 3; these two pin that they do not swallow the
         // orphan receipt — `only_the_scan_that_removed_the_orphans_announces_them` (np-cli: the printed half)
         // and `a_version_two_database_upgrades_and_keeps_every_row_that_has_a_note` (this crate: the handle).
-        carried.orphans = orphan_receipt.or(carried.orphans);
-        carried.merges = merge_receipt.or(carried.merges);
+        carried.orphans = orphan_receipt.or(carried.orphans.take());
+        carried.merges = merge_receipt.or(carried.merges.take());
     }
-    Ok(carried)
+    Ok(())
 }
 
 /// Migration 3 — every child table gains a real foreign key on its note.

@@ -20,6 +20,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use thiserror::Error;
@@ -89,6 +90,26 @@ pub use self::upgrades::{merge_total, orphan_total};
 /// they do not prove it is enough at scale. If a scan's write phase ever runs past it, that scan reports
 /// `database is locked` under overlap and this constant is what moves.
 pub(crate) const BUSY_TIMEOUT_MS: u32 = 1800;
+
+/// The step of the wait described at [`Db::open`]'s journal-mode retry.
+pub(crate) const FIRST_OPEN_RETRY_WAIT: Duration = Duration::from_millis(20);
+
+/// How many times that wait is taken before the open gives up. A solo first open is milliseconds of DDL, so the ceiling is
+/// orders of magnitude past the work it waits for; it exists because SQLite will not wait on our behalf for a journal-mode
+/// change, not because building a schema is slow. An opener that still cannot convert after this reports what it reports
+/// today — the bound is there so a workspace genuinely wedged by another process stays a reportable failure.
+pub(crate) const FIRST_OPEN_RETRY_LIMIT: u32 = 20;
+
+/// Whether SQLite said *someone else holds this right now* rather than refusing the statement itself. Only the first is
+/// worth waiting on: a statement that was refused does not become acceptable with delay, and retrying one turns a clear
+/// failure into a slow one.
+fn is_transient_lock(source: &rusqlite::Error) -> bool {
+    matches!(
+        source,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
 
 /// What can fail while opening or writing the workspace database.
 #[derive(Debug, Error)]
@@ -215,13 +236,33 @@ impl Db {
             }
         }
         let conn = Connection::open(path)?;
+        // The per-connection settings go first and on their own, because both take effect whatever another process is
+        // doing with the file — which is precisely what the journal mode below cannot promise.
+        conn.execute_batch(&format!(
+            "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}; PRAGMA foreign_keys = ON;"
+        ))?;
         // WAL is a file-database privilege: `:memory:` refuses it, so it is asked for here
         // and not in [`Db::in_memory`].
-        conn.execute_batch(&format!(
-            "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};
-             PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;"
-        ))?;
+        //
+        // **The journal mode is the one statement here that cannot wait for its own turn.** SQLite answers a `journal_mode`
+        // change made while another connection holds the file with `database is locked`, and it does not consult this
+        // connection's busy timeout on the way: the pragma comes back immediately, with `busy_timeout` set one statement
+        // earlier and never consulted. Nothing shows until a workspace is being *created*, where both openers are writers of
+        // the schema rather than readers of one — so the loser of this statement used to be the first search of a brand-new
+        // folder, told its database was locked milliseconds after it did not exist. Retrying waits for the condition the
+        // pragma actually needs (the other open's transaction finished) instead of for a lock SQLite never offers; a solo
+        // first open never takes a second trip, so only contention that already existed pays anything.
+        let mut waits = 0u32;
+        loop {
+            match conn.execute_batch("PRAGMA journal_mode = WAL;") {
+                Ok(()) => break,
+                Err(source) if waits < FIRST_OPEN_RETRY_LIMIT && is_transient_lock(&source) => {
+                    waits += 1;
+                    std::thread::sleep(FIRST_OPEN_RETRY_WAIT);
+                }
+                Err(source) => return Err(source.into()),
+            }
+        }
         let carried = migrate(&conn)?;
         Ok(Db(conn, carried))
     }
