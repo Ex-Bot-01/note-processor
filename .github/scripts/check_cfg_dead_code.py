@@ -12,11 +12,20 @@ So the cheap static proxy runs here: for every function or const that carries no
 *all* of its call sites sit inside items gated by one and the same predicate. If they do, it is dead wherever that cfg is
 off — and CI is the place that will find out.
 
-Heuristic, not a compiler. What it cannot see: a reference through a macro or a function pointer; an item used only from
-a gated `mod { … }` block rather than a gated function; anything whose definition line does not match the shapes in `DEF`.
+Heuristic, not a compiler. What it cannot see: a reference through a macro or a function pointer; anything whose
+definition line does not match the shapes in `DEF`; a gate whose item's brace is separated from it by a signature spanning
+lines. Braces inside raw strings (`r#"…"#`) and the char literals `'{'` / `'}'` are still counted, since counting them is
+what makes the rest cheap — line comments and double-quoted spans are removed first, because an unmatched brace in prose
+displaces every block depth after it. And because rustc decides deadness crate-wide while this reads file by file, an item
+another file reaches for is live (`used_elsewhere`); a path-shaped mention in that file's prose counts as reaching, which is
+the direction this fence should err.
+
 A gate counts as the item's own only when it is contiguous with the definition — attribute and doc-comment lines
 immediately above it, nothing else — because "there is a `#[cfg]` somewhere within four lines" is exactly the shape this
-fence exists to catch, not an exemption from it.
+fence exists to catch, not an exemption from it. An item inside a gated block inherits that block's gate, taking the
+innermost when blocks nest: an item that does not exist where a feature is off can never be the item rustc reports dead
+there. `rerank.rs`'s `verified` — a helper inside `#[cfg(feature = "local-model")] mod verify`, called from gated code below
+it — is the shape this rule exists to keep out of the report.
 
 Usage: python3 .github/scripts/check_cfg_dead_code.py [repo]
 Exit 0 = nothing flagged, 1 = offenders printed. `--self-test` runs the planted cases in this file and needs no repository.
@@ -43,6 +52,22 @@ CONTIGUOUS = re.compile(r"^\s*(#\[|///|//!|//)")
 TAKES_SELF = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|async\s+)?fn\s+\w+\s*\(\s*(?:&\s*(?:'\w+\s+)?(?:mut\s+)?|mut\s+)?self\b")
 
 
+# Text that cannot open or close a block, removed before braces are counted. What stays out of reach: raw strings
+# (`r#"…"#`) and the char literals `'{'` / `'}'`, both rare enough here to name rather than parse.
+LINE_COMMENT = re.compile(r"//.*$")
+STRING_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def code_braces(line: str) -> str:
+    """`line` with strings and line comments removed, so prose braces are not counted as blocks.
+
+    Counting every brace made the fence read whichever way a comment happened to point: an unmatched `{` in prose lifts the
+    depth for the rest of the file, and a gated block whose closing brace then lands at the wrong depth is never recorded —
+    which reports as "this helper has no gate", the same misleading conclusion a truncated block gives.
+    """
+    return LINE_COMMENT.sub("", STRING_LITERAL.sub("", line))
+
+
 def gated_blocks(lines: list[str]) -> list[tuple[int, int, str]]:
     """`(first_line, last_line, predicate)` for every `#[cfg(...)]`-gated brace block.
 
@@ -50,23 +75,31 @@ def gated_blocks(lines: list[str]) -> list[tuple[int, int, str]]:
     dead there — which is what makes `fetch.rs`'s `GetDiskFreeSpaceExW`, declared inside a gated `extern "system"` block,
     live rather than flagged. The gate must sit contiguous with the block's own header line, for the same reason as an
     item's: "a `#[cfg]` somewhere above" is not evidence about this block.
+
+    Frames remember the **depth** their brace opened at, because a close has to be matched against the frame it closes.
+    Counting opens and closes per line and popping on any close instead let one balanced pair end a block early —
+    `use std::path::{Path, PathBuf};` is the ordinary offender — so a gated module's gate stopped three lines into it,
+    every helper below read as ungated, and a helper called only from its own gated neighbours was reported as dead code
+    on the platform where that gate is off. On a platform that never compiles the item at all.
     """
     blocks: list[tuple[int, int, str]] = []
-    stack: list[tuple[int, str | None]] = []
-    for index, line in enumerate(lines):
+    stack: list[tuple[int, int, str]] = []
+    depth = 0
+    for index, raw in enumerate(lines):
         gate = contiguous_gate(lines, index)
-        opens, closes = line.count("{"), line.count("}")
-        if opens and not closes:
-            stack.append((index, gate))
-        elif opens and closes:
-            if gate:
-                blocks.append((index, index, gate))
-        if closes:
-            for _ in range(closes):
-                if stack:
-                    start, block_gate = stack.pop()
-                    if block_gate:
-                        blocks.append((start, index, block_gate))
+        claimed = False
+        for char in code_braces(raw):
+            if char == "{":
+                depth += 1
+                # The block's header is the first brace on the gated line; a second one there opens something else.
+                if gate is not None and not claimed:
+                    stack.append((depth, index, gate))
+                    claimed = True
+            elif char == "}":
+                if stack and stack[-1][0] == depth:
+                    _, start, block_gate = stack.pop()
+                    blocks.append((start, index, block_gate))
+                depth -= 1
     return blocks
 
 
@@ -112,7 +145,9 @@ def spans(lines: list[str]) -> list[tuple[str, int, int, str | None]]:
         gate = contiguous_gate(lines, index)
         enclosing = [b for b in blocks if b[0] < index <= b[1]]
         if enclosing:
-            gate = gate or enclosing[-1][2]
+            # The **innermost** gate, not the last one recorded: with a gated block nested in another, the predicate that
+            # decides whether this item exists is the tightest one around it, and two different ones must not be merged.
+            gate = gate or max(enclosing, key=lambda block: (block[0], -block[1]))[2]
         # A plain `pub` item is exported API: rustc never reports it dead, so flagging it would be noise. `pub(crate)`
         # and `pub(super)` are not exported, so they stay under the fence.
         public = bool(match.group(1)) and not match.group(2)
@@ -124,7 +159,29 @@ def spans(lines: list[str]) -> list[tuple[str, int, int, str | None]]:
     return found
 
 
-def audit(path: pathlib.Path) -> list[str]:
+def corpus(directory: pathlib.Path) -> list[tuple[pathlib.Path, str]]:
+    """Every `.rs` file under `directory`, read once.
+
+    rustc decides dead code for the whole crate, while this fence reads one file at a time — so an item whose only in-file
+    caller is the test module looks dead here and is not. A `pub(crate)` helper driven from its own tests and called from
+    a sibling module (`serve.rs`'s `handle_line`, met by `serve_channel.rs`) is exactly that shape.
+    """
+    return [(path, path.read_text(encoding="utf-8")) for path in sorted(directory.rglob("*.rs"))]
+
+
+def used_elsewhere(name: str, path: pathlib.Path, bodies: list[tuple[pathlib.Path, str]]) -> bool:
+    """Whether another file reaches for `name` as a call or a path.
+
+    Shaped like a use rather than a mention, because prose quotes names constantly: `` `handle_line` builds the response ``
+    is not a call, `crate::serve::handle_line(line)` is. A doc link written as a full path does count as one — erring
+    toward silence there keeps this fence from inventing work, at the cost of missing an item nobody outside its own file
+    calls but every other file documents.
+    """
+    reference = re.compile(r"::\s*" + re.escape(name) + r"\b|\b" + re.escape(name) + r"\s*[(<]")
+    return any(reference.search(text) for other, text in bodies if other != path)
+
+
+def audit(path: pathlib.Path, bodies: list[tuple[pathlib.Path, str]] = ()) -> list[str]:
     lines = path.read_text(encoding="utf-8").splitlines()
     items = spans(lines)
     problems: list[str] = []
@@ -140,7 +197,7 @@ def audit(path: pathlib.Path) -> list[str]:
         # `windows` on the other, some platform always compiles a caller.
         covered = [item[3] for item in hosts if item[3]]
         predicates = set(covered)
-        if len(covered) == len(sites) and len(predicates) == 1:
+        if len(covered) == len(sites) and len(predicates) == 1 and not used_elsewhere(name, path, bodies):
             problems.append(
                 f"{path}:{start + 1}: `{name}` is called only from #[cfg({predicates.pop()})] code"
             )
@@ -158,7 +215,8 @@ def run(root: pathlib.Path) -> int:
     if not files:
         print(f"no .rs files under {root / 'crates'} — is that the repository root?")
         return 1
-    problems = [problem for path in files for problem in audit(path)]
+    bodies = corpus(root / "crates")
+    problems = [problem for path in files for problem in audit(path, bodies)]
     for problem in problems:
         print(problem)
     if problems:
@@ -200,6 +258,63 @@ fn only_caller() -> u32 {
 
 
 
+# The shape a false positive came from: a gated module whose first balanced-brace line — `use a::{b, c};` is the ordinary
+# one — closed the gate as far as the parser was concerned, so everything below it read as ungated while its callers, in a
+# separately gated item, stayed gated. One predicate on every caller then looked exactly like dead code on the other side.
+FALSE_POSITIVE_ACROSS_A_GATED_MODULE = '''#[cfg(feature = "local-model")]
+mod verify {
+    use std::path::{Path, PathBuf};
+
+    pub(super) fn verified(path: &Path) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "local-model")]
+fn open(path: &Path) -> bool {
+    verify::verified(path)
+}
+'''
+
+# The same module read end to end: a helper and its only caller both inside the gate, so no platform ever compiles one
+# without the other.
+GATED_MODULE_WITH_A_BALANCED_LINE = '''#[cfg(feature = "local-model")]
+mod verify {
+    use std::path::{Path, PathBuf};
+
+    pub(super) fn verified(path: &Path) -> bool {
+        true
+    }
+
+    pub(super) fn open(path: &Path) -> bool {
+        verified(path)
+    }
+}
+'''
+
+# A `pub(crate)` item is crate-wide to rustc, so a helper whose in-file caller lives in the test module is not dead code
+# merely because this file's non-test lines never name it. The fence has to look past the file before it flags one.
+USED_FROM_ANOTHER_FILE = (
+    '''pub(crate) fn handle_line(line: &str) -> u32 {
+    line.len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_line;
+
+    #[test]
+    fn one_line() {
+        assert_eq!(handle_line("x"), 1);
+    }
+}
+''',
+    '''pub fn run(line: &str) -> u32 {
+    crate::a::handle_line(line)
+}
+''',
+)
+
 ASYNC_CALLER = '''fn helper_behind_an_async_caller() -> u32 {
     1
 }
@@ -231,6 +346,11 @@ GATE_SHAPES = [
     ("/// docs first\n#[cfg(unix)]\nfn gated() {}\n", "gated", "unix"),
     ('#[cfg(windows)]\nextern "system" {\n    fn imported() -> i32;\n}\n', "imported", "windows"),
     ('#[cfg(windows)]\nmod m {\n    use super::*;\n    fn helper() {}\n}\n', "helper", "windows"),
+    (
+        '#[cfg(unix)]\nmod m {\n    use std::path::{Path, PathBuf};\n    fn helper() {}\n}\n',
+        "helper",
+        "unix",
+    ),
     ("#[test]\n\nfn spaced_apart() {}\n", "spaced_apart", None),
 ]
 
@@ -241,6 +361,12 @@ def self_test() -> int:
         ("a helper called only from #[cfg(windows)] code is flagged", DEAD_ON_WINDOWS, 1),
         ("an async gated caller still counts as a caller", ASYNC_CALLER, 1),
         ("a trait method is not the shape this fence hunts", METHOD_IS_NOT_THE_SHAPE, 0),
+        (
+            "a helper in a gated module is not dead code across it",
+            FALSE_POSITIVE_ACROSS_A_GATED_MODULE,
+            0,
+        ),
+        ("a gated module keeps its gate past its first brace-balanced line", GATED_MODULE_WITH_A_BALANCED_LINE, 0),
     ]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -253,6 +379,15 @@ def self_test() -> int:
             ok = (1 if found else 0) == expected
             print(f"{'ok  ' if ok else 'FAIL'} {label}: {len(found)} problem(s), expected {'a flag' if expected else 'silence'}")
             failures += 0 if ok else 1
+        # The cross-file case needs two files, so it runs outside the single-source table above.
+        (first, second) = USED_FROM_ANOTHER_FILE
+        (target / "lib.rs").write_text(first, encoding="utf-8")
+        (target / "b.rs").write_text(second, encoding="utf-8")
+        found = audit(target / "lib.rs", corpus(target))
+        ok = not found
+        print(f"{'ok  ' if ok else 'FAIL'} an item used from another file is live: {len(found)} problem(s), expected silence")
+        failures += 0 if ok else 1
+        (target / "b.rs").unlink()
         for source, name, want in GATE_SHAPES:
             path = target / "shape.rs"
             path.write_text(source, encoding="utf-8")
