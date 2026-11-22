@@ -24,9 +24,10 @@ use np_core::config::Config;
 use np_core::db::{self, Db, ModelRow};
 use np_core::hash::{sha256_bytes, sha256_file};
 use np_core::models::{
-    self, ArtifactState, FetchFields, Install, InstallOutcome, ListedModel, ModelError, Unclaimed,
-    UnclaimedKind,
+    self, ArtifactState, FetchFields, Install, InstallOutcome, ListedModel, ModelError,
+    RerankerInstall, RerankerState, Unclaimed, UnclaimedKind,
 };
+use np_core::pins::{pinned_member, Role, RERANKER_ID};
 use rusqlite::params;
 use tempfile::TempDir;
 
@@ -2241,6 +2242,187 @@ fn list_fetch_markers_reports_every_marker_and_keeps_them() {
         ],
         "a listing that removed or rewrote a marker would be §12 rule 4 broken by a read-only command"
     );
+}
+
+/// The reranker's own heading in a listing, or a failure that says this build pins none.
+fn listed_reranker(listing: &np_core::models::Listing) -> np_core::models::ListedReranker {
+    listing
+        .reranker
+        .clone()
+        .expect("this build pins a rerank member, so a listing reports one")
+}
+
+/// Installing an id this build does not pin **as a reranker** refuses by name. The embedding id is the natural wrong
+/// answer to give — it is pinned, it has bytes, and it must still be refused here because its digest belongs to a row,
+/// not to a scoring head.
+#[test]
+fn installing_a_reranker_refuses_an_id_that_is_not_pinned_as_one() {
+    let f = Fixture::new();
+    let source = f.source("artifact.gguf", b"not a reranker, and short on purpose");
+    let problem = models::install_reranker(
+        &f.config,
+        &f.workspace,
+        &RerankerInstall {
+            id: "embeddinggemma-2".into(),
+            source,
+        },
+    )
+    .expect_err("an embedding id is not a reranker");
+    assert!(
+        matches!(problem, ModelError::NotPinnedReranker { .. }),
+        "expected a named-id refusal, got {problem:?}"
+    );
+    // And nothing was placed: the refusal is before the copy, not after it.
+    let listing = models::list(&f.db(), &f.config, &f.workspace).expect("listing");
+    assert_eq!(listed_reranker(&listing).state, RerankerState::Absent);
+}
+
+/// A file whose length the pin can already rule out is refused **before hashing**, and says so in the length's own words.
+///
+/// The message matters as much as the refusal: "digest mismatch" would report an inspection that never happened, which
+/// is the same honesty rule that makes `install` check a mistyped `--sha256` before it reads half a gigabyte.
+#[test]
+fn a_reranker_source_of_the_wrong_length_is_refused_before_anything_is_hashed() {
+    let f = Fixture::new();
+    const WRONG: &[u8] = b"the wrong size by several hundred megabytes";
+    let source = f.source("almost.gguf", WRONG);
+    let problem = models::install_reranker(
+        &f.config,
+        &f.workspace,
+        &RerankerInstall {
+            id: RERANKER_ID.into(),
+            source: source.clone(),
+        },
+    )
+    .expect_err("a few dozen bytes cannot be the pinned artifact");
+    match problem {
+        ModelError::PinnedSize {
+            path,
+            id,
+            expected,
+            found,
+        } => {
+            assert_eq!(path, source);
+            assert_eq!(id, RERANKER_ID);
+            assert_eq!(expected, pinned_size());
+            assert_eq!(found, WRONG.len() as u64);
+        }
+        other => panic!("expected a length refusal, got {other:?}"),
+    }
+}
+
+/// The three states a listing answers for the reranker, all from one `stat` — and its name never appears among the
+/// unclaimed files, which is the difference between "your reranker is installed" and "you should delete this junk".
+#[test]
+fn listing_reports_the_reranker_state_from_the_pin_and_the_file() {
+    let f = Fixture::new();
+    let models_dir = f.config.workspace_models_dir(&f.workspace);
+
+    // 1. Absent: no directory, no file, no row — the state of every install until someone asks for 635 MB.
+    let listing = models::list(&f.db(), &f.config, &f.workspace).expect("listing");
+    let reranker = listed_reranker(&listing);
+    assert_eq!(reranker.id, RERANKER_ID);
+    assert_eq!(
+        reranker.file, RERANKER_ID,
+        "`main` installs under the id itself"
+    );
+    assert_eq!(reranker.pinned_bytes, pinned_size());
+    assert_eq!(reranker.state, RerankerState::Absent);
+    assert_eq!(reranker.state.state_label(), "absent");
+    assert!(listing.unclaimed.is_empty());
+
+    // 2. PresentSized: a file of exactly the pinned length. Sparse, because the claim under test is about length and a
+    //    listing must be able to make it without reading — or holding — 635 MB.
+    let path = models_dir.join(RERANKER_ID);
+    fs::create_dir_all(&models_dir).expect("test setup: models dir");
+    let file = fs::File::create(&path).expect("test setup: sparse file");
+    file.set_len(pinned_size())
+        .expect("test setup: sparse length");
+    let listing = models::list(&f.db(), &f.config, &f.workspace).expect("listing");
+    assert_eq!(listed_reranker(&listing).state, RerankerState::PresentSized);
+    assert_eq!(
+        listed_reranker(&listing).state.state_label(),
+        "present, size matches the pin"
+    );
+    assert!(
+        listing.unclaimed.is_empty(),
+        "a pinned reranker is our file; unclaimed says {:?}",
+        listing
+            .unclaimed
+            .iter()
+            .map(|u| u.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        listing.models.is_empty(),
+        "and it is not a model row either: a reranker owns neither"
+    );
+
+    // 3. PresentWrongSize: something else's bytes under this name — a partial copy, or another quantization.
+    drop(file);
+    fs::write(&path, b"a truncated download").expect("test setup: short file");
+    let listing = models::list(&f.db(), &f.config, &f.workspace).expect("listing");
+    assert_eq!(
+        listed_reranker(&listing).state,
+        RerankerState::PresentWrongSize
+    );
+    assert!(listing.unclaimed.is_empty(), "still ours to report");
+}
+
+/// The happy path, against the real pinned bytes: placed under the id, and **no `models` row written** — the fact this
+/// whole round exists to keep true. Gated on `NP_TEST_RERANK_PATH` because the only bytes that pass are 635 MB of them.
+#[test]
+fn installing_the_pinned_reranker_places_bytes_and_writes_no_row() {
+    let Some(source) = std::env::var_os("NP_TEST_RERANK_PATH").map(PathBuf::from) else {
+        println!(
+            "NOT COVERAGE: NP_TEST_RERANK_PATH is unset, so no real reranker bytes were installed. Re-run with it \
+             pointing at bge-reranker-v2-m3 (sha256 d32a877b…) to install them."
+        );
+        return;
+    };
+    let f = Fixture::new();
+    let db = f.db();
+    let request = || RerankerInstall {
+        id: RERANKER_ID.into(),
+        source: source.clone(),
+    };
+
+    assert_eq!(
+        models::install_reranker(&f.config, &f.workspace, &request())
+            .expect("the pinned bytes install"),
+        np_core::models::RerankerInstallOutcome::Placed
+    );
+    let models_dir = f.config.workspace_models_dir(&f.workspace);
+    assert_eq!(
+        fs::metadata(models_dir.join(RERANKER_ID))
+            .expect("placed under the id")
+            .len(),
+        pinned_size()
+    );
+    assert!(
+        db::model_rows(&db)
+            .expect("readable")
+            .iter()
+            .all(|row| row.id != RERANKER_ID),
+        "a reranker must not appear in `models`: that table is what makes an id selectable as an embedder"
+    );
+    let listing = models::list(&db, &f.config, &f.workspace).expect("listing");
+    assert_eq!(listed_reranker(&listing).state, RerankerState::PresentSized);
+
+    // Idempotent, and it says so with the second state rather than by pretending to install again.
+    assert_eq!(
+        models::install_reranker(&f.config, &f.workspace, &request())
+            .expect("a second call is a check, not a conflict"),
+        np_core::models::RerankerInstallOutcome::AlreadyPlaced
+    );
+}
+
+/// The pinned reranker's expected length, read from the table rather than repeated here: a test that hard-coded it
+/// would keep passing after someone changed the row and forgot this file.
+fn pinned_size() -> u64 {
+    let pin = pinned_member(RERANKER_ID, "main").expect("the reranker's main member");
+    assert_eq!(pin.role, Role::Rerank);
+    pin.size_bytes
 }
 
 /// A directory that does not exist is not an error to report about — it is the state of a workspace nobody has

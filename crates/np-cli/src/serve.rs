@@ -645,16 +645,20 @@ fn models_list(params: &Value) -> Result<Value, ServeError> {
             &listing.models,
             &listing.fetching,
             &listing.unclaimed,
+            listing.reranker.as_ref(),
             &crate::commands::models::pinned_json(&config),
             None,
         ),
         // A directory we cannot read is a state the document already knows how to carry (`models_dir_error`), so it stays a result rather than
         // becoming a fault: `np models list --json` prints the same object and exits non-zero, and exit codes do not exist here.
         Err(err @ np_core::models::ModelError::ModelsDir { .. }) => {
+            // Nothing about the bytes under that directory is known — including whether a reranker is among them — so
+            // `null`, which reads "unknown here" rather than claiming "absent".
             crate::commands::models::listing_json(
                 &[],
                 &[],
                 &[],
+                None,
                 &crate::commands::models::pinned_json(&config),
                 Some(&err.to_string()),
             )

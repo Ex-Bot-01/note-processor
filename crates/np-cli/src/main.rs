@@ -267,7 +267,23 @@ fn main() -> ExitCode {
                 // width, so the `None`/`None` arm below is a guard against a future flag change rather than a state a
                 // human can reach — and it answers with a message instead of a panic. Written as a `match` because this
                 // arm's value is the program's result; `main` has no `Err` to return into.
+                // **A pinned reranker takes a different route**, decided by the pin table rather than by a flag nobody
+                // would have to remember: it declares no width, gets no row, and refuses the three flags that describe
+                // stored vectors. An explicit `--member` is left to the arm below, which refuses it honestly
+                // (`MemberWithoutModel`) rather than pretending a reranker has members.
                 match member {
+                    None if np_core::pins::role(&id) == Some(np_core::pins::Role::Rerank) => {
+                        commands::models::install_reranker(&InstallArgs {
+                            workspace,
+                            id,
+                            source: path,
+                            dim,
+                            sha256,
+                            prefix_doc,
+                            prefix_query,
+                            json,
+                        })
+                    }
                     None => commands::models::install_main(&InstallArgs {
                         workspace,
                         id,

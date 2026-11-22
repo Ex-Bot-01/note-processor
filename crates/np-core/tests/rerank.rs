@@ -111,7 +111,10 @@ fn fit_pair_keeps_the_query_and_cuts_the_note_tail() {
     match fit {
         Fit::Truncated { tokens, dropped } => {
             assert_eq!(tokens.len(), 8, "the budget is a ceiling, not a suggestion");
-            assert_eq!(dropped, 14, "twenty minus the six that fit beside the query");
+            assert_eq!(
+                dropped, 14,
+                "twenty minus the six that fit beside the query"
+            );
             assert_eq!(&tokens[..2], QUERY, "the query is never what gets cut");
             assert_eq!(
                 &tokens[2..],
