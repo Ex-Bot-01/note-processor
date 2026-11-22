@@ -399,3 +399,50 @@ fn a_build_without_the_runtime_declines_by_config_and_refuses_by_flag() {
         by_flag.stderr()
     );
 }
+
+/// **The slow part announces itself on the human channel and stays silent on the machine channels** (**F51**).
+///
+/// Verifying and loading the pinned artifact costs about 15 s here, and a search that prints nothing for that long reads as hung —
+/// which is how a good run gets killed one second before answering. So the human channel gets one line naming what is being loaded
+/// and why it takes a moment; `--json` gets nothing, because a reader of that document parses `rerank.reason` rather than prose, and
+/// stderr is where every other machine-channel run stays quiet.
+#[test]
+fn loading_the_reranker_announces_itself_once_to_the_human_channel() {
+    let vault = Vault::new("rerank = true\n");
+
+    let prose = Run::of(vault.search(&[]).output().expect("np runs"));
+    prose.assert_success();
+    let err = prose.stderr();
+    assert!(
+        err.contains("loading reranker") && err.contains(np_core::pins::RERANKER_ID),
+        "the line names what is loading:\n{err}"
+    );
+    assert!(
+        err.contains("once per process"),
+        "and says it is not a per-query cost:\n{err}"
+    );
+    // One line, not one per candidate or per retry.
+    assert_eq!(
+        err.lines()
+            .filter(|line| line.starts_with("loading reranker"))
+            .count(),
+        1,
+        "{err}"
+    );
+
+    let machine = Run::of(vault.search(&["--json"]).output().expect("np runs"));
+    machine.assert_success();
+    assert_eq!(
+        machine.stderr(),
+        "",
+        "`--json` keeps stderr empty; the cause is in `rerank.reason`"
+    );
+    // And a run that never asked for a reranker says nothing about one, in either channel.
+    let plain = Run::of(vault.search(&["--no-rerank"]).output().expect("np runs"));
+    plain.assert_success();
+    assert!(
+        !plain.stderr().contains("loading reranker"),
+        "declined before loading, so nothing may claim to be loading:\n{}",
+        plain.stderr()
+    );
+}

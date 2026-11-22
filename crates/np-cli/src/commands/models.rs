@@ -97,7 +97,9 @@ pub(crate) enum ModelsCommand {
     Fetch {
         /// Workspace root to fetch into. Its models directory receives the artifacts.
         workspace: PathBuf,
-        /// Model identity to fetch: it must be one this build pins bytes **and** an identity for.
+        /// Model identity to fetch. It must be pinned by this build; an embedding id additionally needs a declared identity
+        /// (width and prefixes), while a reranker id is fetched precisely **without** one — its bytes are pinned, and a `models`
+        /// row would list a scoring head among the embedders a workspace can pick (**F51**).
         #[arg(long)]
         id: String,
         /// Which member to fetch, repeatable (`main`, `mmproj`). Default: the members this binary can use — the

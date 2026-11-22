@@ -118,7 +118,7 @@ pub(crate) fn search_run(
     let mut scorer: Option<Box<dyn np_core::rerank::Reranker>> = None;
     let mut declined: Option<search::RerankNote> = None;
     if let Some(plan) = &plan {
-        match crate::commands::rerank::open(&cfg, workspace, plan) {
+        match crate::commands::rerank::prepare(&cfg, workspace, plan, announce)? {
             crate::commands::rerank::Opened::Ready(loaded) => scorer = Some(loaded),
             crate::commands::rerank::Opened::Declined(note) => declined = Some(note),
         }

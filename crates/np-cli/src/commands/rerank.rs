@@ -14,6 +14,7 @@
 //! [`RerankNote::RuntimeNotBuilt`], which is what lets one code path serve both feature shapes: the flag and the config key mean
 //! the same thing everywhere, and only what happens here differs.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use np_core::config::Config;
@@ -137,6 +138,41 @@ mod verify {
             Err(_) => false,
         }
     }
+}
+
+/// Announce, quiet llama.cpp, open. The human channel gets one line before the slow part; the machine channels get nothing,
+/// because they read `rerank.reason` instead of parsing prose.
+///
+/// **Why a line at all.** Verifying and loading the pinned artifact is about 15 s on this machine and more on a slow disk, and a
+/// search that prints nothing for that long reads as hung — which is how a person ends up killing a run that was one second from
+/// answering. The embedding path announces a 309 MB download the same way; a reranker's first load deserves the same courtesy, and
+/// it says *once per process* because that is exactly what it is (see [`verify`]'s cached verdict).
+pub(crate) fn prepare(
+    cfg: &Config,
+    workspace: &Path,
+    plan: &Plan,
+    announce: bool,
+) -> Result<Opened, Box<dyn std::error::Error>> {
+    if announce {
+        let _ = writeln!(
+            std::io::stderr(),
+            "loading reranker {} (verifying {} bytes, once per process)",
+            RERANKER_ID,
+            np_core::pins::pinned_member(RERANKER_ID, "main")
+                .map(|pin| pin.size_bytes)
+                .unwrap_or(0)
+        );
+    }
+    // **One knob for both loads.** `[embeddings] log_level` (and `NP_LLAMA_LOG_LEVEL`) already decides how loud llama.cpp may be
+    // on this run's stderr, and the reranker is the same runtime writing to the same stderr: a second key would let one load be
+    // quiet and the other chatty for reasons nobody configured. Resolved once here, before anything can load, because installing
+    // the sink after the model printed its banner is a switch that misses the only output worth silencing.
+    #[cfg(feature = "local-model")]
+    {
+        let level = np_core::loglevel::resolve_level_from_env(cfg.embeddings.log_level)?;
+        np_core::local_model::set_log_level(level);
+    }
+    Ok(open(cfg, workspace, plan))
 }
 
 /// Open the scorer the plan asked for.

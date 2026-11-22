@@ -201,7 +201,10 @@ It costs a model: the pinned `bge-reranker-v2-m3` is 635,674,432 bytes and must 
 `stat`, free), then the digest, because wrong bytes producing a plausible order is the one failure this command could not detect
 afterwards. The verdict is remembered for the process and re-validated against size and mtime, so `np serve` pays one pass while
 every `np search` pays its own: measured here at roughly 15 s on a laptop CPU, which is why an un-reranked search never touches
-this path at all. **`np search` never fetches it** — not when `[models] auto_fetch = true`, not ever.
+this path at all. Because that pause would otherwise read as a hang, the human channel gets one line before it —
+`loading reranker bge-reranker-v2-m3 (verifying 635674432 bytes, once per process)` — and `--json` and `np serve` stay silent on
+stderr, since those readers get `rerank.reason` instead of prose. llama.cpp's own volume during that load is governed by
+[`[embeddings] log_level`](reference-config.md), the same knob the embedding model uses: one runtime, one stderr, one switch. **`np search` never fetches it** — not when `[models] auto_fetch = true`, not ever.
 A ranking preference is not permission to download half a gigabyte, and one test runs with auto-fetch on to keep that sentence
 true.
 
