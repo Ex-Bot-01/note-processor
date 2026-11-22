@@ -259,6 +259,10 @@ not-produced
 offline
 prefix-drift
 provider-disabled
+rerank-artifact-missing
+rerank-runtime-not-built
+rerank-artifact-unverified
+rerank-cannot-score
 token-budget
 unreadable
 unchanged-content
@@ -290,6 +294,10 @@ alert written against those rows would have silently missed every disconnected `
 | `offline`                  | warn    | `np_core::embed`, `np_core::search` | the model id whose fetch found nothing                                          |
 | `prefix-drift`             | warn    | `np_core::embed`                    | the model id stored under a prefix this build does not declare                   |
 | `provider-disabled`        | warn    | `np_core::embed`, `np_core::search` | embed: the key that is empty; search: the model id that had no provider          |
+| `rerank-artifact-missing`  | warn    | `np_core::search`                   | — (the message names the reranker id and the install command)                     |
+| `rerank-runtime-not-built` | warn    | `np_core::search`                   | — (the message says the build lacks `local-model`)                                |
+| `rerank-artifact-unverified` | warn  | `np_core::search`                   | — (the message carries why the bytes were refused)                                |
+| `rerank-cannot-score`      | warn    | `np_core::search`                   | — (the message carries the ranker's own reason)                                   |
 | `token-budget`             | warn    | `np_core::embed`                    | the chunk id that was too big (`expected`/`actual` carry the counts)            |
 | `unreadable`               | debug   | `np_core::scan`                     | the path that could not be read                                                 |
 | `unchanged-content`        | trace   | `np_core::scan`                     | the file whose bytes matched the stored stamp                                   |

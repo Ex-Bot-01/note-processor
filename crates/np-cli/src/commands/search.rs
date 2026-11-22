@@ -289,6 +289,7 @@ pub(crate) fn search_run(
         query,
         limit,
         prefix,
+        None,
     )?;
     let hits = answer.hits;
     let note = note.or(answer.note);

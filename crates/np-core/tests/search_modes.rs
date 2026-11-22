@@ -134,6 +134,7 @@ impl Fixture {
             query_text,
             10,
             search::Prefix::Marked,
+            None,
         )
         .expect("the search answers");
         answer
@@ -350,6 +351,7 @@ fn a_hit_found_by_both_lists_outranks_one_found_by_either_alone() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("hybrid search answers");
     let paths = report.paths();
@@ -391,6 +393,7 @@ fn a_hit_found_by_both_lists_outranks_one_found_by_either_alone() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic search answers");
     // `words.md` is absent: it holds no vector, so the semantic list cannot see it at all. That absence is the same fact that
@@ -420,6 +423,7 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("keyword answers");
     assert_eq!(keyword.paths(), ["a.md"]);
@@ -436,6 +440,7 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("hybrid answers");
     // The note is vouched for twice (keyword rank 1, semantic rank 2) and the figure once — at cosine 1.0. Rank fusion ranks
@@ -450,6 +455,7 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic answers");
     assert_eq!(semantic.paths(), ["img/fig.png", "a.md"]);
@@ -471,6 +477,7 @@ fn no_vectors_is_a_state_and_the_report_says_which_half_answered() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("hybrid answers with no vectors at all");
     assert_eq!(report.paths(), ["a.md"]);
@@ -490,6 +497,7 @@ fn no_vectors_is_a_state_and_the_report_says_which_half_answered() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic answers empty");
     assert!(semantic.paths().is_empty());
@@ -521,6 +529,7 @@ fn a_meanings_only_search_names_the_vectors_that_are_missing() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic answers empty rather than refusing");
     assert!(semantic.paths().is_empty());
@@ -540,6 +549,7 @@ fn a_meanings_only_search_names_the_vectors_that_are_missing() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("hybrid answers from keywords");
     let hybrid_note = hybrid
@@ -570,6 +580,7 @@ fn a_meanings_only_search_names_the_vectors_that_are_missing() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic answers from the vectors that are there");
     assert_eq!(

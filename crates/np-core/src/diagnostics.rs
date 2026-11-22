@@ -95,6 +95,25 @@ pub mod rule {
     /// An artifact arrived during this command. Not a degradation, so it is reported at info; it is in the list because
     /// a reader that sees vectors where it saw none last run needs to know which run made them.
     pub const ARTIFACT_FETCHED: &str = "artifact-fetched";
+    // ---- rerank: one token per reason the optional cross-encoder stage declined (F51).
+    //
+    // Four causes and no token for "disabled" or "no candidates": those are states of a run that lost nothing, and a rule
+    // token means *something was degraded*. The two reasons live in the result document instead
+    // (`np_core::search::RerankSkip::token`), where a caller already reads them per query.
+
+    /// Configuration or `--rerank` asked for a reranked answer and the pinned reranker artifact is not on disk. Distinct from
+    /// `artifact-missing`, which is about the *embedding* model: the two have different remedies — one installs 635 MB, the
+    /// other turns a setting off — and an operator told merely "artifact missing" cannot tell which.
+    pub const RERANK_ARTIFACT_MISSING: &str = "rerank-artifact-missing";
+    /// The reranker exists but this binary cannot run it: built without the `local-model` feature. Named apart from
+    /// `local-model-not-built` for the same reason as above — that token sends a reader to the embedding model's remedy.
+    pub const RERANK_RUNTIME_NOT_BUILT: &str = "rerank-runtime-not-built";
+    /// The reranker is on disk but its bytes are not what this build pins, so it was refused rather than loaded. A partial
+    /// download or somebody else's quantization; `np models install` is both diagnosis and fix.
+    pub const RERANK_ARTIFACT_UNVERIFIED: &str = "rerank-artifact-unverified";
+    /// The reranker loaded and declined a pair — a query wider than the scoring window, or a decode that failed. Reported per
+    /// search rather than per pair, because the answer a human is reading is the thing that lost its second pass.
+    pub const RERANK_CANNOT_SCORE: &str = "rerank-cannot-score";
 
     // ---- scan: one token per reason a file on disk was not indexed.
     //
@@ -132,7 +151,7 @@ pub mod rule {
 ///
 /// The documentation test asserts this list against `docs/reference-diagnostics.md` in both directions, so a token can
 /// be neither undocumented nor invented.
-pub const RULE_TOKENS: [&str; 21] = [
+pub const RULE_TOKENS: [&str; 25] = [
     rule::CONFIG_REFUSED,
     rule::PROVIDER_DISABLED,
     rule::LOCAL_MODEL_NOT_BUILT,
@@ -146,6 +165,10 @@ pub const RULE_TOKENS: [&str; 21] = [
     rule::MODEL_NOT_INSTALLED,
     rule::FETCH_DISABLED,
     rule::ARTIFACT_FETCHED,
+    rule::RERANK_ARTIFACT_MISSING,
+    rule::RERANK_RUNTIME_NOT_BUILT,
+    rule::RERANK_ARTIFACT_UNVERIFIED,
+    rule::RERANK_CANNOT_SCORE,
     rule::NOT_MARKDOWN,
     rule::UNREADABLE,
     rule::UNREPRESENTABLE_PATH,
@@ -171,7 +194,7 @@ pub const RULE_TOKENS: [&str; 21] = [
 /// degraded state, and `np_cli::serve_channel`, because stdin/stdout framing failures are reported on the response channel
 /// they belong to. Both stay listed in [`TARGETS`] as filters that answer "nothing here, yet"; `np_core::fetch` carries the
 /// phase span (its cost) but no rule, since every fetch outcome a caller acts on is reported by the command that asked.
-pub const RULE_TARGETS: [(&str, &[&str]); 21] = [
+pub const RULE_TARGETS: [(&str, &[&str]); 25] = [
     (rule::ARTIFACT_FETCHED, &[target::SEARCH]),
     (rule::ARTIFACT_MISSING, &[target::EMBED, target::SEARCH]),
     (rule::CONFIG_REFUSED, &[target::CONFIG]),
@@ -188,6 +211,11 @@ pub const RULE_TARGETS: [(&str, &[&str]); 21] = [
     (rule::OFFLINE, &[target::EMBED, target::SEARCH]),
     (rule::PREFIX_DRIFT, &[target::EMBED]),
     (rule::PROVIDER_DISABLED, &[target::EMBED, target::SEARCH]),
+    // All four rerank causes are search's alone: the stage exists nowhere else, and a `np embed` run has no second pass to lose.
+    (rule::RERANK_ARTIFACT_MISSING, &[target::SEARCH]),
+    (rule::RERANK_RUNTIME_NOT_BUILT, &[target::SEARCH]),
+    (rule::RERANK_ARTIFACT_UNVERIFIED, &[target::SEARCH]),
+    (rule::RERANK_CANNOT_SCORE, &[target::SEARCH]),
     (rule::TOKEN_BUDGET, &[target::EMBED]),
     (rule::UNREADABLE, &[target::SCAN]),
     (rule::UNCHANGED_CONTENT, &[target::SCAN]),
