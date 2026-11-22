@@ -1766,3 +1766,61 @@ fn expected_of(err: &FetchError) -> u64 {
         other => panic!("this helper is only for over-long refusals, got {other:?}"),
     }
 }
+
+/// **A default fetch plan is bounded by what the id pins, not only by what the build can load.** The shape that asked for
+/// this: a reranker is one pinned file, while a build with image support defaults to a pair — so `mmproj` was requested for
+/// an id that has never pinned one, and the fetch refused itself for a member with no recorded digest. A caller reading that
+/// sentence looks at mirrors and digests; the actual fact was that the command had been typed correctly.
+#[test]
+fn a_default_plan_never_requests_a_member_the_id_does_not_pin() {
+    let image_build = ["main", np_core::pins::MMPROJ_MEMBER];
+    let text_build = ["main"];
+
+    // The reranker: exactly one member, in both build shapes. This is the case the capability set alone got wrong.
+    for build in [image_build.as_slice(), text_build.as_slice()] {
+        assert_eq!(
+            fetch::default_members(build, RERANKER_ID),
+            vec!["main"],
+            "a reranker has no projector to transfer, whatever this build could read"
+        );
+    }
+
+    // The embedding model keeps both halves where the build can use them and drops the one it cannot — the reason the pin set
+    // alone is not the answer either.
+    assert_eq!(
+        fetch::default_members(image_build.as_slice(), "embeddinggemma-2"),
+        vec!["main", np_core::pins::MMPROJ_MEMBER],
+        "an image-capable build still plans the projector it was built for"
+    );
+    assert_eq!(
+        fetch::default_members(text_build.as_slice(), "embeddinggemma-2"),
+        vec!["main"],
+        "bytes this build would never read must not be transferred"
+    );
+
+    // The invariant across the whole table, so a third pinned id cannot reintroduce the bug: a plan is always a subset of
+    // what that id pins, in pin order.
+    for id in fetch::fetchable_ids() {
+        let pinned = fetch::pinned_member_names(id);
+        let plan = fetch::default_members(image_build.as_slice(), id);
+        assert!(
+            plan.iter().all(|member| pinned.contains(member)),
+            "`{id}` planned {plan:?}, which reaches outside its own pins {pinned:?}"
+        );
+    }
+}
+
+/// **An id whose members this build cannot use plans nothing at all**, which is the caller's cue to say so rather than start a
+/// transfer it cannot finish. An unknown id lands on the same empty answer and must keep the sharper refusal it already has —
+/// "this build pins nothing for that" describes a typo, and these two cases are told apart where the plan is used.
+#[test]
+fn an_id_with_no_usable_member_plans_nothing() {
+    assert!(
+        fetch::default_members(&[np_core::pins::MMPROJ_MEMBER], RERANKER_ID).is_empty(),
+        "a build that can read only a projector cannot use a single-file artifact at all"
+    );
+    assert!(
+        fetch::default_members(&["main"], "no-such-model").is_empty(),
+        "an unknown id plans nothing, which the caller must not report as a capability problem"
+    );
+}

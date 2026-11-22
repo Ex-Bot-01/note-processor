@@ -102,8 +102,9 @@ pub(crate) enum ModelsCommand {
         /// row would list a scoring head among the embedders a workspace can pick (**F51**).
         #[arg(long)]
         id: String,
-        /// Which member to fetch, repeatable (`main`, `mmproj`). Default: the members this binary can use — the
-        /// projector is left out of a build without image support, and naming it explicitly is refused.
+        /// Which member to fetch, repeatable (`main`, `mmproj`). Default: the members this binary can use **and** this id
+        /// pins — the projector is left out of a build without image support (naming it there is refused), and it is left out
+        /// of an id that has no projector at all, which is why fetching a reranker needs no flags.
         #[arg(long = "member")]
         members: Vec<String>,
         /// Discard this id's fetch marker (and the partial download it names) and then fetch.
@@ -230,13 +231,32 @@ pub(crate) fn models_fetch(
         emit(origin_kind_line(&config));
     }
 
-    // **Fetch what this binary can use**: with no `--member`, the plan is
-    // the members this build could load, so a text-only install never transfers 554 MB of projector it has no code for.
+    // **Fetch what this binary can use *of this id***: with no `--member`, the plan is the members this build could load that
+    // this id actually pins. The capability set alone was half the question — it kept a text-only install from transferring
+    // 554 MB of projector it has no code for, and it also made an image-capable build ask a single-file artifact for a
+    // projector it never pinned, which the fetch then refused for having no recorded digest.
     let requested_owned: Vec<String> = if members.is_empty() {
-        np_core::pins::members_for_build()
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect()
+        let plan = np_core::fetch::default_members(np_core::pins::members_for_build(), id);
+        if plan.is_empty() {
+            // Two facts reach an empty plan, and only one of them is this binary's fault. An id with nothing pinned at all is
+            // a typo, and `fetch` answers that with "this build pins nothing for that" — the truer sentence, so it is not
+            // pre-empted here. What *is* this binary's fault: the id pins members and none of them are usable here. No id
+            // pinned today can reach this arm — every one of them pins `main`, which every build can use — and it exists so
+            // that the day one does, the answer is true instead of "this build pins nothing for that" about an id it pins.
+            let pinned = np_core::fetch::pinned_member_names(id);
+            if !pinned.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "cannot fetch `{id}` with this binary: it pins {}, and this build can use none of \
+                         those members (image support is a build feature — np-core's `vision`)",
+                        pinned.join(", "),
+                    ),
+                )
+                .into());
+            }
+        }
+        plan.into_iter().map(String::from).collect()
     } else {
         members.to_vec()
     };
