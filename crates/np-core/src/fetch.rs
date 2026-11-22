@@ -1463,6 +1463,22 @@ pub fn pinned_member_names(id: &str) -> Vec<&'static str> {
     pins::pinned(id).map(|member| member.member).collect()
 }
 
+/// The members a fetch transfers when the caller named none, given the members a build can use.
+///
+/// Either input alone answers the wrong question. The capability set alone asks an id for members it never pinned: a reranker
+/// is one file, so a build with image support would request a projector that exists only for the embedding model and then
+/// refuse its own fetch for having no recorded digest — a sentence about a different artifact, in a command typed exactly as
+/// documented. The pin set alone would transfer 554 MB of projector that a text-only build has no code to read.
+///
+/// An empty result means *this build can use none of the members `id` pins* — or that nothing is pinned for it at all, which
+/// the caller must not report as the same fact: an unknown id already has a better refusal waiting in [`fetch_with_progress`].
+pub fn default_members(build_members: &[&'static str], id: &str) -> Vec<&'static str> {
+    pinned_member_names(id)
+        .into_iter()
+        .filter(|member| build_members.contains(member))
+        .collect()
+}
+
 /// Every distinct id this build can fetch — the pin table's, and nothing else's: the binary decides.
 pub fn fetchable_ids() -> Vec<&'static str> {
     let mut ids = BTreeSet::new();
