@@ -33,6 +33,24 @@ A source build is the only shape you can choose features on: `--features local-m
 
 **Current release: `v0.7.0` (2026-11-22).** A **minor** release: keys appear where a client can read them, and no method is added. The protocol stays **1**, `initialize` still answers the same ten methods in the same order, `INDEX.md`'s bytes are unchanged, and an existing workspace database opens as it is with no migration. What arrived is **F51**, an optional rerank stage for `np search`: a cross-encoder (`bge-reranker-v2-m3`, GGUF, loaded in-process by the same pinned llama.cpp that already runs the embedding model) rescores the first `rerank_top_n` note hits after retrieval. It is **off by default**, it is never fetched by a search even with `[models] auto_fetch = true`, and a build without `--features local-model` refuses it in words rather than pretending. The keys that moved: each `search` hit gains `rerank_score`, `rerank_rank_before`, `rerank_rank_after` (all `null` when the stage did not run), the document gains a top-level `rerank` object, and `search` accepts the optional `rerank` / `rerank_text` parameters. Everything else — the ranking of an un-reranked query, every byte of text output for one, the catalog, the database schema — is what `v0.6.1` produced; `release-notes/v0.7.0.md` carries the measurements behind that sentence.
 
+The two `v0.7.0` archives, as published (2026-11-22), measured from a fresh download of the page and confirmed by `sha256sum -c SHA256SUMS.txt`
+(which lists exactly these two names and nothing inside them):
+
+```text
+dc052c0c043f289f0b25f1fbf8fce1a064791cafbdedb1163e4d55d5bad7e39c  np-0.7.0-x86_64-unknown-linux-gnu.tar.gz
+47fda373d28b2f31f404f91edab3eb5cc0364671e2af16c253bde8de8d247dec  np-0.7.0-x86_64-pc-windows-gnu-cross.zip
+```
+
+Both came from one run of the tag ([`45045632267`](https://github.com/Ex-Bot-01/note-processor/actions/runs/45045632267)), which published at
+16:48 UTC, with `ABOUT-windows-gnu-cross.md` riding along beside them.
+
+What was measured in the downloaded Linux archive before this paragraph went up: `np --version` → `np 0.7.0`; an `initialize` handshake answering
+`local_model: true`, `fetch: true`, `vision: false`, `protocol 1` and the same ten methods; and `np search --help`, which names `--rerank`,
+`--no-rerank` and `--rerank-text`. The `local_model: true` is the half that decides whether the release is usable for F51 at all — the stage needs
+the runtime in the binary, and this asset is built `local-model,fetch` by `.github/scripts/package-assets.sh`, so the downloaded
+`np` can rerank once the artifact is installed. No instruction-set census was taken on this archive; the `%zmm`/`%ymm` figures quoted for older
+releases were not re-measured here, so they are not claimed for this one.
+
 Previous release `v0.6.1`: its two archives, as published (2026-11-21), measured from a fresh download of the page and confirmed by `sha256sum -c SHA256SUMS.txt`
 (which lists exactly these two names and nothing inside them):
 
