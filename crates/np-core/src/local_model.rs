@@ -76,6 +76,7 @@ use crate::embed::{ArtifactCheck, EmbedError, Embedder, Vector};
 use crate::hash;
 use crate::llama_ffi::{self, llama_context, llama_model};
 use crate::models;
+use crate::rerank::{fit_pair, Fit, RerankError, Reranker, Specials, TokenId, VocabFlags};
 use crate::walk;
 
 /// The context window [`load`] asks llama.cpp for, and the number it also gets for `n_batch` and `n_ubatch`:
@@ -544,134 +545,158 @@ impl LoadedModel {
         normalise(row)
     }
 
-    /// Tokenize with `add_special = true`, **asking for the size before allocating for it**.
-    ///
-    /// The rule is [`src/llama-vocab.cpp:4645-4647`]: when `n_tokens_max` is too small the call writes nothing
-    /// and returns minus the exact count needed, specials included (measured: a 2-slot buffer for a 17-token
-    /// sentence returned `-17`). So the first call deliberately passes an **empty** buffer — it cannot succeed,
-    /// and the number it names is the size to allocate. Nothing about bytes-per-token is load-bearing anywhere in
-    /// this file, which is the point: R6b2's first draft guessed `bytes.len() + 2`, treated a short buffer as
-    /// success, and so would have decoded a buffer of zero-valued token ids and returned a confident unit vector
-    /// for text it never read (R6b2 review **P0-1**, reproduced: forcing the short buffer left every assertion
-    /// green and changed the output). Probing costs one extra tokenization pass over text we tokenize again —
-    /// microseconds beside a multi-second forward pass.
-    ///
-    /// `budget` is checked against that count **before** allocating, so an over-budget note never sizes a buffer.
+    /// Tokenize `joined` with `add_special = true`, under `budget`. The sizing rule and its reasoning live on
+    /// [`tokenize_with`], which rank mode calls with `false`; this is the embedding recipe's fixed spelling.
     fn tokenize(
         &self,
         joined: &str,
         budget: usize,
     ) -> Result<Vec<llama_ffi::llama_token>, EmbedError> {
-        let bytes = joined.as_bytes();
-        // `text_len` is an `int32_t`, and the buffer size derived from the count has to stay in range too.
-        // Unreachable through any budget a config can name (four thousand tokens cannot come from 2 GiB of text),
-        // but `as i32` would otherwise wrap into a negative `n_tokens_max`.
-        if bytes.len() > i32::MAX as usize - 2 {
-            return Err(EmbedError::Unavailable(
-                "the sequence is too long to hand to the tokenizer".to_string(),
-            ));
-        }
-        let vocab = self.vocab()?;
-
-        // The probe: zero writable slots. On an artifact that adds specials this always answers `Needed(n)` —
-        // `src/llama-vocab.cpp:4645` compares against the size of a result that already carries them, so it is
-        // never zero here (measured: `""` gives 2). It *can* legitimately answer `Written(0)` on an artifact with
-        // both specials off and nothing but whitespace to tokenize: that is an empty tokenization, not a lie from
-        // C, so it yields an empty vector and the caller refuses on its own terms (R6b2 re-review P2-4 — accusing
-        // the runtime of a write it did not perform would have been our bug, not the artifact's).
-        let needed = match self.tokenize_into(vocab, bytes, &mut [])? {
-            Tokenize::Needed(n) => n,
-            Tokenize::Written(0) => return Ok(Vec::new()),
-            // Non-zero from a buffer with no room means the runtime no longer obeys the rule this sizing depends
-            // on. Refuse rather than guess what it wrote, or where.
-            Tokenize::Written(_) => {
-                return Err(EmbedError::Unavailable(
-                    "the tokenizer wrote into a buffer with no room".to_string(),
-                ))
-            }
-        };
-        if needed > budget {
-            return Err(EmbedError::TokenBudgetExceeded {
-                tokens: needed,
-                budget,
-            });
-        }
-
-        let mut tokens = vec![0 as llama_ffi::llama_token; needed];
-        match self.tokenize_into(vocab, bytes, &mut tokens)? {
-            Tokenize::Written(n) => {
-                // `truncate`, never `resize`: if the answer came back smaller than the count the probe named, the
-                // spare slots were never written and must not be read as token ids.
-                tokens.truncate(n);
-                Ok(tokens)
-            }
-            // The runtime named a size, we allocated exactly that, and it now wants more: a contract violation
-            // rather than a sizing problem, so chasing it with another allocation would be wrong.
-            Tokenize::Needed(_) => Err(EmbedError::Unavailable(
-                "the tokenizer's count did not fit its own buffer".to_string(),
-            )),
-        }
+        tokenize_with(self.vocab()?, joined, true, budget)
     }
 
-    /// One `llama_tokenize` call, with llama.cpp's answers separated into types instead of signs.
-    ///
-    /// The signs are deliberately not the interface. R6b2's first draft normalised "needed N slots" to a positive
-    /// `i64` while its caller still read negatives as the resize signal, which is how a dead resize path and a
-    /// silent-garbage path shipped in the same commit. An enum cannot be misread that way.
-    fn tokenize_into(
-        &self,
-        vocab: *const llama_ffi::llama_vocab,
-        bytes: &[u8],
-        tokens: &mut [llama_ffi::llama_token],
-    ) -> Result<Tokenize, EmbedError> {
-        // SAFETY: `vocab` is non-null (checked by [`Self::vocab`]); `bytes` is a Rust slice whose length fits
-        // `i32` (checked by the caller) and is read, not freed; `tokens` has exactly `tokens.len()` writable
-        // slots, which is what `n_tokens_max` promises — including the empty slice the probe passes, where
-        // `as_mut_ptr` yields a valid aligned pointer that C must not write through, and per the rule above does
-        // not. `add_special = true` because the budget counts what the model sees, and `parse_special = false`
-        // because a note's text is data — treating it as markup would let a file containing a control token spell
-        // vocabulary entries the tokenizer then obeys.
-        let n = unsafe {
-            llama_ffi::llama_tokenize(
-                vocab,
-                bytes.as_ptr() as *const std::ffi::c_char,
-                bytes.len() as i32,
-                tokens.as_mut_ptr(),
-                tokens.len() as i32,
-                true,
-                false,
-            )
-        };
-        if n >= 0 {
-            return Ok(Tokenize::Written(n as usize));
-        }
-        if n == i32::MIN {
-            // `include/llama.h:1274` documents this as its own outcome — "INT32_MIN on overflow" — and
-            // `src/llama-vocab.cpp:4640-4642` returns it **before** the size check, so it is never a resize
-            // signal. Negating it would overflow; no real note is anywhere near that long.
-            return Err(EmbedError::Unavailable(
-                "the tokenizer refused to count this sequence".to_string(),
-            ));
-        }
-        Ok(Tokenize::Needed((-n) as usize))
-    }
-
-    /// The vocabulary handle the tokenizer calls need.
+    /// The vocabulary handle the tokenizer calls need — [`model_vocab`] read against this model.
     fn vocab(&self) -> Result<*const llama_ffi::llama_vocab, EmbedError> {
-        // SAFETY: `model` is non-null by the type. `llama_model_get_vocab` returns `&model->vocab` — a plain
-        // member address that cannot be null for a live model (`src/llama-model.cpp:3406-3408`), which is why
-        // [`crate::llama_ffi`] documents it as never returning null rather than as a checked call. The check
-        // stays because a re-pin could change it and a null here must be a refusal, not a dereference.
-        let vocab = unsafe { llama_ffi::llama_model_get_vocab(self.model.as_ptr()) };
-        if vocab.is_null() {
-            return Err(EmbedError::Unavailable(
-                "the loaded model exposed no vocabulary".to_string(),
-            ));
-        }
-        Ok(vocab)
+        model_vocab(self.model)
     }
 }
 
+// ---- the tokenizer and the vocabulary handle, shared by both loaders -------------------------------
+//
+// These were methods on `LoadedModel` until rank mode needed them. Duplicating the size-then-allocate probe for a
+// second type would have put two copies of the one rule this file exists to get right (`Needed(n)` is a resize signal;
+// a short buffer is *not* success) where only one could be reviewed, so both loaders call these instead.
+
+/// Tokenize `joined`, **asking for the size before allocating for it**.
+///
+/// `add_special` is a parameter because two recipes need this one function. An embedding pass passes `true`: its budget
+/// counts the tokens the model will actually read, specials included. Rank mode passes `false` and assembles specials
+/// itself — see [`crate::rerank::pair_tokens`] — because which ones to add, and whether this vocabulary has any at
+/// all, is a fact about the artifact that the pair recipe reads rather than assumes.
+///
+/// The rule is [`src/llama-vocab.cpp:4645-4647`]: when `n_tokens_max` is too small the call writes nothing
+/// and returns minus the exact count needed, specials included (measured: a 2-slot buffer for a 17-token
+/// sentence returned `-17`). So the first call deliberately passes an **empty** buffer — it cannot succeed,
+/// and the number it names is the size to allocate. Nothing about bytes-per-token is load-bearing anywhere in
+/// this file, which is the point: R6b2's first draft guessed `bytes.len() + 2`, treated a short buffer as
+/// success, and so would have decoded a buffer of zero-valued token ids and returned a confident unit vector
+/// for text it never read (R6b2 review **P0-1**, reproduced: forcing the short buffer left every assertion
+/// green and changed the output). Probing costs one extra tokenization pass over text we tokenize again —
+/// microseconds beside a multi-second forward pass.
+///
+/// `budget` is checked against that count **before** allocating, so an over-budget note never sizes a buffer.
+fn tokenize_with(
+    vocab: *const llama_ffi::llama_vocab,
+    joined: &str,
+    add_special: bool,
+    budget: usize,
+) -> Result<Vec<llama_ffi::llama_token>, EmbedError> {
+    let bytes = joined.as_bytes();
+    // `text_len` is an `int32_t`, and the buffer size derived from the count has to stay in range too.
+    // Unreachable through any budget a config can name (four thousand tokens cannot come from 2 GiB of text),
+    // but `as i32` would otherwise wrap into a negative `n_tokens_max`.
+    if bytes.len() > i32::MAX as usize - 2 {
+        return Err(EmbedError::Unavailable(
+            "the sequence is too long to hand to the tokenizer".to_string(),
+        ));
+    }
+    // The probe: zero writable slots. On an artifact that adds specials this always answers `Needed(n)` —
+    // `src/llama-vocab.cpp:4645` compares against the size of a result that already carries them, so it is
+    // never zero here (measured: `""` gives 2). It *can* legitimately answer `Written(0)` on an artifact with
+    // both specials off and nothing but whitespace to tokenize: that is an empty tokenization, not a lie from
+    // C, so it yields an empty vector and the caller refuses on its own terms (R6b2 re-review P2-4 — accusing
+    // the runtime of a write it did not perform would have been our bug, not the artifact's).
+    let needed = match tokenize_into(vocab, bytes, &mut [], add_special)? {
+        Tokenize::Needed(n) => n,
+        Tokenize::Written(0) => return Ok(Vec::new()),
+        // Non-zero from a buffer with no room means the runtime no longer obeys the rule this sizing depends
+        // on. Refuse rather than guess what it wrote, or where.
+        Tokenize::Written(_) => {
+            return Err(EmbedError::Unavailable(
+                "the tokenizer wrote into a buffer with no room".to_string(),
+            ))
+        }
+    };
+    if needed > budget {
+        return Err(EmbedError::TokenBudgetExceeded {
+            tokens: needed,
+            budget,
+        });
+    }
+
+    let mut tokens = vec![0 as llama_ffi::llama_token; needed];
+    match tokenize_into(vocab, bytes, &mut tokens, add_special)? {
+        Tokenize::Written(n) => {
+            // `truncate`, never `resize`: if the answer came back smaller than the count the probe named, the
+            // spare slots were never written and must not be read as token ids.
+            tokens.truncate(n);
+            Ok(tokens)
+        }
+        // The runtime named a size, we allocated exactly that, and it now wants more: a contract violation
+        // rather than a sizing problem, so chasing it with another allocation would be wrong.
+        Tokenize::Needed(_) => Err(EmbedError::Unavailable(
+            "the tokenizer's count did not fit its own buffer".to_string(),
+        )),
+    }
+}
+
+/// One `llama_tokenize` call, with llama.cpp's answers separated into types instead of signs.
+///
+/// The signs are deliberately not the interface. R6b2's first draft normalised "needed N slots" to a positive
+/// `i64` while its caller still read negatives as the resize signal, which is how a dead resize path and a
+/// silent-garbage path shipped in the same commit. An enum cannot be misread that way.
+fn tokenize_into(
+    vocab: *const llama_ffi::llama_vocab,
+    bytes: &[u8],
+    tokens: &mut [llama_ffi::llama_token],
+    add_special: bool,
+) -> Result<Tokenize, EmbedError> {
+    // SAFETY: `vocab` is non-null (checked by [`model_vocab`]); `bytes` is a Rust slice whose length fits
+    // `i32` (checked by the caller) and is read, not freed; `tokens` has exactly `tokens.len()` writable
+    // slots, which is what `n_tokens_max` promises — including the empty slice the probe passes, where
+    // `as_mut_ptr` yields a valid aligned pointer that C must not write through, and per the rule above does
+    // not. `add_special` is the caller's decision: an embedding pass passes `true` because the budget counts what the model sees, and `parse_special = false`
+    // because a note's text is data — treating it as markup would let a file containing a control token spell
+    // vocabulary entries the tokenizer then obeys.
+    let n = unsafe {
+        llama_ffi::llama_tokenize(
+            vocab,
+            bytes.as_ptr() as *const std::ffi::c_char,
+            bytes.len() as i32,
+            tokens.as_mut_ptr(),
+            tokens.len() as i32,
+            add_special,
+            false,
+        )
+    };
+    if n >= 0 {
+        return Ok(Tokenize::Written(n as usize));
+    }
+    if n == i32::MIN {
+        // `include/llama.h:1274` documents this as its own outcome — "INT32_MIN on overflow" — and
+        // `src/llama-vocab.cpp:4640-4642` returns it **before** the size check, so it is never a resize
+        // signal. Negating it would overflow; no real note is anywhere near that long.
+        return Err(EmbedError::Unavailable(
+            "the tokenizer refused to count this sequence".to_string(),
+        ));
+    }
+    Ok(Tokenize::Needed((-n) as usize))
+}
+
+/// The vocabulary handle the tokenizer calls need.
+fn model_vocab(model: NonNull<llama_model>) -> Result<*const llama_ffi::llama_vocab, EmbedError> {
+    // SAFETY: `model` is non-null by the type. `llama_model_get_vocab` returns `&model->vocab` — a plain
+    // member address that cannot be null for a live model (`src/llama-model.cpp:3406-3408`), which is why
+    // [`crate::llama_ffi`] documents it as never returning null rather than as a checked call. The check
+    // stays because a re-pin could change it and a null here must be a refusal, not a dereference.
+    let vocab = unsafe { llama_ffi::llama_model_get_vocab(model.as_ptr()) };
+    if vocab.is_null() {
+        return Err(EmbedError::Unavailable(
+            "the loaded model exposed no vocabulary".to_string(),
+        ));
+    }
+    Ok(vocab)
+}
 /// Scale a pooled row to unit L2 length, refusing anything that cannot be scaled.
 ///
 /// The recipe is mean-then-L2 and llama.cpp has already done the mean (`pooling_type = MEAN`, refused
@@ -1524,6 +1549,11 @@ pub struct LoadedRanker {
     /// Numbers a pooled row holds, from [`llama_ffi::llama_model_n_cls_out`]. [`load_rank`] refuses anything but 1, so
     /// reading this is a sanity check rather than a branch a caller has to get right.
     n_cls_out: usize,
+    /// Which specials this vocabulary's tokenizer inserts on request. Read once at load: they are facts about the file,
+    /// and [`crate::rerank::pair_tokens`] needs them for every pair.
+    flags: VocabFlags,
+    /// The ids behind those flags, `None` where the vocabulary has none.
+    specials: Specials,
 }
 
 impl LoadedRanker {
@@ -1538,6 +1568,185 @@ impl LoadedRanker {
     pub fn n_cls_out(&self) -> usize {
         self.n_cls_out
     }
+
+    /// Which special tokens this artifact's tokenizer inserts on request.
+    pub fn flags(&self) -> VocabFlags {
+        self.flags
+    }
+
+    /// And which of them it actually has ids for.
+    pub fn specials(&self) -> Specials {
+        self.specials
+    }
+
+    /// Tokenize one side of a pair **without** specials: [`crate::rerank::pair_tokens`] adds those, from the ids this
+    /// artifact really has, and a second source of them would be two recipes rather than one.
+    ///
+    /// No budget is passed on purpose. What a pair may cost is decided by [`crate::rerank::fit_pair`] once both halves
+    /// exist, and the half that shrinks is the document; refusing a long note here would turn every long vault into an
+    /// error instead of a truncation the caller can report.
+    fn tokenize_plain(&self, text: &str) -> Result<Vec<TokenId>, EmbedError> {
+        tokenize_with(model_vocab(self.model)?, text, false, usize::MAX)
+    }
+
+    /// One forward pass over one assembled pair, returning the head's single number.
+    ///
+    /// `tokens` must already fit [`LoadedRanker::window`] — [`crate::rerank::fit_pair`] is what guarantees it, and the
+    /// equality of `n_ctx`, `n_batch` and `n_ubatch` set in [`open_context`] is what makes an over-long input a refusal
+    /// rather than the encoder assert at `src/llama-context.cpp:1631`.
+    fn score_pair(&self, tokens: &[TokenId]) -> Result<f64, RerankError> {
+        if tokens.is_empty() {
+            // Reachable only for an empty query against an empty document on an artifact that adds no specials. Naming
+            // it beats letting `llama_decode` answer -1 for an empty batch and reporting that as a runtime fault.
+            return Err(RerankError::Runtime(
+                "a pair with no tokens for the model to read".to_string(),
+            ));
+        }
+        // `llama_batch_get_one` takes a mutable pointer because llama.cpp reserves the right to rewrite token ids in
+        // place; this copy is ours, is not read after the decode below, and outlives the batch that borrows it.
+        let mut buffer = tokens.to_vec();
+        // SAFETY: `buffer` is alive until here and has exactly `buffer.len()` writable slots. Its length is at most
+        // `self.window` (guaranteed by `fit_pair` against this same window, in the caller below), which equals the
+        // `n_ubatch` this context was built with, so `n_tokens` cannot exceed what one pass holds; and a window of
+        // 2,048 fits an `i32` with no thinking required.
+        let batch =
+            unsafe { llama_ffi::llama_batch_get_one(buffer.as_mut_ptr(), buffer.len() as i32) };
+        // SAFETY: `ctx` is non-null by construction and owned by us; `batch` borrows live memory as above. The answer
+        // is an `int32_t` error code, read rather than assumed.
+        let rc = unsafe { llama_ffi::llama_decode(self.ctx.as_ptr(), batch) };
+        match rc {
+            0 => {}
+            // "No memory slot for this batch" — the KV-cache answer. A BERT context built for RANK has no cache to run
+            // out of, so this arm is expected never to fire; it is named separately because if a re-pin changes that,
+            // "our window arithmetic was wrong" and "the runtime refused" must not arrive as the same sentence.
+            1 => {
+                return Err(RerankError::Runtime(
+                    "the runtime reported a full window for this pair".to_string(),
+                ))
+            }
+            _ => {
+                return Err(RerankError::Runtime(
+                    "the runtime refused to score this pair".to_string(),
+                ))
+            }
+        }
+        // SAFETY: `ctx` as above. Null means no sequence row was written at all — a context that did not pool, which
+        // [`open_context`] refuses for both purposes — so nothing is read through it.
+        let pooled = unsafe { llama_ffi::llama_get_embeddings_seq(self.ctx.as_ptr(), 0) };
+        if pooled.is_null() {
+            return Err(RerankError::Runtime(
+                "the runtime produced no score for this pair".to_string(),
+            ));
+        }
+        // SAFETY: under RANK pooling the sequence row is `float[n_cls_out]` (`include/llama.h:1167`) — **not**
+        // `n_embd_out`, which for this artifact would be 1,024 floats and a ~4 KiB over-read of a buffer sized for one.
+        // `self.n_cls_out` is the runtime's own answer, read in [`load_rank`] and refused unless it is exactly 1, so
+        // this slice cannot extend past what llama.cpp allocated. Copied out immediately: the context rewrites that
+        // buffer on the next decode (see [`crate::llama_ffi`]'s note on the accessor).
+        let row = unsafe { std::slice::from_raw_parts(pooled, self.n_cls_out) };
+        let score = f64::from(row[0]);
+        if !score.is_finite() {
+            // A NaN or infinite logit cannot order anything, and `rank_order` would file it last in silence. Saying so
+            // is the same posture as the embedding path refusing a zero vector: a number that means nothing must not
+            // become a ranking.
+            return Err(RerankError::Runtime(
+                "the runtime produced a score that is not a number".to_string(),
+            ));
+        }
+        Ok(score)
+    }
+}
+
+impl Reranker for LoadedRanker {
+    /// Score each document against `query`, one pair per forward pass.
+    ///
+    /// The query is tokenized once and reused; each document is tokenized on its own and assembled by
+    /// [`crate::rerank::pair_tokens`], so the recipe for what a pair looks like exists in exactly one place.
+    ///
+    /// **One refusal stops the batch.** A [`RerankError::PairTooLong`] means the *query* cannot be scored at all, which
+    /// is true of every document in the list; carrying on would report scores for a question that cannot be asked. The
+    /// caller's answer to that is to rerank nothing and say why — the same shape as a missing artifact.
+    fn score(&mut self, query: &str, docs: &[&str]) -> Result<Vec<f64>, RerankError> {
+        let query_tokens = self
+            .tokenize_plain(query)
+            .map_err(|problem| tokenize_refused(&problem))?;
+        let mut scores = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let doc_tokens = self
+                .tokenize_plain(doc)
+                .map_err(|problem| tokenize_refused(&problem))?;
+            let pair = match fit_pair(
+                &self.specials,
+                &self.flags,
+                &query_tokens,
+                &doc_tokens,
+                self.window,
+            ) {
+                Fit::Whole(tokens) | Fit::Truncated { tokens, .. } => tokens,
+                Fit::QueryTooLong { tokens, budget } => {
+                    return Err(RerankError::PairTooLong { tokens, budget })
+                }
+            };
+            scores.push(self.score_pair(&pair)?);
+        }
+        Ok(scores)
+    }
+}
+
+/// A tokenizer refusal in the vocabulary a caller of [`Reranker`] can report.
+///
+/// Mapped rather than passed through because [`EmbedError`]'s sentences are about embedding — "this context can hold",
+/// "token budget" — and a rerank run has no token budget to name. Both labels below are ours; nothing here quotes the
+/// runtime, which is the payload rule [`RerankError`] exists to keep.
+fn tokenize_refused(problem: &EmbedError) -> RerankError {
+    match problem {
+        EmbedError::ArtifactUnreadable { .. } | EmbedError::ArtifactNotLoadable { .. } => {
+            RerankError::CannotScore("the model's vocabulary could not be read".to_string())
+        }
+        _ => RerankError::Runtime("the tokenizer refused to count this text".to_string()),
+    }
+}
+
+/// Read the pair recipe's facts off a live model: which specials its tokenizer inserts, and which it has ids for.
+///
+/// Six reads, all metadata, none of which can fail — but the vocabulary handle itself can be null on a re-pin, so the
+/// whole thing returns a `Result` rather than assuming what [`model_vocab`] refuses.
+fn read_pair_facts(model: NonNull<llama_model>) -> Result<(VocabFlags, Specials), EmbedError> {
+    let vocab = model_vocab(model)?;
+    // SAFETY: `vocab` is non-null (checked by `model_vocab`) and owned by the model, which outlives this read; all six
+    // calls read one field of the vocabulary object.
+    let (flags, ids) = unsafe {
+        (
+            VocabFlags {
+                add_bos: llama_ffi::llama_vocab_get_add_bos(vocab),
+                add_eos: llama_ffi::llama_vocab_get_add_eos(vocab),
+                add_sep: llama_ffi::llama_vocab_get_add_sep(vocab),
+            },
+            (
+                llama_ffi::llama_vocab_bos(vocab),
+                llama_ffi::llama_vocab_eos(vocab),
+                llama_ffi::llama_vocab_sep(vocab),
+            ),
+        )
+    };
+    Ok((
+        flags,
+        Specials {
+            bos: known_token(ids.0),
+            eos: known_token(ids.1),
+            sep: known_token(ids.2),
+        },
+    ))
+}
+
+/// Turn a special-token id into "this vocabulary has one", refusing to treat any negative as an id.
+///
+/// [`llama_ffi::LLAMA_TOKEN_NULL`] is -1 and is the documented answer for "absent"; a *different* negative would be a
+/// runtime we no longer understand, and writing it into a batch would be worse than scoring without the token. So this
+/// keeps only non-negative ids and says nothing about which negative arrived — there is no caller that can act on the
+/// difference.
+fn known_token(id: TokenId) -> Option<TokenId> {
+    (id >= 0).then_some(id)
 }
 
 impl Drop for LoadedRanker {
@@ -1552,17 +1761,38 @@ impl Drop for LoadedRanker {
     }
 }
 
+impl fmt::Debug for LoadedRanker {
+    /// The same shape as [`LoadedModel`]'s: facts and addresses, because "is this the same loaded model?" is the first
+    /// question a double-load bug asks, and printing weights would be meaningless — we never read them.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadedRanker")
+            .field("window", &self.window)
+            .field("n_cls_out", &self.n_cls_out)
+            .field("flags", &self.flags)
+            .field("specials", &self.specials)
+            .field("model", &self.model)
+            .field("ctx", &self.ctx)
+            .finish()
+    }
+}
+
 /// Load an artifact as a reranker: RANK pooling, a window sized for one pair, and no width check against anything.
 ///
 /// **Capability is measured here, not declared.** There is no registry row for a reranker (a `models` row carries a
 /// vector width and embedding prefixes, and this artifact has neither), so nothing upstream can promise what a given
-/// file is. What this refuses instead: a missing or unreadable file, a context that did not become RANK (the
-/// `accepted_pooling` table), and a head that answers with more than one number per pair.
+/// file is. Three reads decide it, in the order that makes each one meaningful:
 ///
-/// The consequence of "measured" is worth stating plainly: **any** artifact can be handed to this function, including
-/// an embedding model, and the refusal may come from the pooling check rather than from a name. That is fine for the
-/// `np` commands, which resolve a pinned id before opening a path, and is why this is `pub`: a caller that hands in an
-/// arbitrary path is told what the artifact turned out to be.
+/// 1. the context resolved to RANK pooling (the `accepted_pooling` table) — necessary, and on its own nearly worthless,
+///    because *we* asked for RANK and llama.cpp obeys;
+/// 2. the artifact declares a classifier label ([`llama_ffi::llama_model_cls_label`] answers non-null) — this is the
+///    read that comes from the file alone, and the only one that separates a reranker from every other GGUF; without it
+///    an embedding model loads happily as a rank head (measured: `embeddinggemma-2-Q8_0.gguf`, `n_cls_out = 1`);
+/// 3. the head is exactly one number wide ([`llama_ffi::llama_model_n_cls_out`]), which is what makes reading one float
+///    an in-bounds read rather than an over-read.
+///
+/// So **any** artifact can be handed to this function, including an embedding model, and it will be refused — by the
+/// label table rather than by a name. That is fine for the `np` commands, which resolve a pinned id before opening a
+/// path, and is why this is `pub`: a caller that hands in an arbitrary path is told what the artifact turned out to be.
 pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError> {
     // The same spelling `load` uses: absolute, no symlink resolution, prefixed when long. A file that is not there is
     // not checked for here — the runtime answers null for both "missing" and "not a GGUF", and both come back as the
@@ -1600,22 +1830,37 @@ pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError> {
         }
     };
 
+    // **Does this artifact have a reranking head at all?** The label table is the one capability read that comes from
+    // the file rather than from our own request: `n_cls_out` defaults to 1 for every architecture, and rank mode *sets*
+    // the pooling strategy instead of reading it, so an embedding model passes both of those other checks by
+    // construction. Measured on this tree before the check existed: `embeddinggemma-2-Q8_0.gguf` loaded as a rank head,
+    // answered `n_cls_out = 1`, and would have returned numbers that describe nothing.
+    // SAFETY: `model` is non-null and alive; llama.cpp compares the index against its own label vector, so index 0 is
+    // always in range and a null answer means "this model declares no labels".
+    let has_head = unsafe { !llama_ffi::llama_model_cls_label(model.as_ptr(), 0).is_null() };
+
+    // The head's width, read only after something established there is a head to measure — the header calls this entry
+    // "undefined behavior for non-classifier models", which is worth honouring even when the answer looks harmless.
     // SAFETY: `model` is non-null (it came from a checked load) and still alive — the context does not own it, and
     // nothing frees it on this path. The read is metadata only, which is what makes it valid after the context exists.
     let n_cls_out = unsafe { llama_ffi::llama_model_n_cls_out(model.as_ptr()) };
-    // A refusal below has to hand back both handles, so the count is decided before any of them are freed.
-    let width_problem = match usize::try_from(n_cls_out) {
-        Ok(1) => None,
-        Ok(other) => Some(format!(
-            "this artifact answers with {other} scores per pair; this build reads one"
-        )),
-        // `u32` into `usize` cannot fail on a supported target, so this arm keeps `as` out of the file rather than
-        // naming a branch anyone expects to reach.
-        Err(_) => {
-            Some("this artifact reports a classifier head this build cannot count".to_string())
+    // A refusal below has to hand back both handles, so every verdict is decided before any of them are freed.
+    let head_problem = if !has_head {
+        Some("this artifact declares no reranking head, so it cannot score a pair".to_string())
+    } else {
+        match usize::try_from(n_cls_out) {
+            Ok(1) => None,
+            Ok(other) => Some(format!(
+                "this artifact answers with {other} scores per pair; this build reads one"
+            )),
+            // `u32` into `usize` cannot fail on a supported target, so this arm keeps `as` out of the file rather than
+            // naming a branch anyone expects to reach.
+            Err(_) => {
+                Some("this artifact reports a classifier head this build cannot count".to_string())
+            }
         }
     };
-    if let Some(sentence) = width_problem {
+    if let Some(sentence) = head_problem {
         // SAFETY: both handles came from the constructors above and are owned by nobody else — no `LoadedRanker` was
         // built, so nothing else will free them. Context first, for the reason in [`LoadedRanker::drop`].
         unsafe {
@@ -1625,6 +1870,23 @@ pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError> {
         return Err(EmbedError::Unavailable(sentence));
     }
 
+    // The pair recipe, read while the model is alive and before any handle is handed to a `LoadedRanker`: these six
+    // numbers decide what tokens go around a query and a document, and an artifact that has no separator must not have
+    // one written into its batch because a model card said it would.
+    let facts = match read_pair_facts(model) {
+        Ok(facts) => facts,
+        Err(problem) => {
+            // SAFETY: as in the refusal above — both handles came from the constructors in this function, are owned by
+            // nobody else, and nothing reads through them after these calls.
+            unsafe {
+                llama_ffi::llama_free(ctx.as_ptr());
+                llama_ffi::llama_model_free(model.as_ptr());
+            }
+            return Err(problem);
+        }
+    };
+
+    let (flags, specials) = facts;
     Ok(LoadedRanker {
         model,
         ctx,
@@ -1632,6 +1894,8 @@ pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError> {
         // `usize::try_from` above proved this is 1; storing the converted value rather than a literal keeps the
         // number's owner in one place.
         n_cls_out: 1,
+        flags,
+        specials,
     })
 }
 

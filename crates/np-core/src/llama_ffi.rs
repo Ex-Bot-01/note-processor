@@ -317,6 +317,20 @@ extern "C" {
     /// and answer with another, so this is never the check for a stored vector.
     pub fn llama_model_n_embd_inp(model: *const llama_model) -> i32;
 
+    /// The name of classifier output `i` (`include/llama.h:617`; body `src/llama-model.cpp:3468-3474`: returns
+    /// `classifier_labels[i].c_str()` when `i < classifier_labels.size()`, null otherwise — so the index is bounds-checked
+    /// by llama.cpp and a null answer means "this model has no labels", not "you asked out of range".
+    ///
+    /// This is how rank mode tells a reranker from anything else. [`llama_model_n_cls_out`] cannot: `src/llama-hparams.h`
+    /// defaults that field to 1 for every architecture, so an embedding model answers 1 too — and because rank mode
+    /// *declares* RANK pooling rather than reading it from the file, an embedder passes the pooling check as well. Only
+    /// the label table comes from the artifact alone: `bge-reranker-v2-m3` carries `classifier_labels = ["LABEL_0"]` and
+    /// `embeddinggemma-2` carries none, which is the difference a refusal should be built on.
+    ///
+    /// Memory: **borrowed** from `model`, valid as long as the model is and never freed by us. A caller that wants the
+    /// text after the model dies copies it (`CStr::to_str` at the load site).
+    pub fn llama_model_cls_label(model: *const llama_model, i: u32) -> *const std::ffi::c_char;
+
     /// How many numbers a pooled RANK row holds (`include/llama.h:614`, body `src/llama-model.cpp:3464-3466`:
     /// `return model->hparams.n_cls_out;`).
     ///

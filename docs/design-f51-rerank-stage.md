@@ -93,6 +93,13 @@ artifact's own metadata, fetched with a ranged GET so the claim is cheap to re-c
   (`common/arg.cpp:3537`). So unlike the embedding path — which deliberately leaves `pooling_type` unspecified and takes it from
   the file — rank mode **sets `ctx_params.pooling_type = LLAMA_POOLING_TYPE_RANK`**, then reads back what the context built
   (`llama_pooling_type`) and refuses anything but RANK. Capability here is our claim, so it is our check.
+* **Because we declare the pooling, the pooling cannot identify the artifact.** That consequence showed up as a failing test
+  rather than as a review comment: rank mode handed `embeddinggemma-2-Q8_0.gguf` loaded happily, because llama.cpp obeys the
+  RANK we asked for and `hparams.n_cls_out` is 1 by default for every architecture (`src/llama-hparams.h:253`). So rank mode
+  additionally requires a declared classifier label — `llama_model_cls_label(model, 0)` non-null, backed by
+  `bert.classifier.output_labels`, which the reranker carries (`['LABEL_0']`) and an embedding model does not. It is the one
+  capability read that comes from the file rather than from our request, and it is read **before** `n_cls_out`, whose header
+  comment says "undefined behavior for non-classifier models".
 * **Pair formatting follows the pinned tree's own fallback** for a model with no rerank template
   (`tools/server/server-common.cpp:2010-2032`): `[BOS if add_bos] · query · [EOS if add_eos] · [SEP if add_sep] · document ·
   [EOS if add_eos]`, each half tokenised with `add_special = false`. Every flag is **read at load**, not assumed, because other
@@ -102,9 +109,10 @@ artifact's own metadata, fetched with a ranged GET so the claim is cheap to re-c
   §9's reference check compare scores and not only order. An artifact that omitted `add_sep_token` would produce one EOS
   between the halves; that is llama.cpp's own answer for those bytes, and np does not second-guess it (§10 pins the recipe as a
   pure function over the flags, so both spellings are covered without weights).
-* Five declarations join `llama_ffi.rs`, all present in the pinned header: `llama_model_n_cls_out` (`:614`),
-  `llama_vocab_bos`/`eos`/`sep` (`:1217-1220`), `llama_vocab_get_add_sep` (`:1227`). **No pin bump**: the pinned version can
-  score this model, which is the question the request asked to stop on if the answer was no.
+* Six declarations join `llama_ffi.rs`, all present in the pinned header: `llama_model_n_cls_out` (`:614`),
+  `llama_model_cls_label` (`:617`), `llama_vocab_bos`/`eos`/`sep` (`:1217-1220`), `llama_vocab_get_add_sep` (`:1227`).
+  **No pin bump**: the pinned version can score this model, which is the question the request asked to stop on if the answer
+  was no.
 
 Two refusals in `local_model.rs` stay exactly where they are: `load` still refuses `Pooling::Rank` (the P0-2 over-read — a RANK
 buffer is `n_cls_out` floats wide, not `n_embd_out`), and the embedding path keeps its width check against `n_embd_out`. Rank

@@ -137,7 +137,7 @@ pub struct NoReranker(pub RerankError);   // implements Reranker by refusing
 ### Task 4: Rank mode in `local_model` — load it, check what it became, score a pair
 
 **Files:**
-- Modify: `crates/np-core/src/local_model.rs` (`Purpose::Rank` arm, `RankModel`, `impl Reranker for RankModel`)
+- Modify: `crates/np-core/src/local_model.rs` (`Purpose::Rank` arm, `LoadedRanker`, `load_rank`, `impl Reranker for LoadedRanker`)
 - Test: crates/np-core/tests/local_rerank.rs (new, artifact-gated on **`NP_TEST_RERANK_PATH`**, printing `NOT COVERAGE` and returning when unset — copy the pattern in `tests/local_load.rs`)
 - Modify: `docs/developing.md` (the gated-suite paragraph gains the third variable and its command line)
 
@@ -145,20 +145,36 @@ pub struct NoReranker(pub RerankError);   // implements Reranker by refusing
 - Consumes: `Purpose::Rank { ctx_tokens }` (Task 2), `pair_tokens` / `fit_pair` / `Reranker` / `RerankError` (Task 3), the five FFI entries (Task 1).
 - Produces:
 
+As built (names differ from the first sketch, which said `RankModel::open` and a `RankFacts` bundle):
+
 ```rust
-pub const RERANK_CTX_TOKENS: usize = 2048;
-pub struct RankFacts { pub window: usize, pub n_cls_out: usize, pub flags: VocabFlags, pub specials: Specials }
-pub struct RankModel(/* model + ctx handles, facts */);
-impl RankModel { pub fn open(path: &Path) -> Result<RankModel, EmbedError>; pub fn facts(&self) -> RankFacts; }
-// impl crate::rerank::Reranker for RankModel
+const RERANK_CTX_TOKENS: usize = 2_048;            // private: the window is this module's decision
+pub struct LoadedRanker { /* model, ctx, window, n_cls_out, flags, specials */ }
+impl LoadedRanker {
+    pub fn window(&self) -> usize;
+    pub fn n_cls_out(&self) -> usize;
+    pub fn flags(&self) -> VocabFlags;
+    pub fn specials(&self) -> Specials;
+}
+pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError>;
+// impl crate::rerank::Reranker for LoadedRanker
 ```
 
+Facts are read once at load and returned by four accessors rather than bundled into a struct that would have to be kept in step with the handles it describes.
+
 - [ ] **Step 1: Write the failing artifact-gated tests** — each one returns early with a printed `NOT COVERAGE` line when `NP_TEST_RERANK_PATH` is unset:
-  - `the_pinned_artifact_loads_in_rank_mode`: `RankModel::open` succeeds; `facts().n_cls_out == 1`; `facts().window <= RERANK_CTX_TOKENS`; `facts().flags == VocabFlags { add_bos: true, add_eos: true, add_sep: true }` and `specials.eos == specials.sep` — this is the assertion that pins §4 of the design to bytes rather than to prose.
+  - `the_pinned_artifact_loads_in_rank_mode`: `load_rank` succeeds; `n_cls_out() == 1`; `0 < window() <= 2048`; `flags() == VocabFlags { add_bos: true, add_eos: true, add_sep: true }`, `bos() == Some(0)` and `specials.eos == specials.sep` — this is the assertion that pins §4 of the design to bytes rather than to prose.
+  - `a_query_wider_than_the_window_is_refused_rather_than_truncated`: a ~12,000-word query returns `PairTooLong { tokens, budget }` with `budget == ranker.window()`, and no forward pass runs.
+  - `an_absent_artifact_is_refused_by_name`, `an_embedding_model_is_not_a_reranker` (gated on `NP_TEST_MODEL_PATH`) and `an_embedding_loader_refuses_a_reranker`: the cross-refusals, in both directions.
   - `a_relevant_pair_outranks_an_irrelevant_one_in_both_languages`: five DE and five EN (query, relevant, irrelevant) triples from the Task 10 fixture; every relevant score beats its irrelevant partner.
   - `scores_fall_in_the_cross_encoder_range_and_are_finite`: all scores finite; at least one positive and one negative across the set (a head that silently returned zeros would pass a pure ordering test).
-- [ ] **Step 2: Run, expect compile failure** naming `RankModel`.
-- [ ] **Step 3: Implement `open`.** Load like `load_with_options` does (same `walk::to_open_path` + `models::access` spelling, same four refusals) through `Purpose::Rank { ctx_tokens: RERANK_CTX_TOKENS }`, then **read back and refuse**: `llama_pooling_type(ctx)` must be `LLAMA_POOLING_TYPE_RANK`; `llama_model_n_cls_out(model)` must be `1` — *"the runtime answered a rank head of N outputs"* on anything else, because reading a wider row than the buffer holds is an over-read, and accepting 1 from `llama-hparams.h:253`'s default would test a default rather than the artifact. Read `llama_vocab_bos/eos/sep` + the three `add_*` flags into `VocabFlags`/`Specials`, treating `LLAMA_TOKEN_NULL` as `None`.
+- [ ] **Step 2: Run, expect compile failure** naming `load_rank`.
+- [ ] **Step 3: Implement `load_rank`.** Load like `load_with_options` does (same `walk::to_open_path` + `models::access` spelling) through `Purpose::Rank { ctx_tokens: RERANK_CTX_TOKENS }`, then refuse on three reads, in this order:
+  1. `llama_pooling_type(ctx)` must be `LLAMA_POOLING_TYPE_RANK` (`accepted_pooling`);
+  2. **`llama_model_cls_label(model, 0)` must be non-null** — added while running Step 5, because the first version passed this and `tests/local_rerank.rs::an_embedding_model_is_not_a_reranker` caught it: rank mode *declares* its pooling, so an embedding model sails through check 1, and `n_cls_out` answers 1 for every architecture. The label table is the only capability read that comes from the file;
+  3. `llama_model_n_cls_out(model)` must be `1`, because reading a wider row than the buffer holds is an over-read — read after the label check, since the header calls this entry undefined behaviour for a non-classifier model.
+
+  Then read `llama_vocab_bos/eos/sep` + the three `add_*` flags into `VocabFlags`/`Specials`, treating any negative id as `None`. The tokenizer helper shared with the embedding loader (`tokenize_with`, `model_vocab`) moved out of `impl LoadedModel` rather than being copied: two copies of the size-then-allocate rule would be two places to get wrong.
 - [ ] **Step 4: Implement `Reranker for RankModel`.** Per doc: tokenise query and doc separately with `add_special = false` (reuse the existing size-then-allocate `tokenize`), `fit_pair`, one `llama_batch_get_one` + `llama_decode`, then copy `n_cls_out` floats from `llama_get_embeddings_seq(ctx, 0)` — **not** `n_embd_out`. Each SAFETY line says which buffer it vouches for and why the width is the checked one. A `Fit::QueryTooLong` becomes `RerankError::PairTooLong`; a non-zero decode rc becomes `RerankError::Runtime("…")` with our own words, never llama.cpp's.
 - [ ] **Step 5: Run** `cargo test -p np-core --features local-model --test local_rerank -- --nocapture` twice — once without the env var (expect the `NOT COVERAGE` line and a pass), once with `NP_TEST_RERANK_PATH=<the pinned Q8_0 file>` (expect real passes). Then the feature clippy rows for `local-model` and `local-model,vision`.
 - [ ] **Step 6: Commit** `git commit -am "feat(local-model): rank-mode loading and pair scoring through a checked head"`

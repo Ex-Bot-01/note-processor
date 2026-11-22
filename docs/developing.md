@@ -77,15 +77,22 @@ RUSTDOCFLAGS="--deny warnings" cargo doc --locked --workspace --no-deps
 Two rules that are not negotiable here: **never regenerate the catalog goldens** (any diff in `tests/golden*` is a stop-and-
 report), and a test whose assertion cannot be broken by mutating the code it covers is a defect, not coverage.
 
-The model-backed suites skip loudly instead of failing quietly. Set the two variables and they run for real:
+The model-backed suites skip loudly instead of failing quietly. Set the variables and they run for real:
 
 ```sh
 NP_TEST_MODEL_PATH=~/models/embeddinggemma-2-Q8_0.gguf \
 NP_TEST_MMPROJ_PATH=~/models/mmproj-embeddinggemma-2-Q8_0.gguf \
   cargo test -p np-core --features local-model,vision --test local_vision
+
+# Rank mode (F51). `an_embedding_model_is_not_a_reranker` also reads NP_TEST_MODEL_PATH, so set both to exercise
+# the cross-refusals; the installed reranker is named by id, with no quant in the filename.
+NP_TEST_RERANK_PATH=~/models/bge-reranker-v2-m3 \
+NP_TEST_MODEL_PATH=~/models/embeddinggemma-2-Q8_0.gguf \
+  cargo test -p np-core --features local-model --test local_rerank -- --nocapture
 ```
 
-Without them, nothing that needs weights runs. Counted on 2026-11-06 on this host with both variables unset — `cargo test --workspace` prints
+Without them, nothing that needs weights runs. Counted on 2026-11-06 on this host with both variables unset (before F51's
+rerank cases landed, so the local-model counts below are due a re-measure alongside the next full gate run) — `cargo test --workspace` prints
 **5** such lines (most artifact-gated suites are not even compiled without the runtime), `-p np-core -p np-cli --features local-model` prints
 **36**, and the same pair with `--features local-model,vision` prints **45**. They mean "compiled, never ran", never "passed". The commands are
 printed beside the numbers on purpose: an earlier pair recorded here (29 / 38) could not be reproduced by any command in this file once F28's
