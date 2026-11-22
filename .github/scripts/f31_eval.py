@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -73,6 +74,27 @@ def mrr(results: list[QueryResult]) -> float:
     return total / len(results)
 
 
+def ndcg_at(results: list[QueryResult], k: int) -> float:
+    """Mean nDCG@k with **binary** relevance, one labelled answer per query — F31's whole label model, unchanged.
+
+    With a single relevant document the ideal DCG is 1, so the discounted cumulative gain of one query is just its discount:
+    `1 / log2(rank + 1)` when the answer lands inside `k`, and `0.0` when it does not or never appears. A miss counts as zero and
+    **stays in the denominator** — the same rule [`mrr`] states, for the same reason: averaging over answered queries only would let
+    a change that loses recall score an *improvement*, which is precisely the self-flattering mutant `--self-test` refuses.
+
+    Why nDCG beside recall and MRR: recall@k says "did it appear", MRR says "how high", and neither punishes moving an answer from
+    rank 2 to rank 4 while both stay unchanged. A rerank stage's whole claim is about ordering inside the window, so a table that
+    cannot see that movement cannot grade the stage.
+    """
+    if not results:
+        return 0.0
+    total = 0.0
+    for r in results:
+        if r.rank is not None and r.rank <= k:
+            total += 1.0 / math.log2(r.rank + 1)
+    return total / len(results)
+
+
 def image_outranks_note(results: list[QueryResult]) -> int:
     """How often the top hit was an `image` while the labelled answer was a `note`.
 
@@ -95,13 +117,27 @@ class Run:
     vectors_seen: dict[str, bool] = field(default_factory=dict)
 
 
-def search(np_bin: str, workspace: str, query: str, mode: str) -> dict:
+def search(
+    np_bin: str,
+    workspace: str,
+    query: str,
+    mode: str,
+    rerank: bool = False,
+    rerank_text: str | None = None,
+) -> dict:
     """One `np search --json`, refused loudly if the answer is not one JSON object.
 
     A refusal (no provider, no artifact) prints its message on stderr and exits 1 with **no** document; that is a real result about
     this machine — usually "this build has no runtime" — and it is reported as such rather than becoming a zero score in silence.
     """
+    # **The harness drives the binary; it does not reimplement a flag.** `--rerank` and `--rerank-text` therefore travel to every
+    # query as argv, which is also what makes an un-reranked row and a reranked one comparable: same binary, same code path, and the
+    # only difference is what the process was told (**F51**).
     cmd = [np_bin, "search", workspace, query, "--mode", mode, "--json"]
+    if rerank:
+        cmd.append("--rerank")
+    if rerank_text:
+        cmd += ["--rerank-text", rerank_text]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0 and not proc.stdout.strip():
         raise SystemExit(
@@ -115,13 +151,21 @@ def search(np_bin: str, workspace: str, query: str, mode: str) -> dict:
         raise SystemExit(f"`{' '.join(cmd)}` did not print one JSON object: {err}\n{proc.stdout[:400]}")
 
 
-def evaluate(np_bin: str, workspace: str, labels: list[tuple[str, str, str]], modes: list[str], k: int) -> dict[str, list[QueryResult]]:
+def evaluate(
+    np_bin: str,
+    workspace: str,
+    labels: list[tuple[str, str, str]],
+    modes: list[str],
+    k: int,
+    rerank: bool = False,
+    rerank_text: str | None = None,
+) -> dict[str, list[QueryResult]]:
     """Rank position of each labelled answer, per mode, with `surfaced_somewhere` across all modes."""
     per_mode: dict[str, list[QueryResult]] = {m: [] for m in modes}
     documents: dict[str, list[dict]] = {}
     for query, expected, kind in labels:
         for mode in modes:
-            doc = search(np_bin, workspace, query, mode)
+            doc = search(np_bin, workspace, query, mode, rerank, rerank_text)
             documents.setdefault(mode, []).extend(doc.get("hits") or [])
             hits = doc.get("hits") or []
             rank = None
@@ -148,14 +192,18 @@ def evaluate(np_bin: str, workspace: str, labels: list[tuple[str, str, str]], mo
 def report(per_mode: dict[str, list[QueryResult]], k: int, header: list[str]) -> int:
     print("\n".join(header))
     print()
-    print(f"{'mode':<10} {'n':>3}  {'recall@1':>9} {f'recall@{k}':>{len(f'recall@{k}') + 1}}  {'MRR':>6}  {'img>note':>8}  {'unsurfaced':>10}")
+    print(
+        f"{'mode':<10} {'n':>3}  {'recall@1':>9} {f'recall@{k}':>{len(f'recall@{k}') + 1}}  "
+        f"{f'ndcg@{k}':>{len(f'ndcg@{k}') + 1}}  {'MRR':>6}  {'img>note':>8}  {'unsurfaced':>10}"
+    )
     strict_fail = 0
     for mode, results in per_mode.items():
         misses = unsurfaced(results)
         strict_fail += len(misses)
         print(
             f"{mode:<10} {len(results):>3}  {recall_at(results, 1):>9.3f} "
-            f"{recall_at(results, k):>{len(f'recall@{k}') + 1}.3f}  {mrr(results):>6.3f}  "
+            f"{recall_at(results, k):>{len(f'recall@{k}') + 1}.3f}  "
+            f"{ndcg_at(results, k):>{len(f'ndcg@{k}') + 1}.3f}  {mrr(results):>6.3f}  "
             f"{image_outranks_note(results):>8}  {len(misses):>10}"
         )
     print()
@@ -209,6 +257,43 @@ def self_test() -> int:
                      QueryResult("q2", "b.md", "note", rank=None, top_kind="note")])
     ok = abs(with_miss - 0.5) < 1e-12
     print(f"{'ok  ' if ok else 'FAIL'} mrr counts a miss as zero rather than dropping it: got {with_miss!r}, want 0.5")
+
+    # **nDCG, computed on paper.** Four queries whose answers land at ranks 4, never, 1 and 2, graded at k=10 with binary
+    # relevance. One relevant document means the ideal gain is 1, so each term is its own discount:
+    #   rank 4 -> 1/log2(5) = 0.430676558…   miss -> 0 (and still in the denominator)
+    #   rank 1 -> 1/log2(2) = 1              rank 2 -> 1/log2(3) = 0.630929754…
+    # Mean of the four: 0.515401578…. Written here as digits rather than recomputed from the same formula, because a self-test that
+    # calls the function it grades proves nothing.
+    ndcg_results = [
+        QueryResult("a", "a.md", "note", rank=4, top_kind="note"),
+        QueryResult("b", "b.md", "note", rank=None, top_kind="note"),
+        QueryResult("c", "c.md", "note", rank=1, top_kind="note"),
+        QueryResult("d", "d.md", "note", rank=2, top_kind="note"),
+    ]
+    want = 0.515401578
+    got = ndcg_at(ndcg_results, 10)
+    ok = abs(got - want) < 1e-9 and ok
+    print(f"{'ok  ' if abs(got - want) < 1e-9 else 'FAIL'} ndcg@10 over ranks [4, miss, 1, 2]: got {got!r}, want {want}")
+
+    # Truncation is the `@k` in nDCG@k: the same list graded at k=3 cannot see the answer at rank 4.
+    want_3 = (0.0 + 0.0 + 1.0 + 0.630929754) / 4
+    got_3 = ndcg_at(ndcg_results, 3)
+    ok = abs(got_3 - want_3) < 1e-9 and ok
+    print(f"{'ok  ' if abs(got_3 - want_3) < 1e-9 else 'FAIL'} ndcg@3 drops the rank-4 answer: got {got_3!r}, want {want_3}")
+
+    # **The mutant that flatters itself.** One query's answer slides from rank 5 to nowhere: recall falls, and so must nDCG — over
+    # **all** queries. Averaging over answered queries only would report the *same* number for the second list as for a list where
+    # that query never existed, which is how a stage that loses coverage could be written up as an improvement.
+    before = [QueryResult("q", "a.md", "note", rank=5, top_kind="note"), QueryResult("r", "b.md", "note", rank=1, top_kind="note")]
+    after = [QueryResult("q", "a.md", "note", rank=None, top_kind="note"), QueryResult("r", "b.md", "note", rank=1, top_kind="note")]
+    lost = ndcg_at(after, 10) < ndcg_at(before, 10)
+    ok = lost and ok
+    print(
+        f"{'ok  ' if lost else 'FAIL'} nDCG falls when an answer disappears (misses stay in the denominator): "
+        f"{ndcg_at(before, 10):.6f} -> {ndcg_at(after, 10):.6f}"
+    )
+    ok = (ndcg_at([], 10) == 0.0) and ok
+    print(f"{'ok  ' if ndcg_at([], 10) == 0.0 else 'FAIL'} empty result set is 0.0, not a crash: got {ndcg_at([], 10)!r}")
     failed += 0 if ok else 1
     return 1 if failed else 0
 
@@ -244,6 +329,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--modes", default="keyword,semantic,hybrid")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--strict", action="store_true", help="exit 3 when any labelled answer is absent from every mode")
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="pass `--rerank` to every query, so a row of the table measures the cross-encoder stage (**F51**)",
+    )
+    parser.add_argument(
+        "--rerank-text",
+        choices=["title-body", "body"],
+        help="pass `--rerank-text` to every query; the axis that asks whether a note's title helps (**F51**)",
+    )
     parser.add_argument("--self-test", action="store_true", help="check the metric arithmetic and exit")
     args = parser.parse_args(argv)
 
@@ -265,8 +360,17 @@ def main(argv: list[str]) -> int:
         f"F31 retrieval harness — {len(labels)} labelled queries against {args.workspace}",
         f"binary: {args.np} ({version})",
         f"modes: {', '.join(modes)}   k={args.k}   label file: {args.labels}",
+        # **The shape of the run travels above the table**, because a 0.02 difference over eight queries is not a finding unless a
+        # reader can see what else was true: whether the stage ran at all, which text it read, and how many queries were asked.
+        # Without these lines one row of numbers can be re-quoted beside a different binary, mode set or k and look comparable.
+        "rerank: "
+        + (
+            f"on, text={args.rerank_text or 'title-body (config default)'} (**F51**)"
+            if args.rerank
+            else "off (retrieval order)"
+        ),
     ]
-    per_mode = evaluate(args.np, args.workspace, labels, modes, args.k)
+    per_mode = evaluate(args.np, args.workspace, labels, modes, args.k, args.rerank, args.rerank_text)
     misses = report(per_mode, args.k, header)
     if args.strict and misses:
         print(f"\n--strict: {misses} labelled answer(s) never surfaced. Fix the label file or the index before quoting any number.", file=sys.stderr)
