@@ -69,8 +69,8 @@ allowlist live in that script. 150 packages; 1 offer a choice of licenses.
 | litemap | 0.8.3 | `Unicode-3.0` | permissive |
 | log | 0.4.35 | `MIT OR Apache-2.0` | permissive |
 | memchr | 2.8.3 | `Unlicense OR MIT` | permissive |
-| np-cli | 0.6.1 | `MIT` | permissive |
-| np-core | 0.6.1 | `MIT` | permissive |
+| np-cli | 0.7.0 | `MIT` | permissive |
+| np-core | 0.7.0 | `MIT` | permissive |
 | once_cell | 1.21.4 | `MIT OR Apache-2.0` | permissive |
 | once_cell_polyfill | 1.70.2 | `MIT OR Apache-2.0` | permissive |
 | percent-encoding | 2.3.2 | `MIT OR Apache-2.0` | permissive |
