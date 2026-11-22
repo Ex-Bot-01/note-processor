@@ -1,7 +1,7 @@
 # F51 — A rerank stage: score the top hits with a cross-encoder, and say out loud when you did not
 
-Status: **proposed 2026-11-21, one builder-check round folded in, awaiting review.** Written before the branch had a line of
-code in it, per `AGENTS.md`. Prior art: `search.rs` (read-only rule, ordering contract, `RankNote` as the vocabulary for "a
+Status: **decided 2026-11-21 — one builder-check round folded in, and the two open rulings answered by the human (§7, §9).**
+Written before the branch had a line of code in it, per `AGENTS.md`. Prior art: `search.rs` (read-only rule, ordering contract, `RankNote` as the vocabulary for "a
 half was missing"), F35 (an unknown config value is refused, never ignored), F45 (hybrid answers and names the missing half;
 only the mode that cannot answer refuses), `design-m2-models-install` and `pins.rs` (a pin says *what* bytes are acceptable;
 the host is config), **F31** (`design-f31-quality-harness.md`: queries generated from the corpus they search are circular,
@@ -12,8 +12,8 @@ Three rulings came from the human and are recorded rather than invented here: **
 matters**, and **a llama.cpp re-pin is permitted only if the embedding model still works afterwards**. This note takes that
 last one as a last resort rather than a convenience (§11).
 
-Two things are still open and marked as such where they bite: the label methodology (§9) and which bytes of a note get scored
-(§7). Both are the human's to settle, not the builder's.
+The shape was restated by the human when this note went round: **retrieve first (keyword, semantic or hybrid), then rerank that
+list** — the stage is a second pass over retrieval's output and never a third retriever.
 
 ## 1. What is missing, in one sentence
 
@@ -201,12 +201,12 @@ to the embedder; pointing it at the reranker would make a consent-gated embeddin
 embeddings switched off, and inventing `[search] rerank_threads` would ship a knob nobody measured. `LoadedModel::threads()`
 already reports what the context was told, so the latency table states its thread count instead of implying one.
 
-**Which bytes are scored — OPEN, the human's (§9 note).** Proposal: **`notes.title` + a newline + `notes.body`**, front matter
-excluded. That is the text the keyword half ranks (`notes_fts` over title and body), it is what a reader recognises as the
-note, and for 1–3 word queries the title is likely decisive. The other candidate — the whole decoded file including front
-matter, which is what the chunker embedded (`chunk.rs:31-37`) — would align rerank with the semantic half but would pre-empt
-**D2** ("is front matter part of the embedded text?"), an open ruling in `todo.md`. Whichever way this goes, retrieval and
-rerank scoring different bytes is a fact that belongs in `docs/measurement-rerank.md`, not a footnote.
+**Which bytes are scored — the human's ruling: `notes.title` + a newline + `notes.body`,** front matter excluded. "Yes
+`notes.title + notes.body` is a good idea." That is the text the keyword half ranks (`notes_fts` over title and body), it is what
+a reader recognises as the note, and for 1–3 word queries the title is likely decisive. The alternative — the whole decoded file
+including front matter, which is what the chunker embedded (`chunk.rs:31-37`) — would have aligned rerank with the semantic half
+and pre-empted **D2** ("is front matter part of the embedded text?"), which stays open in `todo.md`. A note with no title scores
+its body alone, and that pair is not padded with a blank line: an empty title is a fact about the note, not a missing field.
 
 ## 8. When it does not run — the two-sided rule
 
@@ -228,21 +228,22 @@ sentence, and declines as a normal answer with `rerank.ran: false`. Each cause g
 
 ## 9. What will be measured, and what will not
 
-**Ranking quality — methodology OPEN to the human.** `design-f31-quality-harness.md:40-48` rules that queries generated from
+**Ranking quality — whose measurement, decided by the human: they run it.** "We first implement it and then I will test it by
+myself on my pc." That settles the collision with F31 (`design-f31-quality-harness.md:40-48` rules that queries generated from
 the corpus they search are "circular by construction" and shipped no label file for that reason; `todo.md` item 6 keeps F31 open
-until ~20 queries are labelled **from the human's own notes**. This round is asked for a committed synthetic DE/EN fixture with
-labelled queries and an nDCG@10 figure, so the two rulings have to be reconciled before code, not after numbers. The proposal
-this note recommends:
+until ~20 queries are labelled from a real vault): **this round makes the measurement possible and runs the parts of it that need
+no private data; it does not claim search got better for anybody.** Concretely:
 
 * Ship `tests/fixtures/rerank-vault/` — ~100 small synthetic DE and EN notes (no private text) with hand-authored labels,
   1–3 word queries included on purpose because they are the case the stage exists for.
-* Report nDCG@10 (and top-1/top-10 agreement) **on that fixture as a statement about the stage**: does the cross-encoder put the
-  answer where we planted it, in both languages, before and after. It can show the stage is wired correctly and that quantization
-  preserves order; it cannot show that anyone's real vault gets better, and `docs/measurement-rerank.md` says that sentence next
-  to the number so the table cannot be quoted without it.
-* Add nDCG@k and a rerank axis to `.github/scripts/f31_eval.py` rather than writing a second harness with a second label format —
-  its metric arithmetic is self-tested (`--self-test`, a gate row) and its TSV labels are the format F31 will close on. Reuse also
-  means: when the human's ~20 real labels land, this round's numbers become comparable to them for free.
+* On that fixture, report what is actually decidable there: does the cross-encoder put the planted answer first in both languages,
+  and do the quants agree on the order. nDCG@10 goes beside it **labelled as a statement about the stage**, never about a real
+  vault — the round's measurement document (docs/measurement-rerank.md, written by this round) prints that sentence beside the
+  number, so the table cannot be quoted without it.
+* Add nDCG@k and a rerank axis to `.github/scripts/f31_eval.py` rather than writing a second harness with a second label format:
+  its metric arithmetic is self-tested (`--self-test`, a gate row), its TSV labels are the format F31 will close on, and it already
+  takes any workspace plus any label file — which is the thing that lets the human re-run all of this on their own machine against
+  their own notes. When their ~20 labels land, this round's numbers become comparable to them for free.
 
 **Speed.** p50/p95 per query at N ∈ {5, 10, 15, 20, 25} and at 50 candidates. Two columns, because they answer different
 questions and today neither is measurable the obvious way: *marginal* cost with the artifact loaded once, from an artifact-gated
@@ -262,7 +263,7 @@ from them, not from the publisher's README.
 reported as not measured). Agreement reported as score deltas *and* order agreement, with the formatting note from §4 beside it:
 our recipe reproduces HuggingFace's two-segment encoding for these bytes, so a systematic offset would be a finding, not noise.
 
-Not measured, and listed in `docs/measurement-rerank.md` as such: figures/images under rerank (never candidates), chunk-level
+Not measured, and listed in this round's measurement document as such: figures/images under rerank (never candidates), chunk-level
 reranking (the stage scores whole-note text, not the best chunk), nDCG on a real private vault (until F31's labels exist),
 whether rerank improves keyword-only retrieval (it *runs* there; that is not a claim it helps), the effect of the 2048-token cut
 on long notes, front matter under rerank (§7), rerank worker-thread scaling (one thread count, stated), and any Windows or macOS
