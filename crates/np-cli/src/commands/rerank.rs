@@ -4,8 +4,9 @@
 //! can actually run here — then hands the stage a scorer or a reason. Two properties shape every line in this file:
 //!
 //! * **`np search` never fetches a reranker.** No transport is constructed on any path here, so `[models] auto_fetch = true`
-//!   cannot volunteer 635 MB because a ranking preference was set. The artifact arrives through `np models install`, or not at
-//!   all — see `docs/reference-models.md`.
+//!   cannot volunteer 635 MB because a ranking preference was set. The bytes arrive when a person asks for them —
+//!   `np models fetch <vault> --id <reranker>` transfers and verifies them, `np models install` places a file already held —
+//!   and never from inside a search; see `docs/reference-models.md`.
 //! * **Unverified bytes never reach a forward pass.** A file whose length the pin can already rule out is refused for free; one
 //!   of the right length is hashed before it scores anything. Wrong bytes producing plausible-looking order is the failure this
 //!   command cannot detect afterwards, so it detects it beforehand.

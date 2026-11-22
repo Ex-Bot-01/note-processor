@@ -513,6 +513,24 @@ fn skip_reasons_are_tokens_for_the_document_only() {
     }
 }
 
+/// **The remedy names only doors this build can open** — the rule every [`np_core::search::RankNote`] sentence already follows,
+/// and the reason it exists twice in `search.rs` rather than once. A `fetch` build has two ways to place these bytes and names
+/// both: `np models fetch` transfers them, and `np models install` is the offline door whose digest comes from the pin. A build
+/// without `fetch` must not name a subcommand that was compiled out of it.
+#[test]
+fn absent_artifact_names_the_door_this_build_can_open() {
+    let sentence = RerankNote::ArtifactAbsent.label();
+    assert!(
+        sentence.contains(np_core::pins::RERANKER_ID) && sentence.contains("np models install"),
+        "the id and the door that exists in every build: {sentence}"
+    );
+    assert_eq!(
+        sentence.contains("np models fetch"),
+        cfg!(feature = "fetch"),
+        "the wording a binary prints is the wording that binary can honour: {sentence}"
+    );
+}
+
 /// The stage's own arithmetic must not be reachable by accident from the default path: with no input the answer is byte-for-byte
 /// what it was before this feature, and `rerank` says `disabled`. `tests/search.rs`'s read-only fence runs the same path.
 #[test]

@@ -1468,16 +1468,34 @@ pub enum RerankNote {
     CannotScore(String),
 }
 
+/// How absent reranker bytes get put on disk, in the two wordings a binary can honour — the same reason every [`RankNote`]
+/// sentence here exists twice. `np models install` is named in **both** shapes: it is compiled into every build and takes its
+/// digest from the pin rather than from the human. `np models fetch` is named only where the transfer path is compiled in, and
+/// named first there, because it is the one command that moves these bytes without asking the reader to locate a file and a
+/// hash — the difference between an instruction a person can type once and one they cannot.
+#[cfg(feature = "fetch")]
+fn rerank_absent_fix(id: &str) -> String {
+    format!(
+        "run `np models fetch <vault> --id {id}` to download and verify it (or place a file you already hold with \
+         `np models install --id {id} --path <file> --sha256 <digest>`)"
+    )
+}
+
+/// The same advice where no transfer path exists: the bytes you already hold, installed by hand.
+#[cfg(not(feature = "fetch"))]
+fn rerank_absent_fix(id: &str) -> String {
+    format!("run `np models install --id {id} --path <file> --sha256 <digest>`")
+}
+
 impl RerankNote {
     /// The one sentence per cause, spelled once so text output, `--json` and the refusal cannot word it three ways. Each names
     /// the next command, because "unavailable" alone has never told anyone which of two files to touch.
     pub fn label(&self) -> String {
         match self {
             Self::ArtifactAbsent => format!(
-                "the reranker `{}` is not installed: run `np models install --id {} --path <file> --sha256 <digest>`, or \
-                 turn `[search] rerank` off",
+                "the reranker `{}` is not installed: {}, or turn `[search] rerank` off",
                 crate::pins::RERANKER_ID,
-                crate::pins::RERANKER_ID
+                rerank_absent_fix(crate::pins::RERANKER_ID)
             ),
             Self::RuntimeNotBuilt => "this binary was built without the `local-model` feature, so no reranker can load; the \
                                       rerank stage needs a build that has it"

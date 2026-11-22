@@ -232,6 +232,19 @@ fn rerank_by_config_with_no_artifact_answers_warns_and_exits_zero() {
             err.contains(np_core::pins::RERANKER_ID) && err.contains("np models install"),
             "the sentence names the artifact and the command that places it:\n{err}"
         );
+        // The same rule every embedding remedy follows: a build that can dial out says so, because `np models fetch` is the
+        // one door that moves these bytes without asking anyone to find a digest first.
+        if cfg!(feature = "fetch") {
+            assert!(
+                err.contains("np models fetch"),
+                "this binary can fetch, and the remedy should say so:\n{err}"
+            );
+        } else {
+            assert!(
+                !err.contains("np models fetch"),
+                "a build without `fetch` must not name it:\n{err}"
+            );
+        }
     } else {
         assert!(
             err.contains("`local-model`"),
@@ -280,7 +293,9 @@ fn explicit_rerank_without_the_artifact_refuses_at_exit_one() {
         "the refusal says what was asked for:\n{err}"
     );
     assert!(
-        (err.contains(np_core::pins::RERANKER_ID) && err.contains("np models install"))
+        (err.contains(np_core::pins::RERANKER_ID)
+            && err.contains("np models install")
+            && err.contains("np models fetch") == cfg!(feature = "fetch"))
             || err.contains("`local-model`"),
         "and which of the two causes it is:\n{err}"
     );
