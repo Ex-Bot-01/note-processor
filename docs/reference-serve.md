@@ -69,7 +69,7 @@ can talk to a server it cannot configure still deserves answers.
 | Method | Params | Result | Built by | Refusals |
 |---|---|---|---|---|
 | `initialize` | `workspace?`, `notifications?` | `{protocol, np, features, methods, data_dir, progress?}` | its own builder | `-32602` on a non-boolean `notifications` |
-| `search` | `workspace`, `query`, `limit?`, `mode?` (`keyword`\|`semantic`\|`hybrid`), `prefix?` (boolean) | the same document as `np search --json` | `search_document` | `-32602` missing/unknown key, or a `prefix` that is not a boolean; `-32000` workspace unreadable |
+| `search` | `workspace`, `query`, `limit?`, `mode?` (`keyword`\|`semantic`\|`hybrid`), `prefix?` (boolean), `rerank?` (boolean or null), `rerank_text?` (`title-body`\|`body`) | the same document as `np search --json`, including the `rerank` object (**F51**) | `search_document` | `-32602` missing/unknown key, a `prefix`/`rerank` that is not a boolean, or a `rerank_text` that is neither spelling; `-32000` workspace unreadable, or `rerank: true` with no reranker to run — the fault carries the CLI's refusal sentence verbatim |
 | `scan` | `workspace` | the same report as `np scan --json` | `ScanReport` | `-32602`; `-32000` |
 | `embed` | `workspace` | the same report as `np embed --json` | `embed_report` | `-32602`; `-32000` (including a build without the inference feature) |
 | `models.list` | `workspace` | `{models, fetching, unclaimed, pinned, models_dir_error}` — installed-artifact rows, any fetch in flight, and what a fetch **would** cost before one starts | `listing_json`, the CLI's own builder | `-32602` |

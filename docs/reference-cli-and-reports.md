@@ -9,7 +9,8 @@ What each command writes, which keys `--json` carries and why they are always pr
 np setup <workspace> [--json] [--yes]     # index, fetch the pinned model if missing, embed — one command for a caller that wants vectors
 np scan <workspace> [--json]              # index + regenerate the catalog
 np embed <workspace> [--json]             # embed what the index says is owed
-np search <workspace> <query> [--limit N] [--mode M] [--json]   # --limit defaults to 10, --mode defaults to config's `hybrid`
+np search <workspace> <query> [--limit N] [--mode M] [--rerank | --no-rerank] [--rerank-text T] [--json]
+                                                                  # --limit defaults to 10, --mode and the rerank flags default to config
 np models install|fetch|hash|list …
 np embeddings enable <id> [--json]        # turn the embedding model on in config.toml; fetches nothing (#7)
 np embeddings disable [--json]            # provider = "none"; the model you chose stays in the file
@@ -183,6 +184,52 @@ Two ways to ask, one default that did not change:
   still has to appear whole. No flag involved, so a person typing into an ordinary search box can use it today.
 - **`--prefix`** widens *every* word: `np search ./notes --prefix grand` reaches `grandma` and `grandmother`. This is the shape of
   a front end's "match word beginnings" toggle, which is one switch for the whole query.
+
+## Reordering the top hits with a cross-encoder (**F51**)
+
+Retrieval — vectors, keywords, or both fused — proposes candidates. `--rerank` adds an optional second pass that reads the query
+against each of the **top N** candidates and reorders just that window; the tail keeps retrieval order, and figures are never
+candidates (a cross-encoder scores pairs of prose, and moving an image because a neighbouring note's score moved would be a claim
+about pixels nobody looked at).
+
+```sh
+np search ~/Notes "wie entkalkt man eine Kaffeemühle" --limit 5 --rerank
+```
+
+It costs a model: the pinned `bge-reranker-v2-m3` is 635,674,432 bytes and must be installed with
+[`np models install`](reference-models.md). Before it scores anything its bytes are checked against the pin — length first (a
+`stat`, free), then the digest, because wrong bytes producing a plausible order is the one failure this command could not detect
+afterwards. The verdict is remembered for the process and re-validated against size and mtime, so `np serve` pays one pass while
+every `np search` pays its own: measured here at roughly 15 s on a laptop CPU, which is why an un-reranked search never touches
+this path at all. **`np search` never fetches it** — not when `[models] auto_fetch = true`, not ever.
+A ranking preference is not permission to download half a gigabyte, and one test runs with auto-fetch on to keep that sentence
+true.
+
+Two flags, both overriding `[search] rerank`:
+
+| Flag | Meaning | What happens when the artifact is missing |
+| --- | --- | --- |
+| `--rerank` | rerank this run | **refuses, exit 1**, nothing on stdout — you asked for a reranked answer and got neither that nor a guess |
+| `--no-rerank` | do not rerank this run, even if config enables it | nothing to decline; stays silent |
+| `--rerank-text title-body\|body` | which text of a note the model reads (default `title-body`: title, newline, body) | same as above; an unknown spelling is refused naming both words |
+
+With `[search] rerank = true` in config and no flag, the same missing artifact is **not** an error: the answer arrives in
+retrieval order, exit 0, with one line on stderr naming the cause and `np models install` as the fix. That asymmetry is the whole
+point of `RerankAsk` — a standing preference should degrade, an expectation stated for this run should not lie about itself.
+
+Depth: `[search] rerank_top_n` says how many candidates to score (1–64). Retrieval reads to `max(--limit, rerank_top_n)` and the
+report is truncated afterwards, so `--rerank-top-n 25 --limit 5` scores 25 and prints 5. `--json` says which of the two passes
+ordered each line: `score` stays the retrieval number, while `rerank_score`, `rerank_rank_before` and `rerank_rank_after` (all
+three `null` when nothing was scored) carry the second pass beside it. Beside the hits, `"rerank"` reports the stage itself:
+
+```json
+"rerank": { "ran": false, "reason": "disabled", "note": null, "candidates": 0, "model": null, "text": "title-body" }
+```
+
+`reason` is one key for both kinds of "did not run": the non-faults (`disabled`, `no-candidates`) and the causes
+(`rerank-artifact-missing`, `rerank-runtime-not-built`, `rerank-artifact-unverified`, `rerank-cannot-score`), each of which also
+appears as a diagnostic rule token ([reference-diagnostics.md](reference-diagnostics.md)). A build without the `local-model`
+feature declines with `rerank-runtime-not-built` and its sentence says to rebuild rather than pointing at your disk.
 
 The document then admits what it did. One real run on a two-note vault — one note holds `grand` as a word, the other only
 `grandma`:

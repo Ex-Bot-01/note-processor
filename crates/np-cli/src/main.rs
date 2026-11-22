@@ -127,6 +127,20 @@ enum Command {
         /// word in the query, which is what a "match word beginnings" toggle in a front end means.
         #[arg(long)]
         prefix: bool,
+        /// Reorder the top hits with a cross-encoder, overriding `[search] rerank`. Needs the pinned reranker installed
+        /// (`np models install --id bge-reranker-v2-m3`), and **never fetches it**: this command will not volunteer 635 MB for a
+        /// ranking preference, even where `[models] auto_fetch = true`. Asking with this flag and not having it refuses at exit 1;
+        /// the config key alone answers un-reranked with one line on stderr (**F51**).
+        #[arg(long, overrides_with = "no_rerank")]
+        rerank: bool,
+        /// Do not rerank, overriding `[search] rerank = true`. Exists so one query can be measured against the same vault with
+        /// the stage off — the difference is what a person is trying to see, and it cannot be seen from one run.
+        #[arg(long)]
+        no_rerank: bool,
+        /// Which text of a note the reranker reads: `title-body` (the default) scores the title, a newline and the body; `body`
+        /// scores the body alone. Overrides `[search] rerank_text`; any other spelling is refused naming both (**F51**).
+        #[arg(long, value_parser = commands::search::parse_rerank_text)]
+        rerank_text: Option<np_core::search::RerankText>,
         /// Print the hits as JSON instead of one line each.
         #[arg(long)]
         json: bool,
@@ -228,6 +242,9 @@ fn main() -> ExitCode {
             limit,
             mode,
             prefix,
+            rerank,
+            no_rerank,
+            rerank_text,
             json,
         } => commands::search::search_workspace(
             &workspace,
@@ -239,6 +256,17 @@ fn main() -> ExitCode {
             } else {
                 search::Prefix::Marked
             },
+            // Two flags, one option: neither named means "say nothing", so `[search] rerank` decides; `--rerank` and
+            // `--no-rerank` are the two directions of saying something. clap's `overrides_with` lets a later flag undo an
+            // earlier one on the same line, which is why this cannot see both as set.
+            if rerank {
+                Some(true)
+            } else if no_rerank {
+                Some(false)
+            } else {
+                None
+            },
+            rerank_text,
             json,
         ),
         Command::Embeddings { command } => match command {

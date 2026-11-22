@@ -477,8 +477,45 @@ fn search(
     // fetch that `np embed` does, and a client watching a search that appears to hang on nothing would otherwise have no
     // way to learn it is downloading a model.
     let progress = crate::serve_channel::ServeProgress::new(ch, request.cloned(), "search");
+    // **The rerank options mirror the two flags** (**F51**): `"rerank": true|false` says something, `null` (or the key absent)
+    // says nothing and lets `[search] rerank` decide; `"rerank_text"` takes `"title-body"` or `"body"`. A value of the wrong type
+    // is a fault naming the parameter, because a server that quietly ignored it would answer a different question than the one
+    // the client asked.
+    let rerank = match params.get("rerank") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(on)) => Some(*on),
+        Some(_) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                "\"rerank\" must be true, false or null",
+            ))
+        }
+    };
+    let rerank_text = match params.get("rerank_text") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => match text.parse::<np_core::search::RerankText>() {
+            Ok(policy) => Some(policy),
+            // The CLI's own sentence, verbatim: one refusal wording for both doors, so a client and a human reading the same
+            // mistake get the same two accepted words.
+            Err(err) => return Err(ServeError::fault(Fault::INVALID_PARAMS, err.to_string())),
+        },
+        Some(_) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                "\"rerank_text\" must be a string: title-body or body",
+            ))
+        }
+    };
     let run = crate::commands::search::search_run(
-        &workspace, query, limit, mode, prefix, false, &progress,
+        &workspace,
+        query,
+        limit,
+        mode,
+        prefix,
+        false,
+        &progress,
+        rerank,
+        rerank_text,
     )?;
     Ok(crate::commands::search::search_document(&run))
 }
