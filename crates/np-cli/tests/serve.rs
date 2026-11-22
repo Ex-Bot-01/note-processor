@@ -283,12 +283,18 @@ fn initialize_answers_before_anything_is_indexed() {
     let result = server.result("initialize", json!({}));
     assert_eq!(result["protocol"], PROTOCOL, "{result}");
     assert_eq!(result["np"], env!("CARGO_PKG_VERSION"), "{result}");
-    for key in ["local_model", "vision", "fetch"] {
+    for key in ["local_model", "vision", "fetch", "rerank"] {
         assert!(
             result["features"][key].is_boolean(),
             "`{key}` must be a boolean, not absent: {result}"
         );
     }
+    // `rerank` advertises that the **parameter** exists, which is a question a client has to ask before it sends one. Its value
+    // tracks the runtime that could honour it, so the two keys cannot drift apart and disagree about whether a search can rerank.
+    assert_eq!(
+        result["features"]["rerank"], result["features"]["local_model"],
+        "a rerank stage with no runtime to load it is a promise this build cannot keep: {result}"
+    );
     let methods: Vec<&str> = result["methods"]
         .as_array()
         .expect("an array of methods")

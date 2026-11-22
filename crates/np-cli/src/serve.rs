@@ -389,6 +389,12 @@ fn initialize(
             "local_model": cfg!(feature = "local-model"),
             "vision": cfg!(feature = "vision"),
             "fetch": cfg!(feature = "fetch"),
+            // **`rerank` is a version marker rather than a fourth capability.** The stage is compiled into every build and can
+            // *run* only where an inference runtime exists, so its value is `local_model`'s by construction; what a client reads
+            // is the key's **presence** — "the `rerank` parameter on `search` means something to this server". It needs saying,
+            // because only the two `embeddings.*` methods reject an unknown parameter: send `rerank` to an older build and it is
+            // ignored, and the answer arrives in retrieval order as though nothing was asked.
+            "rerank": cfg!(feature = "local-model"),
         },
         "methods": METHODS,
         // Where the index and model caches live. A path rather than a host: origin privacy forbids naming an *origin*, and this is the line a support
@@ -940,7 +946,7 @@ mod tests {
         let reply = answer(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).expect("answered");
         assert_eq!(reply["result"]["protocol"], PROTOCOL);
         assert!(reply["result"]["np"].is_string(), "{reply}");
-        for key in ["local_model", "vision", "fetch"] {
+        for key in ["local_model", "vision", "fetch", "rerank"] {
             assert!(
                 reply["result"]["features"][key].is_boolean(),
                 "`{key}` must be a compile-time boolean, not absent: {}",
