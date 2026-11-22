@@ -7,10 +7,10 @@
 //! string, and [`resolve_origin`] is where that string is chosen.
 //!
 //! An earlier version of this header said "**Nothing in this module names a host**, because the pin table keeps the origin out of
-//! the binary", and it is now wrong in its second half: exactly one origin is compiled in by deliberate call
-//! — [`crate::pins::DEFAULT_ORIGIN`] — because an install that cannot reach a network is an install nobody
-//! completes and `np models fetch` is now the documented install step. The default lives in [`crate::pins`] beside the
-//! bytes it was derived from, not here.
+//! the binary", and it is now wrong in its second half: origins are compiled in by deliberate call
+//! — [`crate::pins::DEFAULT_ORIGINS`], one per fetchable id — because an install that cannot reach a network is an
+//! install nobody completes and `np models fetch` is now the documented install step. They live in [`crate::pins`] beside
+//! the bytes each was derived from, not here, and this module still dials only the string it is handed.
 //!
 //! What the old argument still buys, and why the default sits at the **end** of a precedence instead of replacing it:
 //! a mirror stays one config line away (`[models] base_url`, or `NP_MODELS_BASE_URL` when the file leaves that key
@@ -195,9 +195,10 @@ pub enum FetchError {
         /// What was wrong with it.
         reason: String,
     },
-    /// The id has pinned bytes but no declared identity. Refused before any request: 865 MB that cannot be recorded
-    /// as a model is a download with no purpose, and inventing a `dim` at the end of one would be an identity
-    /// declared by nobody.
+    /// The id has pinned bytes but no declared identity **and is not a rerank id**. Refused before any request: 865 MB
+    /// that cannot be recorded as a model is a download with no purpose, and inventing a `dim` at the end of one would be
+    /// an identity declared by nobody. A [`crate::pins::Role::Rerank`] id reaches the opposite answer on purpose — it has
+    /// no identity to declare, so its fetch proceeds and writes no row (see [`Expectation::declaration`]).
     #[error("`{id}` has pinned artifacts but no declared dim or prefixes in this build, so a fetch could not record it")]
     NoIdentity {
         /// The id asked for.
@@ -392,11 +393,15 @@ fn declare(dim: i64, prefix_doc: &str, prefix_query: &str) -> String {
 /// fence — and grouping is the honest fix rather than an `#[allow]`: the pin table and the declaration are **one
 /// decision** (which bytes, and what model they make), and passing them apart invites a caller to pair one id's
 /// digests with another id's width.
+#[derive(Clone, Copy)]
 pub struct Expectation<'a, T> {
     /// The members this call may accept, and what each must hash to.
     pub table: &'a [T],
-    /// The identity the row records when the bytes land.
-    pub declaration: &'a Declaration,
+    /// The identity the row records when the bytes land — **`None` for an artifact that owns no row**, which today means
+    /// one thing: a reranker. A fetch with `None` still verifies every byte against its pin and publishes the file; what
+    /// it does not do is write `models`, because there is no width or prefix pair that honestly describes a scoring head
+    /// (see [`crate::pins::Role`]).
+    pub declaration: Option<&'a Declaration>,
 }
 
 /// What a completed fetch records in `models`: width and both prefixes.
@@ -477,16 +482,24 @@ fn fetch_pinned(
     if crate::pins::pinned(id).next().is_none() {
         return Err(FetchError::NothingPinned { id: id.into() });
     }
-    let pinned =
-        crate::pins::identity(id).ok_or_else(|| FetchError::NoIdentity { id: id.into() })?;
-    let declaration = Declaration {
-        dim: pinned.dim,
-        prefix_doc: pinned.prefix_doc.to_string(),
-        prefix_query: pinned.prefix_query.to_string(),
+    // **The role decides whether an identity is expected at all.** An embedding id without a declared identity is a
+    // refusal — bytes with no width to record are not a model. A reranker id *must* have no identity row, and its fetch
+    // therefore carries `None`: writing a row for it would list a scoring head among the embedders a workspace can pick.
+    let declaration = match crate::pins::role(id) {
+        Some(crate::pins::Role::Rerank) => None,
+        _ => {
+            let pinned = crate::pins::identity(id)
+                .ok_or_else(|| FetchError::NoIdentity { id: id.into() })?;
+            Some(Declaration {
+                dim: pinned.dim,
+                prefix_doc: pinned.prefix_doc.to_string(),
+                prefix_query: pinned.prefix_query.to_string(),
+            })
+        }
     };
     let plan = Expectation {
         table: crate::pins::PINNED,
-        declaration: &declaration,
+        declaration: declaration.as_ref(),
     };
     fetch_with_progress(db, models_dir, id, requested, &plan, transfer)
 }
@@ -606,7 +619,7 @@ fn fetch_attempt<T: MemberPin>(
     plan: &Expectation<'_, T>,
     transfer: &Transfer<'_>,
 ) -> Result<FetchReport, FetchError> {
-    let Expectation { table, declaration } = plan;
+    let Expectation { table, declaration } = *plan;
     // An id that names nothing cannot be fetched, and naming it wrongly is an argv fact — not a file fact, which is
     // why this does not travel through `Io`.
     if let Err(err) = models::validate_id(id) {
@@ -645,7 +658,12 @@ fn fetch_attempt<T: MemberPin>(
     // **The row's declared identity is checked before byte one**, like the target-exists rule: it is a fact this
     // command can learn without transferring anything, and a workspace that declared 1,024 dimensions must not have
     // 865 MB arrive and then be told its model disagrees.
-    if let Some(row) = crate::db::model_row(db, id).map_err(|source| FetchError::Db { source })? {
+    // A stored row is only comparable with a *declared* identity. With `None` (a reranker) there is nothing to compare
+    // width and prefixes against, so the fetch proceeds on the digest alone — and an id that somehow already owns a row
+    // keeps it: this command does not silently convert an embedder's row into a reranker's, because the row arrived by
+    // some other door and only that door can change it.
+    let stored = crate::db::model_row(db, id).map_err(|source| FetchError::Db { source })?;
+    if let (Some(row), Some(declaration)) = (stored.as_ref(), declaration) {
         let primary = members
             .iter()
             .find(|member| member.member() == PRIMARY_MEMBER)
@@ -794,17 +812,22 @@ fn fetch_attempt<T: MemberPin>(
         .find(|member| member.member() == PRIMARY_MEMBER)
         .copied()
         .unwrap_or(members[0]);
-    crate::db::insert_model(
-        db,
-        id,
-        i64::from(declaration.dim),
-        Some(primary.sha256()),
-        &declaration.prefix_doc,
-        &declaration.prefix_query,
-        transfer.now,
-    )
-    .map_err(|source| FetchError::Db { source })?;
-    record_members(db, &report).map_err(|source| FetchError::Db { source })?;
+    // An artifact with no declared identity stops here: the bytes are on disk, verified, and nothing was written to
+    // `models` or `model_files`. That is not a half-finished install — for a reranker it is the finished state, and
+    // `np models list` answers its presence from the pin plus the file rather than from a row.
+    if let Some(declaration) = declaration {
+        crate::db::insert_model(
+            db,
+            id,
+            i64::from(declaration.dim),
+            Some(primary.sha256()),
+            &declaration.prefix_doc,
+            &declaration.prefix_query,
+            transfer.now,
+        )
+        .map_err(|source| FetchError::Db { source })?;
+        record_members(db, &report).map_err(|source| FetchError::Db { source })?;
+    }
 
     let _ = fs::remove_file(models::marker_path(models_dir, id));
     Ok(report)
@@ -1410,10 +1433,11 @@ pub fn failure_class(raw: &str) -> String {
     }
 }
 
-/// The origin a fetch dials, from whatever `[models] base_url` resolved to — or the compiled-in default when it is unset.
+/// The origin a fetch dials **for `id`**, from whatever `[models] base_url` resolved to — or that id's compiled-in
+/// default when it is unset, or `None` when this build has no default for it.
 ///
 /// **One question, one answer, in one place**: the configured value if there is one, else
-/// [`crate::pins::DEFAULT_ORIGIN`]. Config has already merged its two sources before a caller reaches here — the file's
+/// [`crate::pins::default_origin`]. Config has already merged its two sources before a caller reaches here — the file's
 /// own `base_url` wins, and `NP_MODELS_BASE_URL` fills a key the file left unset, which is `crate::config`'s precedence
 /// for every key in that section (`tests/config.rs` pins it) — so this function deliberately does not read the
 /// environment itself. A second reader of `NP_MODELS_BASE_URL` would be a second answer to "which origin did this run
@@ -1421,8 +1445,16 @@ pub fn failure_class(raw: &str) -> String {
 ///
 /// The default is a fallback, never an override: the operator who mirrors these artifacts changes one config line and
 /// gets their own origin here, while acceptance stays the digest's decision either way.
-pub fn resolve_origin(configured: Option<&str>) -> &str {
-    configured.unwrap_or(crate::pins::DEFAULT_ORIGIN)
+///
+/// **`None` means refuse, not fall back.** Each default is the address *those* bytes came from, so borrowing another
+/// id's origin would ask a stranger for bytes this build never vouched for there; a caller that gets `None` names the id
+/// and stops. A configured `base_url` is always honoured — it is the operator's own statement of where to look, and it
+/// covers every pinned filename from one flat directory.
+pub fn resolve_origin<'a>(id: &str, configured: Option<&'a str>) -> Option<&'a str> {
+    match configured {
+        Some(url) => Some(url),
+        None => crate::pins::default_origin(id),
+    }
 }
 
 /// The member names this build pins for `id`, in [`crate::pins::PINNED`] order — what a caller passes as `fetch`'s

@@ -2643,3 +2643,81 @@ fn links_list_refuses_a_rel_that_cannot_name_a_note() {
     assert_eq!(graph["indexed"], false, "{graph}");
     server.finish();
 }
+
+/// **`search` carries the rerank object in both channels, and a bad `rerank_text` is a fault naming itself** (**F51**).
+///
+/// Parity is the point: `np search --json` and `serve.search` are the same document built by the same function, so a client that
+/// reads `rerank.ran` works whichever door it came through. The two parameters mirror the two flags — `"rerank": true|false` says
+/// something, `null` or an absent key says nothing and lets `[search] rerank` decide — and a wrong type is refused rather than
+/// ignored, because a server that quietly dropped the option would answer a question the client did not ask.
+#[test]
+fn search_carries_the_rerank_object_and_refuses_a_bad_text_policy() {
+    let mut server = Server::new();
+    let workspace = server.root.display().to_string();
+    server.result("initialize", json!({"notifications": true}));
+    server.result("scan", json!({"workspace": workspace}));
+
+    let answer = server.result(
+        "search",
+        json!({"workspace": workspace, "query": "meeting", "limit": 5}),
+    );
+    let rerank = &answer["rerank"];
+    assert_eq!(rerank["ran"], false, "nothing installed it: {answer}");
+    assert_eq!(rerank["reason"], "disabled", "{answer}");
+    assert_eq!(rerank["text"], "title-body", "{answer}");
+    assert!(rerank["model"].is_null(), "{answer}");
+
+    // `rerank` must be a boolean or null. A string "true" is the mistake a hand-written client makes, and accepting it would
+    // mean the same request means two things depending on whose JSON library wrote the quotes.
+    let bad_flag = server.request(
+        "search",
+        json!({"workspace": workspace, "query": "meeting", "rerank": "true"}),
+    );
+    assert_eq!(bad_flag["error"]["code"], -32602, "{bad_flag}");
+    assert!(
+        bad_flag["error"]["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("rerank")),
+        "the fault names the parameter: {bad_flag}"
+    );
+
+    let bad_text = server.request(
+        "search",
+        json!({"workspace": workspace, "query": "meeting", "rerank_text": "titles"}),
+    );
+    assert_eq!(bad_text["error"]["code"], -32602, "{bad_text}");
+    let message = bad_text["error"]["message"].as_str().unwrap_or("");
+    for word in ["title-body", "body"] {
+        assert!(
+            message.contains(word),
+            "the fault offers both accepted spellings (`{word}` missing): {bad_text}"
+        );
+    }
+
+    // An accepted value answers with the policy it was given, so a measurement run can record what it asked for beside what it
+    // got — the same key the CLI prints, filled the same way.
+    let asked = server.result(
+        "search",
+        json!({"workspace": workspace, "query": "meeting", "rerank_text": "body"}),
+    );
+    assert_eq!(asked["rerank"]["text"], "body", "{asked}");
+
+    // And the explicit ask that cannot be honoured is a fault carrying the CLI's sentence, not a silent un-reranked answer.
+    // `request`, not `result`: this one is expected to come back a fault, and the helper that unwraps a result would fail the
+    // case for the right reason in the wrong place.
+    let refused = server.request(
+        "search",
+        json!({"workspace": workspace, "query": "meeting", "rerank": true}),
+    );
+    assert!(
+        refused.get("error").is_some(),
+        "`rerank: true` without a reranker refuses: {refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("rerank was requested")),
+        "the fault carries the CLI's own sentence: {refused}"
+    );
+    server.finish();
+}

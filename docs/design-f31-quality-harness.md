@@ -8,7 +8,8 @@ this document — deliberately. Nothing here measures whether search is good. It
 
 ```bash
 .github/scripts/f31_eval.py <workspace> --labels my-labels.tsv \
-    [--np target/release/np] [--modes keyword,semantic,hybrid] [--k 5] [--strict]
+    [--np target/release/np] [--modes keyword,semantic,hybrid] [--k 5] [--strict] \
+    [--rerank] [--rerank-text title-body|body]
 ```
 
 A label file is one query per line:
@@ -50,9 +51,15 @@ some queries whose answer is a figure — that is the case §14.4 cares about, a
 
 ## What is verified today
 
-+ `.github/scripts/f31_eval.py --self-test` — recall@k, MRR, the image-outranks-note count, unsurfaced counting, both empty-list cases, and the
++ `.github/scripts/f31_eval.py --self-test` — recall@k, MRR, nDCG@k, the image-outranks-note count, unsurfaced counting, both empty-list cases, and the
   exclude-the-misses mutant, against hand-computed numbers. It runs with no binary, no model and no workspace, which is why it can be a gate row:
   `gates.sh` calls it as `f31-selftest`.
++ **nDCG@k joined with the rerank stage (**F51**)**, because recall says "did it appear" and MRR says "how high", and neither notices an
+  answer sliding from rank 2 to rank 4 — which is exactly the movement a second-pass reordering lives or dies by. Binary relevance,
+  one labelled answer per query, so with a single relevant document each term is its own discount (`1 / log2(rank + 1)`), and a miss
+  scores 0 **and stays in the denominator** for the same reason MRR does: average over answered queries only and a change that loses
+  coverage scores an improvement. The self-test grades ranks `[4, miss, 1, 2]` at k=10 against `0.515401578…` written out on paper, at
+  k=3 against the truncated figure, and asserts the flattery mutant falls when an answer disappears.
 + End-to-end plumbing against the packaged `v0.2.2` Linux binary on a two-query file, one answerable and one not: `recall@1 0.500`, `MRR 0.500`,
   `unsurfaced 1`, exit 0 — and exit 3 with `--strict`. Those numbers calibrate the harness; they say nothing about search quality, which is the
   distinction the tool prints on every run so it cannot be quoted out of context by accident.

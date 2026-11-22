@@ -155,3 +155,41 @@ verification happens at use time, where reading 554 MB is already being paid for
 *those are the right bytes*. Before this field, confirming an offline projector install meant running `np embed` and watching
 `projector-absent` go away: a diagnosis standing in for a report. Re-declaring an id with a different width is refused outright, because that would silently change what every stored
 vector means; see [Troubleshooting](reference-troubleshooting.md) for the sentence it prints.
+
+## The reranker: an artifact that is not a model
+
+`np search --rerank` scores the candidates retrieval already found with a cross-encoder, which needs a second artifact —
+`bge-reranker-v2-m3`, 635,674,432 bytes in the pinned Q8_0 quantization. It is **off by default**, so nothing downloads it
+behind your back: `np scan` volunteers the embedding model and stops there, because a reranker only helps someone who asked
+for reranking.
+
+```sh
+np models install ~/Notes --id bge-reranker-v2-m3 \
+  --path ~/models/bge-reranker-v2-m3-Q8_0.gguf --sha256 d32a877b7266f5275172458616824ce6728502416672052c2da795da3389201e
+```
+
+The digest is the pin's, and saying a different one refuses the run — for a reranker the bytes are not a choice you make at
+the command line. Three flags are refused **by name** on this id rather than ignored: `--dim`, `--prefix-doc` and
+`--prefix-query` describe how a model stores vectors, and a scoring head stores none. So does `--member`: a reranker is one
+file.
+
+Because it has no row in the index's `models` table, it never appears as a selectable embedder — which is not tidiness but
+the reason there is no new role to configure: that table holds exactly two facts about an identity, its vector width and its
+two query/document prefixes, and a reranker declares neither. It gets its own line instead, in both channels:
+
+```text
+models     1
+embeddinggemma-2  present  dim 768  sha256 2188ac1deca4  installed_at 1793893791  prefix_doc ""  prefix_query ""
+reranker   bge-reranker-v2-m3  present, size matches the pin  (pin expects 635674432 bytes)
+unclaimed  0
+```
+
+`--json` carries it as a `reranker` object — `{"id", "role", "file", "state", "pinned_bytes"}` — and the key is present and
+`null` on a build that pins no reranker, so a reader never has to distinguish "absent" from "this question was not answered".
+The state is decided by **one stat**, never by hashing 635 MB to answer "is it there": `absent`, `present, size matches the
+pin`, or `present, size differs` — the last one says a partial download or somebody else's quantization is sitting at that
+name, and points at `install` above as both diagnosis and fix. Byte verification happens where reading those bytes is already
+being paid for: at install, and at load.
+
+`--dim` became optional in the argument parser with this artifact, because one subcommand now serves both shapes: an
+embedding install that omits it is still refused, by `np` rather than by the parser, in the same words.

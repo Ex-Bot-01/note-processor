@@ -111,6 +111,21 @@ pub struct Hit {
     /// failed a whole-word test, it was never in one. Under a query that asked for no prefixes every keyword hit is
     /// `Some(true)`, so this key never quietly changes meaning when a caller stops marking terms.
     pub matched_exactly: Option<bool>,
+    /// The cross-encoder's own score for this hit, or `None` whenever the stage did not score it — which covers a run with no
+    /// stage, a hit outside the reranked window, and a candidate whose text could not be read.
+    ///
+    /// **Why this is carried rather than replacing [`Hit::score`].** The list a reader sees is ordered by `score`, and after a
+    /// rerank that is no longer true inside the window; overwriting it would destroy the retrieval evidence that explains why
+    /// the note was a candidate at all. Two numbers, two meanings, one order — and the raw logit travels beside them for the
+    /// reader measuring whether the stage helps. A cross-encoder's score is a logit on an unbounded scale, so it is never
+    /// comparable across queries and never printed as though it were a probability.
+    pub rerank_score: Option<f64>,
+    /// 1-based position in the retrieval order, when this hit was inside the reranked window — the "before" half of the pair
+    /// that lets a reader see what the stage changed.
+    pub rerank_rank_before: Option<usize>,
+    /// 1-based position in the answer as delivered, for a hit the stage scored. `None` alongside [`Hit::rerank_score`]`: None`,
+    /// always: half a pair would let a report claim a position the model never earned.
+    pub rerank_rank_after: Option<usize>,
 }
 
 impl Hit {
@@ -138,6 +153,9 @@ impl Hit {
             keyword_rank: None,
             snippet: None,
             matched_exactly: None,
+            rerank_score: None,
+            rerank_rank_before: None,
+            rerank_rank_after: None,
         }
     }
 
@@ -157,6 +175,9 @@ impl Hit {
             keyword_rank: None,
             snippet: None,
             matched_exactly: None,
+            rerank_score: None,
+            rerank_rank_before: None,
+            rerank_rank_after: None,
         }
     }
 
@@ -184,6 +205,17 @@ pub enum SearchError {
     NotUnitNorm {
         /// The Euclidean length that was actually measured.
         norm: f64,
+    },
+    /// The run asked for a reranked answer **by name** and could not have one.
+    ///
+    /// This is the difference between `--rerank` and `[search] rerank = true`: configuration asks politely, so a missing
+    /// reranker warns and the retrieval order is delivered; a flag states an expectation for this run, and quietly answering
+    /// without it is how a script ends up believing it measured reranked quality. The cause travels with the refusal so the
+    /// sentence and the exit code name one fact.
+    #[error("rerank was requested and could not run: {cause}")]
+    RerankUnavailable {
+        /// Why the stage could not score, in its own words.
+        cause: RerankNote,
     },
     /// No `models` row answers to that id.
     /// The configured model id holds no vectors while this database holds some under a **different** id.
@@ -674,6 +706,61 @@ impl std::str::FromStr for SearchMode {
     }
 }
 
+/// Which text of a note the reranker is shown. Two spellings, and they are the whole vocabulary for the same reason
+/// [`SearchMode`] is the single definition of its three: `--rerank-text`, `[search] rerank_text` and `--json` all read these
+/// strings, so a word accepted by one door and refused by another — this project's split-refusal lesson — has nowhere to
+/// enter. [`RerankText::label`] is what every door prints.
+///
+/// The default scores the title and body together, which is what a cross-encoder trained on query/document pairs expects to
+/// read: a note titled "Kaffeemühle entkalken" with a body of three bullet points is a better match for "wie entkalkt man
+/// eine Kaffeemühle" than its bullets alone, because the title is where a vault says what a note *is*. `body` exists because
+/// that claim is worth measuring rather than believing — titles in some vaults are dates, or paths, or noise — and because
+/// the pair has to be built one way or the other anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RerankText {
+    /// `notes.title`, a newline, then `notes.body`. Front matter is in neither: it is metadata about the file, not prose
+    /// a reader of the note would want scored.
+    #[default]
+    TitleBody,
+    /// `notes.body` alone. Identical to [`RerankText::TitleBody`] for a note with no title — neither mode prepends a blank
+    /// line, because a leading newline is not "no title" but a token the model would attend to.
+    Body,
+}
+
+impl RerankText {
+    /// The one spelling of each policy, shared by the CLI flag, the config value and `--json`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::TitleBody => "title-body",
+            Self::Body => "body",
+        }
+    }
+}
+
+impl std::fmt::Display for RerankText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// A text policy that is not one of the two. Named rather than swallowed, and its message lists both accepted words — the
+/// same sentence from a flag and from a config key.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown rerank text `{0}`: expected `title-body` or `body`")]
+pub struct UnknownRerankText(pub String);
+
+impl std::str::FromStr for RerankText {
+    type Err = UnknownRerankText;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "title-body" => Ok(Self::TitleBody),
+            "body" => Ok(Self::Body),
+            other => Err(UnknownRerankText(other.to_string())),
+        }
+    }
+}
+
 /// One answer from the keyword list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeywordHit {
@@ -944,6 +1031,9 @@ pub struct Answer {
     pub prefix_terms: Vec<String>,
     /// The one honest sentence about a missing half, if any.
     pub note: Option<RankNote>,
+    /// What the optional cross-encoder stage did — ran, declined, or was never asked. Always present, because "was this list
+    /// reranked?" must be answerable from the document rather than inferred from an absent field (**F51**).
+    pub rerank: RerankReport,
 }
 
 impl Answer {
@@ -1189,6 +1279,10 @@ fn rrf(rank: usize) -> f64 {
 /// Ordering is the existing contract extended, not replaced: fused score descending, then display path ascending, then kind,
 /// then the raw evidence as bit patterns — so an equal-score pair still has exactly one order on every host and after every
 /// re-embed ([`search`] explains why row order may never be a tie-break).
+// Eight parameters, and the extra one is the point of this signature change. A parameter object was considered and
+// refused: seven of these are what every search already passes, so bundling them would churn every caller to carry one
+// optional stage — and `RerankInput` is already the bundle for the arguments that actually travel together.
+#[allow(clippy::too_many_arguments)]
 pub fn ranked(
     conn: &Db,
     mode: SearchMode,
@@ -1197,10 +1291,19 @@ pub fn ranked(
     query_text: &str,
     limit: usize,
     prefix: Prefix,
+    rerank: Option<RerankInput<'_>>,
 ) -> Result<Answer, SearchError> {
     // The ranking phase (diagnostics design point 7). No workspace field: this function is handed a connection, and the
     // caller that knows the vault — np-cli, or a `np serve` request span — tags everything nested inside it anyway.
     let _span = tracing::info_span!(target: crate::diagnostics::target::SEARCH, "search").entered();
+    // **Retrieval depth is not the report depth.** With a stage asking for N candidates, both halves are read to
+    // `max(limit, N)` and the fused list is truncated back to `limit` at the end, so "rerank the top 25" scores 25 candidates
+    // while stdout still holds `--limit` lines. Without the widening, `--limit 5 --rerank-top-n 25` would hand the model the
+    // five hits it was about to reorder — a stage with nothing to think about.
+    let depth = match &rerank {
+        Some(input) => limit.max(input.top_n),
+        None => limit,
+    };
     let mut semantic: Vec<Hit> = Vec::new();
     let mut semantic_used = false;
     if mode != SearchMode::Keyword {
@@ -1211,7 +1314,7 @@ pub fn ranked(
             // id" is a refusal, and only asking tells those two apart.
             let present = any_vectors_exist(conn)?;
             if mode != SearchMode::Hybrid || present {
-                semantic = search(conn, model, vector, limit)?;
+                semantic = search(conn, model, vector, depth)?;
                 semantic_used = present;
             }
         }
@@ -1242,7 +1345,7 @@ pub fn ranked(
         }
     );
     let keywords = match &plan {
-        Some(plan) => keyword_planned(conn, plan, limit)?,
+        Some(plan) => keyword_planned(conn, plan, depth)?,
         None => Vec::new(),
     };
 
@@ -1285,6 +1388,12 @@ pub fn ranked(
             .then_with(|| left.kind.cmp(&right.kind))
             .then_with(|| raw_key(left).cmp(&raw_key(right)))
     });
+    // **The stage runs on the deep list, before the truncate**, so a candidate promoted from position 30 can reach the report
+    // while a demoted one leaves it — which is the entire point of scoring more than you print.
+    let rerank_report = match rerank {
+        Some(input) => rerank_stage(conn, &mut hits, input, query_text)?,
+        None => RerankReport::disabled(),
+    };
     hits.truncate(limit);
 
     // **An empty answer says why** (the refusal sentence for hybrid, the empty-answer note for semantic). Both notes ask the same question of the
@@ -1309,7 +1418,326 @@ pub fn ranked(
         prefix_used: plan.as_ref().is_some_and(Plan::prefixes),
         prefix_terms: plan.map(|plan| plan.prefix_terms).unwrap_or_default(),
         note,
+        rerank: rerank_report,
     })
+}
+
+/// Whether a rerank stage was asked for by configuration or **by name**, which decides what a failure costs.
+///
+/// The distinction is the whole difference between a warning and exit 1: `[search] rerank = true` is a preference about how
+/// answers are ordered, and a machine without the artifact should still answer; `np search --rerank` states an expectation for
+/// this run — usually because something is measuring the difference — and answering without it would report a measurement that
+/// did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankAsk {
+    /// `[search] rerank = true`: a decline warns, and the answer arrives in retrieval order.
+    ByConfig,
+    /// `--rerank` or `"rerank": true`: a decline refuses with [`SearchError::RerankUnavailable`].
+    Explicit,
+}
+
+/// What the stage was given: a scorer, a policy for failing, a window, and which text to score.
+///
+/// `reranker` is a trait object rather than a generic because the caller's choice is a runtime one — whether the artifact is on
+/// disk, and whether this binary was built with the feature at all — and a type parameter would push that question into every
+/// caller's signature without making it any later.
+pub struct RerankInput<'a> {
+    /// The scorer. `&mut` because scoring is stateful in the real implementation: one loaded context, reused across pairs.
+    pub reranker: &'a mut dyn crate::rerank::Reranker,
+    /// Who asked, and therefore what a decline costs.
+    pub ask: RerankAsk,
+    /// How many of the top hits to score. Retrieval depth rises to cover it; the report does not.
+    pub top_n: usize,
+    /// Which text of a note the model reads.
+    pub text: RerankText,
+}
+
+/// Why a rerank stage could not run. Carried on the answer as [`RerankReport::note`] when configuration asked, and inside
+/// [`SearchError::RerankUnavailable`] when a flag did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RerankNote {
+    /// The pinned reranker artifact is not in the model directory — and nothing fetched it, because `np search` never
+    /// volunteers 635 MB, even where `[models] auto_fetch = true`. A note about a setting, not a download failure.
+    ArtifactAbsent,
+    /// This binary was built without the `local-model` feature, so no runtime exists that could load any ranker.
+    RuntimeNotBuilt,
+    /// The file is there and its bytes are not the pinned ones, so it was refused at load: a truncated download, or another
+    /// quantization under the same name. `np models install --id bge-reranker-v2-m3` is both diagnosis and fix.
+    ArtifactUnverified(String),
+    /// The ranker loaded and refused this query — a pair wider than the scoring window, or a decode that failed mid-pair.
+    CannotScore(String),
+}
+
+impl RerankNote {
+    /// The one sentence per cause, spelled once so text output, `--json` and the refusal cannot word it three ways. Each names
+    /// the next command, because "unavailable" alone has never told anyone which of two files to touch.
+    pub fn label(&self) -> String {
+        match self {
+            Self::ArtifactAbsent => format!(
+                "the reranker `{}` is not installed: run `np models install --id {} --path <file> --sha256 <digest>`, or \
+                 turn `[search] rerank` off",
+                crate::pins::RERANKER_ID,
+                crate::pins::RERANKER_ID
+            ),
+            Self::RuntimeNotBuilt => "this binary was built without the `local-model` feature, so no reranker can load; the \
+                                      rerank stage needs a build that has it"
+                .to_string(),
+            Self::ArtifactUnverified(why) => format!(
+                "the reranker on disk is not the bytes this build pins ({why}); reinstall it with `np models install --id {}`",
+                crate::pins::RERANKER_ID
+            ),
+            Self::CannotScore(why) => format!("the reranker could not score this query: {why}"),
+        }
+    }
+
+    /// The stable token for the result document's rerank `note` key. Kebab-case like every other emitted token, and prefixed
+    /// `rerank-` so it cannot be confused with [`RankNote::token`]`("artifact-missing")`, which names a different file.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::ArtifactAbsent => "rerank-artifact-missing",
+            Self::RuntimeNotBuilt => "rerank-runtime-not-built",
+            Self::ArtifactUnverified(_) => "rerank-artifact-unverified",
+            Self::CannotScore(_) => "rerank-cannot-score",
+        }
+    }
+
+    /// The same fact on the diagnostics side. Identical to [`Self::token`] here, and deliberately so: unlike `offline` versus
+    /// `fetch-offline`, no other command loses a reranker, so one token serves both channels with no aliasing.
+    #[must_use]
+    pub fn diag_rule(&self) -> &'static str {
+        match self {
+            Self::ArtifactAbsent => crate::diagnostics::rule::RERANK_ARTIFACT_MISSING,
+            Self::RuntimeNotBuilt => crate::diagnostics::rule::RERANK_RUNTIME_NOT_BUILT,
+            Self::ArtifactUnverified(_) => crate::diagnostics::rule::RERANK_ARTIFACT_UNVERIFIED,
+            Self::CannotScore(_) => crate::diagnostics::rule::RERANK_CANNOT_SCORE,
+        }
+    }
+
+    /// Report the decline once, at warn: an answer got worse and the reader can act on it. The rule token rides along, so a log
+    /// reader does not have to parse prose to learn which of four things happened.
+    pub fn report(&self) {
+        tracing::warn!(
+            target: crate::diagnostics::target::SEARCH,
+            rule = self.diag_rule(),
+            "{}",
+            self.label()
+        );
+    }
+}
+
+impl std::fmt::Display for RerankNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The same sentence [`RerankNote::label`] gives a report, so a refusal, a warning and a `--json` note cannot word one
+        // cause three ways — and [`SearchError::RerankUnavailable`]'s message is that sentence inside its own.
+        f.write_str(&self.label())
+    }
+}
+
+impl From<crate::rerank::RerankError> for RerankNote {
+    fn from(error: crate::rerank::RerankError) -> Self {
+        use crate::rerank::RerankError as E;
+        match error {
+            E::RuntimeNotBuilt => Self::RuntimeNotBuilt,
+            E::ArtifactAbsent => Self::ArtifactAbsent,
+            E::ArtifactUnverified(why) => Self::ArtifactUnverified(why),
+            // A pair over budget is one reason a scorer refuses, and the ranker's own text already carries the token counts, so
+            // it folds into the general cause rather than inventing a fifth token for one arithmetic case.
+            E::PairTooLong { tokens, budget } => Self::CannotScore(format!(
+                "{tokens} tokens need scoring but the ranking window holds {budget}"
+            )),
+            E::CannotScore(why) | E::Runtime(why) => Self::CannotScore(why),
+        }
+    }
+}
+
+/// The two reasons a stage did not run that are **not** faults. Kept apart from [`RerankNote`] because the difference is what a
+/// reader does next — nothing, in both of these cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankSkip {
+    /// No stage was asked for: the default, and the state of every search on a machine that never enabled it.
+    Disabled,
+    /// A stage was asked for and found nothing to score — no hits, or hits that are all figures.
+    NoCandidates,
+}
+
+impl RerankSkip {
+    /// The result-document token. **Not** a diagnostic rule token: nothing was degraded, so there is nothing to alert on — the
+    /// same split [`RankNote::token`] documents between result keys and diagnostic rules.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NoCandidates => "no-candidates",
+        }
+    }
+}
+
+/// What the stage did, on every answer — including the answers where it was never offered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RerankReport {
+    /// Whether candidates were scored and the window reordered.
+    pub ran: bool,
+    /// Set when the stage did not run for a non-fault reason.
+    pub skip: Option<RerankSkip>,
+    /// Set when it could not run at all. Already reported once on the way in; the answer still holds retrieval order.
+    pub note: Option<RerankNote>,
+    /// How many candidates were actually scored — `min(top_n, note hits)` minus any whose text could not be read. The number
+    /// that costs the run, which is why it is not a copy of [`RerankInput::top_n`].
+    pub candidates: usize,
+}
+
+impl RerankReport {
+    /// The report of a run that never had a stage: `disabled`, nothing scored, nothing to say.
+    fn disabled() -> Self {
+        Self {
+            ran: false,
+            skip: Some(RerankSkip::Disabled),
+            note: None,
+            candidates: 0,
+        }
+    }
+}
+
+/// Reorder the first `top_n` **note** hits by cross-encoder score, leaving the tail and every figure where retrieval put it.
+///
+/// Three properties the implementation exists to keep:
+///
+/// * **Only scored slots move.** Candidates are the first N note hits in fused order; a slot whose text cannot be read (a row
+///   that vanished between retrieval and scoring, or a path whose stored bytes do not round-trip through the display string) is
+///   simply not among the slots in play, so it keeps its position while the readable ones permute among their own. Scoring
+///   empty text to fill a slot would invent a judgement about a note the stage could not read.
+/// * **Figures are never candidates.** The stage scores query/document pairs of prose; an image hit has no text of its own, and
+///   moving one because a nearby note's score moved would be a claim about pixels the model never saw.
+/// * **Ties keep retrieval order**, because [`crate::rerank::rank_order`] is stable and the incoming order is already total
+///   (score, path bytes, kind, raw evidence). No second tie-break here: one ordering argument, not two that can disagree.
+fn rerank_stage(
+    conn: &Db,
+    hits: &mut [Hit],
+    input: RerankInput<'_>,
+    query_text: &str,
+) -> Result<RerankReport, SearchError> {
+    let RerankInput {
+        reranker,
+        ask,
+        top_n,
+        text,
+    } = input;
+
+    // Which slots are in play, and the paths to read for them. Ascending slot order is retrieval order, which is what makes
+    // `rank_order`'s stability a tie-break on the existing total order rather than on nothing.
+    let wanted: Vec<(usize, String)> = hits
+        .iter()
+        .enumerate()
+        .filter(|(_, hit)| hit.kind == HitKind::Note)
+        .take(top_n)
+        .map(|(index, hit)| (index, hit.path.clone()))
+        .collect();
+
+    let mut report = RerankReport {
+        ran: false,
+        skip: Some(RerankSkip::NoCandidates),
+        note: None,
+        candidates: 0,
+    };
+    if wanted.is_empty() {
+        return Ok(report);
+    }
+
+    let paths: Vec<&str> = wanted.iter().map(|(_, path)| path.as_str()).collect();
+    let texts = note_texts(conn, &paths, text)?;
+    // Only the readable ones are scored, and their slots stay put around them.
+    let scored: Vec<(usize, String)> = wanted
+        .iter()
+        .zip(texts)
+        .filter_map(|((slot, _), text)| text.map(|text| (*slot, text)))
+        .collect();
+    if scored.is_empty() {
+        return Ok(report);
+    }
+
+    let borrowed: Vec<&str> = scored.iter().map(|(_, text)| text.as_str()).collect();
+    let scores = match reranker.score(query_text, &borrowed) {
+        Ok(scores) => scores,
+        Err(error) => {
+            let note = RerankNote::from(error);
+            // One report either way, before the policy decides: the log records what happened even when the run declines to
+            // answer at all, so an operator reading the file does not need the exit code to learn the cause.
+            note.report();
+            if ask == RerankAsk::Explicit {
+                return Err(SearchError::RerankUnavailable { cause: note });
+            }
+            report.note = Some(note);
+            report.skip = None;
+            return Ok(report);
+        }
+    };
+
+    let order = crate::rerank::rank_order(&scores);
+    // Snapshot the candidates, then write them back into **the same slots** in scored order: the window reorders, the tail never
+    // moves, and an unreadable slot is not among those in play. Evidence travels with the hit rather than the slot — `before` is
+    // where this candidate sat in retrieval order, `after` where the stage put it, both 1-based and counted in the deep list, so
+    // "it was ranked 31st" stays true on a run whose report prints five lines.
+    let snapshot: Vec<Hit> = scored.iter().map(|(slot, _)| hits[*slot].clone()).collect();
+    for (position, &candidate) in order.iter().enumerate() {
+        let slot = scored[position].0;
+        hits[slot] = snapshot[candidate].clone();
+        hits[slot].rerank_score = Some(scores[candidate]);
+        hits[slot].rerank_rank_before = Some(scored[candidate].0 + 1);
+        hits[slot].rerank_rank_after = Some(slot + 1);
+    }
+
+    report.ran = true;
+    report.skip = None;
+    report.candidates = scored.len();
+    Ok(report)
+}
+
+/// The text each candidate is scored on, in the order asked for, with `None` where no live row answers.
+///
+/// One prepared read-only statement bound per path — the shape every other search read uses, and still a `SELECT`, so
+/// `tests/search.rs`'s `searching_writes_nothing` covers the stage without knowing it exists.
+///
+/// Matching on the **display** path is what makes a note whose stored bytes are not valid UTF-8 answer `None`: its text is not
+/// scored against a lossy rendering of its own name, and its slot keeps its retrieval position instead. A rare note, an honest
+/// degradation, stated in this comment rather than papered over in code.
+fn note_texts(
+    conn: &Db,
+    paths: &[&str],
+    text: RerankText,
+) -> Result<Vec<Option<String>>, SearchError> {
+    use rusqlite::OptionalExtension as _;
+    let mut statement = conn
+        .0
+        .prepare_cached("SELECT title, body FROM notes WHERE rel = ?1")
+        .map_err(DbError::from)?;
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let row = statement
+            .query_row(rusqlite::params![path], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()
+            .map_err(DbError::from)?;
+        let Some((title, body)) = row else {
+            out.push(None);
+            continue;
+        };
+        // `body` is NOT NULL in every migration that made it, so the default is a belt rather than a plan — and an empty note is
+        // still a real, rankable note, which is why this does not become a `None`.
+        let body = body.unwrap_or_default();
+        out.push(Some(match text {
+            // A title that is NULL or empty adds nothing — and must not add a newline either, which would score the *absence* of
+            // a title as if it were a blank line of prose.
+            RerankText::TitleBody => match title.filter(|title| !title.is_empty()) {
+                Some(title) => format!("{title}\n{body}"),
+                None => body,
+            },
+            RerankText::Body => body,
+        }));
+    }
+    Ok(out)
 }
 
 /// The last-resort ordering key: the raw evidence, as bit patterns, so `None` sorts before any number and two hits with equal

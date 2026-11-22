@@ -25,18 +25,15 @@ there at all (`docs/developing.md`); a locally packaged release carries **the on
 and its notes say so. Source builds need no CI and no minutes:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.6.1 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.7.0 -p np-cli --locked
 ```
 
 A source build is the only shape you can choose features on: `--features local-model` puts the inference runtime in the binary, and adding
 `,vision` adds figure encoding. Neither is needed to index or to search by keyword.
 
-**Current release: `v0.6.1` (2026-11-21).** A patch in this repository's strict sense: nothing a client or a vault can see changed — protocol
-**1**, ten methods, no key added or removed, `INDEX.md`'s bytes identical, and the same cosines to the last digit. What moved is the source
-layout (`main.rs` 3,234 lines → 328; `db.rs` and `scan.rs` split at their seams) and what the comments cite. Its page carries the one caveat
-below, because it is a property of *how* an archive is built rather than of any release.
+**Current release: `v0.7.0` (2026-11-22).** A **minor** release: keys appear where a client can read them, and no method is added. The protocol stays **1**, `initialize` still answers the same ten methods in the same order, `INDEX.md`'s bytes are unchanged, and an existing workspace database opens as it is with no migration. What arrived is **F51**, an optional rerank stage for `np search`: a cross-encoder (`bge-reranker-v2-m3`, GGUF, loaded in-process by the same pinned llama.cpp that already runs the embedding model) rescores the first `rerank_top_n` note hits after retrieval. It is **off by default**, it is never fetched by a search even with `[models] auto_fetch = true`, and a build without `--features local-model` refuses it in words rather than pretending. The keys that moved: each `search` hit gains `rerank_score`, `rerank_rank_before`, `rerank_rank_after` (all `null` when the stage did not run), the document gains a top-level `rerank` object, and `search` accepts the optional `rerank` / `rerank_text` parameters. Everything else — the ranking of an un-reranked query, every byte of text output for one, the catalog, the database schema — is what `v0.6.1` produced; `release-notes/v0.7.0.md` carries the measurements behind that sentence.
 
-The two `v0.6.1` archives, as published (2026-11-21), measured from a fresh download of the page and confirmed by `sha256sum -c SHA256SUMS.txt`
+Previous release `v0.6.1`: its two archives, as published (2026-11-21), measured from a fresh download of the page and confirmed by `sha256sum -c SHA256SUMS.txt`
 (which lists exactly these two names and nothing inside them):
 
 ```text

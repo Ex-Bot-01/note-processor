@@ -8,7 +8,7 @@
 
 use np_core::db::{self, Db};
 use np_core::embed::Vector;
-use np_core::search::{self, HitKind, SearchMode};
+use np_core::search::{self, HitKind, RerankText, SearchMode};
 use tempfile::TempDir;
 
 const MODEL: &str = "fixture@1";
@@ -134,6 +134,7 @@ impl Fixture {
             query_text,
             10,
             search::Prefix::Marked,
+            None,
         )
         .expect("the search answers");
         answer
@@ -350,6 +351,7 @@ fn a_hit_found_by_both_lists_outranks_one_found_by_either_alone() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("hybrid search answers");
     let paths = report.paths();
@@ -391,6 +393,7 @@ fn a_hit_found_by_both_lists_outranks_one_found_by_either_alone() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic search answers");
     // `words.md` is absent: it holds no vector, so the semantic list cannot see it at all. That absence is the same fact that
@@ -420,6 +423,7 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("keyword answers");
     assert_eq!(keyword.paths(), ["a.md"]);
@@ -436,6 +440,7 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("hybrid answers");
     // The note is vouched for twice (keyword rank 1, semantic rank 2) and the figure once — at cosine 1.0. Rank fusion ranks
@@ -450,6 +455,7 @@ fn keyword_mode_returns_no_images_and_hybrid_still_does() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic answers");
     assert_eq!(semantic.paths(), ["img/fig.png", "a.md"]);
@@ -471,6 +477,7 @@ fn no_vectors_is_a_state_and_the_report_says_which_half_answered() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("hybrid answers with no vectors at all");
     assert_eq!(report.paths(), ["a.md"]);
@@ -490,6 +497,7 @@ fn no_vectors_is_a_state_and_the_report_says_which_half_answered() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic answers empty");
     assert!(semantic.paths().is_empty());
@@ -521,6 +529,7 @@ fn a_meanings_only_search_names_the_vectors_that_are_missing() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic answers empty rather than refusing");
     assert!(semantic.paths().is_empty());
@@ -540,6 +549,7 @@ fn a_meanings_only_search_names_the_vectors_that_are_missing() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("hybrid answers from keywords");
     let hybrid_note = hybrid
@@ -570,6 +580,7 @@ fn a_meanings_only_search_names_the_vectors_that_are_missing() {
         "kafka",
         10,
         search::Prefix::Marked,
+        None,
     )
     .expect("semantic answers from the vectors that are there");
     assert_eq!(
@@ -599,6 +610,48 @@ fn mode_names_parse_refuse_and_round_trip() {
             "`{bad}` is not a mode and must not parse"
         );
     }
+}
+
+/// **The rerank text policy is spelled once too**, for the same reason and with the same fence: `--rerank-text`,
+/// `[search] rerank_text` and the `--json` echo read these two strings, and this value decides *which bytes of a note the
+/// model reads*, so a spelling accepted by one door and quietly mapped in another would change an answer with no diagnosis.
+/// Refusal wording is pinned here rather than at a print site, so a flag and a config key cannot drift into two sentences —
+/// the message names the value it was given and lists both accepted words.
+#[test]
+fn rerank_text_names_parse_refuse_and_round_trip() {
+    for (text, want) in [
+        ("title-body", RerankText::TitleBody),
+        ("body", RerankText::Body),
+    ] {
+        let parsed: RerankText = text.parse().expect("legal spelling parses");
+        assert_eq!(parsed, want);
+        assert_eq!(parsed.label(), text, "the label is the spelling");
+        assert_eq!(
+            parsed.to_string(),
+            text,
+            "and `Display` prints it rather than a debug form"
+        );
+    }
+    // `title_body` and `titlebody` are the two ways a kebab-cased word gets mistyped; `TitleBody` is someone reaching for the
+    // Rust variant name. None of them parse, because there is no case-folding to fall back on.
+    for bad in [
+        "title",
+        "titles",
+        "title_body",
+        "titlebody",
+        "TitleBody",
+        "",
+    ] {
+        assert!(
+            bad.parse::<RerankText>().is_err(),
+            "`{bad}` is not a text policy and must not parse"
+        );
+    }
+    let refusal = "titles".parse::<RerankText>().unwrap_err().to_string();
+    assert!(
+        refusal.contains("titles") && refusal.contains("title-body") && refusal.contains("body"),
+        "the refusal names the value and both accepted words: {refusal}"
+    );
 }
 
 /// **FTS5's operators are words here, not grammar.** A query is user text, and the characters that mean something to the

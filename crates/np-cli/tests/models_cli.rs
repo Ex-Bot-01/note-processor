@@ -261,13 +261,32 @@ fn keys(value: &serde_json::Value) -> Vec<String> {
 /// all four verdicts (a first start has no row at all, and a present row can be re-fetching). Adding the key had to
 /// fail this fence — three cases did, naming the new key on the left of every diff — and updating it here, with the
 /// design section named as the authority, is the whole point of pinning a key set instead of printing one.
+/// `reranker` joined this set with the rerank stage: the scoring head this build pins is reported beside the models,
+/// and it is a section rather than a row because there is no `models` row behind one — a reranker declares no vector
+/// width, so it is not a model in the sense that table means. Adding a key had to fail three cases here, and it did.
 const LIST_KEYS: &[&str] = &[
     "fetching",
     "models",
     "models_dir_error",
     "pinned",
+    "reranker",
     "unclaimed",
 ];
+
+/// The per-entry key set of the **`reranker`** section. `role` is constant today so a reader can tell this record from
+/// an embedding install without knowing which ids are pinned as what.
+const RERANKER_KEYS: &[&str] = &["file", "id", "pinned_bytes", "role", "state"];
+
+/// The reranker's expected line in text output, spelled from the pin table rather than copied out of a run: a test that
+/// hard-coded 635,674,432 would keep passing after someone re-pinned the artifact and forgot this file.
+fn expected_reranker_line() -> String {
+    let pin = np_core::pins::pinned_member(np_core::pins::RERANKER_ID, "main")
+        .expect("this build pins a reranker's main member");
+    format!(
+        "reranker   {}  absent  (pin expects {} bytes)\n",
+        pin.id, pin.size_bytes
+    )
+}
 
 /// The per-entry key set of the **`pinned`** section (**issue #3**): what a fetch of the workspace's configured model
 /// would cost, in bytes this build pinned, named by the members it would write.
@@ -590,7 +609,10 @@ fn list_on_an_empty_workspace_reports_both_counts_as_zero() {
     plain.assert_success();
     // Two count lines and nothing under them: "looked and found none" has to read differently from "printed
     // nothing", which is the same reason `np scan` prints `skipped 0`.
-    assert_eq!(plain.stdout(), "models     0\nunclaimed  0\n");
+    assert_eq!(
+        plain.stdout(),
+        format!("models     0\n{}unclaimed  0\n", expected_reranker_line())
+    );
 
     let json = run(&mut ws.list(true));
     json.assert_success();
@@ -598,6 +620,13 @@ fn list_on_an_empty_workspace_reports_both_counts_as_zero() {
     assert_eq!(keys(&report), LIST_KEYS, "{report}");
     assert_eq!(report["models"].as_array().map(Vec::len), Some(0));
     assert_eq!(report["unclaimed"].as_array().map(Vec::len), Some(0));
+    // The reranker answers on an empty workspace too — `absent`, not missing — because "nothing fetched yet" is a
+    // state of the reranker as much as of the models.
+    let reranker = &report["reranker"];
+    assert_eq!(keys(reranker), RERANKER_KEYS, "{report}");
+    assert_eq!(reranker["id"], np_core::pins::RERANKER_ID);
+    assert_eq!(reranker["role"], "rerank");
+    assert_eq!(reranker["state"], "absent");
     // Present and null on the good path — suppressing the key would cost every reader a missing-key branch.
     assert!(
         report.get("models_dir_error").is_some() && report["models_dir_error"].is_null(),
@@ -727,12 +756,37 @@ fn an_unknown_or_missing_operand_is_claps_usage_error() {
     assert_eq!(missing.stdout(), "", "clap reports on stderr");
     let text = missing.stderr();
     assert!(text.contains("Usage:"), "not a usage error:\n{text}");
-    for flag in ["--id", "--path", "--dim", "--sha256"] {
+    // `--dim` is absent from this list on purpose. Since the rerank stage it is required by `np` rather than by clap: a
+    // pinned reranker installs through this same subcommand and has no width to declare, so the width check moved to
+    // [`install_main`], which refuses in this command's own words. The next case asserts that refusal.
+    for flag in ["--id", "--path", "--sha256"] {
         assert!(
             text.contains(flag),
             "the usage error has to name the missing `{flag}`:\n{text}"
         );
     }
+    assert!(
+        !text.contains("--dim"),
+        "clap no longer demands a width, so its usage error must not either:\n{text}"
+    );
+
+    // An embedding install that omits `--dim` is refused by the command, in prose that says what the flag is for — and
+    // before the artifact is opened, since a 554 MB read teaches nothing argv has not already said.
+    let source = ws.source("artifact.bin", b"bytes with no declared width");
+    let mut no_dim = ws.models(&["install", "--id", ID]);
+    no_dim
+        .arg("--path")
+        .arg(&source)
+        .arg("--sha256")
+        .arg(source_digest(&source));
+    let refused = run(&mut no_dim);
+    refused.assert_refused();
+    assert_eq!(refused.stdout(), "");
+    assert!(
+        refused.stderr().contains("`--dim` is required"),
+        "the refusal has to name the flag and say it declares the vector width:\n{}",
+        refused.stderr()
+    );
 
     // An unknown flag.
     let unknown = run(&mut ws.models(&["list", "--nope"]));
@@ -1255,7 +1309,9 @@ fn nothing_fetching_prints_no_extra_line() {
     // already pins the byte-exact output of an empty workspace, which is the same claim with fewer parts — this
     // case is here because it says the same thing about a workspace that *has* rows and leftovers, where a
     // "fetching 0" header would otherwise be tempting.
-    assert_eq!(text.lines().count(), 4, "{text}");
+    // The reranker's one line is part of the shape now: a workspace with rows and leftovers gets exactly one line for
+    // it, whether or not the artifact was ever fetched.
+    assert_eq!(text.lines().count(), 5, "{text}");
     assert!(text.starts_with("models     1\n"), "{text}");
     assert!(text.contains("unclaimed  1\n"), "{text}");
     assert!(
@@ -2421,4 +2477,81 @@ fn pinned_survives_the_directory_level_failure() {
         Some(np_core::pins::plan_size("embeddinggemma-2")),
         "a question about bytes does not stop being answerable because a directory is broken: {report}"
     );
+}
+
+/// `np models install` for a pinned reranker refuses the three flags that describe stored vectors **by name**, before it
+/// opens the file: `--dim`, `--prefix-doc` and `--prefix-query` have nothing to describe, because a scoring head stores no
+/// vectors and gets no `models` row. A refusal naming none of them would leave the human guessing which to drop.
+#[test]
+fn installing_a_reranker_refuses_the_vector_flags_by_name() {
+    let ws = Scratch::new();
+    let source = ws.source(
+        "reranker.gguf",
+        b"short on purpose: the refusals come before any read",
+    );
+    let mut cmd = ws.models(&["install", "--id", np_core::pins::RERANKER_ID]);
+    cmd.arg("--path")
+        .arg(&source)
+        .args([
+            "--dim",
+            "1024",
+            "--prefix-doc",
+            "doc: ",
+            "--prefix-query",
+            "query: ",
+        ])
+        .arg("--sha256")
+        .arg(pinned_reranker_digest());
+
+    let refused = run(&mut cmd);
+    assert!(
+        refused.code() != 0,
+        "a reranker install carrying --dim must be refused"
+    );
+    let err = refused.stderr();
+    for flag in ["--dim", "--prefix-doc", "--prefix-query"] {
+        assert!(
+            err.contains(flag),
+            "`{flag}` must be named in the refusal:\n{err}"
+        );
+    }
+    assert!(
+        err.contains("stores none") || err.contains("ranks pairs"),
+        "the refusal has to say why it disagreed, not only that it did:\n{err}"
+    );
+    // And nothing was placed: the refusal is before the copy, not after it.
+    let listing = run(&mut ws.list(true)).json();
+    assert_eq!(listing["reranker"]["state"], "absent", "{listing}");
+}
+
+/// A reranker install declaring a digest other than the pin's refuses **and names the pinned one**. `--sha256` stays
+/// required so `np models install` keeps one shape for every artifact; for a pinned reranker it has to name bytes the
+/// pin already names, because a declared digest nobody compares is a flag that looks like a check and is not one.
+#[test]
+fn installing_a_reranker_refuses_a_digest_that_is_not_the_pinned_one() {
+    let ws = Scratch::new();
+    let source = ws.source(
+        "reranker.gguf",
+        b"whatever bytes, refused before they are read",
+    );
+    let mut cmd = ws.models(&["install", "--id", np_core::pins::RERANKER_ID]);
+    cmd.arg("--path")
+        .arg(&source)
+        .args(["--sha256", &"0".repeat(64)]);
+
+    let refused = run(&mut cmd);
+    assert_ne!(refused.code(), 0, "a wrong digest must be refused");
+    let err = refused.stderr();
+    assert!(
+        err.contains(&pinned_reranker_digest()) && err.contains("other bytes"),
+        "the refusal names the digest the pin expects and says the given one describes other bytes:\n{err}"
+    );
+}
+
+/// The reranker's pinned digest, read from the table rather than copied out of a run.
+fn pinned_reranker_digest() -> String {
+    np_core::pins::pinned_member(np_core::pins::RERANKER_ID, "main")
+        .expect("this build pins a reranker's main member")
+        .sha256
+        .to_string()
 }

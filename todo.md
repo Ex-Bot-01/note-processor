@@ -28,7 +28,8 @@ unresolved.
 
 ## Where things stand (2026-11-21)
 
-* **Shipped through `v0.6.1`** (2026-11-21): scan and index with byte-exact identity, the deterministic catalog and its
+* **Shipped through `v0.7.0`** (2026-11-22): F51, the optional rerank stage — `[search] rerank`, `--rerank` / `--no-rerank` / `--rerank-text`, a pinned reranker that is fetched and listed but never gets a `models` row, and four new diagnostic tokens. Its quality on a real vault is **not yet measured**: the DE/EN fixture, the nDCG rows and docs/measurement-rerank.md are open work.
+* **Also shipped through `v0.6.1`** (2026-11-21): scan and index with byte-exact identity, the deterministic catalog and its
   shards, the link graph, hybrid search, local embeddings behind a consent door, image vectors, `np serve` with progress
   notifications, diagnostics that stay off until asked for, and packaged releases. `v0.6.1` adds nothing a client can see:
   it is the build of `main` after the module splits and the comment diet, measured against `v0.6.0`'s own asset and found

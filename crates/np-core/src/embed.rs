@@ -246,7 +246,7 @@ pub enum EmbedError {
     /// the runtime's own diagnostic text — that text is exactly what this payload rule exists to keep out of logs,
     /// and [`EmbedError::ArtifactNotLoadable`] deliberately declines to be its carrier.
     ///
-    /// **Every label `local-model` emits, verbatim** — twenty-two, spelled out in full because this list is the only
+    /// **Every label `local-model` emits, verbatim** — twenty-five, spelled out in full because this list is the only
     /// place a reader can see what the runtime may answer, and a grep for any of them should find the string. It
     /// replaced an earlier version that listed six and described the rest as "planned, not yet reachable" for two
     /// rounds after the code could reach them.
@@ -278,7 +278,17 @@ pub enum EmbedError {
     /// Four of those twelve — the tokenizer-path four (`too long to hand to the tokenizer`, `refused to count`,
     /// `did not fit its own buffer`, `wrote into a buffer with no room`) — are raised inside the shared
     /// tokenization helper, so they are equally reachable from `LoadedModel::count_tokens`. Listing them under
-    /// `embed_text` alone is the shorter story, and R6b2's re-review asked which one it is (P2-9).
+    /// `embed_text` alone is the shorter story, and R6b2's re-review asked which one it is (P2-9). They are now shared
+    /// with rank mode too (`tokenize_with` serves both loaders), which is the reason that helper exists.
+    ///
+    /// From `local_model::load_rank` (three):
+    /// `"this artifact declares no reranking head, so it cannot score a pair"`,
+    /// `"this artifact answers with N scores per pair; this build reads one"` — one label carrying the runtime's own
+    /// count in the middle, an integer rather than runtime text — and
+    /// `"this artifact reports a classifier head this build cannot count"`. The first of the three is the only read in
+    /// this file that tells a reranker from an embedding model: rank mode *declares* its pooling strategy, so the
+    /// pooling check cannot make that distinction, and `n_cls_out` answers 1 for every architecture because
+    /// `src/llama-hparams.h` defaults it. Without the label table, `embeddinggemma-2-Q8_0.gguf` loads as a rank head.
     ///
     /// Two honesty notes, because a list of what can happen invites reading it as a list of what has: **the KV
     /// window label cannot fire on this artifact** (it has no KV cache — `create_memory` returns null, so
@@ -288,8 +298,8 @@ pub enum EmbedError {
     /// They exist because storing such a row is how a search silently returns nothing.
     ///
     /// Not one of them is llama.cpp's diagnostic text, which is that fifth class in the abstract and this payload
-    /// rule in practice. If a failure arrives that none of the twenty-two describes, the honest move is a
-    /// twenty-third label named for that class — not a wider payload here.
+    /// rule in practice. If a failure arrives that none of the twenty-five describes, the honest move is a
+    /// twenty-sixth label named for that class — not a wider payload here.
     #[error("embedding provider unavailable [{0}]")]
     Unavailable(String),
     /// A vector whose component count is not the declared one. `expected` is what was declared

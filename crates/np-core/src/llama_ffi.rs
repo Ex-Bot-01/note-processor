@@ -86,6 +86,12 @@ pub type llama_pos = i32;
 /// Sequence id; one batch can carry several sequences.
 pub type llama_seq_id = i32;
 
+/// `#define LLAMA_TOKEN_NULL -1` (`include/llama.h:39`) — what the vocabulary accessors answer for "this artifact has
+/// no such token". Mirrored as a constant rather than quoted as a literal because the two uses are different facts: a
+/// `-1` from [`llama_vocab_sep`] means "no separator exists", while a `-1` written into a batch would be an invalid
+/// token id ([`llama_decode`]'s own contract, `include/llama.h:1033`).
+pub const LLAMA_TOKEN_NULL: llama_token = -1;
+
 /// `struct llama_batch` — the input to [`llama_decode`].
 ///
 /// Field order and types copied from v0.8.0's header. The pointers do not own what they point at:
@@ -311,6 +317,34 @@ extern "C" {
     /// and answer with another, so this is never the check for a stored vector.
     pub fn llama_model_n_embd_inp(model: *const llama_model) -> i32;
 
+    /// The name of classifier output `i` (`include/llama.h:617`; body `src/llama-model.cpp:3468-3474`: returns
+    /// `classifier_labels[i].c_str()` when `i < classifier_labels.size()`, null otherwise — so the index is bounds-checked
+    /// by llama.cpp and a null answer means "this model has no labels", not "you asked out of range".
+    ///
+    /// This is how rank mode tells a reranker from anything else. [`llama_model_n_cls_out`] cannot: `src/llama-hparams.h`
+    /// defaults that field to 1 for every architecture, so an embedding model answers 1 too — and because rank mode
+    /// *declares* RANK pooling rather than reading it from the file, an embedder passes the pooling check as well. Only
+    /// the label table comes from the artifact alone: `bge-reranker-v2-m3` carries `classifier_labels = ["LABEL_0"]` and
+    /// `embeddinggemma-2` carries none, which is the difference a refusal should be built on.
+    ///
+    /// Memory: **borrowed** from `model`, valid as long as the model is and never freed by us. A caller that wants the
+    /// text after the model dies copies it (`CStr::to_str` at the load site).
+    pub fn llama_model_cls_label(model: *const llama_model, i: u32) -> *const std::ffi::c_char;
+
+    /// How many numbers a pooled RANK row holds (`include/llama.h:614`, body `src/llama-model.cpp:3464-3466`:
+    /// `return model->hparams.n_cls_out;`).
+    ///
+    /// This is the width [`llama_get_embeddings_seq`] answers with under [`LLAMA_POOLING_TYPE_RANK`] — **not**
+    /// [`llama_model_n_embd_out`], and reading it at that width is the over-read [`crate::local_model::load`] refuses
+    /// [`crate::local_model::Pooling::Rank`] for. The mirror exists so rank mode can *check* a number instead of
+    /// inheriting one: `src/llama-hparams.h:253` defaults this field to 1, so a caller that never asked would score
+    /// an artifact it had not measured.
+    ///
+    /// **Undefined behaviour for a non-classifier model** — the header's own words (`include/llama.h:612-613`), and
+    /// nothing here checks the architecture first. The only caller is the rank-mode loader, which has already loaded
+    /// an artifact whose context it is about to make RANK; no embedding path may reach this entry.
+    pub fn llama_model_n_cls_out(model: *const llama_model) -> u32;
+
     /// Vocabulary size, i.e. the number of rows in the output projection.
     pub fn llama_vocab_n_tokens(vocab: *const llama_vocab) -> i32;
 
@@ -330,6 +364,32 @@ extern "C" {
     /// deprecation warning as [`llama_vocab_get_add_bos`]; both are set for `embeddinggemma-2`, which is why
     /// this build reads them separately instead of assuming one.
     pub fn llama_vocab_get_add_eos(vocab: *const llama_vocab) -> bool;
+
+    /// Whether a tokenisation request with `add_special = true` inserts the separator token. Same owner as the two
+    /// flags above, and the same reason to read it rather than assume it: builds of one model differ here — the
+    /// pinned reranker declares `tokenizer.ggml.add_sep_token`, while another publisher's quantization of the same
+    /// weights omits the key, and `src/llama-vocab.cpp:2986-2988` only sets the flag when the key is present.
+    pub fn llama_vocab_get_add_sep(vocab: *const llama_vocab) -> bool;
+
+    // ---- the special tokens themselves -----------------------------------------
+    //
+    // Mirrored as a set because a scored (query, document) pair is assembled from all three: which of them appear is
+    // decided by the `llama_vocab_get_add_*` flags above and which id to write by these. Declaring one without the
+    // others would leave a caller to hard-code an id out of a model card.
+
+    /// The beginning-of-sentence token (`include/llama.h:1217`; body `src/llama-vocab.cpp:4739-4741`).
+    /// [`LLAMA_TOKEN_NULL`] (-1) when this vocabulary has none — an absent special token is an answer, not an error.
+    pub fn llama_vocab_bos(vocab: *const llama_vocab) -> llama_token;
+
+    /// The end-of-sentence token (`include/llama.h:1218`). [`LLAMA_TOKEN_NULL`] when there is none. For a BERT-family
+    /// artifact this is the same id as [`llama_vocab_sep`], which is why an assembler must take the ids from here
+    /// rather than conclude from one number that two roles share a token.
+    pub fn llama_vocab_eos(vocab: *const llama_vocab) -> llama_token;
+
+    /// The sentence separator (`include/llama.h:1220`; body `src/llama-vocab.cpp:4756-4758`). Defaults to
+    /// [`LLAMA_TOKEN_NULL`] (`src/llama-vocab.cpp:2107`) and is filled from `tokenizer.ggml.seperator_token_id`, so a
+    /// pair recipe that assumed a separator id would be writing a token this vocabulary has never heard of.
+    pub fn llama_vocab_sep(vocab: *const llama_vocab) -> llama_token;
 
     // ---- context --------------------------------------------------------------
 

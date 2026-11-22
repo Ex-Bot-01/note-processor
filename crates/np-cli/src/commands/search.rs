@@ -80,8 +80,22 @@ pub(crate) struct SearchRun {
     pub(crate) offline: bool,
     /// The id whose model (if any) embedded the query — needed only by the text channel's "nothing indexed for …" sentence.
     pub(crate) model: String,
+    /// What the optional cross-encoder stage did. Always carried, including on a run that never asked (**F51**): "was this list
+    /// reranked?" is answered from the document rather than inferred from an absent key.
+    pub(crate) rerank: search::RerankReport,
+    /// The reranker id when a stage was planned, `None` when it was not — so `model` says which artifact could have scored, and
+    /// never names one that was not asked for.
+    pub(crate) rerank_model: Option<String>,
+    /// Which text of a note the policy reads. Carried even when the stage is off, because the answer to "what would it score?"
+    /// is a fact about this run's configuration and a reader measuring the two policies needs it before they ask.
+    pub(crate) rerank_text: search::RerankText,
 }
 
+// Nine parameters, and the last two are what this signature grew for. A parameter object was considered for the pair and
+// refused: they are read once, at the door, and bundling them would name a type that exists only to be unpacked — while every
+// existing caller would still pass the other seven. The precedent is `search::ranked`, which carries its stage arguments in
+// `RerankInput` because those *do* travel together into one call.
+#[allow(clippy::too_many_arguments)]
 /// Run one search. `announce` is the human channel: it lets provider resolution print what it is about to download, and is off for `--json` and
 /// for `np serve`, where the document carries those facts instead (`fetched.origin_kind`, `reason`).
 pub(crate) fn search_run(
@@ -92,10 +106,33 @@ pub(crate) fn search_run(
     prefix: search::Prefix,
     announce: bool,
     progress: &dyn np_core::progress::Progress,
+    rerank: Option<bool>,
+    rerank_text: Option<search::RerankText>,
 ) -> Result<SearchRun, Box<dyn Error>> {
     let cfg = load_config()?;
     // Config first, flag over it: `[search] mode` is the standing choice and `--mode` is the exception to it.
     let mode = mode.unwrap_or(cfg.search.mode);
+    // **The rerank door, opened before any retrieval**, so an explicit `--rerank` that cannot be honoured refuses before the run
+    // has cost anything — and so a decline carries the same cause into both channels instead of being rediscovered at print time.
+    let plan = crate::commands::rerank::plan(&cfg, rerank, rerank_text);
+    let mut scorer: Option<Box<dyn np_core::rerank::Reranker>> = None;
+    let mut declined: Option<search::RerankNote> = None;
+    if let Some(plan) = &plan {
+        match crate::commands::rerank::prepare(&cfg, workspace, plan, announce)? {
+            crate::commands::rerank::Opened::Ready(loaded) => scorer = Some(loaded),
+            crate::commands::rerank::Opened::Declined(note) => declined = Some(note),
+        }
+    }
+    if let (Some(note), Some(plan)) = (&declined, &plan) {
+        // Reported once here rather than at every print site; the explicit case then refuses with that same sentence inside its
+        // own, so stdout's absence and stderr's line describe one fact.
+        note.report();
+        if plan.ask == search::RerankAsk::Explicit {
+            return Err(Box::new(search::SearchError::RerankUnavailable {
+                cause: note.clone(),
+            }));
+        }
+    }
     let db = workspace_db(&cfg, workspace)?;
     // **Asked before any work, because it is a fact about the workspace rather than about the answer** (#5).
     // `workspace_db` above has already opened (and so minted) the database, which is why this reads the scan
@@ -289,6 +326,17 @@ pub(crate) fn search_run(
         query,
         limit,
         prefix,
+        match (&mut scorer, &plan) {
+            (Some(scorer), Some(plan)) => Some(search::RerankInput {
+                reranker: scorer.as_mut(),
+                ask: plan.ask,
+                top_n: plan.top_n,
+                text: plan.text,
+            }),
+            // Either no stage was asked for, or it was and could not open — a decline already decided above, so the answer here
+            // is retrieval order with `disabled`/`note` reported from `declined` below.
+            _ => None,
+        },
     )?;
     let hits = answer.hits;
     let note = note.or(answer.note);
@@ -310,6 +358,23 @@ pub(crate) fn search_run(
         fetched,
         offline,
         model,
+        rerank: declined
+            .map(|note| search::RerankReport {
+                ran: false,
+                // `skip` stays `None`: this is not one of the two non-fault reasons, it is a cause with its own token.
+                skip: None,
+                note: Some(note),
+                candidates: 0,
+            })
+            .unwrap_or(answer.rerank),
+        rerank_model: plan
+            .as_ref()
+            .map(|_| np_core::pins::RERANKER_ID.to_string()),
+        // The policy that applies to this run — flag over config — reported **whether or not a stage ran**. Two reasons it is
+        // not read off the plan: a measurement wants the key to say what it asked for even on the run where the artifact was
+        // missing, and a key that silently reverted to the default whenever reranking was off would make the two directions of
+        // `--rerank`/`--no-rerank` indistinguishable in the document.
+        rerank_text: rerank_text.unwrap_or(cfg.search.rerank_text),
     })
 }
 
@@ -346,16 +411,44 @@ pub(crate) fn search_document(run: &SearchRun) -> Value {
         "reason": run.note.as_ref().map(search::RankNote::token),
         "fetched": run.fetched.clone(),
         "offline": run.offline,
+        // **What the optional rerank stage did** (**F51**), always present. `reason` is one key for both kinds of "did not run"
+        // — a non-fault (`disabled`, `no-candidates`) and a cause (`rerank-artifact-missing`, …) — because they answer the same
+        // question, "why is this still retrieval order?", and a caller that branched on two keys would have to know which kind it
+        // was asking about. `note` carries the sentence when there is a cause; `model` names the artifact only when one was asked
+        // for; `text` says what that artifact reads, so a measurement can record the policy beside its numbers.
+        "rerank": {
+            "ran": run.rerank.ran,
+            "reason": run
+                .rerank
+                .skip
+                .map(|skip| skip.token())
+                .or_else(|| run.rerank.note.as_ref().map(|note| note.token())),
+            "note": run.rerank.note.as_ref().map(search::RerankNote::label),
+            "candidates": run.rerank.candidates,
+            "model": run.rerank_model,
+            "text": run.rerank_text.label(),
+        },
     })
 }
 
+/// Parsing `--rerank-text`, with the same sentence [`np_core::search::RerankText`]'s `FromStr` gives a config key: one wording
+/// for both doors, so a person who mistypes the value learns the two accepted words whichever door they typed it into.
+pub(crate) fn parse_rerank_text(
+    text: &str,
+) -> Result<search::RerankText, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(text.parse()?)
+}
+
 /// `np search`: run the query, then print it in the channel the caller asked for.
+#[allow(clippy::too_many_arguments)] // argv-shaped: one argument per flag, and every caller is `main`'s dispatch
 pub(crate) fn search_workspace(
     workspace: &Path,
     query: &str,
     limit: usize,
     mode: Option<search::SearchMode>,
     prefix: search::Prefix,
+    rerank: Option<bool>,
+    rerank_text: Option<search::RerankText>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let run = search_run(
@@ -366,6 +459,8 @@ pub(crate) fn search_workspace(
         prefix,
         !json,
         np_core::progress::none(),
+        rerank,
+        rerank_text,
     )?;
     if json {
         emit_json(&search_document(&run));
@@ -382,6 +477,12 @@ pub(crate) fn search_workspace(
         ..
     } = run;
     let mut out = io::stdout().lock();
+    if let Some(note) = &run.rerank.note {
+        // One line on stderr for the stage that declined, beside the list it did not reorder: exit 0 because the answer is real,
+        // a sentence because "silently un-reranked" is how a person stops trusting an ordered list. `--json` carries the same
+        // cause in `rerank.note` / `rerank.reason` instead of printing prose.
+        let _ = writeln!(io::stderr(), "{note}");
+    }
     if let Some(reason) = note {
         // One line on stderr for a half that was not there to answer. Stderr because stdout stays parseable; the exit code is
         // still 0 when the keyword list answered, which is the point of the mode.
@@ -435,7 +536,10 @@ pub(crate) fn search_workspace(
     for hit in &hits {
         // Score to four decimals (full precision travels in `--json`), kind padded so the paths start in one column. In
         // hybrid the score is a fused rank sum, not a similarity — which is why the raw numbers ride beside it here too.
-        let score = number(hit.score);
+        // The score column shows whatever ordered this list. After a rerank that is the cross-encoder's number, and printing the
+        // retrieval score here instead would put a number beside an order it did not produce — while `--json` keeps both, because
+        // a machine reader wants to see the two passes separately.
+        let score = number(hit.rerank_score.unwrap_or(hit.score));
         let evidence = match (hit.cosine, hit.bm25) {
             (Some(cosine), Some(bm25)) => format!("cos {} bm25 {}", number(cosine), number(bm25)),
             (Some(cosine), None) => format!("cos {}", number(cosine)),
@@ -500,6 +604,9 @@ pub(crate) fn search_workspace(
 /// and an empty array on the other would put the schema back where `kind`-dependent keys left it.
 fn hit_json(hit: &Hit) -> Value {
     json!({
+        // **The retrieval score, always** — the number that made this hit a candidate. It is *not* overwritten by a rerank, so a
+        // reader can tell which pass produced the order they are looking at and measure the stage against retrieval instead of
+        // taking its word for an improvement.
         "score": hit.score,
         // The two raw numbers beside the fused score. In `hybrid` a reader cannot recover them from `score`, and
         // judging ranking needs both columns; in a single-list mode one of them is `null`, which is the same
@@ -510,6 +617,12 @@ fn hit_json(hit: &Hit) -> Value {
         // `--mode keyword` — which is a different fact from "rank 0".
         "semantic_rank": hit.semantic_rank,
         "keyword_rank": hit.keyword_rank,
+        // The cross-encoder's own evidence (**F51**), all three `null` for a hit it did not score. `rerank_score` is a logit on
+        // an unbounded scale: comparable within one query only, and never a probability. The two ranks are the pair that shows
+        // what the stage moved — retrieval position in, delivered position out.
+        "rerank_score": hit.rerank_score,
+        "rerank_rank_before": hit.rerank_rank_before,
+        "rerank_rank_after": hit.rerank_rank_after,
         "kind": hit.kind.label(),
         "path": hit.path,
         // A matched phrase from the note body with the hit marked, or `null` on a vector-only hit: keyword evidence is a

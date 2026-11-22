@@ -190,7 +190,7 @@ fn fetch(
     let table = table();
     let plan = Expectation {
         table: &table,
-        declaration: &declaration(),
+        declaration: Some(&declaration()),
     };
     let transfer = fetch::Transfer::new(transport, 1_730_000_000).reporting(progress);
     fetch::fetch_with_progress(db, models, "test-model", requested, &plan, &transfer)
@@ -369,7 +369,7 @@ fn the_noop_reporter_keeps_the_old_fetch_signature_working() {
         1_730_000_000,
         &Expectation {
             table: &table,
-            declaration: &declaration,
+            declaration: Some(&declaration),
         },
     )
     .expect("the wrapper still fetches");

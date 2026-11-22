@@ -18,7 +18,7 @@ use np_core::fetch::MemberPin;
 use np_core::fetch::{self, Body, Declaration, Expectation, FetchError, Transport};
 use np_core::hash::sha256_bytes;
 use np_core::models::{self, FetchState};
-use np_core::pins::DEFAULT_ORIGIN;
+use np_core::pins::{default_origin, DEFAULT_ORIGINS, RERANKER_ID};
 use tempfile::TempDir;
 
 /// What a member's body should do when opened.
@@ -237,7 +237,7 @@ fn a_verified_pair_is_published_and_no_fetch_name_survives() {
         1_730_000_000,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect("both members verify");
@@ -307,7 +307,7 @@ fn the_marker_exists_while_bytes_are_arriving() {
         1_730_000_001,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect("the observed fetch completes");
@@ -342,7 +342,7 @@ fn a_second_fetch_refuses_while_a_marker_exists_and_names_the_way_out() {
         1_730_000_002,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect_err("an existing marker is consent already given");
@@ -390,7 +390,7 @@ fn an_unreadable_marker_is_reported_and_left_in_place() {
         1_730_000_003,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect_err("a marker this build cannot read is not an absent marker");
@@ -423,7 +423,7 @@ fn a_short_stream_refuses_and_leaves_nothing_behind() {
         1_730_000_004,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect_err("a truncated transfer is not a verified artifact");
@@ -924,20 +924,130 @@ fn every_refusal_message_is_free_of_the_origin() {
 }
 
 #[test]
-fn an_unconfigured_run_resolves_to_the_baked_default_origin() {
+fn an_unconfigured_run_resolves_to_that_ids_baked_default_origin() {
     // §12 rule 7 as amended 2026-11-04: with nothing configured, a fetch has somewhere to dial, because an install
-    // that cannot reach a network is an install nobody completes. The value comes from the pin table, so the
-    // accepted bytes and the place they are asked for are reviewed in one file.
-    assert_eq!(fetch::resolve_origin(None), DEFAULT_ORIGIN);
+    // that cannot reach a network is an install nobody completes. The value comes from the pin table, so the accepted
+    // bytes and the place they are asked for are reviewed in one file — and since two ids are pinned, it is *that id's*
+    // row the answer comes from: borrowing another id's host would ask a stranger for bytes nobody vouched for there.
+    assert_eq!(
+        fetch::resolve_origin("embeddinggemma-2", None),
+        default_origin("embeddinggemma-2")
+    );
+    assert_eq!(
+        fetch::resolve_origin(RERANKER_ID, None),
+        default_origin(RERANKER_ID)
+    );
+    assert_ne!(
+        default_origin("embeddinggemma-2"),
+        default_origin(RERANKER_ID),
+        "two publishers, so one shared default could only be wrong for one of them"
+    );
+    // An id with no compiled-in origin gets `None`, which every caller turns into a refusal rather than a guess.
+    assert_eq!(fetch::resolve_origin("some-other-model", None), None);
 }
 
 #[test]
 fn a_configured_origin_beats_the_baked_default() {
     // The mirror case, which is what makes the baked default safe rather than convenient: one config line moves the
-    // transfer, and nothing about acceptance changes because the digest still decides. `fetch_http.rs`'s cases are
-    // the other half of this claim — they hand a loopback origin to the same transport and get bytes from it.
+    // transfer for **every** id at once — `[models] base_url` is one flat directory holding every pinned filename —
+    // and nothing about acceptance changes because the digest still decides. `fetch_http.rs`'s cases are the other half
+    // of this claim: they hand a loopback origin to the same transport and get bytes from it.
     let mirror = "http://127.0.0.1:40313/models";
-    assert_eq!(fetch::resolve_origin(Some(mirror)), mirror);
+    assert_eq!(
+        fetch::resolve_origin("embeddinggemma-2", Some(mirror)),
+        Some(mirror)
+    );
+    assert_eq!(
+        fetch::resolve_origin(RERANKER_ID, Some(mirror)),
+        Some(mirror),
+        "one config line moves both ids, because a mirror is one flat directory of filenames"
+    );
+}
+
+/// An artifact with no declared identity — which today means one thing, a reranker — is published by digest and writes
+/// **no `models` row**. That row is what makes two stored vectors comparable, and nothing about a scoring head is; and a
+/// row would also list it among the embedders `np models set-default` offers to choose from.
+#[test]
+fn a_fetch_with_no_declaration_publishes_bytes_and_writes_no_row() {
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    fake.serve("main", Serve::Full(MAIN.to_vec()));
+
+    let plan = Expectation {
+        table: &table,
+        declaration: None,
+    };
+    let report = fetch::fetch_with_table(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        1_730_000_000,
+        &plan,
+    )
+    .expect("the bytes verify against the pin even when nothing is declared");
+
+    assert_eq!(
+        fs::read(models.join("test-model")).expect("published at the id"),
+        MAIN,
+        "the artifact lands exactly where a row-owning fetch would put it"
+    );
+    assert!(report.wrote_anything(), "bytes did move");
+    assert!(
+        db::model_row(&db, "test-model")
+            .expect("queryable")
+            .is_none(),
+        "an undeclared fetch must not create a `models` row"
+    );
+    let names: Vec<String> = fs::read_dir(&models)
+        .expect("the directory exists")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["test-model".to_string()],
+        "no marker and no `.part` survive a completed fetch"
+    );
+}
+
+/// The same absence on the failure side: wrong bytes for an id with no declaration leave nothing published and still
+/// write no row — the digest decides acceptance whether or not anything is recorded afterwards.
+#[test]
+fn an_undeclared_fetch_that_fails_verification_leaves_nothing_behind() {
+    let tmp = dir();
+    let db = db();
+    let models = tmp.path().join("models");
+    let table = table(MAIN, EXTRA);
+    let fake = Fake::new();
+    // Right length, wrong bytes: the size check passes and the digest is what refuses.
+    fake.serve("main", Serve::Full(vec![7u8; MAIN.len()]));
+
+    let plan = Expectation {
+        table: &table,
+        declaration: None,
+    };
+    let err = fetch::fetch_with_table(
+        &db,
+        &models,
+        "test-model",
+        &["main"],
+        &fake,
+        1_730_000_000,
+        &plan,
+    )
+    .expect_err("bytes that do not hash to the pin are refused");
+    assert!(
+        matches!(err, FetchError::DigestMismatch { .. }),
+        "expected a digest refusal, got {err:?}"
+    );
+    assert_nothing_left(tmp.path(), &models);
+    assert!(db::model_row(&db, "test-model")
+        .expect("queryable")
+        .is_none());
 }
 
 // --- helpers ---------------------------------------------------------------------------------------------
@@ -954,7 +1064,7 @@ fn fetch_ok<T: MemberPin>(
 ) {
     let plan = Expectation {
         table,
-        declaration: &declaration(),
+        declaration: Some(&declaration()),
     };
     fetch::fetch_with_table(db, models, id, requested, transport, now, &plan)
         .unwrap_or_else(|err| panic!("the fetch of `{id}` should succeed: {err}"));
@@ -972,7 +1082,7 @@ fn refusal<T: MemberPin>(
 ) -> FetchError {
     let plan = Expectation {
         table,
-        declaration: &declaration(),
+        declaration: Some(&declaration()),
     };
     match fetch::fetch_with_table(db, models, id, requested, transport, now, &plan) {
         Ok(report) => panic!("expected a refusal for `{id}`, got {report:?}"),
@@ -1014,7 +1124,11 @@ fn write_marker_raw(models: &Path, id: &str, body: &str) {
 
 /// §12 rule 8, spelled as an assertion: no part of an origin appears in a report.
 fn assert_no_url_pieces(text: &str) {
-    for forbidden in [
+    // The list starts with **every** compiled-in origin — rule 8 gained a second one when a second publisher arrived, and
+    // a check written against a single string would have quietly stopped covering the new host. Then the shapes a message
+    // could plausibly echo.
+    let mut forbidden: Vec<&str> = DEFAULT_ORIGINS.iter().map(|(_, origin)| *origin).collect();
+    forbidden.extend([
         "http://",
         "https://",
         "127.0.0.1",
@@ -1025,11 +1139,9 @@ fn assert_no_url_pieces(text: &str) {
         "upstream.invalid",
         "other-host.example",
         "bob@example.com",
-        // The baked default is a real host, so rule 8 now has something to leak. Nothing may print it: the full
-        // origin and the part of it a message could plausibly echo are both on the list.
-        DEFAULT_ORIGIN,
         "huggingface",
-    ] {
+    ]);
+    for forbidden in forbidden {
         assert!(
             !text.contains(forbidden),
             "a refusal named {forbidden:?} — §12 rule 8 says a class, never a URL: {text}"
@@ -1418,7 +1530,7 @@ fn a_transport_that_never_opens_leaves_no_directory_at_all() {
         1_730_000_040,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect_err("a transport that cannot open is not a fetch");
@@ -1450,7 +1562,7 @@ fn a_truncated_transfer_also_leaves_no_directory_behind() {
         1_730_000_041,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect_err("a short stream is refused");
@@ -1484,7 +1596,7 @@ fn a_directory_this_call_did_not_create_is_never_removed() {
         1_730_000_042,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect_err("refused");
@@ -1519,7 +1631,7 @@ fn an_empty_directory_this_call_did_not_create_survives_a_failed_fetch() {
         1_730_000_043,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect_err("refused");
@@ -1608,7 +1720,7 @@ fn an_over_long_stream_refuses_at_the_pin_instead_of_filling_the_disk() {
         1_730_000_041,
         &Expectation {
             table: &table,
-            declaration: &declaration(),
+            declaration: Some(&declaration()),
         },
     )
     .expect_err("a body longer than the pin is not the pinned artifact");

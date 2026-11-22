@@ -53,9 +53,14 @@ pub(crate) enum ModelsCommand {
         /// The artifact file to install. It is read and copied, never moved or truncated.
         #[arg(long)]
         path: PathBuf,
-        /// Declared vector width, 1 to 65535 — declared here, never probed. Required unless `--member` names a member;
-        /// refused outright when it does, because only the main artifact has a width.
-        #[arg(long, value_parser = parse_dim, required_unless_present = "member")]
+        /// Declared vector width, 1 to 65535 — declared here, never probed. Refused outright on a `--member` install,
+        /// because only the main artifact has a width.
+        ///
+        /// **Required by `np`, not by clap**, since the rerank stage: an embedding install without it is refused with
+        /// this command's own sentence ([`install_main`]), and a pinned reranker is refused for carrying it — its bytes
+        /// declare their own width, and there is no row to store a claimed one in. Moving the requirement from clap to
+        /// code is what lets one subcommand serve both, and the refusal names the flag either way.
+        #[arg(long, value_parser = parse_dim)]
         dim: Option<NonZeroU16>,
         /// Which artifact of the model this file is: `main` (the text encoder, the default) or `mmproj` (its projector).
         ///
@@ -92,7 +97,9 @@ pub(crate) enum ModelsCommand {
     Fetch {
         /// Workspace root to fetch into. Its models directory receives the artifacts.
         workspace: PathBuf,
-        /// Model identity to fetch: it must be one this build pins bytes **and** an identity for.
+        /// Model identity to fetch. It must be pinned by this build; an embedding id additionally needs a declared identity
+        /// (width and prefixes), while a reranker id is fetched precisely **without** one — its bytes are pinned, and a `models`
+        /// row would list a scoring head among the embedders a workspace can pick (**F51**).
         #[arg(long)]
         id: String,
         /// Which member to fetch, repeatable (`main`, `mmproj`). Default: the members this binary can use — the
@@ -202,7 +209,16 @@ pub(crate) fn models_fetch(
     // in that section), then the origin baked into the pin table. A machine with no configuration therefore makes one
     // outbound request during installation instead of being refused; a mirror is still one config line away, and this
     // line stays true of every run: the resolved origin is read here and printed nowhere.
-    let origin = fetch::resolve_origin(config.models.base_url.as_deref());
+    // A default origin exists for every id this build can fetch, so `None` means the pin table and the origin table
+    // disagree — a bug in this build rather than a state a user can be in. Refusing by id names it, and naming no host
+    // is origin privacy applied to an error path.
+    let Some(origin) = fetch::resolve_origin(id, config.models.base_url.as_deref()) else {
+        return Err(format!(
+            "`{id}` is pinned by digest but this build compiles in no origin for it; \
+             set [models] base_url to where its files are hosted"
+        )
+        .into());
+    };
 
     // **Say which origin this run is about to dial, in class terms, before any byte moves.** Origin privacy still forbids the host, so
     // the line names where the answer came from rather than what it is. It exists because `NP_MODELS_BASE_URL=` (set, empty)
@@ -311,12 +327,89 @@ fn models_install(workspace: &Path, request: &Install, json: bool) -> Result<(),
     Ok(())
 }
 
+/// `np models install` for a pinned reranker: the same door, three fewer flags, and no row at the end.
+///
+/// `--dim`, `--prefix-doc` and `--prefix-query` are refused **by name** rather than quietly ignored. They describe how a
+/// model stores vectors, and a scoring head stores none; accepting them would let someone believe they had declared
+/// something about the reranker, and the row that could hold such a declaration does not exist for it
+/// ([`np_core::pins::Role`]).
+///
+/// `--sha256` stays required so this command has one shape for every artifact — and for a pinned reranker it must name
+/// the bytes the pin already names. A declared digest nobody compares would be the worst of both: a flag that looks like
+/// a check and is not one.
+pub(crate) fn install_reranker(args: &InstallArgs) -> Result<(), Box<dyn Error>> {
+    let mut refused: Vec<&str> = Vec::new();
+    if args.dim.is_some() {
+        refused.push("--dim");
+    }
+    if !args.prefix_doc.is_empty() {
+        refused.push("--prefix-doc");
+    }
+    if !args.prefix_query.is_empty() {
+        refused.push("--prefix-query");
+    }
+    if !refused.is_empty() {
+        return Err(format!(
+            "{} describe how a model stores vectors; `{}` ranks pairs and stores none, so they are not what this \
+             artifact installs — drop {}",
+            refused.join(", "),
+            args.id,
+            if refused.len() == 1 {
+                "the flag"
+            } else {
+                "those flags"
+            }
+        )
+        .into());
+    }
+
+    let pin = np_core::pins::pinned_member(&args.id, "main").ok_or_else(|| {
+        format!(
+            "`{}` is pinned as a reranker but has no `main` member to install",
+            args.id
+        )
+    })?;
+    let declared = args.sha256.trim().to_lowercase();
+    if declared != pin.sha256 {
+        return Err(format!(
+            "`{}` is pinned as sha256 {}; the digest given describes other bytes, and a reranker's bytes are the \
+             pin's decision, not the caller's",
+            args.id, pin.sha256
+        )
+        .into());
+    }
+
+    // No database is opened, because nothing is written to one: `install_reranker` in np-core takes no `Db` for exactly
+    // that reason, and asking for a workspace's database here would create the file this command then declines to touch.
+    let config = load_config()?;
+    let outcome = np_core::models::install_reranker(
+        &config,
+        &args.workspace,
+        &np_core::models::RerankerInstall {
+            id: args.id.clone(),
+            source: args.source.clone(),
+        },
+    )?;
+    if args.json {
+        emit_json(&json!({
+            "id": args.id,
+            // The role beside the state, so a reader of `--json` can tell this record from an embedding install without
+            // knowing which ids are which.
+            "role": "rerank",
+            "state": outcome.state_label(),
+        }));
+    } else {
+        emit(outcome.state_label());
+    }
+    Ok(())
+}
+
 /// `np models install --member …` — one member of an already-installed model, installed from a file with no network.
 ///
 /// Three refusals come before anything is opened, because each is a fact about argv that a 554 MB read would not teach:
-/// an invented member name, `--dim` on a member that has no width, and the main member's own missing width. The last one
-/// is reachable only if clap's `required_unless_present` stops working; it is a refusal rather than an `expect` so that a
-/// future flag change turns into a message instead of a panic.
+/// an invented member name, `--dim` on a member that has no width, and the main member's own missing width — the last of
+/// which clap no longer enforces, because a pinned reranker installs through this same subcommand and must be allowed to
+/// arrive without a width (see [`install_reranker`]).
 ///
 /// The prefixes travel to the main path and are refused for `mmproj` by omission: they are fields of `models`, and a
 /// projector install writes no row there.
@@ -432,6 +525,7 @@ pub(crate) fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Er
                     &listing.models,
                     &listing.fetching,
                     &listing.unclaimed,
+                    listing.reranker.as_ref(),
                     &pinned_json(&config),
                     None,
                 ));
@@ -444,10 +538,13 @@ pub(crate) fn models_list(workspace: &Path, json: bool) -> Result<(), Box<dyn Er
             if json {
                 // The plan still goes out beside the failure: it is a fact about this build and this config, and the
                 // person whose artifact directory is unreadable is exactly the one wondering what a re-fetch costs.
+                // No reranker section either: the directory could not be listed, so nothing about the bytes under it
+                // is known — including whether a reranker is there. `null` says "unknown here", which is what happened.
                 emit_json(&listing_json(
                     &[],
                     &[],
                     &[],
+                    None,
                     &pinned_json(&config),
                     Some(&err.to_string()),
                 ));
@@ -504,6 +601,7 @@ pub(crate) fn listing_json(
     models: &[ListedModel],
     fetching: &[FetchEntry],
     unclaimed: &[Unclaimed],
+    reranker: Option<&np_core::models::ListedReranker>,
     pinned: &[Value],
     models_dir_error: Option<&str>,
 ) -> Value {
@@ -516,6 +614,19 @@ pub(crate) fn listing_json(
             .iter()
             .map(|entry| json!({ "name": entry.name, "kind": unclaimed_kind(entry.kind) }))
             .collect::<Vec<Value>>(),
+        // The reranker this build pins, or `null` when it pins none. A key rather than an entry in `models` because
+        // there is no row behind it: a scoring head declares no vector width, so it is not a model in the sense that
+        // table means (`np_core::pins::Role`). Present-and-null on a build without one, for the same reason
+        // `models_dir_error` is: a reader should not need a missing-key branch to ask an answered question.
+        "reranker": reranker.map(|entry| {
+            json!({
+                "id": entry.id,
+                "role": "rerank",
+                "file": entry.file,
+                "state": entry.state.state_label(),
+                "pinned_bytes": entry.pinned_bytes,
+            })
+        }),
         // **What a fetch would cost before it starts** (**#3**), beside the sections that say what is already here.
         // Empty whenever no pinned id is configured — an absent key would cost every reader a branch, and a `null`
         // would make "no model named" and "no size known" one answer.
@@ -685,6 +796,18 @@ fn print_listing(listing: &Listing) {
                 model.row.prefix_query,
                 files,
             );
+    }
+    // The reranker gets one line of its own — outside the `models` count above it, because counting a scoring head
+    // among the models would tell a reader they can select it as an embedder. Its expected size travels beside the
+    // verdict so "present, size differs" is actionable against `ls` without looking the number up.
+    if let Some(reranker) = &listing.reranker {
+        let _ = writeln!(
+            out,
+            "reranker   {}  {}  (pin expects {} bytes)",
+            reranker.id,
+            reranker.state.state_label(),
+            reranker.pinned_bytes
+        );
     }
     // One line per fetch in progress, and **no section header**: `models` and `unclaimed` print their counts even
     // when empty because "looked and found none" must not read as "printed nothing", while a fetch line is an

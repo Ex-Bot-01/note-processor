@@ -220,6 +220,7 @@ fn widening_cannot_invent_a_keyword_half() {
             "!!! ???",
             10,
             policy,
+            None,
         )
         .expect("a punctuation query answers");
         assert!(answer.hits.is_empty(), "{policy:?}: nothing to match");
@@ -279,6 +280,7 @@ fn a_hit_the_keyword_list_never_held_has_no_whole_word_answer() {
         "grand",
         10,
         Prefix::Marked,
+        None,
     )
     .expect("semantic search answers");
     assert_eq!(answer.hits.len(), 1, "the vector list held the note");

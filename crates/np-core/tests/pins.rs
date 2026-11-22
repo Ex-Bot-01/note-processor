@@ -24,8 +24,8 @@ use std::path::PathBuf;
 
 use np_core::hash::sha256_file;
 use np_core::pins::{
-    identity, members_for_build, pinned, pinned_member, total_size, PinnedIdentity, PinnedModel,
-    DEFAULT_ORIGIN, PINNED, PINNED_IDENTITIES,
+    default_origin, identity, members_for_build, pinned, pinned_member, role, total_size,
+    PinnedIdentity, PinnedModel, Role, DEFAULT_ORIGINS, PINNED, PINNED_IDENTITIES, RERANKER_ID,
 };
 
 /// Substrings that would mean a field names a place rather than a thing.
@@ -214,6 +214,9 @@ fn both_members_of_the_pair_are_pinned_and_their_total_is_the_number_the_design_
     // §5's "864.7 MB", quoted in bytes and by name: guessing one file understates the transfer by a factor of 2.8,
     // which is exactly what rule 6 exists to prevent.
     assert_eq!(total_size("embeddinggemma-2"), 864_676_512);
+    // The reranker is one file, so its total is its own row — and the number is worth quoting because it is what a
+    // consent line and the disk preflight both print before 635 MB moves.
+    assert_eq!(total_size(RERANKER_ID), 635_674_432);
     assert_eq!(
         total_size("embeddinggemma-2"),
         main.size_bytes + mmproj.size_bytes,
@@ -231,14 +234,14 @@ fn both_members_of_the_pair_are_pinned_and_their_total_is_the_number_the_design_
     }
 }
 
+/// An **embedding** id must declare an identity, because a fetch of one writes a `models` row and the row needs `dim`
+/// plus both prefixes. Split out of the older single test when a second kind of artifact arrived: "every pinned id has
+/// an identity" was true only because every pinned id embedded something.
 #[test]
-fn every_fetchable_id_declares_an_identity_and_every_pinned_id_has_one() {
-    // A fetch writes a `models` row, and the row needs `dim` plus both prefixes. The table that pins bytes therefore
-    // has to cover every id it can transfer — an id with members but no identity would download 865 MB and then be
-    // unable to say what it is.
-    for entry in PINNED {
-        let found =
-            identity(entry.id).unwrap_or_else(|| panic!("{} has no pinned identity", entry.id));
+fn an_embedding_id_declares_an_identity_with_a_width() {
+    for entry in PINNED.iter().filter(|e| e.role == Role::Embedding) {
+        let found = identity(entry.id)
+            .unwrap_or_else(|| panic!("{} embeds and has no pinned identity", entry.id));
         assert_eq!(found.id, entry.id);
         assert!(
             found.dim > 0,
@@ -254,6 +257,53 @@ fn every_fetchable_id_declares_an_identity_and_every_pinned_id_has_one() {
             decl.id
         );
     }
+}
+
+/// A **rerank** id must declare nothing. This asserts an absence, and the absence is the design: a scoring head has no
+/// stored vectors, so there is no width for `dim` to be the width *of* and no prefix that ever reaches it. A row would
+/// also put it in the list `np models set-default` reads, which is how a workspace ends up choosing a reranker as its
+/// embedder. If this test ever fails because somebody added `dim = 0`, read [`crate::pins::Role`] before agreeing.
+#[test]
+fn a_rerank_id_declares_no_identity_at_all() {
+    let rerank: Vec<&str> = PINNED
+        .iter()
+        .filter(|e| e.role == Role::Rerank)
+        .map(|e| e.id)
+        .collect();
+    assert!(
+        rerank.contains(&RERANKER_ID),
+        "the pin table is expected to carry a rerank member for {RERANKER_ID}"
+    );
+    for id in rerank {
+        assert!(
+            identity(id).is_none(),
+            "{id} is pinned as a reranker and must not declare a vector width or prefixes"
+        );
+    }
+}
+
+/// Every member of one id shares its role, so [`role`] can answer from the first row without caring about table order.
+/// Two halves of one artifact cannot be for two different jobs — and an id that mixed roles would make "does installing
+/// this write a row?" depend on which member happened to be scanned first.
+#[test]
+fn a_pinned_ids_members_share_one_role() {
+    let mut ids: Vec<&str> = PINNED.iter().map(|e| e.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        let members: Vec<Role> = pinned(id).map(|e| e.role).collect();
+        let first = members[0];
+        assert!(
+            members.iter().all(|role| *role == first),
+            "{id} pins members with different roles: {members:?}"
+        );
+        assert_eq!(role(id), Some(first));
+    }
+    // An id this build pins nothing for has no role either — `None` here and `NothingPinned` in a fetch are the same
+    // sentence about the same unknown id.
+    assert_eq!(role("some-other-model"), None);
+    assert_eq!(Role::Embedding.label(), "embedding");
+    assert_eq!(Role::Rerank.label(), "rerank");
 
     let gemma = identity("embeddinggemma-2").expect("the shipped id");
     assert_eq!(gemma.dim, 768);
@@ -310,24 +360,84 @@ fn every_default_member_is_pinned_for_the_id_a_fetch_will_ask_about() {
     }
 }
 
+/// Rule 7 as amended 2026-11-04 (the human's R7c scope decision, `docs/design-m2-image-embeddings.md` §13): a machine
+/// with no config file makes one outbound request during installation. One origin per fetchable id now, because the two
+/// ids this build pins come from different publishers — and each default is spelled literally rather than derived, so
+/// moving one is a change made twice, here and in `pins.rs`.
 #[test]
-fn the_baked_default_origin_is_the_repository_the_pinned_digests_came_from() {
-    // Rule 7 as amended 2026-11-04 (the human's R7c scope decision, `docs/design-m2-image-embeddings.md` §13): a
-    // machine with no config file makes one outbound request during installation. Spelled literally rather than
-    // derived, so moving the default is a change made twice — here and in `pins.rs`.
+fn every_default_origin_has_the_shape_a_transport_joins_against() {
     assert_eq!(
-        DEFAULT_ORIGIN,
-        "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main"
+        default_origin("embeddinggemma-2"),
+        Some("https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main")
+    );
+    assert_eq!(
+        default_origin(RERANKER_ID),
+        Some("https://huggingface.co/smarttasks/bge-reranker-v2-m3-GGUF/resolve/main")
     );
 
-    // The three shape facts the transport relies on: a scheme it will accept, no credentials in the authority
-    // (`config::validate_base_url` refuses those in a configured value, and a baked one should not be sloppier),
-    // and no trailing slash — `HttpTransport` joins `origin` + `/` + filename, so a slash here would double up.
-    assert!(DEFAULT_ORIGIN.starts_with("https://"), "{DEFAULT_ORIGIN}");
-    assert!(!DEFAULT_ORIGIN.contains('@'), "{DEFAULT_ORIGIN}");
+    // The three shape facts `HttpTransport` relies on, asserted over **every** entry rather than the one that existed
+    // when this test was written: a scheme it will accept, no credentials in the authority
+    // (`config::validate_base_url` refuses those in a configured value, and a baked one should not be sloppier), and no
+    // trailing slash — the transport joins `origin` + `/` + filename, so a slash here would double up.
     assert!(
-        !DEFAULT_ORIGIN.ends_with('/'),
-        "a trailing slash would reach the transport as `//`"
+        !DEFAULT_ORIGINS.is_empty(),
+        "an empty origin table would make every fetch refuse"
+    );
+    for (id, origin) in DEFAULT_ORIGINS {
+        assert!(origin.starts_with("https://"), "{id}: {origin}");
+        assert!(!origin.contains('@'), "{id}: {origin} carries credentials");
+        assert!(
+            !origin.ends_with('/'),
+            "{id}: a trailing slash would reach the transport as `//`"
+        );
+        // Every origin belongs to an id this build actually pins: an entry for an unpinned id is an address with no
+        // bytes behind it, and the fetch path would refuse on `NothingPinned` long before dialing it.
+        assert!(
+            pinned(id).next().is_some(),
+            "{id} has a default origin but no pinned artifact"
+        );
+    }
+    // And every pinned id has one, in the other direction: an id pinned by bytes and not by address is a fetch that
+    // would refuse with no way for the user to fix it short of config.
+    for entry in PINNED {
+        assert!(
+            default_origin(entry.id).is_some(),
+            "{} is pinned but has no compiled-in origin",
+            entry.id
+        );
+    }
+    // An id nobody pins gets `None`, which means "refuse", not "borrow another id's host".
+    assert_eq!(default_origin("some-other-model"), None);
+}
+
+/// The reranker's row, checked against the file when the runner has one — the same rule [`NP_TEST_MODEL_PATH`]'s case
+/// applies to the embedding pair, and the reason both digests are worth re-reading from bytes rather than trusting a
+/// model card: an upstream re-upload is invisible until first start refuses.
+#[test]
+fn the_reranker_digest_is_the_real_artifacts_digest_when_the_runner_has_one() {
+    let Some(path) = std::env::var_os("NP_TEST_RERANK_PATH").map(PathBuf::from) else {
+        println!(
+            "NOT COVERAGE: NP_TEST_RERANK_PATH is unset, so no reranker file was hashed against the pin. Re-run with \
+             it pointing at bge-reranker-v2-m3 (sha256 d32a877b…) to check the row's bytes."
+        );
+        return;
+    };
+    let pin = pinned_member(RERANKER_ID, "main").expect("the reranker's main member");
+    let bytes = fs::read(&path).expect("the artifact is readable");
+    assert_eq!(
+        bytes.len() as u64,
+        pin.size_bytes,
+        "{} is {} bytes, the pin says {}",
+        path.display(),
+        bytes.len(),
+        pin.size_bytes
+    );
+    let digest = np_core::hash::sha256_file(&path).expect("the artifact hashes");
+    assert_eq!(
+        digest,
+        pin.sha256,
+        "{} hashes differently than the pin",
+        path.display()
     );
 }
 

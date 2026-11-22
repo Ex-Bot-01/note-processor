@@ -257,6 +257,53 @@ pub struct ListedMember {
     pub present: bool,
 }
 
+/// What the pinned reranker's bytes look like from the models directory — answered from the **pin and the file**, never
+/// from a row, because a reranker owns no row ([`crate::pins::Role`]).
+///
+/// The verdict is about **length**, not digest, and that is a deliberate limit rather than an oversight: hashing 635 MB
+/// to answer "what do I have here?" would make the cheap question cost seconds of I/O, which is the same reasoning that
+/// keeps [`ListedMember`] presence stat-only. Byte verification has a home at use time, where the bytes are about to be
+/// trusted — the rerank stage checks the pinned digest before it loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankerState {
+    /// No file at the name the pin gives it. The default state of every install: nothing fetches the reranker quietly.
+    Absent,
+    /// A regular file of exactly the pinned length. Not a claim that the bytes are right — only that they are the size
+    /// the pin expects, which is what a listing can say without reading them.
+    PresentSized,
+    /// Something is there and its length disagrees with the pin: a partial copy, a different quantization placed under
+    /// this name, or a directory. Reported, never deleted and never renamed over.
+    PresentWrongSize,
+}
+
+impl RerankerState {
+    /// The string `--json`'s reranker `"state"` field and the text line's verdict.
+    pub fn state_label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::PresentSized => "present, size matches the pin",
+            Self::PresentWrongSize => "present, size differs from the pin",
+        }
+    }
+}
+
+/// The reranker this build pins, beside what the directory says about it.
+///
+/// A sibling of [`ListedModel`] rather than another entry in it: every field of `ListedModel` comes from a `models` row,
+/// and there is no row here to hang them on. Its own heading also keeps the honest sentence visible — a reranker is not
+/// "a model that happens to be missing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedReranker {
+    /// The pinned id, which is also the file name the artifact lives under (`main`'s spelling).
+    pub id: String,
+    /// The file it claims under the workspace's models directory.
+    pub file: String,
+    /// The length the pin expects, so a reader can compare it with `ls` without looking the number up.
+    pub pinned_bytes: u64,
+    /// What the directory said.
+    pub state: RerankerState,
+}
+
 /// Something under the models directory that no row names, reported under its own heading.
 ///
 /// Reachable **by design**: [`install`] renames before it inserts the row, so a process killed between those
@@ -891,6 +938,13 @@ pub struct Listing {
     /// Entries no row names **and this program does not recognise**, sorted by display name. These never
     /// change an exit code. Fetch names are absent by construction — see [`fetch_name`].
     pub unclaimed: Vec<Unclaimed>,
+    /// The pinned reranker, when this build pins one — [`None`] means the pin table holds no `rerank` member, which is
+    /// how a build without F51 keeps listing exactly what it always did.
+    ///
+    /// It is **not** in [`Listing::models`] (no row to list) and deliberately not in [`Listing::unclaimed`] either:
+    /// `bge-reranker-v2-m3` sitting under the models directory is this program's own file, and reporting it as junk for
+    /// someone to delete would be a wrong sentence about a correct install.
+    pub reranker: Option<ListedReranker>,
 }
 
 /// What can go wrong installing or listing models. Every variant states one fact; none of them is a status
@@ -1043,6 +1097,34 @@ pub enum ModelError {
         id: String,
         /// The member that was asked for, named because the flag that reached this refusal names it too.
         member: String,
+    },
+    /// `np models install` was told to place a reranker for an id this build does not pin as one, so there is no
+    /// digest to verify against and nothing to accept.
+    ///
+    /// The refusal exists because the reranker's door is narrower on purpose: an embedding install takes the digest from
+    /// the human (it is how bytes nobody pinned get installed), and a reranker install takes it from the pin. An id with
+    /// no rerank row has neither source, so this says so instead of installing unverified bytes under a name the search
+    /// path will later trust.
+    #[error("`{id}` is not pinned as a reranker by this build, so there is no digest to install it against")]
+    NotPinnedReranker {
+        /// The id asked for.
+        id: String,
+    },
+    /// A file the pin can already rule out by length. Refused before hashing, in the same spirit as checking a
+    /// mistyped `--sha256` before reading anything: the cheap fact is answered first, and here it costs one `stat`.
+    ///
+    /// Its message says "length" and not "digest" on purpose. Nothing was hashed to reach this refusal, and reporting a
+    /// digest nobody computed would describe an inspection that did not happen.
+    #[error("{} is {found} bytes; the pinned reranker `{id}` is {expected} bytes, so these are not those bytes (nothing was hashed)", path.display())]
+    PinnedSize {
+        /// The file that was refused.
+        path: PathBuf,
+        /// The id whose pin answered.
+        id: String,
+        /// The length the pin expects.
+        expected: u64,
+        /// The length the file has.
+        found: u64,
     },
     /// The workspace database refused one of [`crate::db`]'s model reads or the insert.
     ///
@@ -1352,6 +1434,126 @@ pub fn install_projector(
 /// The directory is therefore looked at **first**, before any row is hashed: it decides whether a per-row
 /// verdict is expressible at all, and reading it later would spend a whole artifact pass on a listing that
 /// then has to be thrown away.
+/// Everything a reranker install was asked for: the pinned id and the file. **No width, no prefixes and no digest** —
+/// a scoring head answers nothing about vectors, and the bytes it must hash to are the pin's decision, not the caller's.
+#[derive(Debug, Clone)]
+pub struct RerankerInstall {
+    /// The pinned rerank id, which is also the artifact's file name.
+    pub id: String,
+    /// The artifact the human already has — read and copied, never moved or deleted, as with [`Install::source`].
+    pub source: PathBuf,
+}
+
+/// What one reranker install ended as. Two states, because there is no row to restore: either these bytes were not here
+/// and now they are, or they already were and nothing moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankerInstallOutcome {
+    /// The artifact was copied into place. No row was written, because none exists to write.
+    Placed,
+    /// The right bytes were already there: nothing was read past the hash that proved it, and nothing was rewritten.
+    AlreadyPlaced,
+}
+
+impl RerankerInstallOutcome {
+    /// The `"state"` field of `--json`, spelled to match [`InstallOutcome`] so one reader's script reads both.
+    pub fn state_label(self) -> &'static str {
+        match self {
+            Self::Placed => "installed",
+            Self::AlreadyPlaced => "already installed",
+        }
+    }
+}
+
+/// Install a pinned reranker's artifact. **There is no `db` operand, because there is nothing to write**: the signature
+/// is where "a reranker gets no `models` row" lives ([`crate::pins::Role`] is the why).
+///
+/// The order mirrors [`install`] step for step, minus every step that touches a row:
+///
+/// 0. [`require_workspace_dir`], then [`validate_id`] — before any file access.
+/// 1. the id must be pinned **as a rerank member**, or there is no digest to check against
+///    ([`ModelError::NotPinnedReranker`]).
+/// 2. its length, refused before hashing ([`ModelError::PinnedSize`]) — one `stat` rules out the wrong file.
+/// 3. an empty source and a non-file are refused as [`install`] refuses them.
+/// 4. **one** hash of the source, compared with the pinned digest.
+/// 5. an artifact already in place is hashed too and must agree — a disagreement is
+///    [`ModelError::ArtifactDisagrees`], never an overwrite.
+/// 6. copy to `<id>.<nonce>.tmp`, rename to `<id>`.
+///
+/// Step 5 hashes 635 MB a second time in the already-installed case. That is the same trade [`install`] makes for the
+/// row-agrees path and for the same reason: `declared` describes the file named by `--path`, and says nothing about the
+/// bytes that have been sitting under the artifact name — which is exactly the rot this command's trust model catches.
+pub fn install_reranker(
+    config: &Config,
+    workspace: &Path,
+    request: &RerankerInstall,
+) -> Result<RerankerInstallOutcome, ModelError> {
+    require_workspace_dir(workspace)?;
+    validate_id(&request.id)?;
+
+    let pin = crate::pins::pinned_member(&request.id, MAIN_FILE)
+        .filter(|member| member.role == crate::pins::Role::Rerank)
+        .ok_or_else(|| ModelError::NotPinnedReranker {
+            id: request.id.clone(),
+        })?;
+
+    let open_source = walk::to_open_path(&access(&request.source));
+    let meta = fs::metadata(&open_source).map_err(|source| ModelError::Source {
+        path: request.source.clone(),
+        source,
+    })?;
+    if !meta.is_file() {
+        return Err(ModelError::Source {
+            path: request.source.clone(),
+            source: io::Error::new(io::ErrorKind::NotADirectory, "not a regular file"),
+        });
+    }
+    if meta.len() == 0 {
+        return Err(ModelError::EmptySource {
+            path: request.source.clone(),
+        });
+    }
+    if meta.len() != pin.size_bytes {
+        return Err(ModelError::PinnedSize {
+            path: request.source.clone(),
+            id: request.id.clone(),
+            expected: pin.size_bytes,
+            found: meta.len(),
+        });
+    }
+
+    let found = hash::sha256_file(&open_source).map_err(|err| ModelError::Source {
+        path: request.source.clone(),
+        source: hash_io(err),
+    })?;
+    if found != pin.sha256 {
+        return Err(ModelError::DigestMismatch {
+            path: request.source.clone(),
+            declared: pin.sha256.to_string(),
+            found,
+        });
+    }
+
+    let models_dir = config.workspace_models_dir(workspace);
+    if artifact_present(&models_dir, &request.id) {
+        let target = models_dir.join(&request.id);
+        let on_disk = hash::sha256_file(&access(&target)).map_err(|err| ModelError::Io {
+            path: target.clone(),
+            source: hash_io(err),
+        })?;
+        if on_disk != pin.sha256 {
+            return Err(ModelError::ArtifactDisagrees {
+                path: target,
+                expected: pin.sha256.to_string(),
+                found: on_disk,
+            });
+        }
+        return Ok(RerankerInstallOutcome::AlreadyPlaced);
+    }
+
+    publish_artifact(&models_dir, &request.id, &request.source)?;
+    Ok(RerankerInstallOutcome::Placed)
+}
+
 pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, ModelError> {
     require_workspace_dir(workspace)?;
     let rows = db::model_rows(db)?;
@@ -1400,6 +1602,43 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
             }
         }
     }
+    // **A pinned reranker is this program's own file, not junk.** It has no row — a scoring head declares no width — so
+    // without this claim its name would fall into `unclaimed` and the listing would tell someone to delete a correct
+    // install. Claimed here, reported under its own heading below, and answered from the pin plus one `stat`: the length
+    // is what a listing can state honestly without reading 635 MB (see [`RerankerState`]).
+    let mut rerank_members: Vec<&crate::pins::PinnedModel> = crate::pins::PINNED
+        .iter()
+        .filter(|member| member.role == crate::pins::Role::Rerank)
+        .collect();
+    rerank_members.sort_by_key(|member| member.id);
+    let mut reranker = None;
+    if let Some(pin) = rerank_members.first() {
+        let file = member_artifact_name(pin.id, pin.member);
+        claimed.insert(OsString::from(&file));
+        let target = models_dir.join(&file);
+        let state = match fs::metadata(walk::to_open_path(&access(&target))) {
+            Ok(meta) if meta.is_file() && meta.len() == pin.size_bytes => {
+                RerankerState::PresentSized
+            }
+            // A directory, or bytes of another length: both are "something is here and it is not what the pin sizes",
+            // which is reported rather than removed — the human decides what those bytes were for.
+            Ok(_) => RerankerState::PresentWrongSize,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => RerankerState::Absent,
+            Err(source) => {
+                return Err(ModelError::Artifact {
+                    path: target,
+                    source,
+                })
+            }
+        };
+        reranker = Some(ListedReranker {
+            id: pin.id.to_string(),
+            file,
+            pinned_bytes: pin.size_bytes,
+            state,
+        });
+    }
+
     let (unclaimed, marker_ids) = entries.split(&claimed);
 
     let mut models = Vec::with_capacity(rows.len());
@@ -1444,6 +1683,7 @@ pub fn list(db: &Db, config: &Config, workspace: &Path) -> Result<Listing, Model
         models,
         fetching,
         unclaimed,
+        reranker,
     })
 }
 

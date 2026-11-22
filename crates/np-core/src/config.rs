@@ -638,12 +638,58 @@ pub struct SearchConfig {
     /// with `semantic` and `keyword` one key away for anyone who wants one list alone. A value outside those three words is
     /// refused at parse time, naming what it expected rather than falling back.
     pub mode: crate::search::SearchMode,
+    /// Whether to reorder the top of the result list with a cross-encoder. **Off**, and off in a way that survives an
+    /// upgrade: this is the one setting whose activation costs a 635 MB artifact and a model load per process, so it is never
+    /// implied by anything else — `[models] auto_fetch = true` fetches the embedding model a scan needs and will not fetch a
+    /// reranker behind this key's back.
+    pub rerank: bool,
+    /// How many of the top hits to score. Absent means [`DEFAULT_RERANK_TOP_N`]; outside `1..=MAX_RERANK_CANDIDATES` is refused
+    /// by [`deserialize_rerank_top_n`] rather than clamped.
+    #[serde(deserialize_with = "deserialize_rerank_top_n")]
+    pub rerank_top_n: usize,
+    /// Which text of a note the reranker reads. Absent means [`RerankText::TitleBody`](crate::search::RerankText::TitleBody).
+    /// Independent of `[embeddings] provider`: the stage reads strings out of the index, so it works under `provider = "none"`
+    /// and under `--mode keyword` alike.
+    pub rerank_text: crate::search::RerankText,
+}
+
+/// The default number of top hits to rerank: enough for a cross-encoder to change what is on the first screen, few enough
+/// that the scoring stays in tens of milliseconds per query on CPU. A preference, not a physical constant — which is why it
+/// is a key rather than a literal.
+pub const DEFAULT_RERANK_TOP_N: usize = 5;
+
+/// The largest number of candidates one query may score. **A cost bound the human cannot exceed by configuration**, so that
+/// `rerank_top_n = 100000` cannot turn one search into a batch job: pairs are scored serially, and past this depth a run
+/// would look like a hang rather than a slow answer. Refused at parse time, never clamped — F35's rule.
+pub const MAX_RERANK_CANDIDATES: usize = 64;
+
+/// Reading `search.rerank_top_n` as a bounded integer.
+///
+/// Hand-written for the same reason `[embeddings] threads` is (see [`ThreadCount`]'s deserializer): a derived message reports
+/// "invalid value: integer `0`" without naming the key, and the whole worth of a config refusal is that it says which line
+/// to edit. Both bounds are refused rather than repaired: `0` would load a 635 MB model to reorder nothing, and anything
+/// above the cap is a cost this program has decided not to accept silently.
+fn deserialize_rerank_top_n<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 || value > MAX_RERANK_CANDIDATES {
+        return Err(serde::de::Error::custom(format!(
+            "search.rerank_top_n = {value} is not a number of candidates to rerank: write 1 to \
+             {MAX_RERANK_CANDIDATES}"
+        )));
+    }
+    Ok(value)
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             mode: crate::search::SearchMode::Hybrid,
+            rerank: false,
+            rerank_top_n: DEFAULT_RERANK_TOP_N,
+            rerank_text: crate::search::RerankText::TitleBody,
         }
     }
 }

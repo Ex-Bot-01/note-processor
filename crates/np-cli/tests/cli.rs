@@ -2786,13 +2786,15 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
             "prefix_terms",
             "prefix_used",
             "reason",
+            "rerank",
             "semantic_used",
             "vectors",
         ],
         "the hit list plus the keys that say how it was made — **F45** added `reason` (a token beside the prose), `fetched` and
          `offline` (F38's meanings, so one reader handles embed and search); **#5** added `indexed` (has this workspace ever been
          scanned) and `keyword_used` / `semantic_used` (which halves this answer was built from); **#6** added `prefix_used` /
-         `prefix_terms` (did any word match at the start of a word, and which)"
+         `prefix_terms` (did any word match at the start of a word, and which); **F51** added `rerank` (what the optional
+         cross-encoder stage did — see `search_json_reports_a_rerank_stage_that_was_never_asked` for its shape)"
     );
     assert_eq!(
         value["mode"], "hybrid",
@@ -2849,13 +2851,17 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
             "linked_notes",
             "matched_exactly",
             "path",
+            "rerank_rank_after",
+            "rerank_rank_before",
+            "rerank_score",
             "score",
             "semantic_rank",
             "snippet",
             "source_note",
         ],
-        "every hit carries the same twelve keys, with null where a half did not run — `matched_exactly` is **#6**'s: true whole \
-         words, false reached only by a prefix, null not from the keyword list at all"
+        "every hit carries the same fifteen keys, with null where a half did not run — `matched_exactly` is **#6**'s: true whole \
+         words, false reached only by a prefix, null not from the keyword list at all. **F51** added the three rerank keys, and \
+         they are null here because no stage ran: an empty number would read as \"scored, and scored as zero\""
     );
     assert!(
         hits[0]["cosine"].is_null() && hits[0]["semantic_rank"].is_null(),
@@ -4033,12 +4039,16 @@ mod real_model {
                 "linked_notes",
                 "matched_exactly",
                 "path",
+                "rerank_rank_after",
+                "rerank_rank_before",
+                "rerank_score",
                 "score",
                 "semantic_rank",
                 "snippet",
                 "source_note",
             ],
-            "§12's hit fields, F28's linker list, F36's five evidence keys and #6's `matched_exactly`, no extras"
+            "§12's hit fields, F28's linker list, F36's five evidence keys, #6's `matched_exactly` and F51's three rerank keys, \
+             no extras — the rerank trio is null in this run too, because a hybrid search with no artifact installed scores nothing"
         );
         // Both halves ran here, so neither number is null — the claim that would be invisible in a default build, where
         // only the keyword side can answer.

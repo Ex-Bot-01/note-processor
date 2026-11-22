@@ -49,7 +49,7 @@ sha256sum -c SHA256SUMS.txt        # Linux/macOS, run next to the archive
 ```
 
 ```powershell
-(Get-FileHash .\np-0.6.1-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
+(Get-FileHash .\np-0.7.0-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
 ```
 
 | Platform | What you get | Worth knowing |
@@ -65,7 +65,7 @@ The model itself is never inside an archive: ~309 MB arrives only when you run `
 Building from source needs nothing but a stable Rust toolchain for the default build — no C++, no cmake:
 
 ```sh
-cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.6.1 -p np-cli --locked
+cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.7.0 -p np-cli --locked
 ```
 
 Per-version caveats (which old assets are stale, what is compiled out of them): [Release archive caveats](docs/reference-releases.md).
@@ -136,7 +136,7 @@ Two habits that pay off:
 | --- | --- | --- |
 | `np scan <workspace>` | indexes notes and regenerates the catalog; reports added / modified / moved / removed / unchanged | index, `INDEX.md` (+ shards) |
 | `np embed <workspace>` | encodes what the index says is owed | vectors for the configured model |
-| `np search <workspace> <query> [--limit N] [--mode hybrid\|semantic\|keyword] [--prefix]` | ranks notes and figures; default `hybrid` fuses FTS5 `bm25()` with vectors by reciprocal rank fusion. `--prefix` matches every word at a word beginning (`grand` reaches `grandma`); one marked word, `"grand*"`, does the same for itself | nothing (it opens the database, then only `SELECT`s) |
+| `np search <workspace> <query> [--limit N] [--mode hybrid\|semantic\|keyword] [--prefix] [--rerank]` | ranks notes and figures; default `hybrid` fuses FTS5 `bm25()` with vectors by reciprocal rank fusion. `--prefix` matches every word at a word beginning (`grand` reaches `grandma`); one marked word, `"grand*"`, does the same for itself. `--rerank` adds an optional cross-encoder pass over the top `rerank_top_n` notes after retrieval — off by default, local weights only, and it never downloads anything itself (**F51**) | nothing (it opens the database, then only `SELECT`s) |
 | `np setup <workspace> [--yes]` | scan → fetch if missing → embed, one report | index, maybe the artifact, vectors |
 | `np models install \| fetch \| hash \| list …` | puts model bytes in place, per workspace | `<data_dir>/workspaces/<key>.models/` |
 | `np embeddings enable <id> \| disable` | turns the embedding model on or off in np's config file — the door a consent answer needs (**#7**). **Fetches nothing**; quotes what a first `np embed` would cost | `config.toml`, `[embeddings]` |

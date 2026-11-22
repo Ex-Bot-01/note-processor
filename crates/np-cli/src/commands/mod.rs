@@ -12,6 +12,7 @@ pub(crate) mod common;
 pub(crate) mod embed;
 pub(crate) mod embeddings;
 pub(crate) mod models;
+pub(crate) mod rerank;
 pub(crate) mod scan;
 pub(crate) mod search;
 pub(crate) mod setup;
