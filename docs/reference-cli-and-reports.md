@@ -29,6 +29,10 @@ np embeddings disable [--json]            # provider = "none"; the model you cho
   unresolved and *named* in the report (`unresolved_targets`), never guessed. And a link inside code is an example rather than an
   edge: nothing inside a fenced region yields a link, and neither does an inline code span, so quoting markdown in a note adds no
   unresolved link you do not have.
+- **What the catalog leaves on disk.** `np scan` writes `INDEX.md` at the workspace root, and past the entry budget
+  (`catalog.max_entries_per_file`) it splits into shards named for the entry range they hold: `INDEX-a-m.md`, and `INDEX-m-m-2.md`
+  when a second rendering of one range is needed. `index_files` lists every file that run wrote, and the two header lines are what
+  mark a generated file as np's to replace — a same-named file without them is left where it is.
 - **Incremental both ways.** A note whose bytes have not moved keeps its vector; a figure's vectors are keyed to its *content
   hash*, so the same image linked from six notes is encoded once, and deleting the last link to it prunes the row and its
   vectors on the next run.

@@ -20,7 +20,8 @@ starting it on demand and talking to it over its pipes ([`np serve`](#use-np-fro
 - **Resolves links** — `[[Note]]`, `[[Note|alias]]`, `[text](relative.md)`, case-insensitive against the corpus. An ambiguous or
   missing target stays unresolved and is *named*, never guessed; a link inside code is an example, not an edge.
   [Rules in full](docs/reference-cli-and-reports.md).
-- **Writes a catalog** — `INDEX.md` at the root, sharded past the entry budget. Generated files open with a header line, so a scan
+- **Writes a catalog** — `INDEX.md` at the root, sharded into files named like `INDEX-a-m.md` past the entry budget. Generated files
+  open with a header line, so a scan
   replaces only files it owns and leaves a hand-written `INDEX.md` alone.
 - **Searches three ways** — `hybrid` (default) fuses FTS5 `bm25()` with the vector list by reciprocal rank fusion; `keyword` needs no
   model; `semantic` is vectors alone. Hits carry raw evidence (`cosine`, `bm25`, each list's rank): a fused rank sum is not a
@@ -31,8 +32,15 @@ starting it on demand and talking to it over its pipes ([`np serve`](#use-np-fro
 ## Install
 
 Get the binary for your platform from [the latest release](https://github.com/Ex-Bot-01/note-processor/releases/latest) and check it
-against the `SHA256SUMS.txt` beside it: `sha256sum -c SHA256SUMS.txt` next to the archive, or on Windows compare
-`(Get-FileHash .\np-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()` against that file.
+against the `SHA256SUMS.txt` beside it. That file lists **both** archives, so check the one you downloaded rather than the lot:
+
+```sh
+grep 'x86_64-unknown-linux-gnu' SHA256SUMS.txt | sha256sum -c -    # Linux
+```
+
+```powershell
+(Get-FileHash .\np-0.7.0-x86_64-pc-windows-gnu-cross.zip).Hash.ToLower()   # Windows: compare against SHA256SUMS.txt
+```
 
 | Platform | What you get | Worth knowing |
 | --- | --- | --- |
@@ -69,11 +77,11 @@ unresolved 1 — a target matched more than one file or none; spell its path to 
 attachments 1 — tracked, never parsed: scratch.txt
 skipped    0
 index      INDEX.md
-elapsed    84 ms
+elapsed    87 ms
 ```
 
-`~/Notes/INDEX.md` now lists every note with its size and link counts; the database lives under your OS data directory. Run it again
-and nothing recomputes — `unchanged`, 2 ms instead of 84.
+`~/Notes/INDEX.md` now lists every note with its size and link counts; the database lives under your OS data directory. Run it again and
+nothing recomputes — `unchanged 5`, 2 ms.
 
 Add meaning with one command that indexes, fetches the pinned model if this workspace lacks it, and embeds:
 
@@ -85,19 +93,21 @@ np search ~/Notes "moved hash"
 Before any model exists, `np search` still answers and names the half that was missing (exit **0**):
 
 ```text
-the configured model is not installed in this workspace: ranked by keyword only — install it with `np models install <vault> --id <id> --path <file> --dim <width> --sha256 <digest>`, then `np embed`
+the configured model is not installed in this workspace: ranked by keyword only — `np setup` indexes and embeds in one call, or `np models fetch <vault> --id <id>` installs the bytes
 0.0164 note   retro-notes.md  [bm25 -0.7941]   … # Retro notes  What the [moved] files taught us: detect them by [hash] …
 ```
 
-With vectors installed the same command prints a relevance score per hit and ranks by sense as well as words; a measured run is in
-[CLI and report reference](docs/reference-cli-and-reports.md). Everything quoted on this page is output real runs printed.
+Both blocks come from one `np 0.7.0` build of this tree over a five-file workspace, on a default-feature build — the `fetch` half of
+that feature set is what published archives carry, which is why the sentence names `np models fetch`. With vectors installed the same
+command prints a score per hit and ranks by sense as well as words; a measured run of that shape is in
+[CLI and report reference](docs/reference-cli-and-reports.md).
 
 `np setup` is what an application should call — it indexes **first**, so keyword search works the moment indexing finishes, then gets as
 far as it can on vectors and reports where it stopped. Four things worth knowing about that first run:
 
 - **It may download ~295 MiB, and says so before byte one**, then verifies the digest before putting the file in place, so a partial or
-  wrong download is never used. Refuse it with `--no-auto-fetch` (one run), `[models] auto_fetch = false`, or `NP_NO_AUTO_FETCH=1`
-  (which outranks the file). Only ids this build **pins** are fetched — a name in a config file cannot make a download happen.
+  wrong download is never used. Only ids this build **pins** are fetched — a name in a config file cannot make a download happen — and
+  three switches refuse it: `--no-auto-fetch`, `[models] auto_fetch = false`, `NP_NO_AUTO_FETCH=1`.
 - **Offline exits 0 with `vectors: false`.** The vault is searchable and nothing needs fixing but the cable; any other stop on the
   vector half exits 1. [Models: fetch and install](docs/reference-models.md).
 - **No model configured is a decision, not a fault.** np will not start inference just because a binary could; `np embeddings enable
@@ -116,26 +126,28 @@ far as it can on vectors and reports where it stopped. Four things worth knowing
 | `np models install \| fetch \| hash \| list …` | puts model bytes in place, per workspace | `<data_dir>/workspaces/<key>.models/` |
 | `np embeddings enable <id> \| disable` | turns the embedding model on or off in np's config. **Fetches nothing** | `config.toml`, `[embeddings]` |
 
-Every command takes `--json`. Exit codes mean what they say: **0** success (including "nothing to do" and "nothing indexed"),
-**1** anything the runtime refused, **2** an argv error. Every flag, report field and search-hit key:
-[CLI and report reference](docs/reference-cli-and-reports.md).
+Every command except `np serve` — whose stdout *is* the protocol — and `np models hash` takes `--json`. Exit codes mean what they say:
+**0** success (including "nothing to do" and "nothing indexed"), **1** anything the runtime refused, **2** an argv error.
 
 ## Before you script against it
 
-- **The keyword half wants *every* word in *one* note.** Words are quoted and joined with `AND`, so `"lag broker"` finds the note
-  holding both while `"retro kafka"` — one word in each of two notes — answers nothing at exit **0**, and a sentence-shaped query
-  usually dies on one stray `how`. Ask for fewer words, or let `hybrid` rank by meaning once vectors exist. FTS5's own syntax stays
-  out on purpose (`"`, `*`, `-`, `(` and `:` are ordinary characters, which keeps `GGML_DEFAULT_N_THREADS` out of a query parser) and
-  a query past 32 words searches its first 32.
+- **The keyword half wants *every* word in *one* note.** `"lag broker"` finds the note holding both; `"retro kafka"` — one word in
+  each of two notes — answers nothing at exit **0**. Ask for fewer words, or let `hybrid` rank by meaning once vectors exist.
 - **`--mode semantic` in a vault with no vectors refuses at exit 1**, where the default answers with keyword hits at exit 0: one list
   that cannot run is not answerable by the other.
 - **Readers are never blocked by writers.** `search` and `models list` take no write lock, so they keep answering while a `scan` runs;
   two writers contend, and the second waits two seconds then reports `locked` as a state rather than a mystery.
 
+No FTS5 operator reaches the query parser — a trailing `*` is the only syntax np keeps, which is what makes
+`GGML_DEFAULT_N_THREADS` searchable rather than a parse error — and a query past 32 words searches its first 32. Every flag and report
+field: [CLI and report reference](docs/reference-cli-and-reports.md).
+
 ## Configure it
 
 Optional, read once per command from `$XDG_CONFIG_HOME/note-processor/config.toml` (Windows: `%APPDATA%\note-processor\config.toml`).
-A partial file is fine — every key has a default, and an environment variable only *fills* a key the file leaves out.
+A partial file is fine — every key has a default, and an environment variable only *fills* a key the file leaves out. The one
+deliberate exception is `NP_NO_AUTO_FETCH=1`, which **outranks** the file: a switch that stops a 295 MiB download is not something a
+config file should be able to veto.
 
 ```toml
 [embeddings]
@@ -146,8 +158,8 @@ model = "embeddinggemma-2"   # an id this workspace has been given, by fetch or 
 # mode = "hybrid"            # hybrid | semantic | keyword — `--mode` overrides per run
 ```
 
-That is the whole minimum. The other keys — token budgets, llama.cpp threads and log volume, catalog sharding and indentation,
-checklist markers, the fetch origin and its overrides — carry defaults and are listed in [Configuration reference](docs/reference-config.md).
+That is the whole minimum. Every other key has a default and is tabulated with its refusal behaviour in
+[Configuration reference](docs/reference-config.md).
 
 ## Use `np` from your app
 
@@ -155,8 +167,9 @@ checklist markers, the fetch origin and its overrides — carry defaults and are
 exits **0**. Same work as the commands, on a channel that does not fork and opens no port: whoever can write to the process's stdin
 already owns the files it can read.
 
-```jsonc
-// one request per line in; one response per line out
+These are the requests — one per line in, and exactly one response line back for each:
+
+```json
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspace":"/vault","notifications":true}}
 {"jsonrpc":"2.0","id":2,"method":"search","params":{"workspace":"/vault","query":"moved hash"}}
 ```
@@ -169,14 +182,15 @@ client code:
   a test rather than trusted.
 - **stdout is the protocol.** Every sentence goes to stderr, so a client never strips prose out of a parse.
 - **States come back as data, not faults:** `locked`, `offline`, `reason` and `prefix_drift` are keys in the document, while a fault
-  means the request was wrong (`-32700`, `-32601`, `-32602`) or np refused before working (`-32000`).
-- **Progress is off unless you ask.** With `notifications` in the handshake, np narrates the slow parts — `locking`, `fetching` with
-  byte checkpoints against the pinned size, `embedding`, `writing`, then a terminal `completed` or `refused` — and nothing arrives
+  means the request was wrong (`-32700`, `-32600`, `-32601`, `-32602`) or np refused before working (`-32000`).
+- **Progress is off unless you ask.** With `notifications` in the handshake, np narrates the slow parts — `locking`, `resolving`,
+  `fetching` with byte checkpoints against the pinned size, `indexing`, `embedding`, `writing`, then a terminal `completed` or
+  `refused` — and nothing arrives
   unsolicited, so older clients keep the responses they expect.
 
-`links.list` answers what the terminal never asks — **who links this note, and where is every dead target written?** — in one call,
-with both ends as display paths, the line each edge was written on, and unresolved targets named by the text a fix replaces.
-`params.rel` scopes it to one note; it is a reader that creates nothing and answers while an embed runs. Diagnostics stay off the
+`links.list` answers what the terminal never asks — **who links this note, and where is every dead target written?** — with both ends as
+display paths, the line each edge was written on, and unresolved targets named by the text a fix replaces. `params.rel` scopes it to one
+note; it is a reader that creates nothing and answers while an embed runs. Diagnostics stay off the
 protocol (`-v`, `NP_LOG`, `[log] file`), records carrying the id of the request that raised them. Methods, phases, fault codes, captured
 transcripts and a Python walkthrough: [`np serve` reference](docs/reference-serve.md).
 
@@ -185,10 +199,10 @@ transcripts and a Python walkthrough: [`np serve` reference](docs/reference-serv
 A figure is linked with ordinary markdown — `![alt](diagram.png)` — resolved like any other link, inside the workspace only. `np`
 encodes **PNG and JPEG**, extension *and* content signature both; `.svg`, `.drawio`, `.excalidraw` and `.pdf` refuse as
 `unsupported-format`, by decision (an SVG is a file that asks to fetch things). Figures are content-addressed, so bytes linked from six
-notes encode once, and every refusal lands in one of six classes that each name an action. A refused figure costs nothing but the
-count: the note around it stays searchable as text. Encoding needs `--features local-model,vision` plus the projector artifact —
-published archives are text-only on the image side and say so per figure rather than silently skipping.
-[Images in the index](docs/reference-images.md).
+notes encode once, and every refusal lands in one of seven classes that each name an action —
+[Images in the index](docs/reference-images.md). A refused figure costs nothing but the count: the note around it stays searchable as
+text. Encoding needs `--features local-model,vision` plus the projector artifact; published archives are text-only on the image side
+and say so per figure rather than silently skipping.
 
 ## When something looks wrong
 
@@ -208,12 +222,11 @@ Every other refusal sentence np prints, and the two llama.cpp warnings that are 
   which rows ran: [Developing](docs/developing.md).
 - **The Windows write-lock behaviour has never been measured on Windows.** A second writer refusing cleanly is believed equivalent to
   Linux — SQLite uses `LockFileEx` there instead of POSIX record locks — and that belief is untested. MSVC parity is unmeasured too:
-  `build.rs` refuses that target rather than pretending.
-- **No macOS asset**, and feature builds on unsupported targets get a written refusal from `build.rs`.
+  `build.rs` refuses that target rather than pretending, as it does on macOS, where no asset exists either.
 - **Image encoding is off in the published archives** (`vision` is not a default feature), so figures land in `vision-unavailable`
   until you build with it.
 - **No stemming**: `runner` does not match `runners`, because this vault holds identifiers and a typed word must appear whole. Ask for
-  the shorter form instead — mark it (`"grand*"`) or pass `--prefix` — and the answer reports which words matched at a word beginning
+  the shorter form — mark it (`"grand*"`) or pass `--prefix` — and the answer says which words matched at a word beginning
   (`prefix_used`, `prefix_terms`) and which hits came only from a prefix (`matched_exactly`). Widening is opt-in because the rule that
   protects `runner` also protects your file names.
 - **No OCR, no PDF or audio, no sync, no watch mode**, and no network transfer anywhere except the model-fetch path — the indexing

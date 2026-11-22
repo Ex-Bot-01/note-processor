@@ -19,7 +19,8 @@ The table below was checked against the structs on 2026-11-09 rather than copied
 `deny_unknown_fields` (**F35**), so `Config`, `CatalogConfig`, `MarkerConfig`, `EmbeddingsConfig`, `ModelsConfig`, `SearchConfig` and `LogConfig` in
 `crates/np-core/src/config.rs` *are* the key list — a key not in them cannot be written at all. That audit added two rows this table had
 lost: top-level `data_dir`, and `models.auto_fetch`, which is one of the three kill switches the README names while omitting the key that
-holds it. Three more arrived on 2026-11-09 with `[log]`, the diagnostics section. There are **18** keys.
+holds it. The count moves whenever a feature adds a key, so it is read off those structs rather than remembered: **22** leaf keys in total,
+beside the six section headers.
 
 | Key | Default | What it does |
 | --- | --- | --- |
