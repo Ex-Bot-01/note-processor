@@ -585,8 +585,9 @@ pub(crate) fn search_workspace(
     Ok(())
 }
 
-/// One hit as JSON: **the same eleven keys whatever the kind and whatever the mode** —
-/// `{score, cosine, bm25, semantic_rank, keyword_rank, kind, path, snippet, linked_from, source_note, linked_notes}`.
+/// One hit as JSON: **the same fifteen keys whatever the kind and whatever the mode** —
+/// `{score, cosine, bm25, semantic_rank, keyword_rank, rerank_score, rerank_rank_before, rerank_rank_after, kind, path,
+/// snippet, linked_from, source_note, linked_notes, matched_exactly}`.
 ///
 /// The five evidence keys are in this list rather than printed only in the modes that produce them, for the
 /// reason below: a schema whose keys depend on a value inside the object makes every reader branch before it reads.

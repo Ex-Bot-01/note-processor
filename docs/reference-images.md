@@ -9,7 +9,7 @@ link: relative to the linking file, case-insensitively, inside the workspace onl
 `.jpeg`, **and** the bytes must carry that format's signature: an accepted name wrapping a BMP or a GIF is refused as
 `unsupported-format` rather than handed to a decoder that would happily read it (F26).
 
-Figures are content-addressed, so identical bytes across notes encode once, and every refusal is counted under one of six
+Figures are content-addressed, so identical bytes across notes encode once, and every refusal is counted under one of seven
 classes on the `images` line:
 
 | Class | What it means, and what to do |

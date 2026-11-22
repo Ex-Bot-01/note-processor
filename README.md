@@ -1,51 +1,41 @@
 # np — a local index for a folder of markdown notes
 
-`np` walks a vault of `.md` files, keeps an incremental index in a SQLite database, resolves the `[[wikilinks]]` and
-`[text](target)` links between notes, rewrites a readable `INDEX.md` in the vault itself, and — if you ask for it — embeds notes
-and the images they link with a small local model. `np search` ranks words and meaning together, so it answers a query about
-`GGML_DEFAULT_N_THREADS` on a machine that has never downloaded a model, and ranks prose by sense once one is installed.
+`np` walks a vault of `.md` files, keeps an incremental index in one SQLite database, resolves the links between them, rewrites a
+readable `INDEX.md` inside the vault itself, and — if you ask — embeds notes and their figures with a small local model.
+`np search` ranks words and meaning together, so it answers a query about `GGML_DEFAULT_N_THREADS` on a machine that has never
+downloaded a model, and ranks prose by sense once one is installed.
 
-No daemon, no port, no account: one binary, one database per workspace, all on disk. The indexing path never opens a socket; the
-only thing that dials out is a pinned model download, and it says so before byte one. An app that wants `np` as its backend starts
-one on demand and talks to it over its pipes ([`np serve`](#use-np-from-your-app)).
+No daemon, no port, no account: one binary, one database per workspace, all on disk. The indexing path opens no socket; the only
+thing that dials out is a pinned model download you asked for, announced before byte one. An app can use np as its backend by
+starting it on demand and talking to it over its pipes ([`np serve`](#use-np-from-your-app)).
 
-Everything quoted below was measured on one host — Linux x86-64, 16 CPUs, 7.4 GB RAM — and where something has *not* been measured,
-this file says so instead of guessing.
-
-**Start here:** [install](#install) · [first run](#first-run-two-commands) · [commands](#the-five-commands) ·
-[config](#configure-it) · [app integration](#use-np-from-your-app) · [troubleshooting](#when-something-looks-wrong) ·
-[limits](#limits-stated-plainly)
+**Start here:** [install](#install) · [try it](#try-it) · [commands](#the-six-commands) · [configure](#configure-it) ·
+[integrate](#use-np-from-your-app) · [when something looks wrong](#when-something-looks-wrong) · [limits](#limits-stated-plainly)
 
 ## What it does
 
-- **Indexes notes.** Discovers files under a workspace root, parses front matter, titles, headings, checklist items and links. A rescan
-  reports added / modified / moved / removed / unchanged and rewrites only what changed. Only `.md` becomes a note: the rest of your
-  folder is tracked as attachments — hashed, linkable, never searchable — and the report says how many they are (`attachments`,
-  `attachment_examples`), so nothing has to guess that a vault full of `.txt` is not empty.
-- **Resolves links.** `[[Note]]`, `[[Note|alias]]` and `[text](relative.md)` are matched case-insensitively against the corpus. An
-  ambiguous or missing target is left unresolved and *named* in the report — never guessed. A destination may wear angle brackets,
-  so it can hold spaces: `[text](<a note.md>)` finds `a note.md` (**issue #14**). And a link inside code is an example rather than
-  an edge — fenced blocks never yield links, and neither do inline spans (`` `[text](other.md)` ``), so showing a reader a snippet
-  of markdown no longer adds an unresolved link you do not have.
-- **Writes a catalog.** `INDEX.md` at the workspace root, sharded into `INDEX-<a>-<z>.md` once it passes the configured entry budget.
-  Generated files carry a fingerprint header, so a scan only ever replaces files it owns. A title or path that would collide with the line's
-  own markdown is escaped on the way out — brackets in the label, percent-escapes in the destination — so a file named with a newline or a
-  `[` still gets exactly one readable entry (**issue #15**).
-- **Searches three ways.** `hybrid` (the default) fuses SQLite's FTS5 `bm25()` over titles and bodies with the vector list by reciprocal
-  rank fusion; `keyword` needs no model at all; `semantic` is vectors alone. Hits carry their raw evidence (`cosine`, `bm25`, each
-  list's rank), because a fused rank sum is not a similarity and must never be read as one.
-- **Embeds text and figures locally.** Vectors are computed in-process by llama.cpp built from sha256-pinned source. A
-  `.png`/`.jpg`/`.jpeg` linked from a note is content-hashed, de-duplicated across notes, and encoded in a build with image support.
-- **Stays inside your vault.** Nothing outside the workspace root is read — not through an absolute path, not through a symlink. The
-  indexing path opens no socket; the only transfer is a pinned model download you asked for.
+- **Indexes notes** — front matter, titles, headings, checklist items and links, under a workspace root. A rescan reports added /
+  modified / moved / removed / unchanged and rewrites only what changed. Only `.md` becomes a note; everything else is tracked as an
+  attachment — hashed, linkable, never searchable — and counted, so a vault full of `.txt` is not mistaken for an empty one.
+- **Resolves links** — `[[Note]]`, `[[Note|alias]]`, `[text](relative.md)`, case-insensitive against the corpus. An ambiguous or
+  missing target stays unresolved and is *named*, never guessed; a link inside code is an example, not an edge.
+  [Rules in full](docs/reference-cli-and-reports.md).
+- **Writes a catalog** — `INDEX.md` at the root, sharded into files named like `INDEX-a-m.md` past the entry budget. Generated files
+  open with a header line, so a scan
+  replaces only files it owns and leaves a hand-written `INDEX.md` alone.
+- **Searches three ways** — `hybrid` (default) fuses FTS5 `bm25()` with the vector list by reciprocal rank fusion; `keyword` needs no
+  model; `semantic` is vectors alone. Hits carry raw evidence (`cosine`, `bm25`, each list's rank): a fused rank sum is not a
+  similarity and must never be read as one.
+- **Embeds locally** — in-process, with llama.cpp built from sha256-pinned source; a linked `.png`/`.jpg`/`.jpeg` is content-hashed
+  and de-duplicated across notes. And nothing outside the workspace root is ever read — not through an absolute path, not a symlink.
 
 ## Install
 
-Grab the binary for your platform from [the latest release](https://github.com/Ex-Bot-01/note-processor/releases/latest) and check
-it against the `SHA256SUMS.txt` published beside it:
+Get the binary for your platform from [the latest release](https://github.com/Ex-Bot-01/note-processor/releases/latest) and check it
+against the `SHA256SUMS.txt` beside it. That file lists **both** archives, so check the one you downloaded rather than the lot:
 
 ```sh
-sha256sum -c SHA256SUMS.txt        # Linux/macOS, run next to the archive
+grep 'x86_64-unknown-linux-gnu' SHA256SUMS.txt | sha256sum -c -    # Linux
 ```
 
 ```powershell
@@ -54,23 +44,20 @@ sha256sum -c SHA256SUMS.txt        # Linux/macOS, run next to the archive
 
 | Platform | What you get | Worth knowing |
 | --- | --- | --- |
-| **Linux** `x86_64-unknown-linux-gnu` | one binary, inference runtime **in** it | built by CI running `.github/scripts/package-assets.sh`; reproducible **between CI runs of one tag** (three measured), not across machines — an archive you build yourself digests differently ([why](docs/reference-releases.md)) |
-| **Windows** `x86_64-pc-windows-gnu-cross.zip` | one `np.exe`, runtime **in** it | cross-built here with mingw-w64 — **unsigned, not an MSVC build**; import table checked at packaging so it stays a single file |
+| **Linux** `x86_64-unknown-linux-gnu` | one binary, inference runtime **in** it | reproducible between CI runs of one tag, not across machines ([why](docs/reference-releases.md)) |
+| **Windows** `x86_64-pc-windows-gnu-cross.zip` | one `np.exe`, runtime **in** it | cross-built with mingw-w64: **unsigned, not an MSVC build** |
 | **macOS** | *no asset exists* | needs an Apple SDK no cross-compiler here has → [build from source](docs/developing.md) |
 
-Both archives carry the `local-model` and `fetch` features, so a downloaded binary can embed and auto-fetch rather than only index.
-The model itself is never inside an archive: ~309 MB arrives only when you run `np setup` or `np embed` (a vision projector adds
-~555 MB more), and `NP_NO_AUTO_FETCH=1` switches that off. Every archive contains `np`, `LICENSE` and `THIRD_PARTY_NOTICES.md`.
-
-Building from source needs nothing but a stable Rust toolchain for the default build — no C++, no cmake:
+Both archives carry `local-model` and `fetch`, so a downloaded binary can embed and auto-fetch rather than only index; the model is
+never inside an archive. Building from source needs a stable Rust toolchain and nothing else for the default build — no C++, no cmake:
 
 ```sh
 cargo install --git https://github.com/Ex-Bot-01/note-processor --tag v0.7.0 -p np-cli --locked
 ```
 
-Per-version caveats (which old assets are stale, what is compiled out of them): [Release archive caveats](docs/reference-releases.md).
+Per-version caveats, including stale assets and what is compiled out of them: [Release archive caveats](docs/reference-releases.md).
 
-## First run, two commands
+## Try it
 
 Indexing needs no config and no model:
 
@@ -84,90 +71,83 @@ modified   0
 moved      0
 removed    0
 unchanged  0
-notes      3
+notes      4
 unresolved 1 — a target matched more than one file or none; spell its path to place it, e.g. [[notes/a.md]]
-  gone.md
+  gone
+attachments 1 — tracked, never parsed: scratch.txt
 skipped    0
 index      INDEX.md
-elapsed    163 ms
+elapsed    87 ms
 ```
 
-`~/Notes/INDEX.md` now lists every note with its size and link counts, and the database lives under your OS data directory. Run it
-again and nothing recomputes (`unchanged 5`, 25 ms in the same test).
+`~/Notes/INDEX.md` now lists every note with its size and link counts; the database lives under your OS data directory. Run it again and
+nothing recomputes — `unchanged 5`, 2 ms.
 
-Now add meaning — one command that indexes, fetches the pinned model if this workspace lacks it, and embeds:
+Add meaning with one command that indexes, fetches the pinned model if this workspace lacks it, and embeds:
 
 ```sh
 np setup ~/Notes
-np search ~/Notes "how are moved files detected"
+np search ~/Notes "moved hash"
 ```
+
+Before any model exists, `np search` still answers and names the half that was missing (exit **0**):
 
 ```text
-0.7140 note   projects/timeline.md
-0.6566 note   projects/brief.md
-0.5703 note   index-notes.md
+the configured model is not installed in this workspace: ranked by keyword only — `np setup` indexes and embeds in one call, or `np models fetch <vault> --id <id>` installs the bytes
+0.0164 note   retro-notes.md  [bm25 -0.7941]   … # Retro notes  What the [moved] files taught us: detect them by [hash] …
 ```
 
-`np setup` is what an application should call: it indexes **first** (keyword search works the moment indexing finishes), then gets
-as far as it can on vectors and reports exactly where it stopped. Offline, it exits **0** with `vectors: false` — the vault is
-searchable and nothing needs fixing but the cable. Any other stop on the vector half exits 1.
+Both blocks come from one `np 0.7.0` build of this tree over a five-file workspace, on a default-feature build — the `fetch` half of
+that feature set is what published archives carry, which is why the sentence names `np models fetch`. With vectors installed the same
+command prints a score per hit and ranks by sense as well as words; a measured run of that shape is in
+[CLI and report reference](docs/reference-cli-and-reports.md).
 
-One stop is a decision rather than a fault: with no `[embeddings] model` configured, np will not start inference just because a
-binary could. `np embeddings enable <id>` is the door that answer goes through — it writes `embeddings.provider` and
-`embeddings.model`, says which keys it changed and what a first `np embed` would cost, and moves no bytes (**#7**). It is also
-`embeddings.enable` over the pipe, so an app that asked its user can record the answer instead of editing TOML by hand.
+`np setup` is what an application should call — it indexes **first**, so keyword search works the moment indexing finishes, then gets as
+far as it can on vectors and reports where it stopped. Four things worth knowing about that first run:
 
-**The first run may download ~310 MB, and says so before byte one.** `np embed`, `np setup` and a default-mode
-`np search` fetch the pinned artifact when it is missing, announcing id, size and the *kind* of origin, then verifying the digest
-before putting it in place — a partial or wrong file is never used. Three ways to refuse: `--no-auto-fetch` for one run,
-`[models] auto_fetch = false` in the config, or `NP_NO_AUTO_FETCH=1` in the environment (which outranks the file, so a daemon can be
-silenced without editing it). Only ids this build **pins** are ever fetched — a name in a config file cannot make a download happen.
-
-Two habits that pay off:
-
-- **`np embed` reads the index, not the vault.** Edit a note and `np embed` calls it current; run `np scan` first, then
-  `np embed` re-embeds only what moved.
-- **The report goes to stdout; llama.cpp's log lines go to stderr**, where the default level (`warn`) leaves a few hundred bytes
-  instead of the 145,816-byte tensor transcript it used to print ahead of a one-line answer.
+- **It may download ~295 MiB, and says so before byte one**, then verifies the digest before putting the file in place, so a partial or
+  wrong download is never used. Only ids this build **pins** are fetched — a name in a config file cannot make a download happen — and
+  three switches refuse it: `--no-auto-fetch`, `[models] auto_fetch = false`, `NP_NO_AUTO_FETCH=1`.
+- **Offline exits 0 with `vectors: false`.** The vault is searchable and nothing needs fixing but the cable; any other stop on the
+  vector half exits 1. [Models: fetch and install](docs/reference-models.md).
+- **No model configured is a decision, not a fault.** np will not start inference just because a binary could; `np embeddings enable
+  <id>` writes both config keys, quotes what a first `np embed` costs, and moves no bytes.
+- **`np embed` reads the index, not the vault** — scan first, and it re-embeds only what moved. Reports go to stdout; llama.cpp's logs
+  go to stderr at `warn`, where they cost a few hundred bytes rather than a tensor transcript.
 
 ## The six commands
 
 | Command | What it does | What it writes |
 | --- | --- | --- |
-| `np scan <workspace>` | indexes notes and regenerates the catalog; reports added / modified / moved / removed / unchanged | index, `INDEX.md` (+ shards) |
+| `np scan <workspace>` | indexes notes, regenerates the catalog | index, `INDEX.md` (+ shards) |
 | `np embed <workspace>` | encodes what the index says is owed | vectors for the configured model |
-| `np search <workspace> <query> [--limit N] [--mode hybrid\|semantic\|keyword] [--prefix] [--rerank]` | ranks notes and figures; default `hybrid` fuses FTS5 `bm25()` with vectors by reciprocal rank fusion. `--prefix` matches every word at a word beginning (`grand` reaches `grandma`); one marked word, `"grand*"`, does the same for itself. `--rerank` adds an optional cross-encoder pass over the top `rerank_top_n` notes after retrieval — off by default, local weights only, and it never downloads anything itself (**F51**) | nothing (it opens the database, then only `SELECT`s) |
+| `np search <workspace> <query>` | ranks notes and figures. `--limit N`, `--mode hybrid\|semantic\|keyword`, `--prefix` (match words at a word beginning), `--rerank` (optional cross-encoder, local weights only, never fetches) | nothing — it opens the database and only `SELECT`s |
 | `np setup <workspace> [--yes]` | scan → fetch if missing → embed, one report | index, maybe the artifact, vectors |
 | `np models install \| fetch \| hash \| list …` | puts model bytes in place, per workspace | `<data_dir>/workspaces/<key>.models/` |
-| `np embeddings enable <id> \| disable` | turns the embedding model on or off in np's config file — the door a consent answer needs (**#7**). **Fetches nothing**; quotes what a first `np embed` would cost | `config.toml`, `[embeddings]` |
+| `np embeddings enable <id> \| disable` | turns the embedding model on or off in np's config. **Fetches nothing** | `config.toml`, `[embeddings]` |
 
-Every command takes `--json` for a machine-readable document, and exit codes mean what they say: **0** success (including "nothing
-to do" and "nothing indexed"), **1** anything the runtime refused, **2** argv errors. Full field-by-field reference, including why
-every search hit always carries the same twelve keys: [CLI and report reference](docs/reference-cli-and-reports.md).
+Every command except `np serve` — whose stdout *is* the protocol — and `np models hash` takes `--json`. Exit codes mean what they say:
+**0** success (including "nothing to do" and "nothing indexed"), **1** anything the runtime refused, **2** an argv error.
 
-Three behaviours worth knowing before you script against it:
+## Before you script against it
 
-- **The keyword half wants *every* word.** A query is a bag of words, not a sentence: each word is quoted and the words are
-  joined with `AND`, so one note has to contain them all for anything to answer. `"lag broker"` finds the note that says both;
-  `"retro kafka"` — one word in each of two notes — answers *nothing*, exit **0**, and a phrase typed out of a sentence
-  (`"how are moved files detected"`) usually does the same, because one stray word no note contains voids the whole
-  conjunction. Ask for fewer words. Once vectors exist, `--mode hybrid` adds a semantic half that ranks by meaning instead of
-  requiring every word — but until a model is installed (`NP_NO_AUTO_FETCH=1`, or a fresh machine), keyword-only *is* the
-  honest answer, so this is where it shows. FTS5's own syntax is not exposed on purpose: `"`, `*`, `-`, `(` and `:` are ordinary
-  characters rather than operators, which is what keeps a note-worthy identifier like `GGML_DEFAULT_N_THREADS` out of a query
-  parser, and a query longer than 32 words searches its first 32.
-- **`np search` answers before any model exists.** A workspace with no artifact and no vectors returns its keyword hits, prints one
-  line on stderr naming the half that was missing, and exits **0**. Ask for `--mode semantic` in the same vault and you get a refusal
-  at exit 1 instead — a request for one list that cannot run is not answerable by the other.
-- **Readers are never blocked by writers.** `search` and `models list` take no write lock, so they keep answering while a `scan` or
-  `embed` runs. Two writers contend: the second waits two seconds and then reports `locked`, as a state rather than a mystery
-  (`np: locked: another process is writing this workspace (2000 ms) …`).
+- **The keyword half wants *every* word in *one* note.** `"lag broker"` finds the note holding both; `"retro kafka"` — one word in
+  each of two notes — answers nothing at exit **0**. Ask for fewer words, or let `hybrid` rank by meaning once vectors exist.
+- **`--mode semantic` in a vault with no vectors refuses at exit 1**, where the default answers with keyword hits at exit 0: one list
+  that cannot run is not answerable by the other.
+- **Readers are never blocked by writers.** `search` and `models list` take no write lock, so they keep answering while a `scan` runs;
+  two writers contend, and the second waits two seconds then reports `locked` as a state rather than a mystery.
+
+No FTS5 operator reaches the query parser — a trailing `*` is the only syntax np keeps, which is what makes
+`GGML_DEFAULT_N_THREADS` searchable rather than a parse error — and a query past 32 words searches its first 32. Every flag and report
+field: [CLI and report reference](docs/reference-cli-and-reports.md).
 
 ## Configure it
 
-Optional, read once per command from `$XDG_CONFIG_HOME/note-processor/config.toml` (Windows:
-`%APPDATA%\note-processor\config.toml`). A partial file is fine — every key has a default, and an environment variable only *fills*
-a key the file leaves out.
+Optional, read once per command from `$XDG_CONFIG_HOME/note-processor/config.toml` (Windows: `%APPDATA%\note-processor\config.toml`).
+A partial file is fine — every key has a default, and an environment variable only *fills* a key the file leaves out. The one
+deliberate exception is `NP_NO_AUTO_FETCH=1`, which **outranks** the file: a switch that stops a 295 MiB download is not something a
+config file should be able to veto.
 
 ```toml
 [embeddings]
@@ -178,157 +158,96 @@ model = "embeddinggemma-2"   # an id this workspace has been given, by fetch or 
 # mode = "hybrid"            # hybrid | semantic | keyword — `--mode` overrides per run
 ```
 
-That is the whole minimum. Fifteen keys exist in total — counted from the `deny_unknown_fields` structs that define them, because a key
-not in those structs cannot be written at all — and those three are the ones most people need. The other twelve (token budgets,
-llama.cpp thread count and log volume, catalog sharding and indentation, checklist markers, the fetch origin and its two overrides)
-are listed with defaults and refusal behaviour in [Configuration reference](docs/reference-config.md).
+That is the whole minimum. Every other key has a default and is tabulated with its refusal behaviour in
+[Configuration reference](docs/reference-config.md).
 
 ## Use `np` from your app
 
-`np serve` reads one JSON-RPC 2.0 request per line from stdin and writes one response per line to stdout until stdin closes — the
-same work as the commands, on a channel that does not fork. Ask for `notifications` in the handshake and it also narrates the slow
-parts, which is what a GUI needs while a 295 MiB model downloads:
+`np serve` reads one JSON-RPC 2.0 request per line from stdin and writes one response per line to stdout until stdin closes, then
+exits **0**. Same work as the commands, on a channel that does not fork and opens no port: whoever can write to the process's stdin
+already owns the files it can read.
 
-(Temp paths in the transcript below are elided to `$TMPDIR`; the rest is captured output — provenance in
-[the serve reference](docs/reference-serve.md).
+These are the requests — one per line in, and exactly one response line back for each:
 
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"data_dir":"$TMPDIR/cap/run.IaDK9X/C/data","features":{"fetch":true,"local_model":true,"vision":false},"methods":["status.get","initialize","search","scan","embed","models.list","shutdown"],"np":"0.3.0","progress":true,"protocol":1}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"command":"initialize","phase":"completed","request":1,"since_ms":0}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"command":"embed","phase":"locking","request":2,"since_ms":0}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":0,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":61}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":8388608,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":1494}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":16777216,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":4036}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"bytes_done":25165824,"bytes_total":309855456,"command":"embed","member":"main","members_done":0,"members_total":1,"phase":"fetching","request":2,"since_ms":6589}}
-{"error":{"code":-32000,"message":"cannot write $TMPDIR/cap/run.IaDK9X/C/data/workspaces/39e6b8caca57d6ee.models/.part.embeddinggemma-2.1323809-1794227836518406938-0: response body closed before all bytes were read"},"id":2,"jsonrpc":"2.0"}
-{"jsonrpc":"2.0","method":"np/progress","params":{"code":-32000,"command":"embed","phase":"refused","request":2,"since_ms":7704}}
-{"id":3,"jsonrpc":"2.0","result":{"fetch_markers":[],"last":{"code":-32000,"command":"embed","elapsed_ms":7704,"phase":"refused","request":2},"running":null}}
-{"jsonrpc":"2.0","method":"np/progress","params":{"command":"status.get","phase":"completed","request":3,"since_ms":0}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspace":"/vault","notifications":true}}
+{"jsonrpc":"2.0","id":2,"method":"search","params":{"workspace":"/vault","query":"moved hash"}}
 ```
 
-That block is captured stdout, one interrupted download, nothing edited: `locking`, then byte checkpoints against the pinned
-size, then a refusal carrying the same code as the error object. An embed that gets to run says `embedding` and `writing` where
-this one said `fetching`.
-
 Ten methods — `initialize`, `search`, `scan`, `embed`, `models.list`, `links.list`, `embeddings.enable`, `embeddings.disable`,
-`status.get`, `shutdown` — and three rules:
+`status.get`, `shutdown` — with the workspace named in every request, so one server answers for several vaults. Four rules decide most
+client code:
 
-- **Every `result` is exactly the document `np <verb> --json` prints**, because both channels call one builder; a test compares them
-  value for value rather than trusting intent.
+- **Every `result` is exactly the document `np <verb> --json` prints** — one builder behind both channels, compared value for value by
+  a test rather than trusted.
 - **stdout is the protocol.** Every sentence goes to stderr, so a client never strips prose out of a parse.
-- **States come back as data, not faults.** `locked`, `offline`, `reason` and `prefix_drift` are keys in the document; a fault means
-  the *request* was wrong (`-32700`, `-32601`, `-32602`) or `np` refused before doing work (`-32000`). Progress ends with
-  `completed` when the request produced a result — including a degraded one — and `refused` only when it produced an error.
+- **States come back as data, not faults:** `locked`, `offline`, `reason` and `prefix_drift` are keys in the document, while a fault
+  means the request was wrong (`-32700`, `-32600`, `-32601`, `-32602`) or np refused before working (`-32000`).
+- **Progress is off unless you ask.** With `notifications` in the handshake, np narrates the slow parts — `locking`, `resolving`,
+  `fetching` with byte checkpoints against the pinned size, `indexing`, `embedding`, `writing`, then a terminal `completed` or
+  `refused` — and nothing arrives
+  unsolicited, so older clients keep the responses they expect.
 
-`links.list` is the newest of them, and the first method that answers a question the terminal never asks: **who links this
-note, and where is every dead target written?** One call returns every edge with both ends as display paths and the line it
-was written on, plus the unresolved ones named by the text a fix replaces — so a backlinks pane, an in-editor marker and a
-rename-rewriting pass all read np's own link graph instead of maintaining a second wikilink grammar that agrees with np
-until it does not. `params.rel` scopes it to one note; it is a reader that creates nothing and answers while an embed runs.
-
-Progress is **off unless you ask**, so a client built against v0.3.0 keeps the responses it expects: nothing new arrives unsolicited,
-and every method's result document is byte-for-byte what it was. The one line that did change is `initialize`'s own, which now lists
-`status.get` among the methods this build accepts and adds `"progress": true` when asked.
-
-A workspace is named in every request rather than remembered at startup, so one server can answer for several vaults. It exits **0** when stdin closes. Nothing listens on a port: whoever can write to the process's stdin already owns
-the files it can read.
-
-The whole interface — every method, every phase, four captured transcripts and a Python walkthrough including what to show after a
-page reload — is in [`docs/reference-serve.md`](docs/reference-serve.md); the reasoning is in
-[`np serve` over stdio](docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md) and its
-[progress design](docs/superpowers/specs/2026-11-09-np-serve-progress-design.md).
-
-Diagnostics stay off the protocol: `-v`, `NP_LOG` or `[log] level` puts human text on stderr, `[log] file` writes JSONL, and every
-record raised inside a request carries that request's id. You are not obliged to read stderr — np drops diagnostics rather than
-waiting for a client that will not drain the pipe.
-[`docs/reference-diagnostics.md`](docs/reference-diagnostics.md) lists the levels, the ten targets and all twenty-one rule tokens;
-[`docs/measurement-np-diagnostics-cost.md`](docs/measurement-np-diagnostics-cost.md) is what they cost when you do not ask.
+`links.list` answers what the terminal never asks — **who links this note, and where is every dead target written?** — with both ends as
+display paths, the line each edge was written on, and unresolved targets named by the text a fix replaces. `params.rel` scopes it to one
+note; it is a reader that creates nothing and answers while an embed runs. Diagnostics stay off the
+protocol (`-v`, `NP_LOG`, `[log] file`), records carrying the id of the request that raised them. Methods, phases, fault codes, captured
+transcripts and a Python walkthrough: [`np serve` reference](docs/reference-serve.md).
 
 ## Images, briefly
 
-A note links a figure with ordinary markdown — `![alt](diagram.png)` — resolved like any other link, inside the workspace only.
-`np` encodes **PNG and JPEG**, extension *and* content signature both; `.svg`, `.drawio`, `.excalidraw` and `.pdf` resolve and then
-refuse as `unsupported-format`, by decision rather than oversight (an SVG is a file that asks to fetch things). Figures are
-content-addressed, so identical bytes linked from six notes encode once. Every refusal is counted under one of six classes that each
-name an action — [Images in the index](docs/reference-images.md). A refused figure still costs you nothing but the count: the note
-around it stays searchable as text.
-
-Image *encoding* needs a build made with `--features local-model,vision` plus the projector artifact; the release binaries are
-text-only on the image side and say so per figure rather than silently skipping.
+A figure is linked with ordinary markdown — `![alt](diagram.png)` — resolved like any other link, inside the workspace only. `np`
+encodes **PNG and JPEG**, extension *and* content signature both; `.svg`, `.drawio`, `.excalidraw` and `.pdf` refuse as
+`unsupported-format`, by decision (an SVG is a file that asks to fetch things). Figures are content-addressed, so bytes linked from six
+notes encode once, and every refusal lands in one of seven classes that each name an action —
+[Images in the index](docs/reference-images.md). A refused figure costs nothing but the count: the note around it stays searchable as
+text. Encoding needs `--features local-model,vision` plus the projector artifact; published archives are text-only on the image side
+and say so per figure rather than silently skipping.
 
 ## When something looks wrong
 
 | You saw | It means |
 | --- | --- |
-| `configuration disabled: embeddings.provider = "none"` from `np embed` | Nobody has said yes yet. `np embeddings enable <id>` writes both keys and quotes the download without starting it (**#7**); or accept an index-only build, which is a supported shape rather than a failure |
-| `no vectors in this workspace: ranked by keyword only …` on stderr, exit **0** | Not an error. Keywords answered; the vector list had nothing to rank |
-| `nothing matched "…"` on stdout, exit **0**, in a vault you know holds the words | The keyword half needs **every** word in **one** note (`AND` of quoted phrases), so a sentence-shaped query dies on one stray `how`, and two words that live in different notes never meet. Try fewer words; with vectors installed, `--mode hybrid` adds a semantic half that ranks by meaning. A vault nobody indexed says it out loud instead: `… this workspace has never been scanned` |
-| `np embed` reports `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |
-| `locked: another process is writing this workspace (2000 ms)` | Another `np` holds this vault's write lock. Retry; readers were never blocked, and a killed process cannot leave a lock behind |
-| `offline: could not reach the pinned origin to fetch …` | Auto-fetch tried and nothing answered. `setup` still indexed and exited 0; keyword search works meanwhile; no partial state was written |
-| `np` printed nothing while you were sure something went wrong | Diagnostics are off until asked for: add `-vv`, or `NP_LOG=debug`, for the per-file reasons, and `[log] file` for the JSONL version. Nothing here touches stdout — see [Diagnostics reference](docs/reference-diagnostics.md) |
+| `configuration disabled: embeddings.provider = "none"` from `np embed` | Nobody has said yes yet. `np embeddings enable <id>` writes both keys and quotes the download without starting it; an index-only build is a supported shape, not a failure |
+| `no vectors in this workspace: ranked by keyword only …`, exit **0** | Not an error: keywords answered, the vector list had nothing to rank |
+| `nothing matched "…"` in a vault you know holds the words | The keyword half needs every word in one note; try fewer words. A vault nobody indexed says `… this workspace has never been scanned` |
+| `current 3 embedded 0` after you edited notes | Run `np scan` first — embedding is driven by the index |
 
-The full table — including every refusal sentence, the two llama.cpp warnings that are normal, and what to read when an old schema
-upgrade removed something: [Troubleshooting](docs/reference-troubleshooting.md).
+Every other refusal sentence np prints, and the two llama.cpp warnings that are normal: [Troubleshooting](docs/reference-troubleshooting.md).
 
 ## Limits, stated plainly
 
-- **No hosted CI has graded this tree since 2026-11-07** (the account's included minutes ran out). What stands in its place is a
-  20-row local gate list run by exit code, and each release's notes say which rows ran: [developing](docs/developing.md).
-- **The Windows write-lock behaviour has never been measured on Windows.** `np scan` / `np embed` refusing cleanly when a second
-  writer holds a vault is believed equivalent to Linux — SQLite uses `LockFileEx` there instead of POSIX record locks — and that
-  belief is untested. MSVC parity is unmeasured too: `build.rs` refuses that target rather than pretending.
-- **No macOS asset**, and feature builds on Windows/macOS get a written refusal from `build.rs`.
-- **Image encoding is off in the release binaries** (`vision` is not a default feature), so every figure lands in
-  `vision-unavailable` until you build with it.
-- **No stemming**: `runner` does not match `runners`, because this vault holds identifiers. A word you type has to appear as a
-  whole one — so ask for the shorter form instead: mark it (`"grand*"`) or pass `--prefix`, and the answer reports which words it
-  matched at a word beginning (`prefix_used`, `prefix_terms`) and which hits came only from a prefix (`matched_exactly` per hit).
-  Widening is opt-in because the same rule that protects `runner` protects your file names. No OCR, no PDF or audio, no sync, no
-  watch mode, no cloud calls outside `models fetch`.
-- Unmeasured and open: image throughput, resident-set growth with a projector open, cross-worker bit-identity, retrieval quality —
-  the list is in [`design-m2-image-embeddings.md` §14](docs/design-m2-image-embeddings.md).
+- **Hosted CI grades Linux on every push to `main`; the Windows row and both C++ feature rows run nightly**, so between a merge and
+  the next nightly `main` is graded on Linux only. Beside it stands a local gate list run by exit code, and each release's notes say
+  which rows ran: [Developing](docs/developing.md).
+- **The Windows write-lock behaviour has never been measured on Windows.** A second writer refusing cleanly is believed equivalent to
+  Linux — SQLite uses `LockFileEx` there instead of POSIX record locks — and that belief is untested. MSVC parity is unmeasured too:
+  `build.rs` refuses that target rather than pretending, as it does on macOS, where no asset exists either.
+- **Image encoding is off in the published archives** (`vision` is not a default feature), so figures land in `vision-unavailable`
+  until you build with it.
+- **No stemming**: `runner` does not match `runners`, because this vault holds identifiers and a typed word must appear whole. Ask for
+  the shorter form — mark it (`"grand*"`) or pass `--prefix` — and the answer says which words matched at a word beginning
+  (`prefix_used`, `prefix_terms`) and which hits came only from a prefix (`matched_exactly`). Widening is opt-in because the rule that
+  protects `runner` also protects your file names.
+- **No OCR, no PDF or audio, no sync, no watch mode**, and no network transfer anywhere except the model-fetch path — the indexing
+  half never opens a socket.
+- Unmeasured and open: image throughput, resident-set growth with a projector open, cross-worker bit-identity, retrieval quality — in
+  the [image-embeddings design](docs/design-m2-image-embeddings.md).
 
-## Documentation
+## Where to read next
 
-| Read | For |
-| --- | --- |
-| [Models: fetch and install](docs/reference-models.md) | where artifacts live per workspace, what `install` verifies, what it refuses |
-| [Configuration reference](docs/reference-config.md) | every key, default, and refusal |
-| [CLI and report reference](docs/reference-cli-and-reports.md) | `--json` fields, report lines, exit codes, measured output |
-| [`np serve` reference](docs/reference-serve.md) | the stdio protocol: methods, fault codes, progress phases, captured transcripts |
-| [Diagnostics reference](docs/reference-diagnostics.md) | `-v`, `NP_LOG`, `[log]`: levels, targets, rule tokens, both caps, what a diagnostic may never contain |
-| [Images in the index](docs/reference-images.md) | sniffing, the six refusal classes, why vector formats are out |
-| [Troubleshooting](docs/reference-troubleshooting.md) | every sentence `np` prints that makes people pause |
-| [Release archive caveats](docs/reference-releases.md) | what each version's assets do and cannot do |
-| [Developing](docs/developing.md) | feature builds, vendored llama.cpp, the gate list, what CI grades |
-| [Licensing in full](docs/licensing.md) | the MIT ruling, what the notice obligation attaches to |
+Reference: [CLI and reports](docs/reference-cli-and-reports.md) · [configuration](docs/reference-config.md) ·
+[`np serve`](docs/reference-serve.md) · [models](docs/reference-models.md) · [images](docs/reference-images.md) ·
+[diagnostics](docs/reference-diagnostics.md) · [troubleshooting](docs/reference-troubleshooting.md) ·
+[release caveats](docs/reference-releases.md) · [developing](docs/developing.md) · [licensing](docs/licensing.md).
 
-The decisions behind those, each with its measurements:
-
-| Document | Holds |
-| --- | --- |
-| [`docs/superpowers/specs/2026-10-23-note-processor-design.md`](docs/superpowers/specs/2026-10-23-note-processor-design.md) | The original product spec: what to index, how links resolve, what a catalog is |
-| [`docs/design-m2-embeddings.md`](docs/design-m2-embeddings.md) | The embedding design: chunking, budgets, the provider seam |
-| [`docs/design-m2-local-embeddings.md`](docs/design-m2-local-embeddings.md) | llama.cpp ownership (§14), the pin discipline and the §12 fetch rules, §5's context ceiling |
-| [`docs/design-m2-models-install.md`](docs/design-m2-models-install.md) | What "installed" means: rows, digests, per-workspace artifacts |
-| [`docs/design-m2-image-embeddings.md`](docs/design-m2-image-embeddings.md) | R7c: media tables, discovery and sniffing, the vision seam, §8's refusal classes, §14's measured numbers |
-| [`docs/design-m2-thread-policy.md`](docs/design-m2-thread-policy.md) | The `"auto"` worker rule and the measurements behind it |
-| [Hybrid search](docs/design-m3-hybrid-search.md) · [auto-fetch](docs/design-f38-auto-fetch.md) · [`np serve`](docs/superpowers/specs/2026-11-08-np-serve-stdio-design.md) | The three most recent behaviour changes, as designed and as built |
-| [`docs/design-f48-links-as-a-query.md`](docs/design-f48-links-as-a-query.md) | What a client may assume about link identity: display paths and lines, what `rel` scopes, and why figures and stale notes are absent from `links.list` |
-| [`docs/design-f50-consent-has-a-door.md`](docs/design-f50-consent-has-a-door.md) | Who may write `config.toml`, and how the write is checked: validation by loading, refusal over half-configuration, provenance in the file |
-| [`docs/design-f49-word-beginnings.md`](docs/design-f49-word-beginnings.md) | What a query may ask for besides a whole word: the one character of syntax, why the default did not move, and how an answer admits it widened |
-| [Backlog](docs/backlog-m2-followups.md) · [roadmap](docs/archive/roadmap-2026-10-27.md) · [todo](todo.md) | What is owed, with what each item costs, and where this is going |
-
-Code comments carry the local reasoning; those files carry the decisions and the measurements.
-
-Repository layout: `crates/np-core` (discovery, parsing, links, catalog, database, embeddings, media, search) and `crates/np-cli`
-(argv, resolution, printers — no decisions of its own), with `third_party/`, `scripts/` and the pinned `.vendor/` tree for C++.
+[`docs/README.md`](docs/README.md) indexes the whole library, including the design behind each decision and the ADRs that locked it.
+The code is two crates: `crates/np-core` (discovery, parsing, links, catalog, database, embeddings, media, search) and `crates/np-cli`
+(argv, resolution, printers — no decisions of its own).
 
 ## License
 
-MIT — [`LICENSE`](LICENSE), adopted 2026-11-08. Both release archives carry it beside the binary, and
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) carries the verbatim MIT text for the llama.cpp / ggml code statically linked in,
-plus exactly which archives are linked — because that obligation attaches to the artefact you download, not to the repository it came
-from. Model weights are a separate matter and are not redistributed: `embeddinggemma-2` is fetched on your explicit action,
-digest-verified, and its own license governs it. [The long version, including the copyright line's status](docs/licensing.md).
+MIT — [`LICENSE`](LICENSE), carried beside the binary in every archive. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) holds the
+verbatim MIT text for the statically linked llama.cpp / ggml code and exactly which archives are linked, because that obligation
+attaches to the artefact you download rather than the repository it came from. Model weights are not redistributed: they are fetched
+on your explicit action, digest-verified, and their own license governs them. [The long version](docs/licensing.md).

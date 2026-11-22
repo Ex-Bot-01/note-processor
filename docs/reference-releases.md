@@ -321,10 +321,10 @@ Linux asset (`x86_64-unknown-linux-gnu`) was built here by `.github/scripts/pack
 packaging time so it stays a single file rather than a folder of DLLs. **No macOS asset exists**: that needs an Apple SDK, which no cross-compiler here
 has; on macOS build from source. Every archive contains `np`, `LICENSE` and `THIRD_PARTY_NOTICES.md`, and each release publishes `SHA256SUMS.txt`.
 
-**What was not measured about `v0.3.0`**, because you should not have to find out by hand: GitHub Actions was out of included minutes since
-2026-11-07, so no CI job has graded this tree — the local gate list (20 rows: fmt, four clippy feature rows, workspace and per-feature test runs, a
-no-`HOME` config run, three rustdoc `--deny warnings` runs, two static checks, catalog goldens, and the quality-harness self-test) is what stands in
-its place, and the release notes for each tag say which rows ran. The Windows write-lock behaviour (`np scan` and `np embed` refusing cleanly when a
+**What was not measured about `v0.3.0`**, because you should not have to find out by hand: no hosted CI job graded that tag when it was
+cut — the local gate list (fmt, four clippy feature rows, workspace and per-feature test runs, a
+no-`HOME` config run, three rustdoc `--deny warnings` runs, the static fences, catalog goldens, and the quality-harness self-test) is what stood in
+its place, and the release notes for each tag say which rows ran. For what hosted CI grades now and when, see [developing.md](developing.md). The Windows write-lock behaviour (`np scan` and `np embed` refusing cleanly when a
 second writer holds a vault) is believed equivalent to Linux — SQLite uses `LockFileEx` there instead of POSIX record locks — and has never been
 measured on Windows. MSVC parity is unmeasured too: `build.rs` refuses that target rather than pretending.
 
