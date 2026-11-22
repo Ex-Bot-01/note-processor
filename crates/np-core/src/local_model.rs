@@ -191,7 +191,7 @@ pub enum Purpose {
     /// and [`load_rank`] reads back what it got, refusing rather than reading garbage.
     ///
     /// `ctx_tokens` is the ceiling for one scored pair. It must be non-zero — llama.cpp reads `n_ctx == 0` as "no
-    /// ceiling" — and [`load_rank`] is the only caller, passing [`RERANK_CTX_TOKENS`].
+    /// ceiling" — and [`load_rank`] is the only caller, passing `RERANK_CTX_TOKENS`.
     Rank { ctx_tokens: usize },
 }
 
@@ -1556,8 +1556,8 @@ impl Drop for LoadedRanker {
 ///
 /// **Capability is measured here, not declared.** There is no registry row for a reranker (a `models` row carries a
 /// vector width and embedding prefixes, and this artifact has neither), so nothing upstream can promise what a given
-/// file is. What this refuses instead: a missing or unreadable file, a context that did not become RANK
-/// ([`accepted_pooling`]), and a head that answers with more than one number per pair.
+/// file is. What this refuses instead: a missing or unreadable file, a context that did not become RANK (the
+/// `accepted_pooling` table), and a head that answers with more than one number per pair.
 ///
 /// The consequence of "measured" is worth stating plainly: **any** artifact can be handed to this function, including
 /// an embedding model, and the refusal may come from the pooling check rather than from a name. That is fine for the

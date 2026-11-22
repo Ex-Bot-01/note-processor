@@ -58,6 +58,10 @@ pub mod pins;
 // np-core has no serde_json dependency, and the throttle that keeps a status stream from becoming the traffic is a
 // property of the channel printing it.
 pub mod progress;
+// How a (query, document) pair is assembled, what fits the scoring window, and how scores become an order. Ungated for
+// the reason `pins` is: "reranking is off", "this build has no runtime" and "the model is not installed" are sentences
+// about definitions this module owns, and a text-only build has to be able to say all three.
+pub mod rerank;
 // The read side of the index: one cosine pass over both vector kinds, with no write anywhere in its path
 // No feature gate — it reads bytes the schema already holds, so a text-only
 // build can search the images another build embedded.
