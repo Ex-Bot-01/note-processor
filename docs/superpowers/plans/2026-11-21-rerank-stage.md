@@ -98,9 +98,9 @@ fn a_rank_context_is_built_at_the_requested_window() {
 ### Task 3: `rerank.rs` — the recipe, the fitting and the reorder, with no weights involved
 
 **Files:**
-- Create: `crates/np-core/src/rerank.rs`
+- Create: crates/np-core/src/rerank.rs
 - Modify: `crates/np-core/src/lib.rs` (`pub mod rerank;`, ungated, with the one-line reason the embedder seam already gives)
-- Test: `crates/np-core/tests/rerank.rs` (new; runs in the default build, no artifact, no database)
+- Test: crates/np-core/tests/rerank.rs (new; runs in the default build, no artifact, no database)
 
 **Interfaces:**
 - Consumes: nothing outside std.
@@ -119,7 +119,7 @@ pub enum RerankError { RuntimeNotBuilt, ArtifactAbsent, ArtifactUnverified(Strin
 pub struct NoReranker(pub RerankError);   // implements Reranker by refusing
 ```
 
-- [ ] **Step 1: Write the failing tests** in `crates/np-core/tests/rerank.rs`. Named, with the assertions spelled:
+- [ ] **Step 1: Write the failing tests** in crates/np-core/tests/rerank.rs. Named, with the assertions spelled:
   - `pair_tokens_follows_the_pinned_fallback_over_the_flag_table` — over all eight flag combinations with `bos = Some(0)`, `eos = sep = Some(2)`, query `[10, 11]`, doc `[20]`: `{bos,eos,sep}` → `[0,10,11,2,2,20,2]`; `{bos,eos,!sep}` → `[0,10,11,2,20,2]`; `add_sep` alone adds one more `2`; a `None` special is skipped even when its flag is set (a vocabulary that has no SEP cannot emit one).
   - `fit_pair_keeps_the_query_and_cuts_the_note_tail` — budget 8, query 3 tokens, doc 20 → `Truncated { tokens: 8, dropped: 15 }`, and the first three tokens of the result are still the query's.
   - `fit_pair_refuses_a_query_that_does_not_fit_on_its_own` — budget 4, query 6 tokens → `QueryTooLong { tokens: 6, budget: 4 }`; nothing is truncated on the query side, ever.
@@ -138,7 +138,7 @@ pub struct NoReranker(pub RerankError);   // implements Reranker by refusing
 
 **Files:**
 - Modify: `crates/np-core/src/local_model.rs` (`Purpose::Rank` arm, `RankModel`, `impl Reranker for RankModel`)
-- Test: `crates/np-core/tests/local_rerank.rs` (new, artifact-gated on **`NP_TEST_RERANK_PATH`**, printing `NOT COVERAGE` and returning when unset — copy the pattern in `tests/local_load.rs`)
+- Test: crates/np-core/tests/local_rerank.rs (new, artifact-gated on **`NP_TEST_RERANK_PATH`**, printing `NOT COVERAGE` and returning when unset — copy the pattern in `tests/local_load.rs`)
 - Modify: `docs/developing.md` (the gated-suite paragraph gains the third variable and its command line)
 
 **Interfaces:**
@@ -252,7 +252,7 @@ pub enum RerankText { #[default] TitleBody, Body }   // label() + FromStr + serd
 **Files:**
 - Modify: `crates/np-core/src/search.rs` (`Hit` fields, `Answer`, `RerankInput`, `RerankNote`, the stage in `ranked`, note-text reads)
 - Modify: `crates/np-core/src/diagnostics.rs` (four rule tokens + `RULE_TOKENS`)
-- Test: `crates/np-core/tests/rerank_stage.rs` (new; a scripted fake `Reranker`, no weights), `crates/np-core/tests/search.rs` (the read-only fence must still pass)
+- Test: crates/np-core/tests/rerank_stage.rs (new; a scripted fake `Reranker`, no weights), `crates/np-core/tests/search.rs` (the read-only fence must still pass)
 
 **Interfaces:**
 - Consumes: `rerank::{Reranker, rank_order}` (Task 3), `config::MAX_RERANK_CANDIDATES` and `search::RerankText` (Task 7).
@@ -295,8 +295,8 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
 ### Task 9: The CLI and serve doors, including the exit codes
 
 **Files:**
-- Modify: `crates/np-cli/src/main.rs` (two flags), `crates/np-cli/src/commands/search.rs` (`search_run`, `SearchRun`, `search_document`, text line), `crates/np-cli/src/serve.rs` (`"rerank"` param), `crates/np-cli/src/commands/rerank.rs` (new: resolve + verify-once)
-- Test: `crates/np-cli/tests/cli.rs`, `crates/np-cli/tests/serve.rs`, `crates/np-cli/tests/rerank_cli.rs` (new)
+- Modify: `crates/np-cli/src/main.rs` (two flags), `crates/np-cli/src/commands/search.rs` (`search_run`, `SearchRun`, `search_document`, text line), `crates/np-cli/src/serve.rs` (`"rerank"` param), crates/np-cli/src/commands/rerank.rs (new: resolve + verify-once)
+- Test: `crates/np-cli/tests/cli.rs`, `crates/np-cli/tests/serve.rs`, crates/np-cli/tests/rerank_cli.rs (new)
 
 **Interfaces:**
 - Consumes: `search::RerankInput` / `RerankAsk` / `RerankNote` (Task 8), `local_model::RankModel` behind `local-model`, `pins::RERANKER_ID` + `pins::pinned_member` for size/digest, `Config::workspace_models_dir`.
@@ -322,7 +322,7 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
 **Files:**
 - Create: `tests/fixtures/rerank-vault/` (~100 small notes, ~half German), `tests/fixtures/rerank-labels.tsv`
 - Modify: `.github/scripts/f31_eval.py` (nDCG@k, a rerank axis, `--self-test` additions)
-- Test: the fence's own `--self-test`, plus `crates/np-core/tests/rerank_fixture.rs`
+- Test: the fence's own `--self-test`, plus crates/np-core/tests/rerank_fixture.rs
 
 **Interfaces:**
 - Consumes: `f31_eval.py`'s existing TSV label format (`query<TAB>path[<TAB>kind]`) and `search()` runner.
@@ -331,7 +331,7 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
 - [ ] **Step 1: Write the metric's own test first** — extend `--self-test` with a hand-computed nDCG@10 case (planted gains, one known answer at rank 4 → a number computed on paper and written into the script) plus the mutant that flatters itself (nDCG over answered queries only must **not** rise when recall falls). Run `python3 .github/scripts/f31_eval.py --self-test` and watch it fail before implementing.
 - [ ] **Step 2: Implement `ndcg_at` and the rerank axis.** Binary relevance, as F31 does everywhere else; add `--rerank` and `--rerank-text <title-body|body>` as pass-throughs to every `np search` call (the harness's job is to drive the binary, not to reimplement a flag), and print nDCG@k beside recall@k and MRR per mode. Print the run's shape above the table — binary, modes, k, rerank on/off, which text policy ran, label path — so a 0.02 difference over eight queries cannot be read as a finding.
 - [ ] **Step 3: Write the fixture.** ~100 notes of two to eight lines each, DE and EN, plausibly vault-shaped (a meeting note, a recipe, a project log, an invoice reminder) with deliberately flat vocabulary overlap between neighbours so retrieval genuinely misses; include 1-3 word queries in both languages and label every one. No private text, no real names, no host paths.
-- [ ] **Step 4: Write `crates/np-core/tests/rerank_fixture.rs`** — `every_labelled_answer_is_an_indexed_path` (scan the fixture into a temp DB once; an unresolvable label is a broken fixture, not a bad search) and `the_fixture_vault_scans_clean` (no skipped files). These run with no model, so a rotting fixture fails a gate row rather than someone's measurement.
+- [ ] **Step 4: Write crates/np-core/tests/rerank_fixture.rs** — `every_labelled_answer_is_an_indexed_path` (scan the fixture into a temp DB once; an unresolvable label is a broken fixture, not a bad search) and `the_fixture_vault_scans_clean` (no skipped files). These run with no model, so a rotting fixture fails a gate row rather than someone's measurement.
 - [ ] **Step 5: Run** `python3 .github/scripts/f31_eval.py --self-test`, `cargo test -p np-core --test rerank_fixture`, `python3 .github/scripts/check-links.py`.
 - [ ] **Step 6: Commit** `git commit -am "test(fixtures): a DE/EN vault and labels the rerank stage can be measured against"`
 
@@ -340,8 +340,8 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
 ### Task 11: Measure what this host can measure, and write it down
 
 **Files:**
-- Modify: `crates/np-core/tests/local_rerank.rs` (timing rows), `.github/scripts/f31_eval.py` (nothing further)
-- Create: `docs/measurement-rerank.md`
+- Modify: crates/np-core/tests/local_rerank.rs (timing rows), `.github/scripts/f31_eval.py` (nothing further)
+- Create: docs/measurement-rerank.md
 - Modify: `README.md`, `docs/reference-cli-and-reports.md`, `docs/reference-config.md`, `docs/reference-serve.md`, `docs/reference-models.md`, `THIRD_PARTY_NOTICES.md`, `docs/design-f51-rerank-stage.md` (status line), `todo.md`
 
 **Interfaces:**
@@ -352,7 +352,7 @@ pub fn ranked(conn, mode, model, query_vector, query_text, limit, prefix, rerank
 - [ ] **Step 2: Measure the stage's cost** from the artifact-gated harness in `local_rerank.rs`: p50/p95 over ≥30 scored queries at N ∈ {5, 10, 15, 20, 25} and at 50 candidates, with `RankModel::facts().window` and the context's read-back thread counts printed beside the table; peak RSS of one-shot `np search --rerank` versus without it (`/usr/bin/time -v`); the end-to-end wall time of a fresh process including the pin hash.
 - [ ] **Step 3: Compare the quants** through the same seam with `NP_TEST_RERANK_PATH` pointed at Q5_K_M and Q4_K_M: top-1 agreement, top-10 overlap against Q8_0's order, latency, size. Pin nothing new; if a smaller quant is equivalent on those numbers, that is a follow-up card with its own decision, not an edit here.
 - [ ] **Step 4: Attempt the reference cross-check** (an isolated `uv` environment, `sentence-transformers`, the HF weights). If it installs and runs, report score deltas **and** order agreement against np's scores, with §4 of the design beside it. If it does not fit, write that row as not measured — an attempted-and-declined row is a fact; a silent gap is not.
-- [ ] **Step 5: Write `docs/measurement-rerank.md`** in the style of `docs/measurement-f30-vector-surface.md`: what was run, the exact commands, every figure, and a **"not measured"** list carrying at least — real-vault quality (the human runs it), figures/images under rerank, chunk-level scoring, keyword-only improvement, front matter under rerank, long-note truncation effects, worker-thread scaling, and any Windows or macOS figure. State next to the fixture numbers that they describe the stage, not anyone's vault.
+- [ ] **Step 5: Write docs/measurement-rerank.md** in the style of `docs/measurement-f30-vector-surface.md`: what was run, the exact commands, every figure, and a **"not measured"** list carrying at least — real-vault quality (the human runs it), figures/images under rerank, chunk-level scoring, keyword-only improvement, front matter under rerank, long-note truncation effects, worker-thread scaling, and any Windows or macOS figure. State next to the fixture numbers that they describe the stage, not anyone's vault.
 - [ ] **Step 6: Update the live documents** — README (search section: what the stage is, that it is off by default, what it costs), `reference-cli-and-reports.md` (flags, the new hit keys, the `rerank` object, both exit codes), `reference-config.md` (both keys), `reference-serve.md` (`"rerank"` param + `METHODS` note if any changed), `reference-models.md` (Task 6's surface), `THIRD_PARTY_NOTICES.md` (the reranker: Apache-2.0 as the upstream BAAI model and the publishing repository both state, with the same "check the card yourself" posture the existing notices keep). Set the design doc's status to implemented and give `todo.md` its honest next actions.
 - [ ] **Step 7: Run the whole gate list** — `.github/scripts/gates.sh` with `CMAKE` set so the `local-model` rows execute rather than print SKIPPED, plus the artifact-gated rows with `NP_TEST_MODEL_PATH`, `NP_TEST_MMPROJ_PATH` and `NP_TEST_RERANK_PATH` set. Then `python3 .github/scripts/verify_catalog_goldens.py` must print `GOLDEN CHECK: pass` with no golden touched. Record in the final report **which rows ran, which skipped and why, and how many `NOT COVERAGE` lines printed** — a green run with 40 vacuous suites is not evidence.
 - [ ] **Step 8: Commit** `git commit -am "docs(rerank): what the stage measures on this host, and what it does not"`
