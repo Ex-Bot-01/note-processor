@@ -68,7 +68,7 @@ can talk to a server it cannot configure still deserves answers.
 
 | Method | Params | Result | Built by | Refusals |
 |---|---|---|---|---|
-| `initialize` | `workspace?`, `notifications?` | `{protocol, np, features, methods, data_dir, progress?}` | its own builder | `-32602` on a non-boolean `notifications` |
+| `initialize` | `workspace?`, `notifications?` | `{protocol, np, features, methods, data_dir, progress?}` — `features` keys: `local_model`, `vision`, `fetch`, and `rerank` (the last one says this build reads the `rerank` parameter on `search`; an older server ignores a parameter it has never heard of instead of refusing it) | its own builder | `-32602` on a non-boolean `notifications` |
 | `search` | `workspace`, `query`, `limit?`, `mode?` (`keyword`\|`semantic`\|`hybrid`), `prefix?` (boolean), `rerank?` (boolean or null), `rerank_text?` (`title-body`\|`body`) | the same document as `np search --json`, including the `rerank` object (**F51**) | `search_document` | `-32602` missing/unknown key, a `prefix`/`rerank` that is not a boolean, or a `rerank_text` that is neither spelling; `-32000` workspace unreadable, or `rerank: true` with no reranker to run — the fault carries the CLI's refusal sentence verbatim |
 | `scan` | `workspace` | the same report as `np scan --json` | `ScanReport` | `-32602`; `-32000` |
 | `embed` | `workspace` | the same report as `np embed --json` | `embed_report` | `-32602`; `-32000` (including a build without the inference feature) |
@@ -87,6 +87,11 @@ Two things are deliberately **not** methods:
   or `np models fetch` out of band, or let `embed`/`search` auto-fetch under the usual rules (config `[models] auto_fetch`,
   `NP_NO_AUTO_FETCH=1`). **`embeddings.enable` is the consent answer, not the download**: it writes two config keys and quotes
   a price (**F50**); the bytes still move at an `embed`.
+
+The reranker follows the same ruling and has no door here either: nothing over `serve` writes `[search] rerank`, and nothing
+over `serve` moves its bytes, because `auto_fetch` prices embedding ids and never a rerank id. That is the answer a GUI client
+needs, and [Models](reference-models.md#the-reranker-an-artifact-that-is-not-a-model) carries it: read `models.list`'s
+`reranker` for state and price, offer one `np models fetch <vault> --id …` line for the human to run.
 
 These two are also the only methods that **refuse an unknown parameter**. A reader sent an extra key asked a question about
 state; a writer whose `"modle"` was ignored consented to nothing while being told it did — which is F35's argument for refusing

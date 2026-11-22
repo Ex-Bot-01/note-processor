@@ -196,8 +196,9 @@ about pixels nobody looked at).
 np search ~/Notes "wie entkalkt man eine Kaffeemühle" --limit 5 --rerank
 ```
 
-It costs a model: the pinned `bge-reranker-v2-m3` is 635,674,432 bytes and must be installed with
-[`np models install`](reference-models.md). Before it scores anything its bytes are checked against the pin — length first (a
+It costs a model: the pinned `bge-reranker-v2-m3` is 635,674,432 bytes, brought in by
+[`np models fetch`](reference-models.md) or placed by hand with [`np models install`](reference-models.md) — and by neither
+from inside a search. Before it scores anything its bytes are checked against the pin — length first (a
 `stat`, free), then the digest, because wrong bytes producing a plausible order is the one failure this command could not detect
 afterwards. The verdict is remembered for the process and re-validated against size and mtime, so `np serve` pays one pass while
 every `np search` pays its own: measured here at roughly 15 s on a laptop CPU, which is why an un-reranked search never touches
