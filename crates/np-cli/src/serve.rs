@@ -44,7 +44,7 @@ pub const PROTOCOL: u64 = 1;
 /// client that calls something absent gets `-32601` and a support report that names what *was* available.
 pub const METHODS: &[&str] = &[
     // `status.get` is last-but-one because it is the only method that reads state the server did not create this
-    // instant: it answers between requests, which is what a client with no request of its own in flight needs.
+    // instant — and, with `cancel`, one of the two the reader answers at once, even while another request runs.
     "status.get",
     "initialize",
     "search",
@@ -60,6 +60,11 @@ pub const METHODS: &[&str] = &[
     // rather than comparing version strings.
     "embeddings.enable",
     "embeddings.disable",
+    // The three doors a long-lived client needs around models the server keeps between requests: stop a request it no longer
+    // wants, load ahead of the first query, and hand the memory back. Added inside protocol 1, like every method above.
+    "cancel",
+    "models.warm",
+    "models.release",
     "shutdown",
 ];
 
@@ -80,6 +85,9 @@ impl Fault {
     const REFUSED: i64 = -32000;
     /// A panic inside a handler. Reported and survived: one bad note must not end a session.
     const INTERNAL: i64 = -32603;
+    /// The client cancelled this request (`cancel`) before it finished. The number LSP uses for the same answer, so a client
+    /// that already speaks one JSON-RPC dialect recognises it.
+    const CANCELLED: i64 = -32800;
 
     fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
@@ -122,13 +130,15 @@ fn refused<E: Into<Box<dyn Error>>>(source: E) -> ServeError {
 
 /// Serve until stdin closes. Returns `Ok` on EOF and on `shutdown`: a client that hung up is not a failure, and neither is one that said goodbye.
 pub fn serve() -> Result<(), Box<dyn Error>> {
-    // One handle, locked for the loop's life: interleaving responses on a shared stdout is exactly the corruption a client cannot recover from.
-    let stdin = io::stdin();
-    let mut out = io::stdout().lock();
+    // One sink for both threads, written a whole line at a time: interleaving bytes on a shared stdout is exactly the
+    // corruption a client cannot recover from.
     let clock = crate::serve_channel::SystemClock::new();
-    let mut ch = crate::serve_channel::Channel::new(&mut out, &clock);
-    // Every behaviour of the old inline loop lives on, now behind a sink the unit tests can drive in-process.
-    crate::serve_channel::serve_loop(stdin.lock(), &mut ch)?;
+    crate::serve_channel::serve_threaded(
+        io::stdin().lock(),
+        crate::serve_channel::SharedSink::new(crate::serve_channel::StdoutLines(io::stdout())),
+        &clock,
+        std::sync::Arc::new(crate::serve_channel::Session::default()),
+    );
     Ok(())
 }
 
@@ -212,15 +222,30 @@ pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>
         span.record("workspace", workspace);
     }
     let _entered = span.enter();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dispatch(method, &params, call_id.as_ref(), ch)
-    }));
+    // Cancelled while it waited in the queue: answered in its turn, as cancelled, without running.
+    let outcome = if ch.take_cancelled_before_start() {
+        Ok(Err(ServeError::Fault(cancelled(id.as_ref()))))
+    } else {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch(method, &params, call_id.as_ref(), ch)
+        }))
+    };
     // Every arm below ends the same way: a **fault value** or a **result**, and one terminal notification built from
     // which of the two it was. Doing this in one place rather than per handler is the point — "did this request end well"
     // is one question, and two places answering it is how a degraded success starts reporting itself as an error.
     let outcome: Result<Value, Fault> = match outcome {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(ServeError::Fault(fault))) => Err(fault),
+        // A search that noticed the cancel between two pairs says so in its own error type; it is the client's cancel, not a
+        // refusal, and gets the cancel's code.
+        Ok(Err(ServeError::Refused(source)))
+            if matches!(
+                source.downcast_ref::<np_core::search::SearchError>(),
+                Some(np_core::search::SearchError::Cancelled)
+            ) =>
+        {
+            Err(cancelled(id.as_ref()))
+        }
         Ok(Err(ServeError::Refused(source))) => {
             // A refusal is `-32000` with the CLI's own sentence, and nothing else: no code per sentence, because a caller that branches on an
             // error *kind* should be branching on a state key in the result (the lock rule), not on a fault number.
@@ -341,6 +366,9 @@ fn dispatch(
         "embeddings.disable" => embeddings_disable(params),
 
         "status.get" => status(params, ch),
+        "cancel" => cancel(params, ch),
+        "models.warm" => models_warm(params),
+        "models.release" => models_release(ch),
         // The client asked to be done. Answer first, then stop reading: a response that races the pipe closing is a
         // response nobody received. Closing stdin still works and still exits 0 — this only means `shutdown` alone is
         // believed as the request it is, rather than as a hint the server is free to ignore until EOF.
@@ -382,6 +410,20 @@ fn initialize(
         }
     };
     ch.set_notifications(wants_progress);
+    // **How long loaded models outlive the last request.** Absent keeps the server's default; 0 keeps nothing between
+    // requests, which is how every search behaved before the server held models at all.
+    match params.get("models_idle_secs") {
+        None | Some(Value::Null) => {}
+        Some(value) => match value.as_u64() {
+            Some(secs) => ch.session().set_idle_secs(secs),
+            None => {
+                return Err(ServeError::fault(
+                    Fault::INVALID_PARAMS,
+                    format!("`models_idle_secs` needs a whole number of seconds (0 keeps nothing), not {value}"),
+                ))
+            }
+        },
+    }
     let mut result = json!({
         "np": env!("CARGO_PKG_VERSION"),
         "protocol": PROTOCOL,
@@ -397,6 +439,8 @@ fn initialize(
             "rerank": cfg!(feature = "local-model"),
         },
         "methods": METHODS,
+        // Seconds a loaded model stays resident after the last request — the value in force, whether the client set it or not.
+        "models_idle_secs": ch.session().idle_secs(),
         // Where the index and model caches live. A path rather than a host: origin privacy forbids naming an *origin*, and this is the line a support
         // screenshot needs when someone asks "why does this vault have no vectors".
         "data_dir": np_core::config::Config::default().data_dir.display().to_string(),
@@ -596,6 +640,11 @@ fn embed(
         &progress,
     )
     .map_err(refused)?;
+    // The run stopped at a batch boundary because the client cancelled: every batch before it is committed and the rest stay
+    // owed, so the next `embed` resumes rather than repeats. The report would describe a run nobody is waiting for.
+    if np_core::progress::Progress::cancelled(&progress) {
+        return Err(ServeError::Fault(cancelled(request)));
+    }
     let drift = match report.model.as_deref() {
         Some(id) => crate::commands::embed::prefix_drift_notice(
             &crate::commands::common::load_config().map_err(refused)?,
@@ -611,16 +660,17 @@ fn embed(
 
 /// What this connection knows, and what the disk says is being downloaded.
 ///
-/// Three keys, always present — a client should be able to read `result["running"]` without first asking whether this
+/// Every key always present — a client should be able to read `result["running"]` without first asking whether this
 /// build has it:
 ///
 /// * `last`: the finished activity this connection most recently answered (`{request, command, phase, elapsed_ms, …}`),
 ///   or `null` on a connection that has done nothing yet.
 /// * `fetch_markers`: every `.fetching.*` marker in this workspace's models directory, read from disk. Reported, never
 ///   touched (the read-only-marker rule).
-/// * `running`: **always `null` in this design**, and documented as such. The server handles one request at a time, so by
-///   the time it can answer "what is running?", the thing that was running has finished; inventing a value here would
-///   give a client a field to trust that cannot be true. Live status arrives as notifications instead.
+/// * `running`: the request the worker is handling right now (`{request, command, since_ms}`), or `null` when it is idle.
+///   `status.get` is answered by the reader thread the moment it arrives, so this is a live answer, not the last one.
+/// * `queued`: how many requests wait behind it.
+/// * `models_held`: the model ids whose weights this server keeps resident between requests.
 /// * `last_scan`: unix seconds of the last scan whose rows **committed** in this workspace, or `null` when none has —
 ///   including for a path that is not an indexed workspace at all. This is the question a GUI asks most often ("is what I'm
 ///   showing stale?"), and until now the only way to answer it was to run a scan, which is work rather than a reading. The
@@ -663,9 +713,14 @@ fn status(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Valu
         })
         .collect();
     Ok(json!({
-        "last": ch.last().cloned().unwrap_or(Value::Null),
+        "last": ch.last().unwrap_or(Value::Null),
         "fetch_markers": markers,
-        "running": null,
+        // Answered by the reader thread while the worker runs, so this is the request in flight right now — its id, method and
+        // how long it has run — or `null` when the worker is idle.
+        "running": ch.session().running(),
+        "queued": ch.session().queued(),
+        // Model ids whose weights this server holds resident between requests, as the worker last reported them.
+        "models_held": ch.session().held(),
         // Tested for the file, then opened — in that order. `Db::open` creates directories and an empty database, so a
         // check afterwards could not un-mint the thing this function promises not to make.
         "last_scan": if config.workspace_db(&workspace).is_file() {
@@ -677,6 +732,141 @@ fn status(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Valu
             Value::Null
         },
     }))
+}
+
+/// The fault a cancelled request is answered with.
+fn cancelled(request: Option<&Value>) -> Fault {
+    Fault::new(
+        Fault::CANCELLED,
+        match request {
+            Some(id) => format!("request {id} was cancelled by the client"),
+            None => "the request was cancelled by the client".to_string(),
+        },
+    )
+}
+
+/// **Stop a request the client no longer wants.** Answered by the reader thread at once, whatever the worker is doing.
+///
+/// `state` says where the request was: `queued` (it will be answered with `-32800` in its turn, without running),
+/// `running` (it stops at its next checkpoint — between rerank pairs, between embed batches, between a search's phases — and
+/// is answered with `-32800`; work that has no checkpoint left finishes and answers normally), or `unknown` (it already
+/// finished, or never arrived — nothing to stop).
+fn cancel(params: &Value, ch: &crate::serve_channel::Channel<'_>) -> Result<Value, ServeError> {
+    let request = match params.get("request") {
+        Some(id @ (Value::String(_) | Value::Number(_))) => id.clone(),
+        _ => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                "params need the \"request\" id to cancel, as a string or a number",
+            ))
+        }
+    };
+    let state = ch.session().cancel(&request);
+    Ok(json!({
+        "request": request,
+        "state": state,
+        "cancelled": state != "unknown",
+    }))
+}
+
+/// **Load ahead of the first question.** Resolves the workspace's embedding model exactly as a search would — verified bytes,
+/// no download — and makes it resident; with `"rerank": true` (or `[search] rerank` on and no `rerank` key) the reranker too.
+/// A client calls this when its window opens, or right after `np models fetch` put new bytes on disk, so the person's first
+/// search is not the one that pays for reading them.
+fn models_warm(params: &Value) -> Result<Value, ServeError> {
+    let workspace = workspace_of(params)?;
+    let rerank = match params.get("rerank") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(on)) => Some(*on),
+        Some(_) => {
+            return Err(ServeError::fault(
+                Fault::INVALID_PARAMS,
+                "\"rerank\" must be true, false or null",
+            ))
+        }
+    };
+    let cfg = crate::commands::common::load_config().map_err(refused)?;
+    let resolved = crate::commands::embed::embed_provider(
+        &cfg,
+        &workspace,
+        false,
+        false,
+        np_core::progress::none(),
+    )
+    .map_err(refused)?;
+    let embedder = match resolved.state {
+        crate::commands::embed::ProviderState::Ready(provider) => {
+            let mut object = json!({ "model": provider.model_id() });
+            match crate::commands::hold::warm_embedder() {
+                Some(Ok(load)) => {
+                    object["loaded"] = json!(true);
+                    object["reused"] = json!(load.reused);
+                    object["load_ms"] = json!(load.load_ms);
+                    object["query_threads"] = json!(resolved.query_workers);
+                }
+                Some(Err(err)) => {
+                    object["loaded"] = json!(false);
+                    object["note"] = json!(err.to_string());
+                }
+                None => {
+                    object["loaded"] = json!(false);
+                    object["note"] = json!(
+                        "this binary was built without the `local-model` feature, so no model can load"
+                    );
+                }
+            }
+            object
+        }
+        crate::commands::embed::ProviderState::Placeholder { reason, .. } => {
+            json!({ "loaded": false, "note": reason.sentence(&workspace) })
+        }
+        crate::commands::embed::ProviderState::ArtifactAbsent => json!({
+            "loaded": false,
+            "note": np_core::embed_run::install_hint(&workspace),
+        }),
+        crate::commands::embed::ProviderState::FetchSkippedOffline { id } => json!({
+            "model": id,
+            "loaded": false,
+            "note": "the model artifact is not on disk; warming never downloads",
+        }),
+    };
+    let plan = match rerank {
+        Some(false) => None,
+        asked => crate::commands::rerank::plan(&cfg, asked, None),
+    };
+    let reranker = match plan {
+        None => Value::Null,
+        Some(plan) => match crate::commands::rerank::prepare(&cfg, &workspace, &plan, false)
+            .map_err(refused)?
+        {
+            crate::commands::rerank::Opened::Ready { load, threads, .. } => json!({
+                "model": np_core::pins::RERANKER_ID,
+                "loaded": true,
+                "reused": load.reused,
+                "load_ms": load.load_ms,
+                "threads": threads,
+            }),
+            crate::commands::rerank::Opened::Declined(note) => json!({
+                "model": np_core::pins::RERANKER_ID,
+                "loaded": false,
+                "reason": note.token(),
+                "note": note.label(),
+            }),
+        },
+    };
+    Ok(json!({
+        "held": crate::commands::hold::held(),
+        "embedder": embedder,
+        "reranker": reranker,
+    }))
+}
+
+/// **Hand the memory back.** Drops every model this server holds; the next request that needs one loads it again. For a
+/// client that knows search has gone quiet sooner than the idle timeout would notice.
+fn models_release(ch: &crate::serve_channel::Channel<'_>) -> Result<Value, ServeError> {
+    let released = crate::commands::hold::release();
+    ch.session().set_held(Vec::new());
+    Ok(json!({ "released": released }))
 }
 
 fn models_list(params: &Value) -> Result<Value, ServeError> {

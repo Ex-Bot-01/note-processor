@@ -217,6 +217,10 @@ pub enum SearchError {
         /// Why the stage could not score, in its own words.
         cause: RerankNote,
     },
+    /// The caller stopped waiting, and the stage noticed between two pairs. Not a fault of the query or the workspace: nothing
+    /// was written, and asking again answers normally.
+    #[error("the search was cancelled before it finished")]
+    Cancelled,
     /// No `models` row answers to that id.
     /// The configured model id holds no vectors while this database holds some under a **different** id.
     ///
@@ -1450,6 +1454,9 @@ pub struct RerankInput<'a> {
     pub top_n: usize,
     /// Which text of a note the model reads.
     pub text: RerankText,
+    /// Asked between pairs; `true` ends the stage with [`SearchError::Cancelled`]. `None` for a caller that cannot be
+    /// interrupted, which is every CLI run.
+    pub stop: Option<&'a dyn Fn() -> bool>,
 }
 
 /// Why a rerank stage could not run. Carried on the answer as [`RerankReport::note`] when configuration asked, and inside
@@ -1601,6 +1608,9 @@ pub struct RerankReport {
     /// How many candidates were actually scored — `min(top_n, note hits)` minus any whose text could not be read. The number
     /// that costs the run, which is why it is not a copy of [`RerankInput::top_n`].
     pub candidates: usize,
+    /// Wall time spent scoring, in milliseconds — `None` when nothing was handed to the model. Loading the ranker is not
+    /// in here: that happens before the stage and is the caller's number to report.
+    pub score_ms: Option<u64>,
 }
 
 impl RerankReport {
@@ -1611,6 +1621,7 @@ impl RerankReport {
             skip: Some(RerankSkip::Disabled),
             note: None,
             candidates: 0,
+            score_ms: None,
         }
     }
 }
@@ -1638,6 +1649,7 @@ fn rerank_stage(
         ask,
         top_n,
         text,
+        stop,
     } = input;
 
     // Which slots are in play, and the paths to read for them. Ascending slot order is retrieval order, which is what makes
@@ -1655,6 +1667,7 @@ fn rerank_stage(
         skip: Some(RerankSkip::NoCandidates),
         note: None,
         candidates: 0,
+        score_ms: None,
     };
     if wanted.is_empty() {
         return Ok(report);
@@ -1673,7 +1686,34 @@ fn rerank_stage(
     }
 
     let borrowed: Vec<&str> = scored.iter().map(|(_, text)| text.as_str()).collect();
-    let scores = match reranker.score(query_text, &borrowed) {
+    let started = std::time::Instant::now();
+    // With a `stop` hook the pairs go one per call, so a cancel lands between two forward passes instead of after the last;
+    // without one they go together, which leaves the scorer free to treat the list as one job.
+    let outcome = match stop {
+        None => reranker.score(query_text, &borrowed),
+        Some(stop) => {
+            let mut scores = Vec::with_capacity(borrowed.len());
+            let mut failed = None;
+            for doc in &borrowed {
+                if stop() {
+                    return Err(SearchError::Cancelled);
+                }
+                match reranker.score(query_text, std::slice::from_ref(doc)) {
+                    Ok(one) => scores.extend(one),
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            match failed {
+                Some(error) => Err(error),
+                None => Ok(scores),
+            }
+        }
+    };
+    report.score_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    let scores = match outcome {
         Ok(scores) => scores,
         Err(error) => {
             let note = RerankNote::from(error);

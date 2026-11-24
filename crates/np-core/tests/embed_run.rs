@@ -58,6 +58,7 @@ impl Setup {
                 // The policy default, spelled out: these fixtures must not inherit a worker count by
                 // accident if `Auto` ever stops being the default.
                 threads: np_core::config::ThreadCount::Auto,
+                query_threads: np_core::config::ThreadCount::Auto,
                 log_level: None,
             },
             ..Config::default()
@@ -851,6 +852,7 @@ fn provider_none_is_configuration_disabled_and_reads_nothing() {
             // The policy default, spelled out: these fixtures must not inherit a worker count by
             // accident if `Auto` ever stops being the default.
             threads: np_core::config::ThreadCount::Auto,
+            query_threads: np_core::config::ThreadCount::Auto,
             log_level: None,
         },
         ..setup.cfg()
@@ -924,6 +926,7 @@ fn provider_none_still_refuses_without_an_install_hint() {
             dim: None,
             max_tokens: np_core::config::DEFAULT_EMBEDDING_TOKENS,
             threads: np_core::config::ThreadCount::Auto,
+            query_threads: np_core::config::ThreadCount::Auto,
             log_level: None,
         },
         ..setup.cfg()
@@ -1282,6 +1285,7 @@ fn every_report_carries_the_caveat_line() {
             // The policy default, spelled out: these fixtures must not inherit a worker count by
             // accident if `Auto` ever stops being the default.
             threads: np_core::config::ThreadCount::Auto,
+            query_threads: np_core::config::ThreadCount::Auto,
             log_level: None,
         },
         ..setup.cfg()

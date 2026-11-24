@@ -2419,6 +2419,100 @@ fn rerank_keys_read_from_the_file_as_written() {
     );
 }
 
+/// **`query_threads` refuses by its own name.** The two keys share one parser, and a refusal that blamed
+/// `embeddings.threads` for a bad `query_threads` would send a person to edit the line that was fine.
+#[test]
+fn query_threads_loads_both_spellings_and_refuses_naming_itself() {
+    let _env = hold_env();
+    let tmp = tempfile::tempdir().expect("test setup: tempdir");
+    let data = toml_str(&tmp.path().display().to_string());
+    for (body, wanted) in [
+        ("", ThreadCount::Auto),
+        ("query_threads = \"auto\"", ThreadCount::Auto),
+        (
+            "query_threads = 3",
+            ThreadCount::Workers(std::num::NonZeroU32::new(3).unwrap()),
+        ),
+    ] {
+        let path = write_config(
+            tmp.path(),
+            &format!("data_dir = {data}\n[embeddings]\n{body}\n"),
+        );
+        let cfg =
+            Config::load(Some(&path)).unwrap_or_else(|err| panic!("`{body}` must load: {err}"));
+        assert_eq!(cfg.embeddings.query_threads, wanted, "`{body}`");
+    }
+    for body in [
+        "query_threads = 0",
+        "query_threads = \"most\"",
+        "query_threads = 4097",
+    ] {
+        let path = write_config(
+            tmp.path(),
+            &format!("data_dir = {data}\n[embeddings]\n{body}\n"),
+        );
+        let text = Config::load(Some(&path))
+            .expect_err("`{body}` must be refused")
+            .to_string();
+        assert!(
+            text.contains("embeddings.query_threads"),
+            "`{body}` must name its own key: {text}"
+        );
+        assert!(
+            !text.contains("embeddings.threads"),
+            "`{body}` must not blame its sibling: {text}"
+        );
+    }
+}
+
+/// The query rule: `auto` caps a query pass at a couple of workers whatever the batch count, never above the batch count,
+/// and an explicit count is taken as written.
+#[test]
+fn an_auto_query_pass_is_narrow_and_an_explicit_one_is_honoured() {
+    use np_core::config::QUERY_AUTO_WORKERS;
+    assert_eq!(ThreadCount::Auto.resolve_query(12), QUERY_AUTO_WORKERS);
+    assert_eq!(ThreadCount::Auto.resolve_query(1), 1);
+    let six = ThreadCount::Workers(std::num::NonZeroU32::new(6).unwrap());
+    assert_eq!(six.resolve_query(12), 6);
+}
+
+/// `rerank_max_tokens` defaults to the whole scoring window, takes the bounds themselves, and refuses either side of them
+/// by name — a budget too small to hold a question, or wider than the context the ranker is built with.
+#[test]
+fn rerank_max_tokens_is_bounded_by_the_scoring_window() {
+    use np_core::config::{MAX_RERANK_PAIR_TOKENS, MIN_RERANK_PAIR_TOKENS};
+    let _env = hold_env();
+    let tmp = TempDir::new().expect("test setup: tempdir");
+    let path = write_config_with_data_dir(tmp.path(), "");
+    assert_eq!(
+        Config::load(Some(&path))
+            .expect("an empty file loads")
+            .search
+            .rerank_max_tokens,
+        MAX_RERANK_PAIR_TOKENS
+    );
+    for edge in [MIN_RERANK_PAIR_TOKENS, MAX_RERANK_PAIR_TOKENS] {
+        let path = write_config_with_data_dir(
+            tmp.path(),
+            &format!("[search]\nrerank_max_tokens = {edge}\n"),
+        );
+        assert_eq!(
+            Config::load(Some(&path))
+                .expect("a bound is allowed")
+                .search
+                .rerank_max_tokens,
+            edge
+        );
+    }
+    for outside in [MIN_RERANK_PAIR_TOKENS - 1, MAX_RERANK_PAIR_TOKENS + 1] {
+        let (_path, err) = root_refusal(&format!("[search]\nrerank_max_tokens = {outside}\n"));
+        assert!(
+            err.to_string().contains("search.rerank_max_tokens"),
+            "`{outside}` must be refused naming the key: {err}"
+        );
+    }
+}
+
 /// A depth outside `1..=64` is refused **naming the key and the bound**, not clamped: F35's rule is that nonsense is
 /// refused rather than quietly repaired, and `rerank_top_n = 0` in particular would mean "retrieval's order, then reorder
 /// nothing" — a run that loads a 635 MB model to change no bytes. The cap is checked at the boundary as well as past it,

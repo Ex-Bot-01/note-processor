@@ -117,11 +117,15 @@ np search ./notes retro --mode keyword --json
   "offline": false,
   "prefix_terms": [],
   "prefix_used": false,
+  "query_threads": null,
   "reason": null,
   "semantic_used": false,
   "vectors": false
 }
 ```
+
+`query_threads` is how many workers encoded the query (`[embeddings] query_threads`), or `null` when no query was embedded —
+keyword mode, or a hybrid search over a workspace with no vectors. It is the first number to read when a semantic search is slow.
 
 `bm25` is SQLite's own number, unremapped (better is more negative, so `score` carries its negation to keep "higher first"
 true across modes), and the text channel prints small magnitudes in scientific notation rather than `-0.0000`. With a hybrid
@@ -250,8 +254,14 @@ ordered each line: `score` stays the retrieval number, while `rerank_score`, `re
 three `null` when nothing was scored) carry the second pass beside it. Beside the hits, `"rerank"` reports the stage itself:
 
 ```json
-"rerank": { "ran": false, "reason": "disabled", "note": null, "candidates": 0, "model": null, "text": "title-body" }
+"rerank": { "ran": false, "reason": "disabled", "note": null, "candidates": 0, "model": null, "text": "title-body",
+            "reused": null, "load_ms": null, "score_ms": null, "threads": null }
 ```
+
+The last four say where the stage's time went, so "the reranker is slow" can be read as loading or as scoring: `load_ms` is the
+time spent loading the ranker for this run (`0` with `reused: true` when a long-lived `np serve` already held it), `score_ms` the
+wall time of scoring every pair, `threads` the workers the ranking context ran with. All four are `null` when no ranker was opened.
+Scoring dominates on long notes; `[search] rerank_max_tokens` bounds how much of each note a pair holds.
 
 `reason` is one key for both kinds of "did not run": the non-faults (`disabled`, `no-candidates`) and the causes
 (`rerank-artifact-missing`, `rerank-runtime-not-built`, `rerank-artifact-unverified`, `rerank-cannot-score`), each of which also

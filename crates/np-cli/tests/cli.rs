@@ -2785,6 +2785,7 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
             "offline",
             "prefix_terms",
             "prefix_used",
+            "query_threads",
             "reason",
             "rerank",
             "semantic_used",
@@ -2794,7 +2795,8 @@ fn search_json_names_the_mode_that_ran_and_the_half_that_was_missing() {
          `offline` (F38's meanings, so one reader handles embed and search); **#5** added `indexed` (has this workspace ever been
          scanned) and `keyword_used` / `semantic_used` (which halves this answer was built from); **#6** added `prefix_used` /
          `prefix_terms` (did any word match at the start of a word, and which); **F51** added `rerank` (what the optional
-         cross-encoder stage did — see `search_json_reports_a_rerank_stage_that_was_never_asked` for its shape)"
+         cross-encoder stage did — see `search_json_reports_a_rerank_stage_that_was_never_asked` for its shape); **#26** added
+         `query_threads` (how many workers encoded the query, null when none was encoded)"
     );
     assert_eq!(
         value["mode"], "hybrid",
@@ -3969,11 +3971,18 @@ mod real_model {
                 "offline",
                 "prefix_terms",
                 "prefix_used",
+                "query_threads",
                 "reason",
+                "rerank",
                 "semantic_used",
                 "vectors",
             ],
             "the hit list beside the keys that say how it was made — and nothing else on stdout"
+        );
+        // The query was embedded, so the document says by how many workers (`[embeddings] query_threads`, **#26**).
+        assert!(
+            value["query_threads"].as_u64().is_some_and(|n| n >= 1),
+            "{value}"
         );
         // **A healthy run says so by silence.** `note` is null and `vectors` is true exactly when both halves answered, so
         // the caveat key cannot be read as a routine warning; this is the pair to the default-build case

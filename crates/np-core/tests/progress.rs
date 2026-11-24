@@ -414,6 +414,7 @@ impl Setup {
                 dim: None,
                 max_tokens: DEFAULT_EMBEDDING_TOKENS,
                 threads: np_core::config::ThreadCount::Auto,
+                query_threads: np_core::config::ThreadCount::Auto,
                 log_level: None,
             },
             ..Config::default()

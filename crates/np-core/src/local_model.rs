@@ -112,7 +112,11 @@ const REQUESTED_CTX: usize = 8_192;
 /// pair. The number makes a limit real; what to do at the limit is the scorer's rule, and it is *not* truncation — a
 /// pair that does not fit is refused rather than scored from half a document, which would be a judgement about words
 /// the user never asked about.
-const RERANK_CTX_TOKENS: usize = 2_048;
+const RERANK_CTX_TOKENS: usize = crate::config::MAX_RERANK_PAIR_TOKENS;
+
+/// The most workers [`LoadedModel::set_threads`] will hand to C — the same policy bound the config deserializer refuses
+/// above, kept here as a second fence because this setter takes a plain count.
+const MAX_SET_THREADS: usize = 4_096;
 
 /// The one cross-file invariant worth compiling rather than commenting: **a validated budget must fit the context we
 /// build**. `window()` is `min(REQUESTED_CTX, n_ctx_train)`, so this guarantees that any `embeddings.max_tokens` which
@@ -394,6 +398,18 @@ impl LoadedModel {
             usize::try_from(generation).unwrap_or(0),
             usize::try_from(batch).unwrap_or(0),
         )
+    }
+
+    /// Point both worker counts at `n` for every pass after this one. Nothing is reallocated — llama.cpp reads the count at
+    /// each pass — so one loaded model can run a document batch wide and a short query narrow.
+    ///
+    /// Bounded to `1..=MAX_SET_THREADS` rather than refused: every caller passes a count that already went through the
+    /// config deserializer's refusals, so the bound only keeps an impossible value out of C.
+    pub fn set_threads(&self, n: usize) {
+        let n = i32::try_from(n.clamp(1, MAX_SET_THREADS)).unwrap_or(1);
+        // SAFETY: `self.ctx` is live for as long as `&self` is, and `n` is positive. The call writes two integers into
+        // the context's parameters and allocates nothing.
+        unsafe { llama_ffi::llama_set_n_threads(self.ctx.as_ptr(), n, n) };
     }
 
     /// How many tokens the model would see for **`prefix + text`** with its special tokens, without running a
@@ -805,6 +821,10 @@ pub struct LocalEmbedder {
     prefix_query: String,
     /// `embeddings.max_tokens`, checked by [`LoadedModel::embed_text`] over the token count.
     max_tokens: usize,
+    /// Workers for a query pass, when that differs from the batch count the context was built with. A query is one short
+    /// sequence: past a couple of workers the split costs more than it saves, and on a busy machine every extra worker is
+    /// one more thread waiting for a core. `None` runs queries with the batch count.
+    query_threads: Option<usize>,
 }
 
 impl LocalEmbedder {
@@ -830,6 +850,7 @@ impl LocalEmbedder {
                 prefix_doc: row.prefix_doc.clone(),
                 prefix_query: row.prefix_query.clone(),
                 max_tokens,
+                query_threads: None,
             }),
             // A negative `dim` cannot be a width, and neither can one that simply differs; both are reported
             // as the mismatch they are, naming the number the row holds.
@@ -881,13 +902,37 @@ impl LocalEmbedder {
         Ok(())
     }
 
-    /// Embed one text under the prefix `kind` selects.
+    /// Embed one text under the prefix `kind` selects. A query runs at [`Self::query_threads`] workers when one was set, and
+    /// the context goes back to its batch count afterwards, so a document pass after it is as wide as it was before.
     pub fn embed_as(&self, text: &str, kind: TextKind) -> Result<Vector, EmbedError> {
         let prefix = match kind {
             TextKind::Document => &self.prefix_doc,
             TextKind::Query => &self.prefix_query,
         };
+        if kind == TextKind::Query {
+            if let Some(narrow) = self.query_threads {
+                let (_, batch) = self.model.threads();
+                if narrow != batch {
+                    self.model.set_threads(narrow);
+                    let vector = self.model.embed_text(prefix, text, self.max_tokens);
+                    self.model.set_threads(batch);
+                    return vector;
+                }
+            }
+        }
         self.model.embed_text(prefix, text, self.max_tokens)
+    }
+
+    /// Run queries at `threads` workers instead of the batch count.
+    #[must_use]
+    pub fn with_query_threads(mut self, threads: usize) -> Self {
+        self.query_threads = Some(threads);
+        self
+    }
+
+    /// The worker count a query pass runs at.
+    pub fn query_threads(&self) -> usize {
+        self.query_threads.unwrap_or_else(|| self.model.threads().1)
     }
 }
 
@@ -1012,6 +1057,8 @@ pub struct LazyLocalEmbedder {
     /// A path and not an open projector — see this type's header for why that is the only shape the drop rule allows here.
     #[cfg(feature = "vision")]
     mmproj: Option<PathBuf>,
+    /// What `[embeddings] query_threads` said; resolved against the batch count at load, like [`Self::threads`].
+    query_threads: crate::config::ThreadCount,
     loaded: std::cell::OnceCell<Result<LocalEmbedder, LoadFailure>>,
 }
 
@@ -1054,8 +1101,23 @@ impl LazyLocalEmbedder {
             // defaults and a text-only run is exactly what it was before images existed.
             #[cfg(feature = "vision")]
             mmproj: None,
+            query_threads: crate::config::ThreadCount::Auto,
             loaded: std::cell::OnceCell::new(),
         })
+    }
+
+    /// Set the query-side worker policy (`[embeddings] query_threads`). Builder style so [`Self::new`] keeps its signature.
+    #[must_use]
+    pub fn with_query_threads(mut self, threads: crate::config::ThreadCount) -> Self {
+        self.query_threads = threads;
+        self
+    }
+
+    /// The worker count a query pass will run at — answered without loading, from the same two settings the load reads.
+    #[must_use]
+    pub fn query_worker_count(&self) -> usize {
+        self.query_threads
+            .resolve_query(self.threads.resolve(self.available))
     }
 
     /// Say that this provider can serve images once it has loaded, and where its projector file is.
@@ -1109,6 +1171,12 @@ impl LazyLocalEmbedder {
         self.loaded.get().is_some_and(|result| result.is_ok())
     }
 
+    /// Load now rather than at the first text. For a caller that knows a query is coming and would rather pay the load
+    /// while nobody is waiting — a long-lived server right after a fetch, or when a client asks it to warm up.
+    pub fn warm(&self) -> Result<(), EmbedError> {
+        self.model().map(|_| ())
+    }
+
     /// The path a load would read — the file arm (iii) and arm (iv) name.
     pub fn artifact(&self) -> &Path {
         &self.artifact
@@ -1134,21 +1202,25 @@ impl LazyLocalEmbedder {
                 let options = LoadOptions {
                     threads: std::num::NonZeroU32::new(u32::try_from(wanted).unwrap_or(u32::MAX)),
                 };
+                let query = self.query_worker_count();
                 match load_with_options(&self.artifact, self.dim, options) {
                     // The mmproj hand-off happens here rather than as a fourth argument to [`LocalEmbedder::new`]: the
                     // projector path is an optional capability, and this is the one place that knows both the path and a
                     // model that is finally resident.
                     #[cfg(feature = "vision")]
                     Ok(model) => match LocalEmbedder::new(model, &self.row, self.max_tokens) {
-                        Ok(embedder) => Ok(match &self.mmproj {
-                            Some(path) => embedder.with_mmproj(path.clone()),
-                            None => embedder,
-                        }),
+                        Ok(embedder) => {
+                            let embedder = embedder.with_query_threads(query);
+                            Ok(match &self.mmproj {
+                                Some(path) => embedder.with_mmproj(path.clone()),
+                                None => embedder,
+                            })
+                        }
                         Err(err) => Err(LoadFailure::capture(&err)),
                     },
                     #[cfg(not(feature = "vision"))]
                     Ok(model) => LocalEmbedder::new(model, &self.row, self.max_tokens)
-                        .map(Ok)
+                        .map(|embedder| Ok(embedder.with_query_threads(query)))
                         .map_err(|err| LoadFailure::capture(&err))?,
                     Err(err) => Err(LoadFailure::capture(&err)),
                 }
@@ -1554,9 +1626,33 @@ pub struct LoadedRanker {
     flags: VocabFlags,
     /// The ids behind those flags, `None` where the vocabulary has none.
     specials: Specials,
+    /// Tokens one pair may hold, at most [`Self::window`]. A caller narrows it per request
+    /// ([`Self::set_pair_budget`]); the note is cut to fit, exactly as it is cut to fit the window.
+    pair_budget: usize,
 }
 
 impl LoadedRanker {
+    /// Score pairs of at most `tokens` tokens from now on, bounded by [`Self::window`] — the context cannot hold more.
+    pub fn set_pair_budget(&mut self, tokens: usize) {
+        self.pair_budget = tokens.clamp(1, self.window);
+    }
+
+    /// The worker counts this context was told to use, as `(single-token pass, batch pass)` — the same readback
+    /// [`LoadedModel::threads`] gives, with the same caveat: what was asked for, not proof of what ran.
+    pub fn threads(&self) -> (usize, usize) {
+        // SAFETY: `self.ctx` is live for as long as `&self` is; both calls read one field of its parameters.
+        let (generation, batch) = unsafe {
+            (
+                llama_ffi::llama_n_threads(self.ctx.as_ptr()),
+                llama_ffi::llama_n_threads_batch(self.ctx.as_ptr()),
+            )
+        };
+        (
+            usize::try_from(generation).unwrap_or(0),
+            usize::try_from(batch).unwrap_or(0),
+        )
+    }
+
     /// Tokens one scored pair may occupy in a single forward pass — the same three-numbers bound [`LoadedModel::window`]
     /// describes for an embedding pass, and the number a caller refuses over rather than truncates.
     pub fn window(&self) -> usize {
@@ -1680,7 +1776,7 @@ impl Reranker for LoadedRanker {
                 &self.flags,
                 &query_tokens,
                 &doc_tokens,
-                self.window,
+                self.pair_budget,
             ) {
                 Fit::Whole(tokens) | Fit::Truncated { tokens, .. } => tokens,
                 Fit::QueryTooLong { tokens, budget } => {
@@ -1794,6 +1890,15 @@ impl fmt::Debug for LoadedRanker {
 /// label table rather than by a name. That is fine for the `np` commands, which resolve a pinned id before opening a
 /// path, and is why this is `pub`: a caller that hands in an arbitrary path is told what the artifact turned out to be.
 pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError> {
+    load_rank_with_options(path, LoadOptions::default())
+}
+
+/// [`load_rank`] with a worker count. A ranker scores whole notes — hundreds to thousands of tokens per pair — so it is
+/// batch work, and llama.cpp's compile-time default of four leaves most of a modern machine idle while a person waits.
+pub fn load_rank_with_options(
+    path: &Path,
+    options: LoadOptions,
+) -> Result<LoadedRanker, EmbedError> {
     // The same spelling `load` uses: absolute, no symlink resolution, prefixed when long. A file that is not there is
     // not checked for here — the runtime answers null for both "missing" and "not a GGUF", and both come back as the
     // one refusal a caller can act on, which is [`load`]'s precedent rather than an extra stat.
@@ -1819,7 +1924,7 @@ pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError> {
         Purpose::Rank {
             ctx_tokens: RERANK_CTX_TOKENS,
         },
-        LoadOptions::default(),
+        options,
     ) {
         Ok(built) => built,
         Err(problem) => {
@@ -1896,6 +2001,7 @@ pub fn load_rank(path: &Path) -> Result<LoadedRanker, EmbedError> {
         n_cls_out: 1,
         flags,
         specials,
+        pair_budget: window,
     })
 }
 

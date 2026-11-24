@@ -77,6 +77,15 @@ pub struct ProgressEvent<'a> {
 pub trait Progress {
     /// Report one checkpoint.
     fn report(&self, event: &ProgressEvent<'_>);
+
+    /// Whether whoever is watching has stopped waiting for this work.
+    ///
+    /// Asked at the same checkpoints that report, so a long run can stop at a boundary where nothing is half-written: between
+    /// embed batches, between rerank pairs. A run that sees `true` stops early and its caller answers "cancelled" instead of a
+    /// result. Must be as cheap as `report` — an atomic load, not a lock someone else may hold.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// The reporter that does nothing — what every CLI path passes, so `np scan --json` keeps printing exactly what it
