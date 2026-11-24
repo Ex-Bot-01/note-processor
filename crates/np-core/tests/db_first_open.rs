@@ -15,34 +15,42 @@
 //! Rounds are repeated rather than run once because a race is a rate: at the observed ~1 fault in 5 opens, this many opens
 //! miss a regression with probability near zero, and one round would miss it often.
 
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Barrier;
+
+use tempfile::TempDir;
 
 /// How many pairs of simultaneous openers to run. Each round is two opens, so the row count below is `ROUNDS * 2`.
 const ROUNDS: usize = 60;
 
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("np-first-open-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("test setup: scratch directory");
-    dir
+/// A scratch directory **unique to this call**, deleted when the returned guard drops.
+///
+/// The uniqueness is the whole point, and it is why this file uses `TempDir` like every other test file in this crate
+/// (`scan.rs`, `config.rs`) instead of a name it computes itself. A path keyed on tag plus process id is the same path for
+/// both tests here — they run as threads of one binary, so they share a pid — and `baseline_versions()` runs inside each of
+/// them: one test's setup deleted the directory the other was still opening. Under load that surfaced as `unable to open
+/// database file` on a baseline read, and once as a baseline of 2 version rows against a raced 11, which then failed an
+/// assertion about *the schema* for a fault that belonged to the test harness.
+fn scratch(tag: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("np-first-open-{tag}-"))
+        .tempdir()
+        .expect("test setup: scratch directory")
 }
 
 /// The version rows a single uncontended first open leaves behind — the baseline the raced databases are compared with, so
 /// this file never hard-codes how many migrations this build carries.
 fn baseline_versions() -> i64 {
     let dir = scratch("baseline");
-    let db =
-        np_core::db::Db::open(&dir.join("index.db")).expect("test setup: a solo first open works");
+    let db = np_core::db::Db::open(&dir.path().join("index.db"))
+        .expect("test setup: a solo first open works");
     drop(db);
-    let conn =
-        rusqlite::Connection::open(dir.join("index.db")).expect("test setup: read the baseline");
+    let conn = rusqlite::Connection::open(dir.path().join("index.db"))
+        .expect("test setup: read the baseline");
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
         .expect("test setup: the bookkeeping table exists");
     drop(conn);
-    fs::remove_dir_all(&dir).ok();
     n
 }
 
@@ -56,7 +64,7 @@ fn two_openers_of_a_new_workspace_both_get_a_schema() {
 
     for round in 0..ROUNDS {
         let dir = scratch(&format!("race-{round}"));
-        let path = dir.join("index.db");
+        let path = dir.path().join("index.db");
         let barrier = Barrier::new(2);
         let outcomes: Vec<Result<(), String>> = std::thread::scope(|s| {
             let gate = &barrier;
@@ -102,7 +110,6 @@ fn two_openers_of_a_new_workspace_both_get_a_schema() {
             notes, 1,
             "round {round}: the notes table is not there exactly once"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -111,7 +118,7 @@ fn two_openers_of_a_new_workspace_both_get_a_schema() {
 #[test]
 fn a_second_opener_reads_the_schema_the_first_one_built() {
     let dir = scratch("sequential");
-    let path: PathBuf = dir.join("index.db");
+    let path: PathBuf = dir.path().join("index.db");
     {
         np_core::db::Db::open(&path).expect("first open builds the schema");
     }
@@ -126,5 +133,4 @@ fn a_second_opener_reads_the_schema_the_first_one_built() {
         baseline_versions(),
         "a second open must add no migrations"
     );
-    fs::remove_dir_all(&dir).ok();
 }
