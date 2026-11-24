@@ -1813,8 +1813,9 @@ fn a_fetch_that_reaches_its_transport_narrates_bytes_and_ends_refused() {
     use std::time::Duration;
 
     let pinned = np_core::pins::PINNED
-        .first()
-        .expect("a build with `fetch` pins something");
+        .iter()
+        .find(|pin| pin.role == np_core::pins::Role::Embedding && pin.member == "main")
+        .expect("a build with `fetch` pins an embedding model");
     const CHUNK: usize = 4 * 1024 * 1024;
     const CHUNKS: usize = 3;
 
@@ -2188,7 +2189,7 @@ fn an_embed_that_works_narrates_the_chunks_it_encodes() {
     // rather than a fetch, and keeps the digest check on the path.
     let pinned = np_core::pins::PINNED
         .iter()
-        .find(|pin| pin.member == "main")
+        .find(|pin| pin.role == np_core::pins::Role::Embedding && pin.member == "main")
         .expect("test setup: the main member is pinned");
     let installer = Command::new(env!("CARGO_BIN_EXE_np"))
         .args([
