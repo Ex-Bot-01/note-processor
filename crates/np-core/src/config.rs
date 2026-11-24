@@ -367,7 +367,28 @@ impl ThreadCount {
     pub const fn is_auto(self) -> bool {
         matches!(self, Self::Auto)
     }
+
+    /// The count a **query** pass asks for, given the `batch` count the same model was loaded with.
+    ///
+    /// `text
+    /// auto → min(batch, QUERY_AUTO_WORKERS)
+    /// n → n
+    /// `
+    ///
+    /// A query is one short sequence. On an idle machine a couple of workers encode it about as fast as a dozen; on a busy
+    /// one — an embed running beside a person typing — every extra worker waits for a core and spins while it waits, so the
+    /// wide count costs many times the CPU and several times the wall time for the same vector.
+    #[must_use]
+    pub fn resolve_query(self, batch: usize) -> usize {
+        match self {
+            Self::Auto => batch.clamp(1, QUERY_AUTO_WORKERS),
+            Self::Workers(_) => self.resolve(batch),
+        }
+    }
 }
+
+/// What `query_threads = "auto"` caps a query pass at.
+pub const QUERY_AUTO_WORKERS: usize = 2;
 
 /// Hand-written so the two accepted spellings produce a message that names `embeddings.threads`. Serde's derived
 /// untagged-enum failure says "data did not match any variant", which is a sentence about the implementation; this file's
@@ -378,66 +399,88 @@ impl<'de> serde::Deserialize<'de> for ThreadCount {
     where
         D: serde::Deserializer<'de>,
     {
-        struct Visitor;
+        thread_count_named(deserializer, "embeddings.threads")
+    }
+}
 
-        impl serde::de::Visitor<'_> for Visitor {
-            type Value = ThreadCount;
+/// `[embeddings] query_threads`, with refusals that name that key rather than its sibling.
+fn deserialize_query_threads<'de, D>(deserializer: D) -> Result<ThreadCount, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    thread_count_named(deserializer, "embeddings.query_threads")
+}
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("`\"auto\"` or a positive integer of worker threads")
-            }
+/// The one parser for a worker count, parameterised by the key its refusals name.
+fn thread_count_named<'de, D>(deserializer: D, key: &'static str) -> Result<ThreadCount, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor {
+        key: &'static str,
+    }
 
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value == 0 {
-                    return Err(E::custom(
-                        "embeddings.threads = 0 is not a worker count — write `\"auto\"`, or an integer of at \
-                         least 1 (zero workers is not something the runtime can be asked for)",
-                    ));
-                }
-                if value > MAX_REQUESTED_WORKERS {
-                    return Err(E::custom(format!(
-                        "embeddings.threads = {value} is more worker threads than this program will ask for \
-                         (max {MAX_REQUESTED_WORKERS}); write `\"auto\"` or a count near your CPU count"
-                    )));
-                }
-                // `value` is ≥ 1 and fits a `u32`; both were checked above, so neither fallback can run.
-                Ok(ThreadCount::Workers(
-                    std::num::NonZeroU32::new(value as u32)
-                        .unwrap_or_else(|| unreachable!("checked non-zero above")),
-                ))
-            }
+    impl serde::de::Visitor<'_> for Visitor {
+        type Value = ThreadCount;
 
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                let positive = u64::try_from(value).map_err(|_| {
-                    E::custom(format!(
-                        "embeddings.threads = {value} is negative; write `\"auto\"` or a positive count"
-                    ))
-                })?;
-                self.visit_u64(positive)
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                match value {
-                    "auto" => Ok(ThreadCount::Auto),
-                    other => Err(E::custom(format!(
-                        "embeddings.threads must be `\"auto\"` or a positive integer of worker threads, not \
-                         {other:?}"
-                    ))),
-                }
-            }
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("`\"auto\"` or a positive integer of worker threads")
         }
 
-        deserializer.deserialize_any(Visitor)
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value == 0 {
+                return Err(E::custom(format!(
+                    "{} = 0 is not a worker count — write `\"auto\"`, or an integer of at \
+                         least 1 (zero workers is not something the runtime can be asked for)",
+                    self.key
+                )));
+            }
+            if value > MAX_REQUESTED_WORKERS {
+                return Err(E::custom(format!(
+                        "{} = {value} is more worker threads than this program will ask for \
+                         (max {MAX_REQUESTED_WORKERS}); write `\"auto\"` or a count near your CPU count",
+                        self.key
+                    )));
+            }
+            // `value` is ≥ 1 and fits a `u32`; both were checked above, so neither fallback can run.
+            Ok(ThreadCount::Workers(
+                std::num::NonZeroU32::new(value as u32)
+                    .unwrap_or_else(|| unreachable!("checked non-zero above")),
+            ))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let positive = u64::try_from(value).map_err(|_| {
+                E::custom(format!(
+                    "{} = {value} is negative; write `\"auto\"` or a positive count",
+                    self.key
+                ))
+            })?;
+            self.visit_u64(positive)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            match value {
+                "auto" => Ok(ThreadCount::Auto),
+                other => Err(E::custom(format!(
+                    "{} must be `\"auto\"` or a positive integer of worker threads, not \
+                         {other:?}",
+                    self.key
+                ))),
+            }
+        }
     }
+
+    deserializer.deserialize_any(Visitor { key })
 }
 
 /// Which embedding provider to ask for work from.
@@ -548,6 +591,11 @@ pub struct EmbeddingsConfig {
     /// is not a new looseness — the thread policy records the choice, including why there is no
     /// `[local_model]` section and no environment override). Accepted spellings and refusals: [`ThreadCount`].
     pub threads: ThreadCount,
+    /// Worker threads for encoding a **search query** — **default `"auto"`**, the rule in [`ThreadCount::resolve_query`].
+    /// Separate from [`Self::threads`] because the two jobs want opposite things: a batch of chunks uses every core it is
+    /// given, while a one-line query gains nothing past a couple of workers and loses badly when the machine is busy.
+    #[serde(deserialize_with = "deserialize_query_threads")]
+    pub query_threads: ThreadCount,
     /// How loud llama.cpp may be on this program's stderr — **absent means unset, not `off`**.
     ///
     /// Three things worth writing down, because each one was a review finding against the first draft:
@@ -573,6 +621,7 @@ impl Default for EmbeddingsConfig {
             dim: None,
             max_tokens: DEFAULT_EMBEDDING_TOKENS,
             threads: ThreadCount::default(),
+            query_threads: ThreadCount::default(),
             // Unset rather than a level: see the field's note on why "nobody said" is not "said `off`".
             log_level: None,
         }
@@ -651,10 +700,39 @@ pub struct SearchConfig {
     /// Independent of `[embeddings] provider`: the stage reads strings out of the index, so it works under `provider = "none"`
     /// and under `--mode keyword` alike.
     pub rerank_text: crate::search::RerankText,
+    /// The most tokens one scored pair may hold — query, note and the special tokens between them. Absent means
+    /// [`MAX_RERANK_PAIR_TOKENS`], the whole scoring window. A long note is cut to fit, never refused, so this trades how
+    /// much of each note the reranker reads for how long it takes: a pass costs more than linearly in its length.
+    /// Outside `MIN_RERANK_PAIR_TOKENS..=MAX_RERANK_PAIR_TOKENS` is refused rather than clamped.
+    #[serde(deserialize_with = "deserialize_rerank_max_tokens")]
+    pub rerank_max_tokens: usize,
+}
+
+/// The scoring window a ranking context is built with, and so the largest `rerank_max_tokens` there is room for.
+pub const MAX_RERANK_PAIR_TOKENS: usize = 2_048;
+
+/// The smallest pair budget accepted: room for a short question and the start of a note. Below this, most queries would be
+/// refused as too long before any note was read.
+pub const MIN_RERANK_PAIR_TOKENS: usize = 64;
+
+/// Reading `search.rerank_max_tokens` as a bounded integer, refused by key name like `rerank_top_n`.
+fn deserialize_rerank_max_tokens<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if !(MIN_RERANK_PAIR_TOKENS..=MAX_RERANK_PAIR_TOKENS).contains(&value) {
+        return Err(serde::de::Error::custom(format!(
+            "search.rerank_max_tokens = {value} is not a pair budget this build can score: write \
+             {MIN_RERANK_PAIR_TOKENS} to {MAX_RERANK_PAIR_TOKENS}"
+        )));
+    }
+    Ok(value)
 }
 
 /// The default number of top hits to rerank: enough for a cross-encoder to change what is on the first screen, few enough
-/// that the scoring stays in tens of milliseconds per query on CPU. A preference, not a physical constant — which is why it
+/// that a reranked search stays a wait rather than a job: each candidate is one forward pass over up to
+/// `rerank_max_tokens` tokens. A preference, not a physical constant — which is why it
 /// is a key rather than a literal.
 pub const DEFAULT_RERANK_TOP_N: usize = 5;
 
@@ -690,6 +768,7 @@ impl Default for SearchConfig {
             rerank: false,
             rerank_top_n: DEFAULT_RERANK_TOP_N,
             rerank_text: crate::search::RerankText::TitleBody,
+            rerank_max_tokens: MAX_RERANK_PAIR_TOKENS,
         }
     }
 }

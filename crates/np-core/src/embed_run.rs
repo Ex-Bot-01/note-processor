@@ -1107,6 +1107,7 @@ fn run(
     // The provider's own sentence for the last refusal it raised, which becomes arm (iv)'s reason. Every
     // `EmbedError` message is input-free and secret-free by that type's own rule.
     let mut reason: Option<String> = None;
+    let mut cancelled = false;
 
     // The pass says where it starts, and how much work it starts with. `owed.len()` is free — this is the vector the run
     // just built to decide what to embed, not another query — so a client gets a denominator from the first line instead of
@@ -1207,10 +1208,21 @@ fn run(
         });
 
         between_batches(&db_path);
+        // Checked after the batch committed, so a cancelled run leaves every written row stamped and the rest owed — the
+        // next run resumes from here rather than redoing anything.
+        if progress.cancelled() {
+            cancelled = true;
+            break 'batches;
+        }
     }
 
     // ---- the media pass: images are a second vector source with their own counts, and they cannot change the arm.
-    let media = run_media_pass(&db, &root, &model_id, Some(provider));
+    // A cancelled run skips it: nobody is waiting for the answer, and figures are owed work like any chunk.
+    let media = if cancelled {
+        MediaTally::default()
+    } else {
+        run_media_pass(&db, &root, &model_id, Some(provider))
+    };
 
     // ---- arm (iv) when anything is still owed and unproduced; arm (i) when nothing is.
     let mut gaps: Vec<String> = Vec::new();

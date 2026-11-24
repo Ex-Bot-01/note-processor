@@ -18,6 +18,8 @@ added inside version 1 because they are opt-in and cannot surprise a client that
 - [Fault codes](#fault-codes)
 - [Notifications](#notifications)
 - [`status.get`, and what it cannot see](#statusget-and-what-it-cannot-see)
+- [Models held between requests](#models-held-between-requests)
+- [Cancelling a request](#cancelling-a-request)
 - [Captured transcripts](#captured-transcripts)
 - [Client walkthrough](#client-walkthrough)
 - [Reproducing the transcripts](#reproducing-the-transcripts)
@@ -33,12 +35,15 @@ added inside version 1 because they are opt-in and cannot surprise a client that
 | Shutdown | close stdin (or send a [`shutdown`](#methods) request); exit code 0 |
 
 **stdout is the protocol.** Nothing else is ever written there: logs, warnings and panics go to stderr, and a line that is not
-valid JSON means the process broke its contract, not that you should parse harder. stdout is locked for the life of the loop so
-two writers cannot interleave a response in half.
+valid JSON means the process broke its contract, not that you should parse harder. Every line is written whole under one lock,
+so two threads can never interleave a response in half.
 
-**Requests are handled one at a time, in order.** A search queued behind an embed waits for the embed. That is the documented
-cost of a single-threaded server; it is also why readers stay cheap — a search does not take the workspace write lock, so it
-does not queue behind another *process*, only behind this connection's own work.
+**Requests are handled one at a time, in order — except `status.get` and `cancel`.** A search queued behind an embed waits for
+the embed: one worker answers every other method in the order it arrived. That is also why readers stay cheap — a search does
+not take the workspace write lock, so it does not queue behind another *process*, only behind this connection's own work. The
+two exceptions are answered by the reader the moment their line arrives, even while the worker is busy: `status.get`, whose job
+is to say what is happening while something is, and `cancel`, which is useless if it has to wait for what it cancels. Their
+responses can therefore overtake the response to an earlier request; match responses by `id`.
 
 **A blank line is ignored.** A line that is not valid JSON, or not an object, gets a parse or invalid-request fault with
 `id: null`, because there may be no id to echo back.
@@ -68,7 +73,7 @@ can talk to a server it cannot configure still deserves answers.
 
 | Method | Params | Result | Built by | Refusals |
 |---|---|---|---|---|
-| `initialize` | `workspace?`, `notifications?` | `{protocol, np, features, methods, data_dir, progress?}` — `features` keys: `local_model`, `vision`, `fetch`, and `rerank` (the last one says this build reads the `rerank` parameter on `search`; an older server ignores a parameter it has never heard of instead of refusing it) | its own builder | `-32602` on a non-boolean `notifications` |
+| `initialize` | `workspace?`, `notifications?`, `models_idle_secs?` | `{protocol, np, features, methods, data_dir, models_idle_secs, progress?}` — `features` keys: `local_model`, `vision`, `fetch`, and `rerank` (the last one says this build reads the `rerank` parameter on `search`; an older server ignores a parameter it has never heard of instead of refusing it) | its own builder | `-32602` on a non-boolean `notifications` |
 | `search` | `workspace`, `query`, `limit?`, `mode?` (`keyword`\|`semantic`\|`hybrid`), `prefix?` (boolean), `rerank?` (boolean or null), `rerank_text?` (`title-body`\|`body`) | the same document as `np search --json`, including the `rerank` object (**F51**) | `search_document` | `-32602` missing/unknown key, a `prefix`/`rerank` that is not a boolean, or a `rerank_text` that is neither spelling; `-32000` workspace unreadable, or `rerank: true` with no reranker to run — the fault carries the CLI's refusal sentence verbatim |
 | `scan` | `workspace` | the same report as `np scan --json` | `ScanReport` | `-32602`; `-32000` |
 | `embed` | `workspace` | the same report as `np embed --json` | `embed_report` | `-32602`; `-32000` (including a build without the inference feature) |
@@ -76,7 +81,10 @@ can talk to a server it cannot configure still deserves answers.
 | [`links.list`](#reading-the-link-graph) | `workspace`, `rel?` | `{indexed, edges, unresolved}` — who links each note, and every dead target with the file and line it was written on | `links_json` | `-32602` on an empty or non-string `rel`; `-32000` when the workspace is not a directory |
 | [`embeddings.enable`](#turning-embeddings-on-or-off) | `model` | `{changed, provider, model, fetch, persisted_to}` — what the config file now says, and what a first `embed` would cost. **Fetches nothing** | `embeddings_document`, the CLI's own builder | `-32602` on a missing or non-string `model`, or an unknown key; `-32000` for an id this build does not pin, a build with no inference runtime (`local-model-not-built`), or a config that does not load today |
 | [`embeddings.disable`](#turning-embeddings-on-or-off) | none | the same document, with `fetch: null` and `provider: "none"` | `embeddings_document` | `-32000` only when the file cannot be written; `-32602` on any parameter |
-| `status.get` | `workspace` | `{last, fetch_markers, running}` | its own builder | `-32602` |
+| `status.get` | `workspace` | `{last, fetch_markers, last_scan, running, queued, models_held}` — answered at once, even mid-request | its own builder | `-32602` |
+| [`cancel`](#cancelling-a-request) | `request` (the id to stop) | `{request, state, cancelled}` — `state` is `queued`, `running` or `unknown`; answered at once | its own builder | `-32602` on a missing or non-string, non-number `request` |
+| [`models.warm`](#models-held-between-requests) | `workspace`, `rerank?` (boolean or null) | `{held, embedder, reranker}` — loads the embedding model (and the reranker when asked, or when `[search] rerank` is on) so the first search does not pay for it. **Never downloads** | its own builder | `-32602`; `-32000` workspace unreadable |
+| [`models.release`](#models-held-between-requests) | none | `{released}` — the model ids whose memory was handed back | its own builder | — |
 | `shutdown` | none | `{protocol}` echoed, then the loop ends | its own builder | — |
 
 Two things are deliberately **not** methods:
@@ -229,6 +237,7 @@ Only protocol-level faults and genuine refusals produce an `error` object.
 | `-32601` | no such method |
 | `-32602` | `params` missing, wrong type, or containing an unknown key |
 | `-32000` | refused: the command could not be done (`message` says why) |
+| `-32800` | cancelled: a [`cancel`](#cancelling-a-request) for this request arrived before it finished (the code LSP uses for the same answer) |
 | `-32603` | internal error, including a handler that panicked — one bad request never kills the session. This arm is a guard: no shipped method is known to panic, so **no test exercises it**, and a change that broke the catch would be caught by review rather than by this suite |
 
 A notification (a request with no `id`) gets **no response line at all**, per JSON-RPC. That includes `np/progress`: the server
@@ -336,7 +345,7 @@ first and use the notification only for continuity.
 {"id":3,"jsonrpc":"2.0","result":{"last":{"command":"embed","elapsed_ms":68,"phase":"completed","request":2},"fetch_markers":[{"bytes_done":8388608,"bytes_total":309855456,"id":"embeddinggemma-2","started_at":1794220456,"state":"running"}],"running":null}}
 ```
 
-All four keys are always present.
+Every key is always present.
 
 - `last` — the finished activity of **this connection**: `{request?, command, phase, elapsed_ms}` plus `outcome` or `code`.
 - `fetch_markers` — fetch markers found on disk for this workspace, read by listing the models directory. A marker written by a
@@ -348,12 +357,46 @@ All four keys are always present.
   workspace's `.sqlite` already exists, for the same reason `status.get` never creates one. This is the answer to "is what I'm
   showing stale?" — the question a GUI asks far more often than "what is running?", and until now the only way to answer it was to
   run a scan, which is work rather than a reading.
-- `running` — **always `null`.** This design is push-only: the server handles one request at a time, so by construction it
-  cannot answer "what are you doing right now?" while it is doing it. Live status arrives as notifications; the key exists so
-  that a future pull-based answer has a shape to grow into.
+- `running` — the request the worker is handling **right now**, as `{request?, command, since_ms}`, or `null` when it is idle.
+  `status.get` is answered by the reader thread the moment it arrives, so this is a live reading, not the last one.
+- `queued` — how many requests wait behind it.
+- `models_held` — model ids whose weights this server keeps resident between requests (see below).
 
 `status.get` never opens or creates the workspace database, and never touches a marker file — asking for status on a path that
 is not a workspace returns an empty list and leaves no files behind.
+
+## Models held between requests
+
+A fresh `np search` reads the embedding model (~300 MB) before its first answer, and a reranked one the reranker (~635 MB) as
+well. `np serve` loads each **once** and keeps it for the requests after: the second semantic search on a connection costs tens
+of milliseconds instead of a load. A held model is reused only while its artifact's path, size and modification time — and
+every setting that shapes the loaded context (`[embeddings] dim`, `max_tokens`, `threads`, `query_threads`) — are unchanged; a
+re-installed or re-fetched artifact is loaded fresh, and the old one dropped. Only bytes that passed this request's digest check
+are ever held.
+
+Three doors hand that memory back or spend it early:
+
+- **Idle release.** After `models_idle_secs` of quiet (default **900**) the worker drops every held model; the next request
+  loads again. `initialize` takes `models_idle_secs` to change it — `0` keeps nothing between requests — and always reports the
+  value in force.
+- **`models.release`** drops them now, for a client that knows search has gone quiet.
+- **`models.warm`** loads them now — at window open, or right after `np models fetch` put new bytes on disk — so the person's
+  first search is not the one that pays. It never downloads. An `embed` or a hybrid search that **fetched** the embedding model
+  warms it on the way out for the same reason.
+
+A search reports where its time went: `query_threads` (workers that encoded the query), and inside `rerank` the keys `reused`,
+`load_ms`, `score_ms` and `threads` — `null` when no ranker was opened.
+
+## Cancelling a request
+
+`{"method":"cancel","params":{"request":<id>}}` is answered at once with where that request was:
+
+| `state` | What happens to the cancelled request |
+|---|---|
+| `queued` | it never runs; it is answered in its turn with `-32800` |
+| `running` | it stops at its next checkpoint and is answered with `-32800`: a search between its phases or between two rerank pairs, an `embed` between batches (every committed batch stays written, and the next `embed` resumes from there). A request with no checkpoint left — a `scan`, a fetch in progress — finishes and answers normally |
+| `unknown` | no such request is waiting or running: it already finished, or never arrived |
+
 
 ## Captured transcripts
 
@@ -509,8 +552,8 @@ Five rules that are easy to get wrong:
 
 ### The reload recipe
 
-Under a push-only design, a page that reloads mid-download cannot ask "what is happening right now?" — `running` is `null`, and
-the server is busy and will not answer until the command finishes. So the **spawning process** keeps state:
+A page that reloads mid-download can ask `status.get`, which answers at once and names the request in flight under `running` —
+but only the id and how long it has run, not the byte counts its progress lines carried. So the **spawning process** keeps state:
 
 - store the last `np/progress` params per `request` id, in memory (and in your renderer's session, not just the DOM);
 - on reload, re-serve that stored line as the current status instead of showing nothing;

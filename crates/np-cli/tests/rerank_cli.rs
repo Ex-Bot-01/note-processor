@@ -160,16 +160,31 @@ fn search_json_reports_a_rerank_stage_that_was_never_asked() {
     keys.sort();
     assert_eq!(
         keys,
-        ["candidates", "model", "note", "ran", "reason", "text"]
-            .iter()
-            .map(|key| (*key).to_string())
-            .collect::<Vec<String>>(),
+        [
+            "candidates",
+            "load_ms",
+            "model",
+            "note",
+            "ran",
+            "reason",
+            "reused",
+            "score_ms",
+            "text",
+            "threads"
+        ]
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect::<Vec<String>>(),
         "{document}"
     );
     assert_eq!(rerank["ran"], false);
     assert_eq!(rerank["reason"], "disabled");
     assert!(rerank["note"].is_null());
     assert_eq!(rerank["candidates"], 0);
+    // No ranker was opened and nothing was scored, so there is no time and no worker count to report — `null`, not 0.
+    for key in ["load_ms", "reused", "score_ms", "threads"] {
+        assert!(rerank[key].is_null(), "`{key}`: {document}");
+    }
     // `model` is null because no stage was asked for: naming an artifact the run never touched would read as though it had been
     // loaded and found wanting.
     assert!(rerank["model"].is_null());
@@ -389,6 +404,16 @@ fn rerank_scores_more_candidates_than_it_prints() {
     assert!(
         hit["rerank_score"].is_number() && hit["rerank_rank_before"].is_number(),
         "the printed hit carries the evidence of a real scoring pass: {hit}"
+    );
+    // Where the time went: a one-shot process loads (it holds nothing), scores, and says how many workers did it.
+    assert_eq!(document["rerank"]["reused"], false, "{document}");
+    assert!(document["rerank"]["load_ms"].is_u64(), "{document}");
+    assert!(document["rerank"]["score_ms"].is_u64(), "{document}");
+    assert!(
+        document["rerank"]["threads"]
+            .as_u64()
+            .is_some_and(|n| n >= 1),
+        "{document}"
     );
 }
 

@@ -94,6 +94,7 @@ pub(crate) fn embed_report(
         mut state,
         artifact_check,
         workers,
+        query_workers: _,
         fetched,
         // Not read here: `np embed` refuses when it cannot embed, so "a fetch was declined" adds nothing to a refusal that already
         // names the command. `np search --json` is the caller that needs the distinction, and it reads the field directly.
@@ -308,6 +309,9 @@ pub(crate) struct Resolved {
     /// The worker-thread plan for this run, or `None` when no local-model provider was built (the arms that
     /// `provider = "none"` have no worker count to report).
     pub(crate) workers: Option<np_core::embed_run::WorkerPlan>,
+    /// Workers a query pass runs at (`[embeddings] query_threads`), or `None` when no local-model provider was built.
+    /// What `np search` reports, so a slow search can be told apart from an oversubscribed one.
+    pub(crate) query_workers: Option<usize>,
     /// What this run **transferred from an origin** before it could embed, or `None` when nothing arrived.
     ///
     /// Produced where the fetch happens — provider resolution — and copied onto the report by [`embed_workspace`] for the
@@ -367,6 +371,7 @@ fn placeholder(reason: NoProvider) -> Resolved {
         },
         artifact_check: None,
         workers: None,
+        query_workers: None,
         fetched: None,
         fetch_declined: false,
     }
@@ -388,6 +393,7 @@ fn artifact_absent() -> Resolved {
         state: ProviderState::ArtifactAbsent,
         artifact_check: None,
         workers: None,
+        query_workers: None,
         fetched: None,
         fetch_declined: false,
     }
@@ -400,6 +406,7 @@ fn fetch_offline(id: &str) -> Resolved {
         state: ProviderState::FetchSkippedOffline { id: id.to_string() },
         artifact_check: None,
         workers: None,
+        query_workers: None,
         // Nothing arrived, so nothing is claimed. `EmbedReport::offline` is set downstream from the arm itself, which is
         // why this field stays `None` rather than carrying a half-populated record.
         fetched: None,
@@ -592,27 +599,52 @@ pub(crate) fn embed_provider(
                         // those rows as though the pinned pair produced them, is not a degraded mode (R6c2's defect, aimed at
                         // the second artifact this program loads).
                         #[cfg(feature = "vision")]
-                        let embedder = match np_core::local_model::projector_artifact(
+                        let (embedder, mmproj) = match np_core::local_model::projector_artifact(
                             &db,
                             &row.id,
                             &cfg.workspace_models_dir(workspace),
                         ) {
-                            Ok(Some(projector)) => embedder.with_mmproj(projector),
-                            Ok(None) => embedder,
+                            Ok(Some(projector)) => {
+                                (embedder.with_mmproj(projector.clone()), Some(projector))
+                            }
+                            Ok(None) => (embedder, None),
                             Err(err) => return Err(err.into()),
                         };
+                        #[cfg(not(feature = "vision"))]
+                        let mmproj: Option<std::path::PathBuf> = None;
+                        let embedder = embedder.with_query_threads(cfg.embeddings.query_threads);
 
                         // Read before the embedder is boxed into a trait object: `worker_plan` is a method on the
                         // concrete type, and the plan belongs to the provider that was just built.
                         let plan = embedder.worker_plan();
+                        let query_workers = embedder.query_worker_count();
                         match np_core::local_model::verify_artifact(&db, &row, &artifact) {
-                            Ok(check) => Ok(Resolved {
-                                state: ProviderState::Ready(Box::new(embedder)),
-                                artifact_check: Some(check),
-                                workers: Some(plan),
-                                fetched: fetched_this_run,
-                                fetch_declined: false,
-                            }),
+                            Ok(check) => {
+                                // Only verified bytes are held: the key is read after the digest check, so a model kept
+                                // for the next request is always one this request vouched for.
+                                let key = crate::commands::hold::EmbedKey::new(
+                                    &artifact,
+                                    &row,
+                                    configured,
+                                    cfg.embeddings.max_tokens,
+                                    cfg.embeddings.threads,
+                                    cfg.embeddings.query_threads,
+                                    mmproj.as_deref(),
+                                );
+                                // Bytes that just arrived are loaded now, by a server that will keep them: the first
+                                // search after a download should not be the one that pays for reading them.
+                                let warm = fetched_this_run.is_some();
+                                Ok(Resolved {
+                                    state: ProviderState::Ready(crate::commands::hold::embedder(
+                                        key, embedder, warm,
+                                    )),
+                                    artifact_check: Some(check),
+                                    workers: Some(plan),
+                                    query_workers: Some(query_workers),
+                                    fetched: fetched_this_run,
+                                    fetch_declined: false,
+                                })
+                            }
                             Err(err) => Err(err.into()),
                         }
                     }
@@ -635,6 +667,7 @@ pub(crate) fn embed_provider(
                     state: ProviderState::Ready(Box::new(provider)),
                     artifact_check: None,
                     workers: None,
+                    query_workers: None,
                     fetched: fetched_this_run,
                     fetch_declined: false,
                 }),

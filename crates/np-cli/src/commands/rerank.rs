@@ -66,7 +66,13 @@ pub(crate) fn plan(cfg: &Config, rerank: Option<bool>, text: Option<RerankText>)
 pub(crate) enum Opened {
     /// Verified bytes, loaded context. Boxed because the stage holds a `dyn Reranker` either way, and a build without the
     /// runtime has nothing to box but the reason.
-    Ready(Box<dyn Reranker>),
+    Ready {
+        scorer: Box<dyn Reranker>,
+        /// Whether this request loaded the weights or found them held, and what loading cost.
+        load: crate::commands::hold::Acquired,
+        /// Workers the ranking context runs with.
+        threads: usize,
+    },
     /// The stage declines, with one cause that carries its own sentence, token and fix.
     Declined(RerankNote),
 }
@@ -184,11 +190,15 @@ pub(crate) fn prepare(
 /// [`RerankNote::ArtifactUnverified`] rather than loaded "anyway": the failure mode worth preventing is not a crash but a wrong
 /// order that looks like a good answer.
 pub(crate) fn open(cfg: &Config, workspace: &Path, _plan: &Plan) -> Opened {
-    open_at(&artifact_path(cfg, workspace))
+    open_at(
+        &artifact_path(cfg, workspace),
+        cfg.embeddings.threads,
+        cfg.search.rerank_max_tokens,
+    )
 }
 
 #[cfg(feature = "local-model")]
-fn open_at(path: &Path) -> Opened {
+fn open_at(path: &Path, threads: np_core::config::ThreadCount, pair_budget: usize) -> Opened {
     use std::fs;
 
     let meta = match fs::metadata(path) {
@@ -215,8 +225,25 @@ fn open_at(path: &Path) -> Opened {
             path.display()
         )));
     }
-    match np_core::local_model::load_rank(path) {
-        Ok(ranker) => Opened::Ready(Box::new(ranker)),
+    // **Workers: `[embeddings] threads`, not llama.cpp's compile-time four.** Scoring reads whole notes, so a pair is a batch
+    // pass of hundreds to thousands of tokens — the same shape of work an embed batch is, on the same runtime, and the same
+    // policy fits it. Left at four, a reranked search on an idle machine uses a quarter of it while a person waits.
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let workers = threads.resolve(available);
+    let options = np_core::local_model::LoadOptions {
+        threads: std::num::NonZeroU32::new(u32::try_from(workers).unwrap_or(u32::MAX)),
+    };
+    let stamp = crate::commands::hold::FileStamp::of(path);
+    match crate::commands::hold::ranker(stamp, pair_budget, || {
+        np_core::local_model::load_rank_with_options(path, options)
+    }) {
+        Ok((scorer, load)) => Opened::Ready {
+            scorer,
+            load,
+            threads: workers,
+        },
         // Anything the runtime refuses at load is, from here, "the bytes on disk are not a usable ranker" — which is what
         // `ArtifactUnverified` means to a reader, and its sentence names `np models install` as the fix.
         Err(error) => Opened::Declined(RerankNote::ArtifactUnverified(error.to_string())),
@@ -228,6 +255,6 @@ fn open_at(path: &Path) -> Opened {
 /// Reported by the same type as every other decline, which is what lets `--rerank` exit 1 here with a sentence that says *rebuild
 /// with the feature* instead of the misleading "install the model" that would send a reader to look at their disk.
 #[cfg(not(feature = "local-model"))]
-fn open_at(_path: &Path) -> Opened {
+fn open_at(_path: &Path, _threads: np_core::config::ThreadCount, _pair_budget: usize) -> Opened {
     Opened::Declined(RerankNote::RuntimeNotBuilt)
 }

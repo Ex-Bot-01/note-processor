@@ -1350,9 +1350,8 @@ fn a_notification_command_produces_progress_without_a_request_key() {
     }
 }
 
-/// `status.get` is the one question a client can ask *while nothing of its own is running* — the push-only design means
-/// the server answers "what just finished, and what is on disk" rather than "what is happening now". Three keys, always
-/// present, so a client reads `result["running"]` without a contains-check: `last`, `fetch_markers`, `running`.
+/// `status.get` on an idle connection: what just finished, what is on disk, and — empty here — what is in flight, queued and
+/// held. Every key is always present, so a client reads `result["running"]` without a contains-check.
 #[test]
 fn status_get_answers_three_keys_before_anything_is_indexed() {
     let mut server = Server::new();
@@ -1370,9 +1369,115 @@ fn status_get_answers_three_keys_before_anything_is_indexed() {
     );
     assert!(
         status["running"].is_null(),
-        "`running` ships as null and documented so, because a server that handles one request at a time cannot answer \
-         what is in flight while it is answering this one: {status}"
+        "an idle server has nothing in flight: {status}"
     );
+    assert_eq!(status["queued"], 0, "{status}");
+    assert_eq!(
+        status["models_held"],
+        json!([]),
+        "nothing has loaded a model yet: {status}"
+    );
+}
+
+/// Write `count` notes into the vault, enough that a scan of them takes a while — long enough for a second request to arrive
+/// while it runs.
+fn grow_vault(root: &Path, count: usize) {
+    let dir = root.join("bulk");
+    fs::create_dir_all(&dir).expect("test setup: bulk dir");
+    for index in 0..count {
+        fs::write(
+            dir.join(format!("note-{index:05}.md")),
+            format!(
+                "# Note {index}\n\nSome text about kafka brokers and item {index}.\n\n- [ ] open task {index}\n"
+            ),
+        )
+        .expect("test setup: bulk note");
+    }
+}
+
+/// **`status.get` answers while another request runs** (#27). The reader thread answers it the moment its line arrives, so
+/// a client polling for progress is not queued behind the scan it is asking about — and `running` names that scan.
+#[test]
+fn status_get_answers_while_a_scan_is_still_running() {
+    let mut server = Server::new();
+    grow_vault(&server.root, 3_000);
+    let workspace = server.root.display().to_string();
+    server.send_raw(
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "scan", "params": {"workspace": workspace}})
+            .to_string(),
+    );
+    server.send_raw(
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "status.get", "params": {"workspace": workspace}})
+            .to_string(),
+    );
+    let first = server.read_line();
+    assert_eq!(
+        first["id"], 2,
+        "the status answer overtakes the scan: {first}"
+    );
+    assert_eq!(first["result"]["running"]["command"], "scan", "{first}");
+    assert_eq!(first["result"]["running"]["request"], 1, "{first}");
+    assert!(
+        first["result"]["running"]["since_ms"].is_number(),
+        "{first}"
+    );
+    let second = server.read_line();
+    assert_eq!(second["id"], 1, "{second}");
+    assert!(
+        second.get("result").is_some(),
+        "the scan still answers: {second}"
+    );
+    server.finish();
+}
+
+/// **A queued request can be cancelled before it runs** (#27): `cancel` answers at once with `state: "queued"`, the scan in
+/// front finishes normally, and the cancelled search is answered in its turn with `-32800` instead of a result.
+#[test]
+fn cancel_answers_a_queued_request_as_cancelled_without_running_it() {
+    let mut server = Server::new();
+    grow_vault(&server.root, 3_000);
+    let workspace = server.root.display().to_string();
+    for request in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "scan", "params": {"workspace": workspace}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "search", "params": {"workspace": workspace, "query": "kafka", "mode": "keyword"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "cancel", "params": {"request": 2}}),
+    ] {
+        server.send_raw(&request.to_string());
+    }
+    let cancel = server.read_line();
+    assert_eq!(cancel["id"], 3, "cancel is answered immediately: {cancel}");
+    assert_eq!(cancel["result"]["state"], "queued", "{cancel}");
+    assert_eq!(cancel["result"]["cancelled"], true, "{cancel}");
+    let scan = server.read_line();
+    assert_eq!(scan["id"], 1, "{scan}");
+    assert!(scan.get("result").is_some(), "{scan}");
+    let search = server.read_line();
+    assert_eq!(search["id"], 2, "{search}");
+    assert_eq!(search["error"]["code"], -32800, "{search}");
+
+    // A request nobody is running or waiting for has nothing to stop.
+    let unknown = server.result("cancel", json!({"request": 99}));
+    assert_eq!(unknown["state"], "unknown", "{unknown}");
+    assert_eq!(unknown["cancelled"], false, "{unknown}");
+    let missing = server.request("cancel", json!({}));
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
+    server.finish();
+}
+
+/// The doors around held models: `initialize` takes and reports `models_idle_secs`, refuses a value that is not a count, and
+/// `models.release` answers with what it released — nothing, on a server that never loaded a model.
+#[test]
+fn models_idle_secs_and_models_release_answer_on_any_build() {
+    let mut server = Server::new();
+    let defaulted = server.result("initialize", json!({}));
+    assert!(defaulted["models_idle_secs"].is_u64(), "{defaulted}");
+    let set = server.result("initialize", json!({"models_idle_secs": 0}));
+    assert_eq!(set["models_idle_secs"], 0, "{set}");
+    let refused = server.request("initialize", json!({"models_idle_secs": "soon"}));
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    let released = server.result("models.release", json!({}));
+    assert_eq!(released["released"], json!([]), "{released}");
+    server.finish();
 }
 
 /// A marker another process wrote is reported **verbatim** — including an unknown size, which stays unknown (§12 rule 12)

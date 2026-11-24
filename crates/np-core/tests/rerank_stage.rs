@@ -134,6 +134,39 @@ fn eight(db: &Fixture) {
     }
 }
 
+/// **A cancel lands between pairs.** With a `stop` hook the stage hands the scorer one pair per call and asks the hook before
+/// each, so a client that stops waiting costs at most the pair already in flight — not the rest of the window.
+#[test]
+fn a_stop_hook_ends_the_stage_between_pairs_as_cancelled() {
+    let db = Fixture::new();
+    eight(&db);
+    let mut scorer = Scripted::new(&[1.0]);
+    let checks = std::cell::Cell::new(0);
+    let stop = || {
+        checks.set(checks.get() + 1);
+        checks.get() > 1
+    };
+    let refused = db
+        .run(
+            "kafka",
+            8,
+            Some(RerankInput {
+                reranker: &mut scorer,
+                ask: RerankAsk::ByConfig,
+                top_n: 5,
+                text: RerankText::TitleBody,
+                stop: Some(&stop),
+            }),
+        )
+        .expect_err("a stage told to stop does not answer");
+    assert!(
+        matches!(refused, search::SearchError::Cancelled),
+        "{refused:?}"
+    );
+    assert_eq!(scorer.asked.len(), 1, "one pair scored before the stop");
+    assert_eq!(scorer.asked[0].1.len(), 1, "pairs go one per call");
+}
+
 /// **The stage reorders the first N and nothing else.** Planted scores `[1, 2, 3]` with `N = 3` put the third candidate
 /// first inside the window; hits 4-8 keep their retrieval order behind it. A stage that resorted the whole list would make
 /// "rerank the top few" and "rerank everything" the same operation, and the second one is not what anyone asked for.
@@ -154,6 +187,7 @@ fn rerank_reorders_only_the_first_n_and_the_tail_keeps_retrieval_order() {
                 ask: RerankAsk::ByConfig,
                 top_n: 3,
                 text: RerankText::TitleBody,
+                stop: None,
             }),
         )
         .expect("keyword search with a stage answers");
@@ -200,6 +234,7 @@ fn the_stage_scores_what_it_is_given_and_reports_that_many() {
                 ask: RerankAsk::ByConfig,
                 top_n: 5,
                 text: RerankText::TitleBody,
+                stop: None,
             }),
         )
         .expect("two hits answer");
@@ -230,6 +265,7 @@ fn a_hit_that_was_not_a_candidate_carries_null_rerank_evidence() {
                 ask: RerankAsk::ByConfig,
                 top_n: 3,
                 text: RerankText::TitleBody,
+                stop: None,
             }),
         )
         .expect("eight hits answer");
@@ -276,6 +312,7 @@ fn the_stage_needs_no_embeddings_provider() {
                 ask: RerankAsk::ByConfig,
                 top_n: 4,
                 text: RerankText::TitleBody,
+                stop: None,
             }),
         )
         .expect("keyword-only search answers");
@@ -313,6 +350,7 @@ fn rerank_text_picks_what_the_model_is_handed() {
                     ask: RerankAsk::ByConfig,
                     top_n: 5,
                     text,
+                    stop: None,
                 }),
             )
             .expect("both notes match the query word");
@@ -393,6 +431,7 @@ fn a_declined_stage_degrades_and_says_which_cause() {
                     ask: RerankAsk::ByConfig,
                     top_n: 3,
                     text: RerankText::TitleBody,
+                    stop: None,
                 }),
             )
             .expect("a declined stage never costs the answer");
@@ -428,6 +467,7 @@ fn an_explicit_ask_that_cannot_be_honoured_is_an_error() {
                 ask: RerankAsk::Explicit,
                 top_n: 3,
                 text: RerankText::TitleBody,
+                stop: None,
             }),
         )
         .expect_err("an explicit request that cannot be honoured refuses");
@@ -461,6 +501,7 @@ fn no_candidates_and_no_stage_are_both_reported_by_name() {
                 ask: RerankAsk::ByConfig,
                 top_n: 3,
                 text: RerankText::TitleBody,
+                stop: None,
             }),
         )
         .expect("an empty answer is still an answer");

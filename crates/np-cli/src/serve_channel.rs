@@ -12,7 +12,10 @@
 //! for it, it is the layer beneath where that suite cannot reach.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use np_core::progress::{Phase, Progress, ProgressEvent};
@@ -39,6 +42,251 @@ impl LineSink for Vec<u8> {
     fn line(&mut self, text: &str) {
         self.extend_from_slice(text.as_bytes());
         self.push(b'\n');
+    }
+}
+
+/// Standard output as a sink that can move to another thread: the handle is locked per line rather than for the life of
+/// the loop, which is what lets the reader thread answer `status.get` while the worker is mid-request.
+pub struct StdoutLines(pub io::Stdout);
+
+impl LineSink for StdoutLines {
+    fn line(&mut self, text: &str) {
+        let mut out = self.0.lock();
+        // Dropped for the same reason the locked-handle sink drops them: nobody is left to tell.
+        let _ = writeln!(out, "{text}");
+        let _ = out.flush();
+    }
+}
+
+/// One sink, shared by every thread that answers on this connection. Each line is written whole under the lock, so two
+/// threads can interleave **lines** but never bytes — the framing rule a client depends on.
+#[derive(Clone)]
+pub struct SharedSink(Arc<Mutex<dyn LineSink + Send>>);
+
+impl SharedSink {
+    pub fn new(sink: impl LineSink + Send + 'static) -> Self {
+        SharedSink(Arc::new(Mutex::new(sink)))
+    }
+}
+
+impl LineSink for SharedSink {
+    fn line(&mut self, text: &str) {
+        // A poisoned lock means a writer panicked between lines; the sink itself holds no half-written state, so keep going.
+        let mut sink = match self.0.lock() {
+            Ok(sink) => sink,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        sink.line(text);
+    }
+}
+
+/// How long a server keeps loaded models after its last request, unless `initialize` says otherwise. Long enough that a
+/// person reading results and typing the next query never pays a reload; short enough that a window left open overnight
+/// hands the memory back.
+pub const DEFAULT_MODELS_IDLE_SECS: u64 = 900;
+
+/// One request waiting for the worker, as the reader found it.
+pub struct Job {
+    /// The line exactly as read, parsed again by the worker — one parser for every request, wherever it runs.
+    pub line: String,
+    /// The request's id, if it had one, so `cancel` can find it.
+    id: Option<Value>,
+    command: String,
+    /// Set by `cancel` while the job is still queued; the worker then answers it as cancelled without running it.
+    cancelled: bool,
+}
+
+impl Job {
+    pub fn new(line: String, id: Option<Value>, command: String) -> Self {
+        Job {
+            line,
+            id,
+            command,
+            cancelled: false,
+        }
+    }
+}
+
+struct Running {
+    request: Option<Value>,
+    command: String,
+    started: Instant,
+}
+
+#[derive(Default)]
+struct Pending {
+    jobs: VecDeque<Job>,
+    running: Option<Running>,
+    /// The reader has stopped: end of input, an unreadable stdin, or `shutdown`.
+    closed: bool,
+}
+
+/// What the worker should do next.
+pub enum Next {
+    Run(Job),
+    /// Nothing arrived within the idle window.
+    Idle,
+    /// The reader is done and the queue is empty.
+    Closed,
+}
+
+/// What every thread answering on one connection shares.
+///
+/// The queue and the running request sit behind **one** lock, so `cancel` never sees a request that has left the queue
+/// but not yet started: it is always in exactly one of the two places.
+pub struct Session {
+    notifications: AtomicBool,
+    last: Mutex<Option<Value>>,
+    /// Raised by `cancel` for the request now running; reset each time a request starts.
+    cancel: AtomicBool,
+    held: Mutex<Vec<String>>,
+    idle_secs: AtomicU64,
+    pending: Mutex<Pending>,
+    wake: Condvar,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session {
+            notifications: AtomicBool::new(false),
+            last: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            held: Mutex::new(Vec::new()),
+            idle_secs: AtomicU64::new(DEFAULT_MODELS_IDLE_SECS),
+            pending: Mutex::new(Pending::default()),
+            wake: Condvar::new(),
+        }
+    }
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // Every value behind these locks is replaced whole, never left half-updated, so a poisoned lock still holds a usable one.
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl Session {
+    /// Queue a request for the worker.
+    pub fn enqueue(&self, job: Job) {
+        locked(&self.pending).jobs.push_back(job);
+        self.wake.notify_all();
+    }
+
+    /// No more requests are coming; the worker drains what is queued and stops.
+    pub fn close(&self) {
+        locked(&self.pending).closed = true;
+        self.wake.notify_all();
+    }
+
+    /// Wait for the next request, at most `idle` when given. Taking a job marks it running in the same step.
+    pub fn next(&self, idle: Option<Duration>) -> Next {
+        let mut pending = locked(&self.pending);
+        let deadline = idle.map(|idle| Instant::now() + idle);
+        loop {
+            if let Some(job) = pending.jobs.pop_front() {
+                pending.running = Some(Running {
+                    request: job.id.clone(),
+                    command: job.command.clone(),
+                    started: Instant::now(),
+                });
+                self.cancel.store(job.cancelled, Ordering::SeqCst);
+                return Next::Run(job);
+            }
+            if pending.closed {
+                return Next::Closed;
+            }
+            pending = match deadline {
+                None => match self.wake.wait(pending) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                },
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Next::Idle;
+                    }
+                    match self.wake.wait_timeout(pending, deadline - now) {
+                        Ok((guard, _)) => guard,
+                        Err(poisoned) => poisoned.into_inner().0,
+                    }
+                }
+            };
+        }
+    }
+
+    /// The running request has been answered.
+    pub fn finished(&self) {
+        locked(&self.pending).running = None;
+        self.cancel.store(false, Ordering::SeqCst);
+    }
+
+    /// Ask for `request` to stop: answered `"queued"` when it had not started (it will be answered as cancelled without
+    /// running), `"running"` when it had (it stops at its next checkpoint, or finishes if it has none left), and `"unknown"`
+    /// when no such request is waiting or running — it already finished, or never arrived.
+    pub fn cancel(&self, request: &Value) -> &'static str {
+        let mut pending = locked(&self.pending);
+        if let Some(job) = pending
+            .jobs
+            .iter_mut()
+            .find(|job| job.id.as_ref() == Some(request))
+        {
+            job.cancelled = true;
+            return "queued";
+        }
+        if pending
+            .running
+            .as_ref()
+            .is_some_and(|running| running.request.as_ref() == Some(request))
+        {
+            self.cancel.store(true, Ordering::SeqCst);
+            return "running";
+        }
+        "unknown"
+    }
+
+    /// The request in flight, as `status.get` reports it, or `null`.
+    pub fn running(&self) -> Value {
+        let pending = locked(&self.pending);
+        match &pending.running {
+            None => Value::Null,
+            Some(running) => {
+                let mut object = serde_json::Map::new();
+                if let Some(id) = &running.request {
+                    object.insert("request".to_string(), id.clone());
+                }
+                object.insert("command".to_string(), json!(running.command));
+                object.insert(
+                    "since_ms".to_string(),
+                    json!(running.started.elapsed().as_millis() as u64),
+                );
+                Value::Object(object)
+            }
+        }
+    }
+
+    /// Requests waiting behind the running one.
+    pub fn queued(&self) -> usize {
+        locked(&self.pending).jobs.len()
+    }
+
+    /// The model ids the worker holds resident, as it last reported them.
+    pub fn held(&self) -> Vec<String> {
+        locked(&self.held).clone()
+    }
+
+    pub fn set_held(&self, ids: Vec<String>) {
+        *locked(&self.held) = ids;
+    }
+
+    /// Seconds of quiet after which held models are released; 0 means none are kept between requests.
+    pub fn idle_secs(&self) -> u64 {
+        self.idle_secs.load(Ordering::SeqCst)
+    }
+
+    pub fn set_idle_secs(&self, secs: u64) {
+        self.idle_secs.store(secs, Ordering::SeqCst);
     }
 }
 
@@ -99,9 +347,9 @@ const THROTTLE: Duration = Duration::from_millis(1_000);
 pub struct Channel<'a> {
     sink: &'a mut dyn LineSink,
     clock: &'a dyn Clock,
-    /// Set once by `initialize`, on this connection's own request. It is the only session-level fact the
-    /// server keeps; every request still names its own workspace.
-    notifications: bool,
+    /// What this connection's threads share: whether `initialize` asked for progress, the last finished activity, the
+    /// queue, and the cancel flag. Every request still names its own workspace.
+    session: Arc<Session>,
     /// The phase of the last line written, and when — the throttle's whole memory.
     emitted_phase: Option<Phase>,
     emitted_at: Duration,
@@ -111,28 +359,64 @@ pub struct Channel<'a> {
     /// Set when a client sends `shutdown`. The loop finishes writing that response and stops reading, so a client that
     /// asked to be done does not have to also close the pipe to be believed.
     shutdown: bool,
-    /// The one slot of session memory: the last finished activity, for `status.get`.
-    last: Option<Value>,
     /// The terminal notification for the request being handled. It is *queued* rather than written because it has to go
     /// out **after** the response line, and `handle_line` builds the response without writing it — so the loop writes
     /// the answer first and flushes this after (the ordering rule the spec calls "one line, mirroring the response kind").
     pending_terminal: Option<Value>,
+    /// The request about to be handled was cancelled while it waited in the queue, so it is answered as cancelled without
+    /// running. Set by the worker only; the reader's channel never sees a queued job.
+    cancelled_before_start: bool,
 }
 
 impl<'a> Channel<'a> {
-    /// A channel that writes to `sink` and measures elapsed time with `clock`, with progress **off** until asked.
+    /// A channel that writes to `sink` and measures elapsed time with `clock`, with progress **off** until asked, on a
+    /// connection of its own.
+    #[cfg(test)]
     pub fn new(sink: &'a mut dyn LineSink, clock: &'a dyn Clock) -> Self {
+        Self::with_session(sink, clock, Arc::new(Session::default()))
+    }
+
+    /// A channel on a connection whose state other threads share — `np serve`'s reader and worker each hold one.
+    pub fn with_session(
+        sink: &'a mut dyn LineSink,
+        clock: &'a dyn Clock,
+        session: Arc<Session>,
+    ) -> Self {
         Channel {
             sink,
             clock,
-            notifications: false,
+            session,
             emitted_phase: None,
             emitted_at: Duration::ZERO,
             shutdown: false,
             request_at: clock.since_start(),
-            last: None,
             pending_terminal: None,
+            cancelled_before_start: false,
         }
+    }
+
+    /// The state this connection's threads share.
+    pub fn session(&self) -> &Arc<Session> {
+        &self.session
+    }
+
+    /// Whether the client has asked for the request now being handled to stop.
+    pub fn cancel_requested(&self) -> bool {
+        self.session.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Mark the next request as cancelled before it started.
+    pub fn start_cancelled(&mut self, cancelled: bool) {
+        self.cancelled_before_start = cancelled;
+    }
+
+    /// Whether the request being handled was cancelled before it started — read once, so the flag cannot leak into the next.
+    pub fn take_cancelled_before_start(&mut self) -> bool {
+        std::mem::take(&mut self.cancelled_before_start)
+    }
+
+    fn notifications(&self) -> bool {
+        self.session.notifications.load(Ordering::SeqCst)
     }
 
     /// Mark the start of a new request, and **forget the throttle**. Called by the read loop before anything is parsed, so
@@ -166,12 +450,12 @@ impl<'a> Channel<'a> {
 
     /// Remember the last finished activity for `status.get`.
     pub fn set_last(&mut self, document: Value) {
-        self.last = Some(document);
+        *locked(&self.session.last) = Some(document);
     }
 
     /// What finished last on this connection, for `status.get`. `None` until the first request ends.
-    pub fn last(&self) -> Option<&Value> {
-        self.last.as_ref()
+    pub fn last(&self) -> Option<Value> {
+        locked(&self.session.last).clone()
     }
 
     /// Queue the terminal notification for the request being handled.
@@ -187,7 +471,7 @@ impl<'a> Channel<'a> {
     /// them, and leave a client holding an `indexing` line for work that finished. The rule exists to keep a long phase
     /// from becoming the traffic; a phase this short was never the problem.
     pub fn notify_unthrottled(&mut self, phase: Phase, params: Value) {
-        if !self.notifications {
+        if !self.notifications() {
             return;
         }
         // Still recorded, so a later line inside the same phase is measured from the line a client actually saw.
@@ -211,7 +495,7 @@ impl<'a> Channel<'a> {
         let Some(params) = self.pending_terminal.take() else {
             return;
         };
-        if !self.notifications {
+        if !self.notifications() {
             return;
         }
         self.sink.line(
@@ -221,14 +505,14 @@ impl<'a> Channel<'a> {
 
     /// Turn the progress stream on for this connection. Only `initialize` calls it.
     pub fn set_notifications(&mut self, on: bool) {
-        self.notifications = on;
+        self.session.notifications.store(on, Ordering::SeqCst);
     }
 
     /// Write one `np/progress` notification, subject to the throttle: a phase change is written immediately,
     /// and within one phase at most one line per second. A first-run download is ~40 lines over its life; without this
     /// rule the status stream would out-volume the answer it is describing.
     pub fn notify(&mut self, phase: Phase, params: Value) {
-        if !self.notifications {
+        if !self.notifications() {
             return;
         }
         let since = self.clock.since_start();
@@ -311,6 +595,10 @@ impl Progress for ServeProgress<'_, '_> {
     fn report(&self, event: &ProgressEvent<'_>) {
         self.publish(event);
     }
+
+    fn cancelled(&self) -> bool {
+        self.ch.borrow().cancel_requested()
+    }
 }
 
 /// Report one checkpoint for `reporter`, stamping `phase` onto the event.
@@ -383,11 +671,35 @@ pub fn phase_name(phase: Phase) -> &'static str {
     }
 }
 
-/// Read requests until end of input, writing at most one response line per request.
+/// Handle one line on `ch` and write what it produced: the response and its terminal line, or the terminal line alone for a
+/// notification. Returns whether the client asked for the session to end.
+fn answer(line: &str, ch: &mut Channel<'_>) -> bool {
+    match crate::serve::handle_line(line, ch) {
+        Some(response) => ch.response_then_terminal(&response),
+        // A notification gets no response — including for a malformed line, per JSON-RPC 2.0 §5: nothing is known about the sender's intent,
+        // so there is nothing to answer and an error would be a guess.
+        None => {
+            if !line.trim().starts_with('{') {
+                let _ = writeln!(
+                    io::stderr(),
+                    "np: serve: ignored a line that is not a JSON object"
+                );
+            }
+            // A notification-shaped command still ends, and its ending still gets a line — with no `request` key,
+            // because none was given (**Review Focus 5**).
+            ch.flush_terminal();
+        }
+    }
+    ch.shutdown_requested()
+}
+
+/// Read requests until end of input, writing at most one response line per request, one request at a time.
 ///
-/// Behaviour is the loop `serve` has always had: a blank line is ignored without an answer, an unreadable request is
-/// answered with `-32700`, a notification gets nothing, and end of input is a clean exit rather than an error — a
-/// client closing the pipe is how it says goodbye.
+/// A blank line is ignored without an answer, an unreadable request is answered with `-32700`, a notification gets
+/// nothing, and end of input is a clean exit rather than an error — a client closing the pipe is how it says goodbye.
+/// `np serve` itself runs [`serve_threaded`], whose worker takes exactly these steps per request; this single-threaded
+/// form is what the in-process tests drive.
+#[cfg(test)]
 pub(crate) fn serve_loop(input: impl BufRead, ch: &mut Channel<'_>) -> io::Result<()> {
     for line in input.lines() {
         // One clock reading per request, taken before anything is parsed.
@@ -400,31 +712,114 @@ pub(crate) fn serve_loop(input: impl BufRead, ch: &mut Channel<'_>) -> io::Resul
                 break;
             }
         };
-        match crate::serve::handle_line(&line, ch) {
-            Some(response) => ch.response_then_terminal(&response),
-            // A notification gets no response — including for a malformed line, per JSON-RPC 2.0 §5: nothing is known about the sender's intent,
-            // so there is nothing to answer and an error would be a guess.
-            None => {
-                if !line.trim().starts_with('{') {
-                    let _ = writeln!(
-                        io::stderr(),
-                        "np: serve: ignored a line that is not a JSON object"
-                    );
-                }
-                // A notification-shaped command still ends, and its ending still gets a line — with no `request` key,
-                // because none was given (**Review Focus 5**).
-                ch.flush_terminal();
-            }
-        }
         // A client that asked to be done is believed once its answer is on the wire: exit code and framing are unchanged,
         // and it no longer has to close stdin as well to stop the process.
-        if ch.shutdown_requested() {
+        if answer(&line, ch) {
             break;
         }
     }
     Ok(())
 }
 
+/// Methods the reader answers the moment it reads them, even while the worker is busy: each reads state the connection
+/// already has and touches no workspace lock, no model and no database a running request could be holding.
+const IMMEDIATE: [&str; 2] = ["status.get", "cancel"];
+
+/// `np serve`'s loop: a reader on this thread, a worker beside it.
+///
+/// **Every request is still answered in the order it arrived, by one worker,** exactly as before — a search queued behind an
+/// embed still waits for the embed, and the workspace write lock is still taken and released inside one request. Two
+/// methods are the exception, answered by the reader as soon as their line is read: `status.get`, whose whole job is to say
+/// what is happening while something is, and `cancel`, which is useless if it has to wait for the thing it cancels.
+///
+/// The worker is also the only thread that loads a model, so the models it keeps between requests are kept on one thread
+/// (`commands::hold`), and it is the thread that hands them back after `idle_secs` of quiet.
+pub(crate) fn serve_threaded(
+    input: impl BufRead,
+    sink: SharedSink,
+    clock: &dyn Clock,
+    session: Arc<Session>,
+) {
+    std::thread::scope(|scope| {
+        let mut worker_sink = sink.clone();
+        let worker_session = Arc::clone(&session);
+        let worker = scope.spawn(move || {
+            let mut ch = Channel::with_session(&mut worker_sink, clock, worker_session);
+            work(&mut ch);
+        });
+        let mut reader_sink = sink;
+        let mut ch = Channel::with_session(&mut reader_sink, clock, Arc::clone(&session));
+        read(input, &mut ch);
+        session.close();
+        // A handler's panic is caught inside `handle_line`; one that escapes would be a fault in the loop itself, and the
+        // reader has nothing left to do either way.
+        let _ = worker.join();
+    });
+}
+
+fn read(input: impl BufRead, ch: &mut Channel<'_>) {
+    for line in input.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(source) => {
+                let _ = writeln!(io::stderr(), "np: serve: stdin: {source}");
+                return;
+            }
+        };
+        // Parsed only to route it; the worker parses it again through `handle_line`, so there is still one reading of what a
+        // request means. A line that does not parse is queued like any other and answered in its turn.
+        let parsed: Option<Value> = serde_json::from_str(&line).ok();
+        let method = parsed
+            .as_ref()
+            .and_then(|request| request.get("method"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if IMMEDIATE.contains(&method.as_str()) {
+            ch.begin_request();
+            answer(&line, ch);
+            continue;
+        }
+        let id = parsed
+            .as_ref()
+            .and_then(|request| request.get("id"))
+            .cloned();
+        let shutdown = method == "shutdown";
+        ch.session().enqueue(Job::new(line, id, method));
+        // Nothing after `shutdown` is read: the worker answers everything queued before it, then stops.
+        if shutdown {
+            return;
+        }
+    }
+}
+
+fn work(ch: &mut Channel<'_>) {
+    crate::commands::hold::enable();
+    let session = Arc::clone(ch.session());
+    loop {
+        let idle = (!session.held().is_empty()).then(|| Duration::from_secs(session.idle_secs()));
+        match session.next(idle) {
+            Next::Closed => return,
+            Next::Idle => {
+                crate::commands::hold::release();
+                session.set_held(Vec::new());
+            }
+            Next::Run(job) => {
+                ch.begin_request();
+                ch.start_cancelled(job.cancelled);
+                let stop = answer(&job.line, ch);
+                if session.idle_secs() == 0 {
+                    crate::commands::hold::release();
+                }
+                session.set_held(crate::commands::hold::held());
+                session.finished();
+                if stop {
+                    return;
+                }
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::{report, serve_loop, Channel, FakeClock, LineSink, ServeProgress, SystemClock};

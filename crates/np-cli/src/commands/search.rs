@@ -89,6 +89,13 @@ pub(crate) struct SearchRun {
     /// Which text of a note the policy reads. Carried even when the stage is off, because the answer to "what would it score?"
     /// is a fact about this run's configuration and a reader measuring the two policies needs it before they ask.
     pub(crate) rerank_text: search::RerankText,
+    /// How the ranker reached this request — loaded now or already held — and what loading cost. `None` when no ranker
+    /// was opened.
+    pub(crate) rerank_load: Option<crate::commands::hold::Acquired>,
+    /// Workers the ranking context ran with, when one was opened.
+    pub(crate) rerank_threads: Option<usize>,
+    /// Workers the query was encoded with, or `None` when no query was embedded (keyword mode, or hybrid with no vectors).
+    pub(crate) query_threads: Option<usize>,
 }
 
 // Nine parameters, and the last two are what this signature grew for. A parameter object was considered for the pair and
@@ -117,11 +124,25 @@ pub(crate) fn search_run(
     let plan = crate::commands::rerank::plan(&cfg, rerank, rerank_text);
     let mut scorer: Option<Box<dyn np_core::rerank::Reranker>> = None;
     let mut declined: Option<search::RerankNote> = None;
+    let mut rerank_load: Option<crate::commands::hold::Acquired> = None;
+    let mut rerank_threads: Option<usize> = None;
     if let Some(plan) = &plan {
         match crate::commands::rerank::prepare(&cfg, workspace, plan, announce)? {
-            crate::commands::rerank::Opened::Ready(loaded) => scorer = Some(loaded),
+            crate::commands::rerank::Opened::Ready {
+                scorer: loaded,
+                load,
+                threads,
+            } => {
+                scorer = Some(loaded);
+                rerank_load = Some(load);
+                rerank_threads = Some(threads);
+            }
             crate::commands::rerank::Opened::Declined(note) => declined = Some(note),
         }
+    }
+    // Loading a ranker can take seconds; a client that gave up meanwhile should not also pay for retrieval.
+    if progress.cancelled() {
+        return Err(Box::new(search::SearchError::Cancelled));
     }
     if let (Some(note), Some(plan)) = (&declined, &plan) {
         // Reported once here rather than at every print site; the explicit case then refuses with that same sentence inside its
@@ -186,6 +207,7 @@ pub(crate) fn search_run(
     // arrived from an origin", and "the pinned origin could not be reached". `reason` (below) says which half is missing.
     let mut fetched: Option<Value> = None;
     let mut offline = false;
+    let mut query_threads: Option<usize> = None;
 
     if resolve {
         // **`resolving` says which half of the answer is still missing** (**O2**). This is the stretch where a search can
@@ -209,6 +231,7 @@ pub(crate) fn search_run(
             state,
             fetched: arrived,
             fetch_declined,
+            query_workers,
             ..
         } = resolved;
         // Produced where the transfer happens (provider resolution), not re-derived here — the same reasoning that put
@@ -229,7 +252,11 @@ pub(crate) fn search_run(
                 // is what caught it. Hybrid may skip, because hybrid has an answer to give either way — and when it does skip, the
                 // runtime complaint is not lost, only handed to the command that cannot do its job without it (`np embed`, arm (v)).
                 if present || !hybrid {
+                    if progress.cancelled() {
+                        return Err(Box::new(search::SearchError::Cancelled));
+                    }
                     vector = Some(provider.embed_query(query)?.to_bytes());
+                    query_threads = query_workers;
                 } else {
                     // Hybrid with nothing embedded yet. The provider resolved — and may have just arrived on disk — but a model
                     // sitting in a cache writes no vectors by itself, so say which of the two states this is: "run `np embed`" means
@@ -313,6 +340,7 @@ pub(crate) fn search_run(
         note.report((!model.is_empty()).then_some(model.as_str()));
     }
 
+    let stop = || progress.cancelled();
     let answer = search::ranked(
         &db,
         mode,
@@ -332,6 +360,7 @@ pub(crate) fn search_run(
                 ask: plan.ask,
                 top_n: plan.top_n,
                 text: plan.text,
+                stop: Some(&stop),
             }),
             // Either no stage was asked for, or it was and could not open — a decline already decided above, so the answer here
             // is retrieval order with `disabled`/`note` reported from `declined` below.
@@ -365,8 +394,12 @@ pub(crate) fn search_run(
                 skip: None,
                 note: Some(note),
                 candidates: 0,
+                score_ms: None,
             })
             .unwrap_or(answer.rerank),
+        rerank_load,
+        rerank_threads,
+        query_threads,
         rerank_model: plan
             .as_ref()
             .map(|_| np_core::pins::RERANKER_ID.to_string()),
@@ -411,6 +444,9 @@ pub(crate) fn search_document(run: &SearchRun) -> Value {
         "reason": run.note.as_ref().map(search::RankNote::token),
         "fetched": run.fetched.clone(),
         "offline": run.offline,
+        // Workers the query was encoded with — `null` when no query was embedded. The first number to read when a search
+        // is slow: a wide count on a busy machine is the usual cause.
+        "query_threads": run.query_threads,
         // **What the optional rerank stage did** (**F51**), always present. `reason` is one key for both kinds of "did not run"
         // — a non-fault (`disabled`, `no-candidates`) and a cause (`rerank-artifact-missing`, …) — because they answer the same
         // question, "why is this still retrieval order?", and a caller that branched on two keys would have to know which kind it
@@ -427,6 +463,13 @@ pub(crate) fn search_document(run: &SearchRun) -> Value {
             "candidates": run.rerank.candidates,
             "model": run.rerank_model,
             "text": run.rerank_text.label(),
+            // Where the stage's time went, so "the reranker is slow" can be read as loading or as scoring. `reused` is true
+            // when a long-lived server already held the weights and `load_ms` is then 0; all four are `null` when no ranker
+            // was opened.
+            "reused": run.rerank_load.map(|load| load.reused),
+            "load_ms": run.rerank_load.map(|load| load.load_ms),
+            "score_ms": run.rerank.score_ms,
+            "threads": run.rerank_threads,
         },
     })
 }

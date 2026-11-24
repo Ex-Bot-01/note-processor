@@ -524,6 +524,14 @@ extern "C" {
     /// `ctx` must be a live context from [`llama_init_from_model`].
     pub fn llama_n_threads_batch(ctx: *const llama_context) -> i32;
 
+    /// Change both worker counts of a live context (`include/llama.h:1100`). Takes effect at the next pass; nothing is
+    /// reallocated, which is what lets one loaded model serve a twelve-worker batch and a two-worker query in turn.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a live context from [`llama_init_from_model`], and both counts must be positive.
+    pub fn llama_set_n_threads(ctx: *mut llama_context, n_threads: i32, n_threads_batch: i32);
+
     // ---- inference ------------------------------------------------------------
 
     /// Run the model over `batch`. The header's own outcome list (`include/llama.h:1001-1005`) has **five** answers and
