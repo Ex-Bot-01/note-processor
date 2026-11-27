@@ -526,7 +526,12 @@ fn scan_inner(
     // resolve nothing, and an unresolved marked row is a note this refresh did not reach either.
     let hidden = known.hidden + ambiguous.len();
 
-    let tx = db.0.unchecked_transaction().map_err(DbError::from)?;
+    // **The write lock is taken at `BEGIN`.** The write pass reads before it writes; a transaction that began as a reader
+    // has its snapshot made stale by any other writer's commit (an embed batch, a second process opening this folder), and
+    // SQLite then refuses the upgrade at once rather than consulting the busy timeout. Taking the lock up front makes the
+    // scan wait for that writer instead, which is the wait `BUSY_TIMEOUT_MS` is sized for.
+    let tx = rusqlite::Transaction::new_unchecked(&db.0, rusqlite::TransactionBehavior::Immediate)
+        .map_err(DbError::from)?;
     let written = apply_changes(
         &db,
         &found,

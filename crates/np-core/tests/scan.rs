@@ -6179,3 +6179,49 @@ fn attachment_examples_stop_at_the_cap_and_the_count_stays_exact() {
         "and what it does print is the start of the sorted list, not an arbitrary slice"
     );
 }
+
+/// **A scan that meets another writer waits for it rather than failing with `database is locked`.**
+///
+/// The other writer is any connection holding the workspace's write lock — an embed batch, or a second process opening the
+/// same folder. The scan's write phase reads inside its transaction before it writes; if that transaction began as a
+/// reader, the other writer's commit makes its snapshot stale, and SQLite then refuses the upgrade at once instead of
+/// consulting the busy timeout. The holder here commits a real row so that the snapshot really does go stale.
+///
+/// The hold has to cover the scan reaching its transaction, and stay well under `BUSY_TIMEOUT_MS` so that a scan which
+/// waits correctly still gets the lock. A machine slow enough to reach the transaction only after the commit makes this
+/// pass without testing anything; it cannot make a correct scan fail.
+#[test]
+fn a_scan_waits_for_another_writer_instead_of_failing_busy() {
+    let ws = workspace();
+    scan(&ws.root, &ws.cfg).expect("test setup: first scan");
+    // Something for the write phase to do, so the scan really does need the write lock.
+    fs::write(
+        ws.root.join("arrived-while-locked.md"),
+        "# Arrived while locked\n\nWritten while another connection holds the write lock.\n",
+    )
+    .expect("test setup: add a note");
+
+    let holder = ws.db();
+    holder
+        .0
+        .execute_batch(
+            "BEGIN IMMEDIATE; INSERT INTO meta (key, value) VALUES ('test-holder', 'held');",
+        )
+        .expect("test setup: take the write lock and write under it");
+
+    let (root, cfg) = (ws.root.clone(), ws.cfg.clone());
+    let scanning = std::thread::spawn(move || scan(&root, &cfg));
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    holder
+        .0
+        .execute_batch("COMMIT")
+        .expect("test: release the write lock");
+
+    let report = scanning.join().expect("scan thread").expect(
+        "the scan has to wait for the other writer's commit, not fail with `database is locked`",
+    );
+    assert_eq!(
+        report.added, 1,
+        "the note written under the lock is indexed"
+    );
+}

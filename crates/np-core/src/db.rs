@@ -15,7 +15,7 @@
 //! [`MIGRATIONS`] says what a deleted note does to the rows around it.
 //!
 //! There is no transaction helper on purpose: the scan wraps itself in one
-//! [`rusqlite::Connection::unchecked_transaction`], which needs the public connection.
+//! [`rusqlite::Transaction::new_unchecked`] opened with `BEGIN IMMEDIATE`, which needs the public connection.
 
 use std::fs;
 use std::io;
