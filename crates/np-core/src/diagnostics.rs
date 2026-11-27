@@ -85,6 +85,12 @@ pub mod rule {
     pub const PREFIX_DRIFT: &str = "prefix-drift";
     /// Another writer holds this workspace and the wait expired.
     pub const LOCKED: &str = "locked";
+    /// A command or `np serve` request ended without its result because SQLite reported the workspace database locked: another
+    /// connection held its write lock past the busy timeout. Written for every such failure: no other record names it.
+    pub const DATABASE_BUSY: &str = "database-busy";
+    /// A command exited non-zero, or an `np serve` request was answered with an error object, and the failing code wrote no
+    /// rule record of its own. Together with the causes, this makes every failed request leave exactly one record.
+    pub const FAILED: &str = "failed";
     /// No vectors are stored under the configured model, so the semantic half has nothing to rank.
     pub const NO_VECTORS: &str = "no-vectors";
     /// `[embeddings] model` names an id this workspace has no row for.
@@ -151,7 +157,7 @@ pub mod rule {
 ///
 /// The documentation test asserts this list against `docs/reference-diagnostics.md` in both directions, so a token can
 /// be neither undocumented nor invented.
-pub const RULE_TOKENS: [&str; 25] = [
+pub const RULE_TOKENS: [&str; 27] = [
     rule::CONFIG_REFUSED,
     rule::PROVIDER_DISABLED,
     rule::LOCAL_MODEL_NOT_BUILT,
@@ -161,6 +167,8 @@ pub const RULE_TOKENS: [&str; 25] = [
     rule::TOKEN_BUDGET,
     rule::PREFIX_DRIFT,
     rule::LOCKED,
+    rule::DATABASE_BUSY,
+    rule::FAILED,
     rule::NO_VECTORS,
     rule::MODEL_NOT_INSTALLED,
     rule::FETCH_DISABLED,
@@ -194,11 +202,14 @@ pub const RULE_TOKENS: [&str; 25] = [
 /// degraded state, and `np_cli::serve_channel`, because stdin/stdout framing failures are reported on the response channel
 /// they belong to. Both stay listed in [`TARGETS`] as filters that answer "nothing here, yet"; `np_core::fetch` carries the
 /// phase span (its cost) but no rule, since every fetch outcome a caller acts on is reported by the command that asked.
-pub const RULE_TARGETS: [(&str, &[&str]); 25] = [
+pub const RULE_TARGETS: [(&str, &[&str]); 27] = [
     (rule::ARTIFACT_FETCHED, &[target::SEARCH]),
     (rule::ARTIFACT_MISSING, &[target::EMBED, target::SEARCH]),
     (rule::CONFIG_REFUSED, &[target::CONFIG]),
+    // The two outcome rules come from np-cli's two doors: a CLI command's exit path, and the server's per-request fault path.
+    (rule::DATABASE_BUSY, &[target::CLI, target::SERVE]),
     (rule::DUPLICATE_ROWS, &[target::SCAN]),
+    (rule::FAILED, &[target::CLI, target::SERVE]),
     (rule::FETCH_DISABLED, &[target::SEARCH]),
     (rule::HIDDEN_BEHIND_UNREADABLE, &[target::SCAN]),
     (rule::IDENTITY_TAKEN, &[target::SCAN]),

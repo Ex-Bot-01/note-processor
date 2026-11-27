@@ -222,6 +222,7 @@ pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>
         span.record("workspace", workspace);
     }
     let _entered = span.enter();
+    let rule_records_before = crate::diag::rule_records();
     // Cancelled while it waited in the queue: answered in its turn, as cancelled, without running.
     let outcome = if ch.take_cancelled_before_start() {
         Ok(Err(ServeError::Fault(cancelled(id.as_ref()))))
@@ -233,6 +234,7 @@ pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>
     // Every arm below ends the same way: a **fault value** or a **result**, and one terminal notification built from
     // which of the two it was. Doing this in one place rather than per handler is the point — "did this request end well"
     // is one question, and two places answering it is how a degraded success starts reporting itself as an error.
+    let mut failure = crate::commands::common::Failure::Other;
     let outcome: Result<Value, Fault> = match outcome {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(ServeError::Fault(fault))) => Err(fault),
@@ -249,6 +251,7 @@ pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>
         Ok(Err(ServeError::Refused(source))) => {
             // A refusal is `-32000` with the CLI's own sentence, and nothing else: no code per sentence, because a caller that branches on an
             // error *kind* should be branching on a state key in the result (the lock rule), not on a fault number.
+            failure = crate::commands::common::Failure::of(&*source);
             Err(Fault::new(Fault::REFUSED, source.to_string()))
         }
         Err(_) => {
@@ -262,6 +265,28 @@ pub(crate) fn handle_line(line: &str, ch: &mut crate::serve_channel::Channel<'_>
             ))
         }
     };
+    // **Every request that did not get its result is explained in the log**, inside the request's span so the record
+    // carries `request` and `workspace`. A request whose own code already wrote a rule record (`config-refused`, a rerank
+    // decline) is explained once, by that record — "one refusal, one record". `database-busy` is written regardless, because
+    // nothing else ever names that failure. A cancel is the client's own choice, not a failure.
+    if let Err(fault) = &outcome {
+        if failure == crate::commands::common::Failure::Other {
+            failure = crate::commands::common::Failure::from_message(&fault.message);
+        }
+        let explained = crate::diag::rule_records() != rule_records_before;
+        if fault.code != Fault::CANCELLED
+            && (failure == crate::commands::common::Failure::DatabaseBusy || !explained)
+        {
+            tracing::error!(
+                target: np_core::diagnostics::target::SERVE,
+                rule = failure.rule(),
+                what = method,
+                "`{method}` failed ({}): {}",
+                fault.code,
+                fault.message
+            );
+        }
+    }
     let elapsed = ch.since_request();
     ch.set_last(last_document(id.as_ref(), method, &outcome, elapsed));
     ch.queue_terminal(terminal_params(id.as_ref(), method, &outcome, elapsed));
