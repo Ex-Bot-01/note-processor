@@ -2521,3 +2521,22 @@ the reader instead of the writer. Two steps remain, both needing the machine:
 fallback — so a third target would fail to build at the predicate, not at the byte rule. The arms are now `cfg(windows)` / `cfg(all(not(unix),
 not(windows)))` on `os_bytes`, which does not fix that asymmetry but makes it visible at the right item: a missing arm is a compile error to repair,
 where a silently different key rule would be a data defect. Not worth its own card; noted so nobody re-derives it.
+
+## F52 — a second writer's wait for the workspace lock is not fair, and in `np serve` it cannot be cancelled (parked)
+
+**Filed 2026-11-27, parked the same day.** Design: [`design-f52-writers-wait-their-turn.md`](design-f52-writers-wait-their-turn.md).
+
+**What is true.** F44's lock waits 2 s through SQLite's busy handler, which sleeps and polls rather than queueing, so a process that releases
+the workspace lock and takes it again at once keeps winning. Two `np serve` processes on one vault for five minutes, one scanning and
+embedding in a loop and one scanning and searching: the looping writer was refused 0 times in 4 196 scans, the other 119 times in 186
+(64 %). Every refusal was a logged `locked` state, none an error. Separately, a request waiting inside `BEGIN IMMEDIATE` has no `cancel`
+checkpoint.
+
+**Why parked.** The client that reported failures runs one writer and one reader `np serve` and is single-instance, so it never contends for
+this lock in steady state; what it hit was SQLite's `database is locked` inside the workspace database, fixed by the `BEGIN IMMEDIATE`
+changes to migrations and to the scan's write phase. The design (a caller-chosen wait, a cancellable wait loop, a queue file for fairness)
+costs a second lock file, new parameters on two channels and a second Windows-unmeasured lock, which is not worth paying against no reported
+case.
+
+**Reopen when** a `locked` record appears in a real client's log (its `request` and timestamp name the second process), or a supported setup
+starts running two writers on one workspace. Build §4.2 and §4.3 of the design first; the caller-chosen wait (§4.1) only if a client asks.
