@@ -1,6 +1,6 @@
 use crate::db::DbError;
 use crate::path_keys::{self};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use std::io;
 
 use crate::db::meta::read_receipt;
@@ -507,7 +507,13 @@ fn apply_migrations(conn: &Connection, from: i64, carried: &mut Carried) -> Resu
         // One entry per transaction: DDL is transactional in SQLite, so a migration that
         // fails halfway leaves nothing behind and cannot be recorded as done. A code step gets the
         // same transaction, which is what lets it check its own work before anything is committed.
-        let tx = conn.unchecked_transaction()?;
+        //
+        // **The write lock is taken at `BEGIN`, not at the step's first write.** A deferred transaction starts as a reader;
+        // under WAL, when another opener commits between that start and this step's first write, SQLite refuses the
+        // upgrade with `database is locked` at once instead of waiting out the busy timeout. Nothing has been recorded by
+        // the peer yet at that moment, so [`apply_missing`] has no newer version to resume from and the open fails.
+        // Asking for the lock up front makes the second opener wait its turn, which the busy timeout does cover.
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         match migration {
             Migration::Sql(sql) => tx.execute_batch(sql)?,
             Migration::Code(apply) => apply(&tx)?,
