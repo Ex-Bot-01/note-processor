@@ -209,6 +209,16 @@ fn main() -> ExitCode {
         let _ = writeln!(io::stderr(), "np: {err}");
         return ExitCode::FAILURE;
     }
+    let command_name = match &cli.command {
+        Command::Scan { .. } => "scan",
+        Command::Embed { .. } => "embed",
+        Command::Setup { .. } => "setup",
+        Command::Serve => "serve",
+        Command::Search { .. } => "search",
+        Command::Embeddings { .. } => "embeddings",
+        Command::Models { .. } => "models",
+    };
+    let rule_records_before = diag::rule_records();
     let result = match cli.command {
         Command::Scan { workspace, json } => commands::scan::scan_workspace(&workspace, json),
         Command::Embed {
@@ -351,6 +361,15 @@ fn main() -> ExitCode {
             }
         },
     };
+    // The outcome record, written while the sinks are still open: the `np: …` line below goes to stderr only, so a failure
+    // whose code logged no rule record of its own would otherwise leave the `[log] file` with nothing to say about it.
+    if let Err(err) = &result {
+        commands::common::log_command_failure(
+            command_name,
+            err.as_ref(),
+            diag::rule_records() != rule_records_before,
+        );
+    }
     // What stderr swallowed, said once at the end because the notice owes a total. Before the exit paths, so a run that
     // failed *and* was truncated reports both — the truncation is often the reason nobody saw the failure.
     diag::finish();

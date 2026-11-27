@@ -10,6 +10,60 @@ use std::path::Path;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+/// Which way a command or request failed, as the log's outcome record names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// SQLite reported the workspace database locked: another connection held its write lock past the busy timeout.
+    DatabaseBusy,
+    /// Anything else that ended the work without its result.
+    Other,
+}
+
+impl Failure {
+    /// Classify `err` by walking its source chain for SQLite's busy code. The message is checked as well, because several
+    /// refusals reach this point as a sentence that quoted SQLite (`workspace database: sqlite: database is locked`) rather
+    /// than as the typed error — and SQLite's own wording for the code is the one stable thing those sentences share.
+    pub(crate) fn of(err: &(dyn Error + 'static)) -> Self {
+        if np_core::db::is_database_busy(err) {
+            return Self::DatabaseBusy;
+        }
+        Self::from_message(&err.to_string())
+    }
+
+    /// Classify a failure that only survived as its sentence, such as a JSON-RPC fault's `message`.
+    pub(crate) fn from_message(message: &str) -> Self {
+        if message.contains("database is locked") {
+            Self::DatabaseBusy
+        } else {
+            Self::Other
+        }
+    }
+
+    pub(crate) fn rule(self) -> &'static str {
+        match self {
+            Self::DatabaseBusy => np_core::diagnostics::rule::DATABASE_BUSY,
+            Self::Other => np_core::diagnostics::rule::FAILED,
+        }
+    }
+}
+
+/// Write the outcome record for a CLI command that is about to exit non-zero: `error` level, on the `np_cli` target, with
+/// the command in `what` and the sentence the person sees on stderr as the message — unless `explained`, meaning the
+/// failing code already wrote a rule record of its own ("one refusal, one record"). `database-busy` is written either way,
+/// because no other record ever names that failure.
+pub(crate) fn log_command_failure(command: &str, err: &(dyn Error + 'static), explained: bool) {
+    let failure = Failure::of(err);
+    if explained && failure == Failure::Other {
+        return;
+    }
+    tracing::error!(
+        target: np_core::diagnostics::target::CLI,
+        rule = failure.rule(),
+        what = command,
+        "`{command}` failed: {err}"
+    );
+}
+
 /// Take this workspace's write lock, or report that somebody else holds it and stop.
 ///
 /// Every command that changes state calls this before it touches anything, because the defect it closes is not two writers arguing inside

@@ -227,8 +227,9 @@ np_cli::serve_channel
 np_cli
 ```
 
-`np_cli` carries the run itself: its opening record in the file, and the `log full` line that ends a spent budget.
-`np_cli::serve` is the request loop and its spans. Three targets are filters rather than emitters today, and saying so is
+`np_cli` carries the run itself: its opening record in the file, the `log full` line that ends a spent budget, and the
+`failed` / `database-busy` record of a command that exits non-zero. `np_cli::serve` is the request loop, its spans, and
+the same two records for a request answered with an error. Three targets are filters rather than emitters today, and saying so is
 better than letting someone filter to silence and conclude the logging is broken: **`np_core::fetch`** carries the fetch
 phase span — its `elapsed_ms`, never an origin — while every fetch outcome a caller acts on is reported by the command that
 asked for it; **`np_core::models`** stays quiet because a listing's per-row "not installed" verdict is not a degraded state
@@ -246,7 +247,9 @@ directions: a token emitted and undocumented fails, and so does a token document
 artifact-fetched
 artifact-missing
 config-refused
+database-busy
 duplicate-rows
+failed
 fetch-disabled
 hidden-behind-unreadable
 identity-taken
@@ -281,7 +284,9 @@ alert written against those rows would have silently missed every disconnected `
 | `artifact-fetched`         | info    | `np_core::search`                   | the model id whose artifact arrived, or `the semantic half` when none is named  |
 | `artifact-missing`         | warn    | `np_core::embed`, `np_core::search` | embed: the artifact path; search: the model id whose row has no bytes           |
 | `config-refused`           | error   | `np_core::config`                   | — (the message names the file and key)                                          |
+| `database-busy`            | error   | `np_cli`, `np_cli::serve`           | the command or method that failed because SQLite reported the workspace database locked |
 | `duplicate-rows`           | debug   | `np_core::scan`                     | the path whose two spellings both listed                                        |
+| `failed`                   | error   | `np_cli`, `np_cli::serve`           | the command or method that failed without writing a rule record of its own      |
 | `fetch-disabled`           | warn    | `np_core::search`                   | the model id a fetch could have fixed                                           |
 | `hidden-behind-unreadable` | debug   | `np_core::scan`                     | a live row's stored note path                                                   |
 | `identity-taken`           | debug   | `np_core::scan`                     | the path whose identity belongs elsewhere                                       |
@@ -304,7 +309,15 @@ alert written against those rows would have silently missed every disconnected `
 | `unrepresentable-path`     | debug   | `np_core::scan`                     | the name no byte path could hold                                                |
 | `unresolved-ambiguity`     | debug   | `np_core::scan`                     | a lossy-keyed row no route accounted for (F23)                                  |
 
-Two of these need a word of explanation:
+Three of these need a word of explanation:
+
+* **`failed` and `database-busy` close the gap between failures and records.** Every `np` command that exits non-zero, and
+  every `np serve` request answered with an error object (except one the client cancelled), leaves at least one rule record
+  for that `request`: usually the cause its own code wrote (`config-refused`, `locked`, `provider-disabled`, …), and
+  `failed` when that code wrote none — one refusal, one record. `database-busy` is written whenever SQLite reported the
+  workspace database locked (two writers on one workspace, and SQLite's busy timeout ran out before the other connection let
+  go), because nothing else ever names that failure. A `locked: true` *result* from `np serve` is a state, not a failure; its
+  `locked` warning is the record.
 
 * **`offline` versus `fetch-offline`.** Diagnostics say `offline`. The *result document* keeps its published
   `note: "fetch-offline"` (`docs/reference-serve.md`), because that string is frozen output some client already matches

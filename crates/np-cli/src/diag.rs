@@ -488,6 +488,18 @@ impl Sink {
 /// once, and the two phases in this module's header need to *change* what that subscriber does without replacing it.
 static SINK: OnceLock<Arc<Sink>> = OnceLock::new();
 
+thread_local! {
+    /// Records carrying a `rule` that this thread has handed to the sinks. Per thread because `np serve` runs one request at
+    /// a time on each of its threads, so the difference across one request is that request's own records.
+    static RULE_RECORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many rule records this thread has written so far — read before and after a piece of work to learn whether that work
+/// already explained itself in the log.
+pub(crate) fn rule_records() -> u64 {
+    RULE_RECORDS.with(std::cell::Cell::get)
+}
+
 /// The sink for this process, installing the subscriber on first call.
 fn sink() -> Arc<Sink> {
     Arc::clone(SINK.get_or_init(|| {
@@ -1108,6 +1120,9 @@ where
             }
         }
         let level = level_text(meta.level());
+        if record.fields.iter().any(|(name, _)| name == "rule") {
+            RULE_RECORDS.with(|count| count.set(count.get() + 1));
+        }
         // Claimed before the line is built (spec point 8): a diagnostic that will not be printed costs a counter and a poll,
         // not a `format!`.
         if self.sink.claim_stderr_line() {

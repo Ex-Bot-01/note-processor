@@ -111,6 +111,31 @@ fn is_transient_lock(source: &rusqlite::Error) -> bool {
     )
 }
 
+/// Whether anything in `err`'s source chain is SQLite reporting a database locked by another connection — the failure two
+/// writers on one workspace end in once the busy timeout runs out. For a caller outside this crate that has to name that
+/// failure without depending on SQLite's types.
+pub fn is_database_busy(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = next {
+        let sqlite = current.downcast_ref::<rusqlite::Error>().or_else(|| {
+            match current.downcast_ref::<DbError>() {
+                Some(DbError::Sqlite(inner)) => Some(inner),
+                _ => None,
+            }
+        });
+        if let Some(rusqlite::Error::SqliteFailure(failure, _)) = sqlite {
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) {
+                return true;
+            }
+        }
+        next = current.source();
+    }
+    false
+}
+
 /// What can fail while opening or writing the workspace database.
 #[derive(Debug, Error)]
 pub enum DbError {

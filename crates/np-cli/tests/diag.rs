@@ -1243,6 +1243,113 @@ fn a_locked_workspace_reports_the_rule_and_its_path() {
     );
 }
 
+/// Take SQLite's write lock on `vault`'s workspace database the way a second writer outside np's own workspace lock would,
+/// and keep it for as long as the returned connection lives.
+fn hold_workspace_database(vault: &Vault) -> rusqlite::Connection {
+    let db = Config {
+        data_dir: np_data_dir(&vault._tmp.path().join("data")),
+        ..Config::default()
+    }
+    .workspace_db(&vault.root);
+    let conn = rusqlite::Connection::open(&db).expect("test setup: open the workspace database");
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .expect("test setup: take the database's write lock");
+    conn
+}
+
+/// **A request that fails on a locked database says so in the log** — once, at `error`, as `database-busy`, with the
+/// request's id. Before this record existed the client got `sqlite: database is locked` and the file got nothing, so a
+/// failure rate measured from the responses could not be found in the log at all.
+#[test]
+fn a_serve_request_that_meets_a_locked_database_leaves_an_outcome_record() {
+    let vault = Vault::new();
+    vault.write_notes(2);
+    let log = vault.log_config(None);
+    assert_eq!(vault.exec(&["scan"]).code, 0, "the vault is indexed first");
+    fs::write(vault.root.join("note-0000.md"), "# Changed\n\nnew words\n")
+        .expect("test setup: give the next scan something to write");
+    fs::remove_file(&log).expect("test setup: start the assertion from an empty log");
+    let _held = hold_workspace_database(&vault);
+
+    let requests = vec![request(
+        7,
+        "scan",
+        serde_json::json!({"workspace": vault.root}),
+    )];
+    let (code, stdout, _) = serve_with(&requests, |cmd| {
+        cmd.env("XDG_DATA_HOME", vault._tmp.path().join("data"))
+            .env("LOCALAPPDATA", vault._tmp.path().join("data"))
+            .env("HOME", vault._tmp.path())
+            .env("XDG_CONFIG_HOME", vault._tmp.path().join("config"))
+            .env("APPDATA", vault._tmp.path().join("config"));
+    });
+    assert_eq!(code, 0, "the server survives the failed request");
+    assert!(
+        stdout.contains("database is locked"),
+        "the client is told: {stdout}"
+    );
+
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    let outcomes: Vec<&Value> = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.get("rule").and_then(Value::as_str),
+                Some("database-busy" | "failed")
+            )
+        })
+        .collect();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one outcome record per failed request: {records:?}"
+    );
+    let outcome = outcomes[0];
+    assert_eq!(outcome["rule"], "database-busy", "{outcome}");
+    assert_eq!(outcome["level"], "error", "{outcome}");
+    assert_eq!(outcome["target"], "np_cli::serve", "{outcome}");
+    assert_eq!(outcome["request"], 7, "{outcome}");
+    assert_eq!(outcome["what"], "scan", "{outcome}");
+}
+
+/// The CLI half: a command that exits 1 writes its outcome record before the sinks close — `database-busy` for the same
+/// lock, and `failed` for any other refusal, here a workspace directory that does not exist.
+#[test]
+fn a_cli_command_that_fails_leaves_an_outcome_record() {
+    let vault = Vault::new();
+    vault.write_notes(2);
+    let log = vault.log_config(None);
+    assert_eq!(vault.exec(&["scan"]).code, 0, "the vault is indexed first");
+    fs::write(vault.root.join("note-0000.md"), "# Changed\n\nnew words\n")
+        .expect("test setup: give the next scan something to write");
+    fs::remove_file(&log).expect("test setup: start the assertion from an empty log");
+
+    let held = hold_workspace_database(&vault);
+    let busy = vault.exec(&["scan"]);
+    drop(held);
+    assert_eq!(busy.code, 1, "{}", busy.stderr);
+    let missing = crate::run(
+        vault
+            .command(&["scan"])
+            .arg(vault._tmp.path().join("no-such-vault")),
+    );
+    assert_eq!(missing.code, 1, "{}", missing.stderr);
+
+    let records = read_records(&log);
+    assert_keys_are_documented(&records, &log);
+    let outcomes: Vec<(&str, &str)> = records
+        .iter()
+        .filter(|record| record.get("target").and_then(Value::as_str) == Some("np_cli"))
+        .filter_map(|record| Some((record.get("rule")?.as_str()?, record.get("what")?.as_str()?)))
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![("database-busy", "scan"), ("failed", "scan")],
+        "{records:?}"
+    );
+}
+
 /// Plan Task 3 Step 4's privacy rule, run at `trace` with every command that can produce a diagnostic. A note's body and
 /// an origin host are the two things §12 forbids, and the vault below is built so both would be findable if either ever
 /// travelled: the body is one unusual string in every chunk, and the only link in the vault names a host that exists
